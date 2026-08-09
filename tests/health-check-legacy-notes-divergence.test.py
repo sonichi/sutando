@@ -179,7 +179,12 @@ with tempfile.TemporaryDirectory() as _td:
          patch.object(hc, "legacy_dotted_workspace", lambda: _legacy), \
          patch.object(Path, "resolve", _boom_resolve):
         r = hc.check_legacy_notes_divergence()
-    check("resolve() raising OSError -> None, not a traceback", r is None, str(r))
+    check("resolve() raising OSError WARNS — a read failure is not 'no divergence'",
+          r is not None and r.get("status") == "warn", str(r))
+    check("...and says it could not compare, not that the trees agree",
+          r is not None and "could not compare" in r["detail"], str(r))
+    check("...and refuses to read as a clean bill of health",
+          r is not None and "NOT a clean bill of health" in r["detail"], str(r))
 
     _real_rglob = Path.rglob
 
@@ -192,10 +197,33 @@ with tempfile.TemporaryDirectory() as _td:
          patch.object(hc, "legacy_dotted_workspace", lambda: _legacy), \
          patch.object(Path, "rglob", _boom_rglob):
         r = hc.check_legacy_notes_divergence()
-    check("an unreadable legacy tree still reports, from the side that IS readable",
+    check("an unreadable tree WARNS rather than reporting a partial comparison",
           r is not None and r.get("status") == "warn", str(r))
-    check("...and attributes every file to the readable side, not to a false divergence",
-          r is not None and "1 file(s) only in the canonical" in r["detail"], str(r))
+    check("...and names enumeration as what failed, not a file count",
+          r is not None and "enumerating" in r["detail"], str(r))
+
+# The case a non-empty canonical side hides: with nothing on the readable side, a
+# partial scan compares empty-to-empty and the only copy of every file looks fine.
+with tempfile.TemporaryDirectory() as _td2:
+    _root2 = Path(_td2)
+    _ws2, _legacy2 = _root2 / "canonical", _root2 / "legacy"
+    (_ws2 / "notes").mkdir(parents=True)
+    (_legacy2 / "notes").mkdir(parents=True)
+    (_legacy2 / "notes" / "only-copy.md").write_text("the only copy of this file")
+
+    _rg2 = Path.rglob
+
+    def _boom_rglob2(self, pattern):
+        if str(self).startswith(str(_legacy2)):
+            raise OSError("unreadable")
+        return _rg2(self, pattern)
+
+    with patch.object(hc, "WORKSPACE_DIR", _ws2), \
+         patch.object(hc, "legacy_dotted_workspace", lambda: _legacy2), \
+         patch.object(Path, "rglob", _boom_rglob2):
+        r = hc.check_legacy_notes_divergence()
+    check("unreadable legacy + EMPTY canonical still WARNS (the only-copy case)",
+          r is not None and r.get("status") == "warn", str(r))
 
 # The source-substring check above survives deleting the append; only calling the
 # aggregate proves the result actually reaches an operator.

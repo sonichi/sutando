@@ -5763,23 +5763,42 @@ def check_legacy_notes_divergence() -> "dict | None":
     legacy_notes = legacy_dotted_workspace() / "notes"
     if not ws_notes.exists() or not legacy_notes.exists():
         return None
+    # A read failure must not read as "no divergence": this warning exists to stop a
+    # cleanup discarding the only copy, so silence is the one unsafe direction.
+    def _unreadable(what: str, exc: OSError) -> "dict":
+        return {
+            "name": "legacy-notes-divergence",
+            "status": "warn",
+            "detail": (
+                f"could not compare the two notes/ trees — {what}: {exc}. This is NOT "
+                f"a clean bill of health: the probe exists to catch legacy-only files "
+                f"that a cleanup would destroy, and it could not read them. Resolve the "
+                f"access error before deleting or repointing either tree "
+                f"(canonical {ws_notes}, legacy {legacy_notes})."
+            ),
+        }
+
     try:
         if ws_notes.resolve() == legacy_notes.resolve():
             return None
-    except OSError:
-        return None
+    except OSError as exc:
+        return _unreadable("resolving one of them failed", exc)
 
-    def _rel(root: Path) -> "dict[str, Path]":
+    def _rel(root: Path) -> "dict[str, Path] | None":
+        """Map relative path -> file. None means the scan FAILED, never "empty"."""
         out = {}
         try:
             for p in root.rglob("*"):
                 if p.is_file():
                     out[str(p.relative_to(root))] = p
         except OSError:
-            pass
+            return None
         return out
 
     a, b = _rel(ws_notes), _rel(legacy_notes)
+    for label, scanned in (("the canonical tree", a), ("the legacy tree", b)):
+        if scanned is None:
+            return _unreadable(f"enumerating {label} failed", OSError("scan incomplete"))
     only_ws, only_legacy = set(a) - set(b), set(b) - set(a)
     # A shared PATH is not a shared FILE. Comparing name sets alone reports healthy
     # when both trees hold the same path with different bytes — measured 57 of 1056.
