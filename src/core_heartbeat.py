@@ -176,23 +176,49 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     if has is None or has.returncode != 0:
         return None
 
-    # The core process itself — identity, not location.
+    # SESSION-SCOPED FIRST, then the process-name sweep as a fallback.
     #
-    # `pgrep -a` is NOT portable: on Linux it prints "PID argv", but on
-    # macOS/BSD `-a` means "include ancestors" and the output is bare PIDs.
-    # Parsing argv out of it therefore matched nothing on macOS and this whole
-    # identity branch silently fell through to the pane path (review-caught,
-    # qingyun-wu on #2488; reproduced on this host: `pgrep -ax claude` printed
-    # two bare PIDs, one of them an ancestor of pgrep itself).
+    # The order matters and used to be the other way round. `pgrep -x claude`
+    # enumerates every process of that name ON THE WHOLE MACHINE — it has no
+    # notion of the tmux socket or the session. Verified on a peer host
+    # (Sutando-Pro, #2580): `pgrep -x claude` returned a 16-day-old
+    # `claude --resume ...` running under Terminal, parented
+    # zsh -> login -> Terminal -> launchd, not on the tmux socket at all.
+    # `_argv_names_session` rejected it, so the outcome was correct — but that
+    # made the argv test the ONLY thing standing between the resolver and an
+    # unrelated pid, and a stray `claude --name sutando-core` anywhere on the
+    # box (a second core on a DIFFERENT socket, a leftover, a copy-pasted
+    # command) would have been accepted and written into `.alive` as this
+    # host's core.
     #
-    # So: `pgrep -x` for the exact process NAME (no ancestors, no argv), then
-    # ask `ps` for each pid's argv. `pgrep -f` is deliberately avoided — it
-    # matches the invoking shell's own argv and self-matches.
+    # Asking tmux for the panes of THIS exact session cannot make that mistake:
+    # the candidates are bounded by the socket and the session before identity
+    # is even considered. So it goes first, and the machine-wide sweep only runs
+    # if the session-scoped lookup found nothing (a core that is not its pane's
+    # root process — e.g. launched behind a wrapper).
+    #
+    # Both #2488 guards still hold in either branch: candidates are never "any
+    # pane on the socket" (`-t =<sess>` is exact, so `<sess>-watcher` is
+    # excluded), and identity always comes from argv, never from the pane's
+    # foreground command — a healthy core mid-tool shows bash/python3/node.
     try:
-        pg = subprocess.run(["pgrep", "-x", "claude"],
-                            capture_output=True, text=True, timeout=5)
-        if pg.returncode == 0:
-            for pid_s in pg.stdout.split():
+        # `-s` = every pane in the SESSION. Without it `list-panes` reports only
+        # the CURRENT WINDOW's panes, so a core sitting in a non-selected sibling
+        # window is invisible and this branch finds nothing — then the pgrep
+        # fallback cannot see a version-named executable either, and the
+        # resolver returns None for a live core. Sibling windows are not
+        # hypothetical: the Claude launcher deliberately preserves them inside
+        # the core session (`start-cli.sh:563-573`, the G10 heal), so whichever
+        # window is selected decides whether the core is findable.
+        # Review-caught, qingyun-wu on #2581, with an exact reproduction:
+        #     list-panes    -t "=sutando-core" -> sibling
+        #     list-panes -s -t "=sutando-core" -> core, sibling
+        # `-t "={sess}"` still scopes to the EXACT session, so #2488's "never any
+        # pane on the socket" guard is unaffected — `-s` widens across windows
+        # WITHIN this session, never across sessions.
+        lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
+        if lp is not None and lp.returncode == 0:
+            for pid_s in lp.stdout.split():
                 if not pid_s.isdigit():
                     continue
                 ps = subprocess.run(["ps", "-o", "args=", "-p", pid_s],
@@ -204,50 +230,30 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     except Exception:
         pass
 
-    # The executable's accounting NAME is not a reliable handle for the core.
-    # Claude Code installs a version-named binary
-    # (`~/.local/share/claude/versions/<ver>`), and `pgrep -x` matches the
-    # kernel accounting name (`ps -o ucomm=`), which is then `<ver>` — NOT
-    # `claude`. So on a versioned install the branch above matches nothing for a
-    # perfectly healthy core, the `runtime == "claude"` bail below returns None
-    # forever, and `.alive` is never written at all. Measured on a live host:
-    # `ps -o comm=` said `claude` (that is argv[0]) while `ps -o ucomm=` said
-    # `2.1.220`, and a core alive for ten minutes read as dead to every reader.
-    # That is the exact inverse of the bug #2488 fixed, reached through the same
-    # gate — and it is the more dangerous direction, because a consumer that
-    # relaunches a "dead" core would then relaunch a live one in a loop.
+    # Fallback: the process-name sweep.
     #
-    # Fix the pid ENUMERATION rather than the identity test: ask tmux for the
-    # panes of THIS exact session and apply the same `--name <sess>` argv check
-    # to them. Both #2488 guards survive — the candidates are scoped to the
-    # exact session (never "any pane on the socket"), and identity still comes
-    # from argv, never from the pane's foreground command. Strictly stronger
-    # than the non-Claude fallback below, so it runs for every runtime.
-    # `-s` = every pane in the SESSION. WITHOUT it, `list-panes -t "={sess}"`
-    # resolves to that session's CURRENT WINDOW only — and this repo deliberately
-    # keeps sibling windows (gateway, monitor) in the core's session, healing
-    # window-scoped so they survive (`src/agent/claude/cli/start-cli.sh`). Select
-    # a sibling and this branch inspects only that sibling, misses the live core
-    # in another window, and returns None again — the very failure being fixed.
+    # `pgrep -a` is NOT portable: on Linux it prints "PID argv", but on
+    # macOS/BSD `-a` means "include ancestors" and the output is bare PIDs.
+    # Parsing argv out of it therefore matched nothing on macOS and this whole
+    # identity branch silently fell through to the pane path (review-caught,
+    # qingyun-wu on #2488; reproduced on this host: `pgrep -ax claude` printed
+    # two bare PIDs, one of them an ancestor of pgrep itself).
     #
-    # `src/health-check.py` already learned this and says so in its own docstring
-    # ("the first version of this helper targeted the session ... which tmux
-    # resolves to that session's current window"), landing on
-    # `list-panes -s -t "={session}"` plus the argv identity check. This is the
-    # same resolver problem, so it gets the same shape rather than a second
-    # answer. Note that file also records why window NAME is no discriminator:
-    # on a versioned install the core's window is auto-named after the version —
-    # the same `ucomm` fact that motivates this PR.
+    # So: `pgrep -x` for the exact process NAME (no ancestors, no argv), then
+    # ask `ps` for each pid's argv. `pgrep -f` is deliberately avoided — it
+    # matches the invoking shell's own argv and self-matches.
     #
-    # Review-caught, qingyun-wu, with an exact-head canary: gateway window
-    # current, real core pane in a sibling window -> `core_pid` returned None.
-    # `-t "={sess}"` still pins the exact session, so #2488's "never any pane on
-    # the socket" guard is untouched — `-s` widens across windows WITHIN this
-    # session, never across sessions.
+    # Note this branch cannot find the core on a versioned install at all:
+    # `pgrep -x` matches the kernel accounting name, and Claude Code runs from
+    # `~/.local/share/claude/versions/<ver>`, so `ucomm` is `<ver>`, not
+    # `claude` (`ps -o comm=` shows `claude` because that is argv[0]). It is
+    # kept for installs whose executable really is named `claude`, and for
+    # cores that are not their pane's root process.
     try:
-        lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
-        if lp is not None and lp.returncode == 0:
-            for pid_s in lp.stdout.split():
+        pg = subprocess.run(["pgrep", "-x", "claude"],
+                            capture_output=True, text=True, timeout=5)
+        if pg.returncode == 0:
+            for pid_s in pg.stdout.split():
                 if not pid_s.isdigit():
                     continue
                 ps = subprocess.run(["ps", "-o", "args=", "-p", pid_s],
@@ -273,10 +279,10 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
         return None
 
     # Non-Claude runtime: panes of THIS session only (never `-a`), across all its
-    # windows (`-s`) for the same reason as the branch above — without it, a core
-    # in a non-selected window is invisible and this returns None for a live
-    # core. Same one-token correction under the same guard: `-t "={sess}"` keeps
-    # it pinned to the exact session.
+    # windows (`-s`) for the same reason as the identity branch above — without
+    # it, a core in a non-selected window is invisible and this returns None for
+    # a live core. Same one-token correction, same guard: `-t "={sess}"` keeps it
+    # scoped to the exact session.
     lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
     if lp is None or lp.returncode != 0:
         return None

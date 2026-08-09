@@ -62,7 +62,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -72,6 +73,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
+from result_ready import read_ready_result  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -141,6 +143,13 @@ if (not BOT_TOKEN or not APP_TOKEN) and channels_env.exists():
         elif line.startswith("SLACK_APP_TOKEN=") and not APP_TOKEN:
             APP_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
 if not BOT_TOKEN or not APP_TOKEN:
+    # Last resort: the Keychain vault, per token independently — a host may have
+    # one in the .env and the other only vaulted.
+    from channel_token import token_from_vault  # noqa: E402
+    BOT_TOKEN = BOT_TOKEN or token_from_vault("SLACK_BOT_TOKEN")
+    APP_TOKEN = APP_TOKEN or token_from_vault("SLACK_APP_TOKEN")
+
+if not BOT_TOKEN or not APP_TOKEN:
     print("SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set", file=sys.stderr)
     sys.exit(1)
 
@@ -159,26 +168,16 @@ def _is_path_sendable(fpath: str) -> bool:
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
-    """Record owner activity — same schema as src/discord-bridge.py."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ts": int(time.time()),
-            "channel": channel,
-            "summary": summary[:80],
-        }
-        if channel_id:
-            payload["channel_id"] = str(channel_id)
-        # Per-PID staging name: this file is written by four processes (this
-        # bridge + discord/telegram/sparrow). A shared ".json.tmp" name lets two
-        # concurrent writers truncate and interleave the same temp file, so the
-        # rename can publish torn JSON. A per-PID temp is never shared, and
-        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, OWNER_ACTIVITY_FILE)
-    except Exception as e:
-        print(f"  [owner-activity] write failed: {e}", flush=True)
+    """Record owner activity using the shared provider-neutral schema."""
+    _write_owner_activity_shared(
+        OWNER_ACTIVITY_FILE,
+        channel,
+        summary,
+        channel_id,
+        on_error=lambda exc: print(
+            f"  [owner-activity] write failed: {exc}", flush=True
+        ),
+    )
 
 
 def archive_file(src: Path, kind: str, task_id: str) -> None:
@@ -924,17 +923,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    # Owner-activity state is persisted before tier/vault handling below. Use a
-    # redacted preview so an ordinary pasted token never lands in state JSON.
+    # Redact first: a pasted token must never reach state JSON even in a preview.
     initial_secret_filter = filter_chat_secrets(text)
     detected_secret_types = set(initial_secret_filter.secret_types)
     safe_attachment = filter_chat_secrets(attachment_note)
     detected_secret_types.update(safe_attachment.secret_types)
-    write_owner_activity(
-        "slack",
-        initial_secret_filter.text or safe_attachment.text,
-        channel_id=event.get("channel"),
-    )
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for
@@ -944,6 +937,16 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         thread_ts = event.get("thread_ts") or event.get("ts")
     else:
         thread_ts = None
+    # Only an existing Slack thread is a valid target for the immediate
+    # progress update. A top-level mention still uses its message timestamp for
+    # final-result routing above, but must not make the progress update create a
+    # separate thread before the task result arrives.
+    event_thread_ts = event.get("thread_ts")
+    reply_thread_ts = (
+        event_thread_ts
+        if thread_ts and event_thread_ts and event_thread_ts != event.get("ts")
+        else None
+    )
 
     # Resolve access_tier from `tierMap`. The fail-closed rules live on
     # resolve_access_tier's docstring, and tests/slack-bridge-tier-map.test.py
@@ -951,6 +954,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     seeded_ok = _ensure_tier_map_seeded()
     tier_map = load_tier_map()
     access_tier = resolve_access_tier(user_id, tier_map, seeded_ok)
+
+    # Owner-only, as discord-bridge does: the proactive loop reads this file as
+    # owner PRESENCE, so a team/other sender stamping it fakes "owner is here".
+    if access_tier == "owner":
+        write_owner_activity(
+            "slack",
+            initial_secret_filter.text or safe_attachment.text,
+            channel_id=event.get("channel"),
+        )
 
     # Intercept vault commands before any disk write — must happen AFTER
     # access_tier is resolved so untrusted senders cannot write to Keychain.
@@ -1031,10 +1043,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
         if _notify_py.exists():
+            notify_thread_arg = (
+                f" --thread-ts {shlex.quote(str(reply_thread_ts))}"
+                if reply_thread_ts else ""
+            )
             notify_cmd = (
                 f"env CLAUDE_CONFIG_DIR={shlex.quote(str(_claude_config_dir))} "
                 f"python3 {shlex.quote(str(_notify_py))}"
                 f" --source slack --channel-id {channel}"
+                f"{notify_thread_arg}"
                 f' --message "On it — back in a moment."'
             )
             hints_lines.append(f"{step}. NOTIFY FIRST: {notify_cmd}")
@@ -1060,6 +1077,9 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # third bridge; discord/telegram fold onto it in a follow-up dedup).
     media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
         attachment_refs, bool(text and text.strip()))
+    reply_thread_header = (
+        f"reply_thread_ts: {reply_thread_ts}\n" if reply_thread_ts else ""
+    )
     pending_info = {
         "channel": channel,
         "thread_ts": thread_ts,
@@ -1074,6 +1094,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"interaction_type: message\n"
         f"{media_headers}"
         f"channel_id: {channel}\n"
+        f"{reply_thread_header}"
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
@@ -1163,12 +1184,6 @@ def handle_message(event, say):
     username = _resolve_username(user_id)
     text = (event.get("text") or "").strip()
     _write_task(event, "Slack DM", text, username)
-
-
-# Markers that the bridge handles specially in result bodies. Same set as
-# discord-bridge.py + telegram-bridge.py — see CLAUDE.md "Result-body
-# protocol markers".
-FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
 
 
 def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
@@ -1404,8 +1419,8 @@ def result_watcher():
                 result_file = RESULTS_DIR / f"{task_id}.txt"
                 if not result_file.exists():
                     continue
-                reply_text = result_file.read_text().strip()
-                if not reply_text:
+                reply_text = read_ready_result(result_file)
+                if reply_text is None:
                     continue
                 with pending_replies_lock:
                     target = pending_replies.get(task_id)
@@ -1468,9 +1483,9 @@ def result_watcher():
                         f.rename(claim)
                     except FileNotFoundError:
                         continue
-                    text = claim.read_text().strip()
-                    if not text:
-                        claim.unlink(missing_ok=True)
+                    text = read_ready_result(claim)
+                    if text is None:
+                        release_claim(claim)
                         continue
                     try:
                         access_data = json.loads(ACCESS_FILE.read_text())

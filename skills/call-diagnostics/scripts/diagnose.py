@@ -415,7 +415,7 @@ def generate_tracker_html(calls, output_path, source_type="phone"):
     all_categories = set()
     for call in calls:
         sid = call.get("callSid", "?")[:10]
-        first_event_ts = call.get("events", [{}])[0].get("timestamp", "")
+        first_event_ts = (call.get("events") or [{}])[0].get("timestamp", "")
         ts_date = first_event_ts[:10]
         ts_time = first_event_ts[11:16] if len(first_event_ts) > 16 else ""
         issues = diagnose(call)

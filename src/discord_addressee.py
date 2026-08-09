@@ -35,6 +35,7 @@ def is_addressed_in_shared_channel(
     reply_author_id,
     self_id,
     author_id=None,
+    other_agent_mentioned: bool = False,
 ) -> bool:
     """Return True iff this message should be processed as addressed to us.
 
@@ -56,15 +57,21 @@ def is_addressed_in_shared_channel(
         (checked before the self-reply exemption, so a sibling bot replying to
         itself stays skipped); or
       * a HUMAN reply to a DIFFERENT author — `is_reply` whose target is neither
-        us nor the sender.
+        us nor the sender; or
+      * a human message that @-mentions a DIFFERENT agent and not us
+        (`other_agent_mentioned`) — it addressed that agent, not everyone.
 
-    A fresh (non-reply) message from a human that doesn't address anyone is still
+    A fresh (non-reply) message from a human that addresses NOBODY is still
     processed (→ True): the owner posting directly is for whoever is listening —
-    that is the pre-existing `requireMention:false` behavior.
+    that is the pre-existing `requireMention:false` behavior and is out of scope
+    for this fix (the multi-agent "who owns an unaddressed message" question
+    belongs to the channel-IFC design, not the addressee gate).
 
-    Fix 2026-07-25: owner self-replies (reply to own message, no @-mention) were
-    being dropped as `replying_to_other` in a requireMention:false owner channel
-    (e.g. #echo). The `author_id` exemption makes a self-reply count as addressed.
+    `other_agent_mentioned` is resolved by the adapter (which mentioned users are
+    bots other than us); the policy decision stays here.
+
+    An owner self-reply (reply to own message, no @-mention) was dropped as
+    `replying_to_other`; the `author_id` exemption makes it count as addressed.
     """
     replying_to_me = bool(
         is_reply and reply_author_id is not None and reply_author_id == self_id
@@ -83,6 +90,10 @@ def is_addressed_in_shared_channel(
     )
     replying_to_other = bool(is_reply) and not replying_to_me and not replying_to_self
     if replying_to_other:
+        return False
+
+    # A human who @-mentioned another agent addressed THAT agent, not everyone.
+    if other_agent_mentioned:
         return False
 
     return True

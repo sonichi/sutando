@@ -27,7 +27,6 @@ Per-node correctness:
 
 import json
 import os
-import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -60,31 +59,6 @@ from send_allowlist import (  # noqa: E402
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; was a 4th private copy)
 
 
-
-
-# Mirror of discord-bridge.py's `_FILE_MARKER_RE` — agent-emitted file
-# attachment markers embedded in result bodies. dm-result.py is the
-# REST-only fallback delivery path used when voice isn't connected;
-# without parsing these markers it would deliver the literal text
-# `[file: /tmp/sutando-x.png]` in the DM and silently drop the
-# attachment. PR limitation: REST multipart upload for actual file
-# delivery is a follow-up — this commit strips the markers from the
-# body so the user doesn't see the literal text.
-_FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-
-
-def _split_file_markers(text: str) -> tuple[str, list[str]]:
-    """Split a result body into ``(clean_text, files)``.
-
-    Mirrors :func:`src/discord-bridge.py._split_file_markers` style.
-    ``files`` is the list of paths extracted from
-    ``[file:|send:|attach:]`` markers in textual order; ``clean_text``
-    is the original text with every marker removed and surrounding
-    whitespace stripped.
-    """
-    files = _FILE_MARKER_RE.findall(text)
-    clean_text = _FILE_MARKER_RE.sub('', text).strip()
-    return clean_text, files
 
 
 def _chunk_for_discord(text: str, max_len: int = 1900):
@@ -300,19 +274,55 @@ def send_dm(text: str) -> bool:
     # checked against `_is_path_sendable` — same policy as
     # discord-bridge.py to bound exfil if an attacker-controlled marker
     # ever reaches a result body.
-    clean_text, marker_files = _split_file_markers(text)
+    parsed = parse_markers(text)
+    clean_text = parsed.body.strip()
+    marker_files = [
+        action.value
+        for action in parsed.actions
+        if action.kind == "attach"
+    ]
     expanded_files = [os.path.expanduser(p.strip()) for p in marker_files]
     sendable_files = [p for p in expanded_files if _is_path_sendable(p)]
     rejected_files = [p for p in expanded_files if not _is_path_sendable(p)]
     if rejected_files:
-        # Same security signal as discord-bridge: rejected paths log
-        # but don't leak the failure to the user.
         print(
             f"dm-result: {len(rejected_files)} file marker(s) rejected by "
             f"allowlist (would deliver via [file:] but path is outside "
             f"_SEND_ALLOWED_ROOTS / _SEND_ALLOWED_PREFIXES): {rejected_files}",
             file=sys.stderr,
         )
+
+    # Tell the RECIPIENT, not just the log. The comment that used to sit here
+    # claimed "same security signal as discord-bridge", and that parity did not
+    # exist: discord-bridge.py sends `(file not allowed: <path>)` into the
+    # channel, while this path logged to stderr only. So an attachment could
+    # silently never arrive — body delivered, task archived, nothing anywhere
+    # telling the recipient a file was meant to be there.
+    #
+    # Worst exactly here: dm-result is the REST FALLBACK, used when the live
+    # bridge is down, so its stderr is the least-watched output in the system.
+    #
+    # Split the same way discord-bridge does, because the two cases mean
+    # different things:
+    #   * path does not exist  -> almost always a `[file:/path]` substring
+    #     inside prose (a quoted example). discord-bridge logs it and
+    #     deliberately does NOT surface it; a notice here would fire on
+    #     ordinary text that merely mentions a path.
+    #   * path EXISTS but is outside the allowlist -> a real file the author
+    #     meant to attach and the policy refused. That one the recipient needs.
+    blocked = [p for p in rejected_files if os.path.isfile(p)]
+    if blocked:
+        # The path itself is NOT echoed. discord-bridge prints it, but a
+        # rejected marker is by definition outside the allowlist and could be
+        # attacker-chosen if a marker ever reaches a result body from untrusted
+        # input. The count plus the reason tells the recipient an attachment was
+        # dropped without echoing an arbitrary string back out; paths stay in
+        # stderr above.
+        plural = "" if len(blocked) == 1 else "s"
+        notice = ("_({} attachment{} not sent — outside the send allowlist; "
+                  "path{} in the dm-result log)_").format(
+                      len(blocked), plural, plural)
+        clean_text = f"{clean_text}\n\n{notice}" if clean_text else notice
 
     # An all-marker / all-whitespace body becomes empty after strip.
     # Sending `""` to Discord returns 400 ("Cannot send an empty
