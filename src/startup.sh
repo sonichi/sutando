@@ -998,6 +998,15 @@ if [ "${SUTANDO_SCP_WSS_ENABLE:-0}" = "1" ]; then
   else
     echo "  ✓ sutando server (already running)"
   fi
+  # Bonjour/mDNS advertise (_sutando-scp._tcp) so companions find this Mac by
+  # NAME on whatever network both landed on (office, hotspot) — no IP config.
+  if ! pgrep -f "dns-sd -R Sutando _sutando-scp" > /dev/null 2>&1; then
+    dns-sd -R Sutando _sutando-scp._tcp. local "${SUTANDO_SCP_WSS_PORT:-8787}" \
+      > /dev/null 2>&1 &
+    echo "  ✓ mDNS advertise (_sutando-scp._tcp :${SUTANDO_SCP_WSS_PORT:-8787})"
+  else
+    echo "  ✓ mDNS advertise (already running)"
+  fi
 fi
 
 # 5a-bis. Portfolio + research dashboard (port 8899) — idempotent self-guard.
