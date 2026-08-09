@@ -5021,6 +5021,9 @@ async def poll_proactive():
                         print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
                         f.unlink(missing_ok=True)
                         continue
+                    # Bound BEFORE the try: the handler reads it, so a failure in
+                    # fetch_user/create_dm would raise UnboundLocalError instead.
+                    _sent_any = False
                     try:
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
@@ -5111,7 +5114,6 @@ async def poll_proactive():
                                     )
                             # Fall through to DM with the marker INTACT: the visible `[channel: <id>]` is
                             # the loud-failure signal. This except wraps the chunk AND attachment loops.
-                        _sent_any = False  # pragma: no cover — live send path
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
