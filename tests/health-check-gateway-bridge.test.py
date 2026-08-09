@@ -53,13 +53,16 @@ def _pgrep(returncode, stdout):
     return _side_effect
 
 
-def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False, serving=None):
+def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False, serving=None,
+         locks=None):
     """Call check_gateway_bridge() with env, the channel-.env path, and the
     pgrep result all controlled. env=None means the token vars are cleared.
     pgrep_raises=True makes subprocess.run raise (the except-branch path).
     `serving` pins the gateway-status sidecar verdict (None = no opinion) so no
     case depends on whether the host running the tests happens to have a live
-    sidecar — without it, "one process -> ok" flips to warn on a real host."""
+    sidecar — without it, "one process -> ok" flips to warn on a real host.
+    `locks` pins the role->PID instance-lock map; the default {} means "no lock
+    data", so no case reads the real state/locks/ of the host running them."""
     env = env or {}
     # Clear both token vars, then apply the requested env.
     base = {k: v for k, v in hc.os.environ.items()
@@ -70,7 +73,8 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
          unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path), \
          unittest.mock.patch.object(hc.subprocess, "run", run_mock):
-        with unittest.mock.patch.object(hc, "_gateway_serving", lambda *a, **k: serving):
+        with unittest.mock.patch.object(hc, "_gateway_serving", lambda *a, **k: serving), \
+             unittest.mock.patch.object(hc, "_gateway_lock_pids", lambda: dict(locks or {})):
             return hc.check_gateway_bridge()
 
 
@@ -111,6 +115,45 @@ def main() -> int:
     r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0, pgrep_out="111\n222\n")
     check("configured + duplicates → warn", r is not None and r["status"] == "warn", f"got {r!r}")
     check("duplicate detail says multiple", r and "multiple processes" in r["detail"], f"got {r!r}")
+
+    # 4a-i) A supported multi-instance host is NOT a pileup. startup.sh launches the
+    # primary and every named secondary with identical argv, so a PID count alone
+    # cannot tell them apart; the role locks can. This case FAILS on a count-only
+    # rule, which is the regression it exists to catch.
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+             pgrep_out="111\n222\n", serving=None,
+             locks={"gateway-bridge": "111", "gateway-bridge.dev": "222"})
+    check("primary + named secondary → ok (not a pileup)",
+          r is not None and r["status"] == "ok", f"got {r!r}")
+
+    # 4a-ii) ... and the stale stub is still caught, because no role lock claims it.
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+             pgrep_out="111\n999\n", locks={"gateway-bridge": "111"})
+    check("unclaimed PID alongside a held lock → warn",
+          r is not None and r["status"] == "warn", f"got {r!r}")
+    check("warn names the unclaimed PID, not the claimed one",
+          r and "999" in r["detail"] and "no instance lock" in r["detail"], f"got {r!r}")
+
+    # 4a-iii) Two locks, three processes: the extra is a same-role duplicate.
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+             pgrep_out="111\n222\n333\n",
+             locks={"gateway-bridge": "111", "gateway-bridge.dev": "222"})
+    check("duplicate beyond the locked instances → warn",
+          r is not None and r["status"] == "warn" and "333" in r["detail"], f"got {r!r}")
+
+    # 4a-iv) The helper reads role/PID off disk and ignores unparseable locks.
+    import json as _json
+    with tempfile.TemporaryDirectory() as _td:
+        _lk = Path(_td) / "state" / "locks"
+        _lk.mkdir(parents=True)
+        (_lk / "gateway-bridge.lock").write_text(_json.dumps({"role": "gateway-bridge", "pid": 4242}))
+        (_lk / "gateway-bridge.dev.lock").write_text(_json.dumps({"role": "gateway-bridge.dev", "pid": 4243}))
+        (_lk / "gateway-bridge.bad.lock").write_text("{not json")
+        (_lk / "supervisor.lock").write_text(_json.dumps({"role": "supervisor", "pid": 1}))
+        with unittest.mock.patch.object(hc, "WORKSPACE_DIR", Path(_td)):
+            got = hc._gateway_lock_pids()
+    check("_gateway_lock_pids reads role→PID, skips malformed, ignores other roles",
+          got == {"gateway-bridge": "4242", "gateway-bridge.dev": "4243"}, f"got {got!r}")
 
     # 4b) THE PATTERN ITSELF must see a process running under the DEPRECATED filename.
     #
