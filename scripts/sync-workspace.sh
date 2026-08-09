@@ -507,6 +507,28 @@ _is_safe_legacy_host_scope_widening() {
     ) "$desired"
 }
 
+# Comments and blanks are inert in gitignore, so header drift between generated
+# versions must not decide whether a refresh is safe.
+_exclude_rules_only() {
+    grep -vE '^[[:space:]]*(#|$)' "$1" | sort
+}
+
+# A previously-generated exclude whose ONLY difference is carve-outs the shipped
+# config now adds is safe to refresh: no operator-authored rule is lost.
+_is_safe_carveout_addition() {
+    local existing="$1" desired="$2" shipped line
+    shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
+    [ -n "$shipped" ] || return 1
+    # Refuse if the refresh would DROP any rule the existing file carries.
+    [ -z "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ] || return 1
+    # Every added rule must be a shipped carve-out, never an operator's line.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        grep -qxF -- "$line" <<< "$shipped" || return 1
+    done < <(comm -13 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))
+    return 0
+}
+
 # Write `<workspace>/.git/info/exclude` from the composed content. Also
 # deletes a legacy `<workspace>/.gitignore` if one exists (migration from
 # the pre-(6) layout that wrote rules to that tracked-in-tree path).
@@ -570,6 +592,9 @@ generate_exclude() {
         elif _is_safe_legacy_host_scope_widening "$exclude_path" "$tmp_path"; then
             log "generate_exclude: safely widened legacy hosts/<label>/ carrier rules to hosts/*/"
             color_warn "sync-workspace: widened legacy hosts/<label>/ carrier rules to hosts/*/ so peer host state remains durable"
+        elif _is_safe_carveout_addition "$exclude_path" "$tmp_path"; then
+            log "generate_exclude: refreshed a previously-generated exclude with shipped carve-outs only"
+            color_warn "sync-workspace: added shipped carve-out(s) to the existing exclude file; no operator rule was removed"
         elif [ "$FORCE_GITIGNORE" != "1" ]; then
             color_warn "sync-workspace: $exclude_path EXISTS and DIFFERS from the generated content."
             color_warn "Refusing to overwrite (operator-authored content may block carrier-set paths)."
@@ -1353,24 +1378,23 @@ _push_only_impl() {
     fi
 
     # Mass-deletion tripwire (carried over from sync-memory.sh)
-    local deleted staged_d untracked_by_policy max_delete
+    local deleted staged_d untracked_by_policy max_delete _p
     # `-M` for rename detection: legitimate moves (refactor) don't count as
     # deletions. Mirrors pull-side tripwire fix. Mini #1445 v4 Low.
     staged_d=$(git diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
-    # A carrier-policy untrack (_enforce_carrier_set_pre's `git rm --cached`)
-    # stages a D too, so counting raw D's makes the guard block the migration it
-    # is supposed to allow: the file stays on disk, only the index entry goes.
-    # Discriminate by asking the CURRENT rules — a staged deletion whose path is
-    # now excluded is policy; anything else is real content loss and still counts.
-    # check-ignore exits 1 when nothing matches, hence `|| true` (see the same
-    # trap documented at _enforce_carrier_set_pre).
-    untracked_by_policy=$(git diff -M --cached --name-only --diff-filter=D -z \
-        | git check-ignore -z --stdin --no-index 2>/dev/null | tr -dc '\0' | wc -c | tr -d ' ' || true)
-    [ -n "$untracked_by_policy" ] || untracked_by_policy=0
+    # A policy untrack leaves the file on disk; a real deletion does not. Both
+    # stage a D under an excluded path, so disk presence is the discriminator.
+    untracked_by_policy=0
+    while IFS= read -r -d '' _p; do
+        if [ -e "$_p" ] || [ -L "$_p" ]; then
+            untracked_by_policy=$(( untracked_by_policy + 1 ))
+        fi
+    done < <(git diff -M --cached --name-only --diff-filter=D -z \
+        | git check-ignore -z --stdin --no-index 2>/dev/null || true)
     deleted=$(( staged_d - untracked_by_policy ))
     [ "$deleted" -ge 0 ] || deleted=0
     if [ "$untracked_by_policy" -gt 0 ]; then
-        log "_push_only_impl: tripwire counts $deleted real deletion(s); $untracked_by_policy staged D(s) are carrier-policy untracks"
+        log "_push_only_impl: tripwire counts $deleted real deletion(s); $untracked_by_policy staged D(s) are policy untracks still on disk"
     fi
     max_delete="${SUTANDO_SYNC_MAX_DELETE:-50}"
     if [ "$deleted" -gt "$max_delete" ] && [ "${SUTANDO_FORCE_SYNC:-0}" != "1" ]; then

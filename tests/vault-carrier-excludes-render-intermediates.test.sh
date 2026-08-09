@@ -1,28 +1,6 @@
 #!/usr/bin/env bash
-# Regression: the SHIPPED default carrier must NOT back up rendered episode
-# intermediates. `notes/` is an included subtree, so `notes/generated/` — where
-# the WIRE renderer ships mp4 bundles — was carried by inheritance.
-#
-# Measured on the live vault when this was added: 951 files / 2.28 GiB tracked
-# under notes/generated, of which 2.15 GiB was mp4 across 292 files, committed
-# AND pushed (0 unpushed commits) to a private remote whose .git had reached
-# 3.5 GB. `git check-ignore` matched no rule, and a probe file under the
-# canonical workspace showed as `??` — i.e. visible to the carrier's `add -A`.
-#
-# These are regenerable binary derivatives of a spec that IS carried, so the
-# vault gains nothing by holding them and pays for it in clone/push cost.
-#
-# The negative half matters as much as the positive: `notes/` itself must stay
-# carried. A carve-out that widened to `notes/` would silently drop the entire
-# episode-spec + notes corpus out of the backup while sync kept reporting a
-# successful push — the same failure shape documented for `vault.sync.include`
-# in scripts/sync-workspace.sh (include REPLACES wholesale).
-#
-# The push path DOES untrack tracked-but-now-ignored paths every tick, via
-# _enforce_carrier_set_pre() — gitignore alone would not, which is why that walk
-# exists. On an existing install the untrack stages one deletion per formerly
-# carried file, so >50 of them meet the mass-deletion tripwire; see the migration
-# case below. Purging existing HISTORY remains a separate operation.
+# The shipped carrier must exclude `notes/generated/` render intermediates while
+# still carrying `notes/` itself, and untracking them must not read as deletion.
 
 set -euo pipefail
 
@@ -170,11 +148,8 @@ check "git DOES track an ordinary note (carrier not broken)" \
 check "git DOES track the episode SPEC (the input worth backing up)" \
     git -C "$FIXTURE_WS" ls-files --error-unmatch notes/sutando-wire/episode-specs/ep999.yaml
 
-# ---------------------------------------------------------------------------
-# 4. EXISTING installs. The carve-out only helps a fresh vault unless the tick
-#    can untrack what is already carried, and >50 of those met the mass-deletion
-#    tripwire: `git rm --cached` stages a D, so a policy untrack looked exactly
-#    like content loss. The tripwire now discriminates on the CURRENT rules.
+# 4. EXISTING installs: untracking >50 already-carried files stages >50 D's, which
+#    met the mass-deletion tripwire. Disk presence separates untrack from deletion.
 
 MIG="$TEST_ROOT/migration"
 mkdir -p "$MIG" && git -C "$MIG" init -q .
@@ -186,10 +161,15 @@ for i in $(seq 1 51); do echo "note $i" > "$MIG/notes/real/n$i.md"; done
 git -C "$MIG" add -A >/dev/null 2>&1
 git -C "$MIG" commit -qm "existing install: generated/ already tracked"
 
+# Mirrors the shipped classifier: ignored AND still on disk. Counting ignore
+# matches alone excuses a real deletion whose path happens to be excluded.
 count_policy() {
-    git -C "$1" diff -M --cached --name-only --diff-filter=D -z \
-        | git -C "$1" check-ignore -z --stdin --no-index 2>/dev/null \
-        | tr -dc '\0' | wc -c | tr -d ' '
+    local n=0 _p
+    while IFS= read -r -d '' _p; do
+        if [ -e "$1/$_p" ] || [ -L "$1/$_p" ]; then n=$(( n + 1 )); fi
+    done < <(git -C "$1" diff -M --cached --name-only --diff-filter=D -z \
+        | git -C "$1" check-ignore -z --stdin --no-index 2>/dev/null || true)
+    echo "$n"
 }
 count_staged_d() {
     git -C "$1" diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' '
@@ -207,8 +187,32 @@ check "...and ALL of them are classified as carrier-policy untracks" \
 check "...so the tripwire's real-deletion count is 0 and the push proceeds" \
     test "$(( $(count_staged_d "$MIG") - $(count_policy "$MIG") ))" -eq 0
 
-# THE CONTROL. Without this, "migration passes" is satisfied by a guard that
-# stopped guarding. A genuine mass deletion of NON-excluded paths must still trip.
+# THE CONTROL THAT MATTERS: same path, files actually gone from disk. An ignore
+# match alone cannot tell this from the migration above — only disk presence can.
+SAME="$TEST_ROOT/samepath"
+mkdir -p "$SAME" && git -C "$SAME" init -q .
+git -C "$SAME" config user.email t@t && git -C "$SAME" config user.name t
+mkdir -p "$SAME/notes/generated/ep999-bundle"
+for i in $(seq 1 51); do echo "frame $i" > "$SAME/notes/generated/ep999-bundle/f$i.json"; done
+git -C "$SAME" add -A >/dev/null 2>&1
+git -C "$SAME" commit -qm "existing install: generated/ already tracked"
+mkdir -p "$SAME/.git/info" && printf 'notes/generated/\n' > "$SAME/.git/info/exclude"
+rm -rf "$SAME/notes/generated"
+git -C "$SAME" add -A >/dev/null 2>&1
+
+check "a real deletion UNDER the excluded path stages >50 D's" \
+    test "$(count_staged_d "$SAME")" -gt 50
+check "...and NONE are excused as policy (the files are gone from disk)" \
+    test "$(count_policy "$SAME")" -eq 0
+check "...so the tripwire still sees >50 real deletions and refuses" \
+    test "$(( $(count_staged_d "$SAME") - $(count_policy "$SAME") ))" -gt 50
+# Proves the pair is not vacuous: identical paths and rules, opposite verdicts,
+# and the ignore-match-only formula scores this same case 51 -> 0 real deletions.
+check "the ignore-match-only formula WOULD have excused all 51 (the fixed bug)" \
+    test "$(git -C "$SAME" diff -M --cached --name-only --diff-filter=D -z \
+        | git -C "$SAME" check-ignore -z --stdin --no-index 2>/dev/null \
+        | tr -dc '\0' | wc -c | tr -d ' ')" -eq 51
+
 git -C "$MIG" reset -q
 DEL="$TEST_ROOT/realdel"
 mkdir -p "$DEL" && git -C "$DEL" init -q .
@@ -234,17 +238,109 @@ git -C "$MIG" rm -q --cached -- notes/real/n1.md
 check "a real deletion mixed with policy untracks is still counted (exactly 1)" \
     test "$(( $(count_staged_d "$MIG") - $(count_policy "$MIG") ))" -eq 1
 
-# The cases above prove the discrimination RULE is right; they compute it locally,
-# so they cannot see whether the shipped tripwire uses it. These pin the wiring,
-# tightly enough that reverting to a raw D count fails here.
+# The cases above compute the rule locally, so they cannot see whether the shipped
+# tripwire uses it. Comments are stripped so one cannot satisfy a guard.
+SYNC_CODE="$(sed 's/#.*//' "$REPO/scripts/sync-workspace.sh")"
+CLASSIFIER="$(printf '%s\n' "$SYNC_CODE" | sed -n '/untracked_by_policy=0/,/deleted=\$(( staged_d/p')"
+
+check "the classifier region was located (guard is not vacuous)" \
+    test -n "$CLASSIFIER"
 check "the shipped tripwire subtracts policy untracks from its count" \
-    grep -qF 'deleted=$(( staged_d - untracked_by_policy ))' "$REPO/scripts/sync-workspace.sh"
+    grep -qF 'deleted=$(( staged_d - untracked_by_policy ))' <<< "$SYNC_CODE"
 check "...and it does not compare the RAW staged-D count against max_delete" \
-    bash -c '! grep -qE "^\s*deleted=\\\$staged_d\s*\$" "'"$REPO"'/scripts/sync-workspace.sh"'
-# --no-index is load-bearing here for the same reason the untrack walk documents:
-# without it check-ignore consults the index, which these paths were just removed from.
-check "the tripwire's check-ignore keeps --no-index" \
-    bash -c 'sed -n "/untracked_by_policy=/,/+3p/p" "'"$REPO"'/scripts/sync-workspace.sh" | grep -q -- "--no-index"'
+    bash -c '! grep -qE "^\s*deleted=\\\$staged_d\s*\$" <<< "$1"' _ "$SYNC_CODE"
+# Disk presence is the whole fix: without it an excluded path's real deletion is
+# excused. --no-index is required because these paths just left the index.
+check "the classifier gates on the path still existing on disk" \
+    bash -c 'grep -qF -- "[ -e \"\$_p\" ] || [ -L \"\$_p\" ]" <<< "$1"' _ "$CLASSIFIER"
+check "the classifier's check-ignore keeps --no-index" \
+    grep -qF -- "--no-index" <<< "$CLASSIFIER"
+
+# 5. The REAL upgrade path. A hand-written exclude file skips the refusal gate
+#    that actually blocks existing installs, so drive the shipped function.
+
+SYNC_SH="$REPO/scripts/sync-workspace.sh"
+DRIVER="$TEST_ROOT/drive-generate-exclude.sh"
+# Only the shipped function definitions are eval'd; the subcommand dispatch at the
+# bottom of the script is not a function, so it never runs here.
+cat > "$DRIVER" <<'DRIVE'
+set -uo pipefail
+SYNC="$1"; SCRIPT_PARENT="$2"; WORKSPACE_DIR="$3"
+DRY_RUN=0; FORCE_GITIGNORE=0
+eval "$(awk '/^[A-Za-z_][A-Za-z0-9_]*\(\) \{/,/^\}$/' "$SYNC")"
+log() { :; }
+color_warn() { :; }
+_host() { echo "TestHost"; }
+_is_literal_host_label() { return 1; }
+generate_exclude
+DRIVE
+
+compose_rules() {
+    SCRIPT_PARENT="$REPO" bash -c 'set -uo pipefail
+        eval "$(awk "/^[A-Za-z_][A-Za-z0-9_]*\(\) \{/,/^\}\$/" "$1")"
+        log() { :; }; color_warn() { :; }
+        _compose_exclude_content' _ "$SYNC_SH"
+}
+# Builds a workspace whose exclude file is the CURRENT generated content minus
+# the lines named, i.e. what an older generated install actually carries.
+seed_older_install() {
+    local dir="$1"; shift
+    local -a strip=()
+    local l; for l in "$@"; do strip+=(-e "$l"); done
+    rm -rf "$dir"; mkdir -p "$dir/.git/info"
+    if [ "${#strip[@]}" -gt 0 ]; then
+        compose_rules | grep -vxF "${strip[@]}" > "$dir/.git/info/exclude"
+    else
+        compose_rules > "$dir/.git/info/exclude"
+    fi
+}
+upgrade_rc() {
+    bash "$DRIVER" "$SYNC_SH" "$REPO" "$1" >/dev/null 2>&1
+    echo $?
+}
+carveouts_in() { grep -cE '^notes/(generated|media)/$' "$1/.git/info/exclude" || true; }
+
+check "the composer emits both shipped carve-outs (fixture is representative)" \
+    test "$(compose_rules | grep -cE '^notes/(generated|media)/$')" -eq 2
+
+UPG="$TEST_ROOT/upgrade-generated"
+seed_older_install "$UPG" 'notes/generated/' 'notes/media/'
+check "an older GENERATED install starts without the carve-outs" \
+    test "$(carveouts_in "$UPG")" -eq 0
+check "...the real generate_exclude accepts the refresh (rc=0)" \
+    test "$(upgrade_rc "$UPG")" -eq 0
+check "...and both carve-outs are now present (migration actually reaches it)" \
+    test "$(carveouts_in "$UPG")" -eq 2
+
+UPG_OP="$TEST_ROOT/upgrade-operator-edited"
+seed_older_install "$UPG_OP" 'notes/generated/' 'notes/media/'
+echo '!my/operator/rule' >> "$UPG_OP/.git/info/exclude"
+check "an operator-edited exclude is still REFUSED (rc=1)" \
+    test "$(upgrade_rc "$UPG_OP")" -eq 1
+check "...and the operator's own rule survives untouched" \
+    grep -qxF '!my/operator/rule' "$UPG_OP/.git/info/exclude"
+check "...and the carve-outs were NOT force-added behind the refusal" \
+    test "$(carveouts_in "$UPG_OP")" -eq 0
+
+UPG_DROP="$TEST_ROOT/upgrade-would-drop"
+seed_older_install "$UPG_DROP" 'notes/generated/'
+echo 'legacy-only-rule/' >> "$UPG_DROP/.git/info/exclude"
+check "a refresh that would DROP an existing rule is refused (rc=1)" \
+    test "$(upgrade_rc "$UPG_DROP")" -eq 1
+check "...and the rule that would have been dropped is still there" \
+    grep -qxF 'legacy-only-rule/' "$UPG_DROP/.git/info/exclude"
+
+# Comments are inert in gitignore, so header drift alone must not block a refresh.
+UPG_CMT="$TEST_ROOT/upgrade-comment-drift"
+seed_older_install "$UPG_CMT" 'notes/generated/' 'notes/media/'
+printf '# an older header line that no longer ships\n' >> "$UPG_CMT/.git/info/exclude"
+check "comment-only drift does not block the refresh (rc=0)" \
+    test "$(upgrade_rc "$UPG_CMT")" -eq 0
+check "...and the carve-outs landed despite the stale comment" \
+    test "$(carveouts_in "$UPG_CMT")" -eq 2
+
+check "the refusal chain consults the carve-out recognizer" \
+    grep -qF '_is_safe_carveout_addition "$exclude_path" "$tmp_path"' <<< "$SYNC_CODE"
 
 echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"
