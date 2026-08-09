@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
-# The pre-commit ruff pre-filter must block a violation IN THE STAGED BLOB,
-# allow clean staged content, and — critically — never block a contributor who
-# has no ruff installed.
-#
-# Built in a throwaway repo so it cannot touch the developer's index. The
-# load-bearing case is the third: staged content clean, working tree dirty. The
-# hook lints `git show :path`, not the file on disk, and only that case tells
-# the two apart. A hook that linted the worktree would block a commit whose
-# staged bytes are fine.
+# The pre-filter must refuse a violation in the STAGED BLOB, allow clean staged
+# content, and never block a contributor with no ruff installed.
 set -uo pipefail
 
 HOOK_SRC="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,17 +22,8 @@ git config core.hooksPath .githooks
 touch workspace/.gitkeep
 git add -A && git commit -q --no-verify -m base
 
-# The blocking cases below need a runner that CAN LINT, not merely a runner
-# command that exists. Gating on `command -v uvx` conflated the two: on a host
-# where uvx is installed but ruff is uncached and the network is offline, the
-# hook correctly fails open and the suite then demanded a refusal — failing in
-# exactly the environment the hook is designed for. (Reported by two reviewers
-# of #2664, each on such a host.) That is the same presence-vs-capability
-# conflation this PR fixes in the hook, re-encoded in its own test.
-#
-# So: shadow `ruff` with a fake WORKING one. Deterministic everywhere, and it
-# removes the dependency on whatever ruff a contributor or CI host happens to
-# have. The real-runner path is still covered — the hook resolves `ruff` first.
+# Shadow `ruff` with a fake WORKING one: a runner that merely EXISTS may be
+# unable to lint (uncached, offline), and these cases need capability.
 work_bin="$TMP/workbin"; mkdir -p "$work_bin"
 cat > "$work_bin/ruff" <<'WORKING'
 #!/usr/bin/env bash
@@ -87,12 +71,8 @@ if env PATH=/usr/bin:/bin git commit -q -m x >/dev/null 2>&1; then ok "no ruff o
 else bad "no ruff on PATH -> commit still allowed (fail-open)"; fi
 rm -f scripts/d.py
 
-# --- staged paths WITH SPACES (blocking review of #2664) --------------------
-# `for f in $staged_py` word-splits `scripts/my check.py` into two nonexistent
-# paths; `git show` then fails, the loop calls that a RUNNER error, and the hook
-# fails open WITHOUT linting — a violation slips through silently. Both cases
-# below are needed: the violating one catches the split, and the clean one
-# proves the fix did not simply start refusing everything with a space.
+# Both directions are needed: the violating path catches the word-split, the
+# clean one proves the fix did not start refusing every path with a space.
 printf 'import os, sys\nprint(os, sys)\n' > "scripts/my check.py"
 git add "scripts/my check.py"
 if git commit -q -m x >/dev/null 2>&1; then
@@ -111,15 +91,8 @@ else
 fi
 git reset -q HEAD -- . 2>/dev/null; rm -f "scripts/my clean.py"
 
-# --- runner FAILURE must fail open, not refuse (review of #2664) ------------
-# A ruff that cannot RUN — bad config, version skew, offline download, cache
-# error — is not a lint finding. The first version of this hook discarded the
-# exit status and treated any non-empty output as a finding, so a broken runner
-# refused clean commits: the exact opposite of the stated fail-open contract.
-#
-# Deterministic by construction: these fakes shadow ruff on PATH, so the result
-# does not depend on which ruff version a contributor or reviewer happens to
-# have. Two shapes, because a broken runner does not reliably exit 2.
+# A runner that cannot RUN is not a finding and must fail open. Two shapes,
+# because a broken runner does not reliably exit 2; the fakes shadow ruff.
 fake_bin="$TMP/fakebin"; mkdir -p "$fake_bin"
 
 make_fake () {   # $1 = exit code
@@ -133,9 +106,7 @@ FAKE
 }
 
 # A DISTINCT file per iteration: a successful commit consumes the staged file,
-# so reusing one name leaves the next iteration with nothing staged and `git
-# commit` fails for that reason instead — scoring as "refused" and inverting the
-# result. (Cost one false FAIL while writing this.)
+# so a reused name leaves nothing staged and that failure scores as "refused".
 for code in 2 1; do
     make_fake "$code"
     printf 'import os\nimport sys\nprint(os, sys)\n' > "scripts/e$code.py"   # CLEAN content

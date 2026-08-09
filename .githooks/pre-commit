@@ -52,29 +52,8 @@ if [[ -n "$offenders" ]]; then
   exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# ruff pre-filter for staged Python.
-#
-# CI runs `ruff check .` and it is a required check. Three PRs in one session
-# passed their whole test suite and then failed CI on ruff alone (E401, a
-# two-second fix), each costing a push/CI/fix cycle. The failure mode is not
-# carelessness — it is that the check only existed remotely.
-#
-# Deliberately a PRE-FILTER, not an authority:
-#
-#   • FAIL-OPEN when no ruff is installed. A contributor without the tool must
-#     never be blocked from committing; CI remains the gate that decides.
-#   • Lints the STAGED BLOB, not the working tree. `--stdin-filename` keeps the
-#     path so ruff.toml still resolves, while the bytes are the ones actually
-#     being committed; linting the worktree would both miss violations you
-#     staged and block on ones you did not.
-#   • Only files staged in THIS commit, so a pre-existing violation elsewhere
-#     never blocks unrelated work.
-#   • Local ruff may differ from the version CI pins; a disagreement is CI's to
-#     settle. This catches the obvious case before the push, not to mirror CI.
-#
-# Escape hatch, same as above: git commit --no-verify
-# ---------------------------------------------------------------------------
+# Pre-filter, never an authority: fails open when ruff is absent or cannot run.
+# Lints the STAGED blob via --stdin-filename so ruff.toml still resolves.
 
 staged_py="$(printf '%s\n' "$staged" | grep -E '\.py$' || true)"
 
@@ -91,33 +70,17 @@ if [[ -n "$staged_py" ]]; then
   if [[ -z "$ruff_cmd" ]]; then
     printf '\033[33m~ pre-commit: no ruff found locally; skipping lint pre-filter (CI still checks).\033[0m\n' >&2
   else
-    # Findings and failures are DIFFERENT STREAMS with different exit codes, and
-    # conflating them is what made an earlier version of this hook refuse clean
-    # commits whenever the runner itself was broken:
-    #
-    #   rc 0            no findings
-    #   rc 1 + stdout   real lint findings          -> refuse
-    #   rc >= 2         config/flag/download/cache failure, message on STDERR
-    #   rc 1 + NO stdout   a runner that errored but exited 1 anyway
-    #
-    # Only the second case is a finding. Everything else is the runner failing to
-    # RUN, which must fail open exactly like "no ruff installed" — CI is the
-    # authority, and a local toolchain problem must never block a clean commit.
+    # rc 1 WITH stdout is a finding. rc>=2, or rc 1 with no stdout, is the runner
+    # failing to RUN and must fail open exactly like "no ruff installed".
     ruff_out=""
     runner_err=""
-    # Newline-safe, NOT `for f in $staged_py`. Word-splitting turns a staged
-    # path like `scripts/my check.py` into two nonexistent paths (and glob-
-    # expands `*`/`?`); `git show` then fails, which this loop classifies as a
-    # RUNNER error and fails open — so a filename with a space silently skips
-    # linting entirely. That is a false clean introduced by the fail-open fix
-    # itself, which is exactly the shape this hook exists to prevent.
+    # Newline-safe, NOT `for f in $staged_py`: word-splitting a spaced path makes
+    # `git show` fail, which this loop would score as a runner error and skip.
     while IFS= read -r f; do
       [[ -n "$f" ]] || continue
       out_f="$(mktemp)"; err_f="$(mktemp)"
-      # `|| rc=$?` is load-bearing twice over: this file runs under `set -e`
-      # (line 30), so a nonzero runner would abort the hook before the status
-      # could be read — the hook exited 2 and printed nothing. It also captures
-      # the code, which a bare `|| true` would discard (the original defect).
+      # `|| rc=$?` is required under `set -e` and captures the code a bare
+      # `|| true` would discard.
       rc=0
       git show ":$f" 2>/dev/null | $ruff_cmd check --stdin-filename "$f" - >"$out_f" 2>"$err_f" || rc=$?
       out="$(cat "$out_f")"; err="$(cat "$err_f")"
