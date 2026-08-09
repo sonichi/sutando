@@ -19,6 +19,7 @@ Usage:
 """
 from __future__ import annotations
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -324,6 +325,19 @@ def claude_home_path(*subpath: str, vanilla: bool = False) -> Path:
     if not subpath:
         return base
     return base.joinpath(*subpath)
+
+
+def claude_project_slug(path: str | Path) -> str:
+    """Derive the project slug Claude Code uses under `projects/<slug>/`.
+
+    Claude Code dashes every non-alphanumeric character of the path, not
+    just "/" — matching only "/" resolves to a nonexistent dir on any path
+    containing a space or dot (e.g. a desktop-bundled checkout under
+    "Application Support/space.ag2.app/"). Every caller must derive the slug
+    through this one function rather than re-implementing the regex, so the
+    derivation can't drift out of sync again.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
 def channel_access_path(source: str) -> Path:

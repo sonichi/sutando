@@ -597,10 +597,9 @@ EOF
 
     mkdir -p "$CLAUDE_DIR"
 
-    # Compute this checkout's project slug. Claude Code's encoding rule:
-    # replace `/` with `-` in the absolute cwd. So /Users/x/repo becomes
-    # -Users-x-repo.
-    THIS_PROJECT_SLUG="$(printf '%s' "$REPO_ROOT" | tr '/' '-')"
+    # Claude Code dashes EVERY non-alphanumeric char, not just `/` — a path with
+    # a space or dot (Application Support/space.ag2.app) needs the complement set.
+    THIS_PROJECT_SLUG="$(printf '%s' "$REPO_ROOT" | tr -c 'A-Za-z0-9' '-')"
 
     # Build the include set by enumerating candidate slugs in ~/.claude/projects/
     # and confirming each one against the filesystem. For a slug starting with
