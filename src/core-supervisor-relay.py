@@ -83,6 +83,30 @@ def _is_login_class(signal: dict) -> bool:
     return signal.get("state") == "logged-out" or signal.get("kind") == "login"
 
 
+def _derive_backend() -> "dict | None":
+    """The core's own recorded backend, or None when it isn't knowable here.
+
+    `core_heartbeat` writes `socket` into `state/cores/<host>.alive` precisely so a
+    reader need not guess it; an embedded core records no tmux backend and gets None.
+    """
+    try:
+        import json
+        import sys
+        from pathlib import Path
+        # Resolve src/ from THIS file, not ambient sys.path: run as a script sys.path[0]
+        # is src/, but loaded as a module it is not, and the import would silently fail.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from workspace_default import resolve_workspace
+        host = platform.node().split(".")[0]
+        p = Path(resolve_workspace()) / "state" / "cores" / f"{host}.alive"
+        d = json.loads(p.read_text())
+        sock = (d.get("socket") or "").strip()
+        # A socket alone is the tmux case; anything else is not addressable as a console.
+        return {"socket": sock} if sock else None
+    except Exception:
+        return None            # fail-open: an unknown target degrades to generic phrasing
+
+
 def compose_message(signal: dict) -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt."""
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
@@ -104,11 +128,18 @@ def compose_message(signal: dict) -> str:
                 " `bash src/restart.sh` from the repo, then complete /login."
                 " A chat reply can't resolve this.")
     else:
-        # Names no console on purpose: the core may be embedded and the socket is
-        # env-overridable, so no fixed target is correct from here.
         host = platform.node().split(".")[0] or "the host"
-        msg += (f" — answer it where the core is running on {host}."
-                " A chat reply can't answer it.")
+        # No fixed LITERAL is correct (the core may be embedded, the socket is
+        # env-overridable) but the running core records its own socket, so derive it.
+        # Guard at the CALL SITE, not only inside the helper: this message is the only
+        # channel the owner has here, so nothing in derivation may crash the escalation.
+        try:
+            be = _derive_backend()
+        except Exception:
+            be = None
+        where = (f"at the core's terminal on {host} (tmux socket {be['socket']})"
+                 if be else f"where the core is running on {host}")
+        msg += f" — answer it {where}. A chat reply can't answer it."
     return msg
 
 

@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import contextlib
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +36,40 @@ _IDLE = {"state": "idle-ready", "detail": "ready for a task", "prompt": None, "k
 _RUNNING = {"state": "running", "detail": "actively processing", "prompt": None, "kind": None}
 _CRASHED = {"state": "crashed", "detail": "core process/session not found", "prompt": None}
 _HUNG = {"state": "hung", "detail": "core alive but stalled", "prompt": "…", "kind": "unknown"}
+
+
+@contextlib.contextmanager
+def _backend(value):
+    """Pin what the core's recorded backend looks like. Stubbed rather than written to
+    disk so the assertions do not depend on the live workspace or this host's name."""
+    orig = getattr(_mod, "_derive_backend", None)
+    _mod._derive_backend = lambda: value
+    try:
+        yield
+    finally:
+        if orig is not None:
+            _mod._derive_backend = orig
+
+
+def _no_backend():
+    return _backend(None)
+
+
+def _backend_raises():
+    def _boom():
+        raise RuntimeError("unreadable")
+    return _backend_fn(_boom)
+
+
+@contextlib.contextmanager
+def _backend_fn(fn):
+    orig = getattr(_mod, "_derive_backend", None)
+    _mod._derive_backend = fn
+    try:
+        yield
+    finally:
+        if orig is not None:
+            _mod._derive_backend = orig
 
 
 class TestShouldEscalate(unittest.TestCase):
@@ -108,15 +143,37 @@ class TestComposeMessage(unittest.TestCase):
         nor the app can answer it, so the remedy must name the terminal."""
         sig = {"state": "blocked-human", "detail": "awaiting user: selection",
                "prompt": "pick one", "kind": "selection"}
-        m = compose_message(sig)
+        with _no_backend():
+            m = compose_message(sig)
+        # FALLBACK shape: with no derivable backend (embedded core, unreadable .alive)
+        # the remedy must still not invent a transport name.
         self.assertIn("where the core is running", m)
-        # No transport name: the core may be embedded (AG2 Space) and the tmux
-        # socket is env-overridable, so naming one would be wrong somewhere.
         self.assertNotIn("tmux", m)
         self.assertNotIn("sutando-core", m)
         self.assertNotIn("reply here", m)
         self.assertNotIn("open the app to resolve", m)
         self.assertNotIn("GUI /login", m)
+
+    def test_blocked_human_names_the_DERIVED_terminal(self):
+        """When the running core recorded its socket, name it — a generic 'where the
+        core is running' does not tell someone who does not already know."""
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection",
+               "prompt": "pick one", "kind": "selection"}
+        with _backend({"socket": "/tmp/probe-tmux.sock"}):
+            m = compose_message(sig)
+        self.assertIn("/tmp/probe-tmux.sock", m)
+        self.assertIn("terminal", m)
+        self.assertNotIn("where the core is running", m,
+                         "the derived form must REPLACE the vague one, not append to it")
+
+    def test_derivation_failure_is_fail_open_not_fatal(self):
+        """A helper that raises must degrade to the generic remedy, never crash the
+        escalation — the message is the only channel the owner has here."""
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection",
+               "prompt": "pick one", "kind": "selection"}
+        with _backend_raises():
+            m = compose_message(sig)
+        self.assertIn("where the core is running", m)
 
     def test_truncates_long_prompt(self):
         """The prompt echo is bounded, the remedy is not, and the bound must hold
@@ -124,9 +181,14 @@ class TestComposeMessage(unittest.TestCase):
         for state, kind in (("blocked-human", "unknown"), ("logged-out", "login")):
             big = {"state": state, "detail": "awaiting user: unknown",
                    "prompt": "x" * 500, "kind": kind}
-            m = compose_message(big)
-            self.assertNotIn("x" * 130, m, f"{state}: prompt echo not truncated")
-            self.assertLess(len(m), 400, f"{state}: message too long")
+            # BOTH remedy shapes: the derived form is longer, so the bound must hold
+            # for it too — that is the branch a host-name-sensitive bound would miss.
+            for ctx, label in ((_no_backend(), "generic"),
+                               (_backend({"socket": "/tmp/probe-tmux.sock"}), "derived")):
+                with ctx:
+                    m = compose_message(big)
+                self.assertNotIn("x" * 130, m, f"{state}/{label}: prompt echo not truncated")
+                self.assertLess(len(m), 400, f"{state}/{label}: message too long")
 
     def test_kind_appended_when_not_in_detail(self):
         sig = {"state": "blocked-human", "detail": "the core is waiting",
