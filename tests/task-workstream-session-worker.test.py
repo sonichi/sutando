@@ -7,12 +7,15 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -78,7 +81,8 @@ def test_resolution_routes_bounded_tiers_before_owner_workstreams() -> None:
         assert worker.resolve_workstream(workspace, team) is None
         assert worker.resolve_workstream(workspace, _task(workspace, "task-ungrouped")) is None
         assert worker.probe("claude", workspace, owner) == 0
-        assert worker.probe("claude", workspace, team) == 0
+        assert worker.probe("claude", workspace, team) == worker.MUST_HANDLE
+        assert worker.probe("claude", workspace, _task(workspace, "task-guest", "guest")) == worker.UNHANDLED
 
 
 def test_tier_parser_prevents_task_body_escalation_and_fails_closed() -> None:
@@ -95,28 +99,33 @@ def test_tier_parser_prevents_task_body_escalation_and_fails_closed() -> None:
 
         invalid = _task(workspace, "task-invalid", "sudo")
         assert worker.resolve_access_tier(invalid) == "guest"
+        assert worker.resolve_access_tier(_task(workspace, "task-other", "other")) == "guest"
+        assert worker.resolve_access_tier(workspace / "tasks" / "absent.txt") == "guest"
         missing = _task(workspace, "task-legacy")
         missing.write_text("id: task-legacy\ntask: legacy local task\n")
         assert worker.resolve_access_tier(missing) == "owner"
 
 
-def test_claude_bounded_tiers_use_claude_native_capabilities() -> None:
+def test_team_uses_owner_claude_native_sandbox_while_guest_stays_legacy() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         workspace = root / "workspace"
         log = root / "claude-args.jsonl"
         _executable(root / "claude", """#!/usr/bin/env python3
 import json, os, sys
+if '--version' in sys.argv:
+    print('2.1.220 (Claude Code)')
+    raise SystemExit
 with open(os.environ['PROVIDER_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')
-print('bounded claude result')
+print(json.dumps({'type': 'result', 'result': 'bounded claude result'}))
 """)
         env = {"PATH": f"{root}:{os.environ['PATH']}", "PROVIDER_LOG": str(log)}
         team = _task(workspace, "task-team-runtime", "team")
         guest = _task(workspace, "task-guest-runtime", "guest")
         assert _run("claude", workspace, team, env).returncode == 0
-        assert _run("claude", workspace, guest, env).returncode == 0
+        assert _run("claude", workspace, guest, env).returncode == worker.UNHANDLED
 
-        team_args, guest_args = [json.loads(line) for line in log.read_text().splitlines()]
+        [team_args] = [json.loads(line) for line in log.read_text().splitlines()]
         assert team_args[:2] == ["-p", "--no-session-persistence"]
         assert team_args[team_args.index("--permission-mode") + 1] == "acceptEdits"
         assert team_args[team_args.index("--tools") + 1] == "Bash,Read,Edit,Write,Glob,Grep"
@@ -124,14 +133,15 @@ print('bounded claude result')
         assert settings["sandbox"]["enabled"] is True
         assert settings["sandbox"]["failIfUnavailable"] is True
         assert settings["sandbox"]["allowUnsandboxedCommands"] is False
-        assert settings["sandbox"]["network"]["allowedDomains"] == []
-        assert guest_args[guest_args.index("--permission-mode") + 1] == "plan"
-        assert guest_args[guest_args.index("--tools") + 1] == "Read,Glob,Grep"
-        assert "codex" not in team_args and "codex" not in guest_args
-        assert (workspace / "results" / team.name).read_text() == "bounded claude result\n"
+        assert settings["sandbox"]["network"] == {
+            "allowedDomains": [], "strictAllowlist": True}
+        assert "--verbose" in team_args and "stream-json" in team_args
+        assert "codex" not in team_args
+        assert (workspace / "results" / team.name).read_text() == "bounded claude result"
+        assert not (workspace / "results" / guest.name).exists()
 
 
-def test_codex_bounded_tiers_use_codex_only_when_selected() -> None:
+def test_team_uses_owner_codex_workspace_sandbox_while_guest_stays_legacy() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         workspace = root / "workspace"
@@ -146,24 +156,277 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
         team = _task(workspace, "task-team-codex", "team")
         guest = _task(workspace, "task-guest-codex", "guest")
         assert _run("codex", workspace, team, env).returncode == 0
-        assert _run("codex", workspace, guest, env).returncode == 0
-        team_args, guest_args = [json.loads(line) for line in log.read_text().splitlines()]
+        assert _run("codex", workspace, guest, env).returncode == worker.UNHANDLED
+        [team_args] = [json.loads(line) for line in log.read_text().splitlines()]
         assert team_args[team_args.index("--sandbox") + 1] == "workspace-write"
-        assert guest_args[guest_args.index("--sandbox") + 1] == "read-only"
         assert "--ignore-user-config" in team_args and "--ephemeral" in team_args
+        assert "--json" in team_args
 
 
 def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         workspace = root / "workspace"
-        _executable(root / "claude", "#!/bin/sh\nprintf 'sandbox unavailable\\n' >&2\nexit 9\n")
+        _executable(
+            root / "claude",
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.220'; exit; }\n"
+            "printf 'sandbox unavailable\\n' >&2\nexit 9\n",
+        )
         task = _task(workspace, "task-team-fail-closed", "team")
         result = _run("claude", workspace, task, {"PATH": f"{root}:{os.environ['PATH']}"})
         assert result.returncode == 0
         body = (workspace / "results" / task.name).read_text()
         assert "restricted runtime was unavailable" in body
         assert "No unrestricted fallback was used" in body
+
+
+def test_stalled_team_runtime_is_killed_and_publishes_safe_result() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        _executable(
+            root / "claude",
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.220'; exit; }\nsleep 30\n",
+        )
+        task = _task(workspace, "task-team-stall", "team")
+        started = time.monotonic()
+        result = _run("claude", workspace, task, {
+            "PATH": f"{root}:{os.environ['PATH']}",
+            "SUTANDO_TIER_STALL_TIMEOUT": "0.15",
+            "SUTANDO_TIER_HARD_TIMEOUT": "1",
+        })
+        assert time.monotonic() - started < 2
+        assert result.returncode == 0
+        assert "No unrestricted fallback was used" in (
+            workspace / "results" / task.name).read_text()
+
+
+def test_older_claude_fails_closed_before_receiving_team_prompt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        invoked = root / "invoked"
+        _executable(
+            root / "claude",
+            f"#!/bin/sh\n[ \"$1\" = --version ] && {{ echo '2.1.218'; exit; }}\ntouch '{invoked}'\n",
+        )
+        task = _task(workspace, "task-team-old-claude", "team")
+        result = _run("claude", workspace, task, {"PATH": f"{root}:{os.environ['PATH']}"})
+        assert result.returncode == 0
+        assert not invoked.exists()
+        assert "need 2.1.219+" in result.stderr
+        assert "No unrestricted fallback was used" in (
+            workspace / "results" / task.name).read_text()
+
+
+def test_installed_claude_enforces_team_credential_and_network_boundary() -> None:
+    """Hermetic real-CLI probe: the local server replaces model inference."""
+    claude = shutil.which("claude")
+    if not claude:
+        return
+    try:
+        worker._require_claude_team_sandbox()
+    except RuntimeError:
+        return  # Older installed CLIs are rejected by the production gate.
+
+    requests: list[dict] = []
+    network_probes: list[str] = []
+
+    class ProbeHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:
+            pass
+
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            network_probes.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+    probe_server = ThreadingHTTPServer(("127.0.0.1", 0), ProbeHandler)
+    probe_thread = threading.Thread(target=probe_server.serve_forever, daemon=True)
+    probe_thread.start()
+    shell_command = (
+        "printf 'ENV=%s\\n' \"$GITHUB_TOKEN\"; "
+        "cat \"$HOME/.aws/team-secret\"; "
+        f"curl --max-time 2 -sS http://127.0.0.1:{probe_server.server_port}/probe"
+    )
+
+    def sse(block: dict, stop_reason: str) -> bytes:
+        message = {
+            "id": "msg_test", "type": "message", "role": "assistant",
+            "model": "claude-sonnet-4-5", "content": [], "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": 0},
+        }
+        events = [
+            ("message_start", {"type": "message_start", "message": message}),
+            ("content_block_start", {
+                "type": "content_block_start", "index": 0, "content_block": block}),
+        ]
+        delta = (
+            {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+            if block["type"] == "tool_use"
+            else {"type": "text_delta", "text": block["text"]}
+        )
+        events.extend([
+            ("content_block_delta", {
+                "type": "content_block_delta", "index": 0, "delta": delta}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            ("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": 1},
+            }),
+            ("message_stop", {"type": "message_stop"}),
+        ])
+        return "".join(
+            f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+            for event, payload in events
+        ).encode()
+
+    class ApiHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:
+            pass
+
+        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            length = int(self.headers.get("content-length", "0"))
+            body = json.loads(self.rfile.read(length))
+            requests.append(body)
+            has_result = any(
+                isinstance(message.get("content"), list)
+                and any(
+                    isinstance(item, dict) and item.get("type") == "tool_result"
+                    for item in message["content"])
+                for message in body.get("messages", [])
+            )
+            block = (
+                {"type": "text", "text": "sandbox probe complete"}
+                if has_result else {
+                    "type": "tool_use", "id": "toolu_test", "name": "Bash",
+                    "input": {"command": shell_command},
+                }
+            )
+            payload = sse(block, "end_turn" if has_result else "tool_use")
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    api_server = ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
+    api_thread = threading.Thread(target=api_server.serve_forever, daemon=True)
+    api_thread.start()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            repo = root / "repo"
+            (home / ".aws").mkdir(parents=True)
+            repo.mkdir()
+            (home / ".aws" / "team-secret").write_text("FILE_SECRET")
+            with mock.patch.object(worker.Path, "home", return_value=home):
+                settings = worker._claude_tier_settings(repo)
+            command = worker._claude_bounded_command("run the requested probe", repo)
+            command[0] = claude
+            command.insert(2, "--bare")
+            environment = {
+                **os.environ,
+                "HOME": str(home),
+                "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{api_server.server_port}",
+                "ANTHROPIC_API_KEY": "test-only-key",
+                "GITHUB_TOKEN": "ENV_SECRET",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            }
+            settings_index = command.index("--settings") + 1
+            command[settings_index] = settings
+            completed = subprocess.run(
+                command, cwd=repo, env=environment, text=True,
+                capture_output=True, timeout=20,
+            )
+        assert completed.returncode == 0, completed.stderr
+        tool_results = [
+            item
+            for request in requests
+            for message in request.get("messages", [])
+            if isinstance(message.get("content"), list)
+            for item in message["content"]
+            if isinstance(item, dict) and item.get("type") == "tool_result"
+        ]
+        assert tool_results
+        output = str(tool_results[-1].get("content") or "")
+        assert "ENV_SECRET" not in output and "FILE_SECRET" not in output, output
+        assert "ENV=\n" in output, output
+        assert "Operation not permitted" in output or "Permission denied" in output, output
+        assert network_probes == []
+    finally:
+        api_server.shutdown()
+        probe_server.shutdown()
+
+
+def test_bounded_runtime_helper_edges() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        with mock.patch.dict(os.environ, {"SUTANDO_CORE_MODEL": "tier-model"}, clear=False):
+            assert "--model" in worker._claude_bounded_command("p", REPO)
+            assert "-m" in worker._codex_bounded_command("p", REPO, root / "out")
+
+        with mock.patch.object(worker.subprocess, "run", side_effect=OSError("missing")):
+            try:
+                worker._require_claude_team_sandbox()
+                raise AssertionError("missing Claude must fail closed")
+            except RuntimeError as exc:
+                assert "could not verify" in str(exc)
+        invalid_version = subprocess.CompletedProcess([], 0, "not-a-version", "")
+        with mock.patch.object(worker.subprocess, "run", return_value=invalid_version):
+            try:
+                worker._require_claude_team_sandbox()
+                raise AssertionError("unparseable Claude version must fail closed")
+            except RuntimeError as exc:
+                assert "sandbox version" in str(exc)
+
+        already_done = mock.Mock()
+        already_done.poll.return_value = 0
+        worker._terminate_process_group(already_done)
+        already_done.wait.assert_not_called()
+
+        stubborn = mock.Mock(pid=12345)
+        stubborn.poll.return_value = None
+        stubborn.wait.side_effect = [subprocess.TimeoutExpired("provider", 2), 0]
+        with mock.patch.object(
+            worker.os, "killpg", side_effect=[None, ProcessLookupError]
+        ) as killed:
+            worker._terminate_process_group(stubborn)
+        assert killed.call_count == 2
+
+        with mock.patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "0"}, clear=False):
+            try:
+                worker._run_process_bounded(["/bin/true"], REPO)
+                raise AssertionError("invalid timeout must be rejected")
+            except ValueError:
+                pass
+        with mock.patch.dict(os.environ, {
+            "SUTANDO_TIER_HARD_TIMEOUT": "0.1",
+            "SUTANDO_TIER_STALL_TIMEOUT": "2",
+        }, clear=False):
+            try:
+                worker._run_process_bounded(["/bin/sleep", "30"], REPO)
+                raise AssertionError("hard timeout must stop the provider")
+            except TimeoutError as exc:
+                assert "hard timeout" in str(exc)
+
+        try:
+            worker._claude_stream_result("not-json\n{}")
+            raise AssertionError("missing result event must fail")
+        except RuntimeError as exc:
+            assert "terminal result" in str(exc)
+
+        (workspace / "state").mkdir(parents=True)
+        with mock.patch.object(worker, "_run_process_bounded", return_value=(7, "", "nope")):
+            try:
+                worker._run_bounded("codex", "p", REPO, workspace)
+                raise AssertionError("Codex failure must fail closed")
+            except RuntimeError as exc:
+                assert str(exc) == "nope"
 
 
 def test_claude_creates_then_resumes_the_same_durable_session() -> None:
@@ -260,6 +523,12 @@ else:
             "task-one": {"workstream_id": "workstream-a"},
             "task-two": {"workstream_id": "workstream-a"},
         })
+        state_path = workspace / "state" / "task-workstream-sessions.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "schema_version": 1,
+            "sessions": {"codex": {"workstream-a": {"session_id": "corrupt"}}},
+        }))
         env = {"PATH": f"{root}:{os.environ['PATH']}", "PROVIDER_LOG": str(log)}
         assert _run("codex", workspace, first, env).returncode == 0
         assert _run("codex", workspace, second, env).returncode == 0
@@ -410,6 +679,97 @@ def test_watcher_provider_failure_falls_back_without_leaking_stdout() -> None:
         assert "possible at-least-once retry" in result.stderr
         assert (workspace / "state" / "task-event-handler-fallbacks" / "task-retry.txt").is_file()
         assert not (workspace / "state" / "task-event-handler-claims" / "task-retry.txt").exists()
+
+
+def test_required_team_handler_failure_never_emits_live_core_event() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        task = tasks / "task-team-required.txt"
+        task.write_text("access_tier: team\ntask: protected\n")
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\ncase \" $* \" in *\" --probe \"*) exit 4;; esac\nexit 9\n",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 0.2\n")
+        result = subprocess.run(
+            ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(tasks)],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_CORE_RUNTIME": "claude",
+                "SUTANDO_RESULTS_DIR": str(results),
+            },
+            text=True,
+            capture_output=True,
+            start_new_session=True,
+            timeout=5,
+        )
+        assert "TASK_FILE:" not in result.stdout
+        assert "safe terminal failure" in result.stderr
+        assert "No unrestricted fallback was used" in (results / task.name).read_text()
+        assert not (workspace / "state" / "task-event-handler-fallbacks" / task.name).exists()
+        assert not (workspace / "state" / "task-event-handler-claims" / task.name).exists()
+
+
+def test_required_team_handler_shutdown_never_falls_through() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        task = tasks / "task-team-interrupted.txt"
+        task.write_text("access_tier: team\ntask: protected\n")
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\ncase \" $* \" in *\" --probe \"*) exit 4;; esac\nsleep 30\n",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 30\n")
+        process = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(tasks)],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_CORE_RUNTIME": "claude",
+                "SUTANDO_RESULTS_DIR": str(results),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        claim = workspace / "state" / "task-event-handler-claims" / task.name
+        try:
+            deadline = time.monotonic() + 1
+            while not claim.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert claim.exists()
+            assert claim.read_text().splitlines()[3] == "must-handle"
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=3)
+            assert "TASK_FILE:" not in stdout
+            assert "safe terminal failure" in stderr
+            assert "No unrestricted fallback was used" in (results / task.name).read_text()
+            assert not claim.exists()
+            assert not (workspace / "state" / "task-event-handler-fallbacks" / task.name).exists()
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=2)
 
 
 def test_slow_handler_does_not_block_the_next_task_event() -> None:
@@ -909,9 +1269,13 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
 if __name__ == "__main__":
     test_resolution_routes_bounded_tiers_before_owner_workstreams()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
-    test_claude_bounded_tiers_use_claude_native_capabilities()
-    test_codex_bounded_tiers_use_codex_only_when_selected()
+    test_team_uses_owner_claude_native_sandbox_while_guest_stays_legacy()
+    test_team_uses_owner_codex_workspace_sandbox_while_guest_stays_legacy()
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
+    test_stalled_team_runtime_is_killed_and_publishes_safe_result()
+    test_older_claude_fails_closed_before_receiving_team_prompt()
+    test_installed_claude_enforces_team_credential_and_network_boundary()
+    test_bounded_runtime_helper_edges()
     test_claude_creates_then_resumes_the_same_durable_session()
     test_nonzero_provider_stdout_is_never_written_as_a_result()
     test_archived_result_is_not_replayed_on_restart_scan()
@@ -921,6 +1285,8 @@ if __name__ == "__main__":
     test_codex_failures_and_empty_provider_results_are_retryable()
     test_cli_main_delegates_parsed_paths()
     test_watcher_provider_failure_falls_back_without_leaking_stdout()
+    test_required_team_handler_failure_never_emits_live_core_event()
+    test_required_team_handler_shutdown_never_falls_through()
     test_slow_handler_does_not_block_the_next_task_event()
     test_watcher_bounds_provider_backlog_and_drains_every_receipt_once()
     test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back()
