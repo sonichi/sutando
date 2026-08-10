@@ -137,6 +137,8 @@ def _parse_args(argv):
     parser.add_argument("--limit", type=int, default=10, help="Per-call page size (Discord caps at 100). With --until this is the page size, not the total.")
     parser.add_argument("--after", default=None, help="Snowflake ID — fetch messages after this ID (newer)")
     parser.add_argument("--before", default=None, help="Snowflake ID — fetch messages before this ID (older), one page.")
+    parser.add_argument("--full", action="store_true",
+                        help="Do not clip message bodies. The default clip makes a long body indistinguishable from a short one, so a text check over this output can report a phrase absent when it was delivered.")
     parser.add_argument("--until", default=None, help="Snowflake ID or ISO date/time (e.g. 2026-06-24T23:25) — page BACKWARD until reaching this boundary, then stop. Condition-based depth, NOT a message count: use to reconstruct context however far back the referent / conversational boundary is.")
     return parser.parse_args(argv)
 
@@ -149,6 +151,10 @@ def main(argv=None):
         return 1
 
     args = _parse_args(argv)
+    if args.full:
+        # `body[:None]` is the whole string, so the clip sites need no change.
+        global CLIP, REPLY_CLIP
+        CLIP = REPLY_CLIP = None
     headers = {"Authorization": f"Bot {token}", "User-Agent": "Sutando-reader/1.0"}
     page = min(max(args.limit, 1), 100)
 
