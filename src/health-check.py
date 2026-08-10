@@ -4659,6 +4659,25 @@ def _gateway_configured() -> bool:
     return False
 
 
+def _gateway_lock_pids() -> "dict[str, str]":
+    """Role -> PID from state/locks/. Instance identity exists only in the lock;
+    every instance shares the same argv, so the process table cannot separate them."""
+    out: "dict[str, str]" = {}
+    try:
+        locks = sorted((Path(WORKSPACE_DIR) / "state" / "locks").glob("gateway-bridge*.lock"))
+    except Exception:
+        return out
+    for lk in locks:
+        try:
+            d = json.loads(lk.read_text())
+        except Exception:
+            continue
+        role, pid = d.get("role"), d.get("pid")
+        if role and pid:
+            out[str(role)] = str(pid)
+    return out
+
+
 def check_gateway_bridge() -> "dict | None":
     """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
     process that carries MOBILE-app messages from the cloud gateway down to the
@@ -4679,7 +4698,9 @@ def check_gateway_bridge() -> "dict | None":
         return None
     try:
         gw = subprocess.run(
-            ["/usr/bin/pgrep", "-f", r"remote-gateway-bridge\.py$"],
+            # remote-relay-bridge.py is a shipped compat stub running the same
+            # client, so an instance under the old name is a real duplicate.
+            ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
             capture_output=True, text=True,
         )
         pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
@@ -4691,11 +4712,31 @@ def check_gateway_bridge() -> "dict | None":
             "status": "warn",
             "detail": "configured but NOT running — ag2.space mobile messages will not be delivered",
         }
-    if len(pids) > 1:
+    claimed = _gateway_lock_pids()
+    if claimed:
+        # startup.sh gives every instance identical argv, so a supported named
+        # secondary is a duplicate only if no role lock claims its PID.
+        unclaimed = [p for p in pids if p not in set(claimed.values())]
+        if unclaimed:
+            held = ", ".join(f"{r}={pid}" for r, pid in sorted(claimed.items()))
+            return {
+                "name": "gateway-bridge",
+                "status": "warn",
+                "detail": (
+                    f"{len(unclaimed)} gateway process(es) claimed by no instance lock "
+                    f"(PIDs: {','.join(unclaimed)}); locks held: {held}"
+                ),
+            }
+    elif len(pids) > 1:
+        # No lock data at all (pre-lock build, or locks/ unreadable): the count is
+        # all we have, and it over-reports on a multi-instance host.
         return {
             "name": "gateway-bridge",
             "status": "warn",
-            "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})",
+            "detail": (
+                f"multiple processes ({len(pids)} PIDs: {','.join(pids)}) "
+                f"— no instance locks found to attribute them to"
+            ),
         }
     # A live PROCESS is not a serving CONNECTION. The bridge rewrites
     # state/gateway-status.json on every poll outcome, so consult it before
@@ -4893,9 +4934,12 @@ def check_skill_symlinks() -> dict:
         # Reproduced independently by qingyun-wu and bassilkhilo-ag2 (#2660) against
         # `/private/tmp/pr2660 spaced repro .../{src,dst} tree`. The activation test
         # below runs the emitted command under a spaced fixture for this reason.
+        #
+        # The backup goes OUTSIDE <dst>: the skill loader registers every directory
+        # in <dst> as a skill, so a backup left there loads as a phantom duplicate.
         parts.append(
             f"{len(shadowed)} a real dir, not a link (diverges silently; repair with "
-            f'`mv "<dst>/<name>" "<dst>/<name>.local-backup" && ln -s "<src>/<name>" "<dst>/<name>"` '
+            f'`mv "<dst>/<name>" "<dst>/../<name>.skill-backup" && ln -s "<src>/<name>" "<dst>/<name>"` '
             f"— move aside, do NOT `ln -sfn` over it, and keep the backup until you have "
             f"checked it for local edits): "
             f"{', '.join(shadowed[:4])}{'...' if len(shadowed) > 4 else ''}"
