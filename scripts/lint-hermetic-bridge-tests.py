@@ -969,11 +969,8 @@ KNOWN_RESOLVER_STUBS = {
 
 
 def _lambda_absorbs_args(fn: ast.Lambda) -> bool:
-    """True when this lambda can accept at least one argument.
-
-    `*args`/`**kwargs` absorb anything; any declared parameter means the author
-    thought about arity. A bare `lambda:` is the failure mode this check exists for.
-    """
+    """True when the lambda can take an argument: `*args`/`**kwargs` or any declared
+    parameter. A bare `lambda:` is the failure mode this exists to catch."""
     a = fn.args
     if a.vararg or a.kwarg:
         return True
@@ -999,12 +996,8 @@ def _binding_state(value: ast.expr, env: "dict[str, bool]") -> "bool | None":
 
 
 def _unsafe_names_in_scope(body: "list[ast.stmt]") -> "set[str]":
-    """Names this scope EVER binds to a zero-arg lambda, at any statement depth.
-
-    Does not descend into nested `def`/`class` — those are their own scopes.
-    Used only for the late-binding case: a nested function reads a global when
-    it RUNS, so ordering inside the enclosing scope tells you nothing.
-    """
+    """Names this scope ever binds to a zero-arg lambda, at any depth, not descending
+    into nested def/class. Order-free: a nested function reads the global when it RUNS."""
     found: "set[str]" = set()
     stack = list(body)
     while stack:
@@ -1024,15 +1017,8 @@ def _unsafe_names_in_scope(body: "list[ast.stmt]") -> "set[str]":
 
 
 class _ScopeWalk:
-    """Reaching-binding walk over ONE lexical scope, in statement order.
-
-    `env` maps a local name to True when the binding that REACHES this point is
-    a zero-arg lambda. Nested scopes get a snapshot taken where they are defined,
-    so a sibling function's binding can never leak sideways. Branch bodies are
-    walked on copies and merged with OR — a name is unsafe if ANY path can leave
-    it unsafe, which keeps the check conservative where control flow is unknown
-    without letting an unrelated scope decide the verdict.
-    """
+    """Reaching-binding walk over ONE lexical scope in statement order; nested scopes take
+    a snapshot, so a sibling cannot leak. Branches merge with OR (unsafe if any path is)."""
 
     def __init__(self, env: "dict[str, bool]", out: "list[tuple[int, str]]",
                  inherited: "set[str] | None" = None, *, class_body: bool = False) -> None:
@@ -1134,43 +1120,15 @@ class _ScopeWalk:
 
 
 def resolver_stub_violations(tree: ast.AST) -> list[tuple[int, str]]:
-    """(lineno, name) for every zero-arg lambda that REACHES a resolver name.
-
-    Patching a resolver across an already-imported tree REQUIRES binding the stub
-    to a name first — `from workspace_default import resolve_workspace` copies the
-    function into each importer's namespace, so every holder must be reassigned:
-
-        _fake = lambda: tmp
-        for _mod in list(sys.modules.values()):
-            if getattr(_mod, "resolve_workspace", None) is orig:
-                _mod.resolve_workspace = _fake       # flagged
-        workspace_default.resolve_workspace = _fake  # flagged
-
-    A check that only inspects the assignment's own value sees neither half, which
-    is why this tracks aliases at all.
-
-    It tracks them per SCOPE and in STATEMENT ORDER. The first version collected
-    aliases into one file-global set via `ast.walk`, so any `_fake = lambda:` in
-    the file condemned every later `resolve_workspace = _fake` — including one in
-    a different function whose own `_fake` absorbs args, and including assignments
-    written BEFORE the offending rebinding. All three:
-
-        cross_function_safe             -> [(7, 'resolve_workspace')]
-        order_safe_then_bad_later       -> [(3, 'resolve_workspace')]
-        same_scope_bad_then_safe_later  -> [(4, 'resolve_workspace')]
-
-    That is the expensive direction for a MANDATORY gate: a false positive blocks
-    an unrelated safe test and names the wrong line, so the author has no way to
-    act on it. Still per-file and syntactic — no cross-module or caller analysis.
-    """
+    """(lineno, name) for every zero-arg lambda that reaches a resolver name. Tracked per
+    scope in statement order - a file-global alias set false-flags cross-function cases."""
     out: list[tuple[int, str]] = []
     _ScopeWalk({}, out).run(getattr(tree, "body", []))
     return sorted(set(out))
 
 def scan_resolver_stubs(paths) -> dict[str, list[tuple[int, str]]]:
-    """Resolver-stub violations per path. Scans EVERY tracked test, not just the
-    bridge-loading subset `classify()` covers -- a resolver stub is hazardous
-    wherever it appears."""
+    """Resolver-stub violations per path, over EVERY tracked test rather than the
+    bridge-loading subset - a resolver stub is hazardous wherever it appears."""
     out: dict[str, list[tuple[int, str]]] = {}
     for rel in paths:
         try:
