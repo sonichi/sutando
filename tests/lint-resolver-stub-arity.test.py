@@ -139,7 +139,7 @@ def main() -> int:
     # --- unreadable / unparseable files are skipped, never reported --------
 
     # scan_resolver_stubs must swallow OSError and SyntaxError: a file it cannot
-    # read is "no evidence", never a violation. Uses a path that does not exist,
+    # read is "no evidence", never a violation.
     missing = lint.scan_resolver_stubs(["tests/__no_such_file_for_lint_test__.py"])
     check("a nonexistent path yields no violation (OSError swallowed)",
           missing == {}, f"got {missing}")
@@ -208,8 +208,8 @@ for m in mods:
 
     # --- FALSE NEGATIVES: a path that may not run is still a path -----------
 
-    # branch bodies, so a safe rebinding INSIDE a conditional overwrote an
-    # unsafe binding that still reached the assignment when the branch did not
+    # A safe rebinding inside a conditional must not clear an unsafe binding that
+    # still reaches the assignment when the branch does not run.
     check("if with NO else: the fallthrough path still reaches the assignment",
           viols("""
 _fake = lambda: tmp
@@ -302,8 +302,8 @@ if cond:
             wd.resolve_workspace = _fake
 """) == [], "branch path must not re-leak the class namespace")
 
-    # A class namespace encloses NOTHING nested in it — not just methods. An
-    # inner class does not see the outer class's attributes either
+    # A class namespace encloses NOTHING nested in it, not just methods: an inner
+    # class does not see the outer class's attributes either.
     check("a nested class does not inherit the outer class namespace",
           viols("""
 _fake = lambda *a, **kw: tmp
@@ -333,7 +333,7 @@ _fake = lambda: tmp
 """) != [], "the method body runs after the outer binding, so it must flag")
 
     # The discriminating counter-case: if/else covers every path, so a safe
-    # rebinding in BOTH branches really does supersede. Without this, the fix
+    # rebinding in BOTH branches really does supersede the unsafe one.
     check("if/else safe in BOTH branches is NOT flagged",
           viols("""
 _fake = lambda: tmp

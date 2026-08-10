@@ -956,13 +956,13 @@ def classify(path: Path) -> str | None:
 
 # --- workspace-resolver stub arity ----------------------------------
 
-# The CCD checks above prove a test isolates CLAUDE_CONFIG_DIR. They say nothing
-# about the WORKSPACE: a test can be fully CCD-hermetic and still append to
+# The CCD checks prove a test isolates CLAUDE_CONFIG_DIR, not the WORKSPACE.
+# A CCD-hermetic test can still write to the real `<workspace>/state/`.
 
 RESOLVER_NAMES = frozenset({"resolve_workspace", "_resolve_workspace"})
 
-#: Resolver stubs that predate this check. Same contract as KNOWN_UNISOLATED:
-#: the list must SHRINK, never rot. Verified latent, not live, at the time of
+#: Resolver stubs predating this check; same contract as KNOWN_UNISOLATED.
+#: The list must SHRINK, never rot; each entry was verified latent when added.
 KNOWN_RESOLVER_STUBS = {
     "tests/telegram-bridge-access.test.py",
 }
@@ -1038,11 +1038,11 @@ class _ScopeWalk:
                  inherited: "set[str] | None" = None, *, class_body: bool = False) -> None:
         self.env = dict(env)
         self.out = out
-        # Names an ENCLOSING scope ever binds unsafely. Carried down so a method
-        # defined inside a class still gets late-binding treatment, even though
+        # Names an ENCLOSING scope ever binds unsafely, carried down so a method still
+        # gets late-binding treatment even though the class body is not its scope.
         self.ever_unsafe: "set[str]" = set(inherited or ())
-        # A class namespace is NOT a lexical scope for its methods: an
-        # unqualified name inside a method skips the class body entirely and
+        # A class namespace is NOT a lexical scope for its methods: an unqualified
+        # name in a method skips the class body and resolves module or enclosing.
         self.class_body = class_body
         self.func_env = dict(env)
         self.func_unsafe = set(inherited or ())
@@ -1058,8 +1058,8 @@ class _ScopeWalk:
 
     def visit(self, node: ast.stmt) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            # ONE rule for EVERY nested scope, rather than a branch per surface:
-            # a class namespace does not lexically enclose anything nested in it
+            # ONE rule for every nested scope rather than a branch per surface: a class
+            # namespace lexically encloses nothing nested inside it.
             base_env = self.func_env if self.class_body else self.env
             base_unsafe = self.func_unsafe if self.class_body else self.ever_unsafe
             if isinstance(node, ast.ClassDef):
@@ -1067,8 +1067,8 @@ class _ScopeWalk:
                 # definition-point state is exact — no late-binding widening.
                 _ScopeWalk(base_env, self.out, base_unsafe, class_body=True).run(node.body)
                 return
-            # A function body runs LATER: a global it reads resolves at CALL
-            # time, so a binding written after the `def` still reaches it and no
+            # A function body runs LATER: a global resolves at CALL time, so a binding
+            # written after the `def` still reaches it.
             inner = dict(base_env)
             for nm in base_unsafe:
                 inner[nm] = True
@@ -1077,11 +1077,11 @@ class _ScopeWalk:
         if isinstance(node, ast.Assign):
             self._assign(node)
             return
-        # `finalbody` is NOT an alternative branch — it runs on EVERY path, after
-        # whichever of body/handlers/orelse ran. Merging it in with `or` (as this
+        # `finalbody` is NOT an alternative branch: it runs on EVERY path, after
+        # whichever of body/handlers/orelse ran, so OR-merging it keeps the prior state.
         finalbody = getattr(node, "finalbody", None)
-        # On a `try`, `else` is NOT an alternative to the body — Python runs it
-        # SEQUENTIALLY after the body completes without raising. OR-merging it
+        # On a `try`, `else` is NOT an alternative to the body: Python runs it
+        # SEQUENTIALLY after the body succeeds, so both are ONE success path.
         _try_types = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
         if isinstance(node, _try_types):
             success = list(getattr(node, "body", None) or []) + \
@@ -1094,16 +1094,16 @@ class _ScopeWalk:
         if not branches and not finalbody:
             return
         merged: "dict[str, bool]" = {}
-        # A statement whose body may not run at all leaves the PRE-STATE live:
-        # `if` with no `else`, a loop over an empty iterable, a `try` that raised
+        # A statement whose body may not run leaves the PRE-STATE live: `if` with no
+        # `else`, a loop over an empty iterable, a `try` that raised immediately.
         covers_all = (isinstance(node, ast.If) and node.orelse) or isinstance(
             node, (ast.With, ast.AsyncWith)
         )
         if not covers_all:
             merged.update(self.env)
         for body in branches:
-            # A control-flow block is the SAME scope, not a nested one, so the
-            # sub-walk carries EVERYTHING forward. A bare
+            # A control-flow block is the SAME scope, not a nested one, so the sub-walk
+            # must carry EVERYTHING forward, including `ever_unsafe`.
             w = _ScopeWalk(self.env, self.out, self.ever_unsafe,
                            class_body=self.class_body)
             w.func_env = dict(self.func_env)
@@ -1112,8 +1112,8 @@ class _ScopeWalk:
             for k, v in w.env.items():
                 merged[k] = merged.get(k, False) or v
         self.env.update(merged)
-        # `finally` last, over the merged state, and its result WINS. It executes
-        # whether the body completed, raised, or returned, so any name it rebinds
+        # `finally` runs last over the merged state and its result WINS: it executes
+        # whether the body completed, raised or returned, so its rebinding is final.
         if finalbody:
             w = _ScopeWalk(self.env, self.out, self.ever_unsafe,
                            class_body=self.class_body)
