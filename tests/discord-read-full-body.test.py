@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
-"""A 200-char clip makes this reader unsound as a send-verification instrument.
-
-`discord-read.py` clips ordinary bodies to `CLIP = 200` so a channel scroll stays
-scannable. That is right for scanning and wrong for the other thing the reader is
-used for: checking whether a message you sent actually landed.
-
-Measured 2026-08-10. A peer verified a send by grepping the channel for a phrase
-from its own message, got 0, concluded the send had dropped, and re-sent. Both
-greps below ran against the SAME delivered message:
-
-    "Taking the #310 correction"   (opening)         -> 2 hits
-    "semantically empty"           (~600 chars in)   -> 0 hits
-
-The phrase was past the clip, so it could not appear no matter what pattern was
-used. A false negative in this direction produces a DUPLICATE delivery, which is
-the failure the verification was meant to prevent — the check's failure mode was
-the bug.
-
-`--full` makes the read faithful when it is being used as an instrument. The
-default is unchanged: clipping still applies, because the scan case is the common
-one and 200 chars is the right length for it.
+"""`--full` must lift both clips; the default must keep clipping.
+A send-verification grep cannot see text past CLIP, so a false negative duplicates.
 """
 import contextlib
 import importlib.util
@@ -40,9 +21,7 @@ try:
 except SystemExit:
     pass
 
-# The needle must start AFTER the 200-char clip, not merely inside a long body:
-# at offset 150 it ended at 170 and was visible by default, which looked like a
-# code defect and was a fixture error.
+# Needle must start past CLIP=200, or the default case finds it and proves nothing.
 LONG = "A" * 260 + "NEEDLE_PAST_THE_CLIP" + "B" * 300
 
 
@@ -53,7 +32,7 @@ def msg(content, author="Sutando-Mini", mid="1000"):
 
 class FullBody(unittest.TestCase):
     def test_the_needle_is_invisible_at_the_default_clip(self):
-        """The defect, stated as the peer hit it: a grep cannot find delivered text."""
+        """A grep cannot find delivered text past the clip."""
         rendered = dr._render(msg(LONG))
         self.assertEqual(len(rendered), dr.CLIP)
         self.assertNotIn("NEEDLE_PAST_THE_CLIP", rendered)
@@ -64,8 +43,7 @@ class FullBody(unittest.TestCase):
         self.assertEqual(len(rendered), len(LONG))
 
     def test_the_default_is_unchanged(self):
-        """Control: the clip must still apply when nothing is asked for. A fix that
-        simply removed the clip would pass the test above and break every scan."""
+        """Removing the clip outright would pass the case above and break every scan."""
         self.assertEqual(dr._render(msg(LONG)), LONG[:dr.CLIP])
         self.assertEqual(dr._render(msg("short")), "short")
 
@@ -81,21 +59,15 @@ class FullBody(unittest.TestCase):
         self.assertIn("NEEDLE_PAST_THE_CLIP", dr._reply_context(m, None))
 
     def test_forwards_stay_exempt_from_the_clip(self):
-        """Forwards were already exempt; --full must not be the only way to see them."""
+        """Forwards were already exempt; --full must not become the only way."""
         fwd = {"content": "", "author": {"username": "sonichi"},
                "message_snapshots": [{"message": {"content": LONG,
                                                   "author": {"username": "x"}}}]}
         self.assertIn("NEEDLE_PAST_THE_CLIP", dr._render(fwd))
 
     def _run_main(self, argv, messages):
-        """Drive main() with the network stubbed, and capture what it prints.
-
-        Asserting the wiring as a source literal (`"None if args.full else CLIP" in
-        src`) is what the first draft of this test did. That form breaks on
-        reformatting and passes on a call site that is present but wrong, so it
-        tests the text rather than the behaviour. Driving main() is the version that
-        actually fails when the flag is not threaded through.
-        """
+        """Drive main() with the network stubbed; a source-string assertion on the
+        call site passes on a call that is present but wrong."""
         buf = io.StringIO()
         with mock.patch.object(dr, "_fetch", return_value=messages), \
              mock.patch.object(dr, "_load_token", return_value="token"), \
@@ -108,7 +80,7 @@ class FullBody(unittest.TestCase):
         self.assertNotIn("NEEDLE_PAST_THE_CLIP", out)
 
     def test_main_under_full_prints_the_whole_body(self):
-        """The end-to-end pin: fails if the flag exists but main() never passes it."""
+        """Fails if the flag exists but main() never passes it through."""
         out = self._run_main(["123", "--full"], [msg(LONG)])
         self.assertIn("NEEDLE_PAST_THE_CLIP", out)
 
