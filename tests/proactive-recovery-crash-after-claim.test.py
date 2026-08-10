@@ -97,12 +97,13 @@ def run_vanished_source_case():
         d = Path(tmp)
         (d / "proactive-gone.sending").write_text(BODY)
         real_unlink = Path.unlink
-        state = {"first": True}
+        state = {"first": True, "fired": False}
 
         def flaky_unlink(self, *a, **k):
             # A peer removes the source between our link and our unlink.
             if state["first"] and self.name == "proactive-gone.sending":
                 state["first"] = False
+                state["fired"] = True
                 real_unlink(self, *a, **k)
                 raise FileNotFoundError
             return real_unlink(self, *a, **k)
@@ -110,8 +111,11 @@ def run_vanished_source_case():
         with mock.patch.object(Path, "unlink", flaky_unlink):
             recovered = pr.recover_orphan_sending_files(d)
         txt = d / "proactive-gone.txt"
+        if not state["fired"]:
+            print("FAIL  C5 SETUP: the unlink race never fired — assertion would be vacuous")
+            return False
         ok = txt.exists() and txt.read_text() == BODY
-        print(f"{'PASS' if ok else 'FAIL'}  C5 source vanishing after the link still recovers\n      recovered={recovered} txt={txt.exists()}")
+        print(f"{'PASS' if ok else 'FAIL'}  C5 source vanishing after the link still recovers\n      fired=True recovered={recovered} txt={txt.exists()}")
         return ok
 
 
