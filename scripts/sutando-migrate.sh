@@ -1727,7 +1727,16 @@ commit_main() {
     # ~/.claude/hooks/... paths (which can't move automatically). See
     # scripts/sutando-config-hooks.sh header for the full rationale.
     # Opt out with --no-hook-bridge.
-    if [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
+    # SUTANDO_MIGRATE_DEST is declared above as a TEST hook. It redirects DEST,
+    # but the two bridges below resolve claude-sutando-config-dir independently
+    # via sutando-config.sh, so under a test-redirected migration they still
+    # write the OPERATOR's real config dir. Measured on a live host: three of the
+    # four tests that set SUTANDO_MIGRATE_DEST rewrote <ccd>/settings.json.
+    # Bridging into the real config dir during a redirected migration is never
+    # correct, so the test hook now covers both destinations, not just DEST.
+    if [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ] && [ -n "${SUTANDO_MIGRATE_DEST:-}" ]; then
+        echo "  hook bridge: skipped (SUTANDO_MIGRATE_DEST set — test-redirected migration must not write the real config dir)"
+    elif [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
         local _hook_helper="$(dirname "$0")/sutando-config-hooks.sh"
         local _new_ccd; _new_ccd="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
         local _new_settings="${_new_ccd}/settings.json"
@@ -1762,7 +1771,9 @@ commit_main() {
     # Idempotent: skip if dest already populated. Honors $SOURCE_CLAUDE_CONFIG_DIR
     # for the read-from location (defaults to ~/.claude/ — matches the legacy
     # claude_home_path() fallback). Opt out with --no-channel-bridge.
-    if [ "$NO_CHANNEL_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
+    if [ "$NO_CHANNEL_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ] && [ -n "${SUTANDO_MIGRATE_DEST:-}" ]; then
+        echo "  channel bridge: skipped (SUTANDO_MIGRATE_DEST set — test-redirected migration must not write the real config dir)"
+    elif [ "$NO_CHANNEL_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
         local _new_ccd_ch; _new_ccd_ch="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
         local _src_channels="${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels"
         local _dst_channels="${_new_ccd_ch}/channels"

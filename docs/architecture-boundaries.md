@@ -122,6 +122,21 @@ mechanics. For example, `src/presenter_mode.py` owns the presenter sentinel path
 and expiry semantics; Discord, Slack, Telegram, and notification jobs decide
 what delivery to suppress when that policy reports active.
 
+When several adapters publish the same mutable workspace record, the shared
+module also owns the record's schema, field bounds, atomic publication, and
+fail-open/fail-closed contract. Adapters inject the resolved path and their log
+sink; they do not reproduce the write recipe. Tests exercise the production
+writer directly under the relevant concurrency model, then separately pin each
+adapter's delegation. `src/owner_activity.py` is the reference pattern.
+
+Centralize only writers with the same policy. AG2 Sparrow's
+`remote_gateway_bridge._write_owner_activity` intentionally remains separate:
+before publishing the shared record it applies the sender-tier gate, excludes
+known fleet agents, strips gateway attribution, and redacts secrets. Those are
+gateway trust-boundary rules, not provider-neutral record-publication mechanics.
+Do not delegate that writer to `src/owner_activity.py` unless those controls and
+their tests move with it.
+
 ### Shared result-file lifecycle
 
 The task/result filesystem protocol is core infrastructure, including its
@@ -137,8 +152,49 @@ sent. Copying the filesystem state machine into each adapter is not permitted.
 HTTP handlers are transport adapters, not the owner of feature policy. Repeated
 authentication gates, status/header emission, and JSON serialization belong in
 small handler helpers so every route uses one wire contract. Route branches retain
-endpoint-specific orchestration and payload construction. Refactors must preserve
-status codes, headers, and payload shapes with direct contract tests.
+only dispatch; named endpoint methods own orchestration and payload construction.
+Refactors must preserve delegation, status codes, headers, and payload shapes with
+direct contract tests.
+
+### HTTP route boundaries
+
+HTTP route methods should remain dispatch layers: parse and authorize the request,
+call a named operation, then emit its result. Filesystem reconciliation and
+response assembly belong in module-level operations that can be tested without a
+socket. Protect both the operation contract and one route-wiring path.
+
+The same rule governs result-body markers, with an explicit one-way dependency
+direction:
+
+    result_markers.parse_markers()   # protocol interpretation
+              |
+              v
+    send_allowlist.is_path_sendable()  # delivery authorization
+              |
+              v
+    provider-specific upload mechanism
+
+`src/result_markers.py` owns marker syntax, precedence, stripping, and action
+extraction. `src/send_allowlist.py` owns attachment-path authorization. Delivery
+consumers (Discord, Slack, Telegram, gateway, and the `dm-result.py` REST
+fallback) own transport routing and upload calls only — they must not define
+marker regexes or path-policy copies.
+
+**All four Python consumers now conform, and the guard enforces it.**
+`discord-bridge.py`, `dm-result.py`, `telegram-bridge.py`, and `slack-bridge.py`
+obtain marker grammar solely from `parse_markers()`.
+`tests/bridge-marker-no-leak.test.py` fails if any of them declares the grammar
+itself, matching the grammar in any regex literal so a renamed private parser
+cannot slip past. Telegram's `send_reply()` used to compile its own
+`file|send|attach` regex and Slack declared the same regex dead at module scope;
+both are gone. The rule above forbids *new* private parsers — add any new
+consumer to that guard when it starts handling markers.
+
+Parsing never authorizes and authorization never parses: `parse_markers()`
+extracts any marker value and leaves the decision about whether a path may be
+opened to the allowlist. A consumer that filters values during parsing
+re-couples the two and drifts — which is precisely how `dm-result.py` came to
+deliver literal `[file: ...]` text that every other consumer stripped.
 
 ## Current repository classification
 
@@ -343,3 +399,54 @@ core internals or maintain a long-lived core fork.
   gone.
 - Consider a separate public core repository only after the package boundary is
   proven inside this repository.
+
+## Events plane: resident transport vs on-demand capability (2026-08-05)
+
+Two components consume gateway room events. Ownership, ratified by the owner
+in the client-stack review (Feature Haul, 2026-08-05):
+
+**ag2-sparrow owns (resident plane):**
+- the resident SSE connection and its reconnect loop
+- durable cursor ownership
+- the SQLite inbox (`event_inbox.EventInbox`)
+- dedupe / exactly-once consumption
+- event → ambient task promotion (taskification)
+
+**agent-room-ops owns (on-demand plane):**
+- subscription configuration (`subscribe`/`unsubscribe`)
+- subscription inspection (`subscriptions`)
+- bounded ad-hoc `pull`
+- bounded, foreground, non-durable diagnostic streaming (debug-only; must be
+  bounded via `--max-events`/`--duration`-class limits, never a second
+  resident event client)
+- the event-acceptance policy the Agent applies
+
+**Grandfathered debt register** (discovered/confirmed by running the guard
+against main; frozen — may only shrink, never grow):
+- `skills/agent-room-ops/events.py:stream_with_resume` + its durable
+  `save_cursor` file: resident-lifecycle behavior (forever-reconnect with
+  durable cursor ownership) in the on-demand skill. Already over the
+  boundary; migrates to sparrow's event pump, after which the bounded
+  debug-only stream is what remains. (`room_ops.py`'s `events stream
+  --cursor-file` is this debt's CLI wiring; its `--once`/`--max-events`
+  bounded modes are the shape the surviving debug stream keeps.)
+- `skills/agent-room-ops/events_acceptance.py` imports
+  `ag2_sparrow.event_consumer` and performs taskification from the skill
+  side. Promotion of the taskify client to the sparrow plane is required
+  work; the import is frozen as-is until then.
+
+Sparrow-side debt (same register, same rules):
+- `human_action.py` posts question cards through the `/v1/room` envelope;
+  `remote_gateway_bridge.py` uploads media through the `/v1/rooms/{room}/media`
+  facade. Both are frozen; no NEW sparrow file may touch the room-verb
+  endpoint surface.
+
+Do not add to the skill: SQLite inboxes, forever reconnect loops, durable
+cursor ownership, background daemon lifecycles, or event taskification. Do
+not add on-demand room verbs to sparrow — enforced at the ENDPOINT surface
+(`/v1/room` envelope + `/v1/rooms/` facade, frozen to the two files above).
+Ad-hoc event pull shares sparrow's legitimate `/v1/events` consumption
+endpoint and is governed by review, not grep. All of this is pinned by
+`tests/events-plane-boundary.test.py` — allowlists frozen, shrink-only, and
+the collector excludes only real test artifacts (`tests/` dirs, `test_*.py`,
+`*.test.py`), never production filenames that merely contain "test".
