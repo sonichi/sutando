@@ -3093,10 +3093,8 @@ async def _handle_discord_message(message, force=False):
                 getattr(u, "bot", False) and getattr(u, "id", None) != _self_id
                 for u in (getattr(message, "mentions", None) or [])
             )
-            # A forward also sets message.reference (type=forward) but is NOT a
-            # reply — its payload is in message_snapshots. Treat only a genuine
-            # reply as is_reply, else an owner's forward is skipped here as a
-            # "reply not addressed to me" and the forward-handler never runs.
+            # A forward sets message.reference too but is NOT a reply (its payload is
+            # in message_snapshots); classing it as one makes this gate skip forwards.
             _is_reply = reference_is_reply(_ref is not None, getattr(_ref, "type", None))
             if not is_addressed_in_shared_channel(
                 author_is_bot=bool(getattr(message.author, "bot", False)),

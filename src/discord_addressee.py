@@ -29,20 +29,11 @@ from __future__ import annotations
 def reference_is_reply(has_reference: bool, reference_type_name) -> bool:
     """Return True iff a `message.reference` denotes a genuine REPLY.
 
-    Discord sets `message.reference` for two distinct features:
-      * a reply — `reference.type == default` (enum name ``"default"``);
-      * a forward — `reference.type == forward` (enum name ``"forward"``), whose
-        payload lives in `message.message_snapshots` with empty top-level content.
+    Discord sets `reference` for replies (enum name "default") and for forwards
+    (name "forward"), whose payload lives in `message.message_snapshots` instead.
 
-    The addressee gate must not treat a forward as a reply: an owner's forwarded
-    message has no `reply.resolved.author`, so classifying it as `is_reply=True`
-    made `is_addressed_in_shared_channel` see a "reply not addressed to me" and
-    skip it — the forward-handler that extracts the snapshot never ran (owner-
-    reported 2026-07-27: "did you receive this" → forwarded #2336 msg dropped).
-
-    Version-robust: matches on the enum member NAME so it holds even if the
-    numeric values change. A missing/None type is treated as a reply (the
-    pre-forward default), preserving existing reply behavior.
+    Matches on the enum NAME so it survives numeric changes; a missing type is a
+    reply, the pre-forward default.
     """
     if not has_reference:
         return False
