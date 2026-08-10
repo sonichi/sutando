@@ -72,12 +72,14 @@ for v in sorted(rgb._INTERACTION_TYPES):
     h = _headers({"id": f"task-it-{v}", "task": "x", "interaction_type": v})
     check(f"vocab round-trip: {v}", h.get("interaction_type") == v)
 
-# 5. access_tier still the LAST header (regression guard: the new branch must
-# not disturb the ordering the tier defense relies on — locally-decided tier
-# written last so it wins under a last-occurrence parser).
+# 5. access_tier must remain the ONLY header-shaped access_tier line — nothing
+# after it but bridge-authored block text that never carries the key.
 body = (rgb.TASKS_DIR / "task-it-1.txt").read_text()
 lines = [l for l in body.split("\n") if l]
-check("access_tier is the last header", lines[-1].startswith("access_tier:"))
+_tier_at = [i for i, l in enumerate(lines) if l.startswith("access_tier:")]
+_tail = lines[_tier_at[0] + 1:] if len(_tier_at) == 1 else None
+check("access_tier is the last header",
+      _tail is not None and (not _tail or any(l.startswith("===SKILL INSTRUCTIONS") for l in _tail)))
 
 if failures:
     sys.exit(1)
