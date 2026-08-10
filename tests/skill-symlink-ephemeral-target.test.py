@@ -42,9 +42,7 @@ class EphemeralSkillTarget(unittest.TestCase):
     def _inject_classifier(self, temp_subtree: Path):
         """Call `temp_subtree` ephemeral and nothing else.
 
-        A path the real classifier calls DURABLE would have to be written outside a
-        temp root, i.e. under $HOME. The predicate is unit-tested separately below.
-        """
+        A real DURABLE path would have to be written outside a temp root."""
         root = str(temp_subtree.resolve())
         self.hc._is_ephemeral = lambda t: os.path.realpath(t) == root or \
             os.path.realpath(t).startswith(root + os.sep)

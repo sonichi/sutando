@@ -4877,25 +4877,8 @@ def check_skill_symlinks() -> dict:
             shadowed.append(skill_name)
         elif (dst.is_symlink() and _is_ephemeral(os.path.realpath(dst))
               and not _is_ephemeral(str(skills_src.resolve()))):
-            # A link that RESOLVES, into a temp dir. Every branch above asks
-            # "does it load?"; this asks "will it still be there tomorrow?".
-            # A scratch worktree satisfies the first and fails the second: the
-            # skill loads from code `git pull` never reaches, then vanishes on
-            # the next tmp sweep and reads as a dangling link with no record of
-            # how it got that way.
-            #
-            # Two conditions, both required. "Target is under a temp root"
-            # alone is wrong: a test fixture builds its whole install under
-            # tempfile, so every CORRECT link there is temp-rooted. What marks
-            # the defect is the MISMATCH -- a durable repo whose skill escapes
-            # into temp. When the repo is temp-rooted too, the layout is
-            # self-consistent and says nothing.
-            #
-            # Also deliberately NOT "resolves somewhere other than this
-            # checkout": pointing at another DURABLE clone is a supported
-            # layout (a skills repo installed alongside), and comparing against
-            # the running checkout flags every link when health-check runs from
-            # a worktree or a second clone -- 57 of 57 on this host.
+            # The MISMATCH is the defect, not temp-rootedness: a temp-rooted repo
+            # is self-consistent, and another DURABLE clone is a supported layout.
             misdirected.append((skill_name, os.path.realpath(dst)))
 
     # Dangling links whose skill is NOT in this repo are missed by the loop
