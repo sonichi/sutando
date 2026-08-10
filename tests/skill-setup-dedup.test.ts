@@ -1,28 +1,5 @@
-/**
- * Regression: a skill scanned from TWO roots must register its setup() hook ONCE.
- *
- * The bug: loadSkillManifestTools() collected setup() hooks in a plain array, one
- * push per scanned copy. The same skill present in two scan roots (public /
- * workspace / private / external-plugin / sibling checkout) therefore attached its
- * session handler twice — e.g. talk-highlight's turn.end driver advancing a slide
- * two steps per turn. The fix keys the hooks by stable skill identity
- * (manifest.name || dirName) so same-skill copies collapse last-write-wins, while
- * two DIFFERENT skills each exporting setup() both survive.
- *
- * This exercises the REAL loader: fixtures are injected through
- * SUTANDO_EXTERNAL_PLUGIN_DIRS (an os.pathsep-separated list of plugin checkouts
- * the loader already scans), so no production seam is added for the test's sake.
- *
- * The loader runs at module scope (top-level await), so each case imports
- * src/inline-tools.ts in a CHILD process with the fixture env set — a same-process
- * import would be cached and could not vary the scan roots.
- *
- * Assertions filter to this fixture's own effects rather than counting
- * personalSkillSetups outright: the host's real skills/ dirs may legitimately
- * contribute setup() hooks, and this regression is about duplicates of ONE skill.
- *
- * Run: npx tsx --test tests/skill-setup-dedup.test.ts
- */
+// The loader runs at module scope, so each case imports inline-tools.ts in a
+// CHILD process; a cached same-process import could not vary the scan roots.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';

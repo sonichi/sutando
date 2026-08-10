@@ -1103,12 +1103,8 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // Split by manifest `access_tier` so phone-conversation can include
 // owner-tier tools only when the caller is the verified owner. Manifest
 // access_tier values: "owner" (default if omitted) | "any_caller".
-// SkillSetup: an OPTIONAL lifecycle hook a skill's tools.ts may export. Core
-// calls it once per voice session (after the session exists) with {session,
-// injectText} so the skill can register session-lifecycle handlers (e.g. a
-// turn.end driver) without importing core. Generic — any skill can use it; core
-// stays ignorant of what the skill does with the session. (Added 2026-06-11 for
-// the talk-highlight auto-advance driver; see voice-agent session-setup loop.)
+// OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
+// session so the skill registers session handlers without importing core.
 export type SkillSetupCtx = { session: unknown; injectText: (session: unknown, text: string) => void };
 export type SkillSetup = (ctx: SkillSetupCtx) => void;
 
@@ -1144,13 +1140,8 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];
 	const anyCaller: ToolDefinition[] = [];
-	// Keyed by stable skill identity (manifest.name || dirName) so the SAME skill
-	// scanned from two roots (public/workspace/private/external/sibling) registers
-	// its setup() hook ONCE, with the same last-write-wins precedence as the tool
-	// dedup below. Without this, a duplicated manifest across roots would attach
-	// the same session handler twice (e.g. talk-highlight's turn.end advancing a
-	// slide twice). Identity is the skill, not the tool name: two DIFFERENT skills
-	// each exporting setup() both survive — only same-skill copies collapse.
+	// Keyed by skill identity (manifest.name || dirName), not tool name: the same
+	// skill scanned from two roots must attach its handler ONCE, last-write-wins.
 	const setups = new Map<string, SkillSetup>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
@@ -1185,11 +1176,8 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
 				if (typeof mod.setup === 'function') {
-					// Log the DISCOVERY here (naming the root, which is what you need when
-					// debugging a duplicate) — never the registration. The same skill found
-					// in N roots hits this line N times but registers ONCE, so claiming
-					// "registered" here overstates it by exactly the factor the dedupe
-					// removes. The authoritative count is logged after the scan.
+					// DISCOVERY, not registration: a skill in N roots hits this line N times
+					// but registers once. The authoritative count is logged after the scan.
 					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
 					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
 				}
@@ -1227,9 +1215,8 @@ const personalAllTools = (() => {
 export const envDependentToolNames: ReadonlySet<string> = new Set([
 	...personalAllTools.map(t => t.name), 'slide_control', 'fullscreen',
 ]);
-// Lifecycle hooks exported by personal skills (e.g. talk-highlight auto-advance).
-// voice-agent invokes each once per session with {session, injectText}. Empty
-// when no skill exports setup(). See SkillSetup type above.
+// voice-agent invokes each once per session with {session, injectText}.
+// Empty when no skill exports setup().
 export const personalSkillSetups: SkillSetup[] = personalTools.setups;
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.

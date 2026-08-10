@@ -1190,12 +1190,8 @@ async function main() {
 		console.log(`${ts()} [VoiceSession] user interrupt detected — userHasInterrupted=true`);
 	});
 
-	// Generic skill-lifecycle hook: give each personal skill that exported a
-	// setup() the live session + injectText so it can register session handlers
-	// (e.g. talk-highlight's turn.end auto-advance driver) WITHOUT importing core.
-	// Core stays ignorant of what the skill does; talk-specific logic lives in the
-	// skill. Empty when no skill exports setup(). Each call is guarded so a buggy
-	// skill setup can't break session bootstrap. (Added 2026-06-11.)
+	// Give each skill's setup() the live session so it registers handlers without
+	// importing core. Guarded: a buggy setup must not break session bootstrap.
 	for (const skillSetup of personalSkillSetups) {
 		try { skillSetup({ session, injectText }); }
 		catch (err) { console.error(`${ts()} [skill-setup] hook threw:`, err instanceof Error ? err.message : err); }
