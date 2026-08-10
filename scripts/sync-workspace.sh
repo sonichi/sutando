@@ -1401,21 +1401,12 @@ cmd_default_bidirectional() {
     fi
     acquire_lock
     _pull_only_impl || true   # pull failures shouldn't block push
-    # `|| _rc=$?`, NOT a bare call then `$?`. This file runs under `set -euo
-    # pipefail` and `cmd_default_bidirectional` is invoked bare from the case
-    # dispatch, so a non-zero `_push_only_impl` terminates the function AT THAT
-    # CALL — before the rc is captured and before the reporter below runs. The
-    # diagnostic would be skipped exactly when it matters most: a pull that
-    # preserved incoming content followed by a failed push. (qingyun-wu, #2662 P2.)
+    # `|| _rc=$?`, NOT a bare call then `$?`: under `set -e` a non-zero
+    # `_push_only_impl` would exit before the reporter below ever runs.
     local _rc=0
     _push_only_impl || _rc=$?
-    # `_resolve_conflicts_keep_ours` preserves every discarded incoming file, so
-    # nothing is unrecoverable — but recoverable only helps if somebody looks,
-    # and until now nothing said when a preserved file still held content the
-    # live copy lacked. Reported here rather than resolved differently: a union
-    # merge would never lose a line, but it resurrects an in-place retraction
-    # directly beneath its own correction, where it reads as current. Losing
-    # recoverably beats corrupting silently.
+    # Report rather than auto-merge: a union merge loses no line but resurrects
+    # an in-place retraction beneath its own correction, where it reads as current.
     _report_unmerged_conflicts || true   # fail-open: never change sync's outcome
     return "$_rc"
 }

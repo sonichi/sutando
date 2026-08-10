@@ -111,13 +111,10 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("subset.md", r.stdout)
 
     def test_a_SINGLE_real_added_line_IS_reported(self):
-        """The P1 the line-count threshold hid (qingyun-wu, #2662).
+        """A SINGLE added line is reported.
 
-        One extra line is the archetypal loss this tool exists to catch -- a
-        fact, a bullet, a corrected number. The previous `TRIVIAL_LINES = 3`
-        rule called it noise and exited 0. The old assertion in this slot
-        (`a trivial line difference is NOT reported`) ENCODED that bug, which is
-        why the suite went green over it.
+        One extra line -- a fact, a bullet, a corrected number -- is the
+        archetypal loss, and a line-count threshold calls it noise.
         """
         self._pair("note.md", "keep\n", "keep\nimportant new fact\n")
         r = self._run()
@@ -140,23 +137,10 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("indent.md", r.stdout)
 
     def test_SWAPPED_SECTIONS_are_reported(self):
-        """john-the-dev's #2662 blocker: a policy inversion read as clean.
+        """Swapped sections are reported.
 
-        Every line and every heading appears on BOTH sides — only the
-        ASSOCIATION between them changed. A global line set and a global
-        normalised haystack prove text exists somewhere and discard order and
-        heading association entirely, so an access-policy inversion was
-        completely unmerged while the reporter exited 0.
-
-            live:   ## Allowed / - Alice / ## Denied / - Bob
-            saved:  ## Allowed / - Bob   / ## Denied / - Alice
-
-        (`_pair` takes live FIRST, then saved — the inversion is symmetric, so
-        the direction does not change the assertion, but the labels should not
-        lie about which side is which.)
-
-        This is the reason presence is now keyed to the nearest preceding
-        heading. No set-membership test can see it.
+        Every line and heading appears on BOTH sides; only the association
+        changed, which a global presence test cannot see.
         """
         self._pair("access.md",
                    "## Allowed\n- Alice\n## Denied\n- Bob\n",
@@ -166,7 +150,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("access.md", r.stdout)
 
     def test_the_same_KEY_under_DIFFERENT_sections_is_reported(self):
-        """The generalisation john named alongside the swap.
+        """The same KEY under DIFFERENT headings is reported.
 
         Repeated keys/bullets under different headings fail identically: both
         values are globally present, so only the section binding distinguishes
@@ -251,7 +235,7 @@ class TestSyncConflictsReport(unittest.TestCase):
     def test_the_split_is_the_OLD_global_rule_so_the_buckets_are_meaningful(self):
         """`under another heading` == what the pre-section-scoping version called
         clean. Pinning that keeps the second bucket interpretable: it is exactly
-        the set john-the-dev's blocker made visible, not an arbitrary category.
+        the set section-scoping made visible, not an arbitrary category.
         """
         import importlib.util
         spec = importlib.util.spec_from_file_location("rep", SCRIPT)
@@ -265,18 +249,9 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(moved, ["the peer fact"])
 
     def test_a_saved_line_that_is_a_PARTIAL_SUBSTRING_of_live_text_still_reports(self):
-        """The collision control (qingyun-wu, #2662).
+        """A saved line that is a PARTIAL SUBSTRING of live prose is reported.
 
-        The reflow check asks whether the saved line's text already exists in
-        the live copy. With a raw substring search, any saved line that happens
-        to sit inside unrelated live prose reads as "already merged":
-
-            saved  'The peer fact'
-            live   'The peer facts are documented elsewhere.'   -> false CLEAN
-
-        That is a false negative in the discriminator this whole PR exists to
-        make trustworthy. Matching is now space-padded on both sides, so
-        containment lands on word boundaries.
+        Raw substring matching would read it as already merged.
         """
         self._pair("collide.md",
                    "The peer facts are documented elsewhere.\n",
@@ -286,7 +261,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("collide.md", r.stdout)
 
     def test_live_text_that_gained_TRAILING_PUNCTUATION_is_not_reported(self):
-        """Regression on my own first boundary fix, found on live data.
+        """Live text that gained TRAILING PUNCTUATION is not reported.
 
         Space-padding the match over-tightened it: a live line that is the saved
         text plus a period (and an annotation) then read as ABSENT, though the
@@ -383,17 +358,10 @@ class TestSyncConflictsReport(unittest.TestCase):
         (d / name).write_text(text)
 
     def test_retiring_one_batch_leaves_ANOTHER_batchs_copy_reporting(self):
-        """john-the-dev's activated repro (#2662).
+        """Retiring one batch leaves another batch's copy reporting.
 
-        Two batches hold the same relative path: batch-a's copy is merged,
-        batch-b's is never-merged. The first selector matched on BASENAME across
-        every batch, so `--retire note.md` retired both and turned exit 1 into a
-        permanent false-clean — silencing content the operator never saw.
-
-        The content digest in the retire key protects a copy created LATER; it
-        does nothing about a distinct copy already on disk. My own comment on
-        that key called a permanent false negative "the worse of the two", and
-        the selector shipped exactly that.
+        Two batches hold the same relative path; a basename-wide selector
+        would retire both and turn exit 1 into a permanent false clean.
         """
         self._pair("note.md", "base\nmerged fact\n", "base\nmerged fact\n")
         self._second_batch("note.md", "base\nNEVER MERGED fact\n")
@@ -431,15 +399,10 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(self._run().returncode, 1, "bare --retire mutated state")
 
     def test_merged_then_RETRACTED_content_stays_silent_once_retired(self):
-        """The lifecycle john-the-dev activated (#2662 P1).
+        """Merged-then-retracted content stays silent once retired.
 
-        Merged and later deliberately retracted is INDISTINGUISHABLE on disk
-        from never-merged -- both end with the line absent from the live copy --
-        so `_new_content()` cannot separate them by content at any level of
-        cleverness. Without a retire record the reporter re-flags every
-        legitimate correction on every sync, forever, which is the same sin this
-        PR cites when rejecting union merges: a withdrawn claim must not be
-        resurrected, including as a nag.
+        It is indistinguishable on disk from never-merged, so only the
+        retirement record separates them.
         """
         self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
         self.assertEqual(self._run().returncode, 0, "identical copies should be silent")
@@ -474,10 +437,11 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("note.md", r.stdout)
 
     def test_retire_works_while_the_entry_is_SILENT_not_only_while_reporting(self):
-        """Regression on my own first implementation, which scanned only the
-        currently-reporting set. The operator retires right AFTER merging, when
-        the entry is silent — so that version could never record the case it
-        exists for, and printed 'nothing matched'."""
+        """Retire works while the entry is SILENT.
+
+        The operator retires right AFTER merging, when the live copy already
+        matches, so a retire limited to the reporting set could never fire.
+        """
         self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
         out = self._retire(f"{self.batch.name}/memory/note.md").stdout
         self.assertIn("retired 1", out, out)

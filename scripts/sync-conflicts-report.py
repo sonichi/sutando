@@ -1,34 +1,8 @@
 #!/usr/bin/env python3
 """Report peer content that sync discarded and nobody has merged back.
 
-`_resolve_conflicts_keep_ours` resolves every conflict by keeping the local
-version and preserving the incoming one under `<git-dir>/sutando-sync-conflicts/`.
-That is the right default -- it is recoverable, whereas a union merge would
-never lose a line but would resurrect an in-place retraction next to its own
-correction, which reads as current (demonstrated 2026-08-05).
-
-Recoverable only helps if someone looks. Measured on Chis-MacBook-Pro the same
-day: 13 preserved files, of which 6 were strict SUBSETS of the local copy (zero
-loss -- keeping ours was correct), 1 was a legacy flat path retired by #2567,
-and 5 carried real peer content that had sat unmerged for hours. Nothing
-reported the difference, so the count of batches looked alarming and the count
-that mattered was invisible.
-
-WHY NOT A LINE-COUNT THRESHOLD. The first version ignored diffs of <= 3 lines as
-"reformatting noise". qingyun-wu reproduced the hole: a peer copy one line longer
--- `important new fact` -- reported clean. Line count cannot separate a reflow
-from a short, meaningful addition, and the short addition is exactly what this
-tool exists to catch.
-
-It was not hypothetical. Re-classifying the 13 by CONTENT moved two files out of
-"trivial" and into real loss (3 -> 5), including a `MEMORY.md` overflow cap and
-two lines documenting a send-syntax trap. My own earlier analysis had called both
-noise on the strength of their line count.
-
-The discriminator is presence, not size: a reflow re-lays-out text that still
-EXISTS in the live copy, so its content is found there under whitespace
-normalisation. Genuinely new content is absent at any length. One line of new
-text is reported; a hundred lines of pure re-wrapping are not.
+Classify by presence, not size: a reflow's text still exists in the live copy
+under whitespace normalisation, while new content is absent at any length.
 """
 import hashlib
 import json
@@ -38,10 +12,8 @@ import subprocess
 import sys
 import time
 
-# REPO root, to import the resolver from src/ — not a workspace path. The
-# line-scoped pragma is the sanctioned form: it exempts this one line and leaves
-# every other line in the file visible to the lint, unlike a file-level
-# allowlist entry (which #2639 showed is a blind spot, not an exemption).
+# REPO root, not a workspace path. The line-scoped pragma exempts only this
+# line; a file-level allowlist entry would blind the lint to the whole file.
 ROOT = pathlib.Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(ROOT / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
@@ -66,55 +38,22 @@ def _new_content(saved: str, live: str) -> "list[str]":
     """Lines in the preserved copy whose TEXT is absent from the live copy
     IN THE SAME SECTION.
 
-    Whitespace-normalised on both sides, so re-wrapping, re-indenting and
-    trailing-space churn all resolve to "already present" — the reflow case the
-    old line-count threshold was reaching for, without its blindness to a single
-    real line.
-
-    SECTION-SCOPED, and that is the fix for john-the-dev's #2662 blocker. The
-    previous version tested presence against a GLOBAL line set and a global
-    normalised haystack, which proves the text exists SOMEWHERE and discards
-    order and heading association entirely. A peer access-policy change was
-    therefore invisible:
-
-        saved:  ## Allowed / - Alice / ## Denied / - Bob
-        live:   ## Allowed / - Bob   / ## Denied / - Alice
-        -> []            every line is present globally; the POLICY inverted
-
-    Both names and both headings appear on both sides, so a set-membership test
-    can never see it. Keying each line to its nearest preceding heading does,
-    and it generalises to the repeated-keys-under-different-sections case from
-    the same review.
-
-    Two limits, stated because a discriminator whose blind spots are unwritten
-    is the thing this PR exists to stop being:
-
-      * If the saved line's heading is ABSENT from live (a renamed or deleted
-        section) the check falls back to the global search for that line. A
-        rename would otherwise report every line beneath it as unmerged, which
-        is a false-positive class these files would hit constantly. Measured,
-        `## Notes` -> `## Note` reports the HEADING line only (its text really
-        is absent) and correctly stays quiet about the body beneath it. The
-        cost is that a rename AND a swap together can still hide.
-      * Pure REORDERING of identical lines within one section is not detected —
-        both sides hold the same (heading, line) pairs. Sequence-preservation
-        would catch it; section context is the axis this fix chose.
+    Section-scoped because a global presence test discards heading association,
+    so an inverted policy (the same names swapped between two headings) reads as
+    clean. Two blind spots remain: a saved line whose heading is absent from live
+    falls back to a global search, and pure reordering within one section is
+    undetected.
     """
-    # Space-PADDED on both sides so the containment test lands on word
-    # boundaries. A raw substring search reports clean whenever a saved line
-    # happens to sit inside unrelated live text -- `The peer fact` is a
-    # substring of `The peer facts are documented elsewhere`, so a genuinely
-    # unmerged line was treated as present. That is a false CLEAN in the
-    # discriminator this PR exists to make trustworthy. (qingyun-wu, #2662.)
+    # Word-boundary matching, not raw substring: `The peer fact` sits inside
+    # `The peer facts ...`, which would report an unmerged line as present.
     haystack = " ".join(live.split())          # global fallback (renamed section)
     live_pairs = set()
     live_lines_by_section: "dict[str, list[str]]" = {}
     for head, line in _by_section(live):
         live_pairs.add((head, line))
         live_lines_by_section.setdefault(head, []).append(line)
-    # One normalised haystack PER section, so the reflow negative keeps working
-    # inside a section without letting text from another section vouch for a
-    # line that moved out of this one.
+    # One haystack PER section, so text elsewhere cannot vouch for a line that
+    # moved out of this one.
     live_haystacks = {
         h: " ".join(" ".join(ls).split()) for h, ls in live_lines_by_section.items()
     }
@@ -123,25 +62,11 @@ def _new_content(saved: str, live: str) -> "list[str]":
         if not line.strip() or (head, line) in live_pairs:
             continue
         needle = " ".join(line.split())
-        # Section present in live -> judge strictly within it. Section absent
-        # (renamed/deleted) -> fall back to the global haystack rather than
-        # reporting every line beneath a renamed heading. Bound to a LOCAL name:
-        # rebinding `haystack` here would leak one section's scope into every
-        # later iteration.
+        # Absent section falls back to the global haystack. LOCAL name:
+        # rebinding `haystack` would leak this section's scope into later ones.
         hay = live_haystacks.get(head, haystack)
-        # Boundary = a NON-WORD character (or the string edge), not specifically
-        # a space. Space-padding was the first attempt and it over-tightened: a
-        # live line that gained trailing punctuation or was extended mid-sentence
-        # then read as absent. Found on real data — a memory index entry whose
-        # live copy is the saved text plus a period and an annotation was
-        # reported missing, though the content is fully present.
-        #
-        #   saved  '... match the body'
-        #   live   '... match the body. *(Restored 2026-08-04 ...)*'
-        #
-        # `\w` boundaries keep qingyun-wu's collision case reported --
-        # `The peer fact` inside `The peer facts` is followed by `s`, a word
-        # character -- while treating punctuation as a legitimate boundary.
+        # Boundary is any NON-WORD character, not a space: a live line that
+        # gained trailing punctuation would otherwise read as absent.
         if re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", hay):
             continue  # same text, laid out differently
         out.append(line)
@@ -151,17 +76,9 @@ def _new_content(saved: str, live: str) -> "list[str]":
 def _split_by_reason(extra: "list[str]", live: str) -> "tuple[list[str], list[str]]":
     """Split reported lines into (absent-entirely, present-under-another-heading).
 
-    Section-scoping is what catches john-the-dev's swap, and it necessarily also
-    reports a line that merely MOVED between headings — the text is present, the
-    association is not. Those two cases need different human responses and the
-    old count could not tell them apart, so the report said "5 lines" and the
-    operator had to open the file to learn whether anything was actually lost.
-
-    Nothing is suppressed here. The second bucket is NOT benign: a policy
-    inversion IS a line appearing under a different heading, which is the whole
-    point of the fix. It is labelled, not filtered, so the swap still reports
-    and a re-section still reports — the operator just learns which they have
-    before opening anything.
+    Section-scoping also reports a line that merely MOVED between headings: the
+    text is present, the association is not. The second bucket is labelled, not
+    filtered -- a policy inversion IS a line under a different heading.
 
     The test is deliberately the OLD global-haystack rule, so the second bucket
     is exactly "what the pre-section-scoping version would have called clean".
@@ -203,16 +120,9 @@ def _entry_key(batch: str, rel: pathlib.PurePath, saved_text: str) -> str:
 def unmerged(workspace: pathlib.Path):
     if not workspace.is_dir():
         return None, f"no such directory: {workspace}"
-    # `git rev-parse` SEARCHES ANCESTORS. Pointing it at a non-repo directory
-    # that merely sits inside one succeeds and answers about the ANCESTOR --
-    # so a workspace that was never `--init`ed reports "no unmerged peer
-    # content" about somebody else's repository. Caught by running this from a
-    # PR worktree, where the fallback workspace exists but is not a repo and
-    # git happily returned the worktree's own git dir.
-    # ONE rev-parse for both answers. A second `--git-dir` call cannot fail once
-    # `--show-toplevel` has succeeded on the same path, so its error branch was
-    # unreachable — dead code that the coverage gate correctly refused to accept
-    # as covered (john-the-dev, #2662).
+    # `git rev-parse` SEARCHES ANCESTORS, so a non-repo workspace answers about
+    # its ancestor -- hence the toplevel-equality check below. ONE rev-parse for
+    # both answers: `--git-dir` cannot fail once `--show-toplevel` succeeded.
     rp = subprocess.run(
         ["git", "-C", str(workspace), "rev-parse", "--show-toplevel", "--git-dir"],
         capture_output=True, text=True,
@@ -240,14 +150,8 @@ def unmerged(workspace: pathlib.Path):
                 continue
             saved_text = saved.read_text(errors="replace")
             rel = saved.relative_to(batch)
-            # A RETIRED entry stays silent whatever the live file does later.
-            # Without this the reporter has no way to tell "never merged" from
-            # "merged, then deliberately retracted" -- the end states are
-            # identical on disk -- so a legitimate correction would be flagged
-            # as missing content on every 30-minute sync, forever. That is the
-            # exact failure this PR cites when rejecting a union merge:
-            # a withdrawn claim must not be resurrected, including as a nag.
-            # (john-the-dev, #2662 P1.)
+            # A RETIRED entry stays silent whatever the live file does later:
+            # "never merged" and "merged then retracted" are identical on disk.
             if _entry_key(batch.name, rel, saved_text) in retired:
                 continue
             live = workspace / rel
@@ -273,14 +177,9 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
     exactly ONE preserved copy; zero matches, an ambiguous match, or no target at
     all mutates nothing and returns an error.
 
-    The first version matched on basename OR relpath across EVERY batch, so
-    `--retire note.md` retired batch-a's merged copy AND batch-b's never-merged
-    copy, turning exit 1 into a permanent false-clean; bare `--retire` retired
-    everything for the same reason (empty targets read as "match all"). The
-    content digest in the key protects a LATER copy, not a distinct copy already
-    on disk. My own comment on that key called a permanent false negative "the
-    worse of the two" — and the selector shipped exactly that.
-    (john-the-dev, #2662.)
+    The key is batch-qualified and digest-bearing: a basename-or-relpath match
+    across batches would retire another batch's never-merged copy, and empty
+    targets would read as "match all". The digest protects a LATER copy only.
     """
     _, err = unmerged(workspace)          # reuse its validation of the workspace
     if err:
@@ -293,12 +192,8 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
     root = root / "sutando-sync-conflicts"
     if not root.is_dir():
         return [], None
-    # Scan EVERY preserved copy, not just the ones currently reporting. The
-    # operator retires right after merging, when the live file already matches
-    # and the entry is therefore silent -- so a retire limited to the reporting
-    # set could never record the case it exists for, and the first later
-    # retraction would resurrect it. (Caught by activating john-the-dev's
-    # sequence before pushing: step 2 printed "nothing matched".)
+    # Scan EVERY preserved copy, not just reporting ones: the operator retires
+    # right after merging, when the entry is already silent.
     if not targets:
         return None, ("--retire needs an explicit <batch>/<path> selector; "
                       "refusing to retire everything")
@@ -339,12 +234,8 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
 
 
 def main() -> int:
-    # No positional arg -> the canonical resolver, never Path.cwd(). A reporter
-    # about workspace state that guessed the workspace from the caller's cwd
-    # would answer about whichever directory happened to invoke it -- and the
-    # cron path invokes it from the repo, not the workspace. `migrate=False`
-    # because this is a read-only diagnostic: it must never trigger a migration
-    # as a side effect of being asked a question. (bassilkhilo-ag2, #2662.)
+    # No positional arg -> canonical resolver, never Path.cwd(): the cron path
+    # invokes this from the repo. `migrate=False` -- read-only diagnostic.
     argv = sys.argv[1:]
     targets: "list[str]" = []
     if "--retire" in argv:
