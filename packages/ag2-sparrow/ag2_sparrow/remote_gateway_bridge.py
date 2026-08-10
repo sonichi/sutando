@@ -187,6 +187,7 @@ from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
 from .result_ready import read_ready_result
+from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -280,6 +281,9 @@ INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
 TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
+# Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
+# fresh local id, but the delivery it answers is still the original one.
+DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 # sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
@@ -1627,6 +1631,54 @@ def _write_task(task: dict) -> str | None:
     return tid
 
 
+def _load_dedup_aliases() -> "dict[str, str] | None":
+    """The alias map, or None when it exists but cannot be read.
+
+    None is not the same as empty: guessing "no alias" for an unreadable
+    ledger POSTs a recovered answer under the re-ask id, which the broker is
+    not waiting on.
+    """
+    if not DEDUP_ALIAS_FILE.exists():
+        return {}
+    try:
+        loaded = json.loads(DEDUP_ALIAS_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        _log(f"dedup alias ledger unreadable ({exc}) — deferring")
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _save_dedup_aliases(aliases: dict[str, str]) -> bool:
+    """Atomically persist the alias map. Returns False if it did not commit.
+
+    Unlike the neighbouring sidecars this one is delivery-critical, so the
+    caller must not retire the original delivery until it returns True.
+    """
+    try:
+        DEDUP_ALIAS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DEDUP_ALIAS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(aliases, sort_keys=True))
+        os.replace(tmp, DEDUP_ALIAS_FILE)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"dedup alias persist FAILED ({exc}) — keeping original delivery")
+        return False
+
+
+def _delivery_tid(tid: str) -> "str | None":
+    """The id to POST under, or None when the ledger cannot be read."""
+    aliases = _load_dedup_aliases()
+    return None if aliases is None else aliases.get(tid, tid)
+
+
+def _forget_dedup_alias(tid: str) -> None:
+    aliases = _load_dedup_aliases()
+    if aliases is None:
+        return
+    if aliases.pop(tid, None) is not None:
+        _save_dedup_aliases(aliases)  # cleanup: a stale entry is harmless
+
+
 def _load_task_rooms() -> dict[str, str]:
     """Restore the {task id → room id} sidecar map (fail-open to empty)."""
     try:
@@ -1749,6 +1801,35 @@ def _save_inflight(inflight: set[str]) -> None:
 _uploaded_attachments: set[tuple[str, str]] = set()
 
 
+def _dedup_plan(tid: str, holder_id: str | None):
+    """Shared dedup recovery, bound to this adapter's directories.
+
+    A requeue carries the delivery forward: the re-ask keeps the room, stays
+    in flight, and aliases back to the id the broker is waiting on. Without
+    that the re-ask is written and its answer is never looked for.
+    """
+    room = _load_task_rooms().get(tid, "")
+
+    def _commit(new_id: str) -> bool:
+        """Persist routing for the re-ask before it becomes visible."""
+        delivery = _delivery_tid(tid)
+        aliases = _load_dedup_aliases()
+        if delivery is None or aliases is None:
+            return False
+        aliases[new_id] = delivery
+        if not _save_dedup_aliases(aliases):
+            return False
+        rooms = _load_task_rooms()
+        rooms[new_id] = room
+        _save_task_rooms(rooms)
+        return True
+
+    action, payload = plan_dedup_recovery(
+        RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
+        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+    return action, payload, room
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -1764,6 +1845,38 @@ def _post_ready_results(inflight: set[str]) -> None:
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip and skip.value == "deduped":
+            action, payload, room = _dedup_plan(tid, skip.extra)
+            if action == "defer":
+                # Nothing was retired; the next pass retries the whole decision.
+                _log(f"dedup deferred for {tid} — alias not committed")
+                continue
+            if action != "honour":
+                if action == "report":
+                    # The results endpoint is keyed by delivery id; an empty
+                    # room map must not turn the report into a silent drop.
+                    _delivery = _delivery_tid(tid)
+                    if _delivery is None:
+                        _log(f"dedup report deferred for {tid} — ledger unreadable")
+                        continue
+                    try:
+                        _req("POST", "/v1/results",
+                             {"id": _broker_tid(_delivery), "body": payload})
+                    except (urllib.error.URLError, urllib.error.HTTPError,
+                            TimeoutError) as exc:
+                        # The report IS the delivery here. Archiving now would
+                        # strand the ask exactly as the unreported dedup did.
+                        _log(f"dedup report POST failed for {tid}: {exc} — will retry")
+                        continue
+                _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
+                _archive_result(rfile, tid)
+                inflight.discard(tid)
+                _forget_task_room(tid)
+                _forget_dedup_alias(tid)
+                if action == "requeue":
+                    inflight.add(payload)
+                changed = True
+                continue
         if skip:
             # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
             # archive without POSTing (match the other bridges' semantics).
@@ -1805,7 +1918,12 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": _broker_tid(tid), "body": out_body})
+            _delivery = _delivery_tid(tid)
+            if _delivery is None:
+                _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                continue
+            _req("POST", "/v1/results",
+                 {"id": _broker_tid(_delivery), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
@@ -1815,6 +1933,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         _archive_result(rfile, tid)
         inflight.discard(tid)
         _forget_task_room(tid)
+        _forget_dedup_alias(tid)
         changed = True
         _log(f"delivered result for {tid}")
     if changed:
