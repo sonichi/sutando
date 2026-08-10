@@ -10,7 +10,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +52,30 @@ describe('last-ditch workspace parity between the TS and Python resolvers', () =
 			`last-ditch must be one path segment, got ${LAST_DITCH_WORKSPACE_REL}`);
 		assert.ok(!LAST_DITCH_WORKSPACE_REL.startsWith('.'),
 			`last-ditch must not be a hidden dotdir, got ${LAST_DITCH_WORKSPACE_REL}`);
+	});
+
+	it('the PRODUCTION branch returns it — not just the constant', () => {
+		// Copies the module to a config-less dir so findRepoRoot() (which walks from the
+		// MODULE's own path, not cwd) returns undefined and the last-ditch branch runs.
+		const bare = mkdtempSync(join(tmpdir(), 'sutando-lastditch-'));
+		try {
+			copyFileSync(join(REPO, 'src', 'sutando_config.ts'), join(bare, 'cfg.ts'));
+			const probe = join(bare, 'probe.ts');
+			writeFileSync(probe,
+				"import { resolveWorkspace } from './cfg.js';\n" +
+				"process.stdout.write(resolveWorkspace());\n");
+			const env = { ...process.env };
+			delete env.SUTANDO_WORKSPACE;
+			delete env.SUTANDO_DEFAULT_WORKSPACE;
+			const got = execFileSync(join(REPO, 'node_modules', '.bin', 'tsx'), [probe],
+				{ cwd: bare, env, encoding: 'utf-8' }).trim();
+			assert.equal(resolve(got), resolve(join(homedir(), LAST_DITCH_WORKSPACE_REL)),
+				`resolveWorkspace() returned ${got}; the branch does not use the constant`);
+			assert.equal(resolve(got), resolve(pythonLastDitch()),
+				`resolveWorkspace() returned ${got}, Python returns ${pythonLastDitch()}`);
+		} finally {
+			rmSync(bare, { recursive: true, force: true });
+		}
 	});
 
 	it('the branch is reachable, not dead code', () => {
