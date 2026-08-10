@@ -168,8 +168,7 @@ class TestInsightPriority(unittest.TestCase):
         self.assertIn("Sutando's Echo Act IV Mini instance shipped 2 commits", insight)
 
     def test_shipped_requires_that_the_commits_actually_landed(self):
-        """`--branches` spans UNMERGED work, so the count alone cannot say "shipped".
-        Reported 43 "shipped" on 2026-08-09 when 1 had landed and 42 sat on branches."""
+        """`--branches` spans UNMERGED work, so the count alone cannot say "shipped"."""
         base = {"commits_24h": 43, "top_dirs": [("tests", 9)], "stand": ""}
         none_landed = self.mod.dev_activity_insight({**base, "landed_24h": 0})
         self.assertNotIn("shipped", none_landed)
