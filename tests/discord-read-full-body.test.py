@@ -21,11 +21,13 @@ the bug.
 default is unchanged: clipping still applies, because the scan case is the common
 one and 200 chars is the right length for it.
 """
-import ast
+import contextlib
 import importlib.util
+import io
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "discord-read.py"
@@ -44,8 +46,9 @@ except SystemExit:
 LONG = "A" * 260 + "NEEDLE_PAST_THE_CLIP" + "B" * 300
 
 
-def msg(content, author="Sutando-Mini"):
-    return {"content": content, "author": {"username": author}}
+def msg(content, author="Sutando-Mini", mid="1000"):
+    # `id` is required: main() sorts the batch by int(m["id"]).
+    return {"id": mid, "content": content, "author": {"username": author}}
 
 
 class FullBody(unittest.TestCase):
@@ -84,13 +87,37 @@ class FullBody(unittest.TestCase):
                                                   "author": {"username": "x"}}}]}
         self.assertIn("NEEDLE_PAST_THE_CLIP", dr._render(fwd))
 
-    def test_the_flag_is_actually_wired_into_both_call_sites(self):
-        """The function can be correct while main() never passes the flag through —
-        the parse-only version of this change would leave the CLI unaffected."""
-        src = SCRIPT.read_text()
-        self.assertIn('"--full"', src)
-        self.assertIn("None if args.full else CLIP", src)
-        self.assertIn("None if args.full else REPLY_CLIP", src)
+    def _run_main(self, argv, messages):
+        """Drive main() with the network stubbed, and capture what it prints.
+
+        Asserting the wiring as a source literal (`"None if args.full else CLIP" in
+        src`) is what the first draft of this test did. That form breaks on
+        reformatting and passes on a call site that is present but wrong, so it
+        tests the text rather than the behaviour. Driving main() is the version that
+        actually fails when the flag is not threaded through.
+        """
+        buf = io.StringIO()
+        with mock.patch.object(dr, "_fetch", return_value=messages), \
+             mock.patch.object(dr, "_load_token", return_value="token"), \
+             contextlib.redirect_stdout(buf):
+            dr.main(argv)
+        return buf.getvalue()
+
+    def test_main_clips_by_default(self):
+        out = self._run_main(["123"], [msg(LONG)])
+        self.assertNotIn("NEEDLE_PAST_THE_CLIP", out)
+
+    def test_main_under_full_prints_the_whole_body(self):
+        """The end-to-end pin: fails if the flag exists but main() never passes it."""
+        out = self._run_main(["123", "--full"], [msg(LONG)])
+        self.assertIn("NEEDLE_PAST_THE_CLIP", out)
+
+    def test_main_under_full_also_lifts_the_reply_target(self):
+        ref = {"content": LONG, "author": {"username": "sonichi"}}
+        m = {"id": "1001", "content": "2 merge", "author": {"username": "sonichi"},
+             "referenced_message": ref}
+        self.assertNotIn("NEEDLE_PAST_THE_CLIP", self._run_main(["123"], [m]))
+        self.assertIn("NEEDLE_PAST_THE_CLIP", self._run_main(["123", "--full"], [m]))
 
     def test_argparse_accepts_it(self):
         args = dr._parse_args(["123", "--full"])
