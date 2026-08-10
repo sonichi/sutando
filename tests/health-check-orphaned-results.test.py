@@ -105,15 +105,17 @@ class OrphanedResultsTest(unittest.TestCase):
         turns a real orphan into `ok` and nothing says the scan was incomplete.
         """
         self._write("results/task-stat.txt", TWO_HOURS_AGO)
-        task = self._write("tasks/task-stat.txt", TWO_HOURS_AGO)
-        real_stat = pathlib.Path.stat
 
-        def boom(self_p, *a, **k):
-            if self_p == task:
+        class _UnstatableTask:
+            # Only `.name` and `.stat()` are used by the probe. A stub keeps the
+            # failure on that one call; patching Path.stat globally also breaks
+            # Path.exists(), which calls it internally.
+            name = "task-stat.txt"
+
+            def stat(self, *a, **k):
                 raise OSError("EIO")
-            return real_stat(self_p, *a, **k)
 
-        with mock.patch.object(pathlib.Path, "stat", boom):
+        with mock.patch.object(hc, "find_task_file", return_value=_UnstatableTask()):
             result = hc.check_orphaned_results()
         self.assertEqual(result["status"], "warn", result)
         self.assertIn("unreadable", result["detail"])
