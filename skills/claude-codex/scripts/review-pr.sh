@@ -43,10 +43,8 @@ OUT="$(mktemp -t review-pr.XXXXXX)"
 VERDICT_MARKER="===CODEX-VERDICT==="
 trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
 
-# Mechanical checks — the deterministic, guide-driven scanners (today: hardcoded
-# paths) via the shared runner (supersedes the baked-in scanner from #2229; the
-# patterns live in REVIEW.md, not here). Captured now, emitted after the marker:
-# a consumer keeps only the post-marker text, so printing here would drop a FAIL.
+# Captured now, emitted AFTER the marker: a consumer keeps only post-marker text,
+# so printing here would drop a FAIL. Patterns live in REVIEW.md, not here.
 CHECKS_SH="$(cd "$HERE/../../.." && pwd)/scripts/review-checks.sh"
 MECH=""
 if [[ -x "$CHECKS_SH" ]]; then
