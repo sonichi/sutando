@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
-"""Coverage for the process-tap audio pipeline in src/screen-capture-server.py
-(issue #2314, diff-coverage gate).
-
-Exercises:
-  - _ffmpeg() — PATH hit, homebrew fallback, and not-found,
-  - _spawn_audio_captures() — tap alive (mix/system), tap dead → legacy
-    fallback, tap unbuildable → legacy fallback,
-  - _finalize_recording() — mux with sys+mic, sys-only, no-audio rename,
-    mux-failure rename, legacy passthrough,
-  - GET /capture-video?action=start — audio=mix registers tap+mic and records
-    video to *-video.mov; `on` aliases to mix; audio=mic keeps the legacy -g
-    flag; tap-fallback also lands on -g,
-  - GET /capture-video?action=stop — returns the muxed final path.
-
-No real audio, screencapture, swiftc, or ffmpeg: subprocess and the tap
-binary checks are mocked, so it runs headless.
-"""
+"""_ffmpeg/_spawn_audio_captures/_finalize_recording and the /capture-video
+audio-mode routing, headless (subprocess and the tap binary are mocked)."""
 import importlib.util
 import json
 import os

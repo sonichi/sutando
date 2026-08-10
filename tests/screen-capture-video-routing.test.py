@@ -263,9 +263,8 @@ class TestCaptureVideoRouting(unittest.TestCase):
             self._get("/capture-video?action=stop&silent=true", token=self.token)
         self.assertEqual(ctx.exception.code, 500)
         self.assertEqual(ctx.exception.headers.get_content_type(), "application/json")
-        # _finalize_recording kills the proc and continues on a wait()
-        # failure (shared cleanup path with the watchdog), so no video
-        # file ever lands and the outer empty-file check is what fires.
+        # _finalize_recording continues past a wait() failure, so no video
+        # lands and the outer empty-file check is what actually fires.
         self.assertEqual(
             json.loads(ctx.exception.read()),
             {"status": "error", "error": "recording produced no file"},

@@ -183,8 +183,8 @@ and re-run `python3 scripts/gen-src-map.py`.
 
 ## `src/audio-tap/`
 
-- **`build-audio-tap.sh`** — Build + ad-hoc-sign the sys-audio-tap helper (issue #2314).
-- **`sys-audio-tap.swift`** — sys-audio-tap — record system output audio to a WAV via a Core Audio process tap.
+- **`build-audio-tap.sh`** — Builds and ad-hoc-signs sys-audio-tap.
+- **`sys-audio-tap.swift`** — sys-audio-tap <out.wav> — records system audio via a Core Audio process tap until SIGINT/SIGTERM.
 
 ## `src/launchd/`
 

@@ -1,10 +1,6 @@
 #!/bin/bash
-# Build + ad-hoc-sign the sys-audio-tap helper (issue #2314).
-# Output: src/audio-tap/sys-audio-tap (gitignored binary; built on demand).
-#
-# The Info.plist is embedded into the binary (__TEXT,__info_plist) so the TCC
-# audio-capture prompt shows a proper usage description without needing an
-# .app bundle. Ad-hoc signing (-s -) is sufficient for the local TCC grant.
+# Builds and ad-hoc-signs sys-audio-tap. The Info.plist is embedded directly
+# into the binary (__TEXT,__info_plist) so the TCC prompt works without an .app bundle.
 set -euo pipefail
 cd "$(dirname "$0")"
 

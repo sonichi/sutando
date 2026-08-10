@@ -1,23 +1,5 @@
-// sys-audio-tap — record system output audio to a WAV via a Core Audio process tap.
-//
-// Usage: sys-audio-tap <out.wav>
-//   Records ALL system audio (every process, post-mix) until SIGINT/SIGTERM,
-//   then finalizes the file and exits 0.
-//
-// Why a tap (issue #2314): `screencapture -g` records the default INPUT device,
-// so system audio required routing output through BlackHole via a Multi-Output
-// device — which kills the macOS volume keys, and screencapture truncates the
-// aggregate to its first stereo pair anyway. A process tap (macOS 14.2+) reads
-// the output stream WITHOUT re-routing it: speakers stay the default output,
-// volume keys keep working, playback is unaffected (muteBehavior = .unmuted).
-//
-// Implementation notes (verified against SDK + AudioCap reference):
-// - CATapDescription(stereoGlobalTapButExcludeProcesses: []) taps everything.
-// - Audio is pulled with AudioDeviceCreateIOProcIDWithBlock on a private
-//   aggregate that contains the tap — NOT AVAudioEngine, which silently
-//   no-ops when retargeted at a tap aggregate.
-// - First run triggers the one-time TCC audio-capture prompt; the binary is
-//   ad-hoc signed with an embedded Info.plist (see build-audio-tap.sh).
+// sys-audio-tap <out.wav> — records system audio via a Core Audio process tap
+// until SIGINT/SIGTERM. Uses AudioDeviceCreateIOProcIDWithBlock — AVAudioEngine no-ops on a tap aggregate.
 
 import AVFoundation
 import CoreAudio

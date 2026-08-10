@@ -84,11 +84,8 @@ _active_recording = None  # {"proc": Popen, "path": str, "watchdog": threading.T
 _recording_lock = threading.Lock()
 MAX_RECORDING_SECONDS = 600  # safety cap for a recording nobody stopped
 
-# --- system-audio process tap (issue #2314) ----------------------------------
-# System audio is captured with a Core Audio process tap (src/audio-tap/), NOT
-# by re-routing output through a BlackHole Multi-Output device. The tap reads
-# the output stream in place: speakers stay the default output, volume keys
-# keep working, and the audio is lossless. The helper is built on demand.
+# System audio via a Core Audio process tap (src/audio-tap/), not a
+# BlackHole re-route — speakers stay the default output, volume keys work.
 TAP_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio-tap", "sys-audio-tap")
 TAP_BUILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio-tap", "build-audio-tap.sh")
 
@@ -114,10 +111,8 @@ def _ensure_tap_binary() -> bool:
 
 
 def _spawn_audio_captures(audio: str, base: str):
-    """Start system-tap and/or mic capture for mode `audio` (mix|system|mic).
-    Returns (tap_proc|None, mic_proc|None, fallback_to_legacy_mic: bool).
-    A tap that dies within its first ~0.7s (TCC denied / unsupported) triggers
-    graceful fallback to the legacy default-input path."""
+    """Returns (tap_proc|None, mic_proc|None, fallback_to_legacy_mic: bool).
+    A tap that dies within ~0.7s (TCC denied/unsupported) triggers fallback."""
     tap = mic = None
     if audio in ("mix", "system") and _ensure_tap_binary():
         try:
@@ -147,9 +142,8 @@ def _spawn_audio_captures(audio: str, base: str):
 
 
 def _finalize_recording(rec) -> str:
-    """Stop all capture processes and mux audio into the final clip.
-    Returns the path of the finished .mov. Shared by action=stop and the
-    watchdog so both produce identical results."""
+    """Stops all capture processes and muxes audio into the final .mov.
+    Shared by action=stop and the watchdog so both behave identically."""
     for key, sig_ in (("proc", signal.SIGINT), ("tap", signal.SIGINT), ("mic", signal.SIGINT)):
         p = rec.get(key)
         if p is not None:
@@ -413,9 +407,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if query.get("silent", ["false"])[0] != "true":
                     _signal_seeing()
                     _notify_capture()
-                # Default is the legacy -g/-G mic path (owner call 2026-07-26:
-                # the tap-mix default double-captured bot audio). ?audio=mix
-                # or =system opts into the process tap; "on" aliases "mix".
+                # Default is the legacy -g/-G mic path; ?audio=mix or =system
+                # opts into the process tap. "on" aliases "mix".
                 audio = query.get("audio", ["mic"])[0]
                 if audio == "on":
                     audio = "mix"
