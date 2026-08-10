@@ -73,7 +73,7 @@ def _reply_context(msg, clip=REPLY_CLIP):
         return None
     author = (ref.get("author") or {}).get("username", "?")
     body = " ".join((_render(ref, clip) or "").split())
-    return f"\u21b3 replying to {author}: {body[:clip] if clip else body}" if body else \
+    return f"\u21b3 replying to {author}: {body[:clip] if clip is not None else body}" if body else \
            f"\u21b3 replying to {author}: (no readable body)"
 
 
@@ -99,7 +99,7 @@ def _render(msg, clip=CLIP):
     body = (msg.get("content") or "").strip()
     snaps = msg.get("message_snapshots") or []
     if not snaps:
-        return body[:clip] if clip else body
+        return body[:clip] if clip is not None else body
     fwd = (snaps[0].get("message") or {})
     fwd_body = (fwd.get("content") or "").strip()
     extra = []

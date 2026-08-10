@@ -51,6 +51,13 @@ class FullBody(unittest.TestCase):
         for clip in (dr.CLIP, None):
             self.assertEqual(dr._render(msg("brief"), clip), "brief")
 
+    def test_clip_zero_clips_to_nothing(self):
+        """`clip` is public on two functions; a falsy test made 0 mean "no clip"."""
+        for fn_arg in (0, None, dr.CLIP):
+            got = dr._render(msg(LONG), fn_arg)
+            want = len(LONG) if fn_arg is None else fn_arg
+            self.assertEqual(len(got), want, f"clip={fn_arg}")
+
     def test_reply_targets_clip_independently_and_full_lifts_both(self):
         ref = {"content": LONG, "author": {"username": "sonichi"}}
         m = {"content": "2 merge", "author": {"username": "sonichi"},
