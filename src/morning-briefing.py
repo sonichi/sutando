@@ -339,9 +339,36 @@ def get_reminders() -> "list[str] | None":
             line = line.strip()
             if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
-        return items[:5]
+        return _demote_stale_reminders(items)[:5]
     except (subprocess.TimeoutExpired, OSError):
         return None
+
+
+# TWO years, not one: the due clause gives only year granularity, so `year_now - 1`
+# would demote a December item in January — one month overdue, not a year.
+_STALE_YEARS = 2
+# Anchored to the literal `(due` so a lowercase "due" in a TITLE cannot supply the year;
+# any 4-digit run, because an alternation of plausible years cannot match a corrupt one.
+_DUE_YEAR_RE = re.compile(r"\(due\b[^)]*?\b(\d{4})\b")
+
+
+def _reminder_due_year(line):
+    """The year in a reminder's `(due …)` clause, or None. Takes the LAST clause: the
+    real one is appended, so a title containing `(due …)` cannot win."""
+    m = _DUE_YEAR_RE.findall(line)
+    return int(m[-1]) if m else None
+
+
+def _demote_stale_reminders(items, now=None):
+    """Move reminders overdue by >= two calendar years to the END. Never drops; an
+    unparseable date keeps its position so a format change cannot bury a live one."""
+    year_now = (datetime.fromtimestamp(now) if now else datetime.now()).year
+    cutoff = year_now - _STALE_YEARS
+    fresh, stale = [], []
+    for it in items:
+        y = _reminder_due_year(it)
+        (stale if (y is not None and y <= cutoff) else fresh).append(it)
+    return fresh + stale
 
 
 def get_overnight_discord(now: float | None = None) -> list[str]:
