@@ -954,13 +954,13 @@ def classify(path: Path) -> str | None:
 
 
 
-# --- workspace-resolver stub arity (#2621) ----------------------------------
+# --- workspace-resolver stub arity ----------------------------------
 #
 # The CCD checks above prove a test isolates CLAUDE_CONFIG_DIR. They say nothing
 # about the WORKSPACE: a test can be fully CCD-hermetic and still append to
 # `<workspace>/state/outbox.log`, because production reaches it through
-# `resolve_workspace()`, not through the config dir. Five tests did exactly that
-# (#2612 #2615 #2618 #2619 #2620), each fixed individually.
+# `resolve_workspace()`, not through the config dir. Five tests did exactly that,
+# each fixed individually.
 #
 # This check covers the ONE form a per-file static predicate can prove: a stub
 # bound to a resolver name that CANNOT ABSORB the arguments production passes.
@@ -968,7 +968,7 @@ def classify(path: Path) -> str | None:
 # `lambda: tmp` raises TypeError at every one of them — and where the caller sits
 # behind a broad `except`, that TypeError is swallowed, so the write path is
 # DISABLED rather than redirected and every other assertion stays green. That is
-# how #2619 survived three review rounds.
+# how the defect survived three review rounds.
 #
 # TWO names, deliberately. `resolve_workspace` is the shared helper;
 # `_resolve_workspace` is a module-local wrapper (src/runtime-health.py,
@@ -1000,7 +1000,6 @@ RESOLVER_NAMES = frozenset({"resolve_workspace", "_resolve_workspace"})
 #: caller behind a broad `except` -- leaves the suite green and is never filed
 #: by anyone. So the severe cases are systematically the ones MISSING from this
 #: list. Its length measures what has been noticed, not what exists.
-#: (Sutando-Pro, reviewing #2622.)
 KNOWN_RESOLVER_STUBS = {
     "tests/telegram-bridge-access.test.py",
 }
@@ -1104,8 +1103,7 @@ class _ScopeWalk:
             # — not its methods, not an inner class. Whatever we descend into
             # therefore inherits the state at the CLASS statement, never the
             # class body's own bindings. This was fixed for methods, then again
-            # for nested classes; writing it once is what stops a third surface
-            # (@john-the-dev, #2622).
+            # for nested classes; writing it once is what stops a third surface.
             base_env = self.func_env if self.class_body else self.env
             base_unsafe = self.func_unsafe if self.class_body else self.ever_unsafe
             if isinstance(node, ast.ClassDef):
@@ -1128,8 +1126,7 @@ class _ScopeWalk:
         # whichever of body/handlers/orelse ran. Merging it in with `or` (as this
         # did) keeps the pre-`finally` state alive beside it, so a `finally` that
         # rebinds a stub to a SAFE absorbing lambda still left the unsafe binding
-        # in the merge and the following line was flagged. qingyun-wu's repro,
-        # confirmed by bassilkhilo-ag2 at e82c01b6:
+        # in the merge and the following line was flagged. Repro:
         #
         #     _fake = lambda: x
         #     try:      pass
@@ -1146,8 +1143,7 @@ class _ScopeWalk:
         # kept the body's pre-`else` binding alive beside it, so an `else` that
         # rebinds a stub to a SAFE absorbing lambda still left the unsafe body
         # binding in the merge and the following line was flagged. Same shape as
-        # the `finally` fix above, one branch over. Repro (john-the-dev,
-        # independently reproduced by bassilkhilo-ag2 at 160af1c2):
+        # the `finally` fix above, one branch over. Repro:
         #
         #     _fake = lambda *a, **k: x
         #     try:              _fake = lambda: x          # unsafe
@@ -1188,8 +1184,8 @@ class _ScopeWalk:
             # sub-walk carries EVERYTHING forward. A bare
             # `_ScopeWalk(self.env, self.out)` dropped `ever_unsafe`, so a `def`
             # inside an `if`/loop/`try`/`with` lost the module's late bindings
-            # and went unflagged while the identical top-level `def` was caught
-            # (@john-the-dev, #2622). `class_body` and the `func_*` pair ride
+            # and went unflagged while the identical top-level `def` was caught.
+            # `class_body` and the `func_*` pair ride
             # along too — otherwise a branch inside a class body would re-leak
             # the class namespace into its methods, the defect fixed one round
             # earlier.
@@ -1240,13 +1236,13 @@ def resolver_stub_violations(tree: ast.AST) -> list[tuple[int, str]]:
         workspace_default.resolve_workspace = _fake  # flagged
 
     A check that only inspects the assignment's own value sees neither half, which
-    is why this tracks aliases at all (Sutando-Pro, #2622).
+    is why this tracks aliases at all.
 
     It tracks them per SCOPE and in STATEMENT ORDER. The first version collected
     aliases into one file-global set via `ast.walk`, so any `_fake = lambda:` in
     the file condemned every later `resolve_workspace = _fake` — including one in
     a different function whose own `_fake` absorbs args, and including assignments
-    written BEFORE the offending rebinding. @qingyun-wu demonstrated all three:
+    written BEFORE the offending rebinding. All three:
 
         cross_function_safe             -> [(7, 'resolve_workspace')]
         order_safe_then_bad_later       -> [(3, 'resolve_workspace')]
