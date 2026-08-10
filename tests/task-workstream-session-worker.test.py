@@ -18,6 +18,9 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
+# Guards a hang, not promptness — a leaked worker holds stdout open forever, so any
+# bound catches it. Every timing claim here is a separate assert; keep this generous.
+SHUTDOWN_DRAIN_TIMEOUT_S = 30
 WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 spec = importlib.util.spec_from_file_location("workstream_session_worker", WORKER)
 worker = importlib.util.module_from_spec(spec)
@@ -377,7 +380,7 @@ def test_slow_handler_does_not_block_the_next_task_event() -> None:
             assert elapsed < 1.0, f"second task event was blocked for {elapsed:.2f}s"
         finally:
             os.killpg(process.pid, signal.SIGTERM)
-            process.communicate(timeout=2)
+            process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_watcher_bounds_provider_backlog_and_drains_every_receipt_once() -> None:
@@ -477,7 +480,7 @@ lock.rmdir()
             assert int((state / "maximum").read_text()) <= 2
         finally:
             os.killpg(process.pid, signal.SIGTERM)
-            process.communicate(timeout=2)
+            process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back() -> None:
@@ -544,12 +547,12 @@ def test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back(
             assert calls.read_text().splitlines() == ["provider"]
 
             os.killpg(overlap.pid, signal.SIGTERM)
-            overlap.communicate(timeout=2)
+            overlap.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             overlap = None
             assert claim.is_file(), "non-owner cleanup must not remove another watcher's claim"
 
             os.killpg(owner.pid, signal.SIGTERM)
-            owner_stdout, _ = owner.communicate(timeout=2)
+            owner_stdout, _ = owner.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             owner_events = [
                 line.removeprefix("TASK_FILE: ")
                 for line in owner_stdout.splitlines()
@@ -563,10 +566,10 @@ def test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back(
         finally:
             if overlap is not None and overlap.poll() is None:
                 os.killpg(overlap.pid, signal.SIGKILL)
-                overlap.communicate(timeout=2)
+                overlap.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             if owner.poll() is None:
                 os.killpg(owner.pid, signal.SIGKILL)
-                owner.communicate(timeout=2)
+                owner.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def _assert_shutdown_falls_back_without_surviving_workers() -> None:
@@ -621,7 +624,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             assert sorted(path.name for path in claims.glob("task-*.txt")) == names
 
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=2)
+            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             process = None
             remaining_claims = sorted(path.name for path in claims.glob("task-*.txt"))
             fallbacks = workspace / "state" / "task-event-handler-fallbacks"
@@ -652,7 +655,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
         finally:
             if process is not None and process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate(timeout=2)
+                process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_shutdown_falls_back_without_surviving_workers() -> None:
@@ -718,7 +721,7 @@ def test_codex_notifier_dispatches_each_isolated_task_once_without_waiting() -> 
             assert time.monotonic() - started < 1.0
         finally:
             os.killpg(process.pid, signal.SIGTERM)
-            process.communicate(timeout=2)
+            process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
@@ -797,7 +800,7 @@ def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
             assert handler_log.read_text().splitlines() == ["task-z-isolated.txt"]
         finally:
             os.killpg(process.pid, signal.SIGTERM)
-            process.communicate(timeout=2)
+            process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
