@@ -113,9 +113,8 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
         self.assertNotEqual(a, b, "a per-run nonce that repeats IS a fixed literal")
 
     def test_a_verdict_quoting_the_LEGACY_marker_cannot_truncate_the_extract(self):
-        """The blocking case. The old literal appears 4x in this PR's own diff, so
-        reviewing these files inlines it; a verdict echoing it used to eat the
-        mechanical-checks block — the exact loss the emit ordering exists to prevent."""
+        """A verdict may legitimately quote the legacy literal, so the split point
+        must be the per-run nonce; matching the literal would truncate the extract."""
         poisoned = (f"the `{LEGACY_MARKER}` marker is sound.\n"
                     "- src/foo.py:12 real bug: off-by-one\n")
         r = self._run(verdict=poisoned)

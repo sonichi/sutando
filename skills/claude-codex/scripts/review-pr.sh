@@ -11,7 +11,12 @@
 #   bash skills/claude-codex/scripts/review-pr.sh 1754
 #   bash skills/claude-codex/scripts/review-pr.sh 1754 --max 300
 #
-# Prints Codex's verdict to stdout. Exit 0 = verdict produced; non-zero = the
+# stdout is NOT the verdict. Line 1 announces a per-run nonce as
+# `VERDICT-MARKER: <nonce>`; codex's trace follows; then that marker is emitted
+# again, and everything after its LAST occurrence is the review (mechanical checks
+# then codex's verdict). A consumer MUST extract after the last marker — taking the
+# stream, or its tail, picks up trace or truncates the mechanical block. Matches
+# `SKILL.md` and the bridge prompt. Exit 0 = verdict produced; non-zero = the
 # review failed (gh error, or codex stalled=125 / hit cap=124 / errored).
 #
 # NOTE on timing: `codex exec` is agentic — even with the diff inlined it may
