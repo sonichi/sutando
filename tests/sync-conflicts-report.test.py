@@ -76,7 +76,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("lost.md", r.stdout)
 
     def test_a_peer_copy_that_is_a_strict_SUBSET_is_NOT_reported(self):
-        """6 of 13 real conflicts were this: an older, shorter peer copy."""
+        """A peer copy that is a strict subset carries nothing the live copy lacks."""
         self._pair("subset.md",
                    "# b\n" + "\n".join(f"l{i}" for i in range(40)) + "\n",
                    "# b\nl0\nl1\n")
@@ -161,7 +161,8 @@ class TestSyncConflictsReport(unittest.TestCase):
                          "the swap must still be REPORTED, just correctly labelled")
 
     def test_the_split_is_the_OLD_global_rule_so_the_buckets_are_meaningful(self):
-        """`under another heading` == what the pre-section-scoping version called clean. Pinning that keeps the second bucket interpretable: it is exactly."""
+        """The second bucket is the global-haystack rule, which is what makes it
+        interpretable: present text whose heading association changed."""
         import importlib.util
         spec = importlib.util.spec_from_file_location("rep", SCRIPT)
         rep = importlib.util.module_from_spec(spec)
@@ -281,8 +282,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(self._run().returncode, 1, "an ambiguous retire mutated state")
 
     def test_a_BARE_retire_refuses_rather_than_retiring_everything(self):
-        """Empty targets read as "match all" in the first version, so a bare
-        `--retire` cleared the whole queue and returned a false-clean exit 0."""
+        """A bare `--retire` must refuse; empty targets must not mean "match all"."""
         self._pair("note.md", "base\n", "base\nnever merged\n")
         self.assertEqual(self._run().returncode, 1)
         r = self._retire()
@@ -381,8 +381,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("no such directory", r.stdout)
 
     def test_the_clean_line_NAMES_the_workspace_it_examined(self):
-        """A clean verdict that does not say what it looked at is unfalsifiable
-        -- printing the path is what exposed the ancestor-walk bug."""
+        """The clean line names the workspace it examined, so the verdict is checkable."""
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn(str(self.ws), r.stdout)
