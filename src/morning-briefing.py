@@ -290,27 +290,21 @@ def get_reminders() -> "list[str] | None":
 # TWO years, not one: the due clause gives only year granularity, so `year_now - 1`
 # would demote a December item in January — one month overdue, not a year.
 _STALE_YEARS = 2
-# Anchored to the literal `(due` so a lowercase "due" in the TITLE cannot supply the
-# year; any 4-digit run inside the clause, since a plausible-years alternation cannot
-# match a corrupt one.
+# Anchored to the literal `(due` so a lowercase "due" in a TITLE cannot supply the year;
+# any 4-digit run, because an alternation of plausible years cannot match a corrupt one.
 _DUE_YEAR_RE = re.compile(r"\(due\b[^)]*?\b(\d{4})\b")
 
 
 def _reminder_due_year(line):
-    """The 4-digit year in a reminder's `(due …)` clause, or None if not parseable.
-
-    Takes the LAST clause: the real one is appended, so a title containing `(due …)`
-    cannot win.
-    """
+    """The year in a reminder's `(due …)` clause, or None. Takes the LAST clause: the
+    real one is appended, so a title containing `(due …)` cannot win."""
     m = _DUE_YEAR_RE.findall(line)
     return int(m[-1]) if m else None
 
 
 def _demote_stale_reminders(items, now=None):
-    """Move reminders overdue by two calendar years or more to the END of the list.
-
-    Never drops; an unparseable date keeps its position so a format change cannot bury
-    a live reminder."""
+    """Move reminders overdue by >= two calendar years to the END. Never drops; an
+    unparseable date keeps its position so a format change cannot bury a live one."""
     year_now = (datetime.fromtimestamp(now) if now else datetime.now()).year
     cutoff = year_now - _STALE_YEARS
     fresh, stale = [], []
