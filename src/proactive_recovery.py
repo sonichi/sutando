@@ -7,8 +7,12 @@ stranded so every adapter applies one collision and failure policy at startup.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Optional
+
+# A claim this process took but had not finished when it died.
+_PRIVATE_CLAIM_RE = re.compile(r"^(proactive-.*\.sending)\.recover-(\d+)-\d+$")
 
 
 def claim_for_delivery(path: Path, recipient: Optional[object]) -> Optional[Path]:
@@ -46,20 +50,54 @@ def release_claim(claim: Path) -> bool:
         return False
 
 
+def _recovery_target(name: str) -> Optional[str]:
+    """Map a claim name to its ``.txt`` destination, or None if not a claim.
+    The private ``.recover-`` form counts: a crash must not strand it unscanned."""
+    match = _PRIVATE_CLAIM_RE.match(name)
+    base = match.group(1) if match else name
+    if not (base.startswith("proactive-") and base.endswith(".sending")):
+        return None
+    return base[: -len(".sending")] + ".txt"
+
+
+def _holder_is_live(name: str) -> bool:
+    """True if a private claim names a still-running OTHER process."""
+    match = _PRIVATE_CLAIM_RE.match(name)
+    if not match:
+        return False
+    pid = int(match.group(2))
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def recover_orphan_sending_files(results_dir: Path) -> int:
     """Restore orphan ``proactive-*.sending`` claims to the polling stream."""
     if not results_dir.exists():
         return 0
 
     recovered = 0
+    seq = 0
     for orphan in sorted(results_dir.iterdir()):
-        if not (orphan.name.startswith("proactive-") and orphan.suffix == ".sending"):
+        target_name = _recovery_target(orphan.name)
+        if target_name is None:
+            continue
+        # A private claim whose owner is still running is mid-recovery, not orphaned.
+        if _holder_is_live(orphan.name):
             continue
 
-        target = orphan.with_suffix(".txt")
-        # Decide and unlink on a name only this process holds: a stat pair cannot
-        # stop a peer from reusing `.sending` before the unlink lands.
-        private = orphan.with_name(f"{orphan.name}.recover-{os.getpid()}-{recovered}")
+        target = orphan.with_name(target_name)
+        # Derive from the BASE claim name, never from orphan.name: re-suffixing an
+        # already-private name yields one this scan no longer matches.
+        base = target_name[: -len(".txt")] + ".sending"
+        private = orphan.with_name(f"{base}.recover-{os.getpid()}-{seq}")
+        seq += 1
         try:
             orphan.rename(private)
         except FileNotFoundError:
@@ -82,10 +120,11 @@ def recover_orphan_sending_files(results_dir: Path) -> int:
                     continue
                 # A real collision never justifies deleting a body: put the claim
                 # back if the name is free, else keep it under the private name.
+                restore = orphan.with_name(base)
                 try:
-                    os.link(private, orphan)
+                    os.link(private, restore)
                     private.unlink()
-                    stranded = orphan.name
+                    stranded = restore.name
                 except (FileExistsError, OSError):
                     stranded = private.name
                 print(

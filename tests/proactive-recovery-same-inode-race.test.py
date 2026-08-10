@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """The same-inode cleanup must not unlink a claim a peer created meanwhile.
-
-Deciding from a stat pair and then unlinking the SHARED `.sending` pathname
-destroys whatever answers to that name by the time the unlink lands.
-"""
+Unlinking the SHARED pathname destroys whatever answers to it by then."""
 import importlib.util
 import os
 import pathlib
@@ -32,11 +29,8 @@ def run() -> bool:
 
         def racing_stat(self, *a, **kw):
             result = real_stat(self, *a, **kw)
-            # The hazard window is AFTER the same-inode comparison reads the
-            # target's inode and BEFORE the unlink. Anchor on the claim's own
-            # stat first, then fire on the next .txt stat — Path.exists() routes
-            # through Path.stat on some versions and not others, so a call count
-            # would silently stop injecting.
+            # Fire between the inode comparison and the unlink. Anchor on the claim's
+            # own stat: Path.exists() routes through Path.stat only on some versions.
             if self.name != "proactive-race.txt":
                 state["claim_stat_seen"] = True
             elif state["claim_stat_seen"] and not state["fired"]:
