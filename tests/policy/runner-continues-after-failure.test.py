@@ -14,7 +14,13 @@ synthetic files in a temp tree, and assert the four properties that matter:
   1. an early failure does not prevent later files from running
   2. every failing filename is named in the summary
   3. the final exit is nonzero when any file failed
-  4. an all-pass run exits zero and emits no summary
+  4. an all-pass run exits zero and prints a TOTAL, not a failure summary
+  5. discovering zero files fails instead of reporting success
+
+Property 5 is the same defect partitioned at zero: with no files the `while` body never
+runs, so `fail` stays 0 and the run exits 0 with nothing on stdout — "ran nothing" and
+"ran 421, all green" were indistinguishable by exit code. Hence the total in property 4:
+an exit code alone cannot carry a magnitude.
 
 POLICY test — sibling of runner-glob.test.py, which pins discovery; this pins
 continuation.
@@ -80,11 +86,36 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
         self.assertNotIn("b.test.py", summary[-1],
                          "a passing file must not appear in the failure summary")
 
-    def test_all_pass_exits_zero_and_emits_no_summary(self) -> None:
+    def test_all_pass_exits_zero_with_a_total_and_no_failure_summary(self) -> None:
         r = self._run({"a.test.py": PASSING, "b.test.py": PASSING})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("failed:", r.stdout,
                          "an all-pass run must not print a failure summary")
+        self.assertIn("2 file(s)", r.stdout,
+                      "an all-pass run must report HOW MANY files ran — a bare exit 0 "
+                      "cannot be told apart from a run that discovered nothing")
+
+    def test_zero_discovery_fails_instead_of_reporting_success(self) -> None:
+        """No files is not success. The `while` body never runs, so `fail` stays 0 and
+        a naive runner exits 0 silently — indistinguishable from an all-green suite."""
+        r = self._run({})
+        self.assertNotEqual(r.returncode, 0,
+                            "a run that discovered zero test files exited 0 — "
+                            "'ran nothing' must not report as 'all passed'")
+        self.assertIn("0 test files discovered", r.stdout,
+                      "the zero case must say so, not just fail")
+
+    def test_zero_discovery_is_distinguishable_from_a_real_failure(self) -> None:
+        """Both exit nonzero, so the exit code cannot separate them — the operator
+        needs the reason. Guards against 'fix' that just exits 1 on the empty case."""
+        empty = self._run({})
+        real = self._run({"a.test.py": FAILING})
+        self.assertNotEqual(empty.returncode, 0)
+        self.assertNotEqual(real.returncode, 0)
+        self.assertNotIn("failed:", empty.stdout,
+                         "the empty case must not claim a file failed")
+        self.assertNotIn("0 test files discovered", real.stdout,
+                         "a real failure must not be reported as empty discovery")
 
     def test_every_discovered_file_is_executed(self) -> None:
         """The magnitude guard: files run must equal files discovered, with the
