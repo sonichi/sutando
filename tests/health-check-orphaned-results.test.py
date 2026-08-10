@@ -75,9 +75,32 @@ class OrphanedResultsTest(unittest.TestCase):
     # --- negative: the guards that keep a 'warn' meaningful -------------
 
     def test_task_still_queued_is_not_an_orphan(self):
-        """The consumer simply has not reached this pair yet."""
+        """The consumer simply has not reached this pair yet.
+
+        Scoped to a task younger than the threshold: "not reached yet" is a
+        transient state, not one a pair can hold for hours.
+        """
         self._write("results/task-abc.txt", TWO_HOURS_AGO)
-        self._write("tasks/task-abc.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-abc.txt")
+        self.assertEqual(hc.check_orphaned_results()["status"], "ok")
+
+    def test_aged_unclaimed_task_beside_its_result_IS_an_orphan(self):
+        """Nothing is coming to collect it, so "still queued" is the wrong read.
+
+        A task written straight into tasks/ by a script is never registered
+        with a bridge, so its result is polled by no one and BOTH files sit
+        past the threshold forever.
+        """
+        self._write("results/task-newsradar-1.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-newsradar-1.txt", TWO_HOURS_AGO)
+        result = hc.check_orphaned_results()
+        self.assertEqual(result["status"], "warn", result)
+        self.assertIn("task-newsradar-1.txt", result["detail"])
+
+    def test_aged_CLAIMED_task_is_still_not_an_orphan(self):
+        """A claimed task is owned by a running consumer, however long it runs."""
+        self._write("results/task-slow.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-slow.claimed-core-2.txt", TWO_HOURS_AGO)
         self.assertEqual(hc.check_orphaned_results()["status"], "ok")
 
     def test_claimed_task_is_still_a_live_task(self):

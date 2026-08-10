@@ -5169,8 +5169,24 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         # same signal as a genuinely stranded reply, which is how a detector
         # trains its readers to ignore it. `find_task_file()` is the canonical
         # locator (it is what the bridge archive paths already use).
-        if find_task_file(tasks_dir, path.stem) is not None:
-            continue
+        task_path = find_task_file(tasks_dir, path.stem)
+        if task_path is not None:
+            # A CLAIMED task is owned by a running consumer; its lifetime is
+            # not ours to judge, however long it takes.
+            if ".claimed-core-" in task_path.name:
+                continue
+            try:
+                task_age = now - task_path.stat().st_mtime
+            except OSError:
+                continue
+            # An UNCLAIMED task sitting beside its own finished result, both
+            # past the threshold, is not a pair in flight: nothing is coming
+            # to collect it. Tasks written straight into tasks/ by a script
+            # are never registered with a bridge, so their result is polled by
+            # no one and both files stay on disk forever -- which is exactly
+            # the state this exclusion used to read as "still queued".
+            if task_age < threshold_age_sec:
+                continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
@@ -5184,7 +5200,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(orphans)} result(s) whose task is already archived — never delivered; "
+        "detail": (f"{len(orphans)} result(s) with no consumer coming — never delivered; "
                    f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
     }
 
