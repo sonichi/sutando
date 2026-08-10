@@ -29,11 +29,8 @@ from __future__ import annotations
 def reference_is_reply(has_reference: bool, reference_type_name) -> bool:
     """Return True iff a `message.reference` denotes a genuine REPLY.
 
-    Discord sets `reference` for replies (enum name "default") and for forwards
-    (name "forward"), whose payload lives in `message.message_snapshots` instead.
-
-    Matches on the enum NAME so it survives numeric changes; a missing type is a
-    reply, the pre-forward default.
+    Discord also sets `reference` on forwards (enum NAME "forward", matched so it
+    survives renumbering); a missing type is a reply, the pre-forward default.
     """
     if not has_reference:
         return False

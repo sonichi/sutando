@@ -79,9 +79,8 @@ def main() -> int:
                          is_reply=True, reply_author_id=PRO), "bot replying to a third bot"
     print("  ok  another bot replying to a third bot")
 
-    # --- forward vs reply: a forward is NOT a reply ---
-    # A forward carries message.reference but its payload is in message_snapshots,
-    # so reference_is_reply must return False or the gate skips owner forwards.
+    # A forward carries message.reference too, so reference_is_reply must return
+    # False for it or the gate skips the owner's forwarded messages.
     class _RefType:
         def __init__(self, name):
             self.name = name
