@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-"""`empty_result_notice` — announce a stuck-empty result, never a mid-write one.
-
-Both obvious fixes are wrong: deleting the bridges' `continue` delivers an empty reply
-on a routine race (`>` truncates at open); logging on first sight is tuned out in a day.
-
-PERSISTENCE is the only signal separating "empty for 2 ms" from "empty forever",
-so the policy is a threshold and the near-miss case is what keeps it honest.
-
-PURE: `result_router` does no I/O. The last case touches the filesystem on purpose,
-deterministically, to show the truncate-at-open state the threshold exists for.
+"""PURE policy: persistence is the only signal separating "empty for 2ms" from
+"empty forever", so the near-miss case is what keeps the threshold honest.
 """
 from __future__ import annotations
 
@@ -42,9 +34,8 @@ def main() -> int:
     T = EMPTY_RESULT_POLL_THRESHOLD
     P = "/w/results/task-1.txt"
 
-    # --- THE NEAR-MISS: a mid-write file must stay SILENT ------------------
-    # Every poll below the bound is indistinguishable from a partial write, so
-    # every one of them must produce nothing.
+    # Every poll below the bound is indistinguishable from a partial write, so every
+    # one of them must produce nothing.
     noisy = [n for n in range(1, T) if empty_result_notice("task-1", P, n) is not None]
     check("silent for every poll BELOW the threshold", not noisy,
           f"announced at {noisy} — would fire on normal partial writes")
@@ -59,9 +50,8 @@ def main() -> int:
     check("  ...names the 7-day age-out it pre-empts",
           at is not None and "7-day" in at, repr(at))
 
-    # --- and NEVER again --------------------------------------------------
-    # `== threshold`, not `>=`: a warning repeating every 1s for seven days is
-    # the same silence in a louder font.
+    # `== threshold`, not `>=`: a warning repeating every 1s for seven days is the
+    # same silence in a louder font.
     repeats = [n for n in range(T + 1, T + 40) if empty_result_notice("task-1", P, n) is not None]
     check("NEVER repeats after the threshold", not repeats,
           f"re-announced at {repeats} — a 3s nag for 7 days")
@@ -72,9 +62,8 @@ def main() -> int:
           and empty_result_notice("t", P, 2, threshold=3) is None,
           "threshold arg ignored")
 
-    # --- the bound must sit ABOVE any real write window -------------------
-    # Demonstrated without a race: `>` truncates AT OPEN, so open-without-writing
-    # reproduces the observable state the bridge sees, with no timing involved.
+    # `>` truncates AT OPEN, so open-without-writing reproduces the state the bridge
+    # sees, with no timing involved.
     box = pathlib.Path(tempfile.mkdtemp(prefix="empty-result-"))
     target = box / "r.txt"
     target.write_text("a previous, complete result")
@@ -93,9 +82,8 @@ def main() -> int:
     check("  ...and the completed write is non-empty, so the skip is transient",
           target.stat().st_size > 0, f"size {target.stat().st_size}")
 
-    # --- the COUNTER, which is policy and therefore shared -----------------
-    # Counting lives in result_router, not in each bridge: two verbatim copies of a
-    # five-line helper is still copied policy. One implementation, covered once.
+    # Counting lives in result_router, not each bridge: two verbatim copies of a
+    # five-line helper is still copied policy.
     counters: dict = {}
     fired = [note_empty_result(counters, "t", P) for _ in range(T + 5)]
     announced = [f for f in fired if f is not None]
@@ -106,9 +94,8 @@ def main() -> int:
           note_empty_result(counters, "other-task", P) is None,
           "a second task inherited the first task's count")
 
-    # --- WIRING: a policy with no caller is the defect it fixes ------------
-    # A bound with no caller is the same latent no-op this change removes, so
-    # assert the bridge actually delegates.
+    # A bound with no caller is the same latent no-op this change removes, so assert
+    # the bridge actually delegates.
     for bridge in ("discord-bridge.py",):
         src = (REPO / "src" / bridge).read_text()
         # Pinned to the exact call spelling: an assertion on a contract exists to

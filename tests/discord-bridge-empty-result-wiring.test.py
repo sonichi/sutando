@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-"""BEHAVIOURAL: drive `poll_results` over a genuinely empty result file.
-
-The sibling suite proves the POLICY by reading source; only driving the real loop
-shows whether the counter increments and the notice fires exactly once.
-
-ASYMMETRY: Discord alone is covered behaviourally; Telegram's wiring sits inside
-`main()` and stays source-asserted in the sibling suite, rather than implying both.
-
-HERMETIC: config dir and RESULTS_DIR are tmpdirs; the last case asserts the
-operator's real results/ was untouched rather than trusting the redirect.
+"""BEHAVIOURAL: drives the real `poll_results`, and only Discord — Telegram/Slack
+carry the same bound but are covered by contract, an ASYMMETRY a reader cannot infer.
 """
 from __future__ import annotations
 
@@ -171,9 +163,8 @@ def main() -> int:
     check("  ...and the empty body was NOT delivered",
           not any("Sent" in line for line in out), "an empty reply went out")
 
-    # --- §9.3: OWNER-VISIBLE and TERMINAL, not merely logged ---------------
-    # These assert what a log line cannot: the task stops being pending, the result
-    # is archived, and the owner-notification path is actually entered.
+    # Assert what a log line cannot: the task stops being pending, the result is
+    # archived, and the owner-notification path is entered.
     check("TERMINAL: the task is dropped from pending_replies",
           "task-STUCK" not in db.pending_replies,
           "still pending — it will be re-read every 1s until the 7-day age-out, "
@@ -209,10 +200,8 @@ def main() -> int:
           db._empty_result_polls.get("task-STUCK") is None,
           f"left at {db._empty_result_polls.get('task-STUCK')}")
 
-    # --- the GAP: a poll with no file breaks the run -----------------------
-    # The bound counts CONSECUTIVE present-and-empty polls. Without a reset on the
-    # absent branch the count survives the gap, so a writer that removes and recreates
-    # its result is terminalized on the first poll after it reappears.
+    # CONSECUTIVE means consecutive: without a reset on the absent branch, a writer
+    # that removes and recreates its result is terminalized when it reappears.
     box_gap = Path(tempfile.mkdtemp(prefix="empty-wire-gap-"))
     (box_gap / "task-GAP.txt").write_text("")
     db._empty_result_polls.clear()

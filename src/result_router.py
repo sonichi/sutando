@@ -137,11 +137,8 @@ def audit_line(task_id: str, disposition: str, surface: str, ts: str) -> str:
     return f"{ts}\t{task_id}\t{disposition}\t{surface}"
 
 
-# --------------------------------------------------------------------------
-# §9.3 corollary: a result file that is PRESENT but PERSISTENTLY EMPTY
-# --------------------------------------------------------------------------
-#: Empty polls before a stuck result is announced. `poll_results()` sleeps 1s —
-#: not the neighbours' 3s — so 20 is ~20s: past a write, inside the 7d age-out.
+#: Empty polls before a stuck result is announced. `poll_results()` sleeps 1s, not
+#: the neighbours' 3s, so 20 is ~20s: past a write, inside the 7d age-out.
 EMPTY_RESULT_POLL_THRESHOLD = 20
 
 
@@ -151,11 +148,8 @@ def empty_result_notice(
     consecutive: int,
     threshold: int = EMPTY_RESULT_POLL_THRESHOLD,
 ) -> "str | None":
-    """The notice for a result file stuck empty, or None if it is too early.
-
-    Every normal result file is briefly present-and-empty (`>` truncates at open),
-    so persistence, not first sight, is the only signal separating stuck from racing.
-    """
+    """Every result file is briefly present-and-empty (`>` truncates at open), so
+    persistence, not first sight, separates a stuck result from a racing one."""
     if consecutive != threshold:
         return None
     return (
@@ -173,11 +167,8 @@ def note_empty_result(
     path: str,
     threshold: int = EMPTY_RESULT_POLL_THRESHOLD,
 ) -> "str | None":
-    """Record one empty observation for `task_id`; return the notice or None.
-
-    Counting lives here so the policy is not copied into each bridge. `counters` is
-    caller-owned, keeping this module's no-I/O, no-global contract.
-    """
+    """Counting lives here so the policy is not copied into each bridge; `counters` is
+    caller-owned, keeping this module's no-I/O, no-global contract."""
     n = counters.get(task_id, 0) + 1
     counters[task_id] = n
     return empty_result_notice(task_id, path, n, threshold)

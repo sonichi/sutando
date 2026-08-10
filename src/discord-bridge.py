@@ -118,18 +118,14 @@ class EmptyResultError(Exception):
 
 
 async def _note_empty_result(task_id: str, result_file) -> None:
-    """Bound a present-but-empty result, then make it OWNER-VISIBLE and TERMINAL.
-
-    At the bound: owner DM plus audit row, drain `pending_replies`, archive the
-    result. Below it, a no-op — that window is a normal partial write.
-    """
+    """At the bound: owner DM, audit row, drain `pending_replies`, archive. Below it a
+    no-op, because that window is indistinguishable from a normal partial write."""
     notice = result_router.note_empty_result(
         _empty_result_polls, task_id, str(result_file))
     if not notice:
         return                                    # still inside the write window
     print(f"  {notice}", flush=True)
-    # Terminal means every task-scoped map, not just the one that stops the re-poll:
-    # anything the normal-delivery cleanup pops must be popped here, or the task
+    # Pop every task-scoped map the normal-delivery cleanup pops, or the task
     # reports resolved while still visible to queue-health.
     _empty_result_polls.pop(task_id, None)
     channel = pending_replies.pop(task_id, None)  # stop re-polling it
