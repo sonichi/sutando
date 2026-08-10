@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""BEHAVIOURAL: drives the real `poll_results`, and only Discord — Telegram/Slack
-carry the same bound but are covered by contract, an ASYMMETRY a reader cannot infer.
-"""
+"""BEHAVIOURAL: drives the real `poll_results`. Discord is the ONLY bridge carrying this
+bound — Telegram and Slack do not reference it, so nothing here or in the sibling covers them."""
 from __future__ import annotations
 
 import asyncio
