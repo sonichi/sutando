@@ -257,15 +257,11 @@ if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
 const VOICE_AGENT_CONFIG = loadVoiceConfig(VOICE_AGENT_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = VOICE_AGENT_CONFIG.model;
 const VOICE_GOOGLE_SEARCH = VOICE_AGENT_CONFIG.googleSearch;
-// Shadow STT (config/voice-agent.json "shadowStt": true — default OFF).
-// A Live-model mishear is self-consistent (transcript = what the model heard;
-// live incident 2026-07-30: "what's this" → "what's the news", answered with
-// news, nothing looked wrong). With this on, the same audio also goes to a
-// batch gemini-2.5-flash pass and a disagreement is LOGGED (observation-only —
-// nothing about hearing/answering/storage changes). bodhi PR #25.
+// Shadow STT (config "shadowStt": true — default OFF): re-runs the same
+// audio through a batch model and logs disagreement — observation-only.
 const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
-// "divergenceCorrection": true — additionally SPEAK a self-correction when the
-// shadow detects a mishear (owner option ①, bodhi PR #26). Needs shadowStt.
+// "divergenceCorrection": true additionally speaks a self-correction when
+// the shadow pass disagrees. Requires shadowStt.
 const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
