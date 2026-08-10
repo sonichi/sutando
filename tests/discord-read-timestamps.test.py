@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for src/discord-read.py — owner-timezone timestamp rendering (PR #2270).
-
-Covers the reviewer-requested matrix for format_timestamp():
-  1. valid OWNER_TZ → converted wall-clock time + explicit tz abbreviation
-  2. host-timezone fallback (no OWNER_TZ) → host tz via TZ+tzset, still labeled
-  3. naive timestamp → treated as UTC (what Discord actually sends)
-  4. invalid timezone name → honest UTC-labeled fallback, never a bare time
-  5. invalid/garbage timestamp → honest UTC-labeled fallback
-  6. the rendered label is always explicit (%Z) — asserted in every case above
-
-Also runs main() end-to-end with a mocked Discord API + temp CLAUDE_CONFIG_DIR
-(no real ~/.claude read, no network, no real token) so the changed call-site
-line is exercised the way the script actually runs.
-
-Run: python3 tests/discord-read-timestamps.test.py
-Exit: 0 on pass, 1 on fail.
-"""
+"""format_timestamp() matrix (owner_tz, host fallback, naive/invalid input)
+plus an end-to-end main() run against a mocked Discord API."""
 
 from __future__ import annotations
 
@@ -147,7 +132,6 @@ def main() -> int:
         )
 
     # ---- e2e: main() renders message timestamps through the helper ----
-    # 23:47 UTC on Jul 21 = 19:47 EDT — the exact "1am, goodnight at 7:47pm" bug.
     messages = [
         {
             "id": "111",

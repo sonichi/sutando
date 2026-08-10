@@ -132,18 +132,8 @@ def _strictly_older_than_boundary(msg, until):
 
 
 def format_timestamp(raw, owner_tz=None):
-    """Render a Discord UTC ISO timestamp in the owner's timezone.
-
-    Discord API timestamps are UTC ISO strings. Render in the USER'S timezone
-    (Susan 2026-07-21 "改成 user config 的 timezone", after raw UTC here led the
-    agent to say "1am, goodnight" at 7:47pm local). Resolution: owner_tz (the
-    caller passes OWNER_TZ env — existing convention, phone-conversation
-    server) > the host OS timezone (the user's own system setting). Label
-    comes from %Z so it's always explicit (EDT/EST/PST/...); any failure —
-    garbage input, unknown timezone name — falls back to the raw UTC prefix
-    labeled UTC, never a bare ambiguous time. A naive-but-valid timestamp is
-    treated as UTC (what Discord actually sends).
-    """
+    """Render a Discord UTC timestamp in the owner's timezone, never raw UTC.
+    Priority: owner_tz arg > host OS tz; any failure falls back to labeled UTC."""
     try:
         from datetime import datetime, timezone
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
