@@ -95,7 +95,10 @@ class PersistentBrowserTests(unittest.TestCase):
             elapsed = time.monotonic() - started
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("timed out after 120ms", result.stderr)
-            self.assertLess(elapsed, 0.3, f"command exceeded its deadline: {elapsed:.3f}s")
+            # The command budget starts inside Node after process/module setup;
+            # allow that fixed startup cost while still rejecting an added
+            # Playwright launch-timeout wait after the command deadline.
+            self.assertLess(elapsed, 0.5, f"command exceeded its deadline: {elapsed:.3f}s")
             self._assert_cleanup(log)
             self.assertNotIn("page.goto", log.read_text(encoding="utf-8").splitlines())
 
