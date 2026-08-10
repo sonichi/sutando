@@ -41,7 +41,12 @@ export function lineHoldsProfile(line, profileDir) {
 		const value = line.slice(i + FLAG.length);
 		// Exact, or exact-then-argument-boundary. `startsWith(profileDir)` alone is the
 		// bug: "/tmp/x-profile" is a prefix of "/tmp/x-profile-copy".
-		if (value === profileDir || value.startsWith(profileDir + ' ')) return true;
+		if (value === profileDir) return true;
+		if (value.startsWith(profileDir + ' ')) {
+			// A following FLAG proves the path ended at that space. A bare token does
+			// not: "/tmp/x-profile copy" is equally a path containing a space.
+			if (value.slice(profileDir.length + 1).startsWith('-')) return true;
+		}
 		i += FLAG.length;
 	}
 }

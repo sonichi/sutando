@@ -45,6 +45,17 @@ check(
 	'a path we are a suffix of is not ours either',
 	lineHoldsProfile(line('/home/other/tmp/x-profile'), DIR) === false,
 );
+// pgrep -fl flattens argv, so "<dir> copy" is equally one path with a space or two
+// arguments. Undecidable -> fail closed, per this module's stated failure direction.
+check(
+	'P1: a SPACE-SUFFIX profile is NOT matched (would have been killed)',
+	lineHoldsProfile(line('/tmp/x-profile copy'), DIR) === false,
+	'"/tmp/x-profile copy" was read as our dir plus an argument',
+);
+check(
+	'P1: space-suffix followed by a real flag is still not ours',
+	lineHoldsProfile(line('/tmp/x-profile copy', ' --no-first-run'), DIR) === false,
+);
 
 // --- must still match, or the lock cleanup silently stops working -----------
 check('exact match at end of line', lineHoldsProfile(line(DIR), DIR) === true);
