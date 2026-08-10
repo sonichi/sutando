@@ -89,7 +89,9 @@ def recover_orphan_sending_files(results_dir: Path) -> int:
         if target_name is None:
             continue
         # A private claim whose owner is still running is mid-recovery, not orphaned.
+        # Say so: silence here cannot be told from a body stranded behind a reused pid.
         if _holder_is_live(orphan.name):
+            print(f"  [startup] deferring {orphan.name}: holder still running", flush=True)
             continue
 
         target = orphan.with_name(target_name)
