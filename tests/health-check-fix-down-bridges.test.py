@@ -47,7 +47,7 @@ def check(name: str, status: str, detail: str) -> dict:
 
 def run_with_popen_stub(checks: list, *, action="restart",
                         guard=lambda repo: (True, "test-clean"),
-                        sender=None) -> tuple[list, list]:
+                        sender=None, notifier=None) -> tuple[list, list]:
     """Call fix_down_bridges with Popen stubbed; return (restarted, spawn argvs).
 
     Also stubs the interpreter probe and slack-env load so the test is
@@ -62,6 +62,7 @@ def run_with_popen_stub(checks: list, *, action="restart",
     a canonical checkout with a no-op sender.
     """
     spawned = []
+    notified = []
 
     def fake_popen(argv, **kwargs):
         spawned.append(argv)
@@ -75,7 +76,12 @@ def run_with_popen_stub(checks: list, *, action="restart",
             restarted = hc.fix_down_bridges(
                 checks, action=action, guard=guard,
                 sender=(sender if sender is not None else (lambda _m: True)),
+                # Injected so the local-notification fallback never reaches the
+                # patched Popen — `spawned` must stay a record of RESTARTS only.
+                notifier=(notifier if notifier is not None
+                          else (lambda _m: notified.append(_m) or False)),
             )
+    run_with_popen_stub.last_notified = notified
     return restarted, spawned
 
 
@@ -463,6 +469,78 @@ def case_v_alert_send_failure_is_swallowed() -> list[str]:
     return fails
 
 
+def case_x_failed_sender_falls_back_to_a_local_owner_surface() -> list[str]:
+    """A failed primary sender must reach an owner surface, not just a log line.
+
+    A down bridge is exactly when a bridge-borne alert cannot arrive, so the
+    fallback must not be another bridge.
+    """
+    import contextlib
+    import io
+
+    fails = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+
+    # 1. primary False + fallback True -> delivered, and NO undelivered marker
+    got = []
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: False,
+                            notifier=lambda m: got.append(m) or True)
+    out = buf.getvalue()
+    if not got:
+        fails.append("x) primary sender returned False but the fallback was never called")
+    if hc.ALERT_UNDELIVERED_MARKER in out:
+        fails.append(f"x) fallback delivered yet {hc.ALERT_UNDELIVERED_MARKER} was printed: {out!r}")
+    if "local notification" not in out:
+        fails.append(f"x) fallback delivery was not stated in the output: {out!r}")
+    if got and "discord-bridge" not in got[0]:
+        fails.append(f"x) the fallback got a message naming no bridge: {got[0]!r}")
+
+    # 2. BOTH fail -> marker still present (the fallback must not mask it)
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: False,
+                            notifier=lambda _m: False)
+    out2 = buf2.getvalue()
+    if hc.ALERT_UNDELIVERED_MARKER not in out2:
+        fails.append(f"x) both surfaces failed but no {hc.ALERT_UNDELIVERED_MARKER}: {out2!r}")
+
+    # 3. a fallback that RAISES is undelivered, never an exception out of the check
+    buf3 = io.StringIO()
+    def boom(_m):
+        raise RuntimeError("notifier exploded")
+    try:
+        with contextlib.redirect_stdout(buf3):
+            run_with_popen_stub(checks, action="alert", sender=lambda _m: False,
+                                notifier=boom)
+    except Exception as e:  # noqa: BLE001
+        fails.append(f"x) a raising fallback escaped the check: {e!r}")
+    if hc.ALERT_UNDELIVERED_MARKER not in buf3.getvalue():
+        fails.append("x) a raising fallback did not report undelivered")
+
+    # 4. CONTROL: a working primary must never reach the fallback
+    reached = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: True,
+                            notifier=lambda m: reached.append(m) or True)
+    if reached:
+        fails.append(f"x) fallback fired despite a DELIVERED primary: {reached!r}")
+
+    # 5. the shipped default reports False on a non-zero exit rather than assuming success
+    if hc._default_local_notifier.__doc__ is None:
+        fails.append("x) _default_local_notifier lost its contract docstring")
+    with mock.patch.object(hc.subprocess, "run",
+                           return_value=mock.MagicMock(returncode=1)):
+        if hc._default_local_notifier("m") is not False:
+            fails.append("x) default notifier reported success on a non-zero exit")
+    with mock.patch.object(hc.subprocess, "run",
+                           return_value=mock.MagicMock(returncode=0)):
+        if hc._default_local_notifier("m") is not True:
+            fails.append("x) default notifier reported failure on a zero exit")
+    return fails
+
+
 def case_w_alert_undelivered_is_observable() -> list[str]:
     """A sender that RETURNS False (not raises) must be observable.
 
@@ -661,7 +739,8 @@ def main() -> int:
                  case_t_resolve_down_bridge_action,
                  case_u_defaults_from_config_and_module,
                  case_v_alert_send_failure_is_swallowed,
-                 case_w_alert_undelivered_is_observable):
+                 case_w_alert_undelivered_is_observable,
+                 case_x_failed_sender_falls_back_to_a_local_owner_surface):
         fails = case()
         status = "PASS" if not fails else "FAIL"
         print(f"  {status} {case.__name__}")

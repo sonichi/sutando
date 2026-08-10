@@ -2736,7 +2736,21 @@ def _checkout_is_canonical(repo_dir) -> tuple:
 ALERT_UNDELIVERED_MARKER = "ALERT-UNDELIVERED"
 
 
-def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None) -> list:
+def _default_local_notifier(msg: str) -> bool:
+    """Owner surface that does not depend on any Sutando bridge. True only on a
+    zero exit, so a missing osascript reads as undelivered rather than success."""
+    safe = str(msg).replace('"', "").replace("\\", "")
+    try:
+        return subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{safe}" with title "Sutando — bridge down"'],
+            check=False, timeout=10).returncode == 0
+    except Exception:  # noqa: BLE001 — alerting must never break the check
+        return False
+
+
+def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
+                     notifier=None) -> list:
     """Restart or alert on configured-but-not-running channel bridges.
 
     A dead bridge reports status "warn" (optional channels don't page), which
@@ -2781,26 +2795,27 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None) -> l
     if action == "off":
         return []
     send = sender or _default_slack_sender
+    notify = notifier if notifier is not None else _default_local_notifier
     guard = guard or _checkout_is_canonical
 
     def _alert(msg: str) -> None:
         print(f"  {msg}")
-        # The sender signals failure by RETURNING False, not by raising:
-        # `_default_slack_sender` returns False when the owner's creds are
-        # absent or any Slack API call fails. Discarding that return made
-        # `down_bridge_action=alert` a no-op wherever Slack isn't working —
-        # it printed locally, called a sender that quietly failed, and left
-        # nothing an operator or monitor could act on. That is precisely the
-        # silent-failure shape this check exists to catch, occurring inside
-        # the check itself. (qingyun-wu, independently confirmed by
-        # bassilkhilo-ag2 against the source, #2316.)
-        #
-        # Still fail-safe: a broken alerter must never break the health run,
-        # so an exception is caught and treated as undelivered, not raised.
+        # The sender reports failure by RETURNING False, not by raising, so a
+        # discarded return makes the whole alert path a silent no-op.
         try:
             delivered = bool(send(msg))
         except Exception:  # noqa: BLE001 — alerting must never break the check
             delivered = False
+        if not delivered:
+            # A down bridge is exactly when a bridge-borne alert cannot arrive, so
+            # the fallback must not be another bridge: osascript runs at OS level.
+            try:
+                delivered = bool(notify(msg))
+            except Exception:  # noqa: BLE001 — alerting must never break the check
+                delivered = False
+            if delivered:
+                print("  alert delivered via local notification "
+                      "(primary sender reported failure)")
         if not delivered:
             print(f"  {ALERT_UNDELIVERED_MARKER}: owner was NOT alerted — {msg}")
 
