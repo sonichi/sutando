@@ -37,8 +37,8 @@ CONFLICT = ('API error 409: {"ok":false,"error_code":409,"description":"Conflict
 RECEIPT = "  @chi: hello there"
 STARTUP = "Telegram bridge started. Polling for messages..."
 
-# Verbatim from src/health-check.py — :7065 (heartbeat) and :7054 (log). Using the
-# real strings is the point: the gate discriminates on them.
+# Verbatim producer strings — the gate discriminates on them. A producer REWORD is caught
+# by the run_all_checks cases below, which write a real heartbeat and assert the real output.
 HB_STALE  = "running but heartbeat stale (1906s old)"
 LOG_STALE = "running but log stale (600s old)"
 
