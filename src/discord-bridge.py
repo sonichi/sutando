@@ -4768,9 +4768,7 @@ def _queued_task_count():
 
 
 def _render_progress_content(now, elapsed, channel_is_private=False):
-    """Placeholder body for poll_progress: the live step, or the outage copy.
-
-    `channel_is_private` gates the STEP TEXT and defaults to False — a caller that
+    """`channel_is_private` gates the STEP TEXT and defaults False, so a caller that
     has not established the audience posts the placeholder without a step."""
     status = progress_stream.read_core_status(STATE_DIR)
     if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):

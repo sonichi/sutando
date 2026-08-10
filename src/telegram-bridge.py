@@ -476,11 +476,8 @@ pending_task_private: dict = {}  # task_id -> chat audience is private; in-memor
 
 
 def _render_progress_text(elapsed: float, task_id: str) -> str:
-    """Render the placeholder body for ``task_id``'s chat.
-
-    The allowlist holds a USER id but that user can write from a group, so the gate is
-    the recorded chat audience; unknown (e.g. after a restart) means not-private.
-    """
+    """The allowlist holds a USER id but that user can write from a group, so the gate
+    is the recorded chat audience; unknown (e.g. after a restart) means not-private."""
     if not progress_stream.step_visible_in(pending_task_private.get(task_id, False)):
         return progress_stream.format_progress(None, elapsed)
     step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
