@@ -59,8 +59,8 @@ class EphemeralSkillTarget(unittest.TestCase):
             self.assertIn("alpha", res["detail"])
 
     def test_temp_rooted_install_is_self_consistent(self):
-        """A fixture builds its whole install under tempfile. Every correct link
-        there is temp-rooted; flagging them made two existing suites fail."""
+        """A fixture builds its whole install under tempfile, so every correct link
+        there is temp-rooted."""
         with tempfile.TemporaryDirectory() as td:
             e = Path(td) / "ephemeral"
             e.mkdir()
@@ -94,9 +94,8 @@ class EphemeralSkillTarget(unittest.TestCase):
             self.assertTrue(self.hc._is_ephemeral(root + "/"), root + "/")
 
     def test_sibling_named_like_a_root_is_not_ephemeral(self):
-        """Containment is by path component, not string prefix. Derived per root so the
-        case is real on any platform, and only the SHALLOWEST root can be the sibling
-        because macOS roots nest."""
+        """Containment is by path component, not string prefix; only the shallowest
+        root can be the sibling, because macOS roots nest."""
         roots = self.hc._ephemeral_roots()
         shallow = [r for r in roots
                    if not any(r != o and r.startswith(o + "/") for o in roots)]
@@ -115,10 +114,7 @@ class EphemeralSkillTarget(unittest.TestCase):
 
     def _with_tmpdir(self, value, fn):
         """Evaluate `fn()` as if the platform reported `value` as its temp dir.
-
-        The predicate MUST be called INSIDE this window; after it returns the roots
-        re-derive from the real platform and the assertion is platform-dependent.
-        """
+        Call the predicate INSIDE the window; after it, roots re-derive from the host."""
         orig = tempfile.gettempdir
         tempfile.gettempdir = lambda: value
         try:
