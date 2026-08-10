@@ -68,5 +68,32 @@ class StaleReminders(unittest.TestCase):
         self.assertEqual(self.mb._demote_stale_reminders([JUNK_1219]), [JUNK_1219])
 
 
+class TestTheDueClauseAnchorsTheYear(unittest.TestCase):
+    """A lowercase "due" in the TITLE must not supply the year."""
+
+    def setUp(self):
+        self.mb = _load()
+
+    def test_a_title_containing_due_and_an_old_year_does_not_win(self):
+        line = ("[Reminders] review due 2020 paperwork "
+                "(due Sunday, August 9, 2026 at 9:00:00 AM)")
+        self.assertEqual(self.mb._reminder_due_year(line), 2026)
+
+    def test_such_a_reminder_is_not_demoted(self):
+        real = ("[Reminders] review due 2020 paperwork "
+                "(due Sunday, August 9, 2026 at 9:00:00 AM)")
+        other = "[Reminders] something else (due Monday, August 10, 2026 at 9:00:00 AM)"
+        out = self.mb._demote_stale_reminders(
+            [real, other], now=self.mb.datetime(2026, 8, 9).timestamp())
+        self.assertEqual(out[0], real, "a current reminder was demoted on a title-year")
+
+    def test_a_genuinely_stale_clause_is_still_read(self):
+        line = "[Reminders] 7-minute timer (due Sunday, November 3, 1219 at 12:00:00 AM)"
+        self.assertEqual(self.mb._reminder_due_year(line), 1219)
+
+    def test_no_due_clause_is_unparseable_not_guessed(self):
+        self.assertIsNone(self.mb._reminder_due_year("[Reminders] 2020 budget review"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
