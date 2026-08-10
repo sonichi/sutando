@@ -955,51 +955,14 @@ def classify(path: Path) -> str | None:
 
 
 # --- workspace-resolver stub arity ----------------------------------
-#
+
 # The CCD checks above prove a test isolates CLAUDE_CONFIG_DIR. They say nothing
 # about the WORKSPACE: a test can be fully CCD-hermetic and still append to
-# `<workspace>/state/outbox.log`, because production reaches it through
-# `resolve_workspace()`, not through the config dir. Five tests did exactly that,
-# each fixed individually.
-#
-# This check covers the ONE form a per-file static predicate can prove: a stub
-# bound to a resolver name that CANNOT ABSORB the arguments production passes.
-# 25 call sites in 14 files pass `migrate=False` or `repo`. A zero-arg
-# `lambda: tmp` raises TypeError at every one of them — and where the caller sits
-# behind a broad `except`, that TypeError is swallowed, so the write path is
-# DISABLED rather than redirected and every other assertion stays green. That is
-# how the defect survived three review rounds.
-#
-# TWO names, deliberately. `resolve_workspace` is the shared helper;
-# `_resolve_workspace` is a module-local wrapper (src/runtime-health.py,
-# src/workspace_lock.py x5). A name-exact sweep misses the second — that gap cost
-# two independent audits five call sites each.
-#
-# WHAT THIS CANNOT DO, stated so no reader assumes otherwise:
-#   * transitive reach. `dm-result-send-dm.test.py` contains no resolver token at
-#     all and still writes: test -> dm-result.py -> outbox_log -> resolve_workspace.
-#     A textual OR per-file-AST criterion cannot see a runtime reach. The
-#     complement is behavioural — run each test against a pinned throwaway
-#     workspace and diff. That found all five, including the transitive one.
-#   * exact caller-arity matching. `lambda *, migrate=False` passes here but would
-#     still reject a positional `repo`. This flags the ZERO-ARG case, which is the
-#     defect actually observed, not full signature agreement.
 
 RESOLVER_NAMES = frozenset({"resolve_workspace", "_resolve_workspace"})
 
 #: Resolver stubs that predate this check. Same contract as KNOWN_UNISOLATED:
 #: the list must SHRINK, never rot. Verified latent, not live, at the time of
-#: listing -- telegram-bridge-access.test.py reaches util_paths, whose
-#: `_workspace_root()` guards with a NARROW `except ImportError`, so the
-#: TypeError propagates loudly rather than being swallowed. A tripwire, not a
-#: landmine; it fails on first contact if the call graph ever reaches it.
-#:
-#: DO NOT READ A SHORT LIST AS A CLEAN TREE. This list is biased toward exactly
-#: the harmless case, by construction: a tripwire announces itself (a red suite
-#: gets filed, then grandfathered here), while a LANDMINE -- a stub feeding a
-#: caller behind a broad `except` -- leaves the suite green and is never filed
-#: by anyone. So the severe cases are systematically the ones MISSING from this
-#: list. Its length measures what has been noticed, not what exists.
 KNOWN_RESOLVER_STUBS = {
     "tests/telegram-bridge-access.test.py",
 }
@@ -1077,12 +1040,9 @@ class _ScopeWalk:
         self.out = out
         # Names an ENCLOSING scope ever binds unsafely. Carried down so a method
         # defined inside a class still gets late-binding treatment, even though
-        # the class body itself does not.
         self.ever_unsafe: "set[str]" = set(inherited or ())
         # A class namespace is NOT a lexical scope for its methods: an
         # unqualified name inside a method skips the class body entirely and
-        # resolves module/enclosing-function. So what a method inherits is the
-        # state at the CLASS statement, never the class body's own bindings.
         self.class_body = class_body
         self.func_env = dict(env)
         self.func_unsafe = set(inherited or ())
@@ -1100,10 +1060,6 @@ class _ScopeWalk:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             # ONE rule for EVERY nested scope, rather than a branch per surface:
             # a class namespace does not lexically enclose anything nested in it
-            # — not its methods, not an inner class. Whatever we descend into
-            # therefore inherits the state at the CLASS statement, never the
-            # class body's own bindings. This was fixed for methods, then again
-            # for nested classes; writing it once is what stops a third surface.
             base_env = self.func_env if self.class_body else self.env
             base_unsafe = self.func_unsafe if self.class_body else self.ever_unsafe
             if isinstance(node, ast.ClassDef):
@@ -1113,7 +1069,6 @@ class _ScopeWalk:
                 return
             # A function body runs LATER: a global it reads resolves at CALL
             # time, so a binding written after the `def` still reaches it and no
-            # definition-point snapshot can see it. Widen conservatively.
             inner = dict(base_env)
             for nm in base_unsafe:
                 inner[nm] = True
@@ -1124,38 +1079,9 @@ class _ScopeWalk:
             return
         # `finalbody` is NOT an alternative branch — it runs on EVERY path, after
         # whichever of body/handlers/orelse ran. Merging it in with `or` (as this
-        # did) keeps the pre-`finally` state alive beside it, so a `finally` that
-        # rebinds a stub to a SAFE absorbing lambda still left the unsafe binding
-        # in the merge and the following line was flagged. Repro:
-        #
-        #     _fake = lambda: x
-        #     try:      pass
-        #     finally:  _fake = lambda *a, **k: x
-        #     wd.resolve_workspace = _fake      -> flagged, correct answer is SAFE
-        #
-        # A mandatory lint blocking a safe test with no actionable repair is the
-        # exact false-positive class this PR exists to remove, so it is handled
-        # SEQUENTIALLY below instead: merge the alternatives, commit, then run
-        # `finally` over that state and let it OVERWRITE.
         finalbody = getattr(node, "finalbody", None)
         # On a `try`, `else` is NOT an alternative to the body — Python runs it
         # SEQUENTIALLY after the body completes without raising. OR-merging it
-        # kept the body's pre-`else` binding alive beside it, so an `else` that
-        # rebinds a stub to a SAFE absorbing lambda still left the unsafe body
-        # binding in the merge and the following line was flagged. Same shape as
-        # the `finally` fix above, one branch over. Repro:
-        #
-        #     _fake = lambda *a, **k: x
-        #     try:              _fake = lambda: x          # unsafe
-        #     except Exception: _fake = lambda *a, **k: x  # safe
-        #     else:             _fake = lambda *a, **k: x  # safe
-        #     wd.resolve_workspace = _fake   -> flagged; every real path is SAFE
-        #
-        # So the success path is body THEN orelse, walked as ONE sequence, and
-        # that is what gets OR-merged against the handlers. Scoped to `try`:
-        # on `if` the `orelse` really IS the alternative branch, and on loops it
-        # runs only when the loop was not broken out of, so neither may be
-        # folded into the body this way.
         _try_types = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
         if isinstance(node, _try_types):
             success = list(getattr(node, "body", None) or []) + \
@@ -1170,10 +1096,6 @@ class _ScopeWalk:
         merged: "dict[str, bool]" = {}
         # A statement whose body may not run at all leaves the PRE-STATE live:
         # `if` with no `else`, a loop over an empty iterable, a `try` that raised
-        # before finishing. That path is a real path, so it joins the merge —
-        # otherwise a safe rebinding inside the branch silently overwrites an
-        # unsafe binding that still reaches the assignment. `if/else` and `with`
-        # cover every path, so they merge branches only.
         covers_all = (isinstance(node, ast.If) and node.orelse) or isinstance(
             node, (ast.With, ast.AsyncWith)
         )
@@ -1182,13 +1104,6 @@ class _ScopeWalk:
         for body in branches:
             # A control-flow block is the SAME scope, not a nested one, so the
             # sub-walk carries EVERYTHING forward. A bare
-            # `_ScopeWalk(self.env, self.out)` dropped `ever_unsafe`, so a `def`
-            # inside an `if`/loop/`try`/`with` lost the module's late bindings
-            # and went unflagged while the identical top-level `def` was caught.
-            # `class_body` and the `func_*` pair ride
-            # along too — otherwise a branch inside a class body would re-leak
-            # the class namespace into its methods, the defect fixed one round
-            # earlier.
             w = _ScopeWalk(self.env, self.out, self.ever_unsafe,
                            class_body=self.class_body)
             w.func_env = dict(self.func_env)
@@ -1199,10 +1114,6 @@ class _ScopeWalk:
         self.env.update(merged)
         # `finally` last, over the merged state, and its result WINS. It executes
         # whether the body completed, raised, or returned, so any name it rebinds
-        # holds that binding at every point after the statement — the one place a
-        # later write is guaranteed rather than merely possible. Overwrite (not
-        # `or`) is the whole point: `or` is what preserved the stale pre-`finally`
-        # unsafe state and produced the false positive above.
         if finalbody:
             w = _ScopeWalk(self.env, self.out, self.ever_unsafe,
                            class_body=self.class_body)
