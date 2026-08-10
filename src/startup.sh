@@ -751,10 +751,8 @@ if ! lsof -i :7846 > /dev/null 2>&1; then
   if [ "$BUNDLED_MODE" = "1" ]; then
     _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
   else
-    # Non-bundled: run the proxy from THIS checkout so it resolves the same
-    # workspace as the core/dashboard (it reads workspace file-relatively);
-    # fall back to the claude-home copy if this checkout lacks the skill. See
-    # the launchd installer for the multi-checkout stale-quota rationale.
+    # Run the proxy from THIS checkout so it resolves the same workspace as the
+    # core/dashboard; fall back to the claude-home copy if the skill is absent.
     _PROXY_SCRIPT="$REPO/skills/quota-tracker/scripts/credential-proxy.ts"
     [ -f "$_PROXY_SCRIPT" ] || _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
   fi

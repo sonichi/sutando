@@ -95,14 +95,8 @@ case "$cmd" in
                 exit 1
             fi
         else
-            # Non-bundled: run the proxy from THIS checkout ($REPO), not the
-            # claude-home skills copy. The proxy resolves its workspace
-            # file-relatively (via ../../../src/workspace_default), so it must
-            # live in the same checkout as the core/dashboard that read
-            # quota-state.json — else a multi-checkout host (~/.claude/skills
-            # symlinked to a different clone) has the proxy write one workspace
-            # while the dashboard reads another → stale quota date. Fall back to
-            # the claude-home copy only if this checkout lacks the skill.
+            # Run the proxy from THIS checkout: it resolves its workspace file-relatively,
+            # so another clone's copy would write quota-state.json where nothing reads it.
             _PROXY_SCRIPT="$REPO/skills/quota-tracker/scripts/credential-proxy.ts"
             if [ ! -f "$_PROXY_SCRIPT" ]; then
                 _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
@@ -126,11 +120,8 @@ case "$cmd" in
         _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
             | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
         _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
-        # Persist the install-time Claude config dir (resolved via the M0
-        # helper, not raw — an unset var must pin the same default the
-        # install validated against, not an empty string the wrapper would
-        # treat as unset). Same XML+sed escaping as SUTANDO_NODE:
-        # caller-controlled, lands in plist XML.
+        # Persist the RESOLVED config dir, not the raw var: an unset var must pin the
+        # default the install validated, not an empty string. XML+sed escaped as above.
         _ccd_resolved="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path)"
         _ccd_xml="$(printf '%s' "$_ccd_resolved" \
             | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"

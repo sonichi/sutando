@@ -40,22 +40,15 @@ do
     break   # first (highest-priority) node wins — don't stack multiple node dirs
 done
 
-# Resolve the credential-proxy script path. Prefer THIS checkout's copy (the
-# repo the plist points at, i.e. the same clone as the core/dashboard) so the
-# proxy resolves the same workspace and quota-state.json isn't written to a
-# different clone's workspace (stale-quota split-brain on multi-checkout hosts).
-# Fall back to the claude-home copy for setups where this checkout lacks the
-# skill. launchd doesn't inherit shell env, so claude-home defaults to ~/.claude
-# unless the plist's EnvironmentVariables sets $CLAUDE_CONFIG_DIR.
-# (REPO_ROOT is resolved above, before the node-candidate loop.)
+# Prefer THIS checkout's copy so the proxy resolves the same workspace as the core;
+# launchd inherits no env, so claude-home falls back to ~/.claude unless the plist pins it.
 PROXY_SCRIPT="$REPO_ROOT/skills/quota-tracker/scripts/credential-proxy.ts"
 if [ ! -f "$PROXY_SCRIPT" ]; then
     PROXY_SCRIPT="$(bash "$REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
 fi
 
-# Test probe: print the resolved proxy target and exit — lets the regression
-# suite assert launchd-env resolution (env -i + plist EnvironmentVariables)
-# without exec'ing a real proxy. No production caller passes arguments.
+# Test probe: print the resolved target and exit, so the suite can assert launchd-env
+# resolution without exec'ing a real proxy. No production caller passes arguments.
 if [ "${1:-}" = "--resolve-only" ]; then
     echo "$PROXY_SCRIPT"
     exit 0

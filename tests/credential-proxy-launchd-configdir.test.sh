@@ -1,20 +1,13 @@
 #!/usr/bin/env bash
-# Regression (#1887 review, qingyun): a checkout-missing-skill install
-# validates the proxy fallback against $CLAUDE_CONFIG_DIR/skills/... at
-# install time, but the rendered plist did not persist CLAUDE_CONFIG_DIR —
-# so the launchd-supervised wrapper recomputed claude-home-path with no env
-# and fell back to ~/.claude/..., a different (possibly nonexistent) path:
-# the reproduced kill/restart crash-loop class.
+# Pins the plist's CLAUDE_CONFIG_DIR: launchd inherits no env, so without the pin
+# the wrapper resolves a different proxy path than the installer validated.
 #
-# Asserts: (1) the installer persists the resolved CLAUDE_CONFIG_DIR into
-# the plist; (2) under a launchd-like environment (env -i + only the plist's
-# EnvironmentVariables), the wrapper resolves the SAME proxy path the
-# installer validated; (3) the pre-fix environment (no CLAUDE_CONFIG_DIR)
-# demonstrably diverges — proving the plist pin is load-bearing.
+# Asserts the installer persists the resolved dir, the wrapper resolves the SAME
+# path under env -i + the plist's EnvironmentVariables, and that dropping the pin
+# demonstrably diverges — the negative control that makes the other two mean something.
 #
-# Isolation: HOME/PATH redirected, launchctl stubbed — never touches the
-# real LaunchAgents or launchd domain (same pattern as
-# credential-proxy-bundled-install.test.sh).
+# Isolation: HOME/PATH redirected and launchctl stubbed, so it never touches the
+# real LaunchAgents or launchd domain.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
