@@ -82,7 +82,7 @@ bash "$SKILL_DIR/scripts/review-pr.sh" 1754            # default --max 240 --sta
 bash "$SKILL_DIR/scripts/review-pr.sh" 1754 --max 300  # longer cap for a big diff
 ```
 
-Prints Codex's verdict to stdout preceded by a `===CODEX-VERDICT===` line. **The verdict
+Prints `VERDICT-MARKER: <token>` as stdout line 1, then Codex's verdict preceded by that token. The token is a per-RUN nonce, never shown to Codex, so a diff or verdict quoting a marker literal cannot pose as it. **The verdict
 is only the text after the LAST such line.** The rest of the stream is Codex's exec trace,
 left unredirected on purpose so `codex-bounded.sh --stall` can watch it — it contains
 repository source the agent inlined while working, so a consumer that takes the whole

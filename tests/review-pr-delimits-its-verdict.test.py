@@ -12,7 +12,16 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "claude-codex" / "scripts" / "review-pr.sh"
-MARKER = "===CODEX-VERDICT==="
+LEGACY_MARKER = "===CODEX-VERDICT==="
+_ANNOUNCE = "VERDICT-" + "MARKER: "        # split so this file cannot self-match
+
+
+def marker_of(stdout):
+    """The token this RUN announced on line 1. A test cannot hardcode it — that is the
+    point: a literal in a diff or verdict must not be able to pose as the marker."""
+    first = stdout.splitlines()[0]
+    assert first.startswith(_ANNOUNCE), f"line 1 is not the announcement: {first!r}"
+    return first[len(_ANNOUNCE):].strip()
 
 # A trace that looks like a diff, which is the whole trap.
 TRACE = """thinking about the diff
@@ -26,7 +35,7 @@ VERDICT = "no blocking issues\nbut check the deferral path\n"
 
 
 class ReviewPrDelimitsItsVerdict(unittest.TestCase):
-    def _run(self, diff="diff --git a/x b/x\n+real change\n"):
+    def _run(self, diff="diff --git a/x b/x\n+real change\n", verdict=None):
         bin_dir = Path(tempfile.mkdtemp())
         (bin_dir / "gh").write_text(f"#!/bin/bash\nprintf '%b' {diff!r}\n")
         # codex writes the clean verdict to -o and streams a trace to stdout
@@ -35,7 +44,7 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
             "out=''\n"
             'while [[ $# -gt 0 ]]; do [[ "$1" == "-o" ]] && { out="$2"; shift; }; shift; done\n'
             f"printf '%b' {TRACE!r}\n"
-            f"[[ -n \"$out\" ]] && printf '%b' {VERDICT!r} > \"$out\"\n"
+            f"[[ -n \"$out\" ]] && printf '%b' {(verdict or VERDICT)!r} > \"$out\"\n"
             "exit 0\n")
         for f in ("gh", "codex"):
             (bin_dir / f).chmod(0o755)
@@ -46,8 +55,8 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
 
     def test_the_marker_is_present_and_the_verdict_follows_it(self):
         r = self._run()
-        self.assertIn(MARKER, r.stdout, f"no verdict marker in stdout (rc={r.returncode})")
-        after = r.stdout.rsplit(MARKER, 1)[1].strip()
+        self.assertIn(marker_of(r.stdout), r.stdout, f"no verdict marker in stdout (rc={r.returncode})")
+        after = r.stdout.rsplit(marker_of(r.stdout), 1)[1].strip()
         # The extracted region is the mechanical findings THEN the codex verdict:
         # both are review output, and only the trace belongs on the other side.
         self.assertTrue(after.endswith(VERDICT.strip()), after)
@@ -64,7 +73,7 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
     def test_a_consumer_splitting_on_the_marker_cannot_quote_the_trace(self):
         """The actual defect: diff-shaped lines in the trace must not reach the verdict."""
         r = self._run()
-        after = r.stdout.rsplit(MARKER, 1)[1]
+        after = r.stdout.rsplit(marker_of(r.stdout), 1)[1]
         self.assertNotIn("not_in_this_pr", after)
         self.assertNotIn("diff --git", after)
 
@@ -74,7 +83,7 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
                '+TOKEN = "/Users/qingyun-air/.secret"\n')
         r = self._run(diff=bad)
         self.assertIn("review-checks", r.stdout, "the mechanical runner did not fire")
-        after = r.stdout.rsplit(MARKER, 1)[1]
+        after = r.stdout.rsplit(marker_of(r.stdout), 1)[1]
         # codex says "no blocking issues" here, so the extracted text is the ONLY
         # place a reader would see the hardcoded path.
         self.assertIn("hardcoded path", after,
@@ -88,19 +97,52 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
                    if "On SUCCESS" in ln and "results/task-{id}.txt" in ln]
         self.assertTrue(success, "PR-REVIEW success instruction not found in the bridge")
         for ln in success:
-            self.assertIn(MARKER, ln,
-                          "the bridge must name the marker, not just 'verdict on stdout'")
-            self.assertIn("LAST", ln, "must specify the LAST marker, not any marker")
+            self.assertIn(_ANNOUNCE.strip(), ln,
+                          "the bridge must tell the agent to read the token from line 1")
+            self.assertIn("LAST", ln, "must specify the LAST occurrence, not any")
+            self.assertNotIn(LEGACY_MARKER, ln,
+                             "naming a fixed literal is the defect: a diff can quote it")
+
+    def test_the_marker_is_announced_on_line_one(self):
+        tok = marker_of(self._run().stdout)
+        self.assertTrue(tok.startswith("===CODEX-VERDICT-"), tok)
+        self.assertNotEqual(tok, LEGACY_MARKER, "a fixed literal is the defect")
+
+    def test_the_nonce_differs_between_runs(self):
+        a, b = marker_of(self._run().stdout), marker_of(self._run().stdout)
+        self.assertNotEqual(a, b, "a per-run nonce that repeats IS a fixed literal")
+
+    def test_a_verdict_quoting_the_LEGACY_marker_cannot_truncate_the_extract(self):
+        """The blocking case. The old literal appears 4x in this PR's own diff, so
+        reviewing these files inlines it; a verdict echoing it used to eat the
+        mechanical-checks block — the exact loss the emit ordering exists to prevent."""
+        poisoned = (f"the `{LEGACY_MARKER}` marker is sound.\n"
+                    "- src/foo.py:12 real bug: off-by-one\n")
+        r = self._run(verdict=poisoned)
+        tok = marker_of(r.stdout)
+        extract = r.stdout.rsplit(tok, 1)[1]
+        self.assertIn("off-by-one", extract, "the verdict body was truncated")
+        self.assertIn("Mechanical checks", extract,
+                      "a review-checks FAIL would be silently dropped")
+
+    def test_a_diff_quoting_the_LEGACY_marker_does_not_leak_the_nonce(self):
+        """Codex is never shown the nonce, so it cannot echo it however the diff reads."""
+        r = self._run(diff=f"diff --git a/x b/x\n+{LEGACY_MARKER}\n")
+        tok = marker_of(r.stdout)
+        after_announce = r.stdout.split("\n", 1)[1]
+        self.assertEqual(after_announce.count(tok), 1,
+                         "the nonce must appear exactly once after line 1")
 
     def test_the_skill_stdout_contract_names_the_marker(self):
         """SKILL.md documents the same path the in-band block runs; both or neither."""
         text = (REPO / "skills" / "claude-codex" / "SKILL.md").read_text()
-        idx = text.find("Prints Codex's verdict to stdout")
+        # Anchor on the CONTRACT, not on prose: the sentence around it gets reworded.
+        idx = text.find(_ANNOUNCE.strip())
         self.assertNotEqual(idx, -1, "the stdout contract paragraph is gone")
-        para = text[idx:idx + 700]
-        self.assertIn(MARKER, para,
-                      "SKILL.md must name the marker where it describes stdout")
-        self.assertIn("LAST", para, "must specify the LAST marker, not any marker")
+        para = text[max(0, idx - 100):idx + 700]
+        self.assertIn(_ANNOUNCE.strip(), para,
+                      "SKILL.md must document the line-1 announcement")
+        self.assertIn("LAST", para, "must specify the LAST occurrence, not any")
 
 
 if __name__ == "__main__":

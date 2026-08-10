@@ -39,8 +39,14 @@ DIFF="$(gh pr diff "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff $PR\` 
 [[ -n "$DIFF" ]] || { echo "review-pr: empty diff for #$PR (already merged with no changes, or not found)" >&2; exit 2; }
 
 OUT="$(mktemp -t review-pr.XXXXXX)"
-# Consumers split on this rather than guessing where the agent trace ends.
-VERDICT_MARKER="===CODEX-VERDICT==="
+# Per-RUN nonce, announced on line 1. A fixed literal is unsafe here: the marker would
+# be inlined by any diff that mentions it, and a verdict quoting it defeats the split.
+VERDICT_NONCE="$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 12)"
+[[ -n "$VERDICT_NONCE" ]] || VERDICT_NONCE="$$$(date +%s)"   # never an empty marker
+VERDICT_MARKER="===CODEX-VERDICT-${VERDICT_NONCE}==="
+# FIRST line of stdout, before codex runs: the consumer reads the token here. codex is
+# never shown the nonce, so neither its trace nor the diff-derived verdict can contain it.
+printf 'VERDICT-MARKER: %s\n' "$VERDICT_MARKER"
 trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
 
 # Captured now, emitted AFTER the marker: a consumer keeps only post-marker text,
