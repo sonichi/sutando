@@ -7261,40 +7261,10 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
     return False
 
 
-def _local_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -> bool:
-    """Return True if THIS host's core has a live heartbeat.
-
-    `_any_core_alive` answers a fleet question — "is anyone up to service a
-    queued task?" — and globbing every `state/cores/*.alive` is right for that.
-    It is the wrong question for the dead-core RESTART actuator: the workspace
-    is shared, so one fresh peer record made a dead local host look alive
-    forever and the relaunch never fired. Repro with only `peer-host.alive`
-    present returned `any_core_alive: True, local_heartbeat_exists: False`
-    (qingyun-wu, #2160 P1).
-
-    Restarting is a local action about the local core, so it reads exactly one
-    file: the name `core_heartbeat` writes, via the same `util_paths._host_label()`
-    it uses — not `socket.gethostname()`, which drifts from the label under a
-    DHCP rename and would look for a file nobody writes.
-
-    THREE-STATE, and that is the whole point (john-the-dev, #2160). An earlier
-    version returned a plain bool and collapsed "I could not find out" into
-    "dead". The actuator computes `dead = not alive`, so a transient import,
-    permission, or filesystem failure restarted a perfectly healthy core.
-    Reproduced on the exact head: make `_host_label()` raise, call the actuator
-    twice, and pass 2 returns `restarted`.
-
-    My own case `t` had asserted that False was the "fail-safe" direction,
-    reasoning that an unidentifiable host must not get recovery SUPPRESSED. That
-    weighed only one of the two failures. For an actuator whose action is
-    destructive, killing a healthy core is the worse one, and it is the one a
-    flaky probe actually produces.
-
-    So the states are distinct:
-      True  — a heartbeat exists and is fresh
-      False — DEFINITIVELY dead: the file is absent, or its mtime is stale
-      None  — UNKNOWN: the host could not be identified, or the file exists but
-              could not be read. Callers must not take a destructive action.
+def _local_core_alive(workspace: Optional[Path] = None,
+                      max_age_s: float = 90.0) -> Optional[bool]:
+    """THIS host only, three-state: True fresh, False definitively dead (absent
+    or stale mtime), None UNKNOWN — callers must not act destructively on None.
     """
     if workspace is None:
         workspace = WORKSPACE_DIR
@@ -7846,13 +7816,8 @@ def notify_gateway_for_failures(
 # Heavily guarded, because auto-restarting a 24/7 agent is consequential:
 #   - Fires on either (a) a CONFIRMED, SUSTAINED wedge: core process alive AND
 #     the oldest queued task older than RECOVER_WEDGE_SEC AND the core didn't
-#     just boot; or (b) a DEAD core: no fresh heartbeat AND not just-booted —
-#     the "session died and took its in-session crons/dailies" case (owner-
-#     requested 2026-07-17). Both are observed on two passes ≥ RECOVER_CONFIRM_SEC
-#     apart (never a blip) and share the cooldown + give-up cap below, so a
-#     crash-looping core can't restart-storm. (Design note: this DOES relaunch a
-#     deliberately-stopped core; the give-up cap bounds that, and an explicit
-#     "intended-down" sentinel is a possible future refinement.)
+#     just boot; or (b) a DEAD core: no fresh heartbeat AND not just-booted.
+#     Both observed on two passes ≥ RECOVER_CONFIRM_SEC apart. Never a blip.
 #   - Identity + progress gating (so a legitimately long-running single task is
 #     not killed mid-work): the SAME oldest task must persist across the window
 #     (a draining queue surfaces a different oldest each pass → resets) AND
@@ -7959,30 +7924,9 @@ def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: 
 
 
 def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
-                               now: Optional[float] = None) -> bool:
-    """True if THIS host's core reports `started_at` within the last `seconds`.
-
-    The local twin of `_core_started_within`, and the same local-vs-fleet
-    boundary the liveness check needed. The workspace is shared, so the
-    fleet-wide version is satisfied by a PEER that just booted: local liveness
-    reads dead, the boot guard reads "just booted", `recover_core_if_wedged`
-    returns None, and no confirm window is ever started. A peer boot therefore
-    suppressed local dead-core recovery for the whole startup window
-    (qingyun-wu, #2160).
-
-    Reads exactly the file `core_heartbeat` writes for this host, via the same
-    `util_paths._host_label()`.
-
-    THREE-STATE for the same reason as `_local_core_alive` — this is the second
-    helper john-the-dev flagged. It gates a destructive action, so "I could not
-    read it" must not read as "not just booted, go ahead and restart":
-      True  — started_at is present and within the window
-      False — DEFINITIVELY not just-booted (fresh heartbeat, older started_at)
-      None  — UNKNOWN: unresolvable label, unreadable/undecodable file, or a
-              started_at that is missing or not a number.
-
-    Note a stale heartbeat still returns False, not None: a heartbeat we CAN
-    read and that is old is real evidence the core is not freshly booted.
+                               now: Optional[float] = None) -> Optional[bool]:
+    """THIS host only, three-state like `_local_core_alive`: None is UNKNOWN and
+    must not read as "not just booted". A stale heartbeat is False, not None.
     """
     if workspace is None:
         workspace = WORKSPACE_DIR
@@ -8080,19 +8024,13 @@ def recover_core_if_wedged(
         now = time.time()
     if state_file is None:
         state_file = WORKSPACE_DIR / "state" / "core-recovery.json"
-    # LOCAL, not fleet-wide: a peer's heartbeat must not suppress the relaunch
-    # of a dead core on THIS host (qingyun-wu, #2160 P1). The two call sites
-    # that gate "queue a task for someone to pick up" keep `_any_core_alive`,
-    # because any live core can service a queued task — that question really is
-    # fleet-wide. Restarting is not.
+    # LOCAL, not fleet-wide: a peer's heartbeat must not suppress a relaunch on
+    # THIS host. Queue-gating call sites keep `_any_core_alive` — that IS fleet-wide.
     alive_fn = alive_fn or _local_core_alive
     oldest_task_fn = oldest_task_fn or (lambda: _oldest_pending_task(now))
     status_ts_fn = status_ts_fn or _core_status_ts
-    # LOCAL boot guard, matching the local liveness check above. Fleet-wide here
-    # meant a PEER that just booted suppressed local dead-core recovery for the
-    # whole startup window — liveness said dead, the boot guard said "wait", and
-    # the actuator returned without even starting a confirm window
-    # (qingyun-wu, #2160).
+    # LOCAL boot guard, matching the liveness check: fleet-wide, a PEER's boot
+    # suppressed local dead-core recovery for the whole startup window.
     just_booted_fn = just_booted_fn or (
         lambda: _local_core_started_within(RECOVER_WEDGE_SEC, now=now))
     restart_fn = restart_fn or _default_core_restart
@@ -8142,33 +8080,12 @@ def recover_core_if_wedged(
         status_ts = status_ts_fn()
         alive = alive_fn()
         just_booted = just_booted_fn()
-        # UNKNOWN liveness must never reach the destructive path (john-the-dev,
-        # #2160). `dead` below is `not alive`, so a None here would restart a
-        # healthy core on nothing but a failed probe. Bail BEFORE any decision,
-        # and deliberately leave the observation state untouched: clearing it
-        # would let an intermittently-failing probe reset the confirm window
-        # forever and silently disable recovery — the very failure the old
-        # fail-to-False was reaching for, now handled without the destructive
-        # side. An injected bool from a test is unaffected.
+        # UNKNOWN must not reach the destructive path: `dead` is `not alive`, so a
+        # None would restart a healthy core. Leave observation state untouched.
         if alive is None or just_booted is None:
             which = "liveness" if alive is None else "boot-guard"
-            # RESET the confirmation window (qingyun-wu, #2160 follow-up). An
-            # earlier version deliberately left it intact, reasoning that an
-            # intermittently-failing probe would otherwise reset forever and
-            # silently disable recovery. Reproduced at the exact head, that
-            # choice was the destructive one: liveness `dead -> UNKNOWN -> dead`
-            # returned observed / probe-failed / RESTARTED, so a single
-            # post-uncertainty DEAD reading inherited a window opened BEFORE the
-            # uncertainty. The "death persists across a pass" guarantee was not
-            # holding — the middle pass confirmed nothing.
-            #
-            # Both directions fail, so the question is which way. A flaky probe
-            # that never permits two consecutive affirmative deaths means the
-            # state is genuinely unknown, and NOT restarting is correct there.
-            # Killing a healthy core on one observation plus a gap is not.
-            # Uncertainty therefore invalidates the streak; recovery resumes as
-            # soon as two clean consecutive observations exist, which case `x`
-            # pins so this cannot be read as disabling recovery.
+            # Uncertainty invalidates the streak: a DEAD reading after an UNKNOWN
+            # would otherwise inherit a window opened before the uncertainty.
             if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
                 _reset_observation()
                 _save()
@@ -8182,20 +8099,13 @@ def recover_core_if_wedged(
             and oldest_age > RECOVER_WEDGE_SEC
             and not just_booted
         )
-        # Dead-core relaunch: a fully-dead core (no fresh heartbeat) is a
-        # DISTINCT gap from a wedge — the session exited, taking its in-session
-        # crons/dailies with it. A wedge requires the core ALIVE; a dead core
-        # just needs relaunching. It flows through the SAME confirm→cooldown→
-        # give-up→restart path below (so a crash-looping core can't storm —
-        # bounded by RECOVER_COOLDOWN_SEC + RECOVER_MAX_PER_HOUR), and the
-        # confirm window means the death must persist across a pass (not a
-        # brief mid-restart blip; `just_booted_fn()` also excludes a fresh core).
+        # A dead core is a distinct gap from a wedge (a wedge requires ALIVE) and
+        # flows through the same confirm/cooldown/give-up path below.
         dead = (not alive) and (not just_booted)
 
         if not wedged and not dead:
-            # Healthy / just booted. Clear any in-progress observation so a
-            # future wedge/death starts fresh. last_restart / history are
-            # preserved (cooldown + give-up survive).
+            # Clear any in-progress observation; last_restart / history are
+            # preserved so cooldown and give-up survive.
             if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
                 _reset_observation()
                 _save()
@@ -8205,16 +8115,8 @@ def recover_core_if_wedged(
         # from a legitimately long single task. Reset the confirmation window if
         # EITHER the oldest task changed (queue draining → a different oldest, or
         # the file was rewritten → new mtime) OR the core advanced core-status.json
-        # (it's making progress, not looping) OR the observation MODE flipped
-        # (wedged↔dead). The mode reset matters because a wedge and a dead core
-        # share this observation state: a core that is wedged (alive, oldest task
-        # X, already confirming) can DIE with X still the oldest — without the
-        # mode check it would inherit the wedge's elapsed confirm window and
-        # relaunch on the first dead pass, so the "death persists across a pass"
-        # guarantee would not actually hold. wedged/dead are mutually exclusive
-        # here (wedged requires alive, dead requires not-alive), so cur_mode is
-        # unambiguous. Only a SAME-task, SAME-mode, NO-progress streak across the
-        # window is treated as a real wedge/death.
+        # Wedge and dead share this observation state, so a mode flip must reset
+        # it: a wedged core that DIES would inherit the wedge's elapsed window.
         cur_mode = "wedged" if wedged else "dead"
         prev_key = state.get("wedge_task")
         prev_mode = state.get("wedge_mode")
@@ -8225,16 +8127,8 @@ def recover_core_if_wedged(
             and isinstance(status_ts, (int, float))
             and status_ts > prev_status_ts
         )
-        # A missing wedge_mode on an IN-PROGRESS observation (first_seen set) is a
-        # pre-upgrade state file. The previous head only ever observed WEDGES
-        # (dead-core relaunch is new in this change), so an absent mode implies the
-        # accumulated window is a WEDGE window — treat it as "wedged". That makes a
-        # now-DEAD core correctly register as a flip (re-observe, so death gets its
-        # own confirm window instead of inheriting the wedge's elapsed one — the
-        # exact rollout Qingyun flagged), while a still-WEDGED core sees no flip and
-        # keeps its window (an in-progress give-up on pre-upgrade state is preserved,
-        # case_h). On a fresh observation (first_seen == 0) the `(not first_seen)`
-        # term below already forces a reset, so the implied mode is moot there.
+        # An absent mode on an in-progress observation is a pre-upgrade state file,
+        # which could only have been a wedge; assuming so makes a now-dead core flip.
         effective_prev_mode = prev_mode if prev_mode is not None else "wedged"
         mode_flipped = bool(first_seen) and effective_prev_mode != cur_mode
         if (not first_seen) or prev_key != cur_key or mode_flipped or progressed:

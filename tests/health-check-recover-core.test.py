@@ -249,10 +249,8 @@ def case_i_failed_restart_does_not_burn_state() -> list[str]:
 
 
 def case_j_dead_core_relaunches() -> list[str]:
-    """A fully-dead core (no heartbeat, not just-booted) IS relaunched — the
-    'session died and took its in-session crons/dailies' case (owner-requested
-    2026-07-17). Observed on the first pass, restarted after the confirm window.
-    A dead core that JUST booted is NOT touched (coming up, not gone)."""
+    """A fully-dead core IS relaunched: observed on the first pass, restarted
+    after the confirm window. A dead core that JUST booted is NOT touched."""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         h = Harness(Path(td) / "rec.json")
@@ -273,7 +271,7 @@ def case_j_dead_core_relaunches() -> list[str]:
 
 
 def case_j2_dead_core_before_after_output() -> list[str]:
-    """BEFORE/AFTER health-check output for the dead-core relaunch (CR #2160):
+    """BEFORE/AFTER health-check output for the dead-core relaunch:
     run the SAME recover-core check in two states and capture the action + the
     DM the owner would see.
       BEFORE (healthy, non-wedged core): no action, no restart, no DM.
@@ -426,7 +424,7 @@ def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
     """A wedged→dead transition on the SAME oldest task must RE-OBSERVE (start a
     fresh confirm window for the dead condition) — NOT inherit the wedge's
     already-elapsed window and relaunch on the first dead pass. Regression for
-    the mode-unaware confirm-window reuse found reviewing #2160: dead and wedged
+    the mode-unaware confirm-window reuse: dead and wedged
     share wedge_first_seen/wedge_task, and without a mode check a core that is
     wedged-and-confirming, then dies with the same oldest task, would restart
     immediately though the DEAD condition was never confirmed across a pass."""
@@ -454,13 +452,13 @@ def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
 
 
 def case_q_preupgrade_state_dead_reobserves() -> list[str]:
-    """Persisted-state migration regression (Qingyun review, #2160): a PRE-UPGRADE
+    """Persisted-state migration regression: a PRE-UPGRADE
     state file has wedge_first_seen/wedge_task but NO wedge_mode. The previous head
     only ever observed WEDGES, so that absent mode is an implied wedge window. If
     the core is DEAD on the first post-upgrade pass with the same oldest task and
     the old window has already elapsed, the death must be RE-OBSERVED on its own
     window — NOT restarted immediately by inheriting the elapsed wedge window.
-    Direct repro of the seed Qingyun reported returning action='restarted'."""
+    Direct repro of the seed that returned action='restarted'."""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         sf = Path(td) / "rec.json"
@@ -490,7 +488,7 @@ def case_q_preupgrade_state_dead_reobserves() -> list[str]:
 
 
 def case_r_local_liveness_ignores_peer_heartbeats():
-    """qingyun-wu's P1 (#2160): a PEER heartbeat must not suppress a local relaunch.
+    """A PEER heartbeat must not suppress a local relaunch.
 
     The dead-core actuator defaulted to `_any_core_alive`, whose contract is
     explicitly "any host" and which globs every `state/cores/*.alive`. The
@@ -571,11 +569,8 @@ def case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet():
     finally:
         hc.WORKSPACE_DIR = orig
 
-    # Assert on wedge_mode, NOT on action. Both modes return "observed" — the
-    # fleet-wide default reaches it via the WEDGE path (alive but stuck) and the
-    # local default via the DEAD path. An action-only assertion passes under
-    # both, which is exactly how my first draft of this case failed to pin
-    # anything; the revert control caught it.
+    # Assert on wedge_mode, NOT action: both modes return "observed", so an
+    # action-only assertion passes under either and pins nothing.
     import json as _json
     st = _json.loads((ws / "rec.json").read_text()) if (ws / "rec.json").exists() else {}
     if st.get("wedge_mode") != "dead":
@@ -624,11 +619,8 @@ def case_t_unresolvable_host_label_reads_NOT_alive():
     util_paths._host_label = _boom
     try:
         got = hc._local_core_alive(ws)
-        # `is None`, NOT falsiness. The previous assertion was `if
-        # _local_core_alive(ws):` — which None passes just as well as False, so
-        # it could not tell the two apart and stayed green while the function
-        # returned the dangerous value. A three-state contract needs an
-        # identity check on each state or it pins nothing.
+        # `is None`, NOT falsiness: a truthiness check cannot separate None
+        # from False, so a three-state contract needs an identity check.
         if got is not None:
             fails.append(
                 "t) an unresolvable host label returned %r — it must be None "
@@ -648,7 +640,7 @@ def case_t_unresolvable_host_label_reads_NOT_alive():
 
 
 def case_x_uncertainty_between_two_deaths_invalidates_the_window():
-    """qingyun-wu (#2160 follow-up): an UNKNOWN probe must not be a free pass.
+    """An UNKNOWN probe must not be a free pass.
 
     The first fix suppressed the restart on UNKNOWN but deliberately LEFT the
     confirmation window intact, on the reasoning that an intermittently-failing
@@ -710,7 +702,7 @@ def case_x_uncertainty_between_two_deaths_invalidates_the_window():
 
 
 def case_w_every_three_state_branch_of_both_helpers():
-    """Direct branch coverage for the three-state helpers (#2160).
+    """Direct branch coverage for the three-state helpers.
 
     Cases t and v pin the DANGEROUS transitions. The Coverage Gate then showed
     the rest of `_local_core_started_within` was never executed at all — only
@@ -737,10 +729,8 @@ def case_w_every_three_state_branch_of_both_helpers():
     label = util_paths._host_label()
     alive = ws / "state" / "cores" / f"{label}.alive"
 
-    # --- _local_core_alive: OSError that is NOT FileNotFoundError -> UNKNOWN.
-    # A permission/IO error on a file that EXISTS is the case that must not read
-    # as dead. Patched rather than chmod-ed so it behaves the same on any host
-    # and as any user (a chmod test silently passes when running as root).
+    # An IO error on a file that EXISTS must not read as dead. Patched rather
+    # than chmod-ed: a chmod test silently passes when running as root.
     alive.write_text("{}")
     real_stat = pathlib.Path.stat
 
@@ -798,7 +788,7 @@ def case_w_every_three_state_branch_of_both_helpers():
 
 
 def case_v_an_unknown_probe_must_not_restart_a_healthy_core():
-    """The paired unknown-state control john-the-dev asked for (#2160).
+    """The paired unknown-state control.
 
     Case t pins the helper; this pins the ACTUATOR, because they failed
     independently — the helper returning False was only dangerous once
@@ -856,7 +846,7 @@ def case_v_an_unknown_probe_must_not_restart_a_healthy_core():
 
 
 def case_u_peer_boot_does_not_suppress_local_recovery():
-    """qingyun-wu (#2160): the boot guard had the same local-vs-fleet leak.
+    """The boot guard had the same local-vs-fleet leak.
 
     Fixing liveness was half of it. `_core_started_within` still globbed every
     host, so a PEER that just booted satisfied the just-booted guard: local
