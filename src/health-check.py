@@ -5169,7 +5169,13 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         # same signal as a genuinely stranded reply, which is how a detector
         # trains its readers to ignore it. `find_task_file()` is the canonical
         # locator (it is what the bridge archive paths already use).
-        task_path = find_task_file(tasks_dir, path.stem)
+        try:
+            task_path = find_task_file(tasks_dir, path.stem)
+        except OSError:
+            # The locator itself stats the path, so it raises for the same
+            # reasons the age read does; both are partial coverage, not clean.
+            unreadable += 1
+            continue
         if task_path is not None:
             # A CLAIMED task is owned by a running consumer; its lifetime is
             # not ours to judge, however long it takes.
@@ -5182,12 +5188,8 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
                 # could not take is partial coverage, never a silent clean pass.
                 unreadable += 1
                 continue
-            # An UNCLAIMED task sitting beside its own finished result, both
-            # past the threshold, is not a pair in flight: nothing is coming
-            # to collect it. Tasks written straight into tasks/ by a script
-            # are never registered with a bridge, so their result is polled by
-            # no one and both files stay on disk forever -- which is exactly
-            # the state this exclusion used to read as "still queued".
+            # A task no bridge created is never collected, so an unclaimed
+            # pair past the threshold is stranded rather than in flight.
             if task_age < threshold_age_sec:
                 continue
         orphans.append((path.name, int(age)))

@@ -76,22 +76,13 @@ class OrphanedResultsTest(unittest.TestCase):
     # --- negative: the guards that keep a 'warn' meaningful -------------
 
     def test_task_still_queued_is_not_an_orphan(self):
-        """The consumer simply has not reached this pair yet.
-
-        Scoped to a task younger than the threshold: "not reached yet" is a
-        transient state, not one a pair can hold for hours.
-        """
+        """Not-reached-yet is transient, so this is scoped to a fresh task."""
         self._write("results/task-abc.txt", TWO_HOURS_AGO)
         self._write("tasks/task-abc.txt")
         self.assertEqual(hc.check_orphaned_results()["status"], "ok")
 
     def test_aged_unclaimed_task_beside_its_result_IS_an_orphan(self):
-        """Nothing is coming to collect it, so "still queued" is the wrong read.
-
-        A task written straight into tasks/ by a script is never registered
-        with a bridge, so its result is polled by no one and BOTH files sit
-        past the threshold forever.
-        """
+        """An unclaimed pair past the threshold is stranded, not in flight."""
         self._write("results/task-newsradar-1.txt", TWO_HOURS_AGO)
         self._write("tasks/task-newsradar-1.txt", TWO_HOURS_AGO)
         result = hc.check_orphaned_results()
@@ -99,17 +90,12 @@ class OrphanedResultsTest(unittest.TestCase):
         self.assertIn("task-newsradar-1.txt", result["detail"])
 
     def test_unmeasurable_task_age_warns_rather_than_dropping_the_result(self):
-        """A task whose mtime cannot be read is partial coverage, not a clean pass.
-
-        Same treatment as an unreadable result entry — otherwise a stat failure
-        turns a real orphan into `ok` and nothing says the scan was incomplete.
-        """
+        """An unreadable task age is partial coverage, never a clean pass."""
         self._write("results/task-stat.txt", TWO_HOURS_AGO)
 
         class _UnstatableTask:
-            # Only `.name` and `.stat()` are used by the probe. A stub keeps the
-            # failure on that one call; patching Path.stat globally also breaks
-            # Path.exists(), which calls it internally.
+            # Deterministic counterpart to the real-locator control below:
+            # patching Path.stat globally would also break Path.exists().
             name = "task-stat.txt"
 
             def stat(self, *a, **k):
@@ -119,6 +105,24 @@ class OrphanedResultsTest(unittest.TestCase):
             result = hc.check_orphaned_results()
         self.assertEqual(result["status"], "warn", result)
         self.assertIn("unreadable", result["detail"])
+
+    def test_real_locator_raising_does_not_abort_the_probe(self):
+        """Drives the REAL find_task_file, whose exists() stats the path too."""
+        self._write("results/task-real.txt", TWO_HOURS_AGO)
+        task = self._write("tasks/task-real.txt", TWO_HOURS_AGO)
+        real_stat = pathlib.Path.stat
+
+        def boom(self_p, *a, **k):
+            if self_p == task:
+                raise OSError("EIO")
+            return real_stat(self_p, *a, **k)
+
+        # No stub: the failure must survive the locator, not bypass it.
+        with mock.patch.object(pathlib.Path, "stat", boom):
+            result = hc.check_orphaned_results()
+        # 3.12 raises out of exists(); 3.14 swallows it and the pair reads as
+        # an orphan. Both must warn; only the route differs.
+        self.assertEqual(result["status"], "warn", result)
 
     def test_aged_CLAIMED_task_is_still_not_an_orphan(self):
         """A claimed task is owned by a running consumer, however long it runs."""
