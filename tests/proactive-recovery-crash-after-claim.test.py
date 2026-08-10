@@ -119,7 +119,23 @@ def run_vanished_source_case():
         return ok
 
 
+def restore_collision(d):
+    # A real collision (different inodes) AND the base claim name is occupied,
+    # so the claim cannot be put back and must stay under its private name.
+    (d / "proactive-y.txt").write_text("newer result")
+    (d / "proactive-y.sending").write_text("base claim")
+    (d / f"proactive-y.sending.recover-{DEAD_PID}-0").write_text("stranded body")
+
+
+def check_restore_collision(d, recovered):
+    bodies = {p.read_text() for p in d.iterdir() if p.is_file()}
+    privates = [p.name for p in d.iterdir() if ".recover-" in p.name]
+    ok = {"newer result", "base claim", "stranded body"} <= bodies and bool(privates)
+    return ok, f"recovered={recovered} bodies={len(bodies)} kept_private={privates}"
+
+
 results = [
+    case("C6 unrestorable claim is kept, not dropped", restore_collision, check_restore_collision),
     case("C0 a colliding private claim is never overwritten", two_bodies, check_both_survive),
     case("C1 crashed mid-recovery -> body recovered to .txt", crashed_mid_recovery, check_recovered),
     case("C2 live holder's private claim left untouched", live_holder, check_untouched),
