@@ -331,7 +331,6 @@ with tempfile.TemporaryDirectory() as d:
     _db.STATE_DIR = ws / "state"
     _db.TASKS_DIR = ws / "tasks"
 
-    # ---- the step leak -------------------------------------------------------
     # The owner-tier gate asks who SENT the task, never who can READ the channel,
     # and the step is rendered verbatim into whatever channel it arrived on.
     check("step_visible_in: DM yes", ps.step_visible_in(True) is True)
@@ -372,10 +371,8 @@ with tempfile.TemporaryDirectory() as d:
     # A DM may carry the live step...
     out_live = _db._render_progress_content(now, 42, True)
     check("bridge: live core renders progress copy", out_live.startswith("⏳") and "building" in out_live and "(42s)" in out_live)
-    # ...and the DEFAULT is fail-closed. A caller that has not established the
-    # channel's audience gets a placeholder with no step in it. This is the
-    # The gate asks who SENT the task, never who can READ the channel, so an
-    # unknown audience must suppress the step rather than assume a DM.
+    # ...and the DEFAULT is fail-closed: an unknown audience must suppress the step
+    # rather than assume a DM, since the tier gate answers who SENT, not who reads.
     out_shared = _db._render_progress_content(now, 42)
     check("bridge: step suppressed when audience unknown",
           out_shared.startswith("⏳") and "building" not in out_shared and "(42s)" in out_shared)

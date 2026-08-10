@@ -4768,16 +4768,10 @@ def _queued_task_count():
 
 
 def _render_progress_content(now, elapsed, channel_is_private=False):
-    """Placeholder body for poll_progress: the live core step, or the honest outage
-    copy (frozen status, stale heartbeat, queue depth) when the core looks dead.
+    """Placeholder body for poll_progress: the live step, or the outage copy.
 
-    `channel_is_private` decides whether the STEP TEXT may be published here.
-    It DEFAULTS TO FALSE — fail-closed: a caller that has not established the
-    channel's audience must not publish the step. See
-    progress_stream.step_visible_in: the step is written for the owner, but this
-    placeholder goes to whatever channel his task arrived on — which may be a
-    shared guild owned by someone else. Outside a DM we still post the
-    placeholder (liveness is the point) with no step text."""
+    `channel_is_private` gates the STEP TEXT and defaults to False — a caller that
+    has not established the audience posts the placeholder without a step."""
     status = progress_stream.read_core_status(STATE_DIR)
     if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
         return progress_stream.format_outage(

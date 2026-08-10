@@ -157,11 +157,8 @@ def _truncate(text: str, limit: int) -> str:
 def step_visible_in(channel_is_private: bool) -> bool:
     """Whether the core's live ``step`` may be PUBLISHED in this channel.
 
-    The owner-tier gate answers WHO SENT the task, never WHO CAN SEE the channel,
-    and ``step`` is rendered verbatim into wherever that task arrived.
-
-    So detailed steps go to known-private chats only; everywhere else still gets a
-    placeholder, just a contentless one — the liveness signal is the point.
+    The owner-tier gate answers who SENT the task, never who can SEE the channel, so
+    only a known-private chat gets the step; elsewhere the placeholder goes bare.
     """
     return bool(channel_is_private)
 

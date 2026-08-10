@@ -478,11 +478,8 @@ pending_task_private: dict = {}  # task_id -> chat audience is private; in-memor
 def _render_progress_text(elapsed: float, task_id: str) -> str:
     """Render the placeholder body for ``task_id``'s chat.
 
-    A Telegram allowlist entry is a USER id, but that user can address the bot from
-    a group, so the gate is the recorded chat audience, not the sender.
-
-    Unknown audience defaults to NOT-private: a restart drops `pending_task_private`,
-    so a recovered in-flight task degrades to a contentless placeholder.
+    The allowlist holds a USER id but that user can write from a group, so the gate is
+    the recorded chat audience; unknown (e.g. after a restart) means not-private.
     """
     if not progress_stream.step_visible_in(pending_task_private.get(task_id, False)):
         return progress_stream.format_progress(None, elapsed)
@@ -748,10 +745,8 @@ def main():  # pragma: no cover
                 sender_id = str(msg["from"]["id"])
                 username = msg["from"].get("username", sender_id)
                 chat_id = msg["chat"]["id"]
-                # Telegram's allowlist gates the SENDER, but that sender can
-                # address the bot from a group/supergroup/channel. Capture the
-                # chat audience here so the progress placeholder can withhold
-                # the core's live step anywhere but a 1:1 DM.
+                # The allowlist gates the SENDER, who may be writing from a group,
+                # so record the chat audience for the progress placeholder's gate.
                 chat_is_private = msg["chat"].get("type") == "private"
                 text = msg.get("text", "")
 
