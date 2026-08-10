@@ -50,7 +50,7 @@ def _fetch(extra, channel_id, page, headers):
     return request_json(req, timeout=10)
 
 
-def _reply_context(msg):
+def _reply_context(msg, clip=REPLY_CLIP):
     """The message this one is REPLYING to, or None.
 
     A terse reply is uninterpretable without its target. Measured 2026-08-04 in
@@ -72,12 +72,12 @@ def _reply_context(msg):
     if not isinstance(ref, dict):
         return None
     author = (ref.get("author") or {}).get("username", "?")
-    body = " ".join((_render(ref) or "").split())
-    return f"\u21b3 replying to {author}: {body[:REPLY_CLIP]}" if body else \
+    body = " ".join((_render(ref, clip) or "").split())
+    return f"\u21b3 replying to {author}: {body[:clip] if clip else body}" if body else \
            f"\u21b3 replying to {author}: (no readable body)"
 
 
-def _render(msg):
+def _render(msg, clip=CLIP):
     """One message's readable body, INCLUDING forwarded content.
 
     A Discord *forward* carries empty top-level `content` and puts the real
@@ -99,7 +99,7 @@ def _render(msg):
     body = (msg.get("content") or "").strip()
     snaps = msg.get("message_snapshots") or []
     if not snaps:
-        return body[:CLIP]
+        return body[:clip] if clip else body
     fwd = (snaps[0].get("message") or {})
     fwd_body = (fwd.get("content") or "").strip()
     extra = []
@@ -137,6 +137,8 @@ def _parse_args(argv):
     parser.add_argument("--limit", type=int, default=10, help="Per-call page size (Discord caps at 100). With --until this is the page size, not the total.")
     parser.add_argument("--after", default=None, help="Snowflake ID — fetch messages after this ID (newer)")
     parser.add_argument("--before", default=None, help="Snowflake ID — fetch messages before this ID (older), one page.")
+    parser.add_argument("--full", action="store_true",
+                        help="Do not clip bodies. Use when the read is a VERIFICATION instrument ('did my message land?') rather than a scan: a grep past the 200-char clip returns 0 for text that WAS delivered, and a false negative there causes a duplicate send.")
     parser.add_argument("--until", default=None, help="Snowflake ID or ISO date/time (e.g. 2026-06-24T23:25) — page BACKWARD until reaching this boundary, then stop. Condition-based depth, NOT a message count: use to reconstruct context however far back the referent / conversational boundary is.")
     return parser.parse_args(argv)
 
@@ -178,8 +180,9 @@ def main(argv=None):
             continue
         author = msg.get("author", {}).get("username", "?")
         ts = msg.get("timestamp", "")[:19]
-        print(f"[{ts}] {author}: {_render(msg)}")
-        ctx = _reply_context(msg)
+        clip = None if args.full else CLIP
+        print(f"[{ts}] {author}: {_render(msg, clip)}")
+        ctx = _reply_context(msg, None if args.full else REPLY_CLIP)
         if ctx:
             print(f"    {ctx}")
     return 0
