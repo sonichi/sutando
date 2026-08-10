@@ -120,17 +120,8 @@ class EmptyResultError(Exception):
 async def _note_empty_result(task_id: str, result_file) -> None:
     """Bound a present-but-empty result, then make it OWNER-VISIBLE and TERMINAL.
 
-    The first cut only printed the notice to bridge stdout and fell through to
-    `continue`. @john-the-dev's blocker on 175173c3: that converts a SILENT stall
-    into a LOGGED one and changes nothing the owner experiences — `pending_replies`
-    is untouched, no DM is sent, the result is never archived, and the reply is
-    still owed forever. It also contradicts this module's own rule zero and §9.3,
-    which require an owner DM plus a `failed` audit row for any delivery failure.
-
-    So at the bound this now does what §9.3 says: reuse `_report_delivery_failure`
-    (owner DM + audit row), drain `pending_replies`, and archive the result so the
-    task cannot stay pending. Below the bound it is still a no-op — that is the
-    partial-write window, where doing anything at all is the bug.
+    At the bound: owner DM plus audit row, drain `pending_replies`, archive the
+    result. Below it, a no-op — that window is a normal partial write.
     """
     notice = result_router.note_empty_result(
         _empty_result_polls, task_id, str(result_file))
@@ -4791,6 +4782,10 @@ async def poll_results():
                 # its purpose, remove to bound `discord-delivered/`
                 # directory growth.
                 _clear_delivered(task_id)
+            else:
+                # CONSECUTIVE means consecutive: an absent file breaks the run, or a
+                # writer that retries accumulates counts across separate appearances.
+                _empty_result_polls.pop(task_id, None)
         await asyncio.sleep(1)
 
 

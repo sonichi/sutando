@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """BEHAVIOURAL: drive `poll_results` over a genuinely empty result file.
 
-The sibling suite (`result-router-empty-result-bound.test.py`) proves the POLICY
-and asserts, by reading the source, that both bridges delegate to it. That is a
-grep — it cannot tell whether the counter actually increments, whether the notice
-actually prints, or whether it fires once. This drives the real loop.
+The sibling suite proves the POLICY by reading source; only driving the real loop
+shows whether the counter increments and the notice fires exactly once.
 
-ASYMMETRY, STATED RATHER THAN IMPLIED. Only Discord is covered behaviourally here.
-Its wiring lives in `async def poll_results()`, which a patched `asyncio.sleep`
-turns into a clean single-iteration driver. Telegram's sits inside `main()`
-(lines 555-1045 — bot construction, long-poll, the lot), so driving it would mean
-a harness larger than the change. Telegram stays source-asserted in the sibling
-suite, and this docstring says so instead of letting "both bridges tested" be
-inferred.
+ASYMMETRY: Discord alone is covered behaviourally; Telegram's wiring sits inside
+`main()` and stays source-asserted in the sibling suite, rather than implying both.
 
-HERMETIC: `CLAUDE_CONFIG_DIR` and `RESULTS_DIR` are tmpdirs, `discord` is stubbed,
-`client.is_ready()` is False so no heartbeat is written. The last case asserts the
+HERMETIC: config dir and RESULTS_DIR are tmpdirs; the last case asserts the
 operator's real results/ was untouched rather than trusting the redirect.
 """
 from __future__ import annotations
@@ -216,6 +208,38 @@ def main() -> int:
     check("  ...and the counter is cleared so a resend starts fresh",
           db._empty_result_polls.get("task-STUCK") is None,
           f"left at {db._empty_result_polls.get('task-STUCK')}")
+
+    # --- the GAP: a poll with no file breaks the run -----------------------
+    # The bound counts CONSECUTIVE present-and-empty polls. Without a reset on the
+    # absent branch the count survives the gap, so a writer that removes and recreates
+    # its result is terminalized on the first poll after it reappears.
+    box_gap = Path(tempfile.mkdtemp(prefix="empty-wire-gap-"))
+    (box_gap / "task-GAP.txt").write_text("")
+    db._empty_result_polls.clear()
+    (box_gap / "tasks").mkdir(parents=True, exist_ok=True)
+    (box_gap / "tasks" / "task-GAP.txt").write_text("id: task-GAP\ntask: something\n")
+    _drive(box_gap, "task-GAP", T - 1)
+    before_missing = db._empty_result_polls.get("task-GAP")
+    check("precondition: the counter is one below the bound",
+          before_missing == T - 1, f"counter={before_missing}, expected {T - 1}")
+
+    (box_gap / "task-GAP.txt").unlink()              # the writer retries
+    out_missing = _drive(box_gap, "task-GAP", 1)
+    check("a poll with the file ABSENT clears the counter",
+          db._empty_result_polls.get("task-GAP") is None,
+          f"counter={db._empty_result_polls.get('task-GAP')} — survived the gap, so the "
+          f"next present-and-empty poll reaches the bound and terminalizes a live task")
+    check("  ...and the absent poll announces nothing",
+          not [l for l in out_missing if l.lstrip().startswith("[result] ")], str(out_missing))
+
+    (box_gap / "task-GAP.txt").write_text("")        # reappears, still empty
+    out_again = _drive(box_gap, "task-GAP", 1)
+    check("  ...so the reappearance does NOT fire the terminal notice",
+          not [l for l in out_again if l.lstrip().startswith("[result] ")],
+          "fired on the first poll after the file came back — the count carried over")
+    check("  ...and the task is still pending, not archived",
+          "task-GAP" in db.pending_replies,
+          "a retried writer was falsely terminalized")
 
     # --- the near-miss: filled BEFORE the bound stays silent ---------------
     # The partial-write case. If it ever announces, the bound is too tight.

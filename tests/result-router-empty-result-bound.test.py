@@ -1,30 +1,14 @@
 #!/usr/bin/env python3
 """`empty_result_notice` — announce a stuck-empty result, never a mid-write one.
 
-THE DEFECT. Both bridges skip an empty result file with a bare `continue`
-(`discord-bridge.py:4308`, `telegram-bridge.py:970`) and `pending_replies.pop()`
-happens AFTER it, so the task stays pending, re-read every 1s, until the 7-day
-age-out at `discord-bridge.py:4261` logs `aged out N` without a reason. The owner
-waits up to a week for a reply that never comes and nothing names it.
+Both obvious fixes are wrong: deleting the bridges' `continue` delivers an empty reply
+on a routine race (`>` truncates at open); logging on first sight is tuned out in a day.
 
-WHY THE OBVIOUS FIXES ARE BOTH WRONG, which is what this file has to encode:
+PERSISTENCE is the only signal separating "empty for 2 ms" from "empty forever",
+so the policy is a threshold and the near-miss case is what keeps it honest.
 
-  * DELETING the `continue` delivers an empty reply on a routine race. CLAUDE.md
-    prescribes `cat > "<path>" << EOF`, and `>` truncates at open, so every
-    normal result file is briefly present-and-empty. Measured on that exact
-    write path: 1 of 8 observations caught it empty.
-  * LOGGING ON FIRST SIGHT fires on nearly every delivery and is tuned out
-    inside a day — the same silence in a louder font.
-
-The only signal separating "empty for 2 ms" from "empty forever" is PERSISTENCE,
-so the policy is a threshold, and the near-miss case below is the one that keeps
-the fix honest: a file that fills up before the threshold must stay silent.
-
-PURE: `result_router` does no I/O, so every policy case here is strings and ints.
-The last case touches the filesystem on purpose — it demonstrates the truncate-at-
-open state the threshold exists for, because a premise quoted from a docstring is
-not evidence. It does so DETERMINISTICALLY rather than by racing a poller; see the
-comment there for why the racing version had to go.
+PURE: `result_router` does no I/O. The last case touches the filesystem on purpose,
+deterministically, to show the truncate-at-open state the threshold exists for.
 """
 from __future__ import annotations
 
