@@ -68,6 +68,39 @@ class DeadProc(FakeProc):
         return 1
 
 
+class RaisingProc(FakeProc):
+    """A capture process whose send_signal raises."""
+    def send_signal(self, *_):
+        raise OSError("no such process")
+
+
+class TestEnsureTapBinary(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_module()
+        self.tmp = tempfile.mkdtemp()
+        self.mod.TAP_BIN = os.path.join(self.tmp, "sys-audio-tap")
+        self.mod.TAP_BUILD = os.path.join(self.tmp, "build-audio-tap.sh")
+
+    def test_already_built(self):
+        Path(self.mod.TAP_BIN).write_bytes(b"x")
+        self.assertTrue(self.mod._ensure_tap_binary())
+
+    def test_build_produces_binary(self):
+        def fake_run(cmd, **k):
+            Path(self.mod.TAP_BIN).write_bytes(b"built")
+            return mock.Mock(returncode=0)
+        with mock.patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(self.mod._ensure_tap_binary())
+
+    def test_build_leaves_binary_missing(self):
+        with mock.patch.object(self.mod.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            self.assertFalse(self.mod._ensure_tap_binary())
+
+    def test_build_raises(self):
+        with mock.patch.object(self.mod.subprocess, "run", side_effect=OSError("no bash")):
+            self.assertFalse(self.mod._ensure_tap_binary())
+
+
 class TestFfmpegResolver(unittest.TestCase):
     def setUp(self):
         self.mod = load_module()
@@ -134,6 +167,56 @@ class TestSpawnAudioCaptures(unittest.TestCase):
         self.assertIsNone(tap)
         self.assertIsNone(mic)
         self.assertTrue(fallback)
+
+    def test_tap_spawn_raises_falls_back(self):
+        with mock.patch.object(self.mod, "_ensure_tap_binary", return_value=True), \
+             mock.patch.object(self.mod.subprocess, "Popen", side_effect=OSError("nope")):
+            tap, mic, fallback = self.mod._spawn_audio_captures("mix", self.base)
+        self.assertIsNone(tap)
+        self.assertIsNone(mic)
+        self.assertTrue(fallback)
+
+    def test_mix_no_ffmpeg_leaves_mic_none(self):
+        with mock.patch.object(self.mod, "_ensure_tap_binary", return_value=True), \
+             mock.patch.object(self.mod, "_ffmpeg", return_value=None), \
+             mock.patch.object(self.mod.subprocess, "Popen", FakeProc):
+            tap, mic, fallback = self.mod._spawn_audio_captures("mix", self.base)
+        self.assertIsNotNone(tap)  # tap itself is fine — only mic path failed
+        self.assertIsNone(mic)
+        self.assertFalse(fallback)  # tap alone still counts as success
+
+    def test_mic_dies_instantly_leaves_mic_none(self):
+        # tap must survive (FakeProc), only the mic (ffmpeg) proc dies
+        calls = {"n": 0}
+
+        def popen_side_effect(cmd, **k):
+            calls["n"] += 1
+            return FakeProc(cmd) if calls["n"] == 1 else DeadProc(cmd)
+
+        with mock.patch.object(self.mod, "_ensure_tap_binary", return_value=True), \
+             mock.patch.object(self.mod, "_ffmpeg", return_value="/ff/ffmpeg"), \
+             mock.patch.object(self.mod.subprocess, "Popen", side_effect=popen_side_effect):
+            tap, mic, fallback = self.mod._spawn_audio_captures("mix", self.base)
+        self.assertIsNotNone(tap)
+        self.assertIsNone(mic)
+        self.assertFalse(fallback)
+
+    def test_mic_spawn_raises_leaves_mic_none(self):
+        calls = {"n": 0}
+
+        def popen_side_effect(cmd, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return FakeProc(cmd)
+            raise OSError("no ffmpeg binary")
+
+        with mock.patch.object(self.mod, "_ensure_tap_binary", return_value=True), \
+             mock.patch.object(self.mod, "_ffmpeg", return_value="/ff/ffmpeg"), \
+             mock.patch.object(self.mod.subprocess, "Popen", side_effect=popen_side_effect):
+            tap, mic, fallback = self.mod._spawn_audio_captures("mix", self.base)
+        self.assertIsNotNone(tap)
+        self.assertIsNone(mic)
+        self.assertFalse(fallback)
 
 
 class TestFinalizeRecording(unittest.TestCase):
@@ -204,6 +287,22 @@ class TestFinalizeRecording(unittest.TestCase):
             out = self.mod._finalize_recording(self._rec())
         self.assertEqual(out, self.final)
         self.assertTrue(os.path.exists(self.final))  # raw video preserved as final
+
+    def test_send_signal_failure_does_not_raise(self):
+        # a proc that's already dead (send_signal raises ProcessLookupError)
+        # must not abort finalization — cleanup continues past it.
+        rec = self._rec(proc=RaisingProc(["screencapture", self.video]))
+        out = self.mod._finalize_recording(rec)
+        self.assertEqual(out, self.final)
+
+    def test_wav_cleanup_failure_does_not_raise(self):
+        Path(self.final[:-4] + "-sys.wav").write_bytes(b"s" * 100)
+        with mock.patch.object(self.mod, "_ffmpeg", return_value="/ff/ffmpeg"), \
+             mock.patch.object(self.mod.subprocess, "run",
+                               side_effect=lambda cmd, **k: Path(self.final).write_bytes(b"m")), \
+             mock.patch.object(self.mod.os, "unlink", side_effect=OSError("busy")):
+            out = self.mod._finalize_recording(self._rec())
+        self.assertEqual(out, self.final)
 
 
 class TestHttpAudioModes(unittest.TestCase):
@@ -285,6 +384,48 @@ class TestHttpAudioModes(unittest.TestCase):
             self.assertIn("-g", rec["proc"].cmd)
             self.assertEqual(rec["video_path"], rec["path"])
         self._get("action=stop&silent=true")
+
+    def test_screencapture_spawn_failure_kills_tap_and_mic(self):
+        self._reset()
+        tap, mic = FakeProc(["tap"]), FakeProc(["mic"])
+        killed = []
+        tap.kill = lambda: killed.append("tap")
+        mic.kill = lambda: killed.append("mic")
+        with mock.patch.object(self.mod, "_spawn_audio_captures",
+                               return_value=(tap, mic, False)), \
+             mock.patch.object(self.mod.subprocess, "Popen",
+                               side_effect=OSError("screencapture missing")):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._get("action=start&silent=true&audio=mix")
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertCountEqual(killed, ["tap", "mic"])
+        ctx.exception.close()
+
+    def test_screencapture_spawn_failure_survives_tap_kill_raising(self):
+        # kill() itself raising must not mask the original 500 response.
+        self._reset()
+        tap = FakeProc(["tap"])
+        tap.kill = lambda: (_ for _ in ()).throw(OSError("already dead"))
+        with mock.patch.object(self.mod, "_spawn_audio_captures",
+                               return_value=(tap, None, False)), \
+             mock.patch.object(self.mod.subprocess, "Popen",
+                               side_effect=OSError("screencapture missing")):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._get("action=start&silent=true&audio=mix")
+        self.assertEqual(ctx.exception.code, 500)
+        ctx.exception.close()
+
+    def test_watchdog_auto_stop_survives_finalize_raising(self):
+        self._reset()
+        with mock.patch.object(self.mod.subprocess, "Popen", FakeProc), \
+             mock.patch.object(self.mod.threading, "Timer") as t:
+            t.return_value.daemon = True
+            self._get("action=start&silent=true&audio=mic")
+            auto_stop = t.call_args[0][1]
+        with mock.patch.object(self.mod, "_finalize_recording",
+                               side_effect=RuntimeError("mux blew up")):
+            auto_stop()  # must not raise despite _finalize_recording failing
+        self.assertIsNone(self.mod._active_recording)
 
 
 if __name__ == "__main__":
