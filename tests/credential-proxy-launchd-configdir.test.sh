@@ -59,10 +59,27 @@ IS_CURRENT=(env HOME="$TMP/home" PATH="$TMP/bin:$PATH" CLAUDE_CONFIG_DIR="$CFG" 
 "${IS_CURRENT[@]}" bash "$INSTALLER" is-current
 check $? "a freshly installed plist reads as current"
 
+# plistlib, not PlistBuddy: the latter is macOS-only, so on Linux every read below
+# would return empty and the drift cases would pass without exercising anything.
+plist_get() { python3 -c 'import plistlib,sys
+with open(sys.argv[1],"rb") as fh: d=plistlib.load(fh)
+sys.stdout.write((d.get("EnvironmentVariables") or {}).get(sys.argv[2],""))' "$1" "$2"; }
+plist_has() { python3 -c 'import plistlib,sys
+with open(sys.argv[1],"rb") as fh: d=plistlib.load(fh)
+sys.exit(0 if sys.argv[2] in (d.get("EnvironmentVariables") or {}) else 1)' "$1" "$2"; }
+plist_set() { python3 -c 'import plistlib,sys
+with open(sys.argv[1],"rb") as fh: d=plistlib.load(fh)
+d["EnvironmentVariables"][sys.argv[2]]=sys.argv[3]
+with open(sys.argv[1],"wb") as fh: plistlib.dump(d,fh)' "$1" "$2" "$3"; }
+plist_del() { python3 -c 'import plistlib,sys
+with open(sys.argv[1],"rb") as fh: d=plistlib.load(fh)
+d["EnvironmentVariables"].pop(sys.argv[2],None)
+with open(sys.argv[1],"wb") as fh: plistlib.dump(d,fh)' "$1" "$2"; }
+
 # 6. The reviewer's repro: an OLD plist with no CLAUDE_CONFIG_DIR key at all.
 cp "$PLIST" "$TMP/current.plist"
-/usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:CLAUDE_CONFIG_DIR" "$PLIST" >/dev/null 2>&1
-/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:CLAUDE_CONFIG_DIR" "$PLIST" >/dev/null 2>&1
+plist_del "$PLIST" CLAUDE_CONFIG_DIR
+plist_has "$PLIST" CLAUDE_CONFIG_DIR
 [ $? -ne 0 ]
 check $? "PREMISE: the staged old plist really has no CLAUDE_CONFIG_DIR key"
 "${IS_CURRENT[@]}" bash "$INSTALLER" is-current
@@ -71,7 +88,7 @@ check $? "an old plist WITHOUT the config pin reads as DRIFT (reinstall)"
 
 # 7. Present but pointing at another clone — same verdict, different cause.
 cp "$TMP/current.plist" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:CLAUDE_CONFIG_DIR $TMP/other-home" "$PLIST" >/dev/null
+plist_set "$PLIST" CLAUDE_CONFIG_DIR "$TMP/other-home"
 "${IS_CURRENT[@]}" bash "$INSTALLER" is-current
 [ $? -ne 0 ]
 check $? "a plist pinned to a DIFFERENT config dir reads as drift"
@@ -82,7 +99,12 @@ cp "$TMP/current.plist" "$PLIST"
 "${IS_CURRENT[@]}" bash "$INSTALLER" is-current
 check $? "restoring the correct pin reads as current again"
 
-# 9. Wiring: a drift check startup.sh does not call is a no-op.
+# 9. The drift cases must not pass merely because the reader is broken — a dead
+#    reader returns empty, which reads as drift for any pin at all.
+[ "$(plist_get "$PLIST" CLAUDE_CONFIG_DIR)" = "$CFG" ]
+check $? "CONTROL: the plist reader really returns the pin, so drift means drift"
+
+# 10. Wiring: a drift check startup.sh does not call is a no-op.
 grep -q 'is-current' "$REPO/src/startup.sh"
 check $? "startup.sh gates the reinstall on the installer's is-current"
 grep -q 'EnvironmentVariables:SUTANDO_NODE' "$REPO/src/startup.sh"

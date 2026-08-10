@@ -55,6 +55,22 @@ resolve_brew_bin() {
     fi
 }
 
+# Read one EnvironmentVariables value from a plist. plistlib, not PlistBuddy:
+# the latter is macOS-only, so on Linux CI every comparison would read empty.
+plist_env() {
+    python3 - "$1" "$2" <<'PLISTPY' 2>/dev/null || true
+import plistlib, sys
+try:
+    with open(sys.argv[1], "rb") as fh:
+        env = plistlib.load(fh).get("EnvironmentVariables") or {}
+except Exception:
+    sys.exit(0)
+v = env.get(sys.argv[2])
+if v is not None:
+    sys.stdout.write(str(v))
+PLISTPY
+}
+
 bootout_if_loaded() {
     if launchctl print "$SERVICE" >/dev/null 2>&1; then
         echo "  Existing job found, removing first..."
@@ -164,8 +180,8 @@ case "$cmd" in
         # unlike SUTANDO_NODE, which is legitimately empty on both sides of a dev host.
         _want_ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null || true)"
         [ -n "$_want_ccd" ] || exit 1
-        _have_node="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:SUTANDO_NODE" "$DEST" 2>/dev/null || true)"
-        _have_ccd="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:CLAUDE_CONFIG_DIR" "$DEST" 2>/dev/null || true)"
+        _have_node="$(plist_env "$DEST" SUTANDO_NODE)"
+        _have_ccd="$(plist_env "$DEST" CLAUDE_CONFIG_DIR)"
         [ "$_have_node" = "${SUTANDO_NODE:-}" ] || exit 1
         [ "$_have_ccd" = "$_want_ccd" ] || exit 1
         ;;
