@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""The notify-cooldown stamp belongs under state/, not at the workspace root.
-
-Pins the move, the legacy-stamp retirement, and the deliberate lack of a read-fallback.
-"""
+"""The notify-cooldown stamp belongs under state/, not the workspace root; pins the
+move, the legacy-stamp retirement, and the deliberate absence of a read-fallback."""
 import importlib.util
 import sys
 import unittest
@@ -27,14 +25,8 @@ class TestStampLocation(unittest.TestCase):
         self.assertNotEqual(cpq.LAST_NOTIFY_FILE.name, ".last-pq-notify")
 
     def test_health_check_would_not_call_the_new_location_drift(self):
-        """The allowlist must not be widened to sanction the old root-level name.
-
-        This asserts allowlist MEMBERSHIP, not the scan — it cannot tell you where the
-        probe looks. That the scan reaches only the root is asserted by driving the probe
-        itself, in the root-tidy tests below. The docstring used to claim this test went
-        through health-check's predicate; it does not, and saying so invited exactly the
-        reimplemented-scan mistake those tests now avoid.
-        """
+        """Asserts allowlist MEMBERSHIP only, never where the probe scans; the
+        root-tidy tests below drive the shipped probe for that."""
         hc_path = REPO / "src" / "health-check.py"
         if not hc_path.is_file():
             self.skipTest("health-check.py not present")
@@ -91,10 +83,8 @@ class TestWriteNotifyStamp(unittest.TestCase):
 
 
 class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
-    """An install that already has the root file must end up clean too.
-
-    Retirement runs AFTER the new stamp is written, so a crash costs a cooldown.
-    """
+    """An install that already has the root file must end up clean; retirement runs
+    AFTER the new stamp is written, so a crash costs one cooldown."""
 
     def setUp(self):
         import tempfile
@@ -156,14 +146,8 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
         return hc
 
     def _root_tidy(self, hc):
-        """Drive the SHIPPED probe against this fixture's workspace.
-
-        Calling it is the point. A local `iterdir()` + `is_file()` reimplementation
-        would re-encode the exact property under test — that the scan reaches only the
-        root — so changing the probe to `rglob()` would break production while this test
-        stayed green. A copy also silently drops WORKSPACE_ROOT_SENTINEL_GLOB, making the
-        test stricter than the thing it claims to assert.
-        """
+        """Drives the SHIPPED probe: a local iterdir() copy would re-encode the
+        property under test and would drop WORKSPACE_ROOT_SENTINEL_GLOB."""
         orig = hc.WORKSPACE_DIR
         hc.WORKSPACE_DIR = self.ws
         try:
@@ -191,9 +175,8 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
         self.assertIn(".last-pq-notify", result["detail"])
 
     def test_a_migration_sentinel_at_the_root_is_not_flagged(self):
-        """WORKSPACE_ROOT_SENTINEL_GLOB exempts `.*-migrated*`. The reimplemented scan
-        this test replaced omitted the glob, so it was stricter than production: a
-        sentinel that production accepts would have failed the copy."""
+        """WORKSPACE_ROOT_SENTINEL_GLOB exempts `.*-migrated*`, so a sentinel that
+        production accepts must not be flagged."""
         hc = self._load_hc()
         cpq.write_notify_stamp([], now=1700000000)
         (self.ws / ".foo-migrated-123").write_text("x")
