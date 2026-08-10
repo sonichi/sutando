@@ -4,6 +4,7 @@ The private name is unscanned by pollers, so recovery has to find it itself."""
 import importlib.util
 import os
 import sys
+from unittest import mock
 import tempfile
 from pathlib import Path
 
@@ -59,10 +60,68 @@ def check_plain(d, recovered):
     return ok, f"recovered={recovered} txt={txt.exists()}"
 
 
+def two_bodies(d):
+    # A prior crashed run left a private claim under the name this run will pick.
+    (d / "proactive-x.sending").write_text("ordinary")
+    (d / f"proactive-x.sending.recover-{os.getpid()}-0").write_text("private")
+
+
+def check_both_survive(d, recovered):
+    bodies = {p.read_text() for p in d.iterdir() if p.is_file()}
+    ok = {"ordinary", "private"} <= bodies
+    return ok, f"recovered={recovered} bodies={sorted(bodies)}"
+
+
+def check_permission_holder(d, recovered):
+    private = d / "proactive-perm.sending.recover-4242-0"
+    return (private.exists() and not (d / "proactive-perm.txt").exists(),
+            f"recovered={recovered} private_intact={private.exists()}")
+
+
+def run_permission_case():
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "proactive-perm.sending.recover-4242-0").write_text(BODY)
+        # A pid owned by another user answers signal 0 with EPERM: it is alive.
+        with mock.patch.object(os, "kill", side_effect=PermissionError):
+            recovered = pr.recover_orphan_sending_files(d)
+        ok, detail = check_permission_holder(d, recovered)
+        print(f"{'PASS' if ok else 'FAIL'}  C4 EPERM holder is treated as live\n      {detail}")
+        return ok
+
+
+def run_vanished_source_case():
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "proactive-gone.sending").write_text(BODY)
+        real_unlink = Path.unlink
+        state = {"first": True}
+
+        def flaky_unlink(self, *a, **k):
+            # A peer removes the source between our link and our unlink.
+            if state["first"] and self.name == "proactive-gone.sending":
+                state["first"] = False
+                real_unlink(self, *a, **k)
+                raise FileNotFoundError
+            return real_unlink(self, *a, **k)
+
+        with mock.patch.object(Path, "unlink", flaky_unlink):
+            recovered = pr.recover_orphan_sending_files(d)
+        txt = d / "proactive-gone.txt"
+        ok = txt.exists() and txt.read_text() == BODY
+        print(f"{'PASS' if ok else 'FAIL'}  C5 source vanishing after the link still recovers\n      recovered={recovered} txt={txt.exists()}")
+        return ok
+
+
 results = [
+    case("C0 a colliding private claim is never overwritten", two_bodies, check_both_survive),
     case("C1 crashed mid-recovery -> body recovered to .txt", crashed_mid_recovery, check_recovered),
     case("C2 live holder's private claim left untouched", live_holder, check_untouched),
     case("C3 an ordinary .sending claim still recovers", plain_claim_still_works, check_plain),
+    run_permission_case(),
+    run_vanished_source_case(),
 ]
 failed = [i for i, ok in enumerate(results, 1) if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -51,11 +52,11 @@ with tempfile.TemporaryDirectory(prefix="sutando-proactive-recovery-") as tmp:
     target.unlink()
     raced = results / "proactive-raced.sending"
     raced.write_text("race")
-    with mock.patch.object(Path, "rename", side_effect=FileNotFoundError):
+    with mock.patch.object(os, "link", side_effect=FileNotFoundError):
         check("lost recovery race is harmless", recover_orphan_sending_files(results) == 0)
 
     output = io.StringIO()
-    with mock.patch.object(Path, "rename", side_effect=OSError("disk unavailable")):
+    with mock.patch.object(os, "link", side_effect=OSError("disk unavailable")):
         with contextlib.redirect_stdout(output):
             recovered = recover_orphan_sending_files(results)
     check("per-file failure does not block startup", recovered == 0)

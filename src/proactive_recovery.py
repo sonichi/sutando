@@ -99,12 +99,24 @@ def recover_orphan_sending_files(results_dir: Path) -> int:
         private = orphan.with_name(f"{base}.recover-{os.getpid()}-{seq}")
         seq += 1
         try:
-            orphan.rename(private)
+            # link, not rename: rename REPLACES a colliding private claim and
+            # destroys its body. EEXIST is the gate, exactly as claim_for_delivery.
+            os.link(orphan, private)
+        except FileExistsError:
+            print(
+                f"  [startup] skipping {orphan.name}: {private.name} already holds a body",
+                flush=True,
+            )
+            continue
         except FileNotFoundError:
             continue  # another recovery took this claim first
         except OSError as exc:
             print(f"  [startup] failed to recover {orphan.name}: {exc}", flush=True)
             continue
+        try:
+            orphan.unlink()
+        except FileNotFoundError:
+            pass
 
         try:
             if target.exists():
@@ -133,7 +145,8 @@ def recover_orphan_sending_files(results_dir: Path) -> int:
                     flush=True,
                 )
                 continue
-            private.rename(target)
+            os.link(private, target)
+            private.unlink()
             recovered += 1
             print(f"  [startup] recovered orphan {orphan.name} → {target.name}", flush=True)
         except FileNotFoundError:

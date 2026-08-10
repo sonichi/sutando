@@ -84,6 +84,19 @@ def _load_bridge():
     return mod
 
 
+def _read_either(*paths):
+    """Return the body from whichever name currently exists.
+    exists()-then-read races the watcher's rename between the two calls."""
+    for _ in range(100):
+        for p in paths:
+            try:
+                return p.read_text()
+            except FileNotFoundError:
+                continue
+        time.sleep(0.02)
+    return None
+
+
 def _settle(predicate, timeout=4.0, interval=0.1):
     """Poll until predicate holds; the watcher runs on its own cadence."""
     deadline = time.time() + timeout
@@ -138,9 +151,9 @@ def main() -> int:
           "both the claim and the released file are gone — message lost")
 
     if survived:
-        present = txt if txt.exists() else sending
-        check("its body is intact", present.read_text() == body,
-              f"body became {present.read_text()[:40]!r}")
+        # The watcher oscillates .txt/.sending, so exists()-then-read is a TOCTOU.
+        got = _read_either(txt, sending)
+        check("its body is intact", got == body, f"body became {str(got)[:40]!r}")
 
     check("nothing was delivered on the failure path",
           len(bridge.app.client.calls) == 0,

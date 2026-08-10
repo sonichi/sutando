@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """An undeliverable proactive claim is released, not deleted.
-
-Walks the AST: the defect is an `unlink` reachable from a non-delivery branch,
-which is a structural property a source regex cannot see.
-"""
+Walks the AST: an unlink reachable from a non-delivery branch is structural."""
 from __future__ import annotations
 
 import ast
@@ -43,11 +40,8 @@ class ClaimForDeliveryTest(unittest.TestCase):
         self.assertFalse(self.msg.exists(), "left the .txt behind — a peer could double-send")
 
     def test_the_txt_vanishing_inside_the_claim_window_still_yields_a_claim(self):
-        """A peer can remove the source between the link and the unlink.
-
-        The claim is already made at that point, so losing the source is not a
-        failure; returning None here would strand a body this bridge holds.
-        """
+        """A peer may remove the source between the link and the unlink.
+        The claim is already made, so returning None would strand a held body."""
         real = Path.unlink
 
         def vanish(self_path, *a, **kw):
