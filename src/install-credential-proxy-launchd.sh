@@ -9,6 +9,7 @@
 #   bash src/install-credential-proxy-launchd.sh             # install
 #   bash src/install-credential-proxy-launchd.sh --uninstall # remove
 #   bash src/install-credential-proxy-launchd.sh --status    # print job state
+#   bash src/install-credential-proxy-launchd.sh is-current  # exit 0 if loaded job matches
 #
 # Idempotent: re-running install bootouts the existing job and reloads so a
 # git pull that changes the template is picked up.
@@ -154,6 +155,20 @@ case "$cmd" in
         fi
         echo "Done."
         ;;
+    is-current|--is-current)
+        # Exit 0 only if the LOADED plist already pins what an install would render now.
+        # Owned here, beside the renderer, so the check cannot drift from the template.
+        launchctl print "$SERVICE" >/dev/null 2>&1 || exit 1
+        [ -f "$DEST" ] || exit 1
+        # Resolved, so never empty: an old plist lacking the key cannot compare equal —
+        # unlike SUTANDO_NODE, which is legitimately empty on both sides of a dev host.
+        _want_ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null || true)"
+        [ -n "$_want_ccd" ] || exit 1
+        _have_node="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:SUTANDO_NODE" "$DEST" 2>/dev/null || true)"
+        _have_ccd="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:CLAUDE_CONFIG_DIR" "$DEST" 2>/dev/null || true)"
+        [ "$_have_node" = "${SUTANDO_NODE:-}" ] || exit 1
+        [ "$_have_ccd" = "$_want_ccd" ] || exit 1
+        ;;
     --status|status)
         echo "Service: $SERVICE"
         if launchctl print "$SERVICE" >/dev/null 2>&1; then
@@ -163,7 +178,7 @@ case "$cmd" in
         fi
         ;;
     *)
-        echo "Usage: $0 [install|--uninstall|--status]" >&2
+        echo "Usage: $0 [install|--uninstall|--status|is-current]" >&2
         exit 2
         ;;
 esac

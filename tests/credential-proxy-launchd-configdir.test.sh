@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
-# Pins the plist's CLAUDE_CONFIG_DIR: launchd inherits no env, so without the pin
-# the wrapper resolves a different proxy path than the installer validated.
-#
-# Asserts the installer persists the resolved dir, the wrapper resolves the SAME
-# path under env -i + the plist's EnvironmentVariables, and that dropping the pin
-# demonstrably diverges — the negative control that makes the other two mean something.
-#
-# Isolation: HOME/PATH redirected and launchctl stubbed, so it never touches the
-# real LaunchAgents or launchd domain.
+# Pins the plist's CLAUDE_CONFIG_DIR: launchd inherits no env, so without it the
+# wrapper resolves a different path. HOME/PATH redirected, launchctl stubbed.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
@@ -17,9 +10,8 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/home/Library/LaunchAgents" "$TMP/bin"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/launchctl"; chmod +x "$TMP/bin/launchctl"
 
-# Staged repo WITHOUT skills/quota-tracker — the checkout-missing-skill case.
-# src/ and scripts/ symlink to the real tree so the real installer + wrapper
-# + sutando-config run; dist/ stays empty (dev mode, not bundled).
+# Staged repo WITHOUT skills/quota-tracker, src/+scripts/ symlinked to the real
+# tree: exercises the checkout-missing-skill path in dev (not bundled) mode.
 STAGE="$TMP/repo"; mkdir -p "$STAGE"
 ln -s "$REPO/src" "$STAGE/src"
 ln -s "$REPO/scripts" "$STAGE/scripts"
@@ -45,22 +37,57 @@ check $? "installer renders the plist for a checkout-missing-skill install"
 grep -A1 "<key>CLAUDE_CONFIG_DIR</key>" "$PLIST" | grep -q "<string>$CFG</string>"
 check $? "plist persists the install-time CLAUDE_CONFIG_DIR"
 
-# 3. Launchd-like environment: env -i plus ONLY what the plist's
-#    EnvironmentVariables provides. The wrapper must resolve the exact path
-#    the installer validated.
+# 3. env -i plus ONLY the plist's EnvironmentVariables — the launchd environment.
 resolved="$(env -i HOME="$TMP/home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     CLAUDE_CONFIG_DIR="$CFG" SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 \
     bash "$WRAPPER" --resolve-only 2>/dev/null)"
 [ "$resolved" = "$EXPECTED" ]
 check $? "wrapper under plist env resolves the installer-validated path"
 
-# 4. Divergence proof: the PRE-FIX launchd env (no CLAUDE_CONFIG_DIR)
-#    resolves somewhere else — the ~/.claude fallback the crash-loop hit.
+# 4. Negative control: without the pin, resolution diverges.
 prefix_resolved="$(env -i HOME="$TMP/home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 \
     bash "$WRAPPER" --resolve-only 2>/dev/null)"
 [ "$prefix_resolved" != "$EXPECTED" ] && echo "$prefix_resolved" | grep -q "/.claude/"
 check $? "without the pin, resolution falls back to ~/.claude (the bug class)"
+
+# A loaded-but-old plist must read as drift. SUTANDO_NODE alone cannot see it:
+# it is empty on both sides of a dev host, so that comparison passes.
+IS_CURRENT=(env HOME="$TMP/home" PATH="$TMP/bin:$PATH" CLAUDE_CONFIG_DIR="$CFG" SUTANDO_NODE=)
+
+# 5. The plist just installed IS current.
+"${IS_CURRENT[@]}" bash "$INSTALLER" is-current
+check $? "a freshly installed plist reads as current"
+
+# 6. The reviewer's repro: an OLD plist with no CLAUDE_CONFIG_DIR key at all.
+cp "$PLIST" "$TMP/current.plist"
+/usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:CLAUDE_CONFIG_DIR" "$PLIST" >/dev/null 2>&1
+/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:CLAUDE_CONFIG_DIR" "$PLIST" >/dev/null 2>&1
+[ $? -ne 0 ]
+check $? "PREMISE: the staged old plist really has no CLAUDE_CONFIG_DIR key"
+"${IS_CURRENT[@]}" bash "$INSTALLER" is-current
+[ $? -ne 0 ]
+check $? "an old plist WITHOUT the config pin reads as DRIFT (reinstall)"
+
+# 7. Present but pointing at another clone — same verdict, different cause.
+cp "$TMP/current.plist" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:CLAUDE_CONFIG_DIR $TMP/other-home" "$PLIST" >/dev/null
+"${IS_CURRENT[@]}" bash "$INSTALLER" is-current
+[ $? -ne 0 ]
+check $? "a plist pinned to a DIFFERENT config dir reads as drift"
+
+# 8. Restoring it flips the verdict back — proves 6 and 7 track the pin, not a
+#    check that fails for any reason once the plist has been touched.
+cp "$TMP/current.plist" "$PLIST"
+"${IS_CURRENT[@]}" bash "$INSTALLER" is-current
+check $? "restoring the correct pin reads as current again"
+
+# 9. Wiring: a drift check startup.sh does not call is a no-op.
+grep -q 'is-current' "$REPO/src/startup.sh"
+check $? "startup.sh gates the reinstall on the installer's is-current"
+grep -q 'EnvironmentVariables:SUTANDO_NODE' "$REPO/src/startup.sh"
+[ $? -ne 0 ]
+check $? "startup.sh no longer compares SUTANDO_NODE by itself"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi
