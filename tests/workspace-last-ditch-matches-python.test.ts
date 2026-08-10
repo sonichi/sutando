@@ -1,7 +1,7 @@
 /**
  * The TS and Python resolvers must agree on the home-relative last-ditch workspace.
  *
- * They didn't: TS returned `~/.sutando/workspace` (the retired root) where Python returns
+ * They didn't: TS returned the retired install-home workspace where Python returns
  * `~/sutando-workspace`. Every TS caller of resolveWorkspace() inherits that branch, so a
  * disagreement puts TS services in a different workspace from the Python core.
  *
@@ -45,12 +45,13 @@ describe('last-ditch workspace parity between the TS and Python resolvers', () =
 		);
 	});
 
-	it('is not the retired root', () => {
-		assert.notEqual(LAST_DITCH_WORKSPACE_REL, '.sutando/workspace');
-		assert.ok(
-			!resolve(join(homedir(), LAST_DITCH_WORKSPACE_REL)).startsWith(resolve(join(homedir(), '.sutando')) + '/'),
-			'last-ditch still lands under the retired ~/.sutando tree',
-		);
+	it('is a single visible HOME segment, not a nested dotdir', () => {
+		// The invariant rather than the rejected value: the retired root is a nested
+		// dotdir, so both checks reject it without this test copying the literal.
+		assert.ok(!LAST_DITCH_WORKSPACE_REL.includes('/'),
+			`last-ditch must be one path segment, got ${LAST_DITCH_WORKSPACE_REL}`);
+		assert.ok(!LAST_DITCH_WORKSPACE_REL.startsWith('.'),
+			`last-ditch must not be a hidden dotdir, got ${LAST_DITCH_WORKSPACE_REL}`);
 	});
 
 	it('the branch is reachable, not dead code', () => {
