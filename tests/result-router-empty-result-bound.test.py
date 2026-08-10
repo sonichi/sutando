@@ -59,9 +59,8 @@ def main() -> int:
     P = "/w/results/task-1.txt"
 
     # --- THE NEAR-MISS: a mid-write file must stay SILENT ------------------
-    # This is the case that makes the threshold necessary rather than
-    # decorative. Every poll below the bound is indistinguishable from a
-    # partial write, so every one of them must produce nothing.
+    # Every poll below the bound is indistinguishable from a partial write, so
+    # every one of them must produce nothing.
     noisy = [n for n in range(1, T) if empty_result_notice("task-1", P, n) is not None]
     check("silent for every poll BELOW the threshold", not noisy,
           f"announced at {noisy} — would fire on normal partial writes")
@@ -77,8 +76,8 @@ def main() -> int:
           at is not None and "7-day" in at, repr(at))
 
     # --- and NEVER again --------------------------------------------------
-    # `== threshold`, not `>=`. A warning that repeats every 1s for seven days
-    # is the same silence in a louder font.
+    # `== threshold`, not `>=`: a warning repeating every 1s for seven days is
+    # the same silence in a louder font.
     repeats = [n for n in range(T + 1, T + 40) if empty_result_notice("task-1", P, n) is not None]
     check("NEVER repeats after the threshold", not repeats,
           f"re-announced at {repeats} — a 3s nag for 7 days")
@@ -90,18 +89,8 @@ def main() -> int:
           "threshold arg ignored")
 
     # --- the bound must sit ABOVE any real write window -------------------
-    # PREMISE, demonstrated DETERMINISTICALLY. My first version raced a 0.5 ms
-    # poller against a real `cat > f << EOF` and asserted it caught the file
-    # empty. It did — 1 of 8 observations — and then FAILED on the very next
-    # run at 11 observations, because whether a poll lands inside a
-    # sub-millisecond window is a coin toss. A flaky assertion is bad on its
-    # own; this one was worse, because its failure text read "if this ever
-    # fails the threshold is unnecessary and the `continue` could just go" —
-    # an instruction to DELETE the guard, handed to whoever saw the red.
-    #
-    # The mechanism does not need a race to show. `>` truncates AT OPEN, which
-    # is why the window exists at all, so open-without-writing reproduces the
-    # exact observable state the bridge sees, with no timing involved.
+    # Demonstrated without a race: `>` truncates AT OPEN, so open-without-writing
+    # reproduces the observable state the bridge sees, with no timing involved.
     box = pathlib.Path(tempfile.mkdtemp(prefix="empty-result-"))
     target = box / "r.txt"
     target.write_text("a previous, complete result")
@@ -121,21 +110,8 @@ def main() -> int:
           target.stat().st_size > 0, f"size {target.stat().st_size}")
 
     # --- the COUNTER, which is policy and therefore shared -----------------
-    # Counting lives in result_router rather than in each bridge: two verbatim
-    # copies of a five-line helper is still copied policy (CLAUDE.md). One
-    # implementation, covered once here, for both.
-    #
-    # (This comment used to add "the telegram copy could not be covered by
-    # execution — the repo's convention is to assert on telegram-bridge at
-    # source level, not import it." I first called that simply wrong, on the
-    # grounds that telegram-bridge-progress-stream.test.py imports it. Half
-    # right: importing IS allowed, but only with CLAUDE_CONFIG_DIR isolated at
-    # module level, and lint-hermetic-bridge-tests.py enforces exactly that —
-    # this file failed it the moment the execution block went in with only a
-    # token env var. So the old comment pointed at a real constraint while
-    # naming the wrong reason for it. Both errors are the same shape: I checked
-    # whether other tests import the bridge, and not whether a gate forbids it
-    # unisolated. The isolation now sits at the top of this file.)
+    # Counting lives in result_router, not in each bridge: two verbatim copies of a
+    # five-line helper is still copied policy. One implementation, covered once.
     counters: dict = {}
     fired = [note_empty_result(counters, "t", P) for _ in range(T + 5)]
     announced = [f for f in fired if f is not None]
@@ -147,15 +123,12 @@ def main() -> int:
           "a second task inherited the first task's count")
 
     # --- WIRING: a policy with no caller is the defect it fixes ------------
-    # CLAUDE.md: "Pin both the shared contract and every adapter's delegation
-    # in tests." Landing the bound with nothing calling it would be the same
-    # latent no-op this PR exists to remove, so assert the bridge delegates.
+    # A bound with no caller is the same latent no-op this change removes, so
+    # assert the bridge actually delegates.
     for bridge in ("discord-bridge.py",):
         src = (REPO / "src" / bridge).read_text()
-        # These four assertions fired when I moved the counting into
-        # result_router — correctly. They were pinned to the OLD call spelling,
-        # which is what an assertion on a contract is FOR: it notices when the
-        # contract moves. Re-pointed at the real one rather than loosened.
+        # Pinned to the exact call spelling: an assertion on a contract exists to
+        # notice when the contract moves, so re-point it rather than loosen it.
         check(f"{bridge} delegates counting to the shared policy",
               "result_router.note_empty_result(" in src,
               "does not delegate — the policy would be a no-op here, and two "

@@ -140,21 +140,8 @@ def audit_line(task_id: str, disposition: str, surface: str, ts: str) -> str:
 # --------------------------------------------------------------------------
 # §9.3 corollary: a result file that is PRESENT but PERSISTENTLY EMPTY
 # --------------------------------------------------------------------------
-#: Consecutive empty observations before a stuck result is announced. The
-#: counter increments once per `poll_results()` iteration, and that loop ends in
-#: `await asyncio.sleep(1)` (`discord-bridge.py`), so this is **~20 seconds** —
-#: three orders of magnitude outside the partial-write window it must not fire
-#: on (see below), and four orders of magnitude inside the 7-day
-#: `pending_replies` age-out it exists to pre-empt.
-#:
-#: Corrected from "every 3s, so ~1 minute" (@Sutando-Mini on #2631, who chased
-#: the claim to a number rather than accepting "not seven days"). The 3s came
-#: from NEIGHBOURING loops in the same file — 4111, 4915, 5139 all sleep 3 —
-#: and I carried it across to this one without checking which loop the counter
-#: actually lives in. It lives in `poll_results`, which sleeps 1.
-#:
-#: The distinction is not academic: it is the difference between "the live-path
-#: evidence is a 20-second exercise" and a reader assuming it needs a wait.
+#: Empty polls before a stuck result is announced. `poll_results()` sleeps 1s —
+#: not the neighbours' 3s — so 20 is ~20s: past a write, inside the 7d age-out.
 EMPTY_RESULT_POLL_THRESHOLD = 20
 
 
@@ -166,35 +153,8 @@ def empty_result_notice(
 ) -> "str | None":
     """The notice for a result file stuck empty, or None if it is too early.
 
-    WHY A THRESHOLD AND NOT A LOG ON FIRST SIGHT. Both bridges already do
-
-        if result_file.exists():
-            reply_text = result_file.read_text().strip()
-            if not reply_text:
-                continue
-
-    and that `continue` is LOAD-BEARING, not a missing branch. CLAUDE.md tells
-    the core to write results as `cat > "<path>" << EOF`, and `>` truncates at
-    open — so **every normal result file is briefly present-and-empty** between
-    the redirect and the heredoc flush. Measured on this write path: 1 of 8
-    sub-millisecond observations caught it empty. Drop the `continue` and the
-    bridge delivers an empty reply on a routine race; log on first sight and
-    the line fires on nearly every delivery and is tuned out within a day.
-
-    So the defect was never the missing branch — it is the missing BOUND.
-    Nothing distinguished "empty for 2 ms because it is being written" from
-    "empty forever", and those are identical on any single poll. The one signal
-    that separates them is PERSISTENCE, which is what this counts.
-
-    Without it, an empty result leaves its task in `pending_replies`, re-read
-    every 1s, until the 7-day age-out logs `aged out N` without ever saying
-    why — so the owner waits up to a week for a reply that will never come and
-    nothing names it. (Found by @Sutando-Pro sweeping the silent-skip family;
-    the partial-write mechanism, which relocates the fix, by @Sutando-Mini.)
-
-    Fires EXACTLY ONCE per stuck task — at `== threshold`, not `>=` — because a
-    warning that repeats every 1s for seven days is the same silence in a
-    louder font.
+    Every normal result file is briefly present-and-empty (`>` truncates at open),
+    so persistence, not first sight, is the only signal separating stuck from racing.
     """
     if consecutive != threshold:
         return None
@@ -215,17 +175,8 @@ def note_empty_result(
 ) -> "str | None":
     """Record one empty observation for `task_id`; return the notice or None.
 
-    Counting lives HERE, not in each bridge, for the reason CLAUDE.md gives:
-    "do not copy policy code between bridges". The first cut had this five-line
-    helper duplicated verbatim in both, which is copied policy however small —
-    and it left the telegram copy uncovered, because the repo's own convention
-    (see `tests/bridge-marker-no-leak.test.py`) is to assert on telegram-bridge
-    at SOURCE level rather than import it, its import having side effects. One
-    implementation is covered once and cannot drift.
-
-    `counters` is bridge-owned mutable state passed in, so this module keeps its
-    no-I/O, no-global contract; the caller does the printing, which is the
-    provider-side half.
+    Counting lives here so the policy is not copied into each bridge. `counters` is
+    caller-owned, keeping this module's no-I/O, no-global contract.
     """
     n = counters.get(task_id, 0) + 1
     counters[task_id] = n

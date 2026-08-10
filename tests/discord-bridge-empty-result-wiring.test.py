@@ -84,25 +84,15 @@ class _Tick(Exception):
 def _drive(box: Path, task_id: str, iterations: int) -> list[str]:
     """Run `iterations` real poll passes; return everything the loop printed."""
     db.RESULTS_DIR = box
-    # ARCHIVE_RESULTS_DIR / ARCHIVE_TASKS_DIR are SEPARATE module constants,
-    # computed at import from the real RESULTS_DIR — rebinding RESULTS_DIR alone
-    # does nothing for them, and `archive_path()` then mkdir -p's into the
-    # OPERATOR's live results/. The hermeticity assertion at the end of this file
-    # caught exactly that (`[] -> ['archive']`) before it shipped; without it this
-    # test would have been the pollution class that has blocked three of my PRs.
+    # ARCHIVE_* are separate module constants computed at import, so rebinding
+    # RESULTS_DIR alone lets archive_path() mkdir into the operator's live results/.
     db.ARCHIVE_RESULTS_DIR = box / "archive"
     db.ARCHIVE_TASKS_DIR = box / "archive-tasks"
     db.TASKS_DIR = box / "tasks"
     db.TASKS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # RECIPIENT PROOF (@john-the-dev: "recipient proof remains vacuous").
-    # The old stub client had only `is_ready`, so `_report_delivery_failure`
-    # died at `client.fetch_user` and landed in its own except branch — which
-    # still prints a line containing "delivery-failure". Asserting on that
-    # string therefore passed while NO DM was ever attempted, let alone
-    # addressed. Give the client a real fetch_user -> create_dm -> send chain
-    # and record WHO was written to, so the assertion is about delivery rather
-    # than about logging.
+    # The stub needs a real fetch_user -> create_dm -> send chain that records the
+    # recipient: a log-line assertion passes even when no DM is attempted.
     db.ACCESS_FILE = box / "access.json"
     db.ACCESS_FILE.write_text(json.dumps({"allowFrom": [OWNER_ID]}))
     SENT.clear()
@@ -163,10 +153,8 @@ def main() -> int:
     box = Path(tempfile.mkdtemp(prefix="empty-wire-"))
     (box / "task-STUCK.txt").write_text("")
     db._empty_result_polls.clear()
-    # Preseed the SOURCE TASK — @john-the-dev's focused discriminator. Without
-    # it the lifecycle assertion below is vacuously true: there is no task file
-    # to leave behind, so "absent afterwards" passes on code that never archives
-    # anything. The fixture has to exist for the assertion to mean anything.
+    # Preseed the source task: without it "absent afterwards" is vacuously true and
+    # passes against code that never archives.
     db_tasks = box / "tasks"
     db_tasks.mkdir(parents=True, exist_ok=True)
     (db_tasks / "task-STUCK.txt").write_text("id: task-STUCK\ntask: something\n")
@@ -175,15 +163,11 @@ def main() -> int:
     db.pending_reply_anchors["task-STUCK"] = 123456789
     db._progress_msgs["task-STUCK"] = {"message_id": 1, "chan": 2}
     out = _drive(box, "task-STUCK", T + 5)
-    # Count FIRES, not MENTIONS. `"PRESENT BUT EMPTY" in line` reported 2 — the
-    # notice itself, plus the §9.3 delivery-failure line which quotes the notice
-    # as its error text. The code fired once (probed: iteration 20 only); the
-    # predicate was counting the echo. Anchor on the notice's own prefix.
+    # Count fires, not mentions: the delivery-failure line quotes the notice, so a
+    # substring match double-counts. Anchor on the notice's own prefix.
     fired = [line for line in out if line.lstrip().startswith("[result] ")]
 
-    # The counter is CLEARED at the bound (terminal disposition), so the
-    # post-condition is absence, not T+5. Asserting T+5 was asserting the
-    # pre-fix behaviour.
+    # The counter is cleared at the bound, so the post-condition is absence, not T+5.
     check("the counter reached the bound and was then cleared",
           db._empty_result_polls.get("task-STUCK") is None,
           f"counter={db._empty_result_polls.get('task-STUCK')} — should be cleared "
@@ -196,10 +180,8 @@ def main() -> int:
           not any("Sent" in line for line in out), "an empty reply went out")
 
     # --- §9.3: OWNER-VISIBLE and TERMINAL, not merely logged ---------------
-    # @john-the-dev's blocker on 175173c3: printing to bridge stdout changes
-    # nothing the owner experiences. These four assert the things a log line
-    # cannot give you — that the task STOPS being pending, the result is
-    # archived, and the owner-notification path is actually entered.
+    # These assert what a log line cannot: the task stops being pending, the result
+    # is archived, and the owner-notification path is actually entered.
     check("TERMINAL: the task is dropped from pending_replies",
           "task-STUCK" not in db.pending_replies,
           "still pending — it will be re-read every 1s until the 7-day age-out, "
@@ -207,10 +189,8 @@ def main() -> int:
     check("  ...the result file is archived, not left to re-poll",
           not (box / "task-STUCK.txt").exists(),
           "left in results/ — the next poll finds it empty all over again")
-    # RECIPIENT PROOF, not a log-line count. The previous assertion here was
-    # `any("delivery-failure" in line for line in out)`, which the code satisfies
-    # from inside its OWN except branch when the DM never happens — so it passed
-    # against a bridge that notified nobody. These assert the write itself.
+    # Recipient proof, not a log-line count: the code prints "delivery-failure" from
+    # inside its own except branch when the DM never happens. Assert the write.
     check("OWNER-VISIBLE: exactly one DM was actually sent",
           len(SENT) == 1,
           f"{len(SENT)} DMs sent — 0 means nobody was notified and the previous "
@@ -238,8 +218,7 @@ def main() -> int:
           f"left at {db._empty_result_polls.get('task-STUCK')}")
 
     # --- the near-miss: filled BEFORE the bound stays silent ---------------
-    # This is the partial-write case. If it ever announces, the bound is too
-    # tight and the fix becomes the noise it was meant to avoid.
+    # The partial-write case. If it ever announces, the bound is too tight.
     box2 = Path(tempfile.mkdtemp(prefix="empty-wire-ok-"))
     (box2 / "task-FILLS.txt").write_text("")
     db._empty_result_polls.clear()

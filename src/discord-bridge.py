@@ -108,9 +108,8 @@ from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 
-#: Consecutive polls each task's result file has been present-but-empty.
-#: Bridge-owned state; the THRESHOLD and the wording are policy and live in
-#: result_router, so both bridges cannot drift.
+#: Consecutive polls each result file has been present-but-empty. Bridge-owned
+#: state; threshold and wording live in result_router so the bridges cannot drift.
 _empty_result_polls: "dict[str, int]" = {}
 
 
@@ -138,17 +137,9 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     if not notice:
         return                                    # still inside the write window
     print(f"  {notice}", flush=True)
-    # TERMINAL means every task-scoped map, not just the one that stops the
-    # re-poll. @john-the-dev's second blocker: the first version cleared
-    # `pending_replies` and archived only the RESULT, so `pending_reply_anchors`,
-    # the progress placeholder and the SOURCE TASK all survived. The task then
-    # stayed visible to queue-health and task-discovery while being, by this
-    # branch's own claim, finished — a half-terminal disposition that is worse
-    # than the stall, because it reports resolved.
-    #
-    # Mirrors the normal-delivery cleanup at :4349-4370 deliberately: the two
-    # paths differ in OUTCOME (failure vs reply), never in what they leave
-    # behind. Anything popped there is popped here.
+    # Terminal means every task-scoped map, not just the one that stops the re-poll:
+    # anything the normal-delivery cleanup pops must be popped here, or the task
+    # reports resolved while still visible to queue-health.
     _empty_result_polls.pop(task_id, None)
     channel = pending_replies.pop(task_id, None)  # stop re-polling it
     _atomic_write_pending_replies(
