@@ -1,11 +1,6 @@
 /**
- * The TS and Python resolvers must agree on the home-relative last-ditch workspace.
- *
- * They didn't: TS returned the retired install-home workspace where Python returns
- * `~/sutando-workspace`. Every TS caller of resolveWorkspace() inherits that branch, so a
- * disagreement puts TS services in a different workspace from the Python core.
- *
- * Run: tsx --test tests/workspace-last-ditch-matches-python.test.ts
+ * TS and Python must share one home-relative last-ditch workspace: every TS caller of
+ * resolveWorkspace() inherits that branch, so a disagreement splits them from the core.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
