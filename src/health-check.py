@@ -5178,6 +5178,9 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
             try:
                 task_age = now - task_path.stat().st_mtime
             except OSError:
+                # Same treatment as an unreadable result entry: a measurement we
+                # could not take is partial coverage, never a silent clean pass.
+                unreadable += 1
                 continue
             # An UNCLAIMED task sitting beside its own finished result, both
             # past the threshold, is not a pair in flight: nothing is coming

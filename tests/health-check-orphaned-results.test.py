@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pathlib
 import tempfile
 import time
 import unittest
@@ -96,6 +97,26 @@ class OrphanedResultsTest(unittest.TestCase):
         result = hc.check_orphaned_results()
         self.assertEqual(result["status"], "warn", result)
         self.assertIn("task-newsradar-1.txt", result["detail"])
+
+    def test_unmeasurable_task_age_warns_rather_than_dropping_the_result(self):
+        """A task whose mtime cannot be read is partial coverage, not a clean pass.
+
+        Same treatment as an unreadable result entry — otherwise a stat failure
+        turns a real orphan into `ok` and nothing says the scan was incomplete.
+        """
+        self._write("results/task-stat.txt", TWO_HOURS_AGO)
+        task = self._write("tasks/task-stat.txt", TWO_HOURS_AGO)
+        real_stat = pathlib.Path.stat
+
+        def boom(self_p, *a, **k):
+            if self_p == task:
+                raise OSError("EIO")
+            return real_stat(self_p, *a, **k)
+
+        with mock.patch.object(pathlib.Path, "stat", boom):
+            result = hc.check_orphaned_results()
+        self.assertEqual(result["status"], "warn", result)
+        self.assertIn("unreadable", result["detail"])
 
     def test_aged_CLAIMED_task_is_still_not_an_orphan(self):
         """A claimed task is owned by a running consumer, however long it runs."""
