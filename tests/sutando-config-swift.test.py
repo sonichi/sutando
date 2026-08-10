@@ -96,16 +96,8 @@ class TestSutandoConfigSwift(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
 class TestPersonalAssetPathSwift(unittest.TestCase):
-    """Behaviour coverage for SutandoConfig.hostLabel() + personalAssetPath().
-
-    Added for #2416 review (john-the-dev): both are production additions on the
-    menu-bar icon and presenter-badge render path, and nothing committed exercised
-    them — so CI stayed green whether or not env precedence, per-host-first
-    selection, the legacy fallback, or the neither-exists contract regressed.
-
-    The probe compiles the REAL SutandoConfig.swift and calls the real functions;
-    it does not re-implement the resolution order.
-    """
+    """Compiles the REAL SutandoConfig.swift and calls the real functions rather than
+    re-implementing the resolution order, so a regression in it cannot stay green."""
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="sutando-swift-asset-"))

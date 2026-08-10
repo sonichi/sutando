@@ -262,12 +262,8 @@ enum SutandoConfig {
         return resolved
     }
 
-    /// Per-host directory label for `hosts/<label>/` paths, mirroring
-    /// `src/util_paths.py:_host_label()` (the single source of truth; #1745).
-    /// Precedence: $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE) →
-    /// `scutil --get LocalHostName` (stable Bonjour name) → short hostname.
-    /// scutil ranks above hostname because a DHCP lease can drift the
-    /// hostname and split per-host paths from the stable label.
+    /// Precedence: $SUTANDO_HOST_LABEL / $SUTANDO_HOST_OVERRIDE -> scutil LocalHostName
+    /// -> short hostname. scutil outranks hostname: a DHCP lease can drift the hostname.
     static func hostLabel() -> String {
         let env = ProcessInfo.processInfo.environment
         for key in ["SUTANDO_HOST_LABEL", "SUTANDO_HOST_OVERRIDE"] {
@@ -294,13 +290,8 @@ enum SutandoConfig {
         return short.split(separator: ".").first.map(String.init) ?? short
     }
 
-    /// Resolve a per-host personal asset, mirroring the relevant subset of
-    /// `src/util_paths.py:personal_path()`: the per-host home
-    /// `<workspace>/hosts/<label>/<name>` (#1717) is probed first, then the
-    /// legacy `<workspace>/assets/<name>` location. Returns the first
-    /// existing path, or the per-host path when neither exists (the caller's
-    /// existence check then fails gracefully — same contract as the Python
-    /// helper).
+    /// Probes the per-host home before the legacy `assets/` location. When neither
+    /// exists it returns the per-host path, so the caller's existence check still fails.
     static func personalAssetPath(_ name: String, workspace: String) -> String {
         let candidates = [
             (workspace as NSString).appendingPathComponent("hosts/\(hostLabel())/\(name)"),
