@@ -262,6 +262,9 @@ export function loadConfig(repoRoot?: string): { [k: string]: Json } {
 // --------------------------------------------------------------------------- //
 
 const HARDCODED_WORKSPACE_DEFAULT_REL = 'workspace';
+/** Home-relative last-ditch when no repo root is found (src/ installed outside a
+ *  checkout). MUST equal workspace_default.py's _DEFAULT_SUBPATH. */
+export const LAST_DITCH_WORKSPACE_REL = 'sutando-workspace';
 
 /**
  * Resolve the workspace directory per the canonical contract.
@@ -324,7 +327,7 @@ export function resolveWorkspace(repoRoot?: string): string {
 	} else if (embedderDefault) {
 		resolved = resolve(embedderDefault.replace(/^~/, homedir()));
 	} else if (root === undefined) {
-		resolved = resolve(join(homedir(), '.sutando', 'workspace'));
+		resolved = resolve(join(homedir(), LAST_DITCH_WORKSPACE_REL));
 	} else {
 		resolved = resolve(join(root, HARDCODED_WORKSPACE_DEFAULT_REL));
 	}
