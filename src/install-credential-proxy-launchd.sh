@@ -71,6 +71,45 @@ if v is not None:
 PLISTPY
 }
 
+# Render the template to $1 with this checkout's values. ONE renderer, shared with
+# is-current, so the check can never compare fewer fields than the install writes.
+render_plist() {
+    local _node_xml _node_sed _ccd_xml _ccd_sed _ccd_resolved _brew
+    _brew="$(resolve_brew_bin)"
+    # SUTANDO_NODE is caller-controlled and lands inside plist XML via sed: XML-encode
+    # &<> then escape sed's \ & and the | delimiter so a hostile path cannot corrupt it.
+    _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
+        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+    _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
+    # The RESOLVED dir, not the raw var: an unset var must pin the default the install
+    # validated, not an empty string.
+    _ccd_resolved="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path)"
+    _ccd_xml="$(printf '%s' "$_ccd_resolved" \
+        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+    _ccd_sed="$(printf '%s' "$_ccd_xml" | sed -e 's/[\\&|]/\\&/g')"
+    sed \
+        -e "s|__REPO__|$REPO|g" \
+        -e "s|__WORKSPACE__|$WORKSPACE|g" \
+        -e "s|__BREW_BIN__|$_brew|g" \
+        -e "s|__SUTANDO_NODE__|${_node_sed}|g" \
+        -e "s|__CLAUDE_CONFIG_DIR__|${_ccd_sed}|g" \
+        -e "s|__HOME__|$HOME|g" \
+        "$TEMPLATE" > "$1"
+}
+
+# Semantic plist equality. plistlib, not PlistBuddy: the latter is macOS-only, so on
+# Linux CI every read returns empty and any comparison passes vacuously.
+plists_equal() {
+    python3 - "$1" "$2" <<'PLISTPY'
+import plistlib, sys
+try:
+    with open(sys.argv[1], "rb") as a, open(sys.argv[2], "rb") as b:
+        sys.exit(0 if plistlib.load(a) == plistlib.load(b) else 1)
+except Exception:
+    sys.exit(1)
+PLISTPY
+}
+
 bootout_if_loaded() {
     if launchctl print "$SERVICE" >/dev/null 2>&1; then
         echo "  Existing job found, removing first..."
@@ -134,23 +173,7 @@ case "$cmd" in
         # SUTANDO_NODE is caller-controlled and lands inside plist XML via sed
         # (external review on #2182): XML-encode &<> then escape sed's \ & and
         # the | delimiter so hostile-looking paths can't corrupt the plist.
-        _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
-            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
-        _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
-        # Persist the RESOLVED config dir, not the raw var: an unset var must pin the
-        # default the install validated, not an empty string. XML+sed escaped as above.
-        _ccd_resolved="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path)"
-        _ccd_xml="$(printf '%s' "$_ccd_resolved" \
-            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
-        _ccd_sed="$(printf '%s' "$_ccd_xml" | sed -e 's/[\\&|]/\\&/g')"
-        sed \
-            -e "s|__REPO__|$REPO|g" \
-            -e "s|__WORKSPACE__|$WORKSPACE|g" \
-            -e "s|__BREW_BIN__|$BREW_BIN|g" \
-            -e "s|__SUTANDO_NODE__|${_node_sed}|g" \
-            -e "s|__CLAUDE_CONFIG_DIR__|${_ccd_sed}|g" \
-            -e "s|__HOME__|$HOME|g" \
-            "$TEMPLATE" > "$DEST"
+        render_plist "$DEST"
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"
@@ -172,18 +195,15 @@ case "$cmd" in
         echo "Done."
         ;;
     is-current|--is-current)
-        # Exit 0 only if the LOADED plist already pins what an install would render now.
-        # Owned here, beside the renderer, so the check cannot drift from the template.
+        # Exit 0 only if the loaded plist equals what an install would render NOW.
+        # Whole-plist, not named fields: enumerating them is what missed the last two.
         launchctl print "$SERVICE" >/dev/null 2>&1 || exit 1
         [ -f "$DEST" ] || exit 1
-        # Resolved, so never empty: an old plist lacking the key cannot compare equal —
-        # unlike SUTANDO_NODE, which is legitimately empty on both sides of a dev host.
-        _want_ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null || true)"
-        [ -n "$_want_ccd" ] || exit 1
-        _have_node="$(plist_env "$DEST" SUTANDO_NODE)"
-        _have_ccd="$(plist_env "$DEST" CLAUDE_CONFIG_DIR)"
-        [ "$_have_node" = "${SUTANDO_NODE:-}" ] || exit 1
-        [ "$_have_ccd" = "$_want_ccd" ] || exit 1
+        [ -f "$TEMPLATE" ] || exit 1
+        _want="$(mktemp)"
+        trap 'rm -f "$_want"' EXIT
+        render_plist "$_want" || exit 1
+        plists_equal "$DEST" "$_want" || exit 1
         ;;
     --status|status)
         echo "Service: $SERVICE"

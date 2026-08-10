@@ -76,7 +76,7 @@ with open(sys.argv[1],"rb") as fh: d=plistlib.load(fh)
 d["EnvironmentVariables"].pop(sys.argv[2],None)
 with open(sys.argv[1],"wb") as fh: plistlib.dump(d,fh)' "$1" "$2"; }
 
-# 6. The reviewer's repro: an OLD plist with no CLAUDE_CONFIG_DIR key at all.
+# 6. An OLD plist predating the config pin: the key is absent entirely.
 cp "$PLIST" "$TMP/current.plist"
 plist_del "$PLIST" CLAUDE_CONFIG_DIR
 plist_has "$PLIST" CLAUDE_CONFIG_DIR
@@ -104,7 +104,25 @@ check $? "restoring the correct pin reads as current again"
 [ "$(plist_get "$PLIST" CLAUDE_CONFIG_DIR)" = "$CFG" ]
 check $? "CONTROL: the plist reader really returns the pin, so drift means drift"
 
-# 10. Wiring: a drift check startup.sh does not call is a no-op.
+# 10. A job rendered from ANOTHER CHECKOUT: node + config dir match, everything that
+#     identifies the clone does not. Enumerating fields is what missed this.
+cp "$TMP/current.plist" "$PLIST"
+python3 - "$PLIST" "$TMP/other-checkout" <<'PY' >/dev/null
+import plistlib, sys
+with open(sys.argv[1], "rb") as fh: d = plistlib.load(fh)
+d["ProgramArguments"][1] = sys.argv[2] + "/src/launchd/credential-proxy-wrapper.sh"
+d["WorkingDirectory"] = sys.argv[2]
+d["EnvironmentVariables"]["SUTANDO_WORKSPACE"] = sys.argv[2] + "/workspace"
+with open(sys.argv[1], "wb") as fh: plistlib.dump(d, fh)
+PY
+[ "$(plist_get "$PLIST" CLAUDE_CONFIG_DIR)" = "$CFG" ]
+check $? "PREMISE: the cross-checkout plist still carries the SAME config pin"
+"${IS_CURRENT[@]}" bash "$INSTALLER" is-current
+[ $? -ne 0 ]
+check $? "a job rendered from ANOTHER CHECKOUT reads as drift"
+cp "$TMP/current.plist" "$PLIST"
+
+# 11. Wiring: a drift check startup.sh does not call is a no-op.
 grep -q 'is-current' "$REPO/src/startup.sh"
 check $? "startup.sh gates the reinstall on the installer's is-current"
 grep -q 'EnvironmentVariables:SUTANDO_NODE' "$REPO/src/startup.sh"
