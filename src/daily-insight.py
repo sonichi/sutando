@@ -443,9 +443,7 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
 def _landed_subset_count(repo_root, shas):
     """How many of `shas` are reachable from the remote default branch.
 
-    A SUBSET of the caller's own scan, so landed can never exceed the total. A
-    second author/time query can, and rendered "landed 2 of 1 ... the other -1".
-    """
+    A SUBSET of the caller's own scan, so landed can never exceed the total."""
     if not shas:
         return 0
     ref = None

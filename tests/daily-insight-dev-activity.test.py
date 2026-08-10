@@ -182,10 +182,8 @@ class TestInsightPriority(unittest.TestCase):
         self.assertIn("shipped 43 commits", all_landed)
 
     def test_a_git_failure_yields_None_not_a_false_shipped(self):
-        """The two failure branches of _landed_subset_count exist so a git error
-        cannot become a "shipped" claim: None means unknown, and the caller then
-        says "authored". A 0 here would read as "nothing landed", which is a
-        different and unearned assertion."""
+        """None means unknown and the caller says "authored"; 0 would assert
+        "nothing landed", which is a different and unearned claim."""
         import subprocess as _sp
         mod, real = self.mod, self.mod.subprocess.run
 
