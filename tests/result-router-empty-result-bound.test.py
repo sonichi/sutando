@@ -141,8 +141,8 @@ def main() -> int:
               "_empty_result_polls.pop(task_id, None)" in src,
               "a counter that never clears announces a healthy task after a "
               "few transient empty reads")
-        # #2695 moved emptiness into the shared read_ready_result owner, so the
-        # spelling moved with it; re-pointed at the real contract, not loosened.
+        # Emptiness lives in the shared read_ready_result owner, so assert that
+        # spelling: the contract moved, and the assertion follows it rather than loosening.
         check(f"  ...{bridge} still SKIPS rather than delivering the empty body",
               "read_ready_result(result_file)" in src
               and "if reply_text is None:" in src and src.count("continue") > 0,
