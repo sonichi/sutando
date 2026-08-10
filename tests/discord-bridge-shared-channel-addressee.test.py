@@ -66,8 +66,7 @@ def main() -> int:
                      is_reply=False, reply_author_id=None), "fresh human message"
     print("  ok  fresh human message, no addressee (owner posting directly)")
 
-    # reply-to-SELF: the owner replying to their own message is continuing their
-    # own thread → addressed to us (2026-07-25 fix; requires author_id).
+    # The self-reply case requires author_id; without it the exemption is off.
     assert addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
                      is_reply=True, reply_author_id=OWNER, author_id=OWNER), \
         "owner replies to their OWN message"

@@ -46,16 +46,12 @@ def is_addressed_in_shared_channel(
       * we are @-mentioned (`bot_mentioned`) or role-mentioned (`role_mentioned`);
       * the message is a reply to one of OUR messages
         (`is_reply and reply_author_id == self_id`);
-      * a HUMAN replies to their OWN message (`reply_author_id == author_id`) —
-        that is the sender continuing their own thread, addressed to whoever is
-        listening (us), exactly like a fresh non-reply post. Requires `author_id`
-        to be passed; when it is omitted (legacy callers) this exemption is off
-        and behavior is unchanged.
+      * a HUMAN replies to their OWN message (`reply_author_id == author_id`).
+        Requires `author_id`; omitted (legacy callers) turns the exemption off.
 
     Otherwise the message is addressed elsewhere (→ False) when it is:
-      * another agent's own post/reply — `author_is_bot` and not addressed to us
-        (checked before the self-reply exemption, so a sibling bot replying to
-        itself stays skipped); or
+      * another agent's own post/reply — `author_is_bot` and not addressed to
+        us; or
       * a HUMAN reply to a DIFFERENT author — `is_reply` whose target is neither
         us nor the sender; or
       * a human message that @-mentions a DIFFERENT agent and not us
