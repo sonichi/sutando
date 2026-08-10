@@ -79,6 +79,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from dm_ban import is_dm_banned  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -1459,7 +1460,7 @@ def result_watcher():
                         continue
                     # While dm-ban.sentinel exists, no proactive file is claimed
                     # or sent — it stays queued for delivery once lifted.
-                    if (STATE_DIR / "dm-ban.sentinel").exists():
+                    if is_dm_banned(STATE_DIR.parent):
                         continue
                     delivery_id = f.name
                     # A producer may recreate the same deterministic result

@@ -97,9 +97,8 @@ class SkipMarkers(unittest.TestCase):
 
 
 class DmBanGate(SkipMarkers):
-    """dm-ban.sentinel must gate this consumer too — it is the LAST one in the
-    poll_dm_fallback chain and is not a proactive-*.txt reader, so the
-    delivery-loop guards added elsewhere for that path do not cover it."""
+    """dm-ban.sentinel must gate this consumer too — the other proactive-file
+    guards don't cover it, since it takes text/a path, never a glob."""
 
     def setUp(self):
         import tempfile

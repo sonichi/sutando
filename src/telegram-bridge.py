@@ -61,6 +61,7 @@ from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
+from dm_ban import is_dm_banned  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -998,7 +999,7 @@ def main():  # pragma: no cover
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
                         # While dm-ban.sentinel exists, no proactive file is claimed
                         # or sent — it stays queued for delivery once lifted.
-                        if (STATE_DIR / "dm-ban.sentinel").exists():
+                        if is_dm_banned(STATE_DIR.parent):
                             continue
                         # Peek before claiming: skip Discord-targeted proactive files.
                         # [channel: <17-20 digit snowflake>] is a Discord-only marker;

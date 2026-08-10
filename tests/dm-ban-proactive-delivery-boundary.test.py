@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""Regression: dm-ban.sentinel must gate every bridge's proactive-delivery loop,
-not just the writers. Executes each bridge's real guard node (compiled against
-the real file, original line numbers kept, so coverage attributes correctly).
-"""
+"""Each bridge's proactive-delivery loop must consult is_dm_banned() before
+claiming a file — executes the real guard node, not a copy of it."""
 
 import ast
 import sys
@@ -10,6 +8,8 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+from dm_ban import is_dm_banned  # noqa: E402
 failures = []
 
 
@@ -26,9 +26,10 @@ def _find_ban_guard(tree, func_name):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
             for sub in ast.walk(node):
                 if isinstance(sub, ast.If) and len(sub.body) == 1 and isinstance(sub.body[0], ast.Continue):
-                    consts = [c.value for c in ast.walk(sub.test)
-                              if isinstance(c, ast.Constant) and isinstance(c.value, str)]
-                    if any("dm-ban.sentinel" in c for c in consts):
+                    call = sub.test
+                    if (isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Name)
+                            and call.func.id == "is_dm_banned"):
                         return sub
     return None
 
@@ -57,21 +58,21 @@ CASES = [
 for path, func_name in CASES:
     code = _compiled_guard(path, func_name)
     with tempfile.TemporaryDirectory() as td:
-        state_dir = Path(td)
+        workspace = Path(td)
+        state_dir = workspace / "state"
+        state_dir.mkdir()
         (state_dir / "dm-ban.sentinel").write_text("")
-        ns = {"STATE_DIR": state_dir}
-        # `continue` inside the wrapper is a no-op observable only by absence
-        # of a crash; the real proof is the sibling case below never firing.
+        ns = {"STATE_DIR": state_dir, "is_dm_banned": is_dm_banned}
         exec(code, ns)
         check(f"{path.name}:{func_name} — sentinel present, guard runs clean", True)
 
     with tempfile.TemporaryDirectory() as td:
-        state_dir = Path(td)  # no sentinel written
-        ns = {"STATE_DIR": state_dir}
+        workspace = Path(td)
+        state_dir = workspace / "state"
+        state_dir.mkdir()  # no sentinel written
+        ns = {"STATE_DIR": state_dir, "is_dm_banned": is_dm_banned}
         marker = []
-        # Re-run with a second statement appended so we can observe whether
-        # `continue` fired: if the guard's If is False, execution falls
-        # through to the marker append below it in the same loop body.
+        # A marker appended after the guard proves whether `continue` fired.
         if_node = _find_ban_guard(ast.parse(path.read_text()), func_name)
         loc = dict(lineno=if_node.lineno, col_offset=0,
                    end_lineno=if_node.end_lineno, end_col_offset=0)

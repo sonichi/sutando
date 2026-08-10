@@ -21,6 +21,7 @@ from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
+from dm_ban import is_dm_banned  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
@@ -260,7 +261,7 @@ def notify_voice(questions):
     ts = int(time.time() * 1000)
     path = RESULTS_DIR / f"question-{ts}.txt"
     titles = [q["title"] for q in questions]
-    if (RESULTS_DIR.parent / "state" / "dm-ban.sentinel").exists():
+    if is_dm_banned(RESULTS_DIR.parent):
         print("dm-ban.sentinel present — question-file DM suppressed")
         return
     path.write_text(
@@ -291,7 +292,7 @@ def notify_discord_dm(questions):
     )
     # While dm-ban.sentinel exists, DM delivery is suppressed; the macOS
     # notification still fires and questions stay readable in the file.
-    if (RESULTS_DIR.parent / "state" / "dm-ban.sentinel").exists():
+    if is_dm_banned(RESULTS_DIR.parent):
         print("dm-ban.sentinel present — DM delivery suppressed (macOS-only)")
         return
     path.write_text("\n".join(lines))

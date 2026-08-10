@@ -168,6 +168,11 @@ ALLOWLIST = {
     # The flagged tokens are the state/prompt field names of the core-supervisor.json
     # schema (the hash key + docstring), not a workspace-path composition.
     "src/core-supervisor-relay.py",
+    # dm_ban.py is a pure locator helper — it takes workspace_dir as a
+    # parameter from each of its 5 callers (all of which already resolve
+    # their own workspace root) and never resolves it itself. Same
+    # rationale as task_archive.py.
+    "src/dm_ban.py",
 }
 
 

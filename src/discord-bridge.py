@@ -72,6 +72,7 @@ except ModuleNotFoundError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from dm_ban import is_dm_banned  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
@@ -4947,7 +4948,7 @@ async def poll_proactive():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
                     # While dm-ban.sentinel exists, no proactive file is claimed
                     # or sent — it stays queued for delivery once lifted.
-                    if (STATE_DIR / "dm-ban.sentinel").exists():
+                    if is_dm_banned(STATE_DIR.parent):
                         continue
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
