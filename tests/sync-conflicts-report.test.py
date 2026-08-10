@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""`scripts/sync-conflicts-report.py` must report ONLY real unmerged content.
-
-The reporter exists because `_resolve_conflicts_keep_ours` preserves every
-discarded incoming file and nothing then says whether any of them still hold
-content the live copy lacks. Measured on one host 2026-08-05: 13 preserved
-files, 6 of them strict SUBSETS of the local copy (keeping ours was correct and
-lossless), 1 a legacy flat path, 3 carrying real peer content unmerged for
-hours. A reporter that flagged all 13 would be as useless as the silence it
-replaces -- the whole value is the discrimination, so the negative cases are
-tested as hard as the positive one.
-"""
+"""`scripts/sync-conflicts-report.py` must report ONLY real unmerged content."""
 import contextlib
 import importlib.util
 import io
@@ -25,19 +15,7 @@ SCRIPT = REPO / "scripts" / "sync-conflicts-report.py"
 
 
 def _load_module() -> types.ModuleType:
-    """Import the script as a module so the suite runs it IN-PROCESS.
-
-    Every case used to spawn `python3 scripts/sync-conflicts-report.py`. That
-    exercises the code but is invisible to `coverage`, which instruments the
-    parent only: the Coverage Gate reported `sync-conflicts-report.py (0.0%):
-    Missing 137 lines` on a file whose every branch this suite drives. Coverage
-    measured the harness, not the behaviour.
-
-    ONE subprocess case remains on purpose, below — the caller's-cwd test,
-    whose subject IS the process boundary and which cannot be expressed
-    in-process. (An earlier draft of this docstring said "two"; there were
-    four. Counted them.)
-    """
+    """Import the script as a module so the suite runs it IN-PROCESS."""
     spec = importlib.util.spec_from_file_location("sync_conflicts_report", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -98,11 +76,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("lost.md", r.stdout)
 
     def test_a_peer_copy_that_is_a_strict_SUBSET_is_NOT_reported(self):
-        """6 of 13 real conflicts were this: an older, shorter peer copy.
-
-        Keeping ours lost nothing. Reporting it would train the operator to
-        ignore the output, which is how the previous silence started.
-        """
+        """6 of 13 real conflicts were this: an older, shorter peer copy."""
         self._pair("subset.md",
                    "# b\n" + "\n".join(f"l{i}" for i in range(40)) + "\n",
                    "# b\nl0\nl1\n")
@@ -111,23 +85,14 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("subset.md", r.stdout)
 
     def test_a_SINGLE_real_added_line_IS_reported(self):
-        """A SINGLE added line is reported.
-
-        One extra line -- a fact, a bullet, a corrected number -- is the
-        archetypal loss, and a line-count threshold calls it noise.
-        """
+        """A SINGLE added line is reported."""
         self._pair("note.md", "keep\n", "keep\nimportant new fact\n")
         r = self._run()
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("note.md", r.stdout)
 
     def test_a_pure_REFLOW_is_NOT_reported(self):
-        """What the threshold was reaching for, done by content instead.
-
-        Re-wrapping, re-indenting and trailing-space churn all leave the text
-        present in the live copy, so whitespace-normalised presence finds it --
-        at ANY line count, where the old rule only tolerated three.
-        """
+        """What the threshold was reaching for, done by content instead."""
         self._pair("wrap.md", "alpha beta gamma delta\n",
                    "alpha beta\ngamma delta\n")
         self._pair("indent.md", "x = 1\n", "    x = 1\n")
@@ -137,11 +102,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("indent.md", r.stdout)
 
     def test_SWAPPED_SECTIONS_are_reported(self):
-        """Swapped sections are reported.
-
-        Every line and heading appears on BOTH sides; only the association
-        changed, which a global presence test cannot see.
-        """
+        """Swapped sections are reported."""
         self._pair("access.md",
                    "## Allowed\n- Alice\n## Denied\n- Bob\n",
                    "## Allowed\n- Bob\n## Denied\n- Alice\n")
@@ -150,12 +111,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("access.md", r.stdout)
 
     def test_the_same_KEY_under_DIFFERENT_sections_is_reported(self):
-        """The same KEY under DIFFERENT headings is reported.
-
-        Repeated keys/bullets under different headings fail identically: both
-        values are globally present, so only the section binding distinguishes
-        `key: A` under Prod from `key: A` under Dev.
-        """
+        """The same KEY under DIFFERENT headings is reported."""
         self._pair("cfg.md",
                    "## Prod\nkey: A\n## Dev\nkey: B\n",
                    "## Prod\nkey: B\n## Dev\nkey: A\n")
@@ -164,31 +120,14 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("cfg.md", r.stdout)
 
     def test_a_REFLOW_inside_one_section_is_still_NOT_reported(self):
-        """The paired negative for the section fix.
-
-        Section-scoping must not resurrect the false POSITIVE the reflow
-        negative exists to prevent: re-wrapping within a heading still resolves
-        to present, because each section gets its own normalised haystack.
-        """
+        """The paired negative for the section fix."""
         self._pair("wrapsec.md", "## S\nalpha beta gamma\n", "## S\nalpha beta\ngamma\n")
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertNotIn("wrapsec.md", r.stdout)
 
     def test_a_RENAMED_heading_does_not_report_the_whole_body(self):
-        """The documented fallback, pinned so it cannot silently change.
-
-        If the saved line's heading is absent from live, strict section
-        matching would report every line beneath a renamed heading — a
-        false-positive class these files hit constantly. The fallback is the
-        global haystack for those lines.
-
-        Measured behaviour, and the assertion is deliberately about the BODY:
-        `## Notes` -> `## Note` reports the heading line (its text really is
-        absent) and stays quiet about `- x` beneath it. A test that merely
-        asserted "file not reported" would be wrong — the file IS reported,
-        for the heading. What must not happen is the body coming with it.
-        """
+        """The documented fallback, pinned so it cannot silently change."""
         import importlib.util
         spec = importlib.util.spec_from_file_location("rep", SCRIPT)
         rep = importlib.util.module_from_spec(spec)
@@ -200,18 +139,7 @@ class TestSyncConflictsReport(unittest.TestCase):
                          "its text is present in the live copy")
 
     def test_the_report_SPLITS_absent_from_moved_between_sections(self):
-        """Section-scoping necessarily reports a line that merely MOVED headings.
-
-        That is the cost of catching the swap: the text is present, the
-        ASSOCIATION is not, and the discriminator cannot tell a benign
-        re-section from a policy inversion — because structurally they are the
-        same edit. Found on live data: 4 flagged files, and 2 of them were
-        content present VERBATIM elsewhere in the file.
-
-        So the report names which kind. Nothing is filtered — a swap still
-        reports, labelled "under another heading", which is exactly what a
-        policy inversion looks like.
-        """
+        """Section-scoping necessarily reports a line that merely MOVED headings."""
         import importlib.util
         spec = importlib.util.spec_from_file_location("rep", SCRIPT)
         rep = importlib.util.module_from_spec(spec)
@@ -233,10 +161,7 @@ class TestSyncConflictsReport(unittest.TestCase):
                          "the swap must still be REPORTED, just correctly labelled")
 
     def test_the_split_is_the_OLD_global_rule_so_the_buckets_are_meaningful(self):
-        """`under another heading` == what the pre-section-scoping version called
-        clean. Pinning that keeps the second bucket interpretable: it is exactly
-        the set section-scoping made visible, not an arbitrary category.
-        """
+        """`under another heading` == what the pre-section-scoping version called clean. Pinning that keeps the second bucket interpretable: it is exactly."""
         import importlib.util
         spec = importlib.util.spec_from_file_location("rep", SCRIPT)
         rep = importlib.util.module_from_spec(spec)
@@ -249,10 +174,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(moved, ["the peer fact"])
 
     def test_a_saved_line_that_is_a_PARTIAL_SUBSTRING_of_live_text_still_reports(self):
-        """A saved line that is a PARTIAL SUBSTRING of live prose is reported.
-
-        Raw substring matching would read it as already merged.
-        """
+        """A saved line that is a PARTIAL SUBSTRING of live prose is reported."""
         self._pair("collide.md",
                    "The peer facts are documented elsewhere.\n",
                    "The peer fact\n")
@@ -261,20 +183,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("collide.md", r.stdout)
 
     def test_live_text_that_gained_TRAILING_PUNCTUATION_is_not_reported(self):
-        """Live text that gained TRAILING PUNCTUATION is not reported.
-
-        Space-padding the match over-tightened it: a live line that is the saved
-        text plus a period (and an annotation) then read as ABSENT, though the
-        content is fully present. Real case, surfaced by the tool itself on the
-        very sync after I shipped the padding:
-
-            saved  '... match the body'
-            live   '... match the body. *(Restored 2026-08-04 ...)*'
-
-        The boundary is a NON-WORD character, not specifically a space, so
-        punctuation counts as a legitimate edge while the collision case above
-        (`fact` inside `facts`, followed by a word character) still reports.
-        """
+        """Live text that gained TRAILING PUNCTUATION is not reported."""
         self._pair("punct.md",
                    "x match the body. *(Restored 2026-08-04 from a peer copy)*\n",
                    "x match the body\n")
@@ -283,9 +192,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("punct.md", r.stdout)
 
     def test_boundary_matching_does_not_break_the_REFLOW_case(self):
-        """The paired half: tightening the match must not start reporting
-        re-wrapped or re-indented text, which is what the check exists to
-        tolerate."""
+        """The paired half: tightening the match must not start reporting re-wrapped or re-indented text, which is what the check exists to."""
         self._pair("wrap2.md", "alpha beta gamma delta\n", "alpha beta\ngamma delta\n")
         self._pair("indent2.md", "x = 1\n", "        x = 1\n")
         r = self._run()
@@ -321,23 +228,13 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("no unmerged peer content", r.stdout)
 
     def test_no_argument_uses_the_canonical_resolver_NOT_the_caller_cwd(self):
-        """Run from a directory that is not the workspace and not a git repo.
-
-        With `Path.cwd()` as the fallback this exits 2 ("not a git repo") -- it
-        would be answering about whatever directory invoked it. The cron path
-        invokes it from the REPO, not the workspace, so cwd is never the right
-        answer. With `resolve_workspace()` it resolves the real workspace and
-        reports on that instead. `cwd-lint` gates the same rule statically;
-        this pins the behaviour it protects.
-        """
+        """Run from a directory that is not the workspace and not a git repo."""
         elsewhere = Path(self._tmp.name) / "not-the-workspace"
         elsewhere.mkdir()
         r = subprocess.run([sys.executable, str(SCRIPT)], cwd=str(elsewhere),
                            capture_output=True, text=True)
-        # Assert WHICH path it reported on, not the exit code. The exit code was
-        # a proxy and it broke the moment the ancestor-walk guard landed: a
-        # correctly-resolved workspace that is not a repo now legitimately
-        # exits 2, so the old assertion failed for the right behaviour.
+        # Assert WHICH path it reported on, not the exit code: a correctly
+        # resolved non-repo workspace legitimately exits 2.
         self.assertNotIn(str(elsewhere), r.stdout,
                          "reported on the caller's cwd instead of the resolver's answer")
         expected = subprocess.run(
@@ -358,18 +255,13 @@ class TestSyncConflictsReport(unittest.TestCase):
         (d / name).write_text(text)
 
     def test_retiring_one_batch_leaves_ANOTHER_batchs_copy_reporting(self):
-        """Retiring one batch leaves another batch's copy reporting.
-
-        Two batches hold the same relative path; a basename-wide selector
-        would retire both and turn exit 1 into a permanent false clean.
-        """
+        """Retiring one batch leaves another batch's copy reporting."""
         self._pair("note.md", "base\nmerged fact\n", "base\nmerged fact\n")
         self._second_batch("note.md", "base\nNEVER MERGED fact\n")
         self.assertEqual(self._run().returncode, 1, "batch-b should report")
 
-        # `_pair` writes into the fixture's own batch, NOT "batch-a" — an
-        # earlier draft of this test guessed the name and the guard correctly
-        # refused it, which is itself the fail-closed behaviour working.
+        # `_pair` writes into the fixture's own batch, NOT "batch-a"; a guessed
+        # name is refused, which is the fail-closed behaviour.
         r = self._retire(f"{self.batch.name}/memory/note.md")
         self.assertEqual(r.returncode, 0, r.stdout)
 
@@ -399,11 +291,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(self._run().returncode, 1, "bare --retire mutated state")
 
     def test_merged_then_RETRACTED_content_stays_silent_once_retired(self):
-        """Merged-then-retracted content stays silent once retired.
-
-        It is indistinguishable on disk from never-merged, so only the
-        retirement record separates them.
-        """
+        """Merged-then-retracted content stays silent once retired."""
         self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
         self.assertEqual(self._run().returncode, 0, "identical copies should be silent")
         self.assertEqual(self._retire(f"{self.batch.name}/memory/note.md").returncode, 0)
@@ -437,11 +325,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("note.md", r.stdout)
 
     def test_retire_works_while_the_entry_is_SILENT_not_only_while_reporting(self):
-        """Retire works while the entry is SILENT.
-
-        The operator retires right AFTER merging, when the live copy already
-        matches, so a retire limited to the reporting set could never fire.
-        """
+        """Retire works while the entry is SILENT."""
         self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
         out = self._retire(f"{self.batch.name}/memory/note.md").stdout
         self.assertIn("retired 1", out, out)
@@ -465,14 +349,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("nothing matched", r.stdout)
 
     def test_retiring_the_SAME_copy_twice_is_idempotent(self):
-        """Second retire of an already-retired copy must not re-record it, and
-        must report honestly that nothing changed.
-
-        This is the branch that decides whether a repeated operator action
-        quietly rewrites state. It also drives the `nothing matched` CLI result,
-        which is otherwise only reachable through a selector that matched an
-        entry already retired.
-        """
+        """Second retire of an already-retired copy must not re-record it, and must report honestly that nothing changed."""
         self._pair("note.md", "base\n", "base\nnew fact\n")
         target = f"{self.batch.name}/memory/note.md"
 
@@ -489,17 +366,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(self._run().returncode, 0, "the copy came back after a second retire")
 
     def test_a_non_repo_dir_INSIDE_a_repo_does_not_answer_about_the_ancestor(self):
-        """`git rev-parse` searches ANCESTORS, and that is a silent false clean.
-
-        Found by running the reporter from a PR worktree: the fallback
-        workspace path existed but had never been `--init`ed, so git walked up,
-        found the worktree's own repo, saw no conflicts directory there, and
-        printed "no unmerged peer content" -- a confident verdict about a
-        completely different repository.
-
-        `--show-toplevel` must equal the directory asked about; anything else is
-        an ancestor and the tool has not looked at what it was asked to look at.
-        """
+        """`git rev-parse` searches ANCESTORS, and that is a silent false clean."""
         inner = self.ws / "never-initialised"
         inner.mkdir()
         r = self._main(str(inner))

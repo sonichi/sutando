@@ -1412,8 +1412,7 @@ cmd_default_bidirectional() {
 }
 
 # Print preserved-but-unmerged peer content. Deliberately does NOT gate on the
-# reporter's exit status: it is diagnostics, and a broken diagnostic must not
-# turn a successful sync into a failed one.
+# reporter's exit status: a broken diagnostic must not fail a good sync.
 _report_unmerged_conflicts() {
     local script="$REPO_DIR/scripts/sync-conflicts-report.py"
     [ -f "$script" ] || return 0

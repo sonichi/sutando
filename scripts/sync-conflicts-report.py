@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Report peer content that sync discarded and nobody has merged back.
-
-Classify by presence, not size: a reflow's text still exists in the live copy
-under whitespace normalisation, while new content is absent at any length.
-"""
+"""Report peer content that sync discarded and nobody has merged back."""
 import hashlib
 import json
 import pathlib
@@ -22,11 +18,7 @@ _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
 
 
 def _by_section(text: str):
-    """Yield (heading, line) for every line, heading = nearest one ABOVE it.
-
-    A heading line's own context is itself, so a renamed heading is detected
-    like any other changed line. Lines before the first heading get "".
-    """
+    """Yield (heading, line) for every line, heading = nearest one ABOVE it."""
     head = ""
     for line in text.splitlines():
         if _HEADING_RE.match(line):
@@ -35,15 +27,8 @@ def _by_section(text: str):
 
 
 def _new_content(saved: str, live: str) -> "list[str]":
-    """Lines in the preserved copy whose TEXT is absent from the live copy
-    IN THE SAME SECTION.
-
-    Section-scoped because a global presence test discards heading association,
-    so an inverted policy (the same names swapped between two headings) reads as
-    clean. Two blind spots remain: a saved line whose heading is absent from live
-    falls back to a global search, and pure reordering within one section is
-    undetected.
-    """
+    """Lines in the preserved copy whose TEXT is absent from live IN THE SAME SECTION.
+    Blind to a renamed heading (falls back to global) and to reordering within a section."""
     # Word-boundary matching, not raw substring: `The peer fact` sits inside
     # `The peer facts ...`, which would report an unmerged line as present.
     haystack = " ".join(live.split())          # global fallback (renamed section)
@@ -74,15 +59,7 @@ def _new_content(saved: str, live: str) -> "list[str]":
 
 
 def _split_by_reason(extra: "list[str]", live: str) -> "tuple[list[str], list[str]]":
-    """Split reported lines into (absent-entirely, present-under-another-heading).
-
-    Section-scoping also reports a line that merely MOVED between headings: the
-    text is present, the association is not. The second bucket is labelled, not
-    filtered -- a policy inversion IS a line under a different heading.
-
-    The test is deliberately the OLD global-haystack rule, so the second bucket
-    is exactly "what the pre-section-scoping version would have called clean".
-    """
+    """Split reported lines into (absent-entirely, present-under-another-heading)."""
     haystack = " ".join(live.split())
     absent, resectioned = [], []
     for line in extra:
@@ -107,12 +84,7 @@ def _load_retired(root: pathlib.Path) -> dict:
 
 def _entry_key(batch: str, rel: pathlib.PurePath, saved_text: str) -> str:
     """Identify one preserved COPY, not just one path.
-
-    The digest is part of the key on purpose. Retiring `memory/x.md` from one
-    batch must not silence a LATER conflict that preserved different content for
-    the same path -- that would trade a permanent false positive for a permanent
-    false negative, which is the worse of the two.
-    """
+    The digest is in the key so retiring one copy cannot silence a later, different one."""
     digest = hashlib.sha256(saved_text.encode("utf-8", "replace")).hexdigest()[:16]
     return f"{batch}/{rel}@{digest}"
 
@@ -121,8 +93,7 @@ def unmerged(workspace: pathlib.Path):
     if not workspace.is_dir():
         return None, f"no such directory: {workspace}"
     # `git rev-parse` SEARCHES ANCESTORS, so a non-repo workspace answers about
-    # its ancestor -- hence the toplevel-equality check below. ONE rev-parse for
-    # both answers: `--git-dir` cannot fail once `--show-toplevel` succeeded.
+    # its ancestor -- hence the toplevel-equality check below.
     rp = subprocess.run(
         ["git", "-C", str(workspace), "rev-parse", "--show-toplevel", "--git-dir"],
         capture_output=True, text=True,
@@ -168,19 +139,7 @@ def unmerged(workspace: pathlib.Path):
 
 def retire(workspace: pathlib.Path, targets: "list[str]"):
     """Mark preserved copies as dealt with — merged, or deliberately declined.
-
-    Either decision ends the same way: the operator has SEEN this content and
-    the live file is now correct. Recording that is what lets a later retraction
-    stay retracted instead of being re-reported as missing.
-
-    SELECTION FAILS CLOSED. A target must be `<batch>/<relpath>` and must match
-    exactly ONE preserved copy; zero matches, an ambiguous match, or no target at
-    all mutates nothing and returns an error.
-
-    The key is batch-qualified and digest-bearing: a basename-or-relpath match
-    across batches would retire another batch's never-merged copy, and empty
-    targets would read as "match all". The digest protects a LATER copy only.
-    """
+    Keys are batch-qualified: a bare basename match would retire another batch's copy."""
     _, err = unmerged(workspace)          # reuse its validation of the workspace
     if err:
         return None, err
@@ -197,9 +156,8 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
     if not targets:
         return None, ("--retire needs an explicit <batch>/<path> selector; "
                       "refusing to retire everything")
-    # Index every preserved copy by its batch-qualified path FIRST, so selection
-    # is resolved against the full set and ambiguity is detectable before any
-    # write.
+    # Index by batch-qualified path FIRST, so ambiguity is detectable before
+    # any write.
     index: "dict[str, list]" = {}
     for batch in sorted(p for p in root.iterdir() if p.is_dir()):
         for saved in batch.rglob("*"):
@@ -215,10 +173,8 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
             hint = (f" — did you mean one of: {', '.join(sorted(near)[:4])}"
                     if near else "")
             return None, f"no preserved copy matches {t!r}{hint}"
-        # No len>1 guard: `index` is keyed by "<batch>/<relpath>", which is unique
-        # per filesystem walk, so a bucket cannot hold two. Ambiguity is caught
-        # one line up instead — a bare basename matches NO key and the near-miss
-        # hint names the qualified candidates.
+        # No len>1 guard: the key "<batch>/<relpath>" is unique per walk, so a
+        # bucket cannot hold two; a bare basename matches NO key instead.
         resolved.append(hits[0])
     retired = _load_retired(root)
     done = []
@@ -262,10 +218,8 @@ def main() -> int:
         print(f"sync-conflicts: {err}")
         return 2
     if not rows:
-        # Name the workspace even on the clean path. "no unmerged peer content"
-        # is only meaningful if the reader can see WHICH workspace was examined;
-        # the ancestor-walk bug above produced exactly that sentence about the
-        # wrong repository, and printing the path is what made it visible.
+        # Name the workspace even on the clean path: "no unmerged peer content"
+        # means nothing unless the reader can see WHICH workspace was examined.
         print(f"sync-conflicts: no unmerged peer content ({ws})")
         return 0
     print(f"sync-conflicts: {len(rows)} file(s) hold peer content not in the live copy")
@@ -274,11 +228,8 @@ def main() -> int:
             where = "live file MISSING"
         else:
             total, absent, resectioned = n
-            # Name WHICH kind, because the two need different responses and the
-            # bare count could not distinguish them: `absent` may be real loss;
-            # `under another heading` is present text whose ASSOCIATION changed,
-            # which is both the benign re-section case AND the policy inversion
-            # this reporter exists to catch. Neither is filtered out.
+            # Name WHICH kind: `absent` may be real loss, `under another
+            # heading` is present text whose ASSOCIATION changed. Neither filtered.
             parts = []
             if absent:
                 parts.append(f"{absent} absent")
