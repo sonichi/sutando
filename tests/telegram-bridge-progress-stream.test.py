@@ -149,9 +149,8 @@ class PollProgressTest(unittest.TestCase):
         self.assertNotIn(tid, tg.pending_task_tiers)
 
     def test_idle_core_yields_generic_label(self):
-        # If the core is idle (no step), placeholder still posts a generic "working…"
-        # Pinned to a DM on purpose: with the audience unset the step would be
-        # withheld anyway, so this would pass without exercising the idle path.
+        # Pinned to a DM on purpose: with the audience unset the step is withheld
+        # anyway, so this would pass without exercising the idle path.
         self._write_status("idle", "")
         tid = self._task_id(age_s=12)
         tg.pending_task_tiers[tid] = "owner"
@@ -161,9 +160,8 @@ class PollProgressTest(unittest.TestCase):
         self.assertIsNotNone(send)
         self.assertIn("working", send["text"].lower())
 
-    # --- audience gate: the step is for DMs, not for group/supergroup/channel ---
-    # Telegram's allowlist gates the SENDER; an allowlisted owner can still address
-    # the bot from a group, and every member would read the core's live step.
+    # --- audience gate: the step is for DMs, not group/supergroup/channel ---
+    # The allowlist gates the SENDER; that sender can address the bot from a group.
 
     def test_group_chat_gets_placeholder_but_never_the_step(self):
         tid = self._task_id(age_s=12)
@@ -178,8 +176,8 @@ class PollProgressTest(unittest.TestCase):
         self.assertIn("working", send["text"].lower())
 
     def test_unknown_audience_fails_closed(self):
-        # Post-restart recovery: tier survives via re-derivation but the audience
-        # map is in-memory only. Unknown audience must degrade to contentless.
+        # The audience map is in-memory only, so a recovered task has an unknown
+        # audience and must degrade to contentless.
         tid = self._task_id(age_s=12)
         tg.pending_task_tiers[tid] = "owner"
         # pending_task_private deliberately NOT set
@@ -197,11 +195,11 @@ class PollProgressTest(unittest.TestCase):
         tg.poll_progress({tid: 555})            # initial send
         info = tg._progress_msgs[tid]
         info["last_edit"] = 0                   # force the edit branch
-        self._write_status("running", "Reading Chi's calendar")
+        self._write_status("running", "SENSITIVE-STEP-TEXT")
         tg.poll_progress({tid: 555})
         edits = [p for m, p in self.calls if m == "editMessageText"]
         for e in edits:
-            self.assertNotIn("Reading Chi's calendar", e["text"])
+            self.assertNotIn("SENSITIVE-STEP-TEXT", e["text"])
 
     def test_private_flag_is_gc_d_and_cleared(self):
         tid = self._task_id(age_s=12)

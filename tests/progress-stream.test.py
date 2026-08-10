@@ -331,16 +331,12 @@ with tempfile.TemporaryDirectory() as d:
     _db.STATE_DIR = ws / "state"
     _db.TASKS_DIR = ws / "tasks"
 
-    # ---- the 2026-08-04 step leak -------------------------------------------
-    # poll_progress renders core-status.json's `step` VERBATIM into whatever
-    # channel the owner's task arrived on. That gate asked who SENT the task
-    # (owner tier) and never who could READ the channel. An owner task in a
-    # third party's guild published
-    #   "⏳ Loop pass: draining queue, then #2596 re-review state (22s)"
-    # to everyone in it; the owner's reply was "Wrong channel" / "Not mine".
+    # ---- the step leak -------------------------------------------------------
+    # The owner-tier gate asks who SENT the task, never who can READ the channel,
+    # and the step is rendered verbatim into whatever channel it arrived on.
     check("step_visible_in: DM yes", ps.step_visible_in(True) is True)
     check("step_visible_in: guild no", ps.step_visible_in(False) is False)
-    _leak = "reading Chi's calendar for the Aug 6 dinner"
+    _leak = "SENSITIVE-STEP-TEXT"
     _priv = ps.format_progress(_leak if ps.step_visible_in(True) else None, 12)
     _shar = ps.format_progress(_leak if ps.step_visible_in(False) else None, 12)
     check("DM still shows the live step", _leak in _priv)
@@ -378,8 +374,8 @@ with tempfile.TemporaryDirectory() as d:
     check("bridge: live core renders progress copy", out_live.startswith("⏳") and "building" in out_live and "(42s)" in out_live)
     # ...and the DEFAULT is fail-closed. A caller that has not established the
     # channel's audience gets a placeholder with no step in it. This is the
-    # 2026-08-04 leak: the step reached a third party's guild because the gate
-    # asked who SENT the task, never who could READ the channel.
+    # The gate asks who SENT the task, never who can READ the channel, so an
+    # unknown audience must suppress the step rather than assume a DM.
     out_shared = _db._render_progress_content(now, 42)
     check("bridge: step suppressed when audience unknown",
           out_shared.startswith("⏳") and "building" not in out_shared and "(42s)" in out_shared)

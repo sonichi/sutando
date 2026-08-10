@@ -478,17 +478,11 @@ pending_task_private: dict = {}  # task_id -> chat audience is private; in-memor
 def _render_progress_text(elapsed: float, task_id: str) -> str:
     """Render the placeholder body for ``task_id``'s chat.
 
-    The owner tier gate (`should_stream_task`) answers WHO SENT the task; it
-    says nothing about WHO CAN SEE the chat. A Telegram allowlist entry is a
-    USER id, but that user can address the bot from a group/supergroup/channel,
-    and every member of it would then read the core's live ``step`` verbatim —
-    the same disclosure this PR closes for Discord guild channels.
+    A Telegram allowlist entry is a USER id, but that user can address the bot from
+    a group, so the gate is the recorded chat audience, not the sender.
 
-    So the step text is gated on the recorded chat audience, and the default
-    when the audience is unknown is NOT-private: a bridge restart drops
-    `pending_task_private`, and an in-flight task recovered afterwards must
-    degrade to a contentless placeholder rather than assume a DM. Everywhere
-    else still gets the liveness signal, just without the step.
+    Unknown audience defaults to NOT-private: a restart drops `pending_task_private`,
+    so a recovered in-flight task degrades to a contentless placeholder.
     """
     if not progress_stream.step_visible_in(pending_task_private.get(task_id, False)):
         return progress_stream.format_progress(None, elapsed)

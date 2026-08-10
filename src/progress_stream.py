@@ -157,21 +157,11 @@ def _truncate(text: str, limit: int) -> str:
 def step_visible_in(channel_is_private: bool) -> bool:
     """Whether the core's live ``step`` may be PUBLISHED in this channel.
 
-    ``core-status.json``'s ``step`` is written by whatever the core is doing —
-    a PR number, a file path, whose calendar is being read. `poll_progress`
-    renders it VERBATIM into the channel the owner's task arrived on, and that
-    gate has always been about WHO SENT the task (owner tier), never about WHO
-    CAN SEE the channel.
+    The owner-tier gate answers WHO SENT the task, never WHO CAN SEE the channel,
+    and ``step`` is rendered verbatim into wherever that task arrived.
 
-    Those differ. On 2026-08-04 an owner task arrived in a shared guild channel
-    belonging to a third party, and the placeholder published
-    ``⏳ Loop pass: draining queue, then #2596 re-review state (22s)`` to
-    everyone in it. The owner's reply was "Wrong channel" / "Not mine".
-
-    So: the detailed step goes to DMs only. A guild channel can have any
-    membership, and the bridge cannot know it is safe — a private-looking
-    channel today gains a member tomorrow. Everywhere else still gets a
-    placeholder (the liveness signal is the point), just a contentless one.
+    So detailed steps go to known-private chats only; everywhere else still gets a
+    placeholder, just a contentless one — the liveness signal is the point.
     """
     return bool(channel_is_private)
 

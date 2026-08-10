@@ -4768,10 +4768,8 @@ def _queued_task_count():
 
 
 def _render_progress_content(now, elapsed, channel_is_private=False):
-    """Placeholder body for poll_progress: the live core step normally, or the
-    honest outage copy (frozen status + stale heartbeat + queue depth) when the
-    core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
-    class: never narrate progress the core is not making).
+    """Placeholder body for poll_progress: the live core step, or the honest outage
+    copy (frozen status, stale heartbeat, queue depth) when the core looks dead.
 
     `channel_is_private` decides whether the STEP TEXT may be published here.
     It DEFAULTS TO FALSE — fail-closed: a caller that has not established the
