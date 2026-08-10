@@ -53,6 +53,7 @@ task-last; until then both parsers exist and are named for their trust model.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -478,17 +479,43 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
     `_isVoiceTask` walks. Returns the first existing path or None. Rejects
-    malformed ids rather than globbing with them (traversal gate)."""
+    malformed ids rather than globbing with them (traversal gate).
+
+    The month scan uses `os.scandir` and filters on the NAME before asking
+    whether the entry is a directory. The archive root holds one file per
+    archived task and only a handful of `YYYY-MM/` dirs, so it grows without
+    bound while the thing being looked for stays tiny — on a live host it was
+    5,716 entries to find 3 month dirs, and this lookup cost 182 ms. Measured
+    there, per call:
+
+        sorted(iterdir())                 121 ms   <- Path.__lt__ on 5,716 objects
+        iterdir() + is_dir() on every one  88 ms   <- one stat syscall each
+        scandir() + is_dir() on every one  11 ms   <- dirent type is already cached
+
+    Both halves of the old cost were avoidable: `sorted()` paid to order 5,716
+    Path objects when only the matching month names need ordering, and
+    `Path.is_dir()` stat'd every entry when `os.DirEntry.is_dir()` reads the
+    type the kernel already returned. Sorting the handful of matched NAMES
+    preserves the previous candidate order exactly.
+
+    This is not micro-optimisation for its own sake: `agent-api.py` calls this
+    once per result file in a loop of up to 10 (`_remember_done_result_file`),
+    so the old cost showed up as ~1.8 s of directory scanning on a single
+    dashboard poll.
+    """
     if not valid_archive_lookup_id(task_id):
         return None
     fname = f"{task_id}.txt"
     candidates = [tasks_dir / fname, tasks_dir / "processed" / fname,
                   tasks_dir / "archive" / fname]
     archive_root = tasks_dir / "archive"
-    if archive_root.is_dir():
-        for entry in sorted(archive_root.iterdir()):
-            if entry.is_dir() and _MONTH_DIR_RE.match(entry.name):
-                candidates.append(entry / fname)
+    try:
+        with os.scandir(archive_root) as entries:
+            months = sorted(e.name for e in entries
+                            if _MONTH_DIR_RE.match(e.name) and e.is_dir())
+    except (OSError, ValueError):
+        months = []          # missing/unreadable archive is "no months", not an error
+    candidates.extend(archive_root / m / fname for m in months)
     for p in candidates:
         if p.exists():
             return p

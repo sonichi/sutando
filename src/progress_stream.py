@@ -41,11 +41,37 @@ MAX_PLACEHOLDER_AGE_S = 1800  # 30 min
 
 
 def stream_enabled() -> bool:
-    """Master feature flag. Default OFF — the running production bridge is
-    untouched until the owner sets ``SUTANDO_PROGRESS_STREAM=1``. This is the
-    single switch that gates the whole feature, so a regression can be killed
-    instantly by unsetting it, with zero code change."""
-    return os.environ.get("SUTANDO_PROGRESS_STREAM", "") == "1"
+    """Master feature flag for the owner progress-streamer (both the Discord
+    and Telegram bridges consult this). Default OFF.
+
+    Resolution order (the documented CLI > env > config-file precedence):
+
+      1. ``SUTANDO_PROGRESS_STREAM`` env var, if set to a non-empty value —
+         wins, so a regression can be killed instantly (``=0``) with no config
+         edit. This is the override, not the home.
+      2. else ``bridges.progress_stream`` in ``sutando.config.{local.,}json``
+         — the durable, per-clone config home (so the toggle isn't a stray env
+         var scattered across shell profiles).
+      3. else OFF.
+    """
+    env = os.environ.get("SUTANDO_PROGRESS_STREAM")
+    if env is not None and env != "":
+        return env == "1"
+    # Config-file fallback. Lazy import + defensive sys.path so this works both
+    # when the bridge imports us (src/ already on path) and under test loaders
+    # that spec-load this file without adding src/ first.
+    try:
+        import sys
+        src_dir = str(Path(__file__).resolve().parent)
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        import sutando_config  # type: ignore[import-untyped]
+        val = sutando_config.resolve_progress_stream()
+        if val is not None:
+            return val
+    except Exception:
+        pass  # config unreadable → fall through to the safe default (OFF)
+    return False
 
 
 def should_stream_task(access_tier: Optional[str]) -> bool:

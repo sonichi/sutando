@@ -56,6 +56,14 @@ os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-timeout-guards-")
 _ccd_tg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
 _ccd_tg.mkdir(parents=True, exist_ok=True)
 (_ccd_tg / "access.json").write_text('{"allowFrom": []}')
+# ...and the SAME for discord: this file exec-loads BOTH bridges (DISCORD_SRC and
+# TELEGRAM_SRC), and channel_access_path() resolves PER CHANNEL. Seeding only
+# telegram left `channels/discord/access.json` absent, so the discord import could
+# still fall back to the operator's real allowlist — the exact per-channel gap the
+# hermetic-bridge lint was taught to catch (sonichi/sutando#2429 review 11).
+_ccd_dc = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd_dc.mkdir(parents=True, exist_ok=True)
+(_ccd_dc / "access.json").write_text('{"allowFrom": []}')
 
 failures: list[str] = []
 
