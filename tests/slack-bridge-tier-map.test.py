@@ -2,12 +2,15 @@
 """Behavioral test for slack-bridge.py's tierMap-driven access_tier
 resolution. Mirrors the Discord-bridge tier behavior.
 
-Contract:
-    1. Unmapped users → "owner" (preserves pre-tierMap behavior).
-    2. tierMap[uid] == "team" → "team".
-    3. tierMap[uid] == "other" → "other".
+Contract (post-#2161 fail-closed; resolution cases call the REAL
+resolve_access_tier from src/slack-bridge.py, not a local copy — #2512):
+    1. tierMap[uid] == "team" → "team"; == "other" → "other".
+    2. tierMap present, uid missing → "other" (#893: no silent escalation
+       for a new allowlist addition).
+    3. tierMap empty/unconfirmed → "other" (fail CLOSED, #2161: a legit
+       pre-tierMap config is grandfathered into a NON-empty map by the
+       seed, so an empty map means the seed failed — never grant owner).
     4. Unknown tier value in config → "other" (fail safe, not "owner").
-    5. Missing tierMap key (whole map absent) → all users → "owner".
 
 The bridge imports slack_bolt at module load (auth.test on init) — same
 stub-monkey-patch pattern as slack-bridge-allowlist.test.py.
@@ -113,7 +116,8 @@ def main() -> int:
     # When tierMap is non-empty and uid is missing, caller should use "other".
     expect("Uowner in raw tierMap → None (not mapped)", tm.get("Uowner"), None)
 
-    # Case 2: tierMap completely absent (pre-tierMap config). Everyone defaults to owner.
+    # Case 2: tierMap completely absent — load_tier_map returns {} (the
+    # resolution consequence — fail-closed "other" — is case 8 below).
     _write_access(mod, {
         "allowFrom": ["Uolduser"],
         "tofuOwner": "Uolduser",
@@ -146,49 +150,48 @@ def main() -> int:
     tm = load_tier_map()
     expect("missing file → empty dict", tm, {})
 
-    # --- Caller-side split-default logic tests ---
-    # Mirrors the _write_task access_tier resolution in slack-bridge.py.
-    # Rules:
-    #   uid in tierMap → use mapped value
-    #   tierMap non-empty, uid missing → "other" (fail-safe, #893)
-    #   tierMap empty/absent → "owner" (pre-tierMap compat)
-    #   unknown tier value → degrade to "other"
-    def _resolve_tier(uid: str, tier_map: dict) -> str:
-        if uid in tier_map:
-            tier = tier_map[uid]
-        elif tier_map:
-            tier = "other"
-        else:
-            tier = "owner"
-        if tier not in ("owner", "team", "other"):
-            tier = "other"
-        return tier
+    # --- Resolution tests: call the REAL resolve_access_tier (#2512) ---
+    # A local re-implementation here is a self-asserting helper: it can't
+    # fail when the shipped rule is wrong, and its case 8 historically
+    # asserted the pre-#2161 fail-OPEN behavior while the bridge shipped
+    # fail-closed. Every case below goes through src/slack-bridge.py's own
+    # symbol, so reverting the fail-closed branch fails this suite.
+    resolve_access_tier = mod.resolve_access_tier
 
     # Case 7: tierMap present, uid missing → "other" (the #893 fix)
     expect(
         "tierMap non-empty, uid missing → 'other'",
-        _resolve_tier("Unewguy", {"Uteam": "team"}),
+        resolve_access_tier("Unewguy", {"Uteam": "team"}, True),
         "other",
     )
 
-    # Case 8: tierMap absent → "owner" (backward compat)
+    # Case 8: tierMap absent/empty → "other" (fail CLOSED, #2161). The seed
+    # grandfathers legit pre-tierMap configs into a NON-empty map, so an
+    # empty map here means the seed failed — never grant owner off that.
     expect(
-        "tierMap absent → 'owner'",
-        _resolve_tier("Uolduser", {}),
-        "owner",
+        "tierMap absent → 'other' (fail closed, #2161)",
+        resolve_access_tier("Uolduser", {}, True),
+        "other",
+    )
+
+    # Case 8b: seed itself failed (empty map, seeded_ok=False) → still "other".
+    expect(
+        "seed failure + empty tierMap → 'other' (fail closed, #2161)",
+        resolve_access_tier("Uolduser", {}, False),
+        "other",
     )
 
     # Case 9: uid in tierMap → mapped value
     expect(
         "uid mapped to 'team' → 'team'",
-        _resolve_tier("Uteam", {"Uteam": "team"}),
+        resolve_access_tier("Uteam", {"Uteam": "team"}, True),
         "team",
     )
 
     # Case 10: unknown tier value → degrade to "other"
     expect(
         "unknown tier value → 'other'",
-        _resolve_tier("Ubad", {"Ubad": "rando"}),
+        resolve_access_tier("Ubad", {"Ubad": "rando"}, True),
         "other",
     )
 
@@ -196,13 +199,19 @@ def main() -> int:
     tm_multi = {"Uteam": "team", "Uother": "other"}
     expect(
         "mixed tierMap, unmapped uid → 'other'",
-        _resolve_tier("Umissing", tm_multi),
+        resolve_access_tier("Umissing", tm_multi, True),
         "other",
     )
     expect(
         "mixed tierMap, mapped uid → correct tier",
-        _resolve_tier("Uteam", tm_multi),
+        resolve_access_tier("Uteam", tm_multi, True),
         "team",
+    )
+    # Owner is a recorded tier like any other — mapped uid → "owner".
+    expect(
+        "uid mapped to 'owner' → 'owner'",
+        resolve_access_tier("Uboss", {"Uboss": "owner"}, True),
+        "owner",
     )
     print(f"Results: {passes} passed, {fails} failed")
     return 0 if fails == 0 else 1

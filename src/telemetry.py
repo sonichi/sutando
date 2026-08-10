@@ -271,15 +271,64 @@ def capture(event: str, properties: dict | None = None, *, flush: bool = False) 
     _dispatch(event, properties, flush=flush)
 
 
-def task_processed(source: str) -> None:
+# Coarse inbound surfaces `task_processed` is allowed to tag. The value can
+# originate from a task file's ``source:`` header, which on the local web/API
+# path is caller-supplied — so it is validated against this fixed allowlist
+# before it reaches PostHog. Anything unrecognized collapses to ``unknown``:
+# telemetry stays coarse and bounded-cardinality, and a caller cannot leak an
+# accidentally-supplied identifier/secret or inflate the property space through
+# the ``source:`` field (CR #2274, qingyun-wu). Keep in sync with the surfaces
+# that writers actually emit (`src/task_priority.py:default_priority_for_source`).
+_KNOWN_SOURCES = frozenset({
+    "voice", "phone", "chat", "api", "context-drop",
+    "discord", "slack", "telegram", "whatsapp",
+    "twilio_voice", "twilio_sms", "twilio_voicemail",
+    "cron", "health-check", "sync-memory", "sync-workspace",
+    "github", "web", "push", "remote",
+    # Gateway (AG2 Space) surfaces — emitted by ag2_sparrow's _write_task:
+    # "ag2space" for direct room messages, "events-promotion" for taskify
+    # promotions, "remote" (above) as the REMOTE_TASK_PROVIDER default.
+    "ag2space", "events-promotion",
+})
+
+
+def _coarse_source(source: str) -> str:
+    """Collapse an inbound ``source:`` value to a known coarse bucket, or
+    ``unknown``. Guards the caller-supplied web/API path against unbounded
+    cardinality and accidental identifier/secret leakage (CR #2274)."""
+    s = (source or "").strip().lower()
+    return s if s in _KNOWN_SOURCES else "unknown"
+
+
+def bucket_source(source: str, default: str = "unknown") -> str:
+    """Resolve a ``source:`` to a known bucket, falling back to ``default``
+    instead of the generic ``unknown``. A surface with a known home passes its
+    own bucket — e.g. the gateway is the ``remote`` surface, so a gateway task
+    whose per-task/per-deployment label isn't allowlisted counts as ``remote``,
+    not lost to ``unknown``. ``default`` is itself validated, so it can't smuggle
+    cardinality either."""
+    coarse = _coarse_source(source)
+    return coarse if coarse != "unknown" else _coarse_source(default)
+
+
+def task_processed(source: str, *, flush: bool = False) -> None:
     """One anonymous event per task the core accepts, tagged only with the
-    inbound surface (``discord`` / ``slack`` / ``telegram`` / ``voice`` / …).
+    inbound surface (``discord`` / ``slack`` / ``telegram`` / ``voice`` /
+    ``chat`` / ``phone`` / …).
 
     This is the activation signal that ``core_started`` alone can't give:
     whether an install does anything after launching. It carries ONLY the
-    coarse source bucket — never the task text, ids, user, or channel.
+    coarse source bucket — never the task text, ids, user, or channel. The
+    bucket is validated against a fixed allowlist (`_coarse_source`) so a
+    caller-supplied ``source:`` header cannot smuggle high-cardinality data or
+    a secret into the property.
+
+    ``flush=True`` is for short-lived callers (the CLI entrypoint below, spawned
+    by the TypeScript task-delegation/phone paths) that exit immediately: the
+    default daemon-thread sender would be killed before the request completes.
+    Long-running services (the Python bridges) keep the default async path.
     """
-    capture("task_processed", {"source": str(source)})
+    capture("task_processed", {"source": _coarse_source(source)}, flush=flush)
 
 
 def feature_used(feature: str, *, flush: bool = False) -> None:
@@ -321,3 +370,30 @@ def _dispatch(event: str, properties: dict | None, *, flush: bool = False) -> No
         _post(payload, timeout=1)
     else:
         threading.Thread(target=_post, args=(payload,), daemon=True).start()
+
+
+# ── CLI entrypoint ─────────────────────────────────────────────────────────
+# Lets non-Python task creators (the TypeScript task-delegation and phone
+# paths) emit an event without a duplicate emitter in TS. Fire-and-forget from
+# the caller: `python3 src/telemetry.py task_processed <source>`. Always uses
+# the flush path — this process exits the instant it returns, so a daemon-thread
+# send would be killed mid-flight. No-op (exit 0) when telemetry is opted out /
+# unconfigured, exactly like the in-process calls. Never prints task content.
+def _cli_main(argv: list[str]) -> int:
+    """Dispatch a one-shot CLI emit. Returns the process exit code. Kept a plain
+    function (not inlined under ``__main__``) so every branch is unit-testable
+    in-process — subprocess-only code escapes the coverage gate."""
+    if len(argv) == 2 and argv[0] == "task_processed":
+        task_processed(argv[1], flush=True)
+        return 0
+    if len(argv) == 2 and argv[0] == "feature_used":
+        feature_used(argv[1], flush=True)
+        return 0
+    sys.stderr.write(
+        "usage: python3 src/telemetry.py {task_processed|feature_used} <value>\n"
+    )
+    return 2
+
+
+if __name__ == "__main__":  # pragma: no cover — thin subprocess shim; _cli_main is tested
+    sys.exit(_cli_main(sys.argv[1:]))

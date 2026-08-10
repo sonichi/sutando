@@ -27,8 +27,9 @@
 #   - A new entry in System Settings → General → Login Items → "Allow in the
 #     Background" with a toggle. Disable any time without breaking Sutando.
 #
-# Strictly opt-in: not called by startup.sh. Run this script when you want
-# OS-supervised reliable cron delivery.
+# Claude-core hosts opt in manually. The Codex launcher calls this installer
+# automatically after reconciling fixed schedules because Codex has no
+# session CronCreate owner for them.
 #
 # Usage:
 #   bash src/install-cron-runner-launchd.sh             # install (idempotent)
@@ -168,6 +169,7 @@ case "$cmd" in
                 echo "    Grant: System Settings → Privacy & Security → Full Disk Access → add:"
                 echo "      $PYTHON_BIN"
                 echo "    then verify with: bash $0 --status"
+                exit 1
             fi
         fi
         echo

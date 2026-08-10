@@ -38,6 +38,26 @@ os.environ["SUTANDO_WORKSPACE"] = _WS
 os.environ["SUTANDO_TEST_MODE"] = "1"
 AUDIT = Path(_WS) / "state" / "result-audit.log"
 
+# Isolate the CONFIG dir too, and seed the canonical access file inside it.
+#
+# Setting DISCORD_BOT_TOKEN below stops the `.env` read, but it does NOT stop the
+# module-load-time access resolution: discord-bridge calls channel_access_path("discord"),
+# which resolves under $CLAUDE_CONFIG_DIR and falls back to the LEGACY real-home
+# ~/.claude/channels/discord/access.json when the canonical path is missing. With
+# CLAUDE_CONFIG_DIR unset the test inherits whatever the developer happens to have, so the
+# same defect shows up differently per machine — on a clean host it hits the legacy fallback
+# and prints `[util_paths] DEPRECATION: using legacy …`; on an operator host it silently
+# imports that operator's REAL Discord allowlist. Green everywhere, trustworthy nowhere.
+#
+# Pointing CLAUDE_CONFIG_DIR at a temp root and writing an empty allowlist makes the import
+# hermetic: no host state, no real file, no deprecation warning. Same shape as the telegram
+# fix in tests/bridge-timeout-guards.test.py. (qingyun, #1886 / #2426.)
+_CFG = tempfile.mkdtemp()
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+_cfg_discord = Path(_CFG) / "channels" / "discord"
+_cfg_discord.mkdir(parents=True, exist_ok=True)
+(_cfg_discord / "access.json").write_text('{"allowFrom": []}')
+
 failures = []
 
 
@@ -72,6 +92,19 @@ except ImportError:
 os.environ["DISCORD_BOT_TOKEN"] = "test-token-not-real"
 
 db = _load("dbridge_audit", REPO / "src" / "discord-bridge.py")
+
+# Assert the isolation actually held, rather than trusting that it did. Without these the
+# test still passes while reading host config — which is exactly how this went unnoticed.
+# Checked against the real home explicitly so an inherited CLAUDE_CONFIG_DIR can't satisfy it.
+_REAL_HOME_CFG = Path.home() / ".claude"
+for _attr in ("ACCESS_FILE", "channels_env"):
+    _resolved = getattr(db, _attr, None)
+    check(f"hermetic: {_attr} is confined to the temp config root",
+          _resolved is not None and Path(_resolved).is_relative_to(_CFG),
+          f"{_attr}={_resolved} (temp root={_CFG})")
+    check(f"hermetic: {_attr} does not touch the real ~/.claude",
+          _resolved is not None and not Path(_resolved).is_relative_to(_REAL_HOME_CFG),
+          f"{_attr}={_resolved} resolved inside {_REAL_HOME_CFG}")
 
 db._mark_delivered("task-disc-1")
 check("discord: _mark_delivered writes a delivered audit line",

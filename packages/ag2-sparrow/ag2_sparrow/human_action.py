@@ -39,7 +39,27 @@ import urllib.request
 import uuid
 
 _KEYCAP = {f"{i}️⃣": i for i in range(1, 10)}  # 1️⃣..9️⃣ → 1..9
-_ANSWER_RE = re.compile(r"\banswer\s+(ha_[0-9a-f]{6,})\s+([0-9][0-9,\s]*)", re.IGNORECASE)
+# The `answer` keyword is OPTIONAL: live human acceptance (2026-07-26) showed
+# a real owner naturally types the bare `ha_<hex> 1` — a grammar humans fail
+# on the first try is a UX defect, not a user error. Intent boundary (review):
+# the EXPLICIT `answer ha_<hex> N` form may appear inside prose (the keyword
+# is the intent signal), but the bare `ha_<hex> N` form must BE the entire
+# trimmed message — an owner message that merely QUOTES a pending token in
+# prose must never resolve the action. Both forms remain bounded by the same
+# gates: owner-only sender, PENDING id, valid option numbers.
+_ANSWER_EXPLICIT_RE = re.compile(
+    r"\banswer\s+(ha_[0-9a-f]{6,})\s+([0-9][0-9,\s]*)", re.IGNORECASE)
+_ANSWER_BARE_RE = re.compile(
+    r"(ha_[0-9a-f]{6,})\s+([0-9][0-9,\s]*)", re.IGNORECASE)
+
+
+def _parse_answer(text: str) -> "tuple[str, str] | None":
+    """(action_id, numbers) from an owner message, or None. Explicit form is
+    searched anywhere; bare form must fullmatch the trimmed message."""
+    m = _ANSWER_EXPLICIT_RE.search(text)
+    if m is None:
+        m = _ANSWER_BARE_RE.fullmatch(text.strip())
+    return (m.group(1), m.group(2)) if m else None
 
 
 def _relates_to(event: dict) -> "str | None":
@@ -173,7 +193,9 @@ class CardPoster:
         # Cloudflare rejects urllib's default UA with 403 (same edge rule the
         # bridge's gateway path documents) — without an explicit client UA the
         # card post would retry forever on the real gateway (review blocker).
-        self._headers = {**headers}
+        # BY REFERENCE (no copy): the owning bridge mutates this dict on token
+        # rotation; the post path below builds a per-request copy anyway.
+        self._headers = headers
         self._headers.setdefault("User-Agent", "sutando-gateway-client/1.0")
         self._room = room_id
         self._log = log
@@ -309,10 +331,10 @@ class DecisionHandler:
             if rec and num:
                 choice_nums = [num]
         elif etype == "message.created":
-            m = _ANSWER_RE.search(text)
-            if m:
-                rec = next((r for r in pending if r["action_id"] == m.group(1)), None)
-                choice_nums = [int(n) for n in re.findall(r"\d+", m.group(2))]
+            parsed = _parse_answer(text)
+            if parsed:
+                rec = next((r for r in pending if r["action_id"] == parsed[0]), None)
+                choice_nums = [int(n) for n in re.findall(r"\d+", parsed[1])]
             else:
                 rec = by_card.get(_relates_to(event))
                 if rec and text.strip().isdigit():

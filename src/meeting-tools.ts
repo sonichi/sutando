@@ -6,6 +6,7 @@
 import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { requirePython } from './python-binary.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -65,7 +66,12 @@ export const joinGmeetTool: ToolDefinition = {
 			// The button is in the center-bottom of the preview area
 			await new Promise(r => setTimeout(r, 1000));
 			try {
-				execFileSync('/usr/bin/python3', ['-c', `
+				// requirePython throws when the host has no runnable interpreter —
+				// absorbed by the `catch {}` below, which already degrades this to
+				// "camera not toggled". Never hardcode /usr/bin/python3: on a Mac
+				// without developer tools that is the Xcode-CLT stub and spawning it
+				// raises a modal install dialog.
+				execFileSync(requirePython(), ['-c', `
 import Quartz, subprocess, time
 
 # Get Chrome window position and size

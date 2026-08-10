@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Post a coordination message from this bot to the shared bot2bot channel, @-mentioning the other Sutando node.",
+  "description": "Post a coordination message from this bot to the shared bot2bot channel \u2014 @-mention a specific peer with --to; auto-mention only when exactly one peer exists; never guess.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

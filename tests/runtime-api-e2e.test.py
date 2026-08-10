@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""E2E test for the runtime API v0 (owner acceptance: the E2E loop must be testable through).
+
+Boots the REAL daemon on a temp socket, drives it through the REAL CLI, and
+resolves requests through the REAL human-action store — the only simulated
+piece is the owner's answer, written exactly the way DecisionHandler writes it
+(ActionStore.resolve with 1-based option indexes). This is the local half of
+the design doc's acceptance scenario; slice ② swaps the fake capability
+executor for the governed gateway send.
+
+Covered:
+  1. approval.request → pending → card record visible to CardPoster's sweep
+     source (pending + no card_event_id) → owner approves → request.wait
+     returns approved.
+  2. approval denied path.
+  3. elicitation single_select → owner picks option 2 → wait returns the
+     chosen label.
+  4. capability.execute (fake executor) → completed immediately.
+  5. request.get unknown id → protocol error (exit 1).
+  6. wait timeout on an unanswered request → timedOut: true, still pending.
+  7. daemon restart recovery: pending request survives, resolves after boot.
+  8. cancel → cancelled; a late owner answer does NOT overwrite (CAS).
+
+Run: python3 tests/runtime-api-e2e.test.py   (stdlib only)
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SERVER = REPO / "src" / "runtime-api" / "server.py"
+CLI = REPO / "src" / "runtime-cli" / "sutando-runtime.py"
+
+FAILS: list = []
+
+
+def check(cond, msg):
+    print(("  ok  " if cond else "  FAIL ") + msg)
+    if not cond:
+        FAILS.append(msg)
+
+
+def cli(*args, expect_rc=0, timeout=30):
+    p = subprocess.run([sys.executable, str(CLI), *args],
+                       capture_output=True, text=True, timeout=timeout,
+                       env=ENV)
+    if p.returncode != expect_rc:
+        raise AssertionError(f"cli {args} rc={p.returncode} err={p.stderr}")
+    return json.loads(p.stdout) if p.stdout.strip() else None
+
+
+def wait_socket(path, timeout=10):
+    import socket as _s
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
+        try:
+            s.connect(path)
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def start_daemon():
+    proc = subprocess.Popen([sys.executable, str(SERVER)], env=ENV,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    if not wait_socket(ENV["SUTANDO_RUNTIME_SOCKET"]):
+        proc.kill()
+        print(proc.stdout.read())
+        raise AssertionError("daemon socket never came up")
+    return proc
+
+
+def ha_store():
+    spec = importlib.util.spec_from_file_location(
+        "ha", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "human_action.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.ActionStore(ENV["SUTANDO_HA_DIR"])
+
+
+def pending_action_for(request_id, store, timeout=5):
+    aid = "ha_" + request_id.split("-", 1)[-1][:24]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rec = store.get(aid)
+        if rec is not None:
+            return rec
+        time.sleep(0.1)
+    return None
+
+
+# Mock gateway: /v1/room returns {ok, event_id} (the #207 broker contract);
+# togglable swallowed-send mode returns bare {} — must read as NOT delivered.
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+GW = {"posts": [], "swallow": False, "slow": False}
+
+
+class _GwHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        if GW["slow"]:
+            time.sleep(1.5)
+        n = int(self.headers.get("Content-Length") or 0)
+        GW["posts"].append(json.loads(self.rfile.read(n).decode()))
+        body = b"{}" if GW["swallow"] else json.dumps(
+            {"ok": True, "event_id": f"$evt-{len(GW['posts'])}"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+_gw_srv = ThreadingHTTPServer(("127.0.0.1", 0), _GwHandler)
+threading.Thread(target=_gw_srv.serve_forever, daemon=True).start()
+GW_URL = f"http://127.0.0.1:{_gw_srv.server_address[1]}"
+
+TMP = tempfile.mkdtemp(prefix="runtime-api-e2e-")
+ENV = {**os.environ,
+       "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
+       "SUTANDO_RUNTIME_DB": str(Path(TMP) / "runtime-state.sqlite"),
+       "SUTANDO_HA_DIR": str(Path(TMP) / "human-actions"),
+       "SUTANDO_RUNTIME_RESOLVE_POLL": "0.3",
+       "SUTANDO_AGENT_ID": "@test-agent:example.org",
+       "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
+       "REMOTE_TASK_TOKEN": "test-bearer"}
+
+
+def main() -> int:
+    ENV["REMOTE_TASK_URL"] = GW_URL
+    daemon = start_daemon()
+    store = ha_store()
+    try:
+        # 1. approval → approve
+        r = cli("approval", "request", "--task-id", "task-e2e",
+                "--action", "message.send",
+                "--resource", '{"roomId":"!room:example.org"}',
+                "--reason", "post the summary")
+        check(r["status"] == "pending" and r["requestId"].startswith("approval-"),
+              "approval.request issues pending immediately")
+        act = pending_action_for(r["requestId"], store)
+        # DecisionHandler answer-grammar compatibility: the REAL owner answers
+        # `answer <action_id> N` and _ANSWER_RE only matches ha_ + HEX. A
+        # non-hex id silently strands the card (live finding 2026-07-26).
+        import re as _re
+        _answer_re = _re.compile(r"\banswer\s+(ha_[0-9a-f]{6,})\s+([0-9])")
+        check(act is not None and _answer_re.search(f"answer {act['action_id']} 1") is not None,
+              "ha action id matches DecisionHandler's answer grammar (hex-only)")
+        check(act is not None and act["status"] == "pending"
+              and not act.get("card_event_id")
+              and "Approve" in json.dumps(act["questions"]),
+              "pending ha action exists for CardPoster to sweep (card lifecycle wired)")
+        # owner answers exactly as DecisionHandler writes it: option 1 = Approve
+        check(store.resolve(act["action_id"], {"1": [1]}, "@owner:example.org"),
+              "owner resolution lands (DecisionHandler write shape)")
+        w = cli("request", "wait", r["requestId"], "--timeout", "10")
+        check(w["status"] == "approved" and w["resolvedBy"] == "@owner:example.org",
+              "wait returns approved with resolver identity")
+
+        # 2. approval → deny (option 2)
+        r2 = cli("approval", "request", "--action", "repo.force_push")
+        act2 = pending_action_for(r2["requestId"], store)
+        store.resolve(act2["action_id"], {"1": [2]}, "@owner:example.org")
+        w2 = cli("request", "wait", r2["requestId"], "--timeout", "10")
+        check(w2["status"] == "denied", "Deny option resolves to denied")
+
+        # 3. elicitation single_select
+        r3 = cli("elicitation", "request", "--question", "Deploy where?",
+                 "--type", "single_select", "--options", '["staging","production"]')
+        act3 = pending_action_for(r3["requestId"], store)
+        store.resolve(act3["action_id"], {"1": [2]}, "@owner:example.org")
+        w3 = cli("request", "wait", r3["requestId"], "--timeout", "10")
+        check(w3["status"] == "resolved"
+              and w3["result"]["answer"] == "production",
+              "elicitation returns the chosen option label")
+
+        # 3b. multi_select: multiSelect flag makes the comma grammar resolve
+        r3b = cli("elicitation", "request", "--question", "Which envs?",
+                  "--type", "multi_select", "--options", '["dev","staging","prod"]')
+        act3b = pending_action_for(r3b["requestId"], store)
+        check((act3b.get("questions") or [{}])[0].get("multiSelect") is True,
+              "multi_select sets the multiSelect flag on the card")
+        store.resolve(act3b["action_id"], {"1": [1, 3]}, "@owner:example.org")
+        w3b = cli("request", "wait", r3b["requestId"], "--timeout", "10")
+        check(w3b["status"] == "resolved" and w3b["result"]["answer"],
+              "multi_select resolves with the chosen options")
+        # 3c. free_text is a clean v0 rejection (dead path would strand forever)
+        p3c = subprocess.run([sys.executable, str(CLI), "elicitation", "request",
+                              "--question", "Say anything", "--type", "free_text"],
+                             capture_output=True, text=True, env=ENV)
+        check(p3c.returncode == 1 and "not supported in v0" in p3c.stderr,
+              "free_text elicitation rejected loudly in v0 (no stranded request)")
+
+        # 4. capability.execute — REAL message.send against the mock gateway,
+        #    gated by a consumed-once approval (the full acceptance chain).
+        ra = cli("approval", "request", "--action", "message.send",
+                 "--resource", '{"roomId":"!room:example.org"}',
+                 "--input", '{"body":"hello"}',
+                 "--reason", "post the summary")
+        acta = pending_action_for(ra["requestId"], store)
+        store.resolve(acta["action_id"], {"1": [1]}, "@owner:example.org")
+        wa = cli("request", "wait", ra["requestId"], "--timeout", "10")
+        check(wa["status"] == "approved", "gating approval approved")
+        r4 = cli("capability", "execute", "--action", "message.send",
+                 "--resource", '{"roomId":"!room:example.org"}',
+                 "--input", '{"body":"hello"}',
+                 "--approval", ra["requestId"])
+        check(r4["status"] == "completed"
+              and r4["result"]["eventId"] == "$evt-1"
+              and GW["posts"][-1]["body"] == "hello"
+              and GW["posts"][-1]["room_id"] == "!room:example.org",
+              "capability.execute delivers via gateway, verified by event_id")
+        # one-time consumption: the same approval cannot authorize a second send
+        p4 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                             "--action", "message.send",
+                             "--resource", '{"roomId":"!room:example.org"}',
+                             "--input", '{"body":"hello"}',
+                             "--approval", ra["requestId"]],
+                            capture_output=True, text=True, env=ENV)
+        check(p4.returncode == 1 and "already consumed" in p4.stderr,
+              "an approval authorizes exactly ONE execution (consumed)")
+        # UNGATED governed action → refused BEFORE any gateway contact
+        posts_before = len(GW["posts"])
+        p4u = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                              "--action", "message.send",
+                              "--resource", '{"roomId":"!room:example.org"}',
+                              "--input", '{"body":"sneaky"}'],
+                             capture_output=True, text=True, env=ENV)
+        check(p4u.returncode == 1 and "governed" in p4u.stderr
+              and len(GW["posts"]) == posts_before,
+              "governed message.send without approval is refused pre-gateway")
+
+        # idempotency: same key replays the recorded result — no second send,
+        # no 'already consumed' failure on retry
+        ra2 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"once"}')
+        acta2 = pending_action_for(ra2["requestId"], store)
+        store.resolve(acta2["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", ra2["requestId"], "--timeout", "10")
+        rk1 = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"once"}',
+                  "--approval", ra2["requestId"],
+                  "--idempotency-key", "task-e2e:final")
+        posts_after_first = len(GW["posts"])
+        rk2 = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"once"}',
+                  "--approval", ra2["requestId"],
+                  "--idempotency-key", "task-e2e:final")
+        check(rk1["status"] == "completed"
+              and rk2["requestId"] == rk1["requestId"]
+              and rk2.get("idempotentReplay") is True
+              and len(GW["posts"]) == posts_after_first,
+              "idempotency key replays the first result — no duplicate send")
+
+        # same key + a DIFFERENT approval → replay, and the fresh approval is
+        # NOT consumed (review P1: record + approval consumption are one
+        # atomic step; a replayed key must never spend a second approval)
+        ra3 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"fresh-after-replay"}')
+        acta3 = pending_action_for(ra3["requestId"], store)
+        store.resolve(acta3["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", ra3["requestId"], "--timeout", "10")
+        rk3 = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"once"}',
+                  "--approval", ra3["requestId"],
+                  "--idempotency-key", "task-e2e:final")
+        check(rk3.get("idempotentReplay") is True
+              and rk3["requestId"] == rk1["requestId"]
+              and len(GW["posts"]) == posts_after_first,
+              "same key + different approval replays without a second send")
+        rk4 = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"fresh-after-replay"}',
+                  "--approval", ra3["requestId"],
+                  "--idempotency-key", "task-e2e:fresh")
+        check(rk4["status"] == "completed"
+              and GW["posts"][-1]["body"] == "fresh-after-replay",
+              "the replay did not consume the approval — still spendable once")
+
+        # INPUT binding (review P1): the owner approved the card's exact
+        # effect — an execute that substitutes a different input (the message
+        # body!) after approval must be refused, pre-consume, pre-gateway.
+        rbi = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"benign approved body"}')
+        actbi = pending_action_for(rbi["requestId"], store)
+        card_bi = json.loads((Path(ENV["SUTANDO_HA_DIR"]) / (actbi["action_id"] + ".json")).read_text())
+        check('"body": "benign approved body"' in card_bi["questions"][0]["question"]
+              or 'benign approved body' in card_bi["questions"][0]["question"],
+              "approval card SHOWS the governed input (the body the owner approves)")
+        store.resolve(actbi["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", rbi["requestId"], "--timeout", "10")
+        posts_bi = len(GW["posts"])
+        pbi = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                              "--action", "message.send",
+                              "--resource", '{"roomId":"!room:example.org"}',
+                              "--input", '{"body":"SUBSTITUTED-UNSHOWN-BODY"}',
+                              "--approval", rbi["requestId"]],
+                             capture_output=True, text=True, env=ENV)
+        check(pbi.returncode == 1 and "different resource/input" in pbi.stderr
+              and len(GW["posts"]) == posts_bi,
+              "substituted input after approval is refused pre-gateway")
+        rbi_ok = cli("capability", "execute", "--action", "message.send",
+                     "--resource", '{"roomId":"!room:example.org"}',
+                     "--input", '{"body":"benign approved body"}',
+                     "--approval", rbi["requestId"])
+        check(rbi_ok["status"] == "completed"
+              and GW["posts"][-1]["body"] == "benign approved body",
+              "the refusal did not consume the approval — exact effect still executes")
+
+        # approval BINDING: an approval for another action cannot authorize
+        # message.send — and the mismatch must not consume it.
+        rb = cli("approval", "request", "--action", "repo.force_push",
+                 "--resource", '{"repository":"o/r"}')
+        actb = pending_action_for(rb["requestId"], store)
+        store.resolve(actb["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", rb["requestId"], "--timeout", "10")
+        pb = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                             "--action", "message.send",
+                             "--resource", '{"roomId":"!room:example.org"}',
+                             "--input", '{"body":"cross"}',
+                             "--approval", rb["requestId"]],
+                            capture_output=True, text=True, env=ENV)
+        check(pb.returncode == 1 and "authorizes action" in pb.stderr,
+              "approval for another action cannot authorize message.send")
+        # resource binding: same action, different resource → refused
+        rb2 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!OTHER:example.org"}')
+        actb2 = pending_action_for(rb2["requestId"], store)
+        store.resolve(actb2["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", rb2["requestId"], "--timeout", "10")
+        pb2 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                              "--action", "message.send",
+                              "--resource", '{"roomId":"!room:example.org"}',
+                              "--input", '{"body":"cross2"}',
+                              "--approval", rb2["requestId"]],
+                             capture_output=True, text=True, env=ENV)
+        check(pb2.returncode == 1 and "different resource" in pb2.stderr,
+              "approval bound to another resource cannot authorize this send")
+
+        # idempotency-key REUSE with a different fingerprint → rejected
+        pk = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                             "--action", "message.send",
+                             "--resource", '{"roomId":"!room:example.org"}',
+                             "--input", '{"body":"DIFFERENT"}',
+                             "--idempotency-key", "task-e2e:final"],
+                            capture_output=True, text=True, env=ENV)
+        check(pk.returncode == 1 and "different action/resource/input" in pk.stderr,
+              "idempotency key reuse with a different fingerprint is rejected")
+
+        # concurrency: a slow gateway send must not stall other requests
+        import threading as _th
+        ra4 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"slowpoke"}')
+        acta4 = pending_action_for(ra4["requestId"], store)
+        store.resolve(acta4["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", ra4["requestId"], "--timeout", "10")
+        GW["slow"] = True
+        slow_done = {}
+        def _slow_send():
+            slow_done["r"] = cli("capability", "execute", "--action", "message.send",
+                                 "--resource", '{"roomId":"!room:example.org"}',
+                                 "--input", '{"body":"slowpoke"}',
+                                 "--approval", ra4["requestId"], timeout=30)
+        t = _th.Thread(target=_slow_send)
+        t.start()
+        time.sleep(0.3)  # let the slow send enter the executor
+        t0 = time.monotonic()
+        g = cli("request", "get", ra4["requestId"])
+        dt = time.monotonic() - t0
+        t.join(timeout=30)
+        GW["slow"] = False
+        check(dt < 1.0 and g is not None
+              and slow_done.get("r", {}).get("status") == "completed",
+              f"slow executor does not stall other requests (get took {dt:.2f}s)")
+
+        # swallowed-send 200 (no event_id) → failed, never falsely completed
+        ra3 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"ghost"}')
+        acta3 = pending_action_for(ra3["requestId"], store)
+        store.resolve(acta3["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", ra3["requestId"], "--timeout", "10")
+        GW["swallow"] = True
+        r4b = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"ghost"}',
+                  "--approval", ra3["requestId"])
+        GW["swallow"] = False
+        check(r4b["status"] == "failed" and "not confirmed" in r4b["result"]["error"],
+              "send without event_id fails closed (no false completed)")
+        # unknown action → failed with a clear error
+        r4c = cli("capability", "execute", "--action", "no.such_action")
+        check(r4c["status"] == "failed" and "no executor" in r4c["result"]["error"],
+              "unknown capability action fails cleanly")
+
+        # 5. unknown id → error
+        p = subprocess.run([sys.executable, str(CLI), "request", "get", "nope-1"],
+                           capture_output=True, text=True, env=ENV)
+        check(p.returncode == 1 and "unknown requestId" in p.stderr,
+              "unknown requestId is a clean protocol error")
+
+        # 6. wait timeout leaves the request pending
+        r6 = cli("approval", "request", "--action", "slow.thing")
+        w6 = cli("request", "wait", r6["requestId"], "--timeout", "1")
+        check(w6.get("timedOut") is True and w6["status"] == "pending",
+              "wait timeout reports timedOut and stays pending")
+
+        # 7. restart recovery: r6 survives and resolves after a daemon restart
+        daemon.terminate()
+        daemon.wait(timeout=5)
+        daemon = start_daemon()
+        act6 = pending_action_for(r6["requestId"], store)
+        store.resolve(act6["action_id"], {"1": [1]}, "@owner:example.org")
+        w7 = cli("request", "wait", r6["requestId"], "--timeout", "10")
+        check(w7["status"] == "approved",
+              "pending request survives daemon restart and resolves (recovery)")
+
+        # 7b. rolling-update migration: a pre-idempotency v0 DB gains the new
+        # columns on boot instead of crashing (the live acceptance created one).
+        import sqlite3 as _sq
+        old_db = str(Path(TMP) / "old-schema.sqlite")
+        con = _sq.connect(old_db)
+        con.executescript("""
+CREATE TABLE runtime_requests (
+  request_id TEXT PRIMARY KEY, request_type TEXT NOT NULL, task_id TEXT,
+  execution_id TEXT, actor_id TEXT NOT NULL, method TEXT NOT NULL,
+  params_json TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT,
+  created_at REAL NOT NULL, expires_at REAL, resolved_at REAL,
+  resolved_by TEXT, consumed_at REAL);
+INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
+  '@a:hs','approval.request','{}','pending',NULL,1,NULL,NULL,NULL,NULL);
+""")
+        con.commit(); con.close()
+        spec_rs = importlib.util.spec_from_file_location(
+            "rs", REPO / "src" / "runtime-api" / "request_store.py")
+        rs = importlib.util.module_from_spec(spec_rs)
+        spec_rs.loader.exec_module(rs)
+        migrated = rs.RequestStore(old_db)
+        rec_old = migrated.get("approval-old1")
+        check(rec_old is not None and rec_old["status"] == "pending"
+              and migrated.by_idempotency_key("nope") is None,
+              "pre-idempotency DB migrates on boot (old rows readable, index usable)")
+        migrated.close()
+
+        # 8. cancel wins over a late answer (CAS terminal immutability)
+        r8 = cli("approval", "request", "--action", "late.answer")
+        act8 = pending_action_for(r8["requestId"], store)
+        c8 = cli("request", "cancel", r8["requestId"])
+        check(c8["status"] == "cancelled", "cancel transitions to cancelled")
+        store.resolve(act8["action_id"], {"1": [1]}, "@owner:example.org")
+        time.sleep(1.0)  # give the resolver loop a pass to (not) clobber
+        g8 = cli("request", "get", r8["requestId"])
+        check(g8["status"] == "cancelled",
+              "late owner answer cannot overwrite a terminal state (CAS)")
+    finally:
+        daemon.terminate()
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+
+    print(f"\n{'PASS — runtime-api v0 E2E green' if not FAILS else f'FAILED ({len(FAILS)})'}")
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

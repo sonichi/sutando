@@ -289,14 +289,38 @@ class TestVaultCliMainDispatch(unittest.TestCase):
 
 
 class TestVaultCliEnv(unittest.TestCase):
-    def test_injects_env_and_runs(self):
+    def test_injects_env_and_execs(self):
+        # execvpe REPLACES the process, so on success there is no exit to assert
+        # here — the contract is "we handed CMD the right argv and environment".
         with patch("vault.get_vault_key", return_value="val"), \
-             patch("vault.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
-            with self.assertRaises(SystemExit) as cm:
-                vault_cli.cmd_env(["MY_KEY"], ["echo", "hi"])
-        self.assertEqual(cm.exception.code, 0)
-        env_passed = mock_run.call_args[1]["env"]
+             patch("vault.os.execvpe") as mock_exec:
+            vault_cli.cmd_env(["MY_KEY"], ["echo", "hi"])
+        file_arg, argv, env_passed = mock_exec.call_args[0]
+        self.assertEqual(file_arg, "echo")
+        self.assertEqual(argv, ["echo", "hi"])
         self.assertEqual(env_passed["MY_KEY"], "val")
+
+    def test_does_not_fork_a_child(self):
+        # The regression this guards: subprocess.run() left the wrapper alive as a
+        # parent, so `ps` showed two processes carrying CMD's name and a SIGTERM to
+        # the wrapper never reached CMD. Assert we exec rather than spawn.
+        with patch("vault.get_vault_key", return_value="val"), \
+             patch("vault.os.execvpe") as mock_exec:
+            vault_cli.cmd_env(["MY_KEY"], ["echo", "hi"])
+        self.assertTrue(mock_exec.called, "cmd_env must exec, not spawn a child")
+        self.assertFalse(
+            hasattr(vault_cli, "subprocess"),
+            "secret-vault.py should no longer import subprocess for `env`",
+        )
+
+    def test_exits_127_when_exec_fails(self):
+        # Command missing / not executable: exec itself raises. Stay non-zero and
+        # name the command instead of surfacing a bare traceback.
+        with patch("vault.get_vault_key", return_value="val"), \
+             patch("vault.os.execvpe", side_effect=OSError(2, "No such file")):
+            with self.assertRaises(SystemExit) as cm:
+                vault_cli.cmd_env(["MY_KEY"], ["definitely-not-a-real-binary"])
+        self.assertEqual(cm.exception.code, 127)
 
     def test_exits_1_on_missing_key(self):
         with patch("vault.get_vault_key", side_effect=KeyError("x")):
@@ -308,6 +332,41 @@ class TestVaultCliEnv(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             vault_cli.cmd_env(["KEY"], [])
         self.assertEqual(cm.exception.code, 1)
+
+
+class TestVaultCliEnvActivated(unittest.TestCase):
+    """End-to-end proof, no mocks: the CLI process BECOMES the command.
+
+    Passing zero keys means no Keychain access, so this is hermetic — it exercises
+    the real `env ... -- CMD` path without a stored secret. On the old
+    subprocess.run() implementation the child reports a different pid than the
+    process we launched; after exec they are the same pid, which is the whole
+    point of the change.
+    """
+
+    def _run(self, argv):
+        return subprocess.run(
+            [sys.executable, _SV_PATH, "env", "--"] + argv,
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def test_process_image_is_replaced(self):
+        proc = subprocess.Popen(
+            [sys.executable, _SV_PATH, "env", "--",
+             sys.executable, "-c", "import os; print(os.getpid())"],
+            stdout=subprocess.PIPE, text=True,
+        )
+        out, _ = proc.communicate(timeout=60)
+        child_pid = int(out.strip())
+        self.assertEqual(
+            child_pid, proc.pid,
+            "the command should have REPLACED the wrapper (same pid); a differing "
+            "pid means the wrapper forked and is still sitting around as a parent",
+        )
+
+    def test_exit_status_is_the_commands_own(self):
+        r = self._run(["sh", "-c", "exit 42"])
+        self.assertEqual(r.returncode, 42)
 
 
 if __name__ == "__main__":

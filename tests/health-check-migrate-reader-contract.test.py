@@ -116,7 +116,7 @@ class TestCheckMigrateReaderContract(unittest.TestCase):
     # Case D2: unexpected exception from the subprocess layer -> error
     # ------------------------------------------------------------------
     def test_unexpected_exception_reports_error(self):
-        fake_repo = Path(self.tmp.name) / "repo_exc"
+        fake_repo = self.tmp / "repo_exc"
         tests_dir = fake_repo / "tests"
         tests_dir.mkdir(parents=True)
         (tests_dir / "migrate-reader-contract.test.py").write_text("print('never runs')")

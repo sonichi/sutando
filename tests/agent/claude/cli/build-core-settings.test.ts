@@ -12,8 +12,13 @@ const OBS_BUILDER = fileURLToPath(
 	new URL('../../../../src/observability/claude/hooks/build-hook-settings.mjs', import.meta.url),
 );
 
-function buildCore(guardPath: string, obsJson?: string): any {
-	const args = obsJson === undefined ? [CORE_BUILDER, guardPath] : [CORE_BUILDER, guardPath, obsJson];
+function buildCore(guardPath: string, obsJson?: string, skillTelemetryHook?: string): any {
+	const args =
+		skillTelemetryHook === undefined
+			? obsJson === undefined
+				? [CORE_BUILDER, guardPath]
+				: [CORE_BUILDER, guardPath, obsJson]
+			: [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook];
 	return JSON.parse(execFileSync('node', args, { encoding: 'utf8' }));
 }
 
@@ -29,6 +34,7 @@ function shellParsedPath(command: string): string {
 }
 
 const GUARD = '/x/hooks/skip-ask-user-question.py';
+const SKILL_TELEMETRY = '/x/hooks/skill-usage-telemetry.py';
 
 describe('build-core-settings.mjs', () => {
 	it('always registers the AskUserQuestion guard (guard-only, obs off)', () => {
@@ -62,6 +68,27 @@ describe('build-core-settings.mjs', () => {
 		}
 		// obs-only lifecycle events pass through untouched.
 		assert.deepEqual(o.hooks.SessionStart, obs.hooks.SessionStart);
+	});
+
+	it('registers skill telemetry when obs is off', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY);
+		const post = o.hooks.PostToolUse;
+		assert.equal(post.length, 1);
+		assert.equal(post[0].matcher, 'Skill');
+		assert.equal(shellParsedPath(post[0].hooks[0].command), SKILL_TELEMETRY);
+	});
+
+	it('registers skill telemetry exactly once when obs is on', () => {
+		const o = buildCore(GUARD, buildObs('/x/obs-hook.sh'), SKILL_TELEMETRY);
+		const skillEntries = o.hooks.PostToolUse.filter(
+			(entry: { matcher?: string }) => entry.matcher === 'Skill',
+		);
+		assert.equal(skillEntries.length, 1, 'obs settings must not double-register skill telemetry');
+		assert.equal(shellParsedPath(skillEntries[0].hooks[0].command), SKILL_TELEMETRY);
+		assert.ok(
+			o.hooks.PostToolUse.some((entry: { matcher?: string }) => entry.matcher === '*'),
+			'obs PostToolUse collector must survive the merge',
+		);
 	});
 
 	const ADVERSARIAL = [

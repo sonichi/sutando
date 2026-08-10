@@ -34,6 +34,13 @@ Config (env / .env):
   REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
+  REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
+                        $CLAUDE_CONFIG_DIR/channels/ (default "ag2space") —
+                        selects which .env fallback and access.json a bridge
+                        instance reads, so a second instance (e.g. a dev
+                        homeserver's "dev-ag2space") cannot inherit prod's
+                        credentials or tier map. Env-only by necessity: the
+                        .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
 
 Stdlib only (urllib) — no new dependencies.
@@ -47,6 +54,7 @@ import json
 import os
 import uuid
 import re
+import shlex
 import signal
 import socket
 import sys
@@ -70,25 +78,115 @@ from pathlib import Path
 # is never tried; we keep the original result when there is no v4 address, so a
 # genuinely v6-only destination still resolves. Opt out with
 # REMOTE_GATEWAY_ALLOW_IPV6=1 (hosts with working v6 lose nothing either way).
-if os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1":
-    _orig_getaddrinfo = socket.getaddrinfo
+# DNS resolution has NO native timeout: getaddrinfo blocks the caller until the
+# resolver answers or the OS gives up (which can be minutes, or never on a
+# captive portal / dropped link mid-query). urllib's socket timeout covers
+# connect+read but NOT name resolution — so without a bound, a hung resolver
+# wedges the long-poll loop indefinitely with no "reconnecting" status write and
+# no self-recovery (observed on a tester's machine 2026-07-25: gateway process
+# stuck, DNS for space.ag2.space failing, UI showing "reconnecting" forever).
+# Bounding it lets the loop raise → emit gateway-status reconnecting → back off →
+# retry, so the connection self-heals the moment DNS recovers. Override the bound
+# with REMOTE_GATEWAY_DNS_TIMEOUT (seconds); 0/negative disables it.
+_DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
+_PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
+# Reload-safe original capture: on module re-exec/reload, socket.getaddrinfo is
+# already our wrapper — capturing it blindly makes _resolve_bounded call itself
+# (RecursionError). The installed wrapper carries the TRUE original on its
+# `_ag2_orig_getaddrinfo` attribute, so re-executions pick that up instead.
+_orig_getaddrinfo = getattr(socket.getaddrinfo, "_ag2_orig_getaddrinfo", socket.getaddrinfo)
 
-    def _getaddrinfo_prefer_v4(host, *args, **kwargs):
-        infos = _orig_getaddrinfo(host, *args, **kwargs)
-        if host and "ag2.space" in str(host):
-            v4 = [i for i in infos if i[0] == socket.AF_INET]
-            return v4 or infos
-        return infos
 
-    socket.getaddrinfo = _getaddrinfo_prefer_v4
+class _InflightResolve:
+    """One outstanding getaddrinfo call: waiters share its Event + outcome."""
+
+    __slots__ = ("done", "result", "err")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.result = None
+        self.err = None
+
+
+# Single-flight registry: at most ONE resolver thread exists per distinct
+# (host, args) key. While a call is outstanding — including one wedged on a
+# hung system resolver — every retry for the same key attaches to it instead
+# of spawning another thread, so a persistently hung resolver pins exactly
+# one thread no matter how many times the poll loop retries. The worker
+# removes its slot when the underlying call finally returns, so recovery
+# drains cleanly and the next call starts fresh.
+_INFLIGHT: dict = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _resolve_bounded(host, *args, **kwargs):
+    """socket.getaddrinfo with a hard wall-clock bound.
+
+    getaddrinfo cannot be interrupted, so the actual call runs in a daemon
+    thread; the caller waits up to _DNS_TIMEOUT_S on its completion Event and
+    raises gaierror on overrun (urllib surfaces that as the URLError the poll
+    loop's reconnect branch already handles). The thread is shared single-
+    flight per (host, args) key — see _INFLIGHT — so repeated retries against
+    a wedged resolver never accumulate threads.
+    """
+    if _DNS_TIMEOUT_S <= 0:
+        return _orig_getaddrinfo(host, *args, **kwargs)
+    try:
+        key = (host, args, tuple(sorted(kwargs.items())))
+    except TypeError:  # unhashable arg — never true of real getaddrinfo calls
+        key = None
+
+    with _INFLIGHT_LOCK:
+        call = _INFLIGHT.get(key) if key is not None else None
+        if call is None:
+            call = _InflightResolve()
+            if key is not None:
+                _INFLIGHT[key] = call
+
+            def _run(call=call, key=key):
+                try:
+                    call.result = _orig_getaddrinfo(host, *args, **kwargs)
+                except BaseException as e:  # noqa: BLE001 — re-raised to waiters
+                    call.err = e
+                finally:
+                    # Clear the slot BEFORE signalling: a waiter woken by the
+                    # Event must never re-attach to a completed call.
+                    if key is not None:
+                        with _INFLIGHT_LOCK:
+                            _INFLIGHT.pop(key, None)
+                    call.done.set()
+
+            threading.Thread(target=_run, name="dns-resolve", daemon=True).start()
+
+    if not call.done.wait(_DNS_TIMEOUT_S):
+        raise socket.gaierror(
+            f"DNS resolution for {host!r} exceeded {_DNS_TIMEOUT_S}s (resolver hung)"
+        )
+    if call.err is not None:
+        raise call.err
+    return call.result
+
+
+def _getaddrinfo_prefer_v4(host, *args, **kwargs):
+    infos = _resolve_bounded(host, *args, **kwargs)
+    if _PREFER_V4 and host and "ag2.space" in str(host):
+        v4 = [i for i in infos if i[0] == socket.AF_INET]
+        return v4 or infos
+    return infos
+
+
+_getaddrinfo_prefer_v4._ag2_orig_getaddrinfo = _orig_getaddrinfo
+socket.getaddrinfo = _getaddrinfo_prefer_v4
 
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
 # the path (no repo-walking; the old triple-parent form predated the move into
 # src/ and pointed outside the repo).
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
+from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .result_ready import read_ready_result
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -96,23 +194,113 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# Named-instance support (multi-gateway): one core may run SEVERAL bridge
+# processes, each pointed at a different gateway (e.g. prod + dev homeservers)
+# via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
+# instance; it suffixes the per-BRIDGE state files below and the singleton lock
+# role, so two instances never clobber each other's ledgers or contend one
+# lock. Unset (default) keeps every filename byte-identical to before — the
+# single-bridge install sees zero change. Deliberately NOT suffixed:
+# tasks/ + results/ (the shared task bus — the core is one consumer),
+# last-owner-activity.json (owner presence is one signal regardless of which
+# door the message came through), and core-status.json (the core's, not ours).
+# THE instance-name contract — single source of truth. The import guard below
+# and _LOCAL_TID_RE both derive from this pattern, because every drift between
+# them has produced the same bug class (queue + ACK + silently-stranded
+# results): first a length mismatch (>32 chars, review P1 round 5), then a
+# charset mismatch (str.isalnum() accepts Unicode letters the ASCII regex
+# rejects — GATEWAY_INSTANCE=é imported fine and stranded results, round 6).
+# ASCII [A-Za-z0-9_-], 1-32 chars, and nothing else — if this ever needs to
+# change, it changes HERE and both consumers follow.
+_INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
+if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
+    sys.exit("FATAL: GATEWAY_INSTANCE must match "
+             f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
+_INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+
+
+def _local_tid(broker_tid: str) -> str:
+    """Instance-namespaced LOCAL task id (P1 fixes, PR review 2026-08-02 ×2).
+
+    Broker ids are only unique WITHIN a gateway, so named instances must not
+    share the primary's local id space. The encoding is `task-<inst>~<broker_id>`
+    (broker id embedded VERBATIM after `~`):
+    - INJECTIVE across every (instance, broker_id) pair including the
+      unsuffixed primary: `~` is outside the broker id alphabet
+      (`[A-Za-z0-9._-]`, `_TID_RE`) and outside the GATEWAY_INSTANCE charset
+      (import guard), so no primary pass-through id can equal a named-instance
+      encoding, and the first `~` splits unambiguously. The earlier
+      `task-<inst>.<rest>` scheme was NOT injective — a primary broker id
+      `task-dev.X` collided with dev's mapping of `task-X` (review P1 #2).
+    - Still matches every consumer's `task-*` glob (watcher, archiver).
+    - May exceed _TID_RE's 64-char wire bound (review P1 #1) — local
+      consumers therefore gate on `_valid_local_tid`, and the wire id is
+      re-derived and `_valid_tid`-checked at the ack/result egress points.
+    Unset instance → identity (legacy single-gateway installs unchanged)."""
+    if not GATEWAY_INSTANCE:
+        return broker_tid
+    return f"task-{GATEWAY_INSTANCE}~{broker_tid}"
+
+
+def _broker_tid(local_tid: str) -> str:
+    """Reverse of `_local_tid` — the id the GATEWAY knows this task by."""
+    if not GATEWAY_INSTANCE:
+        return local_tid
+    prefix = f"task-{GATEWAY_INSTANCE}~"
+    if local_tid.startswith(prefix):
+        return local_tid[len(prefix):]
+    return local_tid
+
+
+_LOCAL_TID_RE = re.compile(rf"task-{_INSTANCE_RE.pattern}~([A-Za-z0-9._-]{{1,64}})")
+
+
+def _valid_local_tid(tid: str) -> bool:
+    """A safe LOCAL id: either a plain wire-valid id (primary/legacy) or a
+    named-instance encoding whose embedded broker id is itself wire-valid.
+    Centralizes the widened bound so every local consumer accepts what
+    `_local_tid` can produce (max ≈ 5+32+1+64 chars — filename-safe)."""
+    if _valid_tid(tid):
+        return True
+    m = _LOCAL_TID_RE.fullmatch(tid)
+    return bool(m) and m.group(1) not in (".", "..")
+
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 # gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
-# cross-send other channels' (Discord/Telegram) results to the gateway.
-INFLIGHT_FILE = _STATE / "remote-task-inflight.json"
+# cross-send other channels' (Discord/Telegram) results to the gateway. The
+# per-instance suffix is what keeps a second bridge from claiming results this
+# instance delegated (each instance only POSTs ids in ITS OWN ledger).
+INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # Sidecar map {task id → origin room id}, recorded at queue time. Outbound
 # file-attach needs the room because media uploads go to the room-scoped
 # endpoint (POST /v1/rooms/{room}/media) while text results go to /v1/results
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
-TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
+TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 # sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
 # guessing from tmux-window presence. Written on every poll outcome: connected
 # after a healthy round-trip, reconnecting in the backoff branches.
-GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
+GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
+
+# Launch provenance + in-bridge file log. A supervisor that persists stdout
+# (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
+# SUTANDO_SUPERVISED=1, and _log stays stdout-only — byte-identical to before.
+# Launched any other way ("bare": a hand-run of the script, a debug shell, an
+# app spawn that forgot the redirect), stdout persists nowhere — the exact
+# diagnostic hole of the 2026-07-25 tester wedge (bridge stuck 21h, zero logs
+# or discoverable status to read). So a bare launch ALSO appends every _log
+# line to <state-parent>/logs/gateway-bridge.log (<workspace>/logs/ when
+# sutando injects dirs, ~/.ag2-sparrow/logs/ under defaults), size-capped with
+# a single .1 rotation, best-effort — log I/O must never break the bridge.
+_LAUNCHED_VIA = "supervised" if os.environ.get("SUTANDO_SUPERVISED") else "bare"
+_LOG_DIR = _STATE.parent / "logs"
+_LOG_FILE = _LOG_DIR / "gateway-bridge.log"
+_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # AWP P0: the persistent event channel (if enabled) — a module-level handle so
 # gateway-status can report per-channel health. None until _maybe_start_event_channel.
@@ -138,15 +326,201 @@ def _env_compat(new, old):
 # string may be the combined "https://<gateway>|<secret>" form (the URL travels
 # inside the token — nothing service-specific lives in this repo); a bare
 # secret needs REMOTE_TASK_URL alongside it.
+# The combined onboarding form is "<url>|<secret>" — the URL travels inside the
+# token. The separator is a literal "|", OR a "%7C"/"%7c" when the desktop connect
+# flow URL-encodes it (ag2space-cinny-desktop#231): "https://<gateway>/relay%7C<secret>".
+# A %7C-separated token carries no literal "|", so a naive split leaves it a bare
+# secret with an empty URL and the bridge FATALs at startup — the core looks
+# "connected" (device-connect completed) but never responds, the Vidhu-onboarding
+# failure 2026-07-24. A literal "|" is PREFERRED over %7C/%7c when both appear:
+# a raw pipe cannot legally occur inside a URL, so when one exists it IS the
+# separator — keeps a URL half carrying an encoded %7C intact (#2679; same
+# rule as the shared credential contract until PR3 delegates this parser).
+_ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
+
+
+def _parse_onboarding_token(raw):
+    """Split the onboarding string into (url_from_token, secret).
+
+    NEVER mutates the token bytes — it only *splits* at the separator, so the
+    secret is returned verbatim (a bearer that itself contains "%7C" or "|" is
+    preserved intact; #2307 review). Disambiguation: only the combined form —
+    which begins with an http(s):// scheme — carries a separator to split on; a
+    bare secret is opaque and returned untouched even if it contains "%7C".
+
+    Handled at the single parse point, so every caller (startup.sh, direct env,
+    legacy AG2_REMOTE_TOKEN alias) is covered regardless of the onboarding writer.
+    """
+    if not raw.lower().startswith(("http://", "https://")):
+        return "", raw  # bare secret — opaque, never touched
+    i = raw.find("|")
+    if i != -1:
+        return raw[:i], raw[i + 1:]  # literal pipe wins; URL + secret verbatim
+    m = _ENCODED_SEPARATOR_RE.search(raw)
+    if m is None:
+        return "", raw  # scheme but no separator; the URL-less guard in main() speaks
+    return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
+
+
+# Which channels/<dir>/ this instance reads (.env fallback + access.json).
+# Env-only — the .env file can't name its own directory. Default preserves the
+# historical single-instance layout.
+CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+
+
+def _token_from_ag2space_env():
+    """Fallback token source when the launcher didn't export it into the env.
+
+    `connect` writes the relay token to the channel .env, but not every launcher
+    gets it into the process environment. The desktop-spawned core is the case
+    that matters: its supervisor spawns the core (and the gateway window) with a
+    fixed env whitelist, and the window sources the .env only once at start — so
+    if connect writes the token after that (or the export step is skipped), the
+    bridge sees an empty token and never connects (every new desktop-only user
+    can reproduce this). Read the file directly so the bridge connects regardless
+    of who launched it, and so a bridge already looping when connect wrote the
+    token picks it up on its next start.
+
+    Returns (token, url). A combined url|secret token embeds the URL (split
+    downstream by _parse_onboarding_token), but a split-layout file (bare token +
+    separate REMOTE_TASK_URL) does not — so the file's REMOTE_TASK_URL is returned
+    alongside for the caller to feed into the URL chain. Returns ("", "") when no
+    candidate file holds a token.
+
+    Candidates, in order:
+      1. AG2_DEVICE_ENV — the absolute path the desktop launcher (launch-sutando.sh)
+         lays into the gateway window, pointing straight at the file connect wrote;
+         the ONLY one that reaches the bridge in the desktop-spawned case.
+      2. $CLAUDE_CONFIG_DIR/channels/ag2space/.env — for non-desktop launchers that
+         do export CLAUDE_CONFIG_DIR into the bridge's environment.
+    We deliberately do NOT guess ~/.claude: a bare-home guess is the one path that
+    could silently pick up a token from an UNRELATED/old install and connect as the
+    WRONG identity (reinstall, account switch, leftover config). Both real launchers
+    are covered above; the bare-home guess only adds a footgun.
+    """
+    candidates = [os.environ.get("AG2_DEVICE_ENV")]
+    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _cfg:
+        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        vals = {}
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            key, _, val = ln.partition("=")
+            vals[key.strip()] = val.strip().strip('"').strip("'")
+        # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
+        tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
+        if tok:
+            # Name the exact file — which .env supplied the token is load-bearing
+            # for diagnosis (and for spotting a wrong-file bind).
+            print(f"[remote-gateway-bridge] token not in env; loaded from {path}",
+                  file=sys.stderr, flush=True)
+            # Carry the file's REMOTE_TASK_URL too. A combined url|secret token
+            # embeds the URL (parsed downstream), but a SPLIT layout (bare token +
+            # separate REMOTE_TASK_URL) does not — and in the fallback case the env
+            # is empty, so without this the URL chain has nothing and the bridge
+            # fatals on "no gateway URL" in the exact scenario this fix targets.
+            url = vals.get("REMOTE_TASK_URL") or vals.get("AG2_REMOTE_URL") or ""
+            # Carry REMOTE_MEDIA_MARKER from the same file too. The bridge derives
+            # its marker tag from os.environ at import (MEDIA_MARKER_TAG below), and
+            # a bare/desktop launch reaches config ONLY through this file — it never
+            # sees startup.sh's env exports, which is the one place the AG2 default
+            # is otherwise set. Without this, such a launch falls back to the
+            # provider-neutral default, the marker never matches the gateway's
+            # `[ag2space-media: …]`, and inbound image/file URLs stay unresolved in
+            # the task body — the core can't see owner-sent screenshots (owner-
+            # reported 2026-08-03). This runs at import, before MEDIA_MARKER_TAG is
+            # computed, so the tag picks it up. Provider-neutral: the VALUE lives in
+            # the channel .env, not in this generic package; and a real env var
+            # still wins (we only fill it when unset).
+            _mm = vals.get("REMOTE_MEDIA_MARKER")
+            if _mm and not os.environ.get("REMOTE_MEDIA_MARKER"):
+                os.environ["REMOTE_MEDIA_MARKER"] = _mm
+            # Return the source file path too (main #2323): it is the durable token
+            # source the auth-recovery path re-reads on rejection. In the desktop-
+            # spawned case this is the ONLY thing that arms recovery —
+            # REMOTE_TASK_TOKEN_FILE is unset there, so without carrying `path` into
+            # TOKEN_FILE the bridge keeps the historical FATAL/crash-loop behavior.
+            return tok, url, path
+    return "", "", ""
+
+
+def _token_from_vault_ag2space(vault_get=None):
+    """Vault tier for the ag2space onboarding token — parity with the channel
+    bridges (#2638).
+
+    Before this, sparrow resolved its token from the process env and the channel
+    `.env`, but NEVER the Keychain vault (`get_vault_key` occurrences in this
+    module: 0). So `vault set REMOTE_TASK_TOKEN <value>` stored the secret
+    correctly and changed nothing for ag2space — the operator spent the secret
+    and saw no effect, exactly the failure #2638 fixed for discord/slack/telegram
+    (@qingyun-air's 2026-08-04 bridge-parity finding). This closes that gap.
+
+    Reuses the shared core policy `channel_token.token_from_vault` rather than
+    copying it (the read is total-failure-safe and never surfaces the value).
+    sparrow ships standalone (`pyproject.toml`), so the monorepo `src/` may be
+    absent; when `channel_token` can't be located/imported we degrade to the
+    pre-#2638 behavior — no vault tier — rather than crash a bridge at startup.
+    Tries the current name, then the legacy `AG2_REMOTE_TOKEN` alias. Returns ''
+    on any failure. `vault_get` is injectable so the tier is testable hermetically
+    without touching a real Keychain.
+    """
+    try:
+        cur = os.path.dirname(os.path.abspath(__file__))
+        src = ""
+        while True:
+            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
+                src = os.path.join(cur, "src")
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        if not src:
+            return ""
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from channel_token import token_from_vault
+    except Exception:
+        return ""
+    tok = (token_from_vault("REMOTE_TASK_TOKEN", vault_get=vault_get)
+           or token_from_vault("AG2_REMOTE_TOKEN", vault_get=vault_get))
+    if tok:
+        # Name the source — which layer supplied the token is load-bearing for
+        # diagnosis. Never print the value.
+        print("[remote-gateway-bridge] token not in env or .env; loaded from vault",
+              file=sys.stderr, flush=True)
+    return tok
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
-if "|" in _RAW:
-    _URL_FROM_TOKEN, TOKEN = _RAW.split("|", 1)
-else:
-    _URL_FROM_TOKEN, TOKEN = "", _RAW
+_URL_FALLBACK = ""
+_TOKEN_FILE_FALLBACK = ""
+if not _RAW:
+    _RAW, _URL_FALLBACK, _TOKEN_FILE_FALLBACK = _token_from_ag2space_env()
+if not _RAW:
+    # Last resort: the Keychain vault — parity with the channel bridges (#2638).
+    # Without this, `vault set REMOTE_TASK_TOKEN` was a no-op for ag2space.
+    _RAW = _token_from_vault_ag2space()
+_URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
-       or _URL_FROM_TOKEN).rstrip("/")
+       or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# The ONE auth-header dict shared with long-lived consumers (event channel,
+# card poster). They must hold this dict BY REFERENCE (no copy) so a token
+# rotation (_reload_rotated_token) propagates to their next request without a
+# restart. _req() itself reads the TOKEN global per call and needs no dict.
+_AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 HEARTBEAT_INTERVAL = 60
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
@@ -154,6 +528,18 @@ HEARTBEAT_INTERVAL = 60
 # picked up until the worker restarts; time-gating makes it self-healing.
 ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "300")
 _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipped
+# Auth-rejection recovery: when the gateway rejects the bearer (401/403 — the
+# key was revoked or expired), the historical behavior is an immediate FATAL
+# exit. Under a supervisor that blindly relaunches, that becomes a silent
+# crash-loop hammering the gateway until a human notices. When
+# REMOTE_TASK_TOKEN_FILE names the durable token source (a dotenv-style file
+# with a REMOTE_TASK_TOKEN= line, or the raw onboarding string alone on a
+# line), the bridge instead re-reads that file on rejection: a DIFFERENT token
+# there (the connect/onboarding flow re-ran) is swapped in live — no restart —
+# and an unchanged one holds the bridge in a slow re-check loop until rotation
+# happens. Unset → exactly the pre-existing FATAL-exit behavior.
+TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
+AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
@@ -163,6 +549,9 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                # Room-membership context (gateway writer side, same contract):
+                # a capped one-line mxid list + the true joined total.
+                "room_members", "room_member_count",
                 "source_message_id", "user_id", "priority", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
@@ -214,15 +603,48 @@ if LOCAL_TIER not in ("owner", "team", "other"):
 # We key the lookup on the BROKER-attested `user_id` (Matrix sender the broker
 # writes into the task, not a task-body self-claim), so this stays a LOCAL trust
 # decision — same principle as LOCAL_TIER. Only listed senders are re-tiered;
-# everyone else keeps LOCAL_TIER, so an unknown sender can never ESCALATE (the
-# map only DOWN-tiers named senders; owner stays owner by being absent from it).
-# Hot: re-read on mtime change so the owner can add teammates without a restart.
+# everyone else keeps LOCAL_TIER, so an UNLISTED sender can never escalate. A LISTED
+# sender gets exactly the tier the owner mapped them to — including one ABOVE
+# LOCAL_TIER, which is how a least-privilege node names its owner. See the CONTRACT
+# note on _tier_for for why that cannot be driven from the wire.
+# Hot: the cache keys on (st_mtime_ns, st_size, st_ino) and never serves an
+# above-LOCAL_TIER grant without a fresh read, so the owner can add teammates AND
+# revoke them without a restart.
 def _ag2space_access_path():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, "channels", "ag2space", "access.json")
+    return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
 
 
-_TIER_MAP_CACHE = {"mtime": None, "map": {}}
+# Known tier vocabulary. Also an ordering (higher == more privileged); kept for
+# validating a mapped value. It no longer CLAMPS — see _tier_for.
+_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
+
+_TIER_MAP_CACHE = {"ident": None, "map": {}}
+
+
+def _has_above_local(cached) -> bool:
+    """True if the cached map grants anyone a tier ABOVE this node's LOCAL_TIER."""
+    local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+    return any(_TIER_RANK.get(v, 0) > local_rank for v in cached.values())
+
+
+def _stale_safe(cached):
+    """Project a STALE cached map onto the fail-closed side in BOTH directions.
+
+    The cache is deliberately preserved across a read error so a transient
+    mid-write cannot fail-OPEN a down-tiered sender back to LOCAL_TIER. That
+    reasoning holds only for entries at or below LOCAL_TIER. Once the map can
+    also grant a tier ABOVE LOCAL_TIER, replaying the cache verbatim keeps an
+    ESCALATION alive on a file the owner may have just deleted to revoke it —
+    so deleting access.json would not actually revoke anything.
+
+    Drop the above-LOCAL_TIER entries (those senders fall back to LOCAL_TIER)
+    and keep the rest. A legitimately-granted sender is briefly demoted while
+    the file is unreadable and is restored on the next successful read; an
+    unrevoked escalation is not left standing. Transient demotion is the safe
+    direction — the module already fails closed to "team" on a bad LOCAL_TIER."""
+    local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+    return {k: v for k, v in cached.items() if _TIER_RANK.get(v, 0) <= local_rank}
 
 
 def _load_tier_map():
@@ -239,11 +661,22 @@ def _load_tier_map():
     tradeoff — the map floor never drops on a transient fault)."""
     path = _ag2space_access_path()
     try:
-        mt = os.path.getmtime(path)
+        st = os.stat(path)
     except OSError:
         # Absent/unstattable → keep last-known-good (initially {} before any load).
-        return _TIER_MAP_CACHE["map"]
-    if mt == _TIER_MAP_CACHE["mtime"]:
+        return _stale_safe(_TIER_MAP_CACHE["map"])
+    # Cache identity is (mtime_ns, size, inode), NOT float mtime. A float mtime
+    # collides under a same-second rewrite and can be restored outright with
+    # os.utime, which would serve a REVOKED grant from cache — reproduced on
+    # #2584 (rewrite to {"tierMap":{}}, restore st_mtime_ns, still resolved owner).
+    ident = (st.st_mtime_ns, st.st_size, st.st_ino)
+    # Belt-and-braces: never serve an ABOVE-LOCAL grant from cache without a fresh
+    # read. Identity can still be forged deliberately; a revoked escalation must not
+    # survive that. Costs one small read per call only while an escalation is
+    # cached — discord's loader has no cache at all and re-reads every message.
+    if ident == _TIER_MAP_CACHE["ident"] and not _has_above_local(_TIER_MAP_CACHE["map"]):
+        # File present and UNCHANGED — this cache is current, not stale. Return it
+        # verbatim: projecting here would drop a legitimate up-tier on every call.
         return _TIER_MAP_CACHE["map"]
     try:
         with open(path) as f:
@@ -256,31 +689,46 @@ def _load_tier_map():
     except Exception:
         # Malformed / mid-write → keep last-known-good; don't advance mtime so a
         # later successful read of the fixed file is still picked up.
-        return _TIER_MAP_CACHE["map"]
-    _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
+        return _stale_safe(_TIER_MAP_CACHE["map"])
+    _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = ident, tm
     return tm
-
-
-# Privilege ordering — a higher rank is MORE privileged. Used to clamp a mapped
-# tier so the owner file can only ever DOWN-tier (never escalate above the node's
-# own default), keeping the "map only down-tiers named senders" safety invariant
-# true in code rather than only in the comment.
-_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
 
 
 def _tier_for(user_id):
     """Resolve the access_tier for a task's broker-attested sender.
 
-    A listed sender gets their mapped tier, CLAMPED to <= LOCAL_TIER: the map can
-    down-tier a sender below this node's default but never raise them above it, so
-    a compromised/misconfigured access.json can never ESCALATE. Everyone else
-    (unlisted / no user_id) gets LOCAL_TIER."""
+    An EXPLICITLY LISTED sender gets exactly the tier the owner mapped them to —
+    including a tier ABOVE this node's LOCAL_TIER. That is the point: it lets a
+    SHARED gateway run a least-privilege default (REMOTE_TASK_TIER=team) and name
+    the one sender who is the owner, instead of the only previously-available
+    shape — a blanket `owner` default that every unlisted sender inherits.
+
+    This mirrors the discord and slack bridges, which have always resolved
+    `access_tier = tierMap[sender_id]` with no clamp. The map is LOCAL,
+    owner-owned config with the same trust standing as REMOTE_TASK_TIER itself,
+    and the lookup key is the BROKER-ATTESTED user_id, never a task-body
+    self-claim — so the WIRE still cannot escalate anyone. Only the owner's own
+    local file can, and only for a sender they named explicitly.
+
+    Everyone else (unlisted / no user_id) gets LOCAL_TIER, unchanged: no existing
+    install is silently demoted, and an unknown sender never gains privilege.
+
+    ⚠ CONTRACT — `user_id` MUST stay broker-attested (cold-review note, #2584).
+    The removed clamp used to be a backstop: even if `user_id` had become
+    body-influenced, a mapped tier was still bounded by LOCAL_TIER. With the
+    clamp gone, "`user_id` is the broker-written Matrix sender, never a
+    task-body self-claim" is SOLELY load-bearing for the no-wire-escalation
+    property. It holds today because `user_id` is a broker-writer-side entry in
+    _TASK_FIELDS, serialized beside room_name/sender_name. Any future change
+    that lets a task body influence `user_id` reintroduces wire-controlled
+    escalation — re-add a bound here if that contract is ever weakened.
+    (Deliberately a contract note, not an assert: provenance cannot be checked
+    at runtime — the value is an ordinary string whichever path produced it.)"""
     uid = (user_id or "").strip()
     if uid:
         mapped = _load_tier_map().get(uid)
         if mapped in _TIER_RANK:
-            local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
-            return mapped if _TIER_RANK[mapped] <= local_rank else LOCAL_TIER
+            return mapped
     return LOCAL_TIER
 
 
@@ -397,7 +845,22 @@ def _redact_url(value: str) -> str:
 
 
 def _log(msg: str) -> None:
-    print(f"[remote-gateway-bridge] {msg}", flush=True)
+    line = f"[remote-gateway-bridge] {msg}"
+    print(line, flush=True)
+    if _LAUNCHED_VIA == "supervised":
+        return  # stdout already persisted by the supervisor's redirect
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if _LOG_FILE.stat().st_size > _LOG_MAX_BYTES:
+                _LOG_FILE.replace(_LOG_FILE.with_suffix(".log.1"))
+        except FileNotFoundError:
+            pass
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(_LOG_FILE, "a") as f:
+            f.write(f"{stamp} {line}\n")
+    except Exception:  # noqa: BLE001 — logging must never break the bridge
+        pass
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
@@ -426,16 +889,153 @@ def _http_error_body(e) -> str:
         return ""
 
 
+def _read_token_file(path: str) -> str:
+    """The onboarding string from a token file, or "" (missing / unreadable /
+    empty — the caller treats all three as no-rotation). Two accepted shapes:
+    a dotenv-style file carrying a REMOTE_TASK_TOKEN= line (legacy
+    AG2_REMOTE_TOKEN= honored, optional `export `, surrounding quotes
+    stripped), or the raw onboarding string alone on the first non-comment,
+    '='-free line."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    # Collect BOTH alias assignments across the WHOLE file, then apply the
+    # documented precedence REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN regardless of
+    # line order (review P1: a migration-era env with a stale legacy line
+    # ABOVE the current canonical one made recovery hot-swap back to the stale
+    # legacy secret — first-match-in-file-order inverted startup.sh's
+    # precedence). Last assignment of a repeated key wins, matching shell
+    # sourcing semantics.
+    found: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+            if line.startswith(key + "="):
+                found[key] = line[len(key) + 1:].strip().strip("'\"")
+    for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+        if found.get(key):
+            return found[key]
+    for line in text.splitlines():
+        line = line.strip()
+        if line and "=" not in line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def _read_token_file_url(path: str) -> str:
+    """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) from a SPLIT-layout token
+    file, or "" if absent/unreadable. The combined `url|secret` form embeds the
+    URL (extracted by _parse_onboarding_token), but a split file (bare
+    REMOTE_TASK_TOKEN + a separate REMOTE_TASK_URL line) does not — and
+    _read_token_file discards that URL. The reload path needs it so a split file
+    rewritten by connect to a DIFFERENT gateway is caught by the same
+    cross-gateway guard the combined form already gets; otherwise a re-onboard
+    to a new gateway would hot-swap the new bearer onto the OLD running URL
+    (the exact credential-boundary split the guard exists to prevent)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    found: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        for key in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
+            if line.startswith(key + "="):
+                found[key] = line[len(key) + 1:].strip().strip("'\"")
+    return found.get("REMOTE_TASK_URL") or found.get("AG2_REMOTE_URL") or ""
+
+
+def _reload_rotated_token() -> bool:
+    """Re-read TOKEN_FILE and swap in a rotated SECRET. True only when a
+    usable, DIFFERENT secret was found for the SAME gateway: the TOKEN global
+    and the shared _AUTH_HEADERS dict are updated in place, so the poll loop,
+    event channel, and card poster resume with the new bearer without a
+    process restart.
+
+    A rotation NEVER moves URL. The long-lived consumers (EventChannel,
+    CardPoster) captured the base URL at construction, so honoring a new URL
+    here would split the process across gateways — the poller on the new
+    base, SSE + card posts still on the old one, now carrying the freshly
+    rotated bearer to the old endpoint (review P1). Changing gateways is a
+    reconfiguration, not a key rotation: refuse it loudly and keep waiting —
+    a restart picks the new URL up through the normal import-time parse."""
+    global TOKEN
+    if not TOKEN_FILE:
+        return False
+    raw = _read_token_file(TOKEN_FILE)
+    if not raw:
+        return False
+    # Route through the SAME parse used at import time (_parse_onboarding_token)
+    # so a rotation written in the URL-encoded form (https://gw/relay%7C<secret>,
+    # the desktop connect flow) splits correctly. A literal "|" split treated the
+    # encoded form as a bare secret and set the bearer to the whole URL string,
+    # so a valid rotation kept failing auth (regression caught on #2323 once
+    # #2307's %7C onboarding parser reached main).
+    url_from_token, secret = _parse_onboarding_token(raw)
+    # The URL guard must cover BOTH layouts: the combined url|secret form
+    # (url_from_token) AND the split form (bare secret + a separate
+    # REMOTE_TASK_URL line, which _read_token_file drops). Without the split
+    # fallback, a split file re-pointed by connect to a new gateway sends the
+    # new bearer to the OLD running URL — the credential split this guards.
+    file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
+    if file_url and file_url != URL:
+        _log(f"token file names a DIFFERENT gateway ({file_url}) "
+             f"than the running one ({URL}) — a URL change is not hot-swappable; "
+             "restart the bridge to move gateways")
+        return False
+    if not secret or secret == TOKEN:
+        return False
+    TOKEN = secret
+    _AUTH_HEADERS["Authorization"] = f"Bearer {TOKEN}"
+    return True
+
+
+def _recover_auth(code: int) -> bool:
+    """Auth-rejection recovery. An immediate re-read catches a rotation that
+    already happened (the bridge lagged behind a re-onboard); otherwise hold
+    in a slow re-check loop — keeping the poller singleton heartbeated so a
+    supervisor sees ONE live waiting process instead of a crash-loop — until
+    the token file rotates. Returns True once a rotated token is live; False
+    when no TOKEN_FILE is configured (caller keeps the historical FATAL
+    exit)."""
+    if _reload_rotated_token():
+        _log("auth rejected but token file already rotated — resuming with new token")
+        return True
+    if not TOKEN_FILE:
+        return False
+    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation in "
+         f"{TOKEN_FILE} (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    while True:
+        _emit_gateway_status(False,
+                             error=f"auth rejected HTTP {code} — waiting for re-connect",
+                             backoff_s=AUTH_RECHECK_INTERVAL)
+        time.sleep(AUTH_RECHECK_INTERVAL)
+        if not _heartbeat_singleton():
+            sys.exit("FATAL: lost poller singleton while waiting for token rotation")
+        if _reload_rotated_token():
+            _log("rotated token detected — resuming")
+            return True
+
+
 def _post_task_ack(tid: str) -> bool:
     """Tell the gateway a task made it safely into the local queue."""
     global _ack_disabled_until
-    if not _valid_tid(tid):
+    # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
+    # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
+    # the local form stranded queued results while the gateway waited forever.
+    if not _valid_tid(_broker_tid(tid)):
         return False
     if _ack_disabled_until and time.time() < _ack_disabled_until:
         return False  # gateway recently 404'd /ack — retry after the cooldown
     try:
-        safe_tid = urllib.parse.quote(tid, safe="")
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        wire_tid = _broker_tid(tid)
+        safe_tid = urllib.parse.quote(wire_tid, safe="")
+        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": wire_tid}, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         return True
     except urllib.error.HTTPError as e:
@@ -574,6 +1174,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
             "gateway": _redact_url(URL),
+            "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
         }
         # AWP P0 per-channel health: the task connection is `connected` above; the
@@ -791,6 +1392,11 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     supervisor escalation target). `sender_tier` is passed in by `_write_task` so
     the task tier and this gate share a SINGLE resolution (no divergence, no
     double tierMap read); a direct caller can omit it and we resolve here. For an
+    Since the map may now grant a tier ABOVE LOCAL_TIER, the mirror case also
+    holds: a sender explicitly mapped to owner on a least-privilege node DOES
+    register owner presence — that is the point of naming them owner. Tests 23/24
+    pin both directions, because a refactor that regated this on LOCAL_TIER would
+    silently stop recording the real owner's activity. For an
     unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
     unchanged. Never trusts the gateway's own claim (it is outside the trust
     boundary) — only the broker-attested user_id keyed against the owner's LOCAL
@@ -799,6 +1405,7 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     as discord-bridge.write_owner_activity so the proactive-loop reader is
     transport-agnostic. Best-effort — never blocks task intake."""
     if sender_tier is None:
+        # user_id is broker-attested here — see the CONTRACT note in _tier_for.
         sender_tier = _tier_for(task.get("user_id"))
     if sender_tier != "owner":
         return
@@ -818,6 +1425,9 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         body = (task.get("task") or "").lstrip()
         if body.startswith("[") and "]" in body:
             body = body[body.index("]") + 1:].lstrip()
+        # #2267 parity: the presence summary is persisted state too — a pasted
+        # token must not survive in last-owner-activity.json either.
+        body = filter_chat_secrets(body).text
         payload = {
             "ts": int(time.time()),
             "channel": task.get("source") or PROVIDER,
@@ -847,13 +1457,18 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
 def _write_task(task: dict) -> str | None:
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns the task id, or None if it has no id / already present."""
-    tid = str(task.get("id") or "").strip()
-    if not tid:
+    broker_tid = str(task.get("id") or "").strip()
+    if not broker_tid:
         _log("dropping task with no id")
         return None
-    if not _valid_tid(tid):
-        _log(f"dropping task with unsafe id {tid!r}")
+    if not _valid_tid(broker_tid):
+        _log(f"dropping task with unsafe id {broker_tid!r}")
         return None
+    # Everything from here down — filenames, ledgers, archives, the serialized
+    # id: header the core echoes back as the result filename — uses the LOCAL
+    # id; `_broker_tid` restores the wire id at the ack/result POST boundary.
+    tid = _local_tid(broker_tid)
+    task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived.
     if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
@@ -884,6 +1499,7 @@ def _write_task(task: dict) -> str | None:
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
+    _secret_types: tuple = ()
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -907,7 +1523,17 @@ def _write_task(task: dict) -> str | None:
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
-            lines.append(f"task: {_one_line(_fetched)}")
+            # Redact pasted secrets BEFORE the body is persisted (#2267 parity
+            # with the discord/slack/telegram bridges): a token pasted into a
+            # room message must never land on disk. Runs AFTER media
+            # resolution so a signed media-proxy URL is consumed intact and
+            # only the resolved text is filtered.
+            _filtered = filter_chat_secrets(_fetched)
+            if _filtered.secret_types:
+                _secret_types = tuple(_filtered.secret_types)
+                _log(f"redacted pasted secret(s) in {tid} body: "
+                     f"{', '.join(sorted(_secret_types))}")
+            lines.append(f"task: {_one_line(_filtered.text)}")
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
             # alongside the legacy [File attached:] body line (dual-write) via the
@@ -943,12 +1569,57 @@ def _write_task(task: dict) -> str | None:
     # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
     # below, so the two decisions can never diverge (a single source of truth,
     # no double read of the tierMap).
+    # user_id is broker-attested here — see the CONTRACT note in _tier_for.
     sender_tier = _tier_for(task.get("user_id"))
     lines.append(f"access_tier: {sender_tier}")
+    # #2267 parity, second half: the other bridges append the in-band security
+    # notice so the core neither reproduces nor re-requests the redacted value.
+    # Appended AFTER access_tier: the notice is bridge-generated fixed text with
+    # no header-shaped lines, so the access-tier-wins-last invariant holds.
+    if _secret_types:
+        lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
+    # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
+    # header-shaped lines, so appending after access_tier keeps it the last one.
+    if sender_tier == "owner":
+        _chan = _one_line(task.get("channel_id") or "")
+        # shlex.quote: an unescaped quote in _chan must not close the shell
+        # string early and turn the remainder into executable shell syntax.
+        _chan_q = shlex.quote(_chan)
+        _step = 1
+        _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+        if _chan:
+            _skill.append(
+                f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
+                f"message, reconstruct the room thread — `python3 "
+                f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
+                f"reports no gateway configured, load the channel env first: `set -a; . "
+                f"\"$CLAUDE_CONFIG_DIR/channels/ag2space/.env\"; set +a`) — and read it "
+                "back (everyone's messages including your own prior replies) until this "
+                "message stands on its own, then answer from the reconstructed thread, "
+                "NOT from memory. Do this every time; do NOT skip it because the message "
+                "looks self-contained or you feel you already understand it — felt "
+                "confidence is exactly the signal that fails. The only exception is a "
+                'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
+            _step += 1
+            _skill.append(
+                f"{_step}. NOTIFY FIRST (if task takes >60s): python3 "
+                f"skills/task-progress/scripts/notify.py --source ag2space "
+                f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
+            _step += 1
+        _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
+        lines.extend(_skill)
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
+    # #2274 parity: one task_processed per NEWLY queued task (idempotent early
+    # returns never reach here), bucketed to this gateway's own "remote" surface
+    # when the source label isn't an allowlisted bucket so activity isn't lost.
+    try:
+        from telemetry import bucket_source, task_processed
+        task_processed(bucket_source(_one_line(task.get("source") or PROVIDER), "remote"))
+    except Exception:
+        pass
     _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
@@ -1082,13 +1753,13 @@ def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
     for tid in list(inflight):
-        if not _valid_tid(tid):  # defense-in-depth: never read an unsafe path
+        if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if not rfile.exists():
+        body = read_ready_result(rfile)
+        if body is None:
             continue
-        body = rfile.read_text().strip()
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
@@ -1134,7 +1805,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": tid, "body": out_body})
+            _req("POST", "/v1/results", {"id": _broker_tid(tid), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
@@ -1166,7 +1837,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     check and the discard is then picked up by the next `_post_ready_results`
     instead of being raced. Returns the new suspects set for the next pass."""
     gone = {tid for tid in inflight
-            if _valid_tid(tid)
+            if _valid_local_tid(tid)
             and not (TASKS_DIR / f"{tid}.txt").exists()
             and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
             and not (RESULTS_DIR / f"{tid}.txt").exists()}
@@ -1189,7 +1860,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
 # lock-layer error → poll anyway (a lock bug must never silence task delivery;
 # the only risk of a dropped guard is the pre-existing dual-poller). Kill-switch:
 # SUTANDO_BRIDGE_LOCK=0 lets the owner disable it in prod without a redeploy.
-_LOCK_ROLE = "gateway-bridge"
+_LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"  # per-instance: dual-poller guard stays per-gateway
 _LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
 
 
@@ -1259,7 +1930,8 @@ def _maybe_start_event_channel() -> None:
         from .event_inbox import EventInbox
         from .event_channel import EventChannel
         inbox = EventInbox(str(_STATE / "event-inbox.db"))
-        ch = EventChannel(inbox, URL, {"Authorization": f"Bearer {TOKEN}"}, log=_log)
+        ch = EventChannel(inbox, URL, _AUTH_HEADERS, log=_log,
+                          auth_retry=bool(TOKEN_FILE))
         threading.Thread(target=ch.run, name="sparrow-event-channel", daemon=True).start()
         _EVENT_CHANNEL = ch
         # P1: drain the inbox into the Core's attention (taskify → tasks/) on a
@@ -1278,7 +1950,7 @@ def _maybe_start_event_channel() -> None:
             store = ActionStore(str(_STATE / "human-actions"))
             handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
             if ha_room:
-                poster = CardPoster(store, URL, {"Authorization": f"Bearer {TOKEN}"},
+                poster = CardPoster(store, URL, _AUTH_HEADERS,
                                     ha_room, log=_log,
                                     include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
                                     .strip().lower() in ("1", "true", "yes", "on"))
@@ -1301,14 +1973,30 @@ def _maybe_start_event_channel() -> None:
 
 
 def main() -> None:
-    if not URL or not TOKEN:
-        sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
+    if not TOKEN:
+        sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
+    if not URL:
+        # A token that starts with a URL scheme but yielded no URL means the
+        # url|secret separator was swallowed (e.g. a %7C survived decoding, or a
+        # new encoding we don't handle) — say so, instead of the misleading
+        # "set REMOTE_TASK_TOKEN" when the token is present but malformed.
+        _hint = (" — the token carries a gateway URL but the url|secret separator "
+                 "looks missing/corrupted" if TOKEN[:4].lower() == "http" else "")
+        sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
+                 f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     if not _acquire_singleton():
         return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
     inflight: set[str] = _load_inflight()
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
+    # Always name where the diagnostics live: after an incident this line is the
+    # trailhead (a bare-launched bridge under default dirs writes status to
+    # ~/.ag2-sparrow/state/, where nobody thinks to look).
+    _log(f"launched_via={_LAUNCHED_VIA} status={GATEWAY_STATUS_FILE}")
+    if _LAUNCHED_VIA == "bare":
+        _log(f"running unsupervised — output also logged to {_LOG_FILE}; "
+             f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
@@ -1345,6 +2033,9 @@ def main() -> None:
             _emit_gateway_status(True)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
+                if _recover_auth(e.code):
+                    backoff = 1
+                    continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
