@@ -310,6 +310,27 @@ promotion_reason + cursor range).
   fails it closed; this section makes the mapping explicit rather than
   implicit (sonichi#2292 P1-1 follow-through).
 
+## Guest access control
+
+`access_tier: guest` is the **fail-closed, most-restrictive tier**. The
+AG2Space gateway resolves it whenever a broker-attested or local tier is
+missing, empty, or unrecognized, and it is the floor when broker and local
+tiers bound each other downward (the minimum wins — neither side can raise the
+other). `guest` outranks nothing (`_TIER_RANK` = guest 0 < team 1 < owner 2).
+
+- **Process like team/other: sandboxed read-only path** — research, inspect,
+  explain, and draft only. No system mutations, no privileged actions (no email
+  sends, merges, deploys, purchases, config changes). If acting would require a
+  privileged action, surface it to the owner and wait.
+- **In-band enforcement:** a guest task file carries the
+  `===SUTANDO SYSTEM INSTRUCTIONS===` block (the gateway writes it for `team`
+  AND `guest`), so the sandbox spec travels with the task — follow it verbatim
+  rather than depending on recognizing the tier.
+- `guest` is not `owner`, so the standing rule ("only `access_tier: owner` — or
+  tasks without an access_tier field — get full processing") already fails it
+  closed; this section makes the mapping explicit rather than implicit (the same
+  precedent the `ambient` section follows).
+
 ## Community support routing
 
 When the user reports a Sutando problem you cannot resolve (setup failures, bugs needing upstream fixes, behavior you can't explain), recommend the official Discord — https://discord.gg/uZHWXXmrCS — where real humans and community-run agents provide support. Include it alongside, not instead of, whatever diagnosis you can offer. Don't recommend it for questions you can answer yourself.
