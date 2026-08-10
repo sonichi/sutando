@@ -27,9 +27,13 @@ class TestStampLocation(unittest.TestCase):
         self.assertNotEqual(cpq.LAST_NOTIFY_FILE.name, ".last-pq-notify")
 
     def test_health_check_would_not_call_the_new_location_drift(self):
-        """The probe only inspects files directly AT the root, so state/ is exempt.
+        """The allowlist must not be widened to sanction the old root-level name.
 
-        Asserted through health-check's own predicate, so it fails if that changes.
+        This asserts allowlist MEMBERSHIP, not the scan — it cannot tell you where the
+        probe looks. That the scan reaches only the root is asserted by driving the probe
+        itself, in the root-tidy tests below. The docstring used to claim this test went
+        through health-check's predicate; it does not, and saying so invited exactly the
+        reimplemented-scan mistake those tests now avoid.
         """
         hc_path = REPO / "src" / "health-check.py"
         if not hc_path.is_file():
@@ -138,13 +142,10 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
                         "a failed cleanup must not cost the cooldown record")
         self.assertTrue(self.legacy.is_dir(), "left as found rather than forced")
 
-    def test_root_tidy_is_clean_for_the_upgraded_workspace_afterwards(self):
-        """The standing WARN must actually clear, not just stop being re-created."""
+    def _load_hc(self):
         hc_path = REPO / "src" / "health-check.py"
         if not hc_path.is_file():
             self.skipTest("health-check.py not present")
-        self.legacy.write_text("1785876643 2f35a3c6")
-        cpq.write_notify_stamp([], now=1700000000)
         import importlib.util as iu
         s = iu.spec_from_file_location("hc2", hc_path)
         hc = iu.module_from_spec(s); sys.modules["hc2"] = hc
@@ -152,12 +153,52 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
             s.loader.exec_module(hc)
         except SystemExit:
             pass
-        loose = [f.name for f in self.ws.iterdir()
-                 if f.is_file() and not hc.workspace_root_file_allowed(f.name)] \
-            if hasattr(hc, "workspace_root_file_allowed") else \
-            [f.name for f in self.ws.iterdir()
-             if f.is_file() and f.name not in hc.WORKSPACE_ROOT_ALLOWED]
-        self.assertEqual(loose, [], f"root still not tidy: {loose}")
+        return hc
+
+    def _root_tidy(self, hc):
+        """Drive the SHIPPED probe against this fixture's workspace.
+
+        Calling it is the point. A local `iterdir()` + `is_file()` reimplementation
+        would re-encode the exact property under test — that the scan reaches only the
+        root — so changing the probe to `rglob()` would break production while this test
+        stayed green. A copy also silently drops WORKSPACE_ROOT_SENTINEL_GLOB, making the
+        test stricter than the thing it claims to assert.
+        """
+        orig = hc.WORKSPACE_DIR
+        hc.WORKSPACE_DIR = self.ws
+        try:
+            return hc.check_workspace_root_tidy()
+        finally:
+            hc.WORKSPACE_DIR = orig
+
+    def test_root_tidy_is_clean_for_the_upgraded_workspace_afterwards(self):
+        """The standing WARN must actually clear, not just stop being re-created."""
+        hc = self._load_hc()
+        self.legacy.write_text("1785876643 2f35a3c6")
+        cpq.write_notify_stamp([], now=1700000000)
+        self.assertIsNone(self._root_tidy(hc),
+                          "root still not tidy after the upgrade")
+
+    def test_the_probe_would_still_flag_the_old_root_stamp(self):
+        """Negative control. Without it, a probe that returned None unconditionally —
+        or a fixture that never wrote the file — would satisfy the assertion above."""
+        hc = self._load_hc()
+        cpq.write_notify_stamp([], now=1700000000)
+        (self.ws / ".last-pq-notify").write_text("1785876643 2f35a3c6")
+        result = self._root_tidy(hc)
+        self.assertIsNotNone(result, "a root-level .last-pq-notify must still warn")
+        self.assertEqual(result["status"], "warn")
+        self.assertIn(".last-pq-notify", result["detail"])
+
+    def test_a_migration_sentinel_at_the_root_is_not_flagged(self):
+        """WORKSPACE_ROOT_SENTINEL_GLOB exempts `.*-migrated*`. The reimplemented scan
+        this test replaced omitted the glob, so it was stricter than production: a
+        sentinel that production accepts would have failed the copy."""
+        hc = self._load_hc()
+        cpq.write_notify_stamp([], now=1700000000)
+        (self.ws / ".foo-migrated-123").write_text("x")
+        self.assertIsNone(self._root_tidy(hc),
+                          "a migration sentinel must not count as a loose file")
 
 
 if __name__ == "__main__":
