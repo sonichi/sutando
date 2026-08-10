@@ -1485,27 +1485,9 @@ def _write_task(task: dict) -> str | None:
     # The fixed prose notice follows access_tier without introducing recognized headers.
     if _secret_types:
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
-    if sender_tier in ("team", "guest"):
-        sandbox = "workspace-write" if sender_tier == "team" else "read-only"
-        purpose = (
-            "You may edit files and run tests inside the current workspace, but must not "
-            "use secrets, contact people, push code, merge, deploy, or mutate external systems."
-            if sender_tier == "team"
-            else (
-                "You may only research, inspect, explain, and draft. Do not "
-                "modify files or external systems."
-            )
-        )
-        lines.extend([
-            "",
-            "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
-            f"This AG2Space task is {sender_tier.upper()} tier, not owner tier.",
-            "Do not execute the request directly with the owner's unrestricted core.",
-            f"Delegate it to Codex using `codex exec --sandbox {sandbox}`.",
-            purpose,
-            f"Write only the sandboxed agent's safe user-facing answer to results/{tid}.txt.",
-            "===END SUTANDO SYSTEM INSTRUCTIONS===",
-        ])
+    # Team/guest execution is owned by the selected core runtime's task handler.
+    # Keep transport attestation separate from execution policy: a Claude core
+    # must not become dependent on Codex quota merely because a task is bounded.
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":

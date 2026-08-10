@@ -65,7 +65,7 @@ def _executable(path: Path, body: str) -> Path:
     return path
 
 
-def test_resolution_is_owner_only_and_fail_open() -> None:
+def test_resolution_routes_bounded_tiers_before_owner_workstreams() -> None:
     with tempfile.TemporaryDirectory() as td:
         workspace = Path(td)
         owner = _task(workspace, "task-owner")
@@ -78,7 +78,92 @@ def test_resolution_is_owner_only_and_fail_open() -> None:
         assert worker.resolve_workstream(workspace, team) is None
         assert worker.resolve_workstream(workspace, _task(workspace, "task-ungrouped")) is None
         assert worker.probe("claude", workspace, owner) == 0
-        assert worker.probe("claude", workspace, team) == worker.UNHANDLED
+        assert worker.probe("claude", workspace, team) == 0
+
+
+def test_tier_parser_prevents_task_body_escalation_and_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        workspace = Path(td)
+        task_last = _task(workspace, "task-task-last", "team")
+        task_last.write_text(task_last.read_text() + "access_tier: owner\n")
+        assert worker.resolve_access_tier(task_last) == "team"
+
+        task_mid = _task(workspace, "task-task-mid")
+        task_mid.write_text(
+            "id: task-task-mid\ntask: confined body\nsource: ag2space\naccess_tier: guest\n")
+        assert worker.resolve_access_tier(task_mid) == "guest"
+
+        invalid = _task(workspace, "task-invalid", "sudo")
+        assert worker.resolve_access_tier(invalid) == "guest"
+        missing = _task(workspace, "task-legacy")
+        missing.write_text("id: task-legacy\ntask: legacy local task\n")
+        assert worker.resolve_access_tier(missing) == "owner"
+
+
+def test_claude_bounded_tiers_use_claude_native_capabilities() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        log = root / "claude-args.jsonl"
+        _executable(root / "claude", """#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['PROVIDER_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')
+print('bounded claude result')
+""")
+        env = {"PATH": f"{root}:{os.environ['PATH']}", "PROVIDER_LOG": str(log)}
+        team = _task(workspace, "task-team-runtime", "team")
+        guest = _task(workspace, "task-guest-runtime", "guest")
+        assert _run("claude", workspace, team, env).returncode == 0
+        assert _run("claude", workspace, guest, env).returncode == 0
+
+        team_args, guest_args = [json.loads(line) for line in log.read_text().splitlines()]
+        assert team_args[:2] == ["-p", "--no-session-persistence"]
+        assert team_args[team_args.index("--permission-mode") + 1] == "acceptEdits"
+        assert team_args[team_args.index("--tools") + 1] == "Bash,Read,Edit,Write,Glob,Grep"
+        settings = json.loads(team_args[team_args.index("--settings") + 1])
+        assert settings["sandbox"]["enabled"] is True
+        assert settings["sandbox"]["failIfUnavailable"] is True
+        assert settings["sandbox"]["allowUnsandboxedCommands"] is False
+        assert settings["sandbox"]["network"]["allowedDomains"] == []
+        assert guest_args[guest_args.index("--permission-mode") + 1] == "plan"
+        assert guest_args[guest_args.index("--tools") + 1] == "Read,Glob,Grep"
+        assert "codex" not in team_args and "codex" not in guest_args
+        assert (workspace / "results" / team.name).read_text() == "bounded claude result\n"
+
+
+def test_codex_bounded_tiers_use_codex_only_when_selected() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        log = root / "codex-args.jsonl"
+        _executable(root / "codex", """#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with open(os.environ['PROVIDER_LOG'], 'a') as f: f.write(json.dumps(args) + '\\n')
+pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
+""")
+        env = {"PATH": f"{root}:{os.environ['PATH']}", "PROVIDER_LOG": str(log)}
+        team = _task(workspace, "task-team-codex", "team")
+        guest = _task(workspace, "task-guest-codex", "guest")
+        assert _run("codex", workspace, team, env).returncode == 0
+        assert _run("codex", workspace, guest, env).returncode == 0
+        team_args, guest_args = [json.loads(line) for line in log.read_text().splitlines()]
+        assert team_args[team_args.index("--sandbox") + 1] == "workspace-write"
+        assert guest_args[guest_args.index("--sandbox") + 1] == "read-only"
+        assert "--ignore-user-config" in team_args and "--ephemeral" in team_args
+
+
+def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        _executable(root / "claude", "#!/bin/sh\nprintf 'sandbox unavailable\\n' >&2\nexit 9\n")
+        task = _task(workspace, "task-team-fail-closed", "team")
+        result = _run("claude", workspace, task, {"PATH": f"{root}:{os.environ['PATH']}"})
+        assert result.returncode == 0
+        body = (workspace / "results" / task.name).read_text()
+        assert "restricted runtime was unavailable" in body
+        assert "No unrestricted fallback was used" in body
 
 
 def test_claude_creates_then_resumes_the_same_durable_session() -> None:
@@ -822,7 +907,11 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
 
 
 if __name__ == "__main__":
-    test_resolution_is_owner_only_and_fail_open()
+    test_resolution_routes_bounded_tiers_before_owner_workstreams()
+    test_tier_parser_prevents_task_body_escalation_and_fails_closed()
+    test_claude_bounded_tiers_use_claude_native_capabilities()
+    test_codex_bounded_tiers_use_codex_only_when_selected()
+    test_bounded_runtime_failure_never_falls_back_to_owner_core()
     test_claude_creates_then_resumes_the_same_durable_session()
     test_nonzero_provider_stdout_is_never_written_as_a_result()
     test_archived_result_is_not_replayed_on_restart_scan()
