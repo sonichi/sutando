@@ -45,6 +45,21 @@ def main() -> int:
           flags('rh._resolve_workspace = lambda: "/tmp/x"'),
           "src/runtime-health.py and src/workspace_lock.py define their own")
 
+    # ANNOTATED assignment. `_ScopeWalk.visit` dispatched only ast.Assign, so an
+    # annotated stub passed the mandatory gate while the plain form was caught.
+    check("zero-arg via an ANNOTATED assignment",
+          flags('wd.resolve_workspace: object = lambda: tmp'),
+          "ast.AnnAssign binds exactly like ast.Assign")
+    check("zero-arg via an ANNOTATED alias, then a plain rebind",
+          flags('_fake: object = lambda: tmp\nwd.resolve_workspace = _fake'),
+          "the alias must reach the gate through _unsafe_names_in_scope too")
+    check("ANNOTATED absorbing lambda is still SAFE",
+          not flags('wd.resolve_workspace: object = lambda *a, **k: tmp'),
+          "negative control — without it, flagging every AnnAssign would pass the two above")
+    check("a BARE annotation binds nothing and is not flagged",
+          not flags('wd.resolve_workspace: object'),
+          "ast.AnnAssign with value=None is an annotation, not an assignment")
+
     # --- PASS: stubs that can absorb what callers pass ---------------------
     check("*args/**kwargs absorbs anything",
           not flags('_wd.resolve_workspace = lambda *a, **kw: REPO'))

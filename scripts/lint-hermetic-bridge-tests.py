@@ -995,6 +995,14 @@ def _binding_state(value: ast.expr, env: "dict[str, bool]") -> "bool | None":
     return None
 
 
+def _assign_targets(node: "ast.stmt") -> "list[ast.expr]":
+    """Targets an assignment binds. `ast.Assign` has `.targets`; `ast.AnnAssign` has a
+    single `.target` and binds NOTHING when `.value` is None (a bare annotation)."""
+    if isinstance(node, ast.AnnAssign):
+        return [node.target] if node.value is not None else []
+    return list(getattr(node, "targets", []))
+
+
 def _unsafe_names_in_scope(body: "list[ast.stmt]") -> "set[str]":
     """Names this scope ever binds to a zero-arg lambda, at any depth, not descending
     into nested def/class. Order-free: a nested function reads the global when it RUNS."""
@@ -1004,9 +1012,12 @@ def _unsafe_names_in_scope(body: "list[ast.stmt]") -> "set[str]":
         n = stack.pop()
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Lambda):
+        # An ANNOTATED assignment binds exactly like a plain one, so an alias written as
+        # `_fake: object = lambda: tmp` must reach the gate too. A BARE annotation
+        # (`_fake: object`) has value None and binds nothing at runtime.
+        if isinstance(n, (ast.Assign, ast.AnnAssign)) and isinstance(n.value, ast.Lambda):
             if not _lambda_absorbs_args(n.value):
-                for t in n.targets:
+                for t in _assign_targets(n):
                     if isinstance(t, ast.Name):
                         found.add(t.id)
         for f in ("body", "orelse", "finalbody", "handlers"):
@@ -1060,7 +1071,7 @@ class _ScopeWalk:
                 inner[nm] = True
             _ScopeWalk(inner, self.out, base_unsafe).run(node.body)
             return
-        if isinstance(node, ast.Assign):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
             self._assign(node)
             return
         # `finalbody` is NOT an alternative branch: it runs on EVERY path, after
@@ -1108,13 +1119,16 @@ class _ScopeWalk:
             w.run(finalbody)
             self.env.update(w.env)
 
-    def _assign(self, node: ast.Assign) -> None:
+    def _assign(self, node: "ast.Assign | ast.AnnAssign") -> None:
+        targets = _assign_targets(node)
+        if not targets:            # bare annotation: no value, so no binding happens
+            return
         state = _binding_state(node.value, self.env)
-        for t in node.targets:                       # flag BEFORE rebinding
+        for t in targets:                            # flag BEFORE rebinding
             nm = _assign_target_name(t)
             if nm in RESOLVER_NAMES and state:
                 self.out.append((node.lineno, nm))
-        for t in node.targets:
+        for t in targets:
             if isinstance(t, ast.Name) and t.id not in RESOLVER_NAMES:
                 self.env[t.id] = bool(state)
 
