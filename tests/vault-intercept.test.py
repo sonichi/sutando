@@ -432,8 +432,7 @@ class TestKeychainInteraction(unittest.TestCase):
         self.assertEqual(args[w_idx + 1], "pa$$word")
 
     def test_bare_value_trailing_sentence_punctuation_not_stored(self):
-        # Reviewer-found (qingyun-wu review of #2786): a sentence-ending `.`/`,`/`!`/`?`/`;`
-        # after a bare (unquoted) value was captured into the stored secret, corrupting it.
+        # Bare sentence punctuation after an unquoted value must not become part of the stored secret.
         value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
         with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
             intercept_vault_commands(f"vault set MY_KEY {value}.")
