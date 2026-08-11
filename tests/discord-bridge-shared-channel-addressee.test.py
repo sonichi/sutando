@@ -25,6 +25,7 @@ Run: python3 tests/discord-bridge-shared-channel-addressee.test.py
 Exit: 0 pass / non-zero on assertion failure.
 """
 
+import ast
 import sys
 from pathlib import Path
 
@@ -117,6 +118,18 @@ def main() -> int:
     assert "reference_is_reply(" in bridge, \
         "discord-bridge.py does not use reference_is_reply (forward vs reply fix)"
     print("  ok  bridge uses reference_is_reply for forward/reply disambiguation")
+
+    # A call site proves nothing if the name is never bound: dropping the import
+    # leaves every regex above green and the bridge NameError-ing at runtime.
+    _bound = set()
+    for _node in ast.walk(ast.parse(bridge)):
+        if isinstance(_node, (ast.Import, ast.ImportFrom)):
+            for _a in _node.names:
+                _bound.add(_a.asname or _a.name.split(".")[0])
+    for _name in ("is_addressed_in_shared_channel", "reference_is_reply"):
+        assert _name in _bound, \
+            f"discord-bridge.py calls {_name}() but never imports it"
+    print("  ok  bridge imports every addressee symbol it calls")
 
     # --- a human addressing a DIFFERENT agent ---
     assert not addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
