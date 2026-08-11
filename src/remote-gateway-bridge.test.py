@@ -723,6 +723,26 @@ def main() -> int:
     check(STATE["room_posts"][-1]["room_id"] == "!other:example.org"
           and STATE["room_posts"][-1]["body"] == "routed nudge",
           "[channel: !room] nudge delivers to the routed room, marker stripped")
+    # Marker grammar comes from the CANONICAL parser (result_markers.
+    # parse_markers), so the full protocol holds on proactive files too:
+    # [dm-only] ANYWHERE suppresses a [channel:] redirect (privacy guard) —
+    # the nudge stays in the default owner room with both markers stripped.
+    (rtc.RESULTS_DIR / "proactive-t9.txt").write_text(
+        "[channel: !shared:example.org]\nprivate nudge\n[dm-only]\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!owner:example.org"
+          and STATE["room_posts"][-1]["body"] == "private nudge",
+          "[dm-only] suppresses [channel:] — default room, both markers stripped")
+    # Skip markers archive silently: nothing posted, file archived (protocol:
+    # a [no-send] body is delivered nowhere by every consumer).
+    (rtc.RESULTS_DIR / "proactive-t10.txt").write_text("[no-send]\ninternal note\n")
+    posts_b4_skip = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_skip
+          and not (rtc.RESULTS_DIR / "proactive-t10.txt").exists()
+          and any(p.name.startswith("proactive-t10")
+                  for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
+          "[no-send] proactive nudge is archived silently, never posted")
 
     # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
     # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen

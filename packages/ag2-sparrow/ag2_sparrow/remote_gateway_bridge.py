@@ -1835,31 +1835,39 @@ _EMPTY_LOGGED: "set[str]" = set()
 # Well under the 64 KiB event ceiling to leave room for envelope overhead.
 _PROACTIVE_MAX_BODY_B = 48 * 1024
 
-# Result-body routing marker (CLAUDE.md protocol): `[channel: <id>]` as the
-# first non-empty line redirects delivery. This bridge can only deliver to
-# Matrix rooms — Discord (17-20 digit) / Slack ([CDG]…) destinations belong to
-# their own bridges and must be left unclaimed for them.
-_CHANNEL_MARKER_RE = re.compile(r"^\[channel:\s*([^\]\s]+)\s*\]\s*$")
+# Destination FORMAT validation is this bridge's own job ("the bridge
+# validates the id format for its platform when applying" — result_markers).
+# Matrix room ids only; Discord (17-20 digit) / Slack ([CDG]…) redirect
+# targets belong to their own bridges and their files are left unclaimed.
 _MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
 
 
 def _proactive_route(body: str) -> "tuple[str, str | None, str]":
-    """('send', room_or_None, body-to-send) | ('skip', None, '').
+    """('send', room_or_None, stripped-body) | ('foreign', None, '') |
+    ('drop', None, '').
 
-    Honors the result-body routing protocol on proactive files (review
-    blocker: a `[channel: C…]` Slack/Discord nudge could be won by this
-    consumer and leaked raw to the gateway room, marker included)."""
-    lines = body.splitlines()
-    idx = next((i for i, ln in enumerate(lines) if ln.strip()), None)
-    if idx is None:
-        return ("send", None, body)
-    m = _CHANNEL_MARKER_RE.match(lines[idx].strip())
-    if not m:
-        return ("send", None, body)
-    dest = m.group(1)
-    if _MATRIX_ROOM_RE.match(dest):
-        return ("send", dest, "\n".join(lines[idx + 1:]).strip())
-    return ("skip", None, "")  # foreign destination — its bridge owns the file
+    Marker grammar comes SOLELY from parse_markers() (no private parser —
+    CLAUDE.md result-marker contract); this function only applies the actions
+    this transport supports:
+      * skip markers   → 'drop' (archive silently, deliver nothing)
+      * [dm-only]      → parse_markers already suppressed any redirect, so the
+                         body falls through to the default (owner) room
+      * [channel: !r:s]→ 'send' to that room, marker stripped
+      * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
+                         blocker: claiming it here would leak the raw body)
+      * attach markers → stripped by the parser; uploads are unsupported on
+                         the room-message op, so the actions are ignored
+    """
+    parsed = parse_markers(body)
+    if any(a.kind == "skip" for a in parsed.actions):
+        return ("drop", None, "")
+    redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
+    if redirect is not None:
+        dest = redirect.value
+        if _MATRIX_ROOM_RE.match(dest):
+            return ("send", dest, parsed.body)
+        return ("foreign", None, "")
+    return ("send", None, parsed.body)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1951,7 +1959,7 @@ def _post_proactive() -> None:
             route, _, _ = _proactive_route(f.read_text(encoding="utf-8"))
         except OSError:
             continue  # racing consumer already claimed it
-        if route == "skip":
+        if route == "foreign":
             continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
@@ -1982,13 +1990,21 @@ def _post_proactive() -> None:
                      f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
                      f"owner nudge stranded under live pid until restart")
             continue
-        if route == "skip":
+        if route == "foreign":
             # A foreign destination that only became visible post-claim: hand
             # the file back to its real consumer rather than eating it.
             try:
                 claim.rename(f)
             except OSError:
                 pass
+            continue
+        if route == "drop":
+            # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
+            # archive silently, deliver nothing. Nothing was delivered, so on
+            # an archive failure _retire_proactive hands the claim back rather
+            # than unlinking.
+            _log(f"proactive {f.name} carries a skip marker — archiving, no send")
+            _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
             continue
         body = routed_body.strip()
         if not body:
