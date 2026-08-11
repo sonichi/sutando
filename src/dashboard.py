@@ -666,7 +666,7 @@ def render_dashboard() -> str:
         '</tr>'
     )
     cards.append(
-        '<div class="card full"><h2>Schedules</h2>'
+        '<div class="card full" id="schedules"><h2>Schedules</h2>'
         '<table style="width:100%;font-size:11px;border-collapse:collapse">'
         '<tr style="color:#555;text-align:left"><th>Name</th><th>Cron</th>'
         '<th>Type</th><th>Next run</th><th></th></tr>'
