@@ -382,6 +382,41 @@ def channel_access_path(source: str) -> Path:
     return canonical
 
 
+def channel_env_path(source: str) -> Path:
+    """Resolve `channels/<source>/.env` (bot tokens), preferring state/auth/.
+
+    Same prefer-canonical / fall-back-to-legacy shape as channel_access_path(),
+    for the *secret* half rather than the policy half.
+
+    Why the destination is `state/auth/`: the Team capability root is the owner
+    workspace, so anything under `$CLAUDE_CONFIG_DIR` inside it is readable by a
+    Team task that has Bash. `.claude-sutando/` cannot simply be read-denied —
+    it IS `CLAUDE_CONFIG_DIR`, so denying it stops the sandboxed provider
+    reading its own config. `state/auth/` is already the documented home for
+    per-host credential state, is already covered by the Team deny list, and is
+    exempt from transient-state cleanup, which makes the boundary structural
+    instead of a deny list that has to stay exhaustive.
+
+    The legacy fallback is what makes the move safe: readers keep working off
+    the existing file until it is physically relocated, so bridges do not lose
+    their tokens mid-flight.
+    """
+    canonical = _workspace_root() / "state" / "auth" / "channels" / source / ".env"
+    if canonical.exists():
+        return canonical
+    legacy = claude_home_path("channels", source, ".env")
+    if legacy != canonical and legacy.exists():
+        print(
+            f"[util_paths] DEPRECATION: channel secret for {source!r} still at "
+            f"{legacy} — canonical {canonical} missing. It sits inside the Team "
+            f"capability root; relocate it to state/auth/. This fallback is "
+            f"removed ~30 days post-migration.",
+            file=sys.stderr,
+        )
+        return legacy
+    return canonical
+
+
 # ---------------------------------------------------------------------------
 # Fallback-banner gate — fires ONCE per process when claude_home_path() lands
 # on the ~/.claude/ default because neither $CLAUDE_CONFIG_DIR nor $CLAUDE_HOME
