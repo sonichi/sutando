@@ -31,6 +31,10 @@ Cases:
      of the start (build finishing just after a
      launch)                                       -> ok
   d) `binary_path` is None (the tsx callers)       -> comparison skipped
+  e) the artifact vanishes between `exists()` and
+     `stat()` (an atomic deploy renaming over it)  -> no crash, falls
+                                                     through to the
+                                                     source comparison
 
 (a) is the new behavior: it FAILS on the parent commit, where the branch
 does not exist. (b)-(d) are the guard rails that keep it from being a
@@ -165,6 +169,52 @@ class ArtifactRebuiltUnderProcessTests(unittest.TestCase):
         _set_mtime(self.binary, self.proc_start + 3600)
         check = self._run(binary_path=None)
         self.assertEqual(check["status"], "ok")
+
+    # (e) the artifact disappears between the artifact block's own
+    # `exists()` and its `stat()` — what an atomic deploy (write tmp, rename
+    # over the target) does to a concurrent reader.
+    #
+    # `binary_path` is stat()ed four times per call, and only the LAST is
+    # inside the branch under test:
+    #   1. exists()  -- pre-existing "binary older than source" block
+    #   2. stat()    -- same block
+    #   3. exists()  -- the artifact-vs-process block
+    #   4. stat()    -- the artifact-vs-process block  <- the guarded call
+    # Raising earlier does not exercise the guard: a raise on 3 is caught by
+    # `Path.exists()` itself, which returns False and skips the branch whole.
+    # The exact-count assertion is deliberate — if that sequence ever changes
+    # this test fails loudly instead of silently covering nothing.
+    #
+    # Source is made NEWER than the process here, which is what makes the
+    # guard observable at all. The function's outer handler also catches
+    # OSError, so without the inner `except` the error unwinds past the
+    # SOURCE comparison too and the service reads "ok". The inner guard
+    # confines the failure to the artifact check and lets the source
+    # comparison still return its verdict — so "stale" vs "ok" is exactly
+    # the difference the guard makes, and deleting it fails this test.
+    def test_artifact_vanishing_between_exists_and_stat_is_confined(self):
+        _set_mtime(self.binary, self.proc_start + 3600)
+        _set_mtime(self.src, self.proc_start + 3600)
+        real_stat = Path.stat
+        seen = {"n": 0}
+
+        def _racing_stat(inner_self, *args, **kwargs):
+            if inner_self == self.binary:
+                seen["n"] += 1
+                if seen["n"] == 4:
+                    raise OSError(2, "No such file or directory")
+            return real_stat(inner_self, *args, **kwargs)
+
+        with patch.object(Path, "stat", _racing_stat):
+            check = self._run(binary_path=self.binary)
+
+        self.assertEqual(seen["n"], 4)
+        # The source comparison still ran and still decided.
+        self.assertEqual(check["status"], "stale")
+        self.assertIn("newer than process", check["detail"])
+        # ...and it is the SOURCE verdict, not the artifact one, which could
+        # not have been reached.
+        self.assertNotIn("rebuilt", check["detail"])
 
 
 if __name__ == "__main__":
