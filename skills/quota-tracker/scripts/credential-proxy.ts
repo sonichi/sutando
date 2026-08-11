@@ -253,46 +253,166 @@ function refreshAccessToken(oauth: ClaudeOAuth): Promise<ClaudeOAuth | null> {
 	});
 }
 
-// Single-flight guard: at most one refresh in progress, so concurrent requests
-// never race to consume/rotate the refresh token twice.
-let refreshInFlight: Promise<void> | null = null;
+// Injectable seams (keychain, refresh, upstream, clock) so the proxy's failure
+// semantics are testable hermetically; defaults are the production bindings.
+export interface ProxyDeps {
+	readCred: () => StoredClaudeOAuth | null;
+	writeCred: (service: string, oauth: ClaudeOAuth) => boolean;
+	refreshAccessToken: (oauth: ClaudeOAuth) => Promise<ClaudeOAuth | null>;
+	request: typeof httpsRequest;
+	upstreamUrl: URL;
+	updateQuotaState: (headers: Record<string, string>) => void;
+	now: () => number;
+	idleTimeoutMs: number;
+}
 
-// Failure-backoff state (see nextRefreshBackoffMs / shouldAttemptRefresh).
-// `nextRefreshAllowedAt` is an epoch-ms gate: while now < it, we skip the
-// refresh and fall through to the existing (stale) token instead of hammering.
-let refreshFailCount = 0;
-let nextRefreshAllowedAt = 0;
+export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
+	const deps: ProxyDeps = {
+		readCred,
+		writeCred,
+		refreshAccessToken,
+		request: httpsRequest,
+		upstreamUrl: new URL(UPSTREAM),
+		updateQuotaState,
+		now: Date.now,
+		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
+		...overrides,
+	};
+	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
 
-// Return a usable accessToken, refreshing first if the stored one is at/near
-// expiry. Fail-safe at every step: any problem → return the existing token.
-async function getFreshOAuthToken(): Promise<string | null> {
-	const stored = readCred();
-	if (!stored) return null;
-	const { service, oauth: cred } = stored;
-	const needsRefresh =
-		typeof cred.expiresAt === 'number' &&
-		cred.expiresAt - Date.now() <= REFRESH_SKEW_MS &&
-		!!cred.refreshToken;
-	if (shouldAttemptRefresh(needsRefresh, Date.now(), nextRefreshAllowedAt)) {
-		if (!refreshInFlight) {
-			refreshInFlight = (async () => {
-				const fresh = await refreshAccessToken(cred);
-				if (fresh && writeCred(service, fresh)) {
-					refreshFailCount = 0;
-					nextRefreshAllowedAt = 0;
-					console.log(`${ts()} [Proxy] OAuth token refreshed (new expiry ${new Date(fresh.expiresAt ?? 0).toISOString()})`);
-				} else {
-					refreshFailCount += 1;
-					const backoff = nextRefreshBackoffMs(refreshFailCount);
-					nextRefreshAllowedAt = Date.now() + backoff;
-					console.error(`${ts()} [Proxy] refresh did not persist — keeping existing token (failure ${refreshFailCount}, backing off ${Math.round(backoff / 1000)}s)`);
-				}
-			})().finally(() => { refreshInFlight = null; });
+	// Single-flight guard: at most one refresh in progress, so concurrent requests
+	// never race to consume/rotate the refresh token twice.
+	let refreshInFlight: Promise<void> | null = null;
+
+	// Failure-backoff state (see nextRefreshBackoffMs / shouldAttemptRefresh).
+	// While now < nextRefreshAllowedAt, skip the refresh instead of hammering.
+	let refreshFailCount = 0;
+	let nextRefreshAllowedAt = 0;
+
+	// Return a usable accessToken, refreshing first if the stored one is at/near
+	// expiry. Fail-safe at every step: any problem → return the existing token.
+	async function getFreshOAuthToken(): Promise<string | null> {
+		const stored = deps.readCred();
+		if (!stored) return null;
+		const { service, oauth: cred } = stored;
+		const needsRefresh =
+			typeof cred.expiresAt === 'number' &&
+			cred.expiresAt - deps.now() <= REFRESH_SKEW_MS &&
+			!!cred.refreshToken;
+		if (shouldAttemptRefresh(needsRefresh, deps.now(), nextRefreshAllowedAt)) {
+			if (!refreshInFlight) {
+				refreshInFlight = (async () => {
+					const fresh = await deps.refreshAccessToken(cred);
+					if (fresh && deps.writeCred(service, fresh)) {
+						refreshFailCount = 0;
+						nextRefreshAllowedAt = 0;
+						console.log(`${ts()} [Proxy] OAuth token refreshed (new expiry ${new Date(fresh.expiresAt ?? 0).toISOString()})`);
+					} else {
+						refreshFailCount += 1;
+						const backoff = nextRefreshBackoffMs(refreshFailCount);
+						nextRefreshAllowedAt = deps.now() + backoff;
+						console.error(`${ts()} [Proxy] refresh did not persist — keeping existing token (failure ${refreshFailCount}, backing off ${Math.round(backoff / 1000)}s)`);
+					}
+				})().finally(() => { refreshInFlight = null; });
+			}
+			await refreshInFlight;
+			return deps.readCred()?.oauth.accessToken ?? cred.accessToken;
 		}
-		await refreshInFlight;
-		return readCredFromService(service)?.oauth.accessToken ?? cred.accessToken;
+		return cred.accessToken;
 	}
-	return cred.accessToken;
+
+	return createServer((req, res) => {
+		const chunks: Buffer[] = [];
+		req.on('data', (c) => chunks.push(c));
+		req.on('end', async () => {
+			const body = Buffer.concat(chunks);
+
+			// Read token fresh from keychain each request, refreshing it first if it
+			// is at/near expiry (self-refresh covers headless nodes).
+			const oauthToken = await getFreshOAuthToken();
+			if (!oauthToken) {
+				res.writeHead(502);
+				res.end('No OAuth token in keychain');
+				return;
+			}
+
+			const headers: Record<string, string | number | string[] | undefined> = {
+				...(req.headers as Record<string, string>),
+				host: deps.upstreamUrl.host,
+				'content-length': body.length,
+			};
+
+			// Strip hop-by-hop headers
+			delete headers['connection'];
+			delete headers['keep-alive'];
+			delete headers['transfer-encoding'];
+
+			// Inject OAuth token for auth requests
+			if (headers['authorization']) {
+				delete headers['authorization'];
+				headers['authorization'] = `Bearer ${oauthToken}`;
+			}
+
+			let timedOut = false;
+
+			const upstream = deps.request(
+				{
+					hostname: deps.upstreamUrl.hostname,
+					port: upstreamPort,
+					path: req.url,
+					method: req.method,
+					headers,
+					timeout: deps.idleTimeoutMs,
+				} as RequestOptions,
+				(upRes) => {
+					// Extract rate limit headers
+					const quotaHeaders: Record<string, string> = {};
+					for (const [key, val] of Object.entries(upRes.headers)) {
+						if (key.startsWith('anthropic-ratelimit')) {
+							quotaHeaders[key] = String(val);
+						}
+					}
+					if (Object.keys(quotaHeaders).length > 0) {
+						console.log(`${ts()} [Quota]`, quotaHeaders);
+						deps.updateQuotaState(quotaHeaders);
+					}
+
+					res.writeHead(upRes.statusCode!, upRes.headers);
+					upRes.pipe(res);
+				},
+			);
+
+			// 'timeout' fires on socket inactivity but does NOT auto-abort — destroy the
+			// request so it surfaces through the 'error' handler below as a clean failure
+			// (and Claude Code's own retry kicks in) instead of hanging indefinitely.
+			upstream.on('timeout', () => {
+				timedOut = true;
+				console.error(`${ts()} [Proxy] Upstream idle >${deps.idleTimeoutMs}ms — aborting`);
+				upstream.destroy(new Error('upstream idle timeout'));
+			});
+
+			upstream.on('error', (err) => {
+				console.error(`${ts()} [Proxy] Upstream error:`, err.message);
+				if (!res.headersSent) {
+					res.writeHead(timedOut ? 504 : 502);
+					res.end(timedOut ? 'Gateway Timeout' : 'Bad Gateway');
+				} else {
+					// Headers already streamed — can't change status. Tear down the client
+					// connection so the agent sees a broken stream and retries rather than
+					// waiting forever on a dead upstream.
+					res.destroy(err);
+				}
+			});
+
+			// If the agent hangs up first, don't leak the in-flight upstream request.
+			res.on('close', () => {
+				if (!res.writableEnded) upstream.destroy();
+			});
+
+			upstream.write(body);
+			upstream.end();
+		});
+	});
 }
 
 // Back-compat sync reader (startup probe only — does not refresh).
@@ -332,15 +452,10 @@ function updateQuotaState(headers: Record<string, string>): void {
 }
 
 // Only start the server when run directly. Importing this module (e.g. from the
-// offline parse test) must NOT bind the port, touch the keychain, or exit.
-// Match the exact script name, NOT a substring — the offline test file is named
-// `credential-proxy-refresh.test.ts`, which contains "credential-proxy" but must
-// NOT be treated as the entry point (else importing it tries to bind the port).
+// offline tests) must NOT bind the port, touch the keychain, or exit.
 // Match the exact basename — works for BOTH the dev entry (`credential-proxy.ts`
-// run via tsx) AND the bundled artifact (`dist/credential-proxy.js`), while still
-// excluding `credential-proxy-refresh.test.{ts,js}` (different basename). Using
-// endsWith('.ts') alone silently no-ops the bundle: argv[1] ends in `.js` there,
-// isMain is false, and the proxy never binds the port.
+// run via tsx) AND the bundled artifact (`dist/credential-proxy.js`), while
+// excluding the `credential-proxy-*.test.{ts,js}` files (different basenames).
 const _entryName = (process.argv[1] ?? '').split(/[\\/]/).pop() ?? '';
 const isMain = _entryName === 'credential-proxy.ts' || _entryName === 'credential-proxy.js';
 
@@ -352,106 +467,8 @@ if (isMain) {
 		process.exit(1);
 	}
 	console.log(`${ts()} [Proxy] OAuth token loaded from keychain (will re-read on each request)`);
-}
 
-const upstreamUrl = new URL(UPSTREAM);
-
-const server = createServer((req, res) => {
-	const chunks: Buffer[] = [];
-	req.on('data', (c) => chunks.push(c));
-	req.on('end', async () => {
-		const body = Buffer.concat(chunks);
-
-		// Read token fresh from keychain each request, refreshing it first if it
-		// is at/near expiry (tokens are also refreshed by active interactive
-		// sessions; this self-refresh covers headless nodes where they aren't).
-		const oauthToken = await getFreshOAuthToken();
-		if (!oauthToken) {
-			res.writeHead(502);
-			res.end('No OAuth token in keychain');
-			return;
-		}
-
-		const headers: Record<string, string | number | string[] | undefined> = {
-			...(req.headers as Record<string, string>),
-			host: upstreamUrl.host,
-			'content-length': body.length,
-		};
-
-		// Strip hop-by-hop headers
-		delete headers['connection'];
-		delete headers['keep-alive'];
-		delete headers['transfer-encoding'];
-
-		// Inject OAuth token for auth requests
-		if (headers['authorization']) {
-			delete headers['authorization'];
-			headers['authorization'] = `Bearer ${oauthToken}`;
-		}
-
-		let timedOut = false;
-
-		const upstream = httpsRequest(
-			{
-				hostname: upstreamUrl.hostname,
-				port: 443,
-				path: req.url,
-				method: req.method,
-				headers,
-				timeout: UPSTREAM_IDLE_TIMEOUT_MS,
-			} as RequestOptions,
-			(upRes) => {
-				// Extract rate limit headers
-				const quotaHeaders: Record<string, string> = {};
-				for (const [key, val] of Object.entries(upRes.headers)) {
-					if (key.startsWith('anthropic-ratelimit')) {
-						quotaHeaders[key] = String(val);
-					}
-				}
-				if (Object.keys(quotaHeaders).length > 0) {
-					console.log(`${ts()} [Quota]`, quotaHeaders);
-					updateQuotaState(quotaHeaders);
-				}
-
-				res.writeHead(upRes.statusCode!, upRes.headers);
-				upRes.pipe(res);
-			},
-		);
-
-		// 'timeout' fires on socket inactivity but does NOT auto-abort — destroy the
-		// request so it surfaces through the 'error' handler below as a clean failure
-		// (and Claude Code's own retry kicks in) instead of hanging indefinitely.
-		upstream.on('timeout', () => {
-			timedOut = true;
-			console.error(`${ts()} [Proxy] Upstream idle >${UPSTREAM_IDLE_TIMEOUT_MS}ms — aborting`);
-			upstream.destroy(new Error('upstream idle timeout'));
-		});
-
-		upstream.on('error', (err) => {
-			console.error(`${ts()} [Proxy] Upstream error:`, err.message);
-			if (!res.headersSent) {
-				res.writeHead(timedOut ? 504 : 502);
-				res.end(timedOut ? 'Gateway Timeout' : 'Bad Gateway');
-			} else {
-				// Headers already streamed — can't change status. Tear down the client
-				// connection so the agent sees a broken stream and retries rather than
-				// waiting forever on a dead upstream.
-				res.destroy(err);
-			}
-		});
-
-		// If the agent hangs up first, don't leak the in-flight upstream request.
-		res.on('close', () => {
-			if (!res.writableEnded) upstream.destroy();
-		});
-
-		upstream.write(body);
-		upstream.end();
-	});
-});
-
-if (isMain) {
-	server.listen(PORT, '127.0.0.1', () => {
+	createProxyServer().listen(PORT, '127.0.0.1', () => {
 		console.log(`${ts()} [Proxy] Credential proxy → http://localhost:${PORT}`);
 		console.log(`${ts()} [Proxy] Upstream: ${UPSTREAM}`);
 		console.log(`${ts()} [Proxy] Set ANTHROPIC_BASE_URL=http://localhost:${PORT} to route through proxy`);
