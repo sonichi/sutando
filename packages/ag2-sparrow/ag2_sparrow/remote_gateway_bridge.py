@@ -34,6 +34,13 @@ Config (env / .env):
   REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
+  REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
+                        $CLAUDE_CONFIG_DIR/channels/ (default "ag2space") —
+                        selects which .env fallback and access.json a bridge
+                        instance reads, so a second instance (e.g. a dev
+                        homeserver's "dev-ag2space") cannot inherit prod's
+                        credentials or tier map. Env-only by necessity: the
+                        .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
 
 Stdlib only (urllib) — no new dependencies.
@@ -47,6 +54,7 @@ import json
 import os
 import uuid
 import re
+import shlex
 import signal
 import socket
 import sys
@@ -178,6 +186,8 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .result_ready import read_ready_result
+from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -275,6 +285,9 @@ INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
 TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
+# Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
+# fresh local id, but the delivery it answers is still the original one.
+DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 # sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
@@ -327,8 +340,11 @@ def _env_compat(new, old):
 # A %7C-separated token carries no literal "|", so a naive split leaves it a bare
 # secret with an empty URL and the bridge FATALs at startup — the core looks
 # "connected" (device-connect completed) but never responds, the Vidhu-onboarding
-# failure 2026-07-24.
-_SEPARATOR_RE = re.compile(r"\||%7[Cc]")
+# failure 2026-07-24. A literal "|" is PREFERRED over %7C/%7c when both appear:
+# a raw pipe cannot legally occur inside a URL, so when one exists it IS the
+# separator — keeps a URL half carrying an encoded %7C intact (#2679; same
+# rule as the shared credential contract until PR3 delegates this parser).
+_ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
 
 
 def _parse_onboarding_token(raw):
@@ -345,10 +361,19 @@ def _parse_onboarding_token(raw):
     """
     if not raw.lower().startswith(("http://", "https://")):
         return "", raw  # bare secret — opaque, never touched
-    m = _SEPARATOR_RE.search(raw)
+    i = raw.find("|")
+    if i != -1:
+        return raw[:i], raw[i + 1:]  # literal pipe wins; URL + secret verbatim
+    m = _ENCODED_SEPARATOR_RE.search(raw)
     if m is None:
         return "", raw  # scheme but no separator; the URL-less guard in main() speaks
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
+
+
+# Which channels/<dir>/ this instance reads (.env fallback + access.json).
+# Env-only — the .env file can't name its own directory. Default preserves the
+# historical single-instance layout.
+CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
 
 
 def _token_from_ag2space_env():
@@ -384,7 +409,7 @@ def _token_from_ag2space_env():
     candidates = [os.environ.get("AG2_DEVICE_ENV")]
     _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if _cfg:
-        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
     for path in candidates:
         if not path:
             continue
@@ -544,6 +569,9 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                # Room-membership context (gateway writer side, same contract):
+                # a capped one-line mxid list + the true joined total.
+                "room_members", "room_member_count",
                 "source_message_id", "user_id", "priority", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
@@ -604,7 +632,7 @@ if LOCAL_TIER not in ("owner", "team", "other"):
 # revoke them without a restart.
 def _ag2space_access_path():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, "channels", "ag2space", "access.json")
+    return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
 
 
 # Known tier vocabulary. Also an ordering (higher == more privileged); kept for
@@ -1570,15 +1598,101 @@ def _write_task(task: dict) -> str | None:
     # no header-shaped lines, so the access-tier-wins-last invariant holds.
     if _secret_types:
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
+    # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
+    # header-shaped lines, so appending after access_tier keeps it the last one.
+    if sender_tier == "owner":
+        _chan = _one_line(task.get("channel_id") or "")
+        # shlex.quote: an unescaped quote in _chan must not close the shell
+        # string early and turn the remainder into executable shell syntax.
+        _chan_q = shlex.quote(_chan)
+        _step = 1
+        _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+        if _chan:
+            _skill.append(
+                f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
+                f"message, reconstruct the room thread — `python3 "
+                f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
+                f"reports no gateway configured, load the channel env first: `set -a; . "
+                f"\"$CLAUDE_CONFIG_DIR/channels/ag2space/.env\"; set +a`) — and read it "
+                "back (everyone's messages including your own prior replies) until this "
+                "message stands on its own, then answer from the reconstructed thread, "
+                "NOT from memory. Do this every time; do NOT skip it because the message "
+                "looks self-contained or you feel you already understand it — felt "
+                "confidence is exactly the signal that fails. The only exception is a "
+                'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
+            _step += 1
+            _skill.append(
+                f"{_step}. NOTIFY FIRST (if task takes >60s): python3 "
+                f"skills/task-progress/scripts/notify.py --source ag2space "
+                f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
+            _step += 1
+        _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
+        lines.extend(_skill)
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
+    # #2274 parity: one task_processed per NEWLY queued task (idempotent early
+    # returns never reach here), bucketed to this gateway's own "remote" surface
+    # when the source label isn't an allowlisted bucket so activity isn't lost.
+    try:
+        from telemetry import bucket_source, task_processed
+        task_processed(bucket_source(_one_line(task.get("source") or PROVIDER), "remote"))
+    except Exception:
+        pass
     _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
     return tid
+
+
+def _load_dedup_aliases() -> "dict[str, str] | None":
+    """The alias map, or None when it exists but cannot be read.
+
+    None is not the same as empty: guessing "no alias" for an unreadable
+    ledger POSTs a recovered answer under the re-ask id, which the broker is
+    not waiting on.
+    """
+    if not DEDUP_ALIAS_FILE.exists():
+        return {}
+    try:
+        loaded = json.loads(DEDUP_ALIAS_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        _log(f"dedup alias ledger unreadable ({exc}) — deferring")
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _save_dedup_aliases(aliases: dict[str, str]) -> bool:
+    """Atomically persist the alias map. Returns False if it did not commit.
+
+    Unlike the neighbouring sidecars this one is delivery-critical, so the
+    caller must not retire the original delivery until it returns True.
+    """
+    try:
+        DEDUP_ALIAS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DEDUP_ALIAS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(aliases, sort_keys=True))
+        os.replace(tmp, DEDUP_ALIAS_FILE)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"dedup alias persist FAILED ({exc}) — keeping original delivery")
+        return False
+
+
+def _delivery_tid(tid: str) -> "str | None":
+    """The id to POST under, or None when the ledger cannot be read."""
+    aliases = _load_dedup_aliases()
+    return None if aliases is None else aliases.get(tid, tid)
+
+
+def _forget_dedup_alias(tid: str) -> None:
+    aliases = _load_dedup_aliases()
+    if aliases is None:
+        return
+    if aliases.pop(tid, None) is not None:
+        _save_dedup_aliases(aliases)  # cleanup: a stale entry is harmless
 
 
 def _load_task_rooms() -> dict[str, str]:
@@ -1995,6 +2109,35 @@ def _save_inflight(inflight: set[str]) -> None:
 _uploaded_attachments: set[tuple[str, str]] = set()
 
 
+def _dedup_plan(tid: str, holder_id: str | None):
+    """Shared dedup recovery, bound to this adapter's directories.
+
+    A requeue carries the delivery forward: the re-ask keeps the room, stays
+    in flight, and aliases back to the id the broker is waiting on. Without
+    that the re-ask is written and its answer is never looked for.
+    """
+    room = _load_task_rooms().get(tid, "")
+
+    def _commit(new_id: str) -> bool:
+        """Persist routing for the re-ask before it becomes visible."""
+        delivery = _delivery_tid(tid)
+        aliases = _load_dedup_aliases()
+        if delivery is None or aliases is None:
+            return False
+        aliases[new_id] = delivery
+        if not _save_dedup_aliases(aliases):
+            return False
+        rooms = _load_task_rooms()
+        rooms[new_id] = room
+        _save_task_rooms(rooms)
+        return True
+
+    action, payload = plan_dedup_recovery(
+        RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
+        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+    return action, payload, room
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -2003,13 +2146,45 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if not rfile.exists():
+        body = read_ready_result(rfile)
+        if body is None:
             continue
-        body = rfile.read_text().strip()
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip and skip.value == "deduped":
+            action, payload, room = _dedup_plan(tid, skip.extra)
+            if action == "defer":
+                # Nothing was retired; the next pass retries the whole decision.
+                _log(f"dedup deferred for {tid} — alias not committed")
+                continue
+            if action != "honour":
+                if action == "report":
+                    # The results endpoint is keyed by delivery id; an empty
+                    # room map must not turn the report into a silent drop.
+                    _delivery = _delivery_tid(tid)
+                    if _delivery is None:
+                        _log(f"dedup report deferred for {tid} — ledger unreadable")
+                        continue
+                    try:
+                        _req("POST", "/v1/results",
+                             {"id": _broker_tid(_delivery), "body": payload})
+                    except (urllib.error.URLError, urllib.error.HTTPError,
+                            TimeoutError) as exc:
+                        # The report IS the delivery here. Archiving now would
+                        # strand the ask exactly as the unreported dedup did.
+                        _log(f"dedup report POST failed for {tid}: {exc} — will retry")
+                        continue
+                _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
+                _archive_result(rfile, tid)
+                inflight.discard(tid)
+                _forget_task_room(tid)
+                _forget_dedup_alias(tid)
+                if action == "requeue":
+                    inflight.add(payload)
+                changed = True
+                continue
         if skip:
             # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
             # archive without POSTing (match the other bridges' semantics).
@@ -2051,7 +2226,12 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": _broker_tid(tid), "body": out_body})
+            _delivery = _delivery_tid(tid)
+            if _delivery is None:
+                _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                continue
+            _req("POST", "/v1/results",
+                 {"id": _broker_tid(_delivery), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
@@ -2061,6 +2241,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         _archive_result(rfile, tid)
         inflight.discard(tid)
         _forget_task_room(tid)
+        _forget_dedup_alias(tid)
         changed = True
         _log(f"delivered result for {tid}")
     if changed:

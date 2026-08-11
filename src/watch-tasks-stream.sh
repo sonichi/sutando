@@ -20,6 +20,29 @@
 
 set -u
 
+if [ "${1:-}" = "--handler-runner" ]; then
+  handler="$2"
+  runtime="$3"
+  workspace="$4"
+  task_path="$5"
+  results="$6"
+  repo="$7"
+  events_fifo="$8"
+  filename="$9"
+  if "$handler" \
+      --runtime "$runtime" \
+      --workspace "$workspace" \
+      --task-file "$task_path" \
+      --results-dir "$results" \
+      --repo "$repo" >/dev/null; then
+    handler_rc=0
+  else
+    handler_rc=$?
+  fi
+  printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
+  exit 0
+fi
+
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
@@ -48,6 +71,234 @@ mkdir -p "$TASKS_DIR"
 # `dirname "$path"` == `$TASKS_DIR_ABS` fails when /tmp is symlinked to
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
+WORKSPACE_DIR="$(dirname "$TASKS_DIR_ABS")"
+RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
+
+# Optional task handlers are injected by runtime adapters. Two provider workers
+# may run at once; further eligible tasks stay as tiny on-disk receipts instead
+# of spawning an unbounded process fanout. Unhandled work still emits its
+# TASK_FILE event immediately, even while the provider queue is full.
+TASK_HANDLER_WORKERS=2
+DISPATCH_DIR=""
+WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
+mkfifo "$WATCH_RUNTIME_DIR/events"
+FSWATCH_PID=""
+CLEANING_UP=0
+GROUP_TERM_SENT=0
+CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
+FALLBACKS_DIR="$WORKSPACE_DIR/state/task-event-handler-fallbacks"
+WATCHER_ID="$$-${RANDOM:-0}"
+
+claim_is_live() {
+  local claim="$1" owner_pid
+  [ -f "$claim" ] || return 1
+  owner_pid="$(sed -n '1p' "$claim" 2>/dev/null)"
+  case "$owner_pid" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$owner_pid" 2>/dev/null
+}
+
+remove_claim() {
+  local claim="$1"
+  rm -f "$claim"
+}
+
+retire_stale_claim() {
+  local claim="$1" retired
+  claim_is_live "$claim" && return 1
+  retired="$CLAIMS_DIR/.stale-$WATCHER_ID-$(basename "$claim")"
+  if mv "$claim" "$retired" 2>/dev/null; then
+    remove_claim "$retired"
+    return 0
+  fi
+  return 1
+}
+
+acquire_task_claim() {
+  local filename="$1" task_path="$2" claim temporary attempts=0
+  claim="$CLAIMS_DIR/$filename"
+  temporary="$CLAIMS_DIR/.claim-$WATCHER_ID-$filename"
+  printf '%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" > "$temporary"
+  while [ "$attempts" -lt 3 ]; do
+    # A hard link publishes the fully written claim atomically and fails if
+    # another watcher already owns the destination; it never clobbers.
+    if ln "$temporary" "$claim" 2>/dev/null; then
+      rm -f "$temporary"
+      return 0
+    fi
+    if claim_is_live "$claim"; then
+      rm -f "$temporary"
+      return 1
+    fi
+    retire_stale_claim "$claim" || true
+    attempts=$((attempts + 1))
+  done
+  rm -f "$temporary"
+  return 1
+}
+
+release_task_claim() {
+  local filename="$1" claim retired owner_id
+  claim="$CLAIMS_DIR/$filename"
+  owner_id="$(sed -n '2p' "$claim" 2>/dev/null)"
+  [ "$owner_id" = "$WATCHER_ID" ] || return 1
+  retired="$DISPATCH_DIR/settled/claim-$filename"
+  if mv "$claim" "$retired" 2>/dev/null; then
+    remove_claim "$retired"
+    return 0
+  fi
+  return 1
+}
+
+claim_is_ours() {
+  local filename="$1" owner_id
+  owner_id="$(sed -n '2p' "$CLAIMS_DIR/$filename" 2>/dev/null)"
+  [ "$owner_id" = "$WATCHER_ID" ]
+}
+
+if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
+  DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
+  mkdir "$DISPATCH_DIR/pending" "$DISPATCH_DIR/running" "$DISPATCH_DIR/settled" \
+    "$DISPATCH_DIR/workers"
+  mkdir -p "$CLAIMS_DIR" "$FALLBACKS_DIR"
+  shopt -s nullglob
+  for claim in "$CLAIMS_DIR"/task-*.txt; do
+    # Overlapping watchers preserve a live owner's claim. A dead owner's
+    # record is atomically quarantined before the new sweep retries it.
+    claim_is_live "$claim" || retire_stale_claim "$claim" || true
+  done
+  shopt -u nullglob
+fi
+
+acquire_dispatch_lock() {
+  [ -n "$DISPATCH_DIR" ] || return 1
+  while ! mkdir "$DISPATCH_DIR/lock" 2>/dev/null; do
+    [ -d "$DISPATCH_DIR" ] || return 1
+    sleep 0.01
+  done
+}
+
+release_dispatch_lock() {
+  rmdir "$DISPATCH_DIR/lock" 2>/dev/null || true
+}
+
+finish_handler_task() {
+  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt
+  filename="$(basename "$task_path")"
+  worker_receipt="$DISPATCH_DIR/workers/$filename"
+  settled="$DISPATCH_DIR/settled/$filename.worker"
+  # Cleanup and the completion path race by atomically moving the same receipt.
+  # On failure, keep the durable at-least-once order: fallback receipt, event,
+  # then claim release. A signal between event and release may duplicate the
+  # event during cleanup, but it cannot strand the task without either path.
+  if mv "$marker" "$settled" 2>/dev/null; then
+    if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
+      printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+      echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+      printf 'TASK_FILE: %s\n' "$filename" || true
+      release_task_claim "$filename" || true
+    elif [ "$rc" -eq 0 ]; then
+      release_task_claim "$filename" || true
+    fi
+    rm -f "$settled"
+  fi
+  rm -f "$worker_receipt"
+  drain_dispatch_queue
+}
+
+drain_dispatch_queue() {
+  local marker candidate task_path running_marker worker_receipt running_count=0
+  [ -n "$DISPATCH_DIR" ] && [ ! -e "$DISPATCH_DIR/shutting-down" ] || return
+  acquire_dispatch_lock || return
+  if [ -e "$DISPATCH_DIR/shutting-down" ]; then
+    release_dispatch_lock
+    return
+  fi
+  shopt -s nullglob
+  for marker in "$DISPATCH_DIR/running/"*; do
+    running_count=$((running_count + 1))
+  done
+  while [ "$running_count" -lt "$TASK_HANDLER_WORKERS" ]; do
+    marker=""
+    for candidate in "$DISPATCH_DIR/pending/"*; do
+      marker="$candidate"
+      break
+    done
+    [ -n "$marker" ] || break
+    running_marker="$DISPATCH_DIR/running/$(basename "$marker")"
+    # Cleanup may concurrently settle a pending receipt. Moving it is the
+    # ownership boundary: never read or spawn unless this dispatcher won.
+    if ! mv "$marker" "$running_marker" 2>/dev/null; then
+      continue
+    fi
+    task_path="$(cat "$running_marker")"
+    worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
+    : > "$worker_receipt"
+    /bin/bash "$0" --handler-runner \
+      "$SUTANDO_TASK_EVENT_HANDLER" \
+      "${SUTANDO_CORE_RUNTIME:-}" \
+      "$WORKSPACE_DIR" \
+      "$task_path" \
+      "$RESULTS_DIR" \
+      "$__REPO_ROOT" \
+      "$WATCH_RUNTIME_DIR/events" \
+      "$(basename "$marker")" &
+    printf '%s\n' "$!" > "$worker_receipt"
+    running_count=$((running_count + 1))
+  done
+  shopt -u nullglob
+  release_dispatch_lock
+}
+
+queue_handler_task() {
+  local task_path="$1" filename marker
+  filename="$(basename "$task_path")"
+  acquire_dispatch_lock || return 1
+  if [ -e "$DISPATCH_DIR/shutting-down" ]; then
+    release_dispatch_lock
+    return 1
+  fi
+  marker="$DISPATCH_DIR/pending/$filename"
+  if [ ! -e "$marker" ] && [ ! -e "$DISPATCH_DIR/running/$filename" ]; then
+    if ! acquire_task_claim "$filename" "$task_path"; then
+      release_dispatch_lock
+      return 0
+    fi
+    printf '%s\n' "$task_path" > "$marker"
+  fi
+  release_dispatch_lock
+  drain_dispatch_queue
+}
+
+dispatch_task() {
+  local task_path="$1" rc filename
+  filename="$(basename "$task_path")"
+  if [ -z "$DISPATCH_DIR" ]; then
+    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    return
+  fi
+  if [ -f "$FALLBACKS_DIR/$filename" ]; then
+    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    return
+  fi
+  "$SUTANDO_TASK_EVENT_HANDLER" \
+    --runtime "${SUTANDO_CORE_RUNTIME:-}" \
+    --workspace "$WORKSPACE_DIR" \
+    --task-file "$task_path" \
+    --results-dir "$RESULTS_DIR" \
+    --repo "$__REPO_ROOT" \
+    --probe >/dev/null
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    queue_handler_task "$task_path" || printf 'TASK_FILE: %s\n' "$filename" || exit 0
+  elif [ "$rc" -eq 3 ]; then
+    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+  else
+    echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
+    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+  fi
+}
 
 # PID file for the Stop-hook cleanup path (see .claude/settings.json Stop
 # hook). When a Claude Code session ends, the Stop hook reads this file and
@@ -101,14 +352,6 @@ _tmux_wake() {
   tmux -S "$TMUX_SOCK" send-keys -t "$TMUX_SESSION" '[watcher-ping]' Enter 2>/dev/null || true
 }
 
-# Initial sweep — surface any pre-existing tasks that arrived during a
-# restart gap.
-shopt -s nullglob
-for f in "$TASKS_DIR"/*.txt; do
-  printf 'TASK_FILE: %s\n' "$(basename "$f")" || exit 0
-done
-shopt -u nullglob
-
 # Clean up on exit:
 # - rm PID file (so the next session's PID-gate check sees "absent" rather
 #   than a stale entry that needs `kill -0` to disqualify).
@@ -124,32 +367,125 @@ shopt -u nullglob
 #   plain signal (only `kill -9` stops it). Ignoring the signals we're about
 #   to re-send to ourselves closes that window; the process is exiting
 #   either way so nothing downstream needs to observe them again.
-# The sentinel removal is OWNERSHIP-GUARDED. `rm -f "$PID_FILE"` unconditionally
-# is wrong whenever more than one watcher has existed: the file records ONE pid,
-# and a second watcher overwrites it at startup (:65). If the FIRST then exits —
-# which is exactly what stopping a stale duplicate looks like — it deletes a
-# sentinel that now names the LIVE watcher. Downstream that reads as a dead
-# watcher and breeds another one:
-#
-#   health-check `task-watcher`  -> "orphaned watcher(s) running with no PID sentinel"
-#   /proactive-loop step 9       -> sentinel missing => start a watcher   -> duplicate
-#   /schedule-crons step 5       -> same PID-check, same conclusion
-#
-# Observed on this host 2026-08-04: stopping a duplicate deleted the live
-# watcher's sentinel, health immediately reported the live one as orphaned, and
-# the documented recovery would have spawned a third. Compare the recorded pid
-# with our own before removing; a watcher that no longer owns the file leaves it
-# alone. `2>/dev/null` on the read is safe here — an absent/unreadable file
-# yields "" which cannot equal "$$", so the guard fails CLOSED (leaves it).
-# An `if` rather than `[ … ] && rm`: the && form returns non-zero when the guard
-# declines, which is harmless under the current `set -u` but would abort the rest
-# of cleanup (signal disarm + group kill) the day anyone adds `set -e`.
+fallback_outstanding_handlers() {
+  local marker task_path filename settled made_progress found claim owner_id cleanup_ready
+  local worker_receipt worker_pid job_pid
+  [ -n "$DISPATCH_DIR" ] && [ -d "$DISPATCH_DIR" ] || return
+  : > "$DISPATCH_DIR/shutting-down"
+  shopt -s nullglob
+  while true; do
+    # A drain that acquired its lock just before shutdown may move a pending
+    # receipt after this glob. Rescan until both namespaces are empty so that
+    # ownership transfer cannot make cleanup miss the running receipt.
+    found=0
+    made_progress=0
+    for marker in "$DISPATCH_DIR/pending/"* "$DISPATCH_DIR/running/"*; do
+      found=1
+      settled="$DISPATCH_DIR/settled/$(basename "$marker").cleanup"
+      mv "$marker" "$settled" 2>/dev/null || continue
+      task_path="$(cat "$settled")"
+      filename="$(basename "$task_path")"
+      if claim_is_ours "$filename"; then
+        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+        printf 'TASK_FILE: %s\n' "$filename" || true
+        release_task_claim "$filename" || true
+      fi
+      rm -f "$settled"
+      made_progress=1
+    done
+    [ "$found" -eq 1 ] || break
+    [ "$made_progress" -eq 1 ] || sleep 0.01
+  done
+  # A signal can land after atomic claim publication but before the pending
+  # receipt write, or after a worker moved its receipt but before completion
+  # was consumed. Persist and emit before releasing: duplicate delivery is
+  # acceptable here, while release-before-emit could permanently strand work.
+  for claim in "$CLAIMS_DIR"/task-*.txt; do
+    owner_id="$(sed -n '2p' "$claim" 2>/dev/null)"
+    [ "$owner_id" = "$WATCHER_ID" ] || continue
+    task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
+    [ -n "$task_path" ] || continue
+    filename="$(basename "$task_path")"
+    printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+    echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+    printf 'TASK_FILE: %s\n' "$filename" || true
+    release_task_claim "$filename" || true
+  done
+
+  # Claims and fallback events are durable now. TERM the whole process group,
+  # then explicitly KILL and reap direct jobs/worker runners: an asynchronous
+  # bash can otherwise survive long enough to retain stdout/stderr pipe FDs.
+  kill -TERM 0 2>/dev/null || true
+  GROUP_TERM_SENT=1
+  for worker_receipt in "$DISPATCH_DIR/workers/"*; do
+    worker_pid="$(cat "$worker_receipt" 2>/dev/null)"
+    case "$worker_pid" in
+      ""|*[!0-9]*) ;;
+      *)
+        kill -KILL "$worker_pid" 2>/dev/null || true
+        wait "$worker_pid" 2>/dev/null || true
+        ;;
+    esac
+    rm -f "$worker_receipt"
+  done
+  while IFS= read -r job_pid; do
+    case "$job_pid" in
+      ""|*[!0-9]*) continue ;;
+    esac
+    kill -KILL "$job_pid" 2>/dev/null || true
+    wait "$job_pid" 2>/dev/null || true
+  done < <(jobs -pr 2>/dev/null)
+
+  # A killed completion path can leave its atomically-owned settled receipt or
+  # mkdir lock behind. Claims were reconciled above, and shutting-down still
+  # prevents new dispatch, so these local artifacts are now safe to sweep.
+  for settled in "$DISPATCH_DIR/settled/"*.worker \
+      "$DISPATCH_DIR/settled/"*.cleanup \
+      "$DISPATCH_DIR/settled/claim-"*; do
+    rm -f "$settled"
+  done
+  rmdir "$DISPATCH_DIR/lock" 2>/dev/null || true
+  shopt -u nullglob
+  cleanup_ready=1
+  rmdir "$DISPATCH_DIR/lock" 2>/dev/null || [ ! -d "$DISPATCH_DIR/lock" ] || cleanup_ready=0
+  rmdir "$DISPATCH_DIR/pending" 2>/dev/null || cleanup_ready=0
+  rmdir "$DISPATCH_DIR/running" 2>/dev/null || cleanup_ready=0
+  rmdir "$DISPATCH_DIR/settled" 2>/dev/null || cleanup_ready=0
+  rmdir "$DISPATCH_DIR/workers" 2>/dev/null || cleanup_ready=0
+  if [ "$cleanup_ready" -eq 1 ]; then
+    rm -f "$DISPATCH_DIR/shutting-down"
+    rmdir "$DISPATCH_DIR" 2>/dev/null || true
+  fi
+  [ -d "$DISPATCH_DIR" ] || DISPATCH_DIR=""
+}
+
 cleanup() {
+  [ "${CLEANING_UP:-0}" -eq 0 ] || return
+  CLEANING_UP=1
+  # EXIT and signal traps share this function. Disarm EXIT before spawning
+  # cleanup helpers so a subshell cannot recursively re-enter the trap.
+  trap - EXIT
+  trap '' TERM HUP INT
+  # A duplicate watcher can overwrite the sentinel before the stale watcher
+  # exits. Only the watcher named by the file may remove it; otherwise the live
+  # watcher would look orphaned and recovery would spawn another duplicate.
   if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then
     rm -f "$PID_FILE"
   fi
-  trap '' TERM HUP INT
-  kill 0 2>/dev/null
+  if [ -n "${FSWATCH_PID:-}" ]; then
+    kill -TERM "$FSWATCH_PID" 2>/dev/null || true
+  fi
+  if declare -F fallback_outstanding_handlers >/dev/null; then
+    fallback_outstanding_handlers
+  fi
+  if [ -n "${WATCH_RUNTIME_DIR:-}" ]; then
+    rm -f "$WATCH_RUNTIME_DIR/events"
+    rmdir "$WATCH_RUNTIME_DIR" 2>/dev/null || true
+  fi
+  if [ "${GROUP_TERM_SENT:-0}" -eq 0 ]; then
+    kill -TERM 0 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 # HUP/INT/TERM must explicitly exit after cleanup — a trap only overrides the
@@ -161,6 +497,15 @@ trap cleanup EXIT
 # cleanup() is idempotent (rm -f on an already-removed file, kill 0 on an
 # already-terminating group are both safe no-ops).
 trap 'cleanup; exit 0' HUP INT TERM
+
+# Initial sweep — surface any pre-existing tasks that arrived during a
+# restart gap. Install cleanup first so an immediately exiting fswatch cannot
+# kill a just-started provider before its durable fallback receipt is emitted.
+shopt -s nullglob
+for f in "$TASKS_DIR"/*.txt; do
+  dispatch_task "$f"
+done
+shopt -u nullglob
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
@@ -190,14 +535,28 @@ fswatch \
   -l 0.5 \
   --event Created \
   --event Renamed \
-  "$TASKS_DIR" 2>/dev/null \
-| while IFS= read -r path; do
+  "$TASKS_DIR" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
+FSWATCH_PID=$!
+while IFS= read -r path; do
   case "$path" in
+    "HANDLER_DONE: "*)
+      completion="${path#HANDLER_DONE: }"
+      handler_rc="${completion%% *}"
+      filename="${completion#* }"
+      case "$handler_rc" in
+        ""|*[!0-9]*) handler_rc=1 ;;
+      esac
+      running_marker="$DISPATCH_DIR/running/$filename"
+      if [ -f "$running_marker" ]; then
+        task_path="$(cat "$running_marker")"
+        finish_handler_task "$running_marker" "$task_path" "$handler_rc"
+      fi
+      ;;
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        printf 'TASK_FILE: %s\n' "$(basename "$path")" || exit 0
+        dispatch_task "$path"
       fi
       ;;
   esac
-done
+done < "$WATCH_RUNTIME_DIR/events"

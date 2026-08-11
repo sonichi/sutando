@@ -166,7 +166,9 @@ fi
 # back via `find … | head -1` to whichever sibling memory dir landed first
 # (alphabetical). Bug silently skipped real memory writes for 5+ weeks
 # before being caught. See docs/workspace-contract.md.
-MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory")"
+# Claude Code dashes EVERY non-alphanumeric char, not just `/` — a slash-only
+# derivation resolves to a slug it never creates on a spaced/dotted path.
+MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(printf '%s' "$SCRIPT_PARENT" | tr -c 'A-Za-z0-9' '-')/memory")"
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"

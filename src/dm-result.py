@@ -27,7 +27,6 @@ Per-node correctness:
 
 import json
 import os
-import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -60,31 +59,6 @@ from send_allowlist import (  # noqa: E402
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; was a 4th private copy)
 
 
-
-
-# Mirror of discord-bridge.py's `_FILE_MARKER_RE` — agent-emitted file
-# attachment markers embedded in result bodies. dm-result.py is the
-# REST-only fallback delivery path used when voice isn't connected;
-# without parsing these markers it would deliver the literal text
-# `[file: /tmp/sutando-x.png]` in the DM and silently drop the
-# attachment. PR limitation: REST multipart upload for actual file
-# delivery is a follow-up — this commit strips the markers from the
-# body so the user doesn't see the literal text.
-_FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-
-
-def _split_file_markers(text: str) -> tuple[str, list[str]]:
-    """Split a result body into ``(clean_text, files)``.
-
-    Mirrors :func:`src/discord-bridge.py._split_file_markers` style.
-    ``files`` is the list of paths extracted from
-    ``[file:|send:|attach:]`` markers in textual order; ``clean_text``
-    is the original text with every marker removed and surrounding
-    whitespace stripped.
-    """
-    files = _FILE_MARKER_RE.findall(text)
-    clean_text = _FILE_MARKER_RE.sub('', text).strip()
-    return clean_text, files
 
 
 def _chunk_for_discord(text: str, max_len: int = 1900):
@@ -300,7 +274,13 @@ def send_dm(text: str) -> bool:
     # checked against `_is_path_sendable` — same policy as
     # discord-bridge.py to bound exfil if an attacker-controlled marker
     # ever reaches a result body.
-    clean_text, marker_files = _split_file_markers(text)
+    parsed = parse_markers(text)
+    clean_text = parsed.body.strip()
+    marker_files = [
+        action.value
+        for action in parsed.actions
+        if action.kind == "attach"
+    ]
     expanded_files = [os.path.expanduser(p.strip()) for p in marker_files]
     sendable_files = [p for p in expanded_files if _is_path_sendable(p)]
     rejected_files = [p for p in expanded_files if not _is_path_sendable(p)]
