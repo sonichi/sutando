@@ -524,6 +524,19 @@ def test_bounded_runtime_helper_edges() -> None:
             except RuntimeError as exc:
                 assert "sandbox version" in str(exc)
 
+        with mock.patch.object(worker.subprocess, "run", side_effect=OSError("missing")):
+            try:
+                worker._require_codex_team_sandbox()
+                raise AssertionError("missing Codex must fail closed")
+            except RuntimeError as exc:
+                assert "could not verify Codex sandbox support" in str(exc)
+        with mock.patch.object(worker.subprocess, "run", return_value=invalid_version):
+            try:
+                worker._require_codex_team_sandbox()
+                raise AssertionError("unparseable Codex version must fail closed")
+            except RuntimeError as exc:
+                assert "Codex sandbox version" in str(exc)
+
         old_codex = subprocess.CompletedProcess([], 0, "codex-cli 0.131.0", "")
         with mock.patch.object(worker.subprocess, "run", return_value=old_codex):
             try:
@@ -569,6 +582,29 @@ def test_bounded_runtime_helper_edges() -> None:
             raise AssertionError("missing result event must fail")
         except RuntimeError as exc:
             assert "terminal result" in str(exc)
+
+        with mock.patch.dict(
+            os.environ,
+            {"SUTANDO_ISOLATED_WORKING_DIR": str(root / "missing-workspace")},
+            clear=False,
+        ):
+            try:
+                worker._team_workspace(REPO)
+                raise AssertionError("missing Team workspace must fail closed")
+            except RuntimeError as exc:
+                assert "team workspace is unavailable" in str(exc)
+        workspace_file = root / "workspace-file"
+        workspace_file.write_text("not a directory\n")
+        with mock.patch.dict(
+            os.environ,
+            {"SUTANDO_ISOLATED_WORKING_DIR": str(workspace_file)},
+            clear=False,
+        ):
+            try:
+                worker._team_workspace(REPO)
+                raise AssertionError("non-directory Team workspace must fail closed")
+            except RuntimeError as exc:
+                assert "team workspace is not a directory" in str(exc)
 
         (workspace / "state").mkdir(parents=True)
         with (
