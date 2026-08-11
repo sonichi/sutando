@@ -230,6 +230,13 @@ def service_registry() -> list[dict]:
     return [
         {"id": "core", "name": "Sutando Core",
          "probe": ("alive_file", CORES_DIR / f"{host}.alive")},
+        # KNOWINGLY PRIMARY-ONLY (#2503): named GATEWAY_INSTANCE bridges publish
+        # SUFFIXED sidecars this probe does not read, and the pgrep fallback is
+        # identity-blind (instance identity lives only in env — the launcher's
+        # P1). With a live named secondary, a dead primary's stale sidecar falls
+        # through to pgrep and the secondary's process reads as "running".
+        # Instance-aware probing is tracked separately; until then this row
+        # reports the PRIMARY bridge only.
         {"id": "gateway", "name": "AG2 Gateway",
          "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",
@@ -244,12 +251,20 @@ def service_registry() -> list[dict]:
          "probe": ("port", 7845)},
         {"id": "credential-proxy", "name": "Credential Proxy",
          "probe": ("port", 7846)},
+        # `$`-anchored, like the gateway row above. An UNANCHORED pattern also
+        # matches any process that merely MENTIONS the script — most concretely
+        # `python3 src/discord-bridge.py send <channel> <text>`, the one-off REST
+        # send used to post from outside the daemon. Measured: with such a send
+        # in flight, `pgrep -f 'discord-bridge\.py'` returned BOTH it and the
+        # daemon, so a dead daemon would have read `running` for the life of the
+        # send. Anchoring keeps the daemon (each launches with the script path
+        # LAST in argv) and drops the sub-command form, which has trailing args.
         {"id": "discord-bridge", "name": "Discord",
-         "probe": ("process", r"discord-bridge\.py")},
+         "probe": ("process", r"discord-bridge\.py$")},
         {"id": "slack-bridge", "name": "Slack",
-         "probe": ("process", r"slack-bridge\.py")},
+         "probe": ("process", r"slack-bridge\.py$")},
         {"id": "telegram-bridge", "name": "Telegram",
-         "probe": ("process", r"telegram-bridge\.py")},
+         "probe": ("process", r"telegram-bridge\.py$")},
     ]
 
 

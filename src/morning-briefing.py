@@ -25,7 +25,6 @@ from util_paths import personal_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
-LOGS_DIR = WORKSPACE / "logs"
 STATE_DIR = WORKSPACE / "state"
 
 # Agent-written cache of the owner's real (Google Workspace) calendar. This
@@ -124,14 +123,71 @@ def _read_calendar_cache() -> list[dict] | None:
         return None
     events: list[dict] = []
     for ev in raw_events:
+        start = ""
         if isinstance(ev, dict):
             raw = (ev.get("raw") or "").strip()
             cal = ev.get("calendar", "")
+            start = str(ev.get("start") or "").strip()
         else:
             raw, cal = str(ev).strip(), ""
         if raw:
-            events.append({"raw": raw, "calendar": cal})
+            out = {"raw": raw, "calendar": cal}
+            # This loop rebuilds each event, so any field not named here is
+            # dropped — `start` must be carried or _next_event() never fires.
+            if start:
+                out["start"] = start
+            events.append(out)
     return events
+
+
+def _parse_start(ev: dict):
+    """Return an aware datetime for `ev['start']`, or None if absent/unparseable.
+
+    `start` is optional by design: the gws producer supplies an ISO timestamp,
+    while piped connector events and the macOS AppleScript fallback do not. A
+    missing or malformed value must never be treated as "now" or as the epoch —
+    either would silently reorder the day.
+    """
+    raw = str(ev.get("start") or "").strip()
+    if not raw:
+        return None
+    # A bare YYYY-MM-DD is an ALL-DAY event: the DAY is known, the time of day is
+    # not, and midnight would read as already-past for the rest of the day.
+    if "T" not in raw and ":" not in raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:                 # naive but time-bearing: assume local
+        dt = dt.astimezone()
+    return dt
+
+
+def _all_starts_known(events: list[dict]) -> bool:
+    """True only if EVERY event has a usable start.
+
+    Both time-based claims assert something about the whole day, so partial
+    knowledge cannot support either: one unknown-time event may be upcoming.
+    """
+    return bool(events) and all(_parse_start(e) is not None for e in events)
+
+
+def _last_event(events: list[dict]):
+    """The latest event by parsed start — not list order, which may be unsorted."""
+    dated = [(s, e) for e in events if (s := _parse_start(e)) is not None]
+    return max(dated, key=lambda pair: pair[0])[1] if dated else None
+
+
+def _next_event(events: list[dict], now=None):
+    """The earliest event still ahead of `now`, or None.
+
+    Events with no parseable start are skipped rather than assumed upcoming.
+    """
+    now = now or datetime.now().astimezone()
+    future = [(s, e) for e in events
+              if (s := _parse_start(e)) is not None and s > now]
+    return min(future, key=lambda pair: pair[0])[1] if future else None
 
 
 def get_calendar_events() -> list[dict] | None:
@@ -254,18 +310,25 @@ return output
     return events
 
 
-def get_reminders() -> list[str]:
-    """Get today's and overdue reminders via the existing script."""
+def get_reminders() -> "list[str] | None":
+    """Today's and overdue reminders, or None when the query could not run.
+
+    None and [] are different facts and the caller relies on the difference:
+    [] is a verified-empty list, None is "I do not know". Returning [] for a
+    timeout let `synthesize()` fold an unanswered query into "Everything looks
+    clean" — the same shape as the 2026-07-21 falsely-clear calendar bug
+    (#2256), which is why `get_calendar_events()` already draws this line.
+    """
     script_path = Path(__file__).parent.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
     if not script_path.exists():
-        return []
+        return None
     try:
         r = subprocess.run(
             [sys.executable, str(script_path), "list", "--due-today"],
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
-            return []
+            return None
         items = []
         # reminders.py prints the human-readable sentinel "No reminders."
         # (exit 0) when the due-today list is empty — skip it so the empty
@@ -276,31 +339,117 @@ def get_reminders() -> list[str]:
             line = line.strip()
             if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
-        return items[:5]
+        return _demote_stale_reminders(items)[:5]
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return None
 
 
-def get_overnight_discord() -> list[str]:
-    """Read last 8 hours of Discord DMs from the bridge log."""
-    log = LOGS_DIR / "discord-bridge.log"
-    if not log.exists():
-        return []
-    try:
-        cutoff = time.time() - 8 * 3600
-        messages = []
-        for line in log.read_text(errors="replace").splitlines()[-200:]:
-            # Look for DM lines: [msg] #DM @user: text
-            if "[msg] #DM" in line and "is_dm: True" in line:
-                # Extract sender and preview
-                m = re.search(r'\[msg\] #DM @(\S+): (.+?) \(mentions:', line)
-                if m:
-                    sender, text = m.group(1), m.group(2)[:80]
-                    if sender != "Sutando" and "Sutando-Pro" not in sender:
-                        messages.append(f"{sender}: {text}")
-        return messages[-5:] if messages else []
-    except OSError:
-        return []
+# TWO years, not one: the due clause gives only year granularity, so `year_now - 1`
+# would demote a December item in January — one month overdue, not a year.
+_STALE_YEARS = 2
+# Anchored to the literal `(due` so a lowercase "due" in a TITLE cannot supply the year;
+# any 4-digit run, because an alternation of plausible years cannot match a corrupt one.
+_DUE_YEAR_RE = re.compile(r"\(due\b[^)]*?\b(\d{4})\b")
+
+
+def _reminder_due_year(line):
+    """The year in a reminder's `(due …)` clause, or None. Takes the LAST clause: the
+    real one is appended, so a title containing `(due …)` cannot win."""
+    m = _DUE_YEAR_RE.findall(line)
+    return int(m[-1]) if m else None
+
+
+def _demote_stale_reminders(items, now=None):
+    """Move reminders overdue by >= two calendar years to the END. Never drops; an
+    unparseable date keeps its position so a format change cannot bury a live one."""
+    year_now = (datetime.fromtimestamp(now) if now else datetime.now()).year
+    cutoff = year_now - _STALE_YEARS
+    fresh, stale = [], []
+    for it in items:
+        y = _reminder_due_year(it)
+        (stale if (y is not None and y <= cutoff) else fresh).append(it)
+    return fresh + stale
+
+
+def get_overnight_discord(now: float | None = None) -> list[str]:
+    """Owner Discord DMs from the last 8 hours, newest last (max 5).
+
+    Reads the TASK FILES the bridge writes, not `logs/discord-bridge.log`.
+
+    The log cannot answer this question. Its docstring promised an 8-hour window
+    and the code computed `cutoff = time.time() - 8 * 3600` and then never used
+    it: the effective window was `splitlines()[-200:]`, a line count. That is not
+    an oversight that a one-line patch fixes — the `[msg] #DM` lines carry no
+    timestamp at all (measured 2026-08-02: 10 of 6,754 lines in the live log had
+    an ISO stamp, and none of them were message lines), so there is nothing for a
+    time cutoff to compare against. Meanwhile the line window silently shrinks as
+    the bridge gets chattier: on the same log, all 9 matching DM lines sat at
+    indices 596-6177 while the window began at 6,554, so the briefing reported
+    ZERO overnight messages on a day that had them. The failure direction is
+    false-clean, which is the worst one for a daily briefing.
+
+    The bridge already writes a properly timestamped record of every DM it
+    processes: `tasks/task-<id>.txt`, archived to `tasks/archive/` after
+    handling, each carrying an ISO `timestamp:`, `source:`, `channel_name:` and
+    `access_tier:`. Reading those makes the promised 8-hour filter actually
+    implementable, with no new instrumentation.
+
+    Owner DMs are `source: discord` + `channel_name: DM` + `access_tier: owner`.
+    The tier check is what replaces the old sender-name exclusion: peer bots post
+    to shared channels as `team`, so they cannot reach this list.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - 8 * 3600
+    tasks_dir = WORKSPACE / "tasks"
+    archive = tasks_dir / "archive"
+    found: list[tuple[float, str]] = []
+    # The archive is MONTH-PARTITIONED (`tasks/archive/YYYY-MM/<id>.txt`, PR
+    # #591); the flat form is legacy and only holds tasks archived before it.
+    # Scanning the flat form alone reproduces the very false-clean this function
+    # exists to fix: measured on the live workspace, 280 flat vs 178 month-
+    # partitioned, and in an 8-hour window 1 owner DM flat vs 2 missed. One
+    # level deep, matching discord-bridge.py's own `archive.glob(f"*/{id}.txt")`
+    # — not rglob, which would walk unbounded depth.
+    globs = ((tasks_dir, "task-*.txt"),
+             (archive, "task-*.txt"),
+             (archive, "*/task-*.txt"))
+    for directory, pattern in globs:
+        if not directory.is_dir():
+            continue
+        for path in directory.glob(pattern):
+            try:
+                head = path.read_text(errors="replace")
+            except OSError:
+                continue
+            fields = dict(re.findall(r"^([a-z_]+):[ \t]*(.*)$", head, re.M))
+            if fields.get("source") != "discord":
+                continue
+            if fields.get("channel_name") != "DM":
+                continue
+            if fields.get("access_tier", "owner") != "owner":
+                continue
+            stamp = fields.get("timestamp", "")
+            try:
+                when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            # BOTH edges. Only the lower one was enforced, so a single
+            # future-dated timestamp counted as "overnight" in every briefing
+            # until the wall clock caught up — unbounded, and the mirror image
+            # of the false-clean this function exists to fix. The risk is not
+            # theoretical now that briefing truth rests on mutable on-disk
+            # stamps: clock skew, a hand-edited file, or imported state all
+            # produce one. Both bounds inclusive: `cutoff` is 8h ago exactly,
+            # and a task written this instant must still count.
+            if not cutoff <= when <= now:
+                continue
+            body = ""
+            m = re.search(r"^task:[ \t]*(.*)$", head, re.M)
+            if m:
+                body = m.group(1).strip()[:80]
+            found.append((when, body))
+    found.sort()
+    return [body for _when, body in found[-5:]]
 
 
 def _load_notifier():
@@ -325,6 +474,72 @@ def _load_notifier():
 
 
 _CPQ = _load_notifier()
+
+
+#: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
+#: DM'd, so a title clipped mid-word is read aloud as a mid-word fragment. A hard
+#: `title[:60]` produced, from a real 2026-08-02 run:
+#:     "WIRE - awaiting your verdict / steer (no urgency; nothing bl"
+#: - cut inside "blocked", and leaving an unmatched "(" so the parenthetical never
+#: closes. Clip on a word boundary instead, and drop a parenthetical that the clip
+#: left open rather than speaking half of it.
+def _cut_at_imbalance(s: str) -> str:
+    """Truncate `s` at the first bracket that cannot be matched, either way.
+
+    Both directions matter and only one was handled before. Stripping a leading
+    "(" shifts the slice window one character right, which can pull the matching
+    ")" into the output ALONE -- the mirror image of the orphan being removed:
+
+        clip_for_speech("(abcdefghi) long trailing title", 11) -> "abcdefghi)..."
+
+    A single left-to-right pass covers both: an unmatched ")" truncates before
+    itself; anything still open at the end truncates before the FIRST unmatched
+    "(" (not the last -- cutting at the first is what guarantees balance when
+    several are open).
+    """
+    stack: list[int] = []
+    for i, ch in enumerate(s):
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")":
+            if not stack:
+                return s[:i]
+            stack.pop()
+    return s[:stack[0]] if stack else s
+
+
+#: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
+#: DM'd, so a title clipped mid-word is read aloud as a mid-word fragment. A hard
+#: `title[:60]` produced, from a real 2026-08-02 run:
+#:     "WIRE - awaiting your verdict / steer (no urgency; nothing bl"
+#: - cut inside "blocked", and leaving an unmatched "(" so the parenthetical never
+#: closes. Clip on a word boundary instead, and never emit an unbalanced bracket.
+def clip_for_speech(text: str, limit: int) -> str:
+    """Clip to <= limit chars without cutting a word or orphaning a bracket.
+
+    Returns text unchanged when it already fits, so the common case is untouched
+    -- including text that is ALREADY unbalanced at the source. The contract is
+    "clipping must not create an orphan", not "rewrite titles we did not clip".
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+
+    def _shorten(s: str) -> str:
+        # limit - 1 reserves the ellipsis, so the result is never over the limit.
+        head = s[:limit - 1]
+        cut = head.rfind(" ")
+        if cut > 0:
+            head = head[:cut]
+        return _cut_at_imbalance(head).rstrip(" ,;:-\u2014/(")
+
+    head = _shorten(text)
+    if not head:
+        # The whole window sat inside a parenthetical opening at character 0.
+        # Drop the bracket and re-shorten -- through the SAME balance guard, which
+        # is what the first version of this fix missed.
+        head = _shorten(text.lstrip("(").lstrip())
+    return head + "\u2026"
 
 
 def get_pending_questions() -> list[str]:
@@ -369,16 +584,21 @@ def get_pending_questions() -> list[str]:
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
         if not title:
             continue
-        out.append(title[:60])
+        out.append(clip_for_speech(title, 60))
     return out
 
 
 
-def get_health_issues() -> list[str]:
-    """Run health check and return only the failed/warn items, concisely."""
+def get_health_issues() -> "list[str] | None":
+    """Failed health items, or None when the check could not run.
+
+    Same contract as `get_reminders`: [] means the check ran and found nothing,
+    None means it did not run. A timed-out health check returning [] made the
+    briefing assert a clean system it had never inspected.
+    """
     hc = Path(__file__).parent / "health-check.py"
     if not hc.exists():
-        return []
+        return None
     try:
         r = subprocess.run(
             [sys.executable, str(hc)],
@@ -398,9 +618,18 @@ def get_health_issues() -> list[str]:
                     issues.append(f"{name}: {detail}")
                 elif parts:
                     issues.append(parts[0])
+        # A non-zero exit is AMBIGUOUS here and must not be read as failure
+        # alone: health-check.py ends in `sys.exit(1 if issues else 0)`, so
+        # non-zero is its normal way of saying "I found problems" — and those
+        # problems are exactly what this function is for. The crash case is
+        # non-zero WITH nothing parseable (import error, traceback on stderr,
+        # empty stdout): the run produced no verdict at all, so the answer is
+        # "unknown", not "clean".
+        if r.returncode != 0 and not issues:
+            return None
         return issues[:3]
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return None
 
 
 def get_daily_insight() -> str | None:
@@ -450,8 +679,17 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if count == 1:
             parts.append(f"One meeting today: {events[0]['raw']}.")
         else:
-            next_ev = events[0]["raw"]
-            parts.append(f"{count} meetings today. First up: {next_ev}.")
+            upcoming = _next_event(events) if _all_starts_known(events) else None
+            last = _last_event(events) if _all_starts_known(events) else None
+            if upcoming is not None:
+                parts.append(f"{count} meetings today. Next up: {upcoming['raw']}.")
+            elif last is not None:
+                # Every start known and all past — naming one implies it is ahead.
+                parts.append(f"{count} meetings today, all earlier — "
+                             f"last was {last['raw']}.")
+            else:
+                # Incomplete start times: claim neither, keep the prior wording.
+                parts.append(f"{count} meetings today. First up: {events[0]['raw']}.")
     else:
         parts.append("Your calendar is clear today.")
 
@@ -483,8 +721,14 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if not has_raw_data and len(first_sentence) > 20:
             parts.append(f"Insight: {first_sentence}.")
 
-    # Closing — an unreadable calendar (None) is not a verified-clean day.
-    if events == [] and not reminders and not pending_qs and not health_issues:
+    # Closing — every input must be VERIFIED empty, not merely falsy. `None`
+    # from any gather means that query did not run, and an unanswered query is
+    # not evidence of a clean day. Previously only the calendar was checked this
+    # way, so a timed-out reminders fetch and a timed-out health check (both
+    # returning [] at the time) produced a confident "Everything looks clean"
+    # over two questions nobody had answered.
+    if (events == [] and reminders == [] and health_issues == []
+            and not pending_qs):
         parts.append("Everything looks clean. Good day for deep work.")
 
     return " ".join(parts)
@@ -525,7 +769,7 @@ def main():
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
 
     reminders = get_reminders()
-    print(f"  reminders: {len(reminders)} due")
+    print(f"  reminders: {'unavailable' if reminders is None else f'{len(reminders)} due'}")
 
     discord_msgs = get_overnight_discord()
     print(f"  discord overnight: {len(discord_msgs)} messages")
@@ -537,7 +781,7 @@ def main():
     print(f"  pending questions: {len(pending_qs)}")
 
     health_issues = get_health_issues()
-    print(f"  health issues: {len(health_issues)}")
+    print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")
 
     # Synthesize
     narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight)

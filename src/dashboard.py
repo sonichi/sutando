@@ -35,6 +35,8 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
+import dashboard_schedules  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -123,7 +125,14 @@ def get_pending_count() -> dict:
     # #1265) and moved below a top-level `# Resolved` divider once answered. The
     # old `**Status:** Waiting/Answered` regex matched neither and always returned
     # 0/0 for the format actually in use — count `## ` sections per region instead.
-    active, _, resolved = content.partition('\n# Resolved')
+    # Must use the shared locator, not a bare partition: a line-initial
+    # `# Resolved` inside the file's own HTML banner (which documents the divider)
+    # matches first, so the active region collapses and every open question is
+    # counted as resolved. Measured on the decoy shape: partition gave open=0
+    # done=3 where the truth is open=2 done=1 — and this surface is public via
+    # /json, so it was reporting a confident zero.
+    active = active_region(content)
+    resolved = content[len(active):]
     open_count = len(re.findall(r'^## ', active, flags=re.MULTILINE))
     done_count = len(re.findall(r'^## ', resolved, flags=re.MULTILINE))
     return {"open": open_count, "done": done_count}
@@ -206,6 +215,22 @@ def _quota_freshness(data: dict, quota_file) -> dict:
     age_h = max(0.0, (datetime.now().timestamp() - ts) / 3600.0)
     return {"age_h": round(age_h, 1), "stale": age_h >= QUOTA_STALE_HOURS}
 
+
+
+def _quota_has_data(quota: dict) -> bool:
+    """Whether a reading actually exists, as opposed to defaulting to zero.
+
+    The tiles below format utilization with `.get(..., 0)`, so an ABSENT file
+    rendered as "0% used" plus a green check — absence shown as "healthy,
+    nothing consumed", which is the confidently-wrong failure get_quota_status
+    exists to avoid. Same discriminator as the age label.
+    """
+    return bool(quota.get("headers")) or quota.get("age_h") is not None
+
+
+# Glyph is a THREE-way split, not two: no reading -> "—", a reading the API
+# refused -> "✗", a good reading -> "✓". Collapsing the last two hides a real
+# rate-limit behind a check.
 
 
 def _quota_age_label(quota: dict) -> str:
@@ -390,87 +415,30 @@ def get_use_case_matrix() -> str:
     return '<table style="width:100%;font-size:11px;border-collapse:collapse"><tr style="color:#555;text-align:left"><th></th><th>Use Case</th><th>Details</th></tr>' + ''.join(rows) + '</table>'
 
 
+# ── Schedule domain/storage: delegated to dashboard_schedules ────────────────
+# Cron parsing, schedule validation and atomic crons.json persistence live in
+# src/dashboard_schedules.py. What remains here are thin presentation-layer
+# wrappers that supply the resolved path via _crons_path(); dashboard.py owns
+# path resolution, HTTP adaptation and rendering, nothing else.
+# The wrappers are kept (rather than deleted) so existing callers and the
+# integration tests keep their current names.
+
+_CRON_BOUNDS = dashboard_schedules.CRON_BOUNDS
+
+
 def _cron_field_match(spec: str, value: int) -> bool:
-    """Match one cron field value against a spec supporting *, */N, A-B, A,B, N."""
-    for token in spec.split(","):
-        if token == "*":
-            return True
-        if token.startswith("*/"):
-            try:
-                step = int(token[2:])
-            except ValueError:
-                continue
-            if step and value % step == 0:
-                return True
-        elif "-" in token:
-            try:
-                a, b = (int(x) for x in token.split("-", 1))
-            except ValueError:
-                continue
-            if a <= value <= b:
-                return True
-        elif token.isdigit() and int(token) == value:
-            return True
-    return False
-
-
-# Per-field value bounds (minute, hour, day-of-month, month, day-of-week).
-# dow allows 0-7 (0 and 7 both = Sunday, per cron convention).
-_CRON_BOUNDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+    """Delegates to dashboard_schedules.cron_field_match."""
+    return dashboard_schedules.cron_field_match(spec, value)
 
 
 def _cron_field_valid(spec: str, lo: int, hi: int) -> bool:
-    """True iff every comma-token of a cron field is syntactically valid and in
-    range: ``*``, ``*/N`` (N>0), ``A-B`` (lo<=A<=B<=hi), or a plain integer in
-    [lo, hi]. Used to reject a malformed field (e.g. ``foo``) or an out-of-range
-    one (e.g. minute ``99``) up front — ``_cron_next_run`` can't distinguish
-    those from a valid-but-rare cron with no run in the scan horizon (both →
-    None), so it must not be the validator (CR #2164, qingyun-wu)."""
-    spec = spec.strip()
-    if not spec:
-        return False
-    for token in spec.split(","):
-        token = token.strip()
-        if token == "*":
-            continue
-        if token.startswith("*/"):
-            step = token[2:]
-            if step.isdigit() and int(step) > 0:
-                continue
-            return False
-        if "-" in token:
-            a, _, b = token.partition("-")
-            if a.isdigit() and b.isdigit() and lo <= int(a) <= int(b) <= hi:
-                continue
-            return False
-        if token.isdigit() and lo <= int(token) <= hi:
-            continue
-        return False
-    return True
+    """Delegates to dashboard_schedules.cron_field_valid."""
+    return dashboard_schedules.cron_field_valid(spec, lo, hi)
 
 
 def _cron_next_run(expr: str, now: datetime, horizon_days: int = 8):
-    """Next datetime matching a 5-field cron expr (minute hour dom month dow),
-    scanning minute-by-minute up to horizon_days. Returns datetime or None.
-
-    dom/dow are AND-combined (sufficient for our crons, which restrict only one
-    of them); the rare cron OR-semantics edge case is not modeled.
-    """
-    from datetime import timedelta
-    parts = expr.split()
-    if len(parts) != 5:
-        return None
-    mnt, hr, dom, mon, dow = parts
-    t = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    end = now + timedelta(days=horizon_days)
-    while t <= end:
-        cron_dow = (t.weekday() + 1) % 7  # python Mon=0..Sun=6 -> cron Sun=0..Sat=6
-        if (_cron_field_match(mnt, t.minute) and _cron_field_match(hr, t.hour)
-                and _cron_field_match(dom, t.day) and _cron_field_match(mon, t.month)
-                and _cron_field_match(dow, cron_dow)):
-            return t
-        t += timedelta(minutes=1)
-    return None
+    """Delegates to dashboard_schedules.next_run."""
+    return dashboard_schedules.next_run(expr, now, horizon_days)
 
 
 def _html_attr(v: str) -> str:
@@ -488,139 +456,36 @@ def _crons_path():
 
 
 def _read_crons() -> list:
-    """Load the cron job list; [] on missing/invalid (never raises)."""
-    p = _crons_path()
-    if not p.exists():
-        return []
-    try:
-        jobs = json.loads(p.read_text())
-        return jobs if isinstance(jobs, list) else []
-    except (OSError, ValueError):
-        return []
+    """Delegates to dashboard_schedules.read_crons for this host's path."""
+    return dashboard_schedules.read_crons(_crons_path())
 
 
-# Serializes the full read-merge-write transaction for schedule mutations.
-# dashboard runs under ThreadingHTTPServer, so two overlapping POST/DELETE
-# requests would otherwise both read the old list, and the later os.replace
-# could clobber the earlier acknowledged write (or raise FileNotFoundError off a
-# shared temp path). Every upsert/delete holds this lock across read→merge→write
-# so mutations are linearizable (CR #2164, qingyun-wu). A module-level Lock is
-# process-wide; the dashboard is single-process, so it fully covers the server.
-_CRONS_LOCK = threading.Lock()
+# The transaction lock now lives with the transactions it protects, in
+# dashboard_schedules. Re-exported so anything reaching for the old name still
+# gets THE lock rather than silently creating a second, unrelated one.
+_CRONS_LOCK = dashboard_schedules._CRONS_LOCK
 
 
 def _write_crons(jobs: list) -> None:
-    """Persist the cron list atomically (tmp + os.replace) so a crash mid-write
-    can't leave a truncated crons.json. Callers MUST hold _CRONS_LOCK for the
-    surrounding read-modify-write; the per-writer temp name (pid+uuid) is only
-    defense in depth so two writers can never collide on one .tmp path."""
-    p = _crons_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        tmp.write_text(json.dumps(jobs, indent=2) + "\n")
-        os.replace(tmp, p)
-    except OSError:
-        # Never leave an orphan temp behind on a failed write.
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+    """Delegates to dashboard_schedules.write_crons for this host's path."""
+    dashboard_schedules.write_crons(_crons_path(), jobs)
 
 
 def _validate_job(job: dict) -> str | None:
-    """Return an error string if the job is invalid, else None. A job needs a
-    non-empty name, a valid 5-field cron expr, and exactly one of prompt /
-    prompt_skill (what schedule-crons requires to actually fire something)."""
-    if not isinstance(job, dict):
-        return "job must be an object"
-    name = (job.get("name") or "").strip()
-    if not name:
-        return "name is required"
-    expr = (job.get("cron") or "").strip()
-    fields = expr.split()
-    if len(fields) != 5:
-        return "cron must be a 5-field expression (min hour dom month dow)"
-    # Validate each field's SYNTAX + range directly. _cron_next_run returns None
-    # for a malformed cron AND for a valid-but-no-run-in-horizon one, so it can't
-    # be the gate — a garbage expr like "foo bar baz qux quux" would slip through
-    # and be persisted as an uncomputable schedule (CR #2164, qingyun-wu).
-    if not all(_cron_field_valid(f, lo, hi) for f, (lo, hi) in zip(fields, _CRON_BOUNDS)):
-        return f"invalid cron expression: {expr!r}"
-    has_prompt = bool((job.get("prompt") or "").strip())
-    has_skill = bool((job.get("prompt_skill") or "").strip())
-    if has_prompt == has_skill:
-        return "provide exactly one of prompt or prompt_skill"
-    return None
+    """Delegates to dashboard_schedules.validate_job."""
+    return dashboard_schedules.validate_job(job)
 
 
 def upsert_schedule(body: dict) -> tuple[int, dict]:
-    """Pure add/edit: merge `body` onto an existing job by name (so an inline
-    cron-only edit inherits its prompt/prompt_skill), validate the merged
-    result, persist. Returns (http_status, response_obj). Unit-tested; the
-    do_POST handler is a thin wrapper around this."""
-    if not isinstance(body, dict):
-        return 400, {"error": "malformed JSON body"}
-    # Reject a non-string scalar in any text field before calling a string method
-    # on it. `{"name": 123}` (or a non-string cron/prompt/…) would otherwise raise
-    # AttributeError on `.strip()` and close the request with no JSON 400
-    # (CR #2164, qingyun-wu). `null` is allowed here — it's handled downstream as
-    # "field absent".
-    for _k in ("name", "cron", "prompt", "prompt_skill", "description"):
-        _v = body.get(_k)
-        if _v is not None and not isinstance(_v, str):
-            return 400, {"error": f"{_k} must be a string"}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return 400, {"error": "name is required"}
-    # Serialize the whole read→merge→validate→write transaction. Under
-    # ThreadingHTTPServer two overlapping upserts (or an upsert racing a delete)
-    # would both read the pre-mutation list and the second write would silently
-    # clobber the first acknowledged update (CR #2164). The lock makes the
-    # transaction linearizable; delete_schedule takes the same lock.
-    with _CRONS_LOCK:
-        jobs = _read_crons()
-        existing = next((j for j in jobs if j.get("name") == name), None)
-        merged = dict(existing) if existing else {}
-        merged["name"] = name
-        for k in ("cron", "prompt", "prompt_skill", "description"):
-            if k in body and str(body.get(k)).strip():
-                merged[k] = str(body[k]).strip()
-        if (body.get("prompt_skill") or "").strip():
-            merged.pop("prompt", None)
-        elif (body.get("prompt") or "").strip():
-            merged.pop("prompt_skill", None)
-        err = _validate_job(merged)
-        if err:
-            return 400, {"error": err}
-        # Persist the MERGED job — it starts from the existing on-disk entry, so
-        # scheduler-specific fields (execution, delivery, retry_minutes, timezone,
-        # launchd, room, room_id, …) are preserved. A prior version rebuilt a
-        # name/cron/prompt/description whitelist here, silently dropping those on any
-        # edit — saving a cron change could disable a Codex job or detach its room
-        # (CR #2164, qingyun-wu). The prompt/prompt_skill exclusivity was already
-        # applied to `merged` above, so it's write-ready.
-        jobs = [j for j in jobs if j.get("name") != name]
-        jobs.append(merged)
-        _write_crons(jobs)
-        return 200, {"ok": True, "name": name, "count": len(jobs),
-                     "note": "Saved. Takes effect on the next /schedule-crons run (restart)."}
+    """Add/edit a schedule. Path resolution stays here; the read→merge→validate
+    →write transaction (and its lock) belongs to dashboard_schedules."""
+    return dashboard_schedules.upsert_schedule(_crons_path(), body)
 
 
 def delete_schedule(name: str) -> tuple[int, dict]:
-    """Pure delete-by-name. Returns (http_status, response_obj)."""
-    # Same transaction lock as upsert_schedule — a delete racing an upsert must
-    # not read a stale list and re-persist a job the upsert just removed, or vice
-    # versa (CR #2164).
-    with _CRONS_LOCK:
-        jobs = _read_crons()
-        remaining = [j for j in jobs if j.get("name") != name]
-        if len(remaining) == len(jobs):
-            return 404, {"error": "not found", "name": name}
-        _write_crons(remaining)
-        return 200, {"deleted": name, "count": len(remaining),
-                     "note": "Removed. Takes effect on the next /schedule-crons run (restart)."}
+    """Delete a schedule by name. Path resolution stays here; the locked
+    read→delete→write transaction belongs to dashboard_schedules."""
+    return dashboard_schedules.delete_schedule(_crons_path(), name)
 
 
 def get_schedules() -> list[dict]:
@@ -699,9 +564,9 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
 <div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
-<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("✓" if stats["quota"].get("available", True) else "✗")}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
-<div class="stat"><div class="stat-val">{int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)}%</div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
-<div class="stat"><div class="stat-val">{int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)}%</div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
+<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
+<div class="stat"><div class="stat-val">{(str(int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
+<div class="stat"><div class="stat-val">{(str(int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
 </div></div>""")
 
     # Services (ports + daemons only)
@@ -817,7 +682,7 @@ def render_dashboard() -> str:
         '</tr>'
     )
     cards.append(
-        '<div class="card full"><h2>Schedules</h2>'
+        '<div class="card full" id="schedules"><h2>Schedules</h2>'
         '<table style="width:100%;font-size:11px;border-collapse:collapse">'
         '<tr style="color:#555;text-align:left"><th>Name</th><th>Cron</th>'
         '<th>Type</th><th>Next run</th><th></th></tr>'

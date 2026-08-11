@@ -47,6 +47,16 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         self.ws = Path(self._tmp.name)
         (self.ws / "state").mkdir(parents=True, exist_ok=True)
         self.hc.WORKSPACE_DIR = self.ws
+        # ISOLATE THE HOST. The fresh-file branch consults the RUNNING core's
+        # environment, so without this every fixture below escapes its tmpdir into
+        # the developer's live tmux and its verdict depends on whether that machine
+        # happens to have a routed core. Three cases failed exactly that way on a
+        # host with a running unrouted core while CI — which has no live core —
+        # stayed green. `None` is the neutral answer ("could not determine"), which
+        # by contract changes no existing result, so these 39 cases keep testing
+        # what they were written to test. The True/False/None branch itself is
+        # covered explicitly in TestCoreEnvBranch below.
+        self.hc.core_env_has_proxy_url = lambda *a, **k: None
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -696,6 +706,61 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
             r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok")
         self.assertEqual(r["detail"], "quota state present")
+
+
+
+
+class TestCoreEnvBranch(unittest.TestCase):
+    """The fresh-quota branch, driven through the injectable prober.
+
+    A fresh `quota-state.json` used to be read as proof the core was routed. It is
+    not: the proxy writes that file for whatever talks to it, so one throwaway
+    `claude -p` refreshes it and buys a full staleness window of false green over a
+    core that never routed. These three cases pin the only correct mapping, and the
+    None case is the one that matters most — an unreadable environment must leave
+    the existing verdict untouched rather than manufacture a warning.
+    """
+
+    def setUp(self):
+        self.hc = _load_health_check()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self._tmp.name)
+        (self.ws / "state").mkdir(parents=True, exist_ok=True)
+        self.hc.WORKSPACE_DIR = self.ws
+        (self.ws / "state" / "quota-state.json").write_text('{"remaining_pct": 42}')
+        self.hc.core_env_has_proxy_url = lambda *a, **k: None  # never reached; guards escape
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_probe_false_downgrades_a_fresh_file_to_warn(self):
+        r = self.hc.check_quota_telemetry("ok", core_env_prober=lambda: False)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("ANTHROPIC_BASE_URL", r["detail"])
+        # The detail must say WHOSE environment, or the reader cannot act on it.
+        self.assertIn("RUNNING core", r["detail"])
+
+    def test_probe_true_leaves_a_fresh_file_ok(self):
+        r = self.hc.check_quota_telemetry("ok", core_env_prober=lambda: True)
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("not routed", r["detail"])
+
+    def test_probe_none_leaves_a_fresh_file_ok(self):
+        """Unknown is not a bypass. This is the guard against the mirror-image bug."""
+        r = self.hc.check_quota_telemetry("ok", core_env_prober=lambda: None)
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("not routed", r["detail"])
+
+    def test_a_stale_file_is_unaffected_by_the_probe(self):
+        """The probe gates the FRESH branch only — a stale file still warns on its own."""
+        p = self.ws / "state" / "quota-state.json"
+        past = time.time() - (self.hc.QUOTA_STATE_STALE_SEC + 60)
+        os.utime(p, (past, past))
+        status_p = self.hc.status_read_path("core-status.json", self.ws)
+        status_p.write_text('{"status": "idle"}')
+        r = self.hc.check_quota_telemetry("ok", core_env_prober=lambda: True)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("stale", r["detail"])
 
 
 if __name__ == "__main__":
