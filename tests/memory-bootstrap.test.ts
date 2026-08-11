@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { claudeProjectSlug } from '../src/util_paths.js';
 
+const VOICE_AGENT = readFileSync(join(import.meta.dirname, '..', 'src', 'voice-agent.ts'), 'utf-8');
+
 /**
  * Tests for bootstrapMemoryDir() in src/voice-agent.ts.
  *
@@ -97,6 +99,15 @@ describe('bootstrapMemoryDir — no-clobber on existing index', () => {
 });
 
 describe('bootstrapMemoryDir — env override', () => {
+	it('derives the production slug from the repo root, not the workspace', () => {
+		assert.match(
+			VOICE_AGENT,
+			/const repoRoot = fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\)\.replace\(\/\[\\\\\/\]\+\$\//,
+		);
+		assert.match(VOICE_AGENT, /const slug = claudeProjectSlug\(repoRoot\)/);
+		assert.doesNotMatch(VOICE_AGENT, /claudeProjectSlug\(WORKSPACE_DIR/);
+	});
+
 	it('uses SUTANDO_MEMORY_DIR when provided instead of the slug-derived default', () => {
 		const customDir = join(scratch, 'custom-memory');
 		const out = bootstrapMemoryDir('/Users/test/GitHub/sutando', customDir);
