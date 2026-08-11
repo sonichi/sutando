@@ -450,3 +450,14 @@ endpoint and is governed by review, not grep. All of this is pinned by
 `tests/events-plane-boundary.test.py` — allowlists frozen, shrink-only, and
 the collector excludes only real test artifacts (`tests/` dirs, `test_*.py`,
 `*.test.py`), never production filenames that merely contain "test".
+
+## Why duplicated policy is the defect
+
+Rationale behind the `CLAUDE.md` "fix a bug where the policy lives" rule:
+
+- Do not leave a copy behind because the extraction looked large — a large
+  extraction measures how much drift has already accumulated, not a reason to
+  add more.
+- Duplicated policy is a defect in its own right, whether or not it is
+  currently misbehaving. Copies drift, and the copy nobody remembers is the
+  one that ships the bug.
