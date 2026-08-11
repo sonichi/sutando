@@ -421,13 +421,8 @@ def case_o_launch_env_path() -> list[str]:
 
 
 def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
-    """A wedged→dead transition on the SAME oldest task must RE-OBSERVE (start a
-    fresh confirm window for the dead condition) — NOT inherit the wedge's
-    already-elapsed window and relaunch on the first dead pass. Regression for
-    the mode-unaware confirm-window reuse: dead and wedged
-    share wedge_first_seen/wedge_task, and without a mode check a core that is
-    wedged-and-confirming, then dies with the same oldest task, would restart
-    immediately though the DEAD condition was never confirmed across a pass."""
+    """A wedged->dead transition on the SAME oldest task must start a fresh confirm
+    window for the dead condition, not inherit the wedge's already-elapsed one."""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         h = Harness(Path(td) / "rec.json")
@@ -452,13 +447,8 @@ def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
 
 
 def case_q_preupgrade_state_dead_reobserves() -> list[str]:
-    """Persisted-state migration regression: a PRE-UPGRADE
-    state file has wedge_first_seen/wedge_task but NO wedge_mode. The previous head
-    only ever observed WEDGES, so that absent mode is an implied wedge window. If
-    the core is DEAD on the first post-upgrade pass with the same oldest task and
-    the old window has already elapsed, the death must be RE-OBSERVED on its own
-    window — NOT restarted immediately by inheriting the elapsed wedge window.
-    Direct repro of the seed that returned action='restarted'."""
+    """A state file with wedge_first_seen but NO wedge_mode is an implied WEDGE window:
+    a dead core on the first pass after upgrade must re-observe on its own window."""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         sf = Path(td) / "rec.json"
@@ -488,17 +478,8 @@ def case_q_preupgrade_state_dead_reobserves() -> list[str]:
 
 
 def case_r_local_liveness_ignores_peer_heartbeats():
-    """A PEER heartbeat must not suppress a local relaunch.
-
-    The dead-core actuator defaulted to `_any_core_alive`, whose contract is
-    explicitly "any host" and which globs every `state/cores/*.alive`. The
-    workspace is SHARED, so on a multi-core setup one fresh peer record made a
-    dead local host look alive forever and the relaunch never fired.
-
-    Four states, because two of them are what stop the fix becoming "never
-    believe a heartbeat": a fresh LOCAL beat must still read alive, and a stale
-    one must not.
-    """
+    """A PEER heartbeat must not suppress a local relaunch: the workspace is shared, so
+    an any-host liveness read makes a dead local core look alive. Fresh LOCAL still does."""
     import os
     import pathlib
     import tempfile

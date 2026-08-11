@@ -8111,12 +8111,8 @@ def recover_core_if_wedged(
                 _save()
             return None
 
-        # Identity + progress gating (blocker 3): age alone can't tell a wedge
-        # from a legitimately long single task. Reset the confirmation window if
-        # EITHER the oldest task changed (queue draining → a different oldest, or
-        # the file was rewritten → new mtime) OR the core advanced core-status.json
-        # Wedge and dead share this observation state, so a mode flip must reset
-        # it: a wedged core that DIES would inherit the wedge's elapsed window.
+        # Age alone cannot separate a wedge from one legitimately long task: reset the
+        # window when the oldest task changes, the core advances, or the mode flips.
         cur_mode = "wedged" if wedged else "dead"
         prev_key = state.get("wedge_task")
         prev_mode = state.get("wedge_mode")
