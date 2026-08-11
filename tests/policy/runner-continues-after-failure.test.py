@@ -1,34 +1,11 @@
-"""Guard: `test:py` must run EVERY discovered file, even after one fails.
-
-The runner used to be `... | while read f; do ... python3 "$f" || exit 1; done`. The
-`|| exit 1` exits the pipeline subshell mid-loop, so a failure at sort position 50 of
-421 ended the run and 371 files never executed — while the exit code (1) and the
-output shape were indistinguishable from a complete run that had one failure. The
-"green-but-partial" failure mode, and the reason local runs were trusted as coverage.
-
-A string assertion cannot pin this: the contract is behavioural, and the next edit
-that reintroduces an in-loop `exit` would still match any pattern we grepped for. So
-these tests EXECUTE the shipped `scripts["test:py"]` from package.json against
-synthetic files in a temp tree, and assert the four properties that matter:
-
-  1. an early failure does not prevent later files from running
-  2. every failing filename is named in the summary
-  3. the final exit is nonzero when any file failed
-  4. an all-pass run exits zero and prints a TOTAL, not a failure summary
-  5. discovering zero files fails instead of reporting success
-
-Property 5 is the same defect partitioned at zero: with no files the `while` body never
-runs, so `fail` stays 0 and the run exits 0 with nothing on stdout — "ran nothing" and
-"ran 421, all green" were indistinguishable by exit code. Hence the total in property 4:
-an exit code alone cannot carry a magnitude.
-
-POLICY test — sibling of runner-glob.test.py, which pins discovery; this pins
-continuation.
+"""Guard: `test:py` must run EVERY discovered file, and must never report a green
+run it did not measure — early failure, zero discovery, or a failed `find`.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -96,8 +73,7 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
                       "cannot be told apart from a run that discovered nothing")
 
     def test_zero_discovery_fails_instead_of_reporting_success(self) -> None:
-        """No files is not success. The `while` body never runs, so `fail` stays 0 and
-        a naive runner exits 0 silently — indistinguishable from an all-green suite."""
+        """No files is not success: the loop body never runs, so `fail` stays 0."""
         r = self._run({})
         self.assertNotEqual(r.returncode, 0,
                             "a run that discovered zero test files exited 0 — "
@@ -106,8 +82,7 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
                       "the zero case must say so, not just fail")
 
     def test_zero_discovery_is_distinguishable_from_a_real_failure(self) -> None:
-        """Both exit nonzero, so the exit code cannot separate them — the operator
-        needs the reason. Guards against 'fix' that just exits 1 on the empty case."""
+        """Both exit nonzero, so the exit code alone cannot separate them."""
         empty = self._run({})
         real = self._run({"a.test.py": FAILING})
         self.assertNotEqual(empty.returncode, 0)
@@ -118,14 +93,38 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
                          "a real failure must not be reported as empty discovery")
 
     def test_every_discovered_file_is_executed(self) -> None:
-        """The magnitude guard: files run must equal files discovered, with the
-        failure placed FIRST so a fail-fast runner would skip the rest."""
+        """Files run must equal files discovered; the failure is FIRST so a fail-fast
+        runner would visibly skip the rest."""
         files = {"a.test.py": FAILING}
         files.update({f"z{i}.test.py": PASSING for i in range(6)})
         r = self._run(files)
         ran = r.stdout.count("--- ")
         self.assertEqual(ran, len(files),
                          f"ran {ran} of {len(files)} discovered files")
+
+    def test_partial_discovery_is_not_reported_as_a_clean_run(self) -> None:
+        """A `find` that prints some paths then exits nonzero (unreadable subdir) must
+        not yield a green run — a false-complete result carrying a reassuring count."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "tests").mkdir()
+            (Path(td) / "tests" / "a.test.py").write_text(PASSING)
+            bin_ = Path(td) / "bin"
+            bin_.mkdir()
+            stub = bin_ / "find"
+            stub.write_text('#!/bin/sh\n'
+                            'printf "%s\\n" tests/a.test.py\n'
+                            'echo "find: tests/locked: Permission denied" >&2\n'
+                            'exit 1\n')
+            stub.chmod(0o755)
+            r = subprocess.run(
+                ["sh", "-c", self._runner()], cwd=td,
+                env={**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"},
+                capture_output=True, text=True, timeout=120,
+            )
+        self.assertNotEqual(r.returncode, 0,
+                            "discovery exited nonzero but the run reported success")
+        self.assertNotIn("all passed", r.stdout,
+                         "a partial file list must not be summarised as all passed")
 
     def test_node_modules_is_excluded(self) -> None:
         """A vendored *.test.py must not be executed by the local runner."""
