@@ -183,6 +183,11 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
+## `src/audio-tap/`
+
+- **`build-audio-tap.sh`** — Builds and ad-hoc-signs sys-audio-tap.
+- **`sys-audio-tap.swift`** — sys-audio-tap <out.wav> — records system audio via a Core Audio process tap until SIGINT/SIGTERM.
+
 ## `src/launchd/`
 
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.

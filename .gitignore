@@ -131,3 +131,4 @@ ag2-onboarding.txt
 coverage.xml
 diff-cover.md
 coverage-summary.md
+src/audio-tap/sys-audio-tap

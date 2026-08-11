@@ -256,15 +256,18 @@ class TestCaptureVideoRouting(unittest.TestCase):
         self.mod._active_recording = {
             "proc": FailingStopProc(),
             "path": "/unused/failed-recording.mov",
+            "video_path": "/unused/failed-recording.mov",
             "watchdog": None,
         }
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._get("/capture-video?action=stop&silent=true", token=self.token)
         self.assertEqual(ctx.exception.code, 500)
         self.assertEqual(ctx.exception.headers.get_content_type(), "application/json")
+        # _finalize_recording continues past a wait() failure, so no video
+        # lands and the outer empty-file check is what actually fires.
         self.assertEqual(
             json.loads(ctx.exception.read()),
-            {"status": "error", "error": "stop failed"},
+            {"status": "error", "error": "recording produced no file"},
         )
         ctx.exception.close()
 
@@ -272,6 +275,7 @@ class TestCaptureVideoRouting(unittest.TestCase):
         self.mod._active_recording = {
             "proc": EmptyStopProc(),
             "path": "/unused/empty-recording.mov",
+            "video_path": "/unused/empty-recording.mov",
             "watchdog": None,
         }
         with self.assertRaises(urllib.error.HTTPError) as ctx:
