@@ -206,13 +206,8 @@ def _live_log_lines() -> "tuple[int, int]":
 
 
 def case_run_does_not_touch_the_live_workspace():
-    """The harness must isolate the workspace, not just tmux/claude.
-
-    start-cli.sh stamps `state/session-starts.log` on every session it creates
-    and `logs/restart-attempts.log` on every --restart. A stub run that reaches
-    the live copies fabricates a session boundary newer than the real
-    /schedule-crons stamp, and health-check's `session-crons` probe then reports
-    every still-registered cron as gone with an old session."""
+    """start-cli.sh stamps state/session-starts.log and logs/restart-attempts.log;
+    a stub run reaching the live copies fabricates a real-looking session boundary."""
     before = _live_log_lines()
     _run(restart=True, session=True, core=True)
     after = _live_log_lines()

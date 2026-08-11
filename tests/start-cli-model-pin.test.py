@@ -13,8 +13,8 @@ SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
 
 
 def _isolated_workspace(td: Path) -> str:
-    """A redirected workspace must exist WITH its state/ dir: start-cli.sh writes
-    <ws>/state/core-supervisor-relay-loop.pid and aborts under set -e if it cannot."""
+    """A redirected workspace needs its state/ dir: start-cli.sh writes
+    <ws>/state/core-supervisor-relay-loop.pid and aborts under set -e without it."""
     ws = td / "workspace"
     (ws / "state").mkdir(parents=True, exist_ok=True)
     return str(ws)
