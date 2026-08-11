@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import re
 
-# Separator is whitespace or `=`; KEY stops at the first space/`=` so `=` isn't swallowed.
-# Group numbering: key=group(1), value alternatives=groups 2-5 (separator non-capturing).
+# Separator is whitespace or `=`; KEY stops at the first space/`=` so `=` isn't swallowed. Unquoted
+# value is lazy with an optional trailing-punctuation lookahead so `.,!?;` isn't captured into the secret.
 VAULT_SET_RE = re.compile(
-    r'\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))'
-    r'(?=\s|$|[.,!?;])',
+    r'\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+?))'
+    r'(?=[.,!?;]?(?:\s|$))',
     re.IGNORECASE,
 )
 
