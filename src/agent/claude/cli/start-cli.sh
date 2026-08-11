@@ -181,7 +181,12 @@ fi
 # into the workspace tree rather than the global ~/.claude/.
 #
 # Defense in depth:
-#   - M0 helper missing → silent fallback (legacy install, extracted tarball).
+#   - M0 helper missing → refuse to start. The helper ships in this repo beside
+#     this script, so its absence means an incomplete checkout, not a supported
+#     layout. Falling back silently would leave CLAUDE_CONFIG_DIR unset and send
+#     the core to ~/.claude — a DIFFERENT credential store than every other
+#     Sutando process here, which surfaces as an unrecoverable 401 loop rather
+#     than as the install error it actually is.
 #   - Helper present + config valid → export env for every claude invocation
 #     below (no-tmux fallback at L~75, TTY exec at L~115, no-TTY detached at
 #     L~120 all inherit it).
@@ -328,6 +333,11 @@ PY
     exit 1
   fi
   rm -f "$_ccd_err"
+else
+  echo "start-cli: $REPO/scripts/sutando-config.sh missing or not executable — refusing to start core" >&2
+  echo "  CLAUDE_CONFIG_DIR would go unset and the core would read ~/.claude instead of the" >&2
+  echo "  workspace config dir, i.e. a different credential store. Re-run once the install completes." >&2
+  exit 1
 fi
 
 # NO --model flag: the core inherits the user's global model, so 1M stays the
