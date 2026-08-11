@@ -6,11 +6,24 @@ on:
   push:
     branches: [main, staging-interaction-planes]
 
+# Tests must never emit product telemetry (no PostHog writes from CI).
+env:
+  SUTANDO_TELEMETRY: "0"
+
 jobs:
   typecheck-and-test:
     name: tsc + tests (clean install)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 20, not 10: measured 2026-08-03, this job is at capacity on legitimate work,
+    # not hanging. Run 30801403218 spent 3.9 min (node tests) + 3.2 min (python) +
+    # 1.5 min (shell, cut off) + ~1.4 min setup = 10.0 min and was CANCELED mid-step.
+    # Three of the last four canceled runs are this job at exactly 10.2 min.
+    # A canceled job renders as `fail` in `gh pr checks`, so PRs read red for a
+    # reason that has nothing to do with their code (#1414, #2561 both hit this).
+    # Safe to raise only because every suite loop is now individually bounded at
+    # 120s (shell already was; the python loop is bounded in this same PR) — so a
+    # genuine hang still surfaces in ~2 min, not in 20.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -100,10 +113,16 @@ jobs:
       # discover it — wire both explicitly here. `--all --strict` validates every
       # skills/*/manifest.json (the path skills/MANIFEST.md documents) and fails on
       # warnings (e.g. a network permission that doesn't match the code).
+      # Each call is wrapped in `timeout -k 5 120` for the same reason as the
+      # discovered-suite loops below: this job's timeout-minutes is the only
+      # other bound, so an unbounded hang here burns the whole job budget and
+      # the job is CANCELED mid-step — which renders as `fail` and hides which
+      # suite hung. These two steps are hand-wired lists rather than loops, so
+      # they were missed when the loops were bounded.
       - name: Lint skill manifests
         run: |
-          python3 scripts/lint-skill.test.py
-          python3 scripts/lint-skill.py --all --strict
+          timeout -k 5 120 python3 scripts/lint-skill.test.py
+          timeout -k 5 120 python3 scripts/lint-skill.py --all --strict
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
       # `find tests -name '*.test.py'` step below. Same reason the skill-manifest
@@ -114,20 +133,21 @@ jobs:
       # which is the guard against src/ and the package silently diverging.
       - name: Run out-of-tree Python tests
         run: |
-          python3 src/remote-gateway-bridge.test.py
-          python3 packages/ag2-sparrow/tests/test_gateway_status.py
-          python3 packages/ag2-sparrow/tests/test_dns_timeout.py
-          python3 packages/ag2-sparrow/tests/test_ack_retry.py
-          python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
-          python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
-          python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
-          python3 packages/ag2-sparrow/tests/test_event_consumer.py
-          python3 packages/ag2-sparrow/tests/test_event_wiring.py
-          python3 packages/ag2-sparrow/tests/test_human_action.py
-          python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
-          python3 packages/ag2-sparrow/tools/test_no_drift.py
-          python3 skills/agent-room-ops/test_room_ops.py
-          python3 skills/make-viral-video/scripts/test_source_tag.py
+          timeout -k 5 120 python3 src/remote-gateway-bridge.test.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_human_action.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_vault_token_tier.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
+          timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
+          timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py
 
       - name: Run tests
         run: npm test
@@ -163,7 +183,13 @@ jobs:
             # shell-test step below already uses this idiom for exactly this reason;
             # this step was missed. (Observed on a real CI run: a failure printed no
             # output at all, making it undiagnosable from the log.)
-            output=$(python3 "$f" 2>&1) && rc=0 || rc=$?
+            # `timeout -k 5 120` mirrors the shell loop below. Without it a single
+            # hanging Python suite burns the job's whole timeout-minutes budget and
+            # gets the job CANCELED mid-suite — the exact failure the shell loop's
+            # comment says its own bound exists to prevent. This loop never had one,
+            # so the guard was asymmetric. On overrun timeout SIGTERMs (SIGKILL after
+            # 5s) and returns 124, failing that suite loudly and in isolation.
+            output=$(timeout -k 5 120 python3 "$f" 2>&1) && rc=0 || rc=$?
             # Always show FAIL lines and summary
             echo "$output" | grep -E 'FAIL|^Results:' || true
             if [ "$rc" -ne 0 ]; then

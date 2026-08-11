@@ -46,8 +46,16 @@ For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g
 
    **Step 2b — `.sending` contract clarification** (per qingyun-sutando review of #1074):
    - `results/<id>.txt` (no suffix) → task completed AND result body written. **DONE.**
-   - `results/<id>.txt.sending` → the discord-bridge picked the result up and is mid-delivery (per #1046/#1048's lifecycle). Treat as **DONE** for orphan-check purposes — the bridge already owns post-crash recovery for these via its own startup `.sending` sweep, so we don't second-guess. Read-only either way.
-   - `results/proactive-<id>.txt[.sending]` → same pattern for proactive DMs.
+   - `results/proactive-<id>.txt[.sending]` → the bridge claimed the proactive DM by rename and is mid-delivery. Treat as **DONE** for orphan-check purposes — the bridge owns post-crash recovery via its own startup `.sending` sweep, so we don't second-guess. Read-only either way.
+   - **`results/<id>.txt.sending` (a TASK result) does not occur — do not classify on it.** Every claim-by-rename site gates on the proactive family *before* applying the suffix, so no `task-*` result is ever renamed:
+
+     | site | gate applied before `.sending` |
+     |---|---|
+     | `src/discord-bridge.py` claim loop | `f.name.startswith("proactive-")` |
+     | `src/slack-bridge.py` claim loop | `f.name.startswith("proactive-")` |
+     | `src/telegram-bridge.py` claim loop | `PROACTIVE_PREFIXES` = `("proactive-", "briefing-", "insight-", "friction-")` |
+
+     This line previously described the task form as a live mid-delivery state. It is a dead branch, and not a harmless one: on 2026-08-02 it was cited as a real completion namespace while reviewing #2525, which would have added handling for a case that cannot arise. `tests/sending-suffix-is-proactive-only.test.py` pins the invariant; if a future change *does* start claiming task results by rename, that test fails and this row must be restored **with the producing site named**.
 
 3. **Compute age** — use the IMMUTABLE arrival time, NOT file mtime (mtime gets reset by rsync, `git checkout`, `touch`, or workspace sync, which would make a genuinely old orphan look FRESH and re-fire its side effect — exactly the bug this skill exists to prevent):
    - Preferred: parse the header `timestamp:` ISO field → `task_age_s = now - parse(timestamp)`.

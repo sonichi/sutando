@@ -24,9 +24,10 @@ Fail-OPEN, ALWAYS. Telemetry must never break a tool: any error (bad stdin,
 missing telemetry module, network) is swallowed and the hook exits 0 with no
 output. A PostToolUse observability hook has no decision to make — it observes.
 
-Registration: ``build-hook-settings.mjs`` registers this repo file's absolute
-path under PostToolUse for the ``Skill`` matcher. Repo root is found from this
-file's location, or via ``$SUTANDO_REPO_ROOT`` for tests.
+Registration: ``start-cli.sh`` passes this repo file's absolute path to
+``build-core-settings.mjs``, which registers it under PostToolUse for the
+``Skill`` matcher independently of the observability opt-in. Repo root is found
+from this file's location, or via ``$SUTANDO_REPO_ROOT`` for tests.
 """
 import sys
 import os

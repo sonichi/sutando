@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""`_index_growth_note` — the trend appended to the memory-index warning.
+
+The probe it feeds warned "approaching the session read limit" for hours on
+2026-08-04 and was read as scenery, correctly: a level that never moves carries
+no information about whether the cut is a week away or an hour. These cases pin
+the two things the level cannot say, and the two ways the note must stay quiet.
+
+The over-cap case is the one that matters most. The first draft computed
+`LOAD_BYTES - peak`, which goes NEGATIVE once peak exceeds the cap and printed
+"came within -156 B of the cut" — so the one history that proves real loss
+rendered as the calmest wording in the message. `test_over_cap_*` fails on that
+draft.
+"""
+from __future__ import annotations
+import importlib.util
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SRC = REPO / "src" / "health-check.py"
+
+
+def _hc():
+    spec = importlib.util.spec_from_file_location("hc_trend_test", SRC)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+
+
+def _repo_with_sizes(tmp: Path, sizes: "list[int]") -> Path:
+    """A git repo whose MEMORY.md is committed once per entry in `sizes`."""
+    repo = tmp / "vault"
+    repo.mkdir()
+    _git(repo.parent, "init", "-q", str(repo))
+    _git(repo, "config", "user.email", "t@e")
+    _git(repo, "config", "user.name", "t")
+    idx = repo / "MEMORY.md"
+    for i, n in enumerate(sizes):
+        idx.write_text("x" * n)
+        _git(repo, "add", "MEMORY.md")
+        # distinct, increasing author dates so the window spans real hours
+        env_date = f"2026-08-03T{i:02d}:00:00"
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", f"c{i}",
+             "--date", env_date],
+            check=True, capture_output=True,
+            env={**__import__("os").environ, "GIT_COMMITTER_DATE": env_date},
+        )
+    return idx
+
+
+class OverCapIsNamedAsLoss(unittest.TestCase):
+    def test_over_cap_says_already_exceeded_and_never_a_negative(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [cap - 300, cap + 156, cap - 500])
+            note = m._index_growth_note(idx, cap - 500)
+        self.assertIn("ALREADY EXCEEDED", note)
+        self.assertIn("156", note)
+        # the sign error this test exists for
+        self.assertNotIn("-156", note)
+        self.assertNotIn("came within -", note)
+
+    def test_near_but_under_cap_says_came_within(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [cap - 2000, cap - 12, cap - 900])
+            note = m._index_growth_note(idx, cap - 900)
+        self.assertIn("came within", note)
+        self.assertNotIn("ALREADY EXCEEDED", note)
+        self.assertNotIn("-", note.split("came within")[1][:12])
+
+
+class FailsOpen(unittest.TestCase):
+    """A trend is a nicety; suppressing the level would be a regression."""
+
+    def test_not_a_git_repo_returns_empty(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x" * 100)
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_single_commit_is_not_a_trend(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [1000])
+            self.assertEqual(m._index_growth_note(idx, 1000), "")
+
+    def test_missing_file_returns_empty(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(
+                m._index_growth_note(Path(td) / "nope" / "MEMORY.md", 100), "")
+
+
+class TheHelperCanActuallyFire(unittest.TestCase):
+    """Control. Every assertion above is about STRING CONTENT, so a helper that
+    returned "" unconditionally would satisfy the fail-open cases and give the
+    suite a green half. This is the case that must produce a non-empty note, so
+    the negatives above mean something."""
+
+    def test_a_real_history_produces_a_non_empty_note(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [cap - 3000, cap + 10, cap - 800])
+            note = m._index_growth_note(idx, cap - 800)
+        self.assertTrue(note.strip(), "the helper produced nothing on a real history")
+
+
+class DefensiveBranches(unittest.TestCase):
+    """The skip/except paths. They are REACHABLE — a rewritten history, a gc'd
+    object, a git that is not installed — so covering them with a stub is honest
+    where `pragma: no cover` would only be evading the gate."""
+
+    class _Proc:
+        def __init__(self, out="", rc=0):
+            self.stdout = out
+            self.returncode = rc
+
+    def test_unparsable_log_line_is_skipped(self):
+        m = _hc()
+        calls = {"n": 0}
+
+        def fake_run(argv, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # one malformed line (no epoch), one good line -> <2 points -> ""
+                return self._Proc("deadbeef notanumber\n")
+            return self._Proc("", 0)
+
+        m.subprocess = type("S", (), {
+            "run": staticmethod(fake_run),
+            "SubprocessError": Exception,
+        })
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x")
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_a_truncated_batch_stream_stops_cleanly(self):
+        """`--batch` output that ends mid-record (a killed git, a short pipe).
+        The walker must stop rather than index past the buffer."""
+        m = _hc()
+        state = {"first": True}
+
+        def fake_run(argv, **kw):
+            if state["first"]:
+                state["first"] = False
+                return self._Proc("aaa 1000\nbbb 2000\n")
+            return self._Proc(b"", 0)          # header never arrives
+
+        m.subprocess = type("S", (), {"run": staticmethod(fake_run),
+                                      "SubprocessError": Exception})
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"; idx.write_text("x")
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_an_object_cat_file_reports_missing_is_skipped(self):
+        """`cat-file --batch-check` does NOT fail on a bad spec — it prints
+        "<spec> missing" and exits 0. So the skip has to be driven by parsing
+        the line, not by a return code. An earlier revision of this test stubbed
+        a non-zero exit instead; it still passed, because it hit the batch-level
+        early return rather than this branch — a test can keep passing while
+        silently ceasing to test the thing it names."""
+        m = _hc()
+        state = {"first": True}
+
+        def fake_run(argv, **kw):
+            if state["first"]:
+                state["first"] = False
+                return self._Proc("aaa 1000\nbbb 2000\n")
+            return self._Proc(b"aaa:./MEMORY.md missing\nbbb:./MEMORY.md missing\n", 0)
+
+        m.subprocess = type("S", (), {
+            "run": staticmethod(fake_run),
+            "SubprocessError": Exception,
+        })
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x")
+            # both objects skipped -> 0 points -> ""
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_a_failing_batch_returns_empty(self):
+        m = _hc()
+        state = {"first": True}
+
+        def fake_run(argv, **kw):
+            if state["first"]:
+                state["first"] = False
+                return self._Proc("aaa 1000\nbbb 2000\n")
+            return self._Proc("", 1)           # the batch itself fails
+
+        m.subprocess = type("S", (), {
+            "run": staticmethod(fake_run),
+            "SubprocessError": Exception,
+        })
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x")
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_git_unavailable_is_swallowed(self):
+        m = _hc()
+
+        def boom(*a, **k):
+            raise m.GitUnavailable("no git here")
+
+        m.git_argv = boom
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x")
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+
+class HistoricalBytesUseTheSAMEUnitsAsTheLimit(unittest.TestCase):
+    """The blocker john-the-dev and qingyun-wu each reproduced independently.
+
+    `effective_bytes` — the live level — comes from `_index_effective_text`,
+    which strips frontmatter and whole-line HTML comments BEFORE the runtime
+    measures its 25KB cap. An earlier revision of the helper measured historical
+    revisions as RAW blob length, so a revision whose bulk sits inside
+    `<!-- ... -->` read as far over the cap while being tiny to the runtime, and
+    the note claimed "ALREADY EXCEEDED ... entries were dropped then".
+
+    A false claim of proven loss, in a note whose whole purpose is that the
+    reported number describes the artifact. This case fails on that revision.
+    """
+
+    def test_a_comment_only_over_cap_revision_is_not_reported_as_loss(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        # raw: way over cap. effective: seven bytes.
+        fat = "<!--\n" + ("x" * (cap + 5000)) + "\n-->\n# live\n"
+        lean = "# live\n"
+        self.assertGreater(len(fat.encode()), cap)
+        self.assertLess(len(m._index_effective_text(fat).encode()), 200)
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "vault"; repo.mkdir()
+            _git(repo.parent, "init", "-q", str(repo))
+            _git(repo, "config", "user.email", "t@e"); _git(repo, "config", "user.name", "t")
+            idx = repo / "MEMORY.md"
+            import os
+            for i, text in enumerate((fat, lean)):
+                idx.write_text(text)
+                _git(repo, "add", "MEMORY.md")
+                d = f"2026-08-03T{i:02d}:00:00"
+                subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", f"c{i}", "--date", d],
+                               check=True, capture_output=True,
+                               env={**os.environ, "GIT_COMMITTER_DATE": d})
+            note = m._index_growth_note(idx, len(m._index_effective_text(lean).encode()))
+
+        self.assertNotIn("ALREADY EXCEEDED", note,
+                         "a comment-only revision is tiny to the runtime; claiming entries "
+                         "were dropped there is a false claim of proven loss")
+        self.assertNotIn("came within", note)
+
+
+if __name__ == "__main__":
+    unittest.main()

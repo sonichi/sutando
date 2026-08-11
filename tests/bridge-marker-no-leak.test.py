@@ -26,6 +26,7 @@ Exit: 0 on pass, 1 on fail.
 """
 
 from pathlib import Path
+import re
 import sys
 
 REPO = Path(__file__).resolve().parent.parent
@@ -112,6 +113,23 @@ def main() -> int:
                 f"ag2_sparrow/remote_gateway_bridge.py still has hand-rolled skip check {hand_rolled!r} — "
                 "must route through parse_markers() per #873"
             )
+    # Name-independent grammar ban (mirrors the src/ consumer loop below): the
+    # proactive drain once compiled its own `[channel:...]` regex, which this
+    # guard waved through because only the four src/ bridges were scanned.
+    # Destination-FORMAT validation (e.g. a Matrix `!room:server` shape) is
+    # legitimately local; recognizing the marker grammar itself is not.
+    for m in re.finditer(r"re\.compile\((.{0,120}?)\)", gb_src, re.S):
+        literal = m.group(1)
+        if (
+            "channel:" in literal
+            or "dm-only" in literal
+            or re.search(r"file\s*\|\s*send\s*\|\s*attach", literal)
+        ):
+            return fail(
+                f"ag2_sparrow/remote_gateway_bridge.py compiles a local marker "
+                f"regex ({literal.strip()[:60]}...) — the marker grammar belongs "
+                "solely to result_markers.py; route through parse_markers()"
+            )
 
     # 4. Behavior smoke test of the parser itself
     sys.path.insert(0, str(REPO / "src"))
@@ -137,6 +155,118 @@ def main() -> int:
         return fail(f"parse_markers leaked [file:] marker into body: {r.body!r}")
     if not any(a.kind == "attach" for a in r.actions):
         return fail("parse_markers did not emit an attach action")
+
+    # ---- Adoption guards: no consumer may re-define the marker grammar ----
+    # Scoped deliberately to the delivery consumers. A repo-wide ban would
+    # reject docs, tests, and unrelated protocols, so keep this file-specific.
+    #
+    # Telegram was previously a KNOWN GAP here: send_reply() compiled its own
+    # file|send|attach regex, so it stripped attachment markers but left every
+    # other marker in the body — and poll_proactive() passes raw result text,
+    # leaking [dm-only]/[channel:] to the owner. send_reply() now derives
+    # attachments from parse_markers() actions, so Telegram is in scope.
+    #
+    # Slack was omitted from this tuple while src/slack-bridge.py still carried
+    # a dead module-scope FILE_MARKER_RE. Delivery already went through
+    # parse_markers(), so nothing misbehaved — but the guard stayed green over a
+    # live drift artifact that a future edit could revive. Regex removed and
+    # Slack added here, so all four delivery consumers are enforced.
+    consumers = (
+        "src/discord-bridge.py",
+        "src/dm-result.py",
+        "src/telegram-bridge.py",
+        "src/slack-bridge.py",
+    )
+    for rel in consumers:
+        src = (REPO / rel).read_text()
+        if "_FILE_MARKER_RE" in src:
+            return fail(
+                f"{rel} defines/uses _FILE_MARKER_RE — the attachment-marker "
+                "grammar belongs solely to src/result_markers.py",
+                rel,
+            )
+        if "def _split_file_markers" in src:
+            return fail(
+                f"{rel} defines _split_file_markers() — derive attachments from "
+                'parse_markers() actions with kind == "attach" instead',
+                rel,
+            )
+        # Name-independent check. The two guards above only catch the grammar
+        # when it is spelled with those exact identifiers; Telegram's drift was
+        # an anonymous `file_pattern = re.compile(r'\[(?:file|send|attach)...')`,
+        # which both would have waved through. Match the GRAMMAR itself in any
+        # regex literal so a renamed local parser cannot reintroduce the drift.
+        for m in re.finditer(r"re\.compile\((.{0,120}?)\)", src, re.S):
+            literal = m.group(1)
+            if re.search(r"file\s*\|\s*send\s*\|\s*attach", literal) or (
+                "attach:" in literal and "file:" in literal
+            ):
+                return fail(
+                    f"{rel} compiles a local attachment-marker regex "
+                    f"({literal.strip()[:60]}...) — the marker grammar belongs "
+                    "solely to src/result_markers.py; derive attachments from "
+                    'parse_markers() actions with kind == "attach"',
+                    rel,
+                )
+
+    # dm-result.py must actually USE the canonical parser for delivery prep,
+    # not merely import it for skip markers.
+    dm = (REPO / "src" / "dm-result.py").read_text()
+    if "from result_markers import parse_markers" not in dm:
+        return fail("dm-result.py does not import parse_markers from result_markers")
+    if "parse_markers(text)" not in dm:
+        return fail("dm-result.py does not call parse_markers(text) for delivery preparation")
+    if 'kind == "attach"' not in dm:
+        return fail(
+            'dm-result.py does not derive attachments from actions with kind == "attach"'
+        )
+
+    # 5. The architecture doc must not describe a CONFORMING consumer as an
+    # un-migrated drift instance. Section 1-4 above enforce the consumer set in
+    # code; this keeps the prose maintainers actually read from drifting out of
+    # sync with it. Regression: PR #2551 migrated telegram-bridge.py to
+    # parse_markers and updated CLAUDE.md, but left
+    # docs/architecture-boundaries.md asserting telegram-bridge.py "still
+    # compiles a local file|send|attach regex" — pointing maintainers at an
+    # already-closed gap. Paragraph-scoped rather than sentence-scoped because
+    # the claim spans a colon ("telegram-bridge.py does not: ... still
+    # compiles ...") and sentence splitting severs subject from predicate.
+    consumers = {
+        "discord-bridge.py": REPO / "src" / "discord-bridge.py",
+        "slack-bridge.py": REPO / "src" / "slack-bridge.py",
+        "telegram-bridge.py": REPO / "src" / "telegram-bridge.py",
+        "dm-result.py": REPO / "src" / "dm-result.py",
+    }
+    conforming = {
+        name
+        for name, path in consumers.items()
+        if path.is_file() and "from result_markers import parse_markers" in path.read_text()
+    }
+
+    doc_path = REPO / "docs" / "architecture-boundaries.md"
+    if not doc_path.is_file():
+        return fail("docs/architecture-boundaries.md is missing")
+
+    # Per-consumer non-conformance assertions. Deliberately NOT including
+    # paragraph-level hedges like "conformance is partial": those describe the
+    # section, not a named consumer, and matching them flags conforming
+    # consumers that the same paragraph correctly lists as conforming.
+    non_conformance_claims = (
+        "does not:",
+        "still compiles a",
+        "live instance of the drift",
+    )
+    for para in doc_path.read_text().split("\n\n"):
+        flat = " ".join(para.split())
+        if not any(claim in flat for claim in non_conformance_claims):
+            continue
+        named = sorted(n for n in conforming if n in flat)
+        if named:
+            return fail(
+                "docs/architecture-boundaries.md describes a consumer as un-migrated, "
+                f"but it imports parse_markers: {', '.join(named)}",
+                flat,
+            )
 
     print("PASS: bridges route marker decisions through parse_markers + parser strips all markers from body.")
     return 0
