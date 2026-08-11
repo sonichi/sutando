@@ -127,6 +127,7 @@ class TestGatewayWriterChannelId(unittest.TestCase):
                 # channel_id present → recorded + bracket prefix stripped from summary
                 gw._write_owner_activity({"task": "[AG2 @u] hi there",
                                           "source": "ag2space",
+                                          "access_tier": "owner",
                                           "channel_id": "!room:ag2.space"})
                 data = json.loads(f.read_text())
                 self.assertEqual(data["channel"], "ag2space")
@@ -134,7 +135,8 @@ class TestGatewayWriterChannelId(unittest.TestCase):
                 self.assertEqual(data["summary"], "hi there")
                 # channel_id omitted → key absent (back-compat with older readers)
                 f.unlink()
-                gw._write_owner_activity({"task": "[AG2 @u] no room", "source": "ag2space"})
+                gw._write_owner_activity({"task": "[AG2 @u] no room", "source": "ag2space",
+                                          "access_tier": "owner"})
                 self.assertNotIn("channel_id", json.loads(f.read_text()))
             finally:
                 gw.OWNER_ACTIVITY_FILE, gw.LOCAL_TIER = orig_file, orig_tier
