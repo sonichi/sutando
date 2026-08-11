@@ -1412,10 +1412,15 @@ def _check_task_timeouts() -> None:
     )
     for task_id, channel, thread_ts in to_notify:
         try:
-            _send_reply(channel, thread_ts, msg, task_id=task_id)
+            sent = _send_reply(channel, thread_ts, msg, task_id=task_id)
         except Exception as e:
             # Send failed — leave timed_out unset so the next pass retries.
             print(f"[Slack] timeout notify failed for {task_id}: {e}", flush=True)
+            continue
+        if not sent:
+            # An ordinary refusal returns False without raising; marking here
+            # would suppress this watchdog's only warning permanently.
+            print(f"[Slack] timeout notify refused for {task_id}", flush=True)
             continue
         # Notified once, successfully. Mark so we don't repeat. The entry may
         # have been popped by result_watcher if a real result landed meanwhile

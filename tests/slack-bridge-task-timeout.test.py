@@ -69,13 +69,18 @@ class TestCheckTaskTimeouts(unittest.TestCase):
         self.mod = _load_bridge(self.tmp)
         self.calls = []
         # Capture replies instead of hitting Slack.
-        self.mod._send_reply = (
-            lambda channel, thread_ts, text, task_id=None: self.calls.append(
-                {"task_id": task_id, "channel": channel, "text": text}
-            )
-        )
+        self.mod._send_reply = self._ok_sender()
         with self.mod.pending_replies_lock:
             self.mod.pending_replies.clear()
+
+    def _ok_sender(self):
+        # _send_reply is annotated `-> bool`; a stub returning None would let a
+        # truthiness gate pass for the wrong reason.
+        def _send(channel, thread_ts, text, task_id=None):
+            self.calls.append({"task_id": task_id, "channel": channel, "text": text})
+            return True
+
+        return _send
 
     def _seed(self, task_id, age_sec, **extra):
         info = {
@@ -133,11 +138,25 @@ class TestCheckTaskTimeouts(unittest.TestCase):
             )
 
         # Next pass with a working sender must retry and then mark it sent.
-        self.mod._send_reply = (
-            lambda channel, thread_ts, text, task_id=None: self.calls.append(
-                {"task_id": task_id, "channel": channel, "text": text}
+        self.mod._send_reply = self._ok_sender()
+        self.mod._check_task_timeouts()
+        self.assertEqual([c["task_id"] for c in self.calls], ["task-old"])
+        with self.mod.pending_replies_lock:
+            self.assertTrue(self.mod.pending_replies["task-old"]["timed_out"])
+
+    def test_refusal_without_exception_retries(self):
+        """A Slack refusal returns False without raising; treating that as a
+        successful send suppresses this watchdog's only warning permanently."""
+        self._seed("task-old", 700)
+        self.mod._send_reply = lambda channel, thread_ts, text, task_id=None: False
+        self.mod._check_task_timeouts()
+        with self.mod.pending_replies_lock:
+            self.assertFalse(
+                self.mod.pending_replies["task-old"]["timed_out"],
+                "a False return must leave timed_out unset so the next pass retries",
             )
-        )
+
+        self.mod._send_reply = self._ok_sender()
         self.mod._check_task_timeouts()
         self.assertEqual([c["task_id"] for c in self.calls], ["task-old"])
         with self.mod.pending_replies_lock:
