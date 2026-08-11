@@ -241,7 +241,10 @@ def _claude_tier_settings(team_workspace: Path, runtime_dir: Optional[Path] = No
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
             "filesystem": {
-                "denyRead": [str(Path.home())],
+                # Credentials must be read-denied at the sandbox boundary, not only via
+                # Read()/Edit() rules — those bind tools, and Bash is allowed, so `cat .env`
+                # would otherwise bypass them.
+                "denyRead": [str(Path.home()), *credential_files],
                 "allowRead": [str(team_workspace), str(runtime_dir)],
                 "denyWrite": [str(Path.home()), *credential_files],
                 "allowWrite": [str(team_workspace), str(runtime_dir)],

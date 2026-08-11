@@ -182,6 +182,8 @@ def test_team_capability_root_is_the_owner_configured_workspace() -> None:
         (owner_workspace / "project").mkdir()
         workspace_npmrc = owner_workspace / "project" / ".npmrc"
         workspace_npmrc.write_text("token=blocked\n")
+        workspace_env = owner_workspace / ".env"
+        workspace_env.write_text("API_KEY=blocked\n")
 
         claude_log = root / "claude.json"
         _executable(root / "claude", """#!/usr/bin/env python3
@@ -207,6 +209,12 @@ print(json.dumps({'type': 'result', 'result': 'bounded claude result'}))
         assert str(owner_workspace) in settings["sandbox"]["filesystem"]["allowWrite"]
         assert str(REPO) not in settings["sandbox"]["filesystem"]["allowWrite"]
         assert str(workspace_npmrc) in settings["sandbox"]["filesystem"]["denyWrite"]
+        # Read-deny must hold at the sandbox boundary: Read()/Edit() deny rules bind tools,
+        # and Bash is allowed, so denyWrite alone still permits `cat .env`.
+        deny_read = settings["sandbox"]["filesystem"]["denyRead"]
+        assert str(workspace_env) in deny_read, deny_read
+        assert str(workspace_npmrc) in deny_read, deny_read
+        assert settings["permissions"]["allow"].count("Bash") == 1
         prompt = claude["args"][-1]
         assert f"team workspace at {owner_workspace}" in prompt
 
