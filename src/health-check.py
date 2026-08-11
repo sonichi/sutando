@@ -6995,6 +6995,55 @@ def check_core_model_pin() -> dict:
     return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 
+def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
+    """True when a live process matching `pgrep_pattern` has `artifact` in argv.
+
+    Bundled installs exec the compiled artifact; dev installs run the source
+    through tsx. A dev host can hold a build it never executes, so the
+    artifact comparison is gated on the running process, not on the file.
+    """
+    if not artifact.exists():
+        return False
+    try:
+        out = subprocess.run(["/usr/bin/pgrep", "-f", pgrep_pattern],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return any(str(artifact) in _proc_argv(int(pid))
+               for pid in out.split() if pid.isdigit())
+
+
+def check_credential_proxy() -> dict:
+    """Credential proxy (port 7846) — the OAuth-injection + quota-header path.
+
+    Plain TCP-listening check (probe=False): it's a forwarding proxy with no
+    liveness endpoint, so an HTTP probe would be forwarded upstream and misread
+    as "wedged". Optional (not every node routes through it) -> down is a
+    warning, not a failure.
+
+    The proxy is the service the artifact-vs-process comparison exists for: a
+    bundled host runs `node dist/credential-proxy.js`, so a redeploy under the
+    live process leaves it executing pre-deploy code while every other signal
+    reads healthy. The artifact is passed only when the running process is the
+    one executing it.
+    """
+    check = check_port(7846, "credential-proxy", probe=False)
+    if check["status"] == "down":
+        check["status"] = "warn"
+        check["detail"] = "not running (optional)"
+    elif check["status"] == "ok":
+        artifact = REPO_DIR / "dist" / "credential-proxy.js"
+        mark_stale_if_outdated(
+            check,
+            REPO_DIR / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts",
+            "credential-proxy",
+            binary_path=(artifact
+                         if _process_executes_artifact(artifact, "credential-proxy")
+                         else None),
+        )
+    return check
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -7024,17 +7073,9 @@ def run_all_checks() -> list[dict]:
         # startup.sh's lsof guard sees the port as occupied and won't restart it.
         checks.append(c)
 
-    # Credential proxy (port 7846) — the OAuth-injection + quota-header path
-    # (skills/quota-tracker/scripts/credential-proxy.ts). It was previously
-    # unmonitored, so a dead proxy (= broken auth/quota for proxy-routed cores)
-    # never surfaced on the dashboard. Plain TCP-listening check (probe=False):
-    # it's a forwarding proxy with no liveness endpoint, so an HTTP probe would
-    # be forwarded upstream and misread as "wedged". Optional (not every node
-    # routes through it) → down is a warning, not a failure.
-    proxy_check = check_port(7846, "credential-proxy", probe=False)
-    if proxy_check["status"] == "down":
-        proxy_check["status"] = "warn"
-        proxy_check["detail"] = "not running (optional)"
+    # Previously unmonitored, so a dead proxy (= broken auth/quota for
+    # proxy-routed cores) never surfaced on the dashboard.
+    proxy_check = check_credential_proxy()
     checks.append(proxy_check)
 
     # Quota telemetry — only meaningful when the proxy is actually up.
