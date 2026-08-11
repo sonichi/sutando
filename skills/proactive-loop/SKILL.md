@@ -196,7 +196,20 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    ```
    A `True` is the only proof the question exists for anyone but you.
 
-9. **Ensure the streaming watcher is running.** PID-check the watcher sentinel: if `"$WORKSPACE/state/watch-tasks-stream.pid"` is missing OR its PID is dead (`pid=$(cat "$WORKSPACE/state/watch-tasks-stream.pid" 2>/dev/null); ! kill -0 "$pid" 2>/dev/null`), restart it with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing. Don't use `pgrep -f watch-tasks` here for the same reason as `/schedule-crons` step 5 — pgrep's `-f` matches the bash wrapper's argv (which contains the literal search string) and false-positively returns a transient self-match. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 1 above.
+9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
+
+   | probe says | action |
+   |---|---|
+   | `ok` | nothing to do. |
+   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. Stop the pids it names, then start exactly one. |
+   | sentinel pid dead but **other watcher(s) still run** | same: stop the named pids, then start one. |
+   | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
+
+   **A missing sentinel is UNKNOWN, not DEAD.** The sentinel is written once at startup (`watch-tasks-stream.sh` line ~316) and removed by cleanup only when the content still matches that pid, so an absent file cannot distinguish "no watcher" from "a live watcher whose file was removed". Measured 2026-08-07 on a live core: the watcher had held one pid for ~5h, was **functioning** (it emitted `TASK_FILE:` for a probe written during the check), and the sentinel was absent from disk entirely. The instruction this step used to carry — *missing OR dead → restart* — would have attached a second watcher to that live one, and both then emit every task, so each task gets processed twice. `health-check.py` names this failure directly at its `task-watcher` probe: restarting on a dead-looking sentinel "is what produces the duplicates in the first place."
+
+   When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing.
+
+   **Don't hand-roll a process check to second-guess the probe.** `pgrep -f watch-tasks` / `ps | grep watch-tasks-stream` both match the wrapper shell that runs the check (its own argv contains the search string), so they return a pid for a transient subshell or pick the wrapper instead of the watcher — an attempt at this on 2026-08-07 reported rc=1 with the watcher demonstrably alive. `_watcher_trees()` already solves this by scoping to process trees; use its verdict via the probe.
 
 10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages (unless in #bot2bot), Zoom invites, and messages already sent by you.
 

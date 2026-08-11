@@ -861,6 +861,12 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 <div style="height:80px"></div>
 </div>
 
+<!-- The ONE canonical browser voice transport (src/web-voice-transport.ts),
+     served as a classic-script IIFE that installs the SutandoVoice global.
+     Loaded before the page script so SutandoVoice is defined when voice
+     wiring below runs. A 503 here (packaging error) logs to the console and
+     connectWs() reports it to the user. -->
+<script src="${BROWSER_TRANSPORT_ROUTE}"></script>
 <script>
 // ─── Config ───────────────────────────────────────────────
 let INPUT_RATE  = 16000;
@@ -970,7 +976,8 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ─── State ────────────────────────────────────────────────
-let ws = null;
+// Page-level AudioContext is for tool cues ONLY — the voice audio graph
+// (mic capture + playback) lives inside the canonical transport.
 let audioCtx = null;
 // Play a short, low-volume Web Audio blip to signal a tool/core invocation
 // (owner ask 2026-07-09). Reuses the AudioContext created on the call's user
@@ -1007,22 +1014,22 @@ function playToolCue(kind) {
     });
   } catch (e) {}
 }
-let micStream = null;
-let processor = null;
+// Voice session surface state. The audio pipeline + WS protocol live in the
+// canonical transport (SutandoVoice.VoiceTransport, loaded from
+// /web-voice-transport.js); the page keeps ONLY surface concerns: transcript
+// DOM, status text, stats mirror, reconnect policy, avatar analyser.
+let voice = null;               // SutandoVoice.VoiceTransport of the active session
 let connected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
-let nextPlayTime = 0;
-let analyserNode = null;
+let analyserNode = null;        // playback AnalyserNode handed over via onAnalyser
 let speakingRAF = null;
-let activeSources = [];
-let playbackRate = 1.0;
-let bytesSent = 0;
+let bytesSent = 0;              // onStats mirror (stats panel + debug dump)
 let bytesRecv = 0;
-let audioChunksRecv = 0;
-let playChunkCount = 0;
-let statsTimer = null;
 let muted = false;
+let micAnnounced = false;       // one "Microphone active" system line per session
+let cleanupDone = true;         // doCleanup idempotence latch (reset on connect)
+let _voiceUrlOverride = null;   // takeoverVoice() one-shot URL override
 
 // Chrome STT state — provides real-time interim display; server STT replaces with final
 let recognition = null;
@@ -1774,9 +1781,10 @@ hydrateTaskHistory();
 startTaskPolling();
 
 function updateStats() {
+  // Fed by the transport's onStats (byte totals). Per-chunk detail lives in
+  // the debug log via the transport's onDebug audio channel.
   $('stats').textContent =
-    'Sent ' + fmtBytes(bytesSent) + ' / Recv ' + fmtBytes(bytesRecv) +
-    ' (' + audioChunksRecv + ' chunks, ' + playChunkCount + ' played)';
+    'Sent ' + fmtBytes(bytesSent) + ' / Recv ' + fmtBytes(bytesRecv);
 }
 
 function fmtBytes(n) {
@@ -1791,7 +1799,7 @@ function saveDebug() {
     config: { INPUT_RATE, OUTPUT_RATE, CAPTURE_BUF },
     audioCtxState: audioCtx?.state ?? null,
     audioCtxSampleRate: audioCtx?.sampleRate ?? null,
-    bytesSent, bytesRecv, audioChunksRecv, playChunkCount,
+    bytesSent, bytesRecv,
     log: debugLog,
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1803,94 +1811,9 @@ function saveDebug() {
   dbg('Debug data saved');
 }
 
-// ─── PCM helpers ──────────────────────────────────────────
-function downsample(input, fromRate, toRate) {
-  if (fromRate === toRate) return input;
-  const ratio = fromRate / toRate;
-  const len = Math.floor(input.length / ratio);
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    const pos = i * ratio;
-    const idx = Math.floor(pos);
-    const frac = pos - idx;
-    out[i] = input[idx] * (1 - frac) + (input[idx + 1] || 0) * frac;
-  }
-  return out;
-}
-
-function float32ToInt16(f32) {
-  const i16 = new Int16Array(f32.length);
-  for (let i = 0; i < f32.length; i++) {
-    const s = Math.max(-1, Math.min(1, f32[i]));
-    i16[i] = s < 0 ? (s * 0x8000) | 0 : (s * 0x7FFF) | 0;
-  }
-  return i16;
-}
-
-function int16ToFloat32(buf) {
-  const view = new DataView(buf);
-  const len = buf.byteLength / 2;
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    out[i] = view.getInt16(i * 2, true) / 32768;
-  }
-  return out;
-}
-
-// ─── Audio playback (gapless scheduling) ──────────────────
-function playChunk(arrayBuf) {
-  if (!audioCtx || audioCtx.state === 'closed') {
-    try {
-      audioCtx = new AudioContext();
-      dbg('playChunk: created new AudioContext: ' + audioCtx.sampleRate + ' Hz');
-    } catch (e) {
-      dbg('playChunk: failed to create AudioContext: ' + e, 'err');
-      return;
-    }
-  }
-  if (audioCtx.state === 'suspended') {
-    audioCtx.resume();
-    dbg('playChunk: resumed suspended audioCtx');
-  }
-
-  const f32 = int16ToFloat32(arrayBuf);
-  if (f32.length === 0) return;
-
-  try {
-    const audioBuf = audioCtx.createBuffer(1, f32.length, OUTPUT_RATE);
-    audioBuf.getChannelData(0).set(f32);
-
-    const src = audioCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.playbackRate.value = playbackRate;
-    if (!analyserNode) {
-      analyserNode = audioCtx.createAnalyser();
-      analyserNode.fftSize = 256;
-      analyserNode.connect(audioCtx.destination);
-      startSpeakingDetection();
-    }
-    src.connect(analyserNode);
-
-    const now = audioCtx.currentTime;
-    if (nextPlayTime < now) {
-      nextPlayTime = now + 0.05;
-    }
-    src.start(nextPlayTime);
-    nextPlayTime += audioBuf.duration / playbackRate;
-    activeSources.push(src);
-    src.onended = () => {
-      const idx = activeSources.indexOf(src);
-      if (idx >= 0) activeSources.splice(idx, 1);
-    };
-    playChunkCount++;
-
-    if (playChunkCount <= 5) {
-      dbg('Played chunk #' + playChunkCount + ': ' + f32.length + ' samples, scheduled at ' + nextPlayTime.toFixed(3) + 's (ctx.state=' + audioCtx.state + ')', 'audio');
-    }
-  } catch (err) {
-    dbg('playChunk error: ' + err.message, 'err');
-  }
-}
+// PCM DSP + gapless playback live in the canonical transport
+// (SutandoVoice — src/web-voice-transport.ts). The page receives the
+// playback AnalyserNode via onAnalyser for the avatar animation below.
 
 // ─── Speaking detection (avatar animation) ────────────────
 function startSpeakingDetection() {
@@ -2004,288 +1927,105 @@ function stopSpeakingDetection() {
   if (canvas) { var ctx = canvas.getContext('2d'); if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height); }
 }
 
-// ─── Microphone capture ───────────────────────────────────
-async function startMic() {
-  // Check if getUserMedia is available (requires HTTPS or localhost)
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    const isLocalhost = window.location.hostname === 'localhost' || 
-                       window.location.hostname === '127.0.0.1' ||
-                       window.location.hostname === '[::1]';
-    const isHttps = window.location.protocol === 'https:';
-    
-    if (!isLocalhost && !isHttps) {
-      throw new Error('Microphone access requires HTTPS. Please access this page via HTTPS (https://your-domain.com) or use localhost. Modern browsers block getUserMedia on HTTP for security.');
-    } else {
-      throw new Error('Microphone access is not available in this browser. Please use a modern browser that supports getUserMedia.');
-    }
-  }
+// ─── Voice session wiring (canonical transport) ───────────
+// Mic capture, playback, WS protocol, connect timeout, and failure
+// classification all live in SutandoVoice.VoiceTransport (the canonical
+// src/web-voice-transport.ts served at /web-voice-transport.js). The page
+// supplies callbacks for its surface concerns and keeps reconnect policy.
 
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    }
-  });
-
-  const trackSettings = micStream.getAudioTracks()[0].getSettings();
-  dbg('Mic stream: ' + (trackSettings.sampleRate || '?') + ' Hz, device=' + (trackSettings.deviceId || '?').slice(0, 8));
-
-  // Reuse AudioContext created in toggle() on user gesture
-  if (!audioCtx || audioCtx.state === 'closed') {
-    audioCtx = new AudioContext();
-    dbg('Created new AudioContext: ' + audioCtx.sampleRate + ' Hz');
-  }
-  dbg('AudioContext state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
-
-  if (audioCtx.state === 'suspended') {
-    await audioCtx.resume();
-    dbg('AudioContext resumed');
-  }
-
-  const source = audioCtx.createMediaStreamSource(micStream);
-
-  processor = audioCtx.createScriptProcessor(CAPTURE_BUF, 1, 1);
-  let sendCount = 0;
-  processor.onaudioprocess = (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const raw = e.inputBuffer.getChannelData(0);
-    const down = downsample(raw, audioCtx.sampleRate, INPUT_RATE);
-    const pcm = float32ToInt16(down);
-    ws.send(pcm.buffer);
-    bytesSent += pcm.buffer.byteLength;
-    sendCount++;
-    if (sendCount <= 3) {
-      dbg('Sent mic #' + sendCount + ': ' + pcm.buffer.byteLength + 'B (' + down.length + ' samples @ ' + INPUT_RATE + 'Hz)', 'audio');
-    }
-  };
-
-  source.connect(processor);
-  const silence = audioCtx.createGain();
-  silence.gain.value = 0;
-  processor.connect(silence);
-  silence.connect(audioCtx.destination);
-
-  dbg('Mic capture started');
-  reconnectAttempts = 0;
-  addSystem('Microphone active — speak now.');
-
-  // Start Chrome STT for real-time interim display (server final replaces)
-  startChromeStt();
-}
-
-function stopMic() {
-  stopChromeStt();
-  if (processor) { processor.disconnect(); processor = null; }
-  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  // Don't close audioCtx here — playback may still be draining
-}
-
-// ─── WebSocket ────────────────────────────────────────────
 function connectWs() {
-  const url = $('wsUrl').value.trim();
+  const url = _voiceUrlOverride || $('wsUrl').value.trim();
+  _voiceUrlOverride = null;
   if (!url) return;
+  if (typeof SutandoVoice === 'undefined' || !SutandoVoice.VoiceTransport) {
+    // The classic <script> for /web-voice-transport.js failed (packaging
+    // error → 503; console already has the server-side reason).
+    setStatus('Voice unavailable', 'error');
+    addSystem('Voice transport failed to load (/web-voice-transport.js) — check the server logs, then reload this page.');
+    doCleanup({ keepStatus: true });
+    return;
+  }
 
   dbg('Connecting to ' + url);
   setStatus('Connecting...', '');
 
-  ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
+  voice = new SutandoVoice.VoiceTransport({
+    captureBuf: CAPTURE_BUF,
+    inputRate: INPUT_RATE,
+    outputRate: OUTPUT_RATE,
+    onStatus: onVoiceStatus,
+    onConnectFailure: onVoiceConnectFailure,
+    onDebug: function (msg, kind) { dbg(msg, kind); },
+    onTranscript: function (role, text, partial) { handleTranscript(role, text, partial); },
+    // turn.end and turn.interrupted need the same per-turn transcript reset
+    // here; the transport already handles the barge-in playback flush itself.
+    onTurnEnd: resetTurnTranscriptState,
+    onInterrupted: resetTurnTranscriptState,
+    onSessionConfig: function (inRate, outRate) {
+      INPUT_RATE = inRate;
+      OUTPUT_RATE = outRate;
+      dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
+    },
+    onProtocolMessage: handleProtocolMessage,
+    onMicError: function (name, message, friendly) { addSystem(friendly); },
+    onAnalyser: function (node) { analyserNode = node; startSpeakingDetection(); },
+    onStats: function (s) { bytesSent = s.bytesSent; bytesRecv = s.bytesRecv; updateStats(); },
+  });
+  // Fire-and-forget by contract: async outcomes arrive via the callbacks.
+  voice.connect(url).catch(function (e) {
+    dbg('connect failed: ' + e, 'err');
+    setStatus('Connection failed', 'error');
+    doCleanup({ keepStatus: true });
+  });
+}
 
-  ws.onopen = async () => {
-    dbg('WebSocket connected');
-    setStatus('Starting mic...', 'live');
-    try {
-      await startMic();
-      setStatus('Live — speak now', 'live');
-      statsTimer = setInterval(updateStats, 500);
-    } catch (err) {
-      dbg('Mic error: ' + (err && err.name ? err.name + ': ' : '') + err.message, 'err');
-      setStatus('Mic error', 'error');
-      // Not every failure is a permission denial — name the real cause so the user
-      // isn't sent to "browser settings" when the mic is merely busy or absent.
-      let micMsg;
-      switch (err && err.name) {
-        case 'NotAllowedError':
-        case 'SecurityError':
-          micMsg = 'Microphone access denied. Allow mic for this site in browser settings, then click Connect again.';
-          break;
-        case 'NotReadableError':
-        case 'AbortError':
-          micMsg = 'Microphone is in use by another app or tab (Zoom, Photo Booth, another tab, or a prior session). Close it, then click Connect again.';
-          break;
-        case 'NotFoundError':
-        case 'OverconstrainedError':
-          micMsg = 'No microphone found. Connect an input device and select it as the default in your OS sound settings, then Connect.';
-          break;
-        default:
-          micMsg = 'Microphone error (' + (err && err.name ? err.name : 'unknown') + '): ' + (err && err.message ? err.message : 'could not start capture') + '. Click Connect to retry.';
-      }
-      addSystem(micMsg);
-      connected = false;  // prevent auto-reconnect loop
-      ws.close();
+function resetTurnTranscriptState() {
+  // Remove orphaned Chrome STT interim — if server never finalized it,
+  // it's echo from the assistant's voice picked up by mic.
+  if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
+    currentUserEl.remove();
+  }
+  currentUserEl = null;
+  currentAssistantEl = null;
+  serverUserTextReceived = false;
+}
+
+function onVoiceStatus(status, detail, close) {
+  if (status === 'connecting') {
+    setStatus(detail || 'Connecting...', '');
+    return;
+  }
+  if (status === 'live') {
+    setStatus(detail || 'Live', 'live');
+    // The transport emits exactly this detail when mic capture is up;
+    // announce once per session and start the Chrome interim-STT display.
+    if (!micAnnounced && detail === 'Live — speak now') {
+      micAnnounced = true;
+      reconnectAttempts = 0;
+      addSystem('Microphone active — speak now.');
+      startChromeStt();
     }
-  };
-
-  ws.onmessage = (event) => {
-    if (event.data instanceof ArrayBuffer) {
-      bytesRecv += event.data.byteLength;
-      audioChunksRecv++;
-      if (audioChunksRecv <= 5) {
-        dbg('Recv audio #' + audioChunksRecv + ': ' + event.data.byteLength + 'B', 'audio');
-      }
-      playChunk(event.data);
-    } else {
-      try {
-        const msg = JSON.parse(event.data);
-        dbg('Recv: ' + JSON.stringify(msg), 'event');
-
-        if (msg.type === 'session.config' && msg.audioFormat) {
-          INPUT_RATE = msg.audioFormat.inputSampleRate;
-          OUTPUT_RATE = msg.audioFormat.outputSampleRate;
-          dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
-        } else if (msg.type === 'transcript') {
-          handleTranscript(msg.role, msg.text, msg.partial !== false);
-        } else if (msg.type === 'turn.end') {
-          // Remove orphaned Chrome STT interim — if server never finalized it,
-          // it's echo from the assistant's voice picked up by mic.
-          if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
-            currentUserEl.remove();
-          }
-          currentUserEl = null;
-          currentAssistantEl = null;
-          serverUserTextReceived = false;
-        } else if (msg.type === 'turn.interrupted') {
-          for (const s of activeSources) {
-            try { s.stop(); } catch {}
-          }
-          activeSources = [];
-          nextPlayTime = 0;
-          if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
-            currentUserEl.remove();
-          }
-          currentUserEl = null;
-          currentAssistantEl = null;
-          serverUserTextReceived = false;
-        } else if (msg.type === 'gui.update') {
-          const guiData = msg.payload?.data;
-          if (guiData?.type === 'subprocess_log' && guiData.line) {
-            dbg('subprocess  ' + guiData.line, 'audio');
-          } else if (guiData?.type === 'image' && guiData.base64) {
-            const imgEl = document.createElement('div');
-            imgEl.className = 't-entry t-system';
-            const img = document.createElement('img');
-            const imgDataUrl = 'data:' + (guiData.mimeType || 'image/png') + ';base64,' + guiData.base64;
-            img.src = imgDataUrl;
-            img.alt = guiData.description || 'Generated image';
-            img.style.maxWidth = '100%';
-            img.style.borderRadius = '8px';
-            img.style.marginTop = '8px';
-            imgEl.appendChild(img);
-            const dlLink = document.createElement('a');
-            dlLink.className = 'btn-download';
-            dlLink.href = imgDataUrl;
-            const ext = (guiData.mimeType || 'image/png').split('/')[1] || 'png';
-            dlLink.download = 'generated-image-' + Date.now() + '.' + ext;
-            dlLink.textContent = 'Download image';
-            imgEl.appendChild(dlLink);
-            $('transcript').appendChild(imgEl);
-            scrollTranscript();
-            dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
-          } else if (guiData?.type === 'video' && guiData.base64) {
-            const vidEl = document.createElement('div');
-            vidEl.className = 't-entry t-system';
-            const vidDataUrl = 'data:' + (guiData.mimeType || 'video/mp4') + ';base64,' + guiData.base64;
-            const video = document.createElement('video');
-            video.src = vidDataUrl;
-            video.controls = true;
-            video.autoplay = true;
-            video.muted = true;
-            video.style.maxWidth = '100%';
-            video.style.borderRadius = '8px';
-            video.style.marginTop = '8px';
-            if (guiData.description) {
-              const caption = document.createElement('div');
-              caption.style.fontSize = '12px';
-              caption.style.color = '#888';
-              caption.style.marginTop = '4px';
-              caption.textContent = guiData.description;
-              vidEl.appendChild(caption);
-            }
-            vidEl.appendChild(video);
-            const dlLink = document.createElement('a');
-            dlLink.className = 'btn-download';
-            dlLink.href = vidDataUrl;
-            const vidExt = (guiData.mimeType || 'video/mp4').split('/')[1] || 'mp4';
-            dlLink.download = 'generated-video-' + Date.now() + '.' + vidExt;
-            dlLink.textContent = 'Download video';
-            vidEl.appendChild(dlLink);
-            $('transcript').appendChild(vidEl);
-            scrollTranscript();
-            dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
-          } else {
-            addSystem('[gui] ' + JSON.stringify(guiData));
-          }
-        } else if (msg.type === 'gui.command') {
-          if (msg.command === 'collapse_tasks') { collapseAllTasks(); }
-          else if (msg.command === 'expand_tasks') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); renderTasks(); }
-        } else if (msg.type === 'gui.notification') {
-          addSystem('[notification] ' + (msg.payload?.message || ''));
-        } else if (msg.type === 'image') {
-          const imgEl = document.createElement('div');
-          imgEl.className = 't-entry t-system';
-          const img = document.createElement('img');
-          const legacyDataUrl = 'data:' + (msg.data.mimeType || 'image/png') + ';base64,' + msg.data.base64;
-          img.src = legacyDataUrl;
-          img.alt = msg.data.description || 'Generated image';
-          img.style.maxWidth = '100%';
-          img.style.borderRadius = '8px';
-          img.style.marginTop = '8px';
-          imgEl.appendChild(img);
-          const dlLink2 = document.createElement('a');
-          dlLink2.className = 'btn-download';
-          dlLink2.href = legacyDataUrl;
-          const ext2 = (msg.data.mimeType || 'image/png').split('/')[1] || 'png';
-          dlLink2.download = 'generated-image-' + Date.now() + '.' + ext2;
-          dlLink2.textContent = 'Download image';
-          imgEl.appendChild(dlLink2);
-          $('transcript').appendChild(imgEl);
-          scrollTranscript();
-          dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
-        } else if (msg.type === 'speech_speed') {
-          const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
-          playbackRate = speeds[msg.speed] || 1.0;
-          addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + playbackRate + 'x)');
-        } else if (msg.type === 'session_end') {
-          addSystem('Session ended by voice command.');
-          dbg('session_end received — disconnecting', 'event');
-          connected = false; // prevent auto-reconnect
-          if (ws) { ws.close(); ws = null; }
-          doCleanup();
-        } else if (msg.type === 'task.status') {
-          updateTask(msg.taskId, msg.status, msg.text, msg.result);
-        } else if (msg.type === 'grounding') {
-          const chunks = msg.payload?.groundingChunks;
-          if (Array.isArray(chunks) && chunks.length > 0) {
-            const sources = chunks.map(c => c.web?.title || c.web?.uri || '').filter(Boolean).join(', ');
-            if (sources) addSystem('[sources] ' + sources);
-          }
-        }
-      } catch {
-        dbg('Bad JSON text frame', 'warn');
-      }
-    }
-  };
-
-  ws.onclose = (e) => {
-    dbg('WS closed: code=' + e.code + ' reason=' + e.reason);
+    return;
+  }
+  if (status === 'error') {
+    setStatus(detail || 'Error', 'error');
+    return;
+  }
+  if (status === 'superseded') {
+    // Close 4410 (superseded-by-takeover): a user-confirmed takeover moved
+    // the call to another surface. Terminal — never auto-reconnect into a
+    // fight over the call.
+    addSystem('Voice call moved to another surface (window or device).');
+    doCleanup({ keepStatus: true });
+    setStatus('Call moved', 'error');
+    return;
+  }
+  if (status === 'closed') {
     // Server-initiated clean close (goodbye code 4000) or user clicked Disconnect
-    const wasCleanDisconnect = !connected || e.code === 4000;
+    const wasCleanDisconnect = !connected || (close && close.code === 4000);
     // Always reset connected here so subsequent toggle calls (from auto-
     // reconnect or the external SSE toggle path) take the open-new-ws
-    // branch instead of seeing stale state. Without this, an unclean drop
-    // (e.g. voice-agent restart) leaves the page in a wedged state where
-    // ws=null but connected=true, requiring a hard reload to recover.
+    // branch instead of seeing stale state.
     connected = false;
     doCleanup();
     if (wasCleanDisconnect) {
@@ -2294,12 +2034,7 @@ function connectWs() {
       // Unexpected drop (Gemini timeout, voice-agent restart) — auto-reconnect with limit
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        addSystem('Still trying to connect. Common causes:');
-        addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
-        addSystem('2. Voice agent not running — run: bash src/startup.sh');
-        addSystem('3. Port 9900 blocked — check: lsof -i :9900');
-        addSystem('You can type commands below while reconnecting.');
-        addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+        showVoiceTroubleshooting('Still trying to connect. Common causes:');
         setStatus('Reconnecting...', 'error');
         reconnectAttempts = 0;  // reset counter and keep retrying
       } else {
@@ -2314,23 +2049,176 @@ function connectWs() {
         }
       }, 3000);
     }
-  };
-
-  ws.onerror = () => {
-    dbg('WS error', 'err');
-    setStatus('Connection failed', 'error');
-    addSystem('Connection error — is the agent server running?');
-  };
+  }
 }
 
-function doCleanup() {
-  stopMic();
-  if (audioCtx && audioCtx.state !== 'closed') {
-    // Close audio context immediately — don't use a delayed timeout
-    // (a delayed null can race with reconnect and kill the new AudioContext)
-    if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
+function showVoiceTroubleshooting(lead) {
+  addSystem(lead);
+  addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
+  addSystem('2. Voice agent not running — run: bash src/startup.sh');
+  addSystem('3. Port 9900 blocked — check: lsof -i :9900');
+  addSystem('You can type commands below in the meantime.');
+  addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+}
+
+// Terminal connect-attempt failures (design 1e): the transport latched the
+// 'error' status and suppressed its own close, so the page resets its UI here
+// — fail fast with actionable copy instead of the eternal reconnect spinner.
+function onVoiceConnectFailure(f) {
+  dbg('Voice connect failure: ' + f.kind + ' — ' + f.detail, 'err');
+  doCleanup({ keepStatus: true });
+  if (f.kind === 'mic-permission' || f.kind === 'mic-device' || f.kind === 'mic-other') {
+    return; // onMicError already printed the classified mic guidance
   }
-  setStatus('Text only', '');
+  if (f.kind === 'client-busy') {
+    // W5: voice is in use elsewhere — offer the user-confirmed take-over.
+    addSystem(f.detail + ' <span style="color:#4ecca3;cursor:pointer;text-decoration:underline" onclick="takeoverVoice()">Take over the call here</span>', true);
+    return;
+  }
+  addSystem(f.detail + (f.remediation ? ' ' + f.remediation : ''));
+  if (f.kind === 'timeout' || f.kind === 'connect-error') {
+    showVoiceTroubleshooting('Voice did not come up. Common causes:');
+  }
+}
+
+// W5 take-over affordance: the click IS the user confirmation. The challenger
+// reconnects with ?takeover=1; the server closes the incumbent with 4410
+// (its surface shows "call moved") and attaches us.
+function takeoverVoice() {
+  if (connected) return; // already in a call here
+  const url = $('wsUrl').value.trim();
+  if (!url) return;
+  const sep = url.indexOf('?') >= 0 ? '&' : '?';
+  _voiceUrlOverride = url + sep + 'takeover=1';
+  toggle();
+}
+window.takeoverVoice = takeoverVoice;
+
+// Non-audio protocol frames the transport forwards raw. Types the transport
+// itself owns (session.config, transcript, turn.*, agent.state) are handled
+// via the typed callbacks above and deliberately NOT re-handled here.
+function handleProtocolMessage(msg) {
+  if (!msg || !msg.type) return;
+  if (msg.type === 'gui.update') {
+    const guiData = msg.payload?.data;
+    if (guiData?.type === 'subprocess_log' && guiData.line) {
+      dbg('subprocess  ' + guiData.line, 'audio');
+    } else if (guiData?.type === 'image' && guiData.base64) {
+      const imgEl = document.createElement('div');
+      imgEl.className = 't-entry t-system';
+      const img = document.createElement('img');
+      const imgDataUrl = 'data:' + (guiData.mimeType || 'image/png') + ';base64,' + guiData.base64;
+      img.src = imgDataUrl;
+      img.alt = guiData.description || 'Generated image';
+      img.style.maxWidth = '100%';
+      img.style.borderRadius = '8px';
+      img.style.marginTop = '8px';
+      imgEl.appendChild(img);
+      const dlLink = document.createElement('a');
+      dlLink.className = 'btn-download';
+      dlLink.href = imgDataUrl;
+      const ext = (guiData.mimeType || 'image/png').split('/')[1] || 'png';
+      dlLink.download = 'generated-image-' + Date.now() + '.' + ext;
+      dlLink.textContent = 'Download image';
+      imgEl.appendChild(dlLink);
+      $('transcript').appendChild(imgEl);
+      scrollTranscript();
+      dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
+    } else if (guiData?.type === 'video' && guiData.base64) {
+      const vidEl = document.createElement('div');
+      vidEl.className = 't-entry t-system';
+      const vidDataUrl = 'data:' + (guiData.mimeType || 'video/mp4') + ';base64,' + guiData.base64;
+      const video = document.createElement('video');
+      video.src = vidDataUrl;
+      video.controls = true;
+      video.autoplay = true;
+      video.muted = true;
+      video.style.maxWidth = '100%';
+      video.style.borderRadius = '8px';
+      video.style.marginTop = '8px';
+      if (guiData.description) {
+        const caption = document.createElement('div');
+        caption.style.fontSize = '12px';
+        caption.style.color = '#888';
+        caption.style.marginTop = '4px';
+        caption.textContent = guiData.description;
+        vidEl.appendChild(caption);
+      }
+      vidEl.appendChild(video);
+      const dlLink = document.createElement('a');
+      dlLink.className = 'btn-download';
+      dlLink.href = vidDataUrl;
+      const vidExt = (guiData.mimeType || 'video/mp4').split('/')[1] || 'mp4';
+      dlLink.download = 'generated-video-' + Date.now() + '.' + vidExt;
+      dlLink.textContent = 'Download video';
+      vidEl.appendChild(dlLink);
+      $('transcript').appendChild(vidEl);
+      scrollTranscript();
+      dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
+    } else {
+      addSystem('[gui] ' + JSON.stringify(guiData));
+    }
+  } else if (msg.type === 'gui.command') {
+    if (msg.command === 'collapse_tasks') { collapseAllTasks(); }
+    else if (msg.command === 'expand_tasks') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); renderTasks(); }
+  } else if (msg.type === 'gui.notification') {
+    addSystem('[notification] ' + (msg.payload?.message || ''));
+  } else if (msg.type === 'image') {
+    const imgEl = document.createElement('div');
+    imgEl.className = 't-entry t-system';
+    const img = document.createElement('img');
+    const legacyDataUrl = 'data:' + (msg.data.mimeType || 'image/png') + ';base64,' + msg.data.base64;
+    img.src = legacyDataUrl;
+    img.alt = msg.data.description || 'Generated image';
+    img.style.maxWidth = '100%';
+    img.style.borderRadius = '8px';
+    img.style.marginTop = '8px';
+    imgEl.appendChild(img);
+    const dlLink2 = document.createElement('a');
+    dlLink2.className = 'btn-download';
+    dlLink2.href = legacyDataUrl;
+    const ext2 = (msg.data.mimeType || 'image/png').split('/')[1] || 'png';
+    dlLink2.download = 'generated-image-' + Date.now() + '.' + ext2;
+    dlLink2.textContent = 'Download image';
+    imgEl.appendChild(dlLink2);
+    $('transcript').appendChild(imgEl);
+    scrollTranscript();
+    dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
+  } else if (msg.type === 'speech_speed') {
+    const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
+    const rate = speeds[msg.speed] || 1.0;
+    if (voice) voice.setPlaybackRate(rate);
+    addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + rate + 'x)');
+  } else if (msg.type === 'session_end') {
+    addSystem('Session ended by voice command.');
+    dbg('session_end received — disconnecting', 'event');
+    connected = false; // prevent auto-reconnect
+    // disconnect() emits one synchronous 'closed'; the status handler
+    // sees connected=false → clean path ("Disconnected.", no retry).
+    if (voice) { voice.disconnect(); }
+    doCleanup();
+  } else if (msg.type === 'task.status') {
+    updateTask(msg.taskId, msg.status, msg.text, msg.result);
+  } else if (msg.type === 'grounding') {
+    const chunks = msg.payload?.groundingChunks;
+    if (Array.isArray(chunks) && chunks.length > 0) {
+      const sources = chunks.map(c => c.web?.title || c.web?.uri || '').filter(Boolean).join(', ');
+      if (sources) addSystem('[sources] ' + sources);
+    }
+  }
+}
+
+// Page-surface reset after a voice session ends (any path: user disconnect,
+// server close, terminal failure, takeover). The TRANSPORT owns mic/playback/
+// audio-graph teardown; this only resets what the page itself put up.
+// Idempotent via cleanupDone — several paths may reach it for one session.
+function doCleanup(opts) {
+  if (cleanupDone) return;
+  cleanupDone = true;
+  const keepStatus = opts && opts.keepStatus; // preserve an error status line
+  voice = null; // drop the handle — a dead session must not be reused
+  stopChromeStt();
+  if (!keepStatus) setStatus('Text only', '');
   connected = false;
   muted = false;
   fetch('/mute-state?muted=false&voice=false').catch(() => {}); // Reset state on disconnect
@@ -2346,7 +2234,6 @@ function doCleanup() {
   stopVisionPoll();
   $('voice-status').className = 'status-pill voice-off';
   try { sessionStorage.removeItem('sutando-voice'); } catch {}
-  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   updateStats();
 }
 
@@ -2626,9 +2513,11 @@ window.toggleWatch = toggleWatch;
 
 // ─── Mute toggle ──────────────────────────────────────────
 function toggleMute() {
-  if (!micStream) return;
+  if (!voice || !connected) return;
   muted = !muted;
-  micStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+  // Transport call-control gate (also flips the track so the OS mic
+  // indicator reflects the mute).
+  voice.setMicMuted(muted);
   const btn = document.getElementById('btn-mute');
   btn.textContent = muted ? 'Unmute' : 'Mute';
   btn.className = muted ? 'btn-mute muted' : 'btn-mute';
@@ -2681,10 +2570,17 @@ setInterval(reportAgentState, 1000);
 // ─── UI toggle (user gesture context!) ────────────────────
 function toggle() {
   if (connected) {
-    if (ws) { ws.close(); ws = null; }
-    doCleanup();
+    // Set connected=false BEFORE disconnect(): the transport synchronously
+    // emits one 'closed', and the status handler must read it as a clean
+    // user stop (no auto-reconnect).
+    connected = false;
+    const v = voice;
+    if (v) v.disconnect();
+    doCleanup(); // idempotent — no-op when the closed handler already ran
   } else {
-    // Create AudioContext if not already created (may exist from page load or prior toggle)
+    // Page-level AudioContext (tool cues) on the user gesture; the transport
+    // creates its own voice audio graph inside connect(), also within this
+    // gesture's synchronous call stack.
     if (!audioCtx || audioCtx.state === 'closed') {
       audioCtx = new AudioContext();
     } else if (audioCtx.state === 'suspended') {
@@ -2692,12 +2588,11 @@ function toggle() {
     }
     dbg('AudioContext: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
 
-    // Reset counters
-    nextPlayTime = 0;
+    // Reset per-session surface state
     bytesSent = 0;
     bytesRecv = 0;
-    audioChunksRecv = 0;
-    playChunkCount = 0;
+    micAnnounced = false;
+    cleanupDone = false;
 
     connected = true;
     muted = false;
@@ -2905,9 +2800,8 @@ function sendText() {
   scrollTranscript(true);
   input.value = '';
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    // Voice connected — send through voice agent
-    ws.send(JSON.stringify({ type: 'text_input', text }));
+  if (voice && voice.sendTextInput(text)) {
+    // Voice connected — sent through the voice agent's live socket
     dbg('Sent text via voice: "' + text.slice(0, 50) + '"', 'event');
   } else {
     // Voice disconnected — route through task bridge (same as Telegram/Discord)

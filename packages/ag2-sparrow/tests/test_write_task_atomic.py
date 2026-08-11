@@ -7,6 +7,7 @@ the two properties the at-least-once broker contract leans on at the worker edge
 """
 import os
 import importlib
+import shlex
 import sys
 import pathlib
 import tempfile
@@ -31,6 +32,7 @@ def _task(tid="task-1784500000000"):
         "source": "ag2space",
         "channel_id": "!room:ag2.space",
         "user_id": "@qingyun:ag2.space",
+        "access_tier": "owner",
         "timestamp": "2026-07-20T00:00:00Z",
     }
 
@@ -49,8 +51,16 @@ def test_write_task_publishes_atomically_and_completely():
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [dest]
         body = dest.read_text()
         assert body.endswith("\n")
-        # access_tier is written LAST so a last-occurrence parser can't be tricked.
-        assert body.rstrip().splitlines()[-1].startswith("access_tier:")
+        # access_tier stays the ONLY header-shaped access_tier line even with the
+        # owner-tier block appended — a last-occurrence parser still can't be tricked.
+        lines = body.rstrip().splitlines()
+        tier_at = [i for i, ln in enumerate(lines) if ln.startswith("access_tier:")]
+        assert len(tier_at) == 1
+        tail = lines[tier_at[0] + 1:]
+        assert any(ln.startswith("===SKILL INSTRUCTIONS") for ln in tail)
+        # Completeness: the block's final line (the result path) is the file tail —
+        # a truncated write cannot produce it.
+        assert lines[-1].endswith(f"results/{tid}.txt")
         assert "id: task-1784500000000" in body
         assert "source: ag2space" in body
         print("PASS test_write_task_publishes_atomically_and_completely")
@@ -149,10 +159,33 @@ def test_write_task_drops_unsafe_and_idless():
         print("PASS test_write_task_drops_unsafe_and_idless")
 
 
+def test_write_task_shell_quotes_channel_id_in_skill_instructions():
+    """A malicious channel_id must not break the shell commands embedded in
+    the SKILL INSTRUCTIONS block; shlex must round-trip it as one argument."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        malicious_chan = "!room'; touch /tmp/ag2sparrow_pwned; #"
+        t = _task("task-1784500000020")
+        t["channel_id"] = malicious_chan
+        tid = m._write_task(t)
+        body = (m.TASKS_DIR / f"{tid}.txt").read_text()
+        context_line = next(ln for ln in body.splitlines() if "room_ops.py read" in ln)
+        context_cmd = context_line.split("`python3 ", 1)[1].split("`", 1)[0]
+        context_args = shlex.split("python3 " + context_cmd)
+        assert malicious_chan in context_args
+        notify_line = next(ln for ln in body.splitlines() if "--channel-id" in ln)
+        notify_cmd = notify_line.split("2. NOTIFY FIRST (if task takes >60s): ", 1)[1]
+        notify_args = shlex.split(notify_cmd)
+        assert malicious_chan in notify_args
+        print("PASS test_write_task_shell_quotes_channel_id_in_skill_instructions")
+
+
 if __name__ == "__main__":
     test_write_task_publishes_atomically_and_completely()
     test_write_task_never_leaves_partial_file_on_publish_crash()
     test_write_task_is_idempotent_under_redelivery()
     test_write_task_does_not_reexecute_a_completed_task()
     test_write_task_drops_unsafe_and_idless()
+    test_write_task_shell_quotes_channel_id_in_skill_instructions()
     print("ALL PASS test_write_task_atomic")

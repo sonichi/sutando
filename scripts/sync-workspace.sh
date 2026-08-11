@@ -38,8 +38,11 @@
 # un-ignores exactly the include list. So setting vault.sync.include to add one
 # path silently DROPS every default path — notes/, hosts/*/ and the whole
 # .claude-sutando/projects/*/memory/ corpus — out of the backup, while this
-# script goes on printing "pushed to <branch>" on every run. To add a path you
-# must restate the full carrier set.
+# script goes on printing "pushed to <branch>" on every run. To add an INCLUDE
+# path you must restate the full carrier set.
+#
+# `vault.sync.exclude_extra` appends instead of replacing — use it rather than
+# restating `exclude`. No `include_extra`: unioning a whitelist widens the vault.
 #
 # `exclude` subtracts, carving subpaths out of an included parent (emitted after
 # the includes so gitignore's last-match-wins applies).
@@ -1480,10 +1483,10 @@ _migrate_from_legacy_impl() {
         echo "sync-workspace migrate: copying from $legacy_dir into $WORKSPACE_DIR" >&2
     fi
 
-    # Local slug derivation: matches Claude Code's auto-derived slug
-    # (REPO_DIR with / replaced by -).
+    # Claude Code dashes EVERY non-alphanumeric char, not just `/`; a path with a
+    # space or dot would otherwise resolve to a slug it never creates.
     local local_slug
-    local_slug="$(printf '%s' "$REPO_DIR" | sed 's|/|-|g')"
+    local_slug="$(printf '%s' "$REPO_DIR" | tr -c 'A-Za-z0-9' '-')"
 
     # Per-host segment for hostname-qualified destinations (build_log,
     # pending-questions). Computed once; matches `_host()` + the reader probe.

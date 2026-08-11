@@ -33,11 +33,6 @@ function expandHome(p: string): string {
 	return p.replace(/^~/, process.env.HOME || '');
 }
 
-/** Encode an absolute path the same way Claude Code names projects/<slug>. */
-export function claudeProjectSlug(path: string): string {
-	return path.replace(/[^a-zA-Z0-9]/g, '-');
-}
-
 /**
  * Return the resolved memory-dir env value, preferring the new name.
  *
@@ -235,6 +230,18 @@ export function claudeHomePath(...subpath: string[]): string {
 	}
 	if (subpath.length === 0) return base;
 	return join(base, ...subpath);
+}
+
+/**
+ * Derive the project slug Claude Code uses under `projects/<slug>/` for a
+ * given absolute path, by dashing every non-alphanumeric character (not just
+ * "/"). Matching only "/" resolves to a nonexistent dir on any path
+ * containing a space or dot — e.g. a desktop-bundled checkout under
+ * "Application Support/space.ag2.app/" — so every caller must derive the
+ * slug through this one function rather than re-implementing the regex.
+ */
+export function claudeProjectSlug(path: string): string {
+	return path.replace(/[^A-Za-z0-9]/g, '-');
 }
 
 // ---------------------------------------------------------------------------
