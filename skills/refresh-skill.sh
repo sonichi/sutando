@@ -30,6 +30,9 @@ if [ -z "$SKILLS_DST" ]; then
   SKILLS_DST="${SKILLS_DST:-$HOME/.claude/skills}"
 fi
 SETTLE_S="${REFRESH_SKILL_SETTLE_S:-1}"
+# --all concurrency. The settle is a fixed per-skill wait, so serialising it made
+# --all cost SETTLE_S x skill-count — 97s at 97 skills, past a 120s cron budget.
+JOBS="${REFRESH_SKILL_JOBS:-8}"
 EXCLUDES=(--exclude='workspace' --exclude='node_modules' --exclude='generated'
           --exclude='__pycache__' --exclude='.git' --exclude='*.mp4' --exclude='*.png'
           --exclude='*.wav' --exclude='.venv')
@@ -57,11 +60,17 @@ main() {
   mkdir -p "$SKILLS_DST"
   [ "$#" -ge 1 ] || { echo "usage: refresh-skill.sh <name> [<name> ...] | --all" >&2; exit 2; }
   if [ "$1" = "--all" ]; then
-    local any=0
+    # Each skill's settle is WAITING, not work, so --all runs them concurrently.
+    # Chunked, not unbounded: a crash strands at most $REFRESH_SKILL_JOBS as copies,
+    # which refresh_one then refuses to touch ("not a symlink").
+    local any=0 running=0
     for link in "$SKILLS_DST"/*; do
       [ -L "$link" ] || continue
-      refresh_one "$(basename "$link")"; any=1
+      refresh_one "$(basename "$link")" &
+      any=1; running=$((running + 1))
+      if [ "$running" -ge "$JOBS" ]; then wait; running=0; fi
     done
+    wait
     [ "$any" = 1 ] || echo "  (no symlinked skills under $SKILLS_DST)"
   else
     for name in "$@"; do refresh_one "$name"; done

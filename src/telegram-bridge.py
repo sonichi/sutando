@@ -57,6 +57,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
@@ -472,6 +473,23 @@ def _recover_orphan_sending_files() -> int:
 # swallowed so the real result still delivers.
 _progress_msgs: dict = {}        # task_id -> {message_id, chat_id, first, last_edit, last_text} | {"expired": True}
 pending_task_tiers: dict = {}    # task_id -> access_tier; in-memory ONLY → fail-closed on restart
+
+
+def _dedup_recover(task_id: str, holder_id, chat_id) -> str | None:
+    """Route the shared dedup-recovery plan; returns a new task id to route."""
+    try:
+        action, payload = plan_dedup_recovery(
+            RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
+            f"task-{int(time.time() * 1000)}")
+        if action == "requeue":
+            print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
+            return payload
+        if action == "report":
+            send_reply(chat_id, payload, task_id=task_id)
+            print(f"  [dedup] unresolved for {task_id}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - never block the skip path
+        print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+    return None
 
 
 def _clear_progress(task_id: str) -> None:
@@ -1083,6 +1101,11 @@ def main():  # pragma: no cover
                 # leaks as literal text in the user's DM (#1381).
                 parsed = parse_markers(reply_text)
                 if any(a.kind == "skip" for a in parsed.actions):
+                    _sk = next(a for a in parsed.actions if a.kind == "skip")
+                    if _sk.value == "deduped":
+                        _rq = _dedup_recover(task_id, _sk.extra, chat_id)
+                        if _rq:
+                            pending_replies[_rq] = chat_id
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                     archive_file(result_file, "results", task_id)
