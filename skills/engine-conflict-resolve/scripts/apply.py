@@ -26,7 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     acquire_lock, commit_exists, die, emit, ensure_workspace_guard, git_out,
     is_ancestor, is_git_checkout, load_pending, log, proposal_path,
-    read_meta, read_proposal, release_lock, run_git, set_git, tree_dirty,
+    read_meta, read_proposal, release_lock, run_git, set_engine_hint,
+    set_git, tree_dirty,
 )
 
 EXIT_PROPOSAL = 5
@@ -56,6 +57,7 @@ def main() -> None:
     ap.add_argument("--git", default=None, help="trusted git executable (overrides $SUTANDO_GIT and PATH)")
     args = ap.parse_args()
     set_git(args.git)
+    set_engine_hint(args.engine)
 
     pending = load_pending(args.pending)
     engine = args.engine

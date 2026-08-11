@@ -1,0 +1,10 @@
+{
+  "name": "engine-conflict-resolve",
+  "enabled": true,
+  "access_tier": "owner",
+  "description": "Config-only manifest — present to DECLARE this skill's config per skills/MANIFEST.md (no runtime tools). ENGINE_CONFLICT_GIT: trusted git executable for the scripts (read precedence: --git CLI > env > this manifest default; unset = derive the desktop bundle's <engine-parent>/bin/git, then the src/git_binary.py contract). ENGINE_CONFLICT_NOTIFY_ROOM: owner-only room id for proposal delivery via deliver.py (unset = never post to any room; deterministic fallback to macOS notification + per-host pending-questions.md).",
+  "config": {
+    "ENGINE_CONFLICT_GIT": "",
+    "ENGINE_CONFLICT_NOTIFY_ROOM": ""
+  }
+}

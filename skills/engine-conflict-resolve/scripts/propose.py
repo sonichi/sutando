@@ -19,9 +19,9 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    WS_EXCLUDE, die, emit, git_out, is_ancestor, is_git_checkout,
-    merge_in_progress, proposal_path, read_meta, run_git, set_git,
-    tree_dirty, unmerged_paths, write_proposal,
+    WS_EXCLUDE, die, emit, engine_hint_from_scratch, git_out, is_ancestor,
+    is_git_checkout, merge_in_progress, proposal_path, read_meta, run_git,
+    set_git, tree_dirty, unmerged_paths, write_proposal,
 )
 
 
@@ -53,6 +53,7 @@ def main() -> None:
     ap.add_argument("--git", default=None, help="trusted git executable (overrides $SUTANDO_GIT and PATH)")
     args = ap.parse_args()
     set_git(args.git)
+    engine_hint_from_scratch(args.scratch)
 
     scratch = args.scratch.resolve()
     if not scratch.is_dir() or not is_git_checkout(scratch):

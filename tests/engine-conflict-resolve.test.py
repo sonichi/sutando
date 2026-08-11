@@ -331,7 +331,12 @@ class TestConflictEndToEnd(unittest.TestCase):
 
 
 class TestGitResolution(unittest.TestCase):
-    """Installed-host runtime: sanitized PATH, possibly no system git at all."""
+    """Installed-host runtime: sanitized PATH, possibly no system git at all.
+
+    Contract (declared in the skill's manifest.json per skills/MANIFEST.md):
+    --git > $ENGINE_CONFLICT_GIT > manifest default > <engine-parent>/bin/git
+    (desktop #305 bundle) > src/git_binary.py > clean no-git JSON.
+    """
 
     def setUp(self):
         self.fx = EngineFixture(conflicting=True)
@@ -342,7 +347,7 @@ class TestGitResolution(unittest.TestCase):
     def sanitized_env(self, **extra):
         env = dict(os.environ)
         env["PATH"] = ""
-        env.pop("SUTANDO_GIT", None)
+        env.pop("ENGINE_CONFLICT_GIT", None)
         env.update(extra)
         return env
 
@@ -351,12 +356,39 @@ class TestGitResolution(unittest.TestCase):
         self.assertEqual(p.returncode, 6, p.stdout + p.stderr)
         data = out_json(p)
         self.assertEqual(data["status"], "no-git")
-        self.assertIn("SUTANDO_GIT", data["error"])
+        self.assertIn("ENGINE_CONFLICT_GIT", data["error"])
         self.assertNotIn("Traceback", p.stderr)
         self.assertFalse(self.fx.scratch.exists())
 
-    def test_sutando_git_env_works_without_path(self):
-        p = self.fx.prepare(env=self.sanitized_env(SUTANDO_GIT=self.real_git))
+    def test_bundled_engine_git_serves_the_whole_chain_without_path(self):
+        """Reviewer's control: desktop bundle ships engine/bin/git; PATH has none."""
+        fx = self.fx
+        bin_dir = fx.engine.parent / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "git").symlink_to(self.real_git)
+        env = self.sanitized_env()
+
+        p = fx.prepare(env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(out_json(p)["status"], "conflicts")
+
+        f = fx.scratch / "src" / "app.txt"
+        f.write_text("line1\nline2\nRESOLVED line3 (local+release)\nline4\nline5\n")
+        git(fx.scratch, "add", "--", "src/app.txt")
+        # propose derives the engine (and thus bin/git) from the scratch's
+        # .git pointer file — no config, no PATH.
+        pr = run_script("propose.py", "--scratch", str(fx.scratch), env=env)
+        self.assertEqual(pr.returncode, 0, pr.stdout + pr.stderr)
+        merged = out_json(pr)["merged_sha"]
+
+        a = run_script("apply.py", "--pending", str(fx.pending),
+                       "--engine", str(fx.engine), "--merged-sha", merged, env=env)
+        self.assertEqual(a.returncode, 0, a.stdout + a.stderr)
+        self.assertEqual(git(fx.engine, "rev-parse", "HEAD").stdout.strip(), merged)
+        fx.assert_invariants(self)
+
+    def test_declared_env_works_without_path(self):
+        p = self.fx.prepare(env=self.sanitized_env(ENGINE_CONFLICT_GIT=self.real_git))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(out_json(p)["status"], "conflicts")
 
@@ -366,6 +398,89 @@ class TestGitResolution(unittest.TestCase):
                        "--git", self.real_git, env=self.sanitized_env())
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(out_json(p)["status"], "conflicts")
+
+    def test_configured_but_broken_git_is_an_error_not_a_fallthrough(self):
+        p = self.fx.prepare(env=self.sanitized_env(ENGINE_CONFLICT_GIT="/nonexistent/git"))
+        self.assertEqual(p.returncode, 6, p.stdout + p.stderr)
+        data = out_json(p)
+        self.assertEqual(data["status"], "no-git")
+        self.assertIn("/nonexistent/git", data["error"])
+
+
+class TestProposalDelivery(unittest.TestCase):
+    """deliver.py controls: declared room or deterministic fallback — never a guess."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="engine deliver test "))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.msg = self.root / "proposal.txt"
+        self.msg.write_text("merged_sha abc123\nsrc/app.txt: hand-merged\n")
+        self.record = self.root / "gateway-record.json"
+        self.pq = self.root / "host dir" / "pending-questions.md"
+
+    def stub_room_ops(self, status=200, explode=False):
+        d = self.root / "stub room-ops"
+        d.mkdir(exist_ok=True)
+        body = "raise RuntimeError('gateway down')" if explode else (
+            "with open(%r, 'w') as f:\n"
+            "        json.dump({'url': url, 'payload': payload}, f)\n"
+            "    return (%d, {})" % (str(self.record), status))
+        (d / "_gateway.py").write_text(
+            "import json\n"
+            "def gateway():\n"
+            "    return ('http://stub.local', {'Authorization': 'Bearer x'})\n"
+            "def http_json(method, url, headers, payload):\n"
+            "    %s\n" % body)
+        return d
+
+    def deliver(self, *args, env_room=None):
+        env = dict(os.environ)
+        env["PATH"] = ""  # no osascript: notification tier degrades cleanly
+        env.pop("ENGINE_CONFLICT_NOTIFY_ROOM", None)
+        if env_room is not None:
+            env["ENGINE_CONFLICT_NOTIFY_ROOM"] = env_room
+        return run_script("deliver.py", "--message-file", str(self.msg),
+                          "--pending-questions", str(self.pq), *args, env=env)
+
+    def test_no_room_never_guesses_and_falls_back(self):
+        self.pq.parent.mkdir(parents=True)
+        self.pq.write_text("## Older question\nbody\n\n# Resolved\n## done q\n")
+        d = self.deliver("--room-ops-dir", str(self.stub_room_ops()))
+        self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
+        out = out_json(d)
+        self.assertEqual(out["status"], "fallback")
+        self.assertEqual(out["reason"], "no-room")
+        self.assertFalse(self.record.exists(), "no configured room -> no post, ever")
+        text = self.pq.read_text()
+        self.assertIn("Engine update conflict", text)
+        self.assertLess(text.index("Engine update conflict"), text.index("# Resolved"),
+                        "new question must be inserted ABOVE the Resolved divider")
+
+    def test_post_failure_always_reaches_the_fallback(self):
+        for kwargs, want_reason in (({"status": 500}, "http-500"),
+                                    ({"explode": True}, "post-failed")):
+            if self.pq.exists():
+                self.pq.unlink()
+            d = self.deliver("--room", "!owner-room:stub.local",
+                             "--room-ops-dir", str(self.stub_room_ops(**kwargs)))
+            self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
+            out = out_json(d)
+            self.assertEqual(out["status"], "fallback")
+            self.assertIn(want_reason, out["reason"])
+            self.assertTrue(self.pq.is_file(), "failed send must still reach the owner")
+
+    def test_declared_room_posts_via_gateway(self):
+        d = self.deliver("--room-ops-dir", str(self.stub_room_ops(status=200)),
+                         env_room="!owner-room:stub.local")
+        self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
+        out = out_json(d)
+        self.assertEqual(out["status"], "posted")
+        self.assertEqual(out["room"], "!owner-room:stub.local")
+        rec = json.loads(self.record.read_text())
+        self.assertEqual(rec["payload"]["op"], "message")
+        self.assertEqual(rec["payload"]["room_id"], "!owner-room:stub.local")
+        self.assertIn("merged_sha abc123", rec["payload"]["body"])
+        self.assertFalse(self.pq.exists(), "successful post needs no fallback")
 
 
 if __name__ == "__main__":

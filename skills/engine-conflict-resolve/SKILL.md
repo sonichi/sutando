@@ -95,18 +95,31 @@ python3 skills/engine-conflict-resolve/scripts/propose.py --scratch "<scratch>"
   file alone is a dead letter the owner never sees:
   1. Write the task's result file (`results/task-engine-conflict-<epoch>.txt`,
      same id as the task) — protocol hygiene: the dashboard, result-watcher,
-     and timeout logic key off it.
-  2. **Actively surface the proposal on the owner's live channel**: post it
-     to the owner's active AG2 Space room via the gateway `op:message` path
-     (the `skills/agent-room-ops/` capabilities — gateway URL + token
-     resolution per `_gateway.py` / `gateway_credentials.py`; the legacy
-     `AG2_REMOTE_TOKEN` in the repo `.env` is an accepted token alias). If no
-     gateway resolves, fall back to the repo's Pending-decisions convention:
-     a macOS notification (`osascript -e 'display notification "Engine
-     conflict resolved — proposal ready" with title "Sutando"'`) **and**
-     append the question to the per-host pending-questions file
-     (`<workspace>/hosts/<hostname>/pending-questions.md`, `<hostname>` =
-     `bash scripts/sutando-config.sh host-label`).
+     and timeout logic key off it. **State in the result which delivery
+     channel step 2 actually used** (the room, or the fallback).
+  2. **Actively surface the proposal via the deterministic deliverer** —
+     write the proposal text to a file, then:
+
+     ```bash
+     python3 skills/engine-conflict-resolve/scripts/deliver.py \
+       --message-file "<proposal.txt>" \
+       --title "Engine update conflict — proposal ready"
+     ```
+
+     The destination is DECLARED, never guessed: `--room` >
+     `$ENGINE_CONFLICT_NOTIFY_ROOM` > this skill's `manifest.json` `config`
+     default (skills/MANIFEST.md precedence). The room must be an
+     **owner-only** room; deliver.py never infers a "last active" room —
+     a merge proposal is owner-only material and a guessed room may be
+     shared. When a room resolves, the post goes through the
+     `agent-room-ops` gateway module (`op:message`). **When no room is
+     configured, or the post fails for any reason**, deliver.py always
+     executes the Pending-decisions fallback: a macOS notification plus a
+     question section inserted into the per-host
+     `<workspace>/hosts/<hostname>/pending-questions.md` (above the
+     `# Resolved` divider, via the shared `src/pending_questions_md.py`
+     locator). Its JSON output tells you which path ran — put that in the
+     result file per point 1.
 
 ### 4. WAIT for explicit confirmation
 
@@ -149,18 +162,23 @@ app's tray still owns that state), and confirm.
 ## Git resolution (installed hosts)
 
 The scripts never assume a usable `git` on PATH — an installed Mac may have a
-sanitized PATH or only the Xcode-CLT stub. Resolution order: `--git` flag >
-`$SUTANDO_GIT` > `PATH`; if nothing usable resolves, they print
-`{"status": "no-git", …}` (exit 6) instead of a traceback. **For a
-desktop-app task, pass the app's own bundled git — the same binary the
-updater/attach scripts use, at `<engine-parent>/bin/git`** (sibling of
-`ENGINE_UPDATE_PENDING.json`):
+sanitized PATH or only the Xcode-CLT stub. Resolution order (config declared
+in this skill's `manifest.json` `config` block, per skills/MANIFEST.md):
 
-```bash
-SUTANDO_GIT="<…/engine>/bin/git" python3 skills/engine-conflict-resolve/scripts/prepare.py …
-```
+1. `--git` CLI flag (explicit override);
+2. `$ENGINE_CONFLICT_GIT` (the manifest-declared env spelling);
+3. the manifest `config` default itself;
+4. **derived from the engine path already passed in**: the desktop bundle
+   ships a runnable `<engine-parent>/bin/git` (desktop #305) — for prepare/
+   apply this comes from `--engine`, for propose from the scratch worktree's
+   `.git` pointer file, so desktop tasks need no configuration at all;
+5. the repo's `src/git_binary.py` contract (first non-stub git on PATH; the
+   system git only when the CLT are verifiably installed — never pops the
+   installer dialog).
 
-(or `--git "<…/engine>/bin/git"` on each script; same for propose/apply).
+If nothing usable resolves, every script prints `{"status": "no-git", …}`
+(exit 6) instead of a traceback. An explicitly configured value (tiers 1–3)
+that is not runnable is an error, not a fall-through.
 
 ## Notes
 

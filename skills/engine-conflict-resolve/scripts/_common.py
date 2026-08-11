@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,30 +33,103 @@ PROPOSAL_NAME = "ENGINE_CONFLICT_PROPOSAL.json"
 
 EXIT_NO_GIT = 6
 
+# Declared in this skill's manifest.json config block (skills/MANIFEST.md
+# convention) — read precedence: CLI --git > env > manifest default.
+GIT_CONFIG_KEY = "ENGINE_CONFLICT_GIT"
+
 _GIT: Optional[str] = None
+_CLI_GIT: Optional[str] = None
+_ENGINE_HINT: Optional[Path] = None
 
 
 def set_git(path: Optional[str]) -> None:
-    """CLI --git override; wins over env + PATH resolution."""
-    global _GIT
+    """CLI --git override; the top tier of the declared config precedence."""
+    global _CLI_GIT
     if path:
-        _GIT = path
+        _CLI_GIT = path
+
+
+def set_engine_hint(engine) -> None:
+    """The engine checkout location; lets resolution derive the bundle's git."""
+    global _ENGINE_HINT
+    if engine:
+        _ENGINE_HINT = Path(engine)
+
+
+def engine_hint_from_scratch(scratch: Path) -> None:
+    """A linked worktree's .git is a plain 'gitdir: <engine>/.git/worktrees/<id>'
+    pointer file — readable without git, so the bundle tier works for propose too."""
+    try:
+        text = (Path(scratch) / ".git").read_text().strip()
+    except OSError:
+        return
+    if text.startswith("gitdir:") and "/.git/worktrees/" in text:
+        set_engine_hint(text[len("gitdir:"):].strip().split("/.git/worktrees/")[0])
+
+
+def skill_dir() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def manifest_config(key: str) -> str:
+    try:
+        data = json.loads((skill_dir() / "manifest.json").read_text())
+        val = (data.get("config") or {}).get(key)
+        return val if isinstance(val, str) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def _runnable(path: str) -> bool:
+    return bool(path) and Path(path).is_file() and os.access(path, os.X_OK)
+
+
+def _repo_src() -> Optional[Path]:
+    for p in Path(__file__).resolve().parents:
+        if (p / "src" / "git_binary.py").is_file():
+            return p / "src"
+    return None
 
 
 def resolve_git() -> str:
-    """Trusted git: --git flag > $SUTANDO_GIT > PATH. Never a traceback if absent."""
+    """Trusted git, never a traceback and never the bare CLT stub:
+    --git > $ENGINE_CONFLICT_GIT > manifest config > <engine-parent>/bin/git
+    (the desktop bundle, #305) > src/git_binary.py contract."""
     global _GIT
     if _GIT:
         return _GIT
-    cand = os.environ.get("SUTANDO_GIT") or shutil.which("git")
-    if not cand or not (Path(cand).is_file() and os.access(cand, os.X_OK)):
-        emit({"status": "no-git", "reason": "no-git",
-              "error": "no usable git executable (checked --git, $SUTANDO_GIT, then PATH) — "
-                       "set SUTANDO_GIT to a trusted git (the desktop bundle ships one at "
-                       "<engine-parent>/bin/git) or pass --git"},
-             exit_code=EXIT_NO_GIT)
-    _GIT = cand
-    return _GIT
+    for tier, cand in (("--git", _CLI_GIT),
+                       ("$" + GIT_CONFIG_KEY, os.environ.get(GIT_CONFIG_KEY)),
+                       ("manifest config " + GIT_CONFIG_KEY, manifest_config(GIT_CONFIG_KEY))):
+        if cand:
+            if not _runnable(cand):
+                emit({"status": "no-git", "reason": "no-git",
+                      "error": f"configured git ({tier}) is not runnable: {cand}"},
+                     exit_code=EXIT_NO_GIT)
+            _GIT = cand
+            return _GIT
+    if _ENGINE_HINT is not None:
+        bundled = Path(_ENGINE_HINT).resolve().parent / "bin" / "git"
+        if _runnable(str(bundled)):
+            _GIT = str(bundled)
+            return _GIT
+    src = _repo_src()
+    if src is not None:
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        try:
+            import git_binary
+            cand = git_binary.resolve_git()
+        except Exception:
+            cand = None
+        if cand:
+            _GIT = cand
+            return _GIT
+    emit({"status": "no-git", "reason": "no-git",
+          "error": "no usable git — pass --git, set ENGINE_CONFLICT_GIT (declared in "
+                   "skills/engine-conflict-resolve/manifest.json), or run against a desktop "
+                   "bundle whose engine dir ships bin/git"},
+         exit_code=EXIT_NO_GIT)
 
 
 def run_git(repo, *args: str, check: bool = True, ident: bool = False) -> "subprocess.CompletedProcess[str]":
