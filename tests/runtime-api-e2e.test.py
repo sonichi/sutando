@@ -131,6 +131,8 @@ GW_URL = f"http://127.0.0.1:{_gw_srv.server_address[1]}"
 
 TMP = tempfile.mkdtemp(prefix="runtime-api-e2e-")
 ENV = {**os.environ,
+       # instance lock + run dir must not collide with a live daemon's default
+       "SUTANDO_RUN_DIR": str(Path(TMP) / "run"),
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
        "SUTANDO_RUNTIME_DB": str(Path(TMP) / "runtime-state.sqlite"),
        "SUTANDO_HA_DIR": str(Path(TMP) / "human-actions"),

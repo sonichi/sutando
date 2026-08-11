@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-209 modules indexed.
+215 modules indexed.
 
 ## `src/`
 
@@ -147,6 +147,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`voice-connect-resolver.ts`** — Transparent voice-connection tier resolution — picks the best reachable endpoint for "call your agent" so the user never chooses a tier.
 - **`voice-context.ts`** — Builds a system prompt for the Claude Code subprocess that injects Sutando identity and user context from the memory system.
 - **`voice-error-classifier.ts`** — Classify Gemini Live transport close events into actionable categories.
+- **`voice-host.ts`** — voice-host — the Node process that owns VoiceSession for SCP media streams.
 - **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent, phone-conversation, and any plugin voice surface).
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
@@ -240,16 +241,21 @@ and re-run `python3 scripts/gen-src-map.py`.
 ## `src/runtime-api/`
 
 - **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
+- **`device_store.py`** — device_store.py — per-device SCP credentials + pairing (opaque-bearer v0).
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
 - **`identity_view.py`** — Read-only identity surface for THIS agent (the Sutando Server "smallest slice"): sutando.info / sutando.status / sutando.owner / sutando.allowlist.
 - **`instance_registry.py`** — Sutando Instance Manifest registry — persistent "this agent exists here" records, M1 of the manifest spec (taxonomy part 4/5): Agent existence ≠ agent process existence.
+- **`media_frame.py`** — media_frame.py — the thin envelope on SCP binary (media-plane) frames.
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
 - **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
 - **`runtime_view.py`** — Runtime surface for THIS agent: runtime.health / runtime.details.
 - **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
 - **`tasks_view.py`** — Task-pipeline surface for the Sutando Server: task.submit / task.status / task.get_result / task.details / task.cancel.
+- **`voice_bridge.py`** — voice_bridge.py — the boundary between SCP media framing and voice intelligence.
+- **`voice_host_bridge.py`** — voice_host_bridge.py — bridge SCP audio streams to a voice-host process.
+- **`ws_transport.py`** — ws_transport.py — LAN WSS transport for SCP (Sutando Client Protocol).
 
 ## `src/runtime-cli/`
 

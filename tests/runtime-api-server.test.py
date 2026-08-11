@@ -65,6 +65,8 @@ def _resolve_ha(srv, request_id, answers):
 
 def main() -> int:  # noqa: PLR0915 — one linear conformance script
     tmp = Path(tempfile.mkdtemp(prefix="rt-srv-"))
+    # instance lock + run dir must not collide with a live daemon's default
+    os.environ["SUTANDO_RUN_DIR"] = str(tmp / "run")
     srv = _srv(tmp)
 
     # ── protocol codec ──────────────────────────────────────────────────────

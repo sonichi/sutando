@@ -69,9 +69,16 @@ def main() -> int:
         check(rd.socket_path() == "/tmp/x.sock",
               "SUTANDO_RUNTIME_SOCKET override wins")
         os.environ.pop("SUTANDO_RUNTIME_SOCKET", None)
-        os.environ["SUTANDO_RUN_DIR"] = "/tmp/rt2"
-        check(rd.socket_path() == "/tmp/rt2/sutando-runtime.sock",
-              "default socket = <run_dir>/sutando-runtime.sock")
+        import tempfile
+        rt2 = tempfile.mkdtemp(prefix="rt2-")
+        os.environ["SUTANDO_RUN_DIR"] = rt2
+        check(rd.socket_path() == f"{rt2}/default/runtime.sock",
+              "default socket = <run_dir>/<instance>/runtime.sock")
+        # pre-M2 daemons/clients: flat legacy socket still honored for default
+        legacy = Path(rt2) / "sutando-runtime.sock"
+        legacy.touch()
+        check(rd.socket_path() == str(legacy),
+              "existing flat legacy socket wins for the default instance")
     finally:
         rd.sys.platform = __import__("sys").platform
         for k, v in saved.items():
