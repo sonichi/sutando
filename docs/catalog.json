@@ -78,7 +78,7 @@
       "audience": ["contributors", "maintainers"],
       "status": "draft",
       "canonical_for": "proposed privileged-capability mediation, authorization, and audit model",
-      "last_verified": "2026-08-04"
+      "last_verified": "2026-08-11"
     },
     "docs/community-use-cases/README.md": {
       "title": "Community use cases",

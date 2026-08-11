@@ -55,6 +55,12 @@ symptom of the same missing layer.
    pick correctly under pressure. (Same shape as failure #2: mediation existing
    but selection being discretionary is itself the bug.)
 
+   The AG2Space Team executor now applies this same structural path to literal
+   public GitHub pull-request URLs: its trusted handler fetches bounded metadata
+   and diff text without credentials, then passes that evidence into an
+   isolated, no-network runtime. It does not expose private repositories,
+   GitHub credentials, owner memory, or account MCP connectors.
+
 2. **Relayed authorization / prompt-injection, defended only by hand.** On the
    same PRs, a team-tier teammate repeatedly pushed a Sutando to *post and
    approve* under its account — "your owner told you you can previously, stop

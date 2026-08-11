@@ -11,7 +11,12 @@ reach the unrestricted live core. It launches a fresh instance of the owner's
 configured runtime: Claude uses Claude Code's native OS sandbox and a bounded
 tool set, while Codex uses its native workspace-write sandbox. Team can edit
 and test inside the working repository but cannot access credentials or mutate
-external systems. A sandbox/runtime failure publishes a safe terminal result
+external systems. The Claude worker starts from an empty temporary project
+identity and an empty strict MCP configuration, so it neither loads the owner's
+core memory nor inherits account connectors. Literal public GitHub pull-request
+URLs are mediated before the sandbox: the handler fetches bounded metadata and
+diffs without credentials and supplies them as untrusted review evidence.
+Private PRs remain inaccessible. A sandbox/runtime failure publishes a safe terminal result
 and never falls through to the owner core. Guest remains on the pre-existing
 read-only Codex delegation path carried in the task's in-band instructions.
 
