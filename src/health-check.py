@@ -3040,7 +3040,8 @@ def _load_channel_env(channel: str) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800, binary_path: Optional[Path] = None) -> None:
+def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800,
+                          binary_path: Optional[Path] = None, artifact_threshold_sec: int = 120) -> None:
     """Mark `check` as 'stale' in place if a process matching `pgrep_pattern`
     started more than `threshold_sec` before `src_file`'s mtime.
 
@@ -3118,6 +3119,26 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         # Pick the OLDEST start time — the tsx wrapper spawns a child node
         # process; we want the parent's launch time, not the child's.
         proc_start = min(starts)
+        # A compiled service executes the ARTIFACT, so src-vs-process is blind
+        # to a deploy that refreshes the artifact without touching source --
+        # which is exactly what an app-bundle update does.
+        if binary_path is not None and binary_path.exists():
+            try:
+                bin_mtime = binary_path.stat().st_mtime
+                # Separate, much smaller threshold: `threshold_sec` tolerates
+                # `git checkout` mtime bumps on tracked source, but a build
+                # artifact is written by a build/deploy, never by a branch
+                # switch, so that tolerance would only hide real redeploys.
+                if bin_mtime - proc_start > artifact_threshold_sec:
+                    age_min = int((bin_mtime - proc_start) / 60)
+                    check["status"] = "stale"
+                    check["detail"] = (
+                        f"running, but the artifact it executes was rebuilt "
+                        f"{age_min} min after the process started -- restart needed"
+                    )
+                    return
+            except OSError:
+                pass
         src_mtime = src_file.stat().st_mtime
         if src_mtime - proc_start > threshold_sec:
             # Before flagging stale, cross-check with git: mtime gets bumped by
