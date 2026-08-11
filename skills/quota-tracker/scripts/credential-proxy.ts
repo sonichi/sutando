@@ -124,12 +124,30 @@ function readCredFromService(service: string): StoredClaudeOAuth | null {
 	}
 }
 
+// All keychain candidates that currently hold a credential, scoped item first.
+function readCredCandidates(): StoredClaudeOAuth[] {
+	return keychainServiceCandidates()
+		.map(readCredFromService)
+		.filter((s): s is StoredClaudeOAuth => s !== null);
+}
+
 function readCred(): StoredClaudeOAuth | null {
-	for (const service of keychainServiceCandidates()) {
-		const stored = readCredFromService(service);
-		if (stored) return stored;
+	return readCredCandidates()[0] ?? null;
+}
+
+// Pure: pick the credential to serve. First candidate whose token is usable
+// wins (scoped-first preference preserved); if none is usable, fall back to
+// the first present so degraded handling (pass-through / fail-fast) sees it.
+// A dead scoped item must not eclipse a fresh /login in the default item.
+export function selectCred(
+	candidates: StoredClaudeOAuth[],
+	now: number,
+	rejectedToken: string | null,
+): StoredClaudeOAuth | null {
+	for (const c of candidates) {
+		if (classifyCredential(c.oauth, now, rejectedToken) === 'ok') return c;
 	}
-	return null;
+	return candidates[0] ?? null;
 }
 
 // Atomically write the cred back to the keychain. Returns true ONLY after a
@@ -285,7 +303,7 @@ export function authUnavailableBody(verdict: 'expired' | 'rejected'): string {
 // Injectable seams (keychain, refresh, upstream, clock) so the proxy's failure
 // semantics are testable hermetically; defaults are the production bindings.
 export interface ProxyDeps {
-	readCred: () => StoredClaudeOAuth | null;
+	readCredCandidates: () => StoredClaudeOAuth[];
 	writeCred: (service: string, oauth: ClaudeOAuth) => boolean;
 	refreshAccessToken: (oauth: ClaudeOAuth) => Promise<ClaudeOAuth | null>;
 	request: typeof httpsRequest;
@@ -297,7 +315,7 @@ export interface ProxyDeps {
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	const deps: ProxyDeps = {
-		readCred,
+		readCredCandidates,
 		writeCred,
 		refreshAccessToken,
 		request: httpsRequest,
@@ -344,8 +362,10 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 
 	// Re-read the keychain (every call — no cache, so /login lands within one
 	// request) and refresh first when at/near expiry or upstream-rejected.
+	// selectCred scans ALL candidate items: a fresh /login in the default item
+	// must be found even while a dead scoped item exists.
 	async function resolveCredential(): Promise<StoredClaudeOAuth | null> {
-		const stored = deps.readCred();
+		const stored = selectCred(deps.readCredCandidates(), deps.now(), rejectedToken);
 		if (!stored) return null;
 		const { service, oauth: cred } = stored;
 		const nearExpiry =
@@ -357,7 +377,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		if (shouldAttemptRefresh(needsRefresh, deps.now(), nextRefreshAllowedAt)) {
 			if (nearExpiry) console.log(`${ts()} [Proxy] stored token at/near expiry — attempting refresh`);
 			await runSingleFlightRefresh(service, cred);
-			return deps.readCred() ?? stored;
+			return selectCred(deps.readCredCandidates(), deps.now(), rejectedToken) ?? stored;
 		}
 		return stored;
 	}
@@ -366,7 +386,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	// backoff window allows) → rebuild → retry once. Null = give up loud.
 	async function recoverAfter401(failedToken: string): Promise<string | null> {
 		rejectedToken = failedToken;
-		const stored = deps.readCred();
+		const stored = selectCred(deps.readCredCandidates(), deps.now(), rejectedToken);
 		console.log(`${ts()} [Proxy] keychain re-read after 401: ${stored ? 'credential present' : 'no credential'}`);
 		if (!stored) return null;
 		if (
@@ -377,7 +397,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		}
 		if (stored.oauth.refreshToken && shouldAttemptRefresh(true, deps.now(), nextRefreshAllowedAt)) {
 			await runSingleFlightRefresh(stored.service, stored.oauth);
-			const after = deps.readCred();
+			const after = selectCred(deps.readCredCandidates(), deps.now(), rejectedToken);
 			if (
 				after &&
 				after.oauth.accessToken !== failedToken &&
