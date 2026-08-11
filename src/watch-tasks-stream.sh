@@ -157,9 +157,8 @@ claim_is_ours() {
   [ "$owner_id" = "$WATCHER_ID" ]
 }
 
-# 0 = must-handle, 1 = optional, 2 = unknown. Only the two written tokens are
-# recognised: anything else is unknown, because the optional branch publishes to
-# the unrestricted core and must never be reached by default.
+# 0 = must-handle, 1 = fallback, 2 = unknown.
+# Only must-handle/fallback may reach the live-core branches.
 claim_disposition() {
   local filename="$1"
   case "$(sed -n '4p' "$CLAIMS_DIR/$filename" 2>/dev/null)" in
