@@ -22,6 +22,8 @@ MAP = {
     "task_archive.py": "task_archive.py",
     "local_task_protocol.py": "local_task_protocol.py",
     "result_markers.py": "result_markers.py",
+    "result_ready.py": "result_ready.py",
+    "dedup_recovery.py": "dedup_recovery.py",
     "workspace_lock.py": "workspace_lock.py",
     "chat_secret_filter.py": "chat_secret_filter.py",
 }

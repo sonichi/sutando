@@ -38,8 +38,11 @@
 # un-ignores exactly the include list. So setting vault.sync.include to add one
 # path silently DROPS every default path — notes/, hosts/*/ and the whole
 # .claude-sutando/projects/*/memory/ corpus — out of the backup, while this
-# script goes on printing "pushed to <branch>" on every run. To add a path you
-# must restate the full carrier set.
+# script goes on printing "pushed to <branch>" on every run. To add an INCLUDE
+# path you must restate the full carrier set.
+#
+# `vault.sync.exclude_extra` appends instead of replacing — use it rather than
+# restating `exclude`. No `include_extra`: unioning a whitelist widens the vault.
 #
 # `exclude` subtracts, carving subpaths out of an included parent (emitted after
 # the includes so gitignore's last-match-wins applies).
@@ -483,6 +486,28 @@ _compose_exclude_content() {
     echo "*.jks"
 }
 
+# Print `existing` with a legacy per-host carrier scope rewritten to the shared
+# `hosts/*/` form. Unchanged when the host label is not a literal path segment.
+_widen_legacy_host_scope() {
+    local existing="$1" own_host
+    own_host="$(_host)"
+    if ! _is_literal_host_label "$own_host"; then
+        cat "$existing"
+        return 0
+    fi
+    awk -v host="$own_host" '
+        $0 == "!hosts/" host "/" {
+            print "!hosts/*/"
+            next
+        }
+        $0 == "!hosts/" host "/**" {
+            print "!hosts/*/**"
+            next
+        }
+        { print }
+    ' "$existing"
+}
+
 # Return success only when an existing generated rule set differs from the
 # desired one solely because one or more legacy `!hosts/<label>/` entries need
 # widening to `!hosts/*/`. This narrow comparison preserves the existing
@@ -492,19 +517,47 @@ _is_safe_legacy_host_scope_widening() {
     local existing="$1" desired="$2" own_host
     own_host="$(_host)"
     _is_literal_host_label "$own_host" || return 1
-    cmp -s <(
-        awk -v host="$own_host" '
-            $0 == "!hosts/" host "/" {
-                print "!hosts/*/"
-                next
-            }
-            $0 == "!hosts/" host "/**" {
-                print "!hosts/*/**"
-                next
-            }
-            { print }
-        ' "$existing"
-    ) "$desired"
+    cmp -s <(_widen_legacy_host_scope "$existing") "$desired"
+}
+
+# Comments and blanks are inert in gitignore, so header drift between generated
+# versions must not decide whether a refresh is safe.
+_exclude_rules_only() {
+    grep -vE '^[[:space:]]*(#|$)' "$1" | sort
+}
+
+# A previously-generated exclude whose ONLY difference is carve-outs the shipped
+# config now adds is safe to refresh: no operator-authored rule is lost.
+_is_safe_carveout_addition() {
+    local existing="$1" desired="$2" shipped shipped_rules line path widened rc
+    # Compare against the HOST-WIDENED existing content: the two safe migrations are
+    # independent, so a file needing both was refused by each recognizer alone.
+    widened="$(mktemp -t sync-workspace-widened.XXXXXX)" || return 1
+    _widen_legacy_host_scope "$existing" > "$widened"
+    existing="$widened"
+    shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
+    [ -n "$shipped" ] || { rm -f "$widened"; return 1; }
+    # Compare against what the composer EMITS, not the raw config value: a
+    # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
+    shipped_rules=""
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
+    done <<<"$shipped"
+    shipped="$shipped_rules"
+    rc=0
+    # Refuse if the refresh would DROP any rule the existing file carries.
+    if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ]; then
+        rc=1
+    else
+        # Every added rule must be a shipped carve-out, never an operator's line.
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            grep -qxF -- "$line" <<< "$shipped" || { rc=1; break; }
+        done < <(comm -13 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))
+    fi
+    rm -f "$widened"
+    return "$rc"
 }
 
 # Write `<workspace>/.git/info/exclude` from the composed content. Also
@@ -570,6 +623,9 @@ generate_exclude() {
         elif _is_safe_legacy_host_scope_widening "$exclude_path" "$tmp_path"; then
             log "generate_exclude: safely widened legacy hosts/<label>/ carrier rules to hosts/*/"
             color_warn "sync-workspace: widened legacy hosts/<label>/ carrier rules to hosts/*/ so peer host state remains durable"
+        elif _is_safe_carveout_addition "$exclude_path" "$tmp_path"; then
+            log "generate_exclude: refreshed a previously-generated exclude with shipped carve-outs only"
+            color_warn "sync-workspace: added shipped carve-out(s) to the existing exclude file; no operator rule was removed"
         elif [ "$FORCE_GITIGNORE" != "1" ]; then
             color_warn "sync-workspace: $exclude_path EXISTS and DIFFERS from the generated content."
             color_warn "Refusing to overwrite (operator-authored content may block carrier-set paths)."
@@ -1353,10 +1409,24 @@ _push_only_impl() {
     fi
 
     # Mass-deletion tripwire (carried over from sync-memory.sh)
-    local deleted max_delete
+    local deleted staged_d untracked_by_policy max_delete _p
     # `-M` for rename detection: legitimate moves (refactor) don't count as
     # deletions. Mirrors pull-side tripwire fix. Mini #1445 v4 Low.
-    deleted=$(git diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
+    staged_d=$(git diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
+    # A policy untrack leaves the file on disk; a real deletion does not. Both
+    # stage a D under an excluded path, so disk presence is the discriminator.
+    untracked_by_policy=0
+    while IFS= read -r -d '' _p; do
+        if [ -e "$_p" ] || [ -L "$_p" ]; then
+            untracked_by_policy=$(( untracked_by_policy + 1 ))
+        fi
+    done < <(git diff -M --cached --name-only --diff-filter=D -z \
+        | git check-ignore -z --stdin --no-index 2>/dev/null || true)
+    deleted=$(( staged_d - untracked_by_policy ))
+    [ "$deleted" -ge 0 ] || deleted=0
+    if [ "$untracked_by_policy" -gt 0 ]; then
+        log "_push_only_impl: tripwire counts $deleted real deletion(s); $untracked_by_policy staged D(s) are policy untracks still on disk"
+    fi
     max_delete="${SUTANDO_SYNC_MAX_DELETE:-50}"
     if [ "$deleted" -gt "$max_delete" ] && [ "${SUTANDO_FORCE_SYNC:-0}" != "1" ]; then
         log "_push_only_impl: ABORT — would delete $deleted files (>$max_delete tripwire)"
@@ -1480,10 +1550,10 @@ _migrate_from_legacy_impl() {
         echo "sync-workspace migrate: copying from $legacy_dir into $WORKSPACE_DIR" >&2
     fi
 
-    # Local slug derivation: matches Claude Code's auto-derived slug
-    # (REPO_DIR with / replaced by -).
+    # Claude Code dashes EVERY non-alphanumeric char, not just `/`; a path with a
+    # space or dot would otherwise resolve to a slug it never creates.
     local local_slug
-    local_slug="$(printf '%s' "$REPO_DIR" | sed 's|/|-|g')"
+    local_slug="$(printf '%s' "$REPO_DIR" | tr -c 'A-Za-z0-9' '-')"
 
     # Per-host segment for hostname-qualified destinations (build_log,
     # pending-questions). Computed once; matches `_host()` + the reader probe.

@@ -1,0 +1,18 @@
+{
+  "name": "media-transcript",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "access_tier": "owner",
+  "enabled": true,
+  "description": "Video URL → transcript text via yt-dlp caption tracks (uploader subtitles preferred over auto-captions). CLI-only skill — no inline tools; local media files are audio-transcribe's territory.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

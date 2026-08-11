@@ -448,6 +448,14 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     Missing config returns `{"enabled": False, ...}` with safe defaults so
     callers can branch on `cfg["enabled"]` without KeyError. The vault sync
     engine (M2) is the primary consumer.
+
+    `sync.exclude_extra` is ADDITIVE: it is appended to `sync.exclude` rather
+    than replacing it, and does not appear in the returned schema. `_deep_merge`
+    replaces lists, so a local `exclude` override drops the shipped carve-outs
+    silently — there is no error and the carrier simply stops excluding them.
+    `exclude_extra` is how a clone adds a path while keeping the common set.
+    `include` deliberately has no additive twin: it is a whitelist, and unioning
+    it would widen what the vault carries.
     """
     cfg = load_config(repo_root)
     vault = dict(cfg.get("vault") or {})
@@ -456,6 +464,15 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     sync = dict(vault.get("sync") or {})
     sync.setdefault("include", [])
     sync.setdefault("exclude", [])
+    extra = sync.pop("exclude_extra", None)
+    if extra:
+        base = list(sync.get("exclude") or [])
+        # Order is load-bearing: gitignore is last-match-wins, so appending keeps
+        # every shipped deny ahead of the added ones. De-duplicated.
+        for p in extra:
+            if p not in base:
+                base.append(p)
+        sync["exclude"] = base
     vault["sync"] = sync
     vault.setdefault("interval_seconds", 1800)
     return vault

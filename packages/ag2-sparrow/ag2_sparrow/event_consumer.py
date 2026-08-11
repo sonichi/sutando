@@ -161,6 +161,17 @@ class TaskifyHandler:
             os.fsync(dfd)                            # dir-entry flush would lose the batch
         finally:                                     # (events consumed, task file gone).
             os.close(dfd)
+        # Anonymous product telemetry — #2274 parity for the taskify surface: the
+        # promotion writes its task file directly (never through the relay loop's
+        # _write_task), so it must emit its own task_processed. Placed after the
+        # atomic publish and behind the already-promoted early return above, so
+        # idempotent re-drains aren't double-counted. Same fail-open shape as the
+        # bridges: a standalone PyPI install has no telemetry module and no-ops.
+        try:
+            from telemetry import task_processed
+            task_processed("events-promotion")
+        except Exception:
+            pass
         self._log(f"event-consumer: promoted {n} events → {task_id} (ambient)")
         return path
 
@@ -207,3 +218,5 @@ class EventConsumer:
         # crash re-drains them (no loss); the handler dedups them on re-drain.
         self._inbox.mark_consumed(settled)
         return {"seen": seen, "promoted": promoted, "consumed": len(settled)}
+
+# ci: re-trigger (squash-erased)
