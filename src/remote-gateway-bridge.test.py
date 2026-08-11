@@ -1233,12 +1233,8 @@ def main() -> int:
     _hdrs = [ln for ln in _sec_body.split("\n") if ln.startswith("access_tier: ")]
     check(len(_hdrs) == 1, "notice introduces no second access_tier line")
 
-    # Write-side vault interception (#2638 parity): an owner-tier `vault set
-    # KEY VALUE` in the task body must reach `_vault_intercept_fns()` and have
-    # its sanitized `.text` persisted — not the raw redact-only fallback.
-    # Faked, not the real vault_intercept module: this suite covers the NEW
-    # wiring inside _write_task, not vault_intercept.py's own regex/keychain
-    # logic (covered by tests/vault-intercept.test.py).
+    # Faked interceptor: covers `_write_task`'s wiring, not vault_intercept.py's own
+    # regex/keychain logic (tests/vault-intercept.test.py).
     class _FakeInterceptResult:
         def __init__(self, text, stored=(), failed=()):
             self.text = text
@@ -1295,8 +1291,8 @@ def main() -> int:
     rtc._VAULT_INTERCEPT_FNS = (None, None)
     rtc.LOCAL_TIER = _tier_before_vault_block
 
-    # Two P1 findings from review (qingyun-wu, 2026-08-11), both about a
-    # sanitized body not being authoritative for EVERY persistence sink.
+    # Both cases below check the sanitized body is authoritative for every
+    # persistence sink, not just the task file.
 
     # (1) The interceptor is the ONLY store call site — _write_task() must not
     # invoke it a second time when it also updates task["task"] for

@@ -108,12 +108,8 @@ def _read_manifest() -> dict:
 #   - FP: "the vault set command works fine" → key="command" (not env-shaped),
 #     value="works" (not a secret) → skip, left as prose
 #   - FN: "hey vault set APOLLO_KEY sk-..." mid-prose → "sk-..." is OpenAI → store
-# Grammar (regex + shape) is canonical in vault_set_grammar.py (2026-08-11
-# extraction) — imported above as _VAULT_SET_RE, not redefined here. That
-# module is also what packages/ag2-sparrow vendors verbatim, so the standalone
-# package and this monorepo interceptor can never diverge on what counts as
-# a `vault set` command. This file adds the STORAGE half (Keychain,
-# detect-secrets validation) on top of that shared shape.
+# Grammar is canonical in vault_set_grammar.py, imported above as _VAULT_SET_RE — not
+# redefined here. This file adds the storage half (Keychain, detect-secrets) on top.
 
 # #2074: an unquoted value the FP guard doesn't recognize isn't proof of
 # prose — it can be a real secret the classifier missed (a 32-char Discord

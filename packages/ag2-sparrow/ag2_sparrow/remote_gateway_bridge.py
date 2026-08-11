@@ -554,14 +554,8 @@ def _vault_intercept_fns():
 
 
 def _local_redact_vault_set(text: str) -> str:
-    """Last-resort redaction when _vault_intercept_fns() found neither the
-    real interceptor nor the real redactor (standalone package install with
-    no monorepo src/vault_intercept.py). Delegates to vault_set_grammar,
-    which THIS PACKAGE vendors verbatim from src/ (tools/sync_from_src.py,
-    drift-checked) — a plain in-package import, no runtime search needed,
-    and no hand-copied regex to diverge from the canonical shape (review
-    finding, qingyun-wu 2026-08-11: a duplicated grammar silently drifts the
-    moment the canonical one changes)."""
+    """Last-resort redaction when no monorepo `vault_intercept.py` is found.
+    Delegates to this package's own vendored `vault_set_grammar`, not a hand-copied regex."""
     from .vault_set_grammar import redact_vault_commands as _grammar_redact
     return _grammar_redact(text, placeholder="[VAULT-SET-REDACTED: interceptor unavailable]")
 
@@ -1477,12 +1471,8 @@ def _write_task(task: dict) -> str | None:
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
     _secret_types: tuple = ()
-    # Resolved ONCE, up front, and reused everywhere below (the task-field vault
-    # interception, the access_tier header line, and the guest/owner in-band
-    # branches) so the tier decision can never diverge between them. Moved
-    # ahead of the field loop (2026-08-11): vault interception on the "task"
-    # field needs the tier before that field is processed, but the loop
-    # reaches "task" before the tail of the function used to compute it.
+    # Resolved once, reused everywhere below so the tier decision can never diverge;
+    # must run before the "task" field is reached in the loop below.
     sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     for f in _TASK_FIELDS:
         if f == "source":
@@ -1507,19 +1497,8 @@ def _write_task(task: dict) -> str | None:
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
-            # Intercept `vault set KEY VALUE` BEFORE ordinary secret redaction,
-            # owner-tier only — write-side #2638 parity with discord/slack/
-            # telegram (see _vault_intercept_fns docstring). Non-owner senders
-            # never get Keychain writes; `filter_chat_secrets` below still
-            # catches an unnamed pasted token either way. A value is never both
-            # left unredacted AND unstored: every path below that doesn't
-            # successfully intercept-and-store falls through to SOME redactor —
-            # the real one if `_vault_intercept_fns()` found it, else the
-            # dependency-free `_local_redact_vault_set` (review finding,
-            # qingyun-wu 2026-08-11: the old `elif sender_tier != "owner"` guard
-            # meant an owner-tier sender with no interceptor available — the
-            # standalone `ag2-sparrow` package case — skipped redaction
-            # entirely and the plaintext value reached disk).
+            # Intercept `vault set KEY VALUE` before ordinary redaction, owner-tier only.
+            # Every path below intercepts-and-stores or falls through to a redactor — never neither.
             _intercept_fn, _redact_fn = _vault_intercept_fns()
             _redact_fallback = _redact_fn or _local_redact_vault_set
             if sender_tier == "owner" and _intercept_fn is not None:
@@ -1549,15 +1528,8 @@ def _write_task(task: dict) -> str | None:
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
             lines.append(f"task: {_one_line(_filtered.text)}")
-            # Make the fully-sanitized body authoritative for every OTHER
-            # persistence sink too, not just the task file. _write_owner_activity()
-            # below re-reads task["task"] independently and only applies the
-            # generic filter_chat_secrets (not vault-aware), so without this the
-            # vault-intercepted/redacted text above stayed local to _fetched and
-            # the raw value still leaked into last-owner-activity.json (review
-            # finding, qingyun-wu 2026-08-11). `task` is this function's own
-            # shallow copy (`task = {**task, ...}` above), so mutating it here
-            # doesn't touch the caller's dict.
+            # Make the sanitized body authoritative everywhere, not just this task file —
+            # _write_owner_activity() re-reads task["task"] independently and isn't vault-aware.
             task["task"] = _filtered.text
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
