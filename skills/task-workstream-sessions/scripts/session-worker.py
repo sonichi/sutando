@@ -53,6 +53,9 @@ TEAM_WORKSPACE_SECRET_GLOBS = (
     "**/*credentials*.json", "**/.aws/**", "**/.ssh/**", "**/.kube/**",
     "**/.config/gh/**", "**/.docker/config.json",
 )
+# Denied by DIRECTORY, not glob: the Team root is the owner workspace, and globbing
+# these would enumerate thousands of files into the deny lists on every task.
+TEAM_WORKSPACE_SECRET_DIRS = ("state/auth",)
 TEAM_TOOL_SECRET_GLOBS = TEAM_WORKSPACE_SECRET_GLOBS[:9] + (
     "**/.docker/config.json",
 )
@@ -209,6 +212,7 @@ def _credential_paths(team_workspace: Path) -> list[str]:
         home / ".claude", home / ".config" / "gh", home / ".docker" / "config.json",
         home / ".npmrc", home / ".git-credentials", team_workspace / ".env",
     ]
+    paths.extend(team_workspace / rel for rel in TEAM_WORKSPACE_SECRET_DIRS)
     for pattern in TEAM_WORKSPACE_SECRET_GLOBS:
         paths.extend(path for path in team_workspace.glob(pattern) if path.is_file())
     return list(dict.fromkeys(str(path) for path in paths))
@@ -298,7 +302,10 @@ def _require_claude_team_sandbox() -> None:
 
 
 def _codex_permission_profile_config() -> str:
-    denied = ",".join(f'"{pattern}"="deny"' for pattern in TEAM_WORKSPACE_SECRET_GLOBS)
+    patterns = TEAM_WORKSPACE_SECRET_GLOBS + tuple(
+        f"**/{rel}/**" for rel in TEAM_WORKSPACE_SECRET_DIRS
+    )
+    denied = ",".join(f'"{pattern}"="deny"' for pattern in patterns)
     return (
         f'permissions.{CODEX_TEAM_PROFILE}={{extends=":workspace",'
         f'filesystem={{":workspace_roots"={{{denied}}}}}}}'

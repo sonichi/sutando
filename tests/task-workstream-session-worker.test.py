@@ -184,6 +184,17 @@ def test_team_capability_root_is_the_owner_configured_workspace() -> None:
         workspace_npmrc.write_text("token=blocked\n")
         workspace_env = owner_workspace / ".env"
         workspace_env.write_text("API_KEY=blocked\n")
+        # Sutando's own credential state lives INSIDE the team root once the capability
+        # root is the owner workspace, so it needs deny coverage like any dotfile secret.
+        sutando_secrets = []
+        for rel, body in (
+            ("state/auth/cloud-auth.json", '{"token":"blocked"}\n'),
+            ("state/auth/device.json", '{"device":"blocked"}\n'),
+        ):
+            path = owner_workspace / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body)
+            sutando_secrets.append(path)
 
         claude_log = root / "claude.json"
         _executable(root / "claude", """#!/usr/bin/env python3
@@ -215,6 +226,17 @@ print(json.dumps({'type': 'result', 'result': 'bounded claude result'}))
         assert str(workspace_env) in deny_read, deny_read
         assert str(workspace_npmrc) in deny_read, deny_read
         assert settings["permissions"]["allow"].count("Bash") == 1
+        # Denied by DIRECTORY, not per-file: globbing these would enumerate thousands of
+        # files per task on a real workspace. The parent dir covers everything beneath it.
+        deny_write = settings["sandbox"]["filesystem"]["denyWrite"]
+        for rel in ("state/auth",):
+            assert str(owner_workspace / rel) in deny_read, (rel, deny_read)
+            assert str(owner_workspace / rel) in deny_write, rel
+        for secret in sutando_secrets:
+            assert any(str(secret).startswith(d + "/") for d in deny_read), (secret, deny_read)
+        # An ordinary workspace file stays fully usable — the denies are targeted, not a
+        # blanket lockout of the team root.
+        assert str(owner_workspace / "owner-project.txt") not in deny_read
         prompt = claude["args"][-1]
         assert f"team workspace at {owner_workspace}" in prompt
 
@@ -553,6 +575,9 @@ def test_bounded_runtime_helper_edges() -> None:
             except RuntimeError as exc:
                 assert "need 0.132.0+" in str(exc)
         assert '"**/.env"="deny"' in worker._codex_permission_profile_config()
+        # Same Sutando workspace credential coverage on the Codex side, from the one glob list.
+        for pattern in ("**/state/auth/**",):
+            assert f'"{pattern}"="deny"' in worker._codex_permission_profile_config(), pattern
         assert '"**/.npmrc"="deny"' in worker._codex_permission_profile_config()
 
         already_done = mock.Mock()
