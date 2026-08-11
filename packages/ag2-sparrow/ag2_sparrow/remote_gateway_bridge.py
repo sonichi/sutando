@@ -514,19 +514,8 @@ _VAULT_INTERCEPT_FNS: "tuple | None" = None
 
 
 def _vault_intercept_fns():
-    """Lazily locate + import `intercept_vault_commands`/`redact_vault_commands`
-    from the monorepo `src/vault_intercept.py`, same discovery pattern as
-    `_token_from_vault_ag2space` above (sparrow ships standalone, so `src/` may
-    be absent). Memoized; returns (None, None) on any failure so a caller can
-    degrade to `filter_chat_secrets`-only behavior rather than crash.
-
-    Closes the write-side half of #2638 for ag2space: discord/slack/telegram
-    bridges intercept an owner's `vault set KEY VALUE` before task-write so the
-    secret reaches Keychain and never the task file; this bridge only ever read
-    FROM the vault (`_token_from_vault_ag2space`, its own bootstrap token) and
-    never intercepted an inbound `vault set`, so a room-typed `vault set` here
-    silently stored nothing — same class of gap #2638 fixed for the other three.
-    """
+    """Lazily locate the monorepo `src/vault_intercept.py` helpers; memoized.
+    Returns (None, None) on failure so a caller can fall back to `_local_redact_vault_set`."""
     global _VAULT_INTERCEPT_FNS
     if _VAULT_INTERCEPT_FNS is not None:
         return _VAULT_INTERCEPT_FNS

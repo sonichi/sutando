@@ -1294,10 +1294,8 @@ def main() -> int:
     # Both cases below check the sanitized body is authoritative for every
     # persistence sink, not just the task file.
 
-    # (1) The interceptor is the ONLY store call site — _write_task() must not
-    # invoke it a second time when it also updates task["task"] for
-    # _write_owner_activity()'s benefit, or an owner's `vault set` would be
-    # stored twice (double Keychain write / double-counted "stored" log).
+    # (1) Updating task["task"] for _write_owner_activity() must not re-invoke
+    # the interceptor — that would double-store the vault key.
     rtc.LOCAL_TIER = "owner"
     _oa = rtc.OWNER_ACTIVITY_FILE
     _oa.unlink(missing_ok=True)
@@ -1318,11 +1316,8 @@ def main() -> int:
     rtc._VAULT_INTERCEPT_FNS = (None, None)
     rtc.LOCAL_TIER = _tier_before_vault_block
 
-    # (2) No-interceptor-available fallback: an owner-tier sender with
-    # _vault_intercept_fns() == (None, None) — the standalone/package-only
-    # ag2-sparrow install, no monorepo src/vault_intercept.py to find — must
-    # still get SOME redaction (the dependency-free local fallback), not pass
-    # through untouched to the generic filter_chat_secrets.
+    # (2) No interceptor available (standalone package, no monorepo src/) must still
+    # redact via the local fallback, not pass through untouched.
     rtc.LOCAL_TIER = "owner"
     rtc._VAULT_INTERCEPT_FNS = (None, None)
     rtc._write_task({**TASK, "id": "task-VAULTNOHELPER", "access_tier": "owner",
