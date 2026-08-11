@@ -145,14 +145,14 @@ def main() -> int:
     _dspec.loader.exec_module(_drtc)
     check(_drtc.LOCAL_TIER == "owner",
           "default LOCAL_TIER=owner when REMOTE_TASK_TIER unset (personal-agent model)")
-    # An INVALID value must fail CLOSED to "team" — never silently grant owner on
+    # An INVALID value must fail CLOSED to "guest" — never silently grant owner on
     # a typo; only an unset/explicit config grants owner.
     os.environ["REMOTE_TASK_TIER"] = "owenr"  # typo
     _ispec = importlib.util.spec_from_file_location("rtc_invalid", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
     _irtc = importlib.util.module_from_spec(_ispec)
     _ispec.loader.exec_module(_irtc)
-    check(_irtc.LOCAL_TIER == "team",
-          "invalid REMOTE_TASK_TIER fails CLOSED to team (never silently owner)")
+    check(_irtc.LOCAL_TIER == "guest",
+          "invalid REMOTE_TASK_TIER fails CLOSED to guest (never silently owner)")
     os.environ.pop("REMOTE_TASK_TIER", None)
 
     # ── GATEWAY_INSTANCE (multi-gateway): named instance suffixes the per-bridge
@@ -319,7 +319,36 @@ def main() -> int:
     check("task: hello from gateway" in content, "task body serialized")
     check("source: remote-gateway" in content, "source field carried")
     check("access_tier: team" in content and "access_tier: owner" not in content,
-          "access_tier CLAMPED to local default (wire said owner — never trusted)")
+          "owner attestation is clamped to the local team cap")
+    check("codex exec" not in content,
+          "transport records team authority without selecting a model runtime")
+    _load_map = rtc._load_tier_map
+    _local_tier = rtc.LOCAL_TIER
+    rtc._load_tier_map = lambda: {}
+    rtc.LOCAL_TIER = "owner"
+    try:
+        check(rtc._tier_for("@owner:example.org", "owner") == "owner",
+              "backend owner + local owner remains owner")
+        check(rtc._tier_for("@team:example.org", "team") == "team",
+              "backend team is not upgraded by local owner default")
+        check(rtc._tier_for("@guest:example.org", "guest") == "guest",
+              "backend guest is not upgraded by local owner default")
+        check(rtc._tier_for("@missing:example.org", None) == "guest",
+              "missing backend tier fails closed to guest")
+        rtc._load_tier_map = lambda: {"@team:example.org": "team",
+                                      "@guest:example.org": "owner"}
+        check(rtc._tier_for("@team:example.org", "owner") == "team",
+              "local sender map may downgrade backend owner to team")
+        check(rtc._tier_for("@guest:example.org", "guest") == "guest",
+              "local owner mapping cannot upgrade backend guest")
+    finally:
+        rtc._load_tier_map = _load_map
+        rtc.LOCAL_TIER = _local_tier
+    rtc._write_task({**TASK, "id": "task-GUEST", "access_tier": "guest"})
+    guest_body = (rtc.TASKS_DIR / "task-GUEST.txt").read_text()
+    check("access_tier: guest" in guest_body
+          and "codex exec --sandbox read-only" in guest_body,
+          "guest task retains the established read-only Codex delegation")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
     # present, and a newline in a name can't forge an extra field line.
     rtc._write_task({**TASK, "id": "task-CTX", "room_name": "#design",
@@ -1058,15 +1087,16 @@ def main() -> int:
           "two same-name media saves get distinct files (no overwrite)")
     rtc._download_bytes = real_download
 
-    # 7. owner-activity gate follows LOCAL_TIER, not the gateway's tier claim
+    # 7. owner-activity gate follows the final resolved sender tier
     act = rtc.OWNER_ACTIVITY_FILE
     act.unlink(missing_ok=True)
     rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-gateway",
-                               "access_tier": "owner"})
+                               "access_tier": "owner"}, sender_tier="team")
     check(not act.exists(),
-          "LOCAL_TIER=team → owner-activity NOT written even if wire claims owner")
+          "team task does not write owner activity")
     rtc.LOCAL_TIER = "owner"
-    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-gateway"})
+    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-gateway",
+                               "access_tier": "owner"}, sender_tier="owner")
     data = json.loads(act.read_text()) if act.exists() else {}
     check(data.get("summary") == "hi there" and data.get("channel") == "remote-gateway",
           "LOCAL_TIER=owner → owner-activity written with stripped summary")

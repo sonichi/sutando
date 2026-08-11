@@ -35,6 +35,10 @@ probe_optional_task_handler() {
     --repo "$REPO" \
     --probe >/dev/null
   rc=$?
+  if [ "$rc" -eq 4 ]; then
+    # Required Team handlers are watcher-owned and must never reach the live core.
+    return 0
+  fi
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
     echo "task-notifier: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
     return 3
