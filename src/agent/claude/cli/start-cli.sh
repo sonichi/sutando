@@ -184,9 +184,9 @@ fi
 #   - M0 helper missing → refuse to start. The helper ships in this repo beside
 #     this script, so its absence means an incomplete checkout, not a supported
 #     layout. Falling back silently would leave CLAUDE_CONFIG_DIR unset and send
-#     the core to ~/.claude — a DIFFERENT credential store than every other
-#     Sutando process here, which surfaces as an unrecoverable 401 loop rather
-#     than as the install error it actually is.
+#     the core to Claude Code's user-level default config dir — a DIFFERENT
+#     credential store than every other Sutando process here, which surfaces as
+#     an unrecoverable 401 loop rather than as the install error it actually is.
 #   - Helper present + config valid → export env for every claude invocation
 #     below (no-tmux fallback at L~75, TTY exec at L~115, no-TTY detached at
 #     L~120 all inherit it).
@@ -333,10 +333,17 @@ PY
     exit 1
   fi
   rm -f "$_ccd_err"
+elif [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  # Helper absent but the caller already scoped the config dir (e.g. the desktop
+  # app exports it when spawning the core). Nothing to resolve and nothing unsafe
+  # about it — the core reaches the intended credential store either way.
+  echo "  ✓ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 else
-  echo "start-cli: $REPO/scripts/sutando-config.sh missing or not executable — refusing to start core" >&2
-  echo "  CLAUDE_CONFIG_DIR would go unset and the core would read ~/.claude instead of the" >&2
-  echo "  workspace config dir, i.e. a different credential store. Re-run once the install completes." >&2
+  echo "start-cli: $REPO/scripts/sutando-config.sh missing or not executable, and no" >&2
+  echo "  CLAUDE_CONFIG_DIR from the caller — refusing to start core. It would go unset and" >&2
+  echo "  the core would fall back to Claude Code's user-level default config dir, i.e. a" >&2
+  echo "  different credential store than the rest of Sutando on this host. Re-run once the" >&2
+  echo "  install completes, or export CLAUDE_CONFIG_DIR before launching." >&2
   exit 1
 fi
 

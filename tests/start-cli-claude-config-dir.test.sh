@@ -204,6 +204,36 @@ test_helper_missing_refuses_to_start() {
 }
 
 # ----------------------------------------------------------------------
+# 1b. M0 helper MISSING but the CALLER already exported CLAUDE_CONFIG_DIR →
+#     start, and pass the caller's value through untouched. The desktop app
+#     scopes the config dir when it spawns the core; refusing there would break
+#     a configuration that already reaches the right credential store.
+# ----------------------------------------------------------------------
+test_helper_missing_honours_caller_config_dir() {
+  setup_sandbox "no" "(unused)"
+  caller_ccd="$SANDBOX/caller-scoped-config"
+  export CLAUDE_CONFIG_DIR="$caller_ccd"
+  bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null >/dev/null 2>&1
+  rc=$?
+  unset CLAUDE_CONFIG_DIR
+  if [ "$rc" != "0" ]; then
+    echo "  FAIL: start-cli exit $rc — refused despite a caller-provided CLAUDE_CONFIG_DIR"
+    cleanup_sandbox; return 1
+  fi
+  if [ ! -f "$ENV_DUMP" ]; then
+    echo "  FAIL: claude stub never ran"
+    cleanup_sandbox; return 1
+  fi
+  got="$(grep '^CLAUDE_CONFIG_DIR=' "$ENV_DUMP" | head -1)"
+  if [ "$got" != "CLAUDE_CONFIG_DIR=$caller_ccd" ]; then
+    echo "  FAIL: caller value not passed through — got '${got:-<unset>}', want 'CLAUDE_CONFIG_DIR=$caller_ccd'"
+    cleanup_sandbox; return 1
+  fi
+  cleanup_sandbox
+  return 0
+}
+
+# ----------------------------------------------------------------------
 # 2. helper present + VALID config → CLAUDE_CONFIG_DIR exported, claude gets it.
 # ----------------------------------------------------------------------
 test_valid_config_exports_env() {
@@ -284,6 +314,7 @@ echo "tests/start-cli-claude-config-dir.test.sh — running"
 echo
 
 run_test "1. helper missing → refuses to start"              test_helper_missing_refuses_to_start
+run_test "1b. helper missing + caller-set dir → honoured"     test_helper_missing_honours_caller_config_dir
 run_test "2. helper + valid config → env exported"          test_valid_config_exports_env
 run_test "3. helper + invalid config → refuses to start"    test_invalid_config_refuses_to_start
 run_test "4. source-tied guard: block present in script"    test_block_present_in_start_cli
