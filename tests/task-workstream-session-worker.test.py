@@ -222,6 +222,25 @@ def test_partial_output_then_stall_still_hits_the_deadline() -> None:
             assert elapsed < 2, f"timeout loop blocked on the partial line ({elapsed:.2f}s)"
 
 
+def test_closes_pipes_then_stalls_still_hits_the_deadline() -> None:
+    """Regression: a provider that closes stdout+stderr then hangs must NOT sail
+    past the deadline via the post-EOF wait. Once both pipes EOF, the selector
+    loop exits; a plain process.wait() there would block on the still-running
+    child forever. The bounded wait must fail closed at the deadline instead."""
+    child = "import os, time; os.close(1); os.close(2); time.sleep(5)"
+    started = time.monotonic()
+    with mock.patch.dict(os.environ, {
+        "SUTANDO_TIER_HARD_TIMEOUT": "0.3",
+        "SUTANDO_TIER_STALL_TIMEOUT": "0.2",
+    }):
+        try:
+            worker._run_process_bounded([sys.executable, "-c", child], Path("."))
+            raise AssertionError("expected a TimeoutError, provider was not bounded")
+        except TimeoutError:
+            elapsed = time.monotonic() - started
+            assert elapsed < 2, f"post-EOF wait blocked on the stalled child ({elapsed:.2f}s)"
+
+
 def test_older_claude_fails_closed_before_receiving_team_prompt() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -1296,6 +1315,7 @@ if __name__ == "__main__":
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()
     test_older_claude_fails_closed_before_receiving_team_prompt()
     test_partial_output_then_stall_still_hits_the_deadline()
+    test_closes_pipes_then_stalls_still_hits_the_deadline()
     test_installed_claude_enforces_team_credential_and_network_boundary()
     test_bounded_runtime_helper_edges()
     test_claude_creates_then_resumes_the_same_durable_session()

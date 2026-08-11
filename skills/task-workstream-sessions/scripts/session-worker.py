@@ -345,11 +345,25 @@ def _run_process_bounded(command: list[str], cwd: Path) -> tuple[int, str, str]:
                     last_progress = time.monotonic()
                 else:
                     selector.unregister(key.fd)  # EOF
-        return (
-            process.wait(),
-            b"".join(output["stdout"]).decode("utf-8", "replace"),
-            b"".join(output["stderr"]).decode("utf-8", "replace"),
-        )
+        # Pipes drained, but the process can close stdout/stderr and keep running
+        # (or hang). A plain process.wait() here has no deadline, so that path
+        # sails past the budget and wedges the worker. Keep the deadline
+        # authoritative until the process actually EXITS, not just until EOF.
+        while True:
+            try:
+                return_code = process.wait(timeout=min(0.2, stall_timeout))
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if now - started >= hard_timeout:
+                    raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
+                if now - last_progress >= stall_timeout:
+                    raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
+                continue
+            return (
+                return_code,
+                b"".join(output["stdout"]).decode("utf-8", "replace"),
+                b"".join(output["stderr"]).decode("utf-8", "replace"),
+            )
     except BaseException:
         _terminate_process_group(process)
         raise
