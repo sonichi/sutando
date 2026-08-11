@@ -2,7 +2,7 @@
 # Integration test for src/agent/claude/cli/start-cli.sh's CLAUDE_CONFIG_DIR export.
 #
 # Covers the 3 states the design doc enumerated:
-#   1. M0 helper missing                              → silent fallback, claude spawns w/o env
+#   1. M0 helper missing                              → refuse (exit 1); opt-in env spawns w/ warning
 #   2. helper present + valid config                  → env exported to claude
 #   3. helper present + invariant-violating config    → exit 1, refuse to start
 #
@@ -173,32 +173,49 @@ cleanup_sandbox() {
 REAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ----------------------------------------------------------------------
-# 1. M0 helper MISSING → silent fallback, start-cli still launches claude,
-#    CLAUDE_CONFIG_DIR is NOT set (or set to default from the parent env).
+# 1. M0 helper MISSING → refuse to start (a silent ~/.claude fallback would
+#    switch identity); 1b. explicit opt-in env spawns with a warning, no CCD.
 # ----------------------------------------------------------------------
-test_helper_missing_silent_fallback() {
+test_helper_missing_refuses() {
   setup_sandbox "no" "(unused)"
-  # Run start-cli; should reach claude stub without erroring on missing helper.
-  bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null >/dev/null 2>&1
+  _err="$(bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null 2>&1 >/dev/null)"
   rc=$?
-  if [ "$rc" != "0" ]; then
-    echo "  FAIL: start-cli exit $rc (expected 0 — helper-missing should be silent fallback)"
+  if [ "$rc" = "0" ]; then
+    echo "  FAIL: exit 0 (expected refusal — helper missing must not silently fall back)"
     cleanup_sandbox; return 1
   fi
-  if [ ! -f "$ENV_DUMP" ]; then
-    echo "  FAIL: claude stub never ran — start-cli didn't reach the spawn"
+  if [ -f "$ENV_DUMP" ]; then
+    echo "  FAIL: claude stub ran despite the refusal"
     cleanup_sandbox; return 1
   fi
-  # CLAUDE_CONFIG_DIR should NOT be set by start-cli (the helper-present
-  # block was skipped). If the parent env had one, it'd pass through, but
-  # we cleared the test env.
-  if grep -q "^CLAUDE_CONFIG_DIR=" "$ENV_DUMP"; then
-    echo "  FAIL: CLAUDE_CONFIG_DIR was set even though helper is absent"
-    grep "^CLAUDE_CONFIG_DIR=" "$ENV_DUMP"
+  if ! printf '%s' "$_err" | grep -q "refusing to start the core"; then
+    echo "  FAIL: refusal message missing from stderr"
     cleanup_sandbox; return 1
   fi
   cleanup_sandbox
-  return 0
+}
+
+test_helper_missing_optin_spawns_with_warning() {
+  setup_sandbox "no" "(unused)"
+  _err="$(SUTANDO_ALLOW_DEFAULT_CONFIG_DIR=1 bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null 2>&1 >/dev/null)"
+  rc=$?
+  if [ "$rc" != "0" ]; then
+    echo "  FAIL: exit $rc (opt-in should spawn)"
+    cleanup_sandbox; return 1
+  fi
+  if [ ! -f "$ENV_DUMP" ]; then
+    echo "  FAIL: claude stub never ran under the opt-in"
+    cleanup_sandbox; return 1
+  fi
+  if grep -q "^CLAUDE_CONFIG_DIR=" "$ENV_DUMP"; then
+    echo "  FAIL: CLAUDE_CONFIG_DIR set even though helper is absent"
+    cleanup_sandbox; return 1
+  fi
+  if ! printf '%s' "$_err" | grep -q "WARNING"; then
+    echo "  FAIL: opt-in fallback did not warn"
+    cleanup_sandbox; return 1
+  fi
+  cleanup_sandbox
 }
 
 # ----------------------------------------------------------------------
@@ -281,7 +298,8 @@ test_block_present_in_start_cli() {
 echo "tests/start-cli-claude-config-dir.test.sh — running"
 echo
 
-run_test "1. helper missing → silent fallback"              test_helper_missing_silent_fallback
+run_test "1. helper missing → refuses to start"             test_helper_missing_refuses
+run_test "1b. helper missing + opt-in → spawns w/ warning"   test_helper_missing_optin_spawns_with_warning
 run_test "2. helper + valid config → env exported"          test_valid_config_exports_env
 run_test "3. helper + invalid config → refuses to start"    test_invalid_config_refuses_to_start
 run_test "4. source-tied guard: block present in script"    test_block_present_in_start_cli

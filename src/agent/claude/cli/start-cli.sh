@@ -30,11 +30,8 @@ cd "$REPO"
 # else system python3.
 # Single-sourced in scripts/python-binary.sh (see there for why the bare-name
 # fallback this replaced was the CLT-dialog trigger).
-# Source OPTIONALLY. tests/start-cli-claude-config-dir.test.sh pins a contract
-# older than this change: a checkout without the M0 helper must still spawn
-# claude ("helper missing -> silent fallback"). A hard exit here broke that, so
-# the guard lives at each call site instead — which is what CR #2599 actually
-# needs (no `"" -c ...`), without turning a missing helper into a launch failure.
+# Source OPTIONALLY: a missing python helper must not abort here — the guard
+# lives at each call site (CR #2599 needs no `"" -c ...`, not a launch failure).
 PY=""
 if [ -r "$REPO/scripts/python-binary.sh" ]; then
   . "$REPO/scripts/python-binary.sh"
@@ -181,7 +178,9 @@ fi
 # into the workspace tree rather than the global ~/.claude/.
 #
 # Defense in depth:
-#   - M0 helper missing → silent fallback (legacy install, extracted tarball).
+#   - M0 helper missing → REFUSE to start (a silent ~/.claude fallback switches
+#     keychain identity + memory + sessions without a trace). Legacy installs
+#     opt in explicitly with SUTANDO_ALLOW_DEFAULT_CONFIG_DIR=1.
 #   - Helper present + config valid → export env for every claude invocation
 #     below (no-tmux fallback at L~75, TTY exec at L~115, no-TTY detached at
 #     L~120 all inherit it).
@@ -328,6 +327,13 @@ PY
     exit 1
   fi
   rm -f "$_ccd_err"
+elif [ "${SUTANDO_ALLOW_DEFAULT_CONFIG_DIR:-0}" = "1" ]; then
+  echo "start-cli: WARNING — M0 helper missing; running with the DEFAULT ~/.claude config dir (explicit legacy opt-in)" >&2
+else
+  echo "start-cli: $REPO/scripts/sutando-config.sh missing or not executable — refusing to start the core." >&2
+  echo "start-cli: a silent fallback to ~/.claude would switch credentials, memory and sessions to a different identity." >&2
+  echo "start-cli: fix the checkout (git checkout scripts/sutando-config.sh; chmod +x) or set SUTANDO_ALLOW_DEFAULT_CONFIG_DIR=1 to accept the default dir." >&2
+  exit 1
 fi
 
 # NO --model flag: the core inherits the user's global model, so 1M stays the
