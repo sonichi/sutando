@@ -38,6 +38,7 @@ EXIT_NO_GIT = 6
 GIT_CONFIG_KEY = "ENGINE_CONFLICT_GIT"
 
 _GIT: Optional[str] = None
+_EXEC_PATH: Optional[str] = None  # "" = derivation attempted and failed
 _CLI_GIT: Optional[str] = None
 _ENGINE_HINT: Optional[Path] = None
 
@@ -91,11 +92,23 @@ def _repo_src() -> Optional[Path]:
     return None
 
 
+def _finalize_git(cand: str) -> str:
+    """Cache the binary AND its exec-path: git's merge machinery re-execs
+    itself, and under an empty PATH only GIT_EXEC_PATH lets that resolve."""
+    global _GIT, _EXEC_PATH
+    _GIT = cand
+    try:
+        proc = subprocess.run([cand, "--exec-path"], capture_output=True, text=True, timeout=15)
+        _EXEC_PATH = proc.stdout.strip() if proc.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        _EXEC_PATH = ""
+    return _GIT
+
+
 def resolve_git() -> str:
     """Trusted git, never a traceback and never the bare CLT stub:
     --git > $ENGINE_CONFLICT_GIT > manifest config > <engine-parent>/bin/git
     (the desktop bundle, #305) > src/git_binary.py contract."""
-    global _GIT
     if _GIT:
         return _GIT
     for tier, cand in (("--git", _CLI_GIT),
@@ -106,13 +119,11 @@ def resolve_git() -> str:
                 emit({"status": "no-git", "reason": "no-git",
                       "error": f"configured git ({tier}) is not runnable: {cand}"},
                      exit_code=EXIT_NO_GIT)
-            _GIT = cand
-            return _GIT
+            return _finalize_git(cand)
     if _ENGINE_HINT is not None:
         bundled = Path(_ENGINE_HINT).resolve().parent / "bin" / "git"
         if _runnable(str(bundled)):
-            _GIT = str(bundled)
-            return _GIT
+            return _finalize_git(str(bundled))
     src = _repo_src()
     if src is not None:
         if str(src) not in sys.path:
@@ -123,8 +134,7 @@ def resolve_git() -> str:
         except Exception:
             cand = None
         if cand:
-            _GIT = cand
-            return _GIT
+            return _finalize_git(cand)
     emit({"status": "no-git", "reason": "no-git",
           "error": "no usable git — pass --git, set ENGINE_CONFLICT_GIT (declared in "
                    "skills/engine-conflict-resolve/manifest.json), or run against a desktop "
@@ -133,18 +143,23 @@ def resolve_git() -> str:
 
 
 def run_git(repo, *args: str, check: bool = True, ident: bool = False) -> "subprocess.CompletedProcess[str]":
+    git = resolve_git()
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if _EXEC_PATH:
+        env["GIT_EXEC_PATH"] = _EXEC_PATH
     if ident:
         env.update(SUTANDO_IDENT)
     try:
         proc = subprocess.run(
-            [resolve_git(), "-C", str(repo)] + list(args),
+            [git, "-C", str(repo)] + list(args),
             capture_output=True, text=True, env=env,
         )
     except OSError as e:
+        detail = "" if _EXEC_PATH else " (GIT_EXEC_PATH could not be derived via --exec-path)"
         emit({"status": "no-git", "reason": "no-git",
-              "error": f"git executable failed to launch ({e}) — set SUTANDO_GIT or pass --git"},
+              "error": f"git executable failed to launch ({e}){detail} — "
+                       "set ENGINE_CONFLICT_GIT or pass --git"},
              exit_code=EXIT_NO_GIT)
     if check and proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed in {repo}: {proc.stderr.strip()}")
@@ -335,10 +350,16 @@ def acquire_lock(state_dir: Path, busy_exit: int = 3) -> Path:
 
 
 def _remove_lock(lock_dir: Path) -> None:
+    """Idempotent like the updater's rm -rf: a concurrent reclaim is not an error."""
     try:
         for child in lock_dir.iterdir():
-            child.unlink()
+            try:
+                child.unlink()
+            except FileNotFoundError:
+                pass
         lock_dir.rmdir()
+    except FileNotFoundError:
+        pass
     except OSError as e:
         die(f"could not remove lock {lock_dir}: {e}", reason="lock-error")
 

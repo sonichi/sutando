@@ -361,11 +361,29 @@ class TestGitResolution(unittest.TestCase):
         self.assertFalse(self.fx.scratch.exists())
 
     def test_bundled_engine_git_serves_the_whole_chain_without_path(self):
-        """Reviewer's control: desktop bundle ships engine/bin/git; PATH has none."""
+        """Bundle-derived resolution + GIT_EXEC_PATH propagation, PATH empty.
+
+        The exec-path half is asserted via env capture, not merge survival:
+        this host's git (like CI's apt git) bakes an absolute exec-path at
+        build time, so its internal self-execs survive PATH="" even WITHOUT
+        GIT_EXEC_PATH — a green merge here cannot by itself prove the
+        desktop-bundled git (whose self-execs DO need GIT_EXEC_PATH — the
+        'cannot run stash' failure from review) would work. The wrapper logs
+        every run_git child env; we assert each carries the exec-path derived
+        from the resolved binary.
+        """
         fx = self.fx
         bin_dir = fx.engine.parent / "bin"
         bin_dir.mkdir()
-        (bin_dir / "git").symlink_to(self.real_git)
+        envlog = fx.root / "git-env.log"
+        (bin_dir / "git").write_text(
+            "#!/bin/sh\n"
+            'echo "ARGS=$* EXEC=${GIT_EXEC_PATH:-UNSET}" >> "%s"\n'
+            'exec "%s" "$@"\n' % (envlog, self.real_git))
+        os.chmod(bin_dir / "git", 0o755)
+        expected_exec = subprocess.run([self.real_git, "--exec-path"],
+                                       capture_output=True, text=True).stdout.strip()
+        self.assertTrue(expected_exec)
         env = self.sanitized_env()
 
         p = fx.prepare(env=env)
@@ -386,6 +404,14 @@ class TestGitResolution(unittest.TestCase):
         self.assertEqual(a.returncode, 0, a.stdout + a.stderr)
         self.assertEqual(git(fx.engine, "rev-parse", "HEAD").stdout.strip(), merged)
         fx.assert_invariants(self)
+
+        # Every run_git child (all lines except each process's single
+        # --exec-path derivation probe) must carry the derived exec-path.
+        lines = envlog.read_text().splitlines()
+        work = [l for l in lines if l != "ARGS=--exec-path EXEC=UNSET"]
+        self.assertGreater(len(work), 10, lines)
+        bad = [l for l in work if f"EXEC={expected_exec}" not in l]
+        self.assertEqual(bad, [], "run_git child env missing/incorrect GIT_EXEC_PATH")
 
     def test_declared_env_works_without_path(self):
         p = self.fx.prepare(env=self.sanitized_env(ENGINE_CONFLICT_GIT=self.real_git))

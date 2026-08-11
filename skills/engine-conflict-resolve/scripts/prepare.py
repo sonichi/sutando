@@ -56,7 +56,7 @@ def main() -> None:
     ap.add_argument("--pending", required=True, type=Path)
     ap.add_argument("--engine", required=True, type=Path)
     ap.add_argument("--scratch", type=Path, default=None)
-    ap.add_argument("--git", default=None, help="trusted git executable (overrides $SUTANDO_GIT and PATH)")
+    ap.add_argument("--git", default=None, help="trusted git executable (top tier of the declared $ENGINE_CONFLICT_GIT config precedence)")
     args = ap.parse_args()
     set_git(args.git)
     set_engine_hint(args.engine)

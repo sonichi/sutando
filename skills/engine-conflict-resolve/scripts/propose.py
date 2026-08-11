@@ -50,7 +50,7 @@ def kept_line(scratch: Path, path: str, merged: str, local: str, update: str) ->
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--scratch", required=True, type=Path)
-    ap.add_argument("--git", default=None, help="trusted git executable (overrides $SUTANDO_GIT and PATH)")
+    ap.add_argument("--git", default=None, help="trusted git executable (top tier of the declared $ENGINE_CONFLICT_GIT config precedence)")
     args = ap.parse_args()
     set_git(args.git)
     engine_hint_from_scratch(args.scratch)
