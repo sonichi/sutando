@@ -800,7 +800,7 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
             assert claim.exists()
             assert claim.read_text().splitlines()[3] == "must-handle"
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=3)
+            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             assert "TASK_FILE:" not in stdout
             assert "safe terminal failure" in stderr
             assert "No unrestricted fallback was used" in (results / task.name).read_text()
@@ -809,7 +809,7 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate(timeout=2)
+                process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_slow_handler_does_not_block_the_next_task_event() -> None:
