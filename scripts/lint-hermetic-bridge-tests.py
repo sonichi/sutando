@@ -1012,9 +1012,8 @@ def _unsafe_names_in_scope(body: "list[ast.stmt]") -> "set[str]":
         n = stack.pop()
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        # An ANNOTATED assignment binds exactly like a plain one, so an alias written as
-        # `_fake: object = lambda: tmp` must reach the gate too. A BARE annotation
-        # (`_fake: object`) has value None and binds nothing at runtime.
+        # An annotated assignment binds like a plain one, so `_fake: object = lambda: tmp`
+        # must reach the gate; a bare `_fake: object` has value None and binds nothing.
         if isinstance(n, (ast.Assign, ast.AnnAssign)) and isinstance(n.value, ast.Lambda):
             if not _lambda_absorbs_args(n.value):
                 for t in _assign_targets(n):

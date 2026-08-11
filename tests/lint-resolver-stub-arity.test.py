@@ -298,7 +298,7 @@ _fake = lambda: tmp
 """) != [])
 
     # Counter-cases: the fix must not flag a safe binding, and must not re-leak
-    # the class namespace through the branch path (the round-5 defect).
+    # the class namespace through the branch path.
     check("SAFE: absorbing lambda under a branch is not flagged",
           viols("""
 if cond:
