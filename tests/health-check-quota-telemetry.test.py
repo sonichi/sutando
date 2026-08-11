@@ -4,9 +4,11 @@ producing no quota state.
 
 The gap it covers: quota-state.json is written by the credential proxy from
 upstream response headers, so it only appears if a core actually ROUTES
-through the proxy. src/startup.sh is the only thing exporting
-ANTHROPIC_BASE_URL=http://localhost:7846, and a supervisor-launched core
-never runs startup.sh. On such a host the proxy is healthy and listening,
+through the proxy. The core launcher (src/agent/claude/cli/start-cli.sh)
+exports ANTHROPIC_BASE_URL only when the proxy port already has a listener at
+the moment the core starts, so a proxy that binds seconds AFTER the core --
+routine when both are supervised -- leaves that core unrouted for its whole
+session. On such a host the proxy is healthy and listening,
 every check is green, and quota telemetry is silently absent forever — the
 proactive loop's budget check reads "unknown" every pass with no explanation.
 

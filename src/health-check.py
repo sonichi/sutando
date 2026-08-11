@@ -3962,16 +3962,19 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
                 f"working ({int(agent_age / 60)}m since the last loop pass) — the proxy "
                 "is up but nothing is routing through it any more, so the file on disk "
                 "is a leftover from when it was. Quota-based budgeting is quoting stale "
-                "numbers as current. Check ANTHROPIC_BASE_URL on the running core "
-                "(exported by src/startup.sh; a supervisor-launched core never runs it)."
+                "numbers as current. Check ANTHROPIC_BASE_URL on the running core; the "
+                "core launcher (src/agent/claude/cli/start-cli.sh) exports it only when "
+                "the proxy port already has a listener at launch."
             )
         return check
     check["status"] = "warn"
     check["detail"] = (
         "credential proxy is up but has never written quota-state.json — "
-        "nothing is routing through it (ANTHROPIC_BASE_URL unset; set by "
-        "src/startup.sh, which a supervisor-launched core never runs). "
-        "Quota-based budgeting is blind on this host."
+        "nothing is routing through it (ANTHROPIC_BASE_URL unset). The core "
+        "launcher (src/agent/claude/cli/start-cli.sh) exports it only when the "
+        "proxy port already has a listener at the moment the core starts, so a "
+        "proxy that binds after the core leaves this host unrouted for the whole "
+        "session. Quota-based budgeting is blind on this host."
     )
     return check
 
