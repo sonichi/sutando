@@ -141,8 +141,11 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
                         "the advertised remedy did not produce a symlink")
         self.assertFalse((self.dst / "alpha" / "alpha").exists(),
                          "the remedy created a NESTED link — the `ln -sfn` failure mode")
-        self.assertTrue((self.dst / "alpha.local-backup" / "SKILL.md").exists(),
+        self.assertTrue((self.dst.parent / "alpha.skill-backup" / "SKILL.md").exists(),
                         "the remedy did not preserve the local edits it moved aside")
+        self.assertFalse((self.dst / "alpha.skill-backup").exists(),
+                         "the backup landed INSIDE <dst> — the skill loader registers "
+                         "every directory there, so it loads as a phantom duplicate skill")
 
     def test_every_path_in_the_remedy_is_QUOTED(self):
         """Pin the property, not just the fixture.
@@ -154,7 +157,7 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         wrapped in double quotes.
 
         The failure it guards is silent, which is what makes it worth a second
-        test: unquoted, `mv` exits 1 with "<tail>.local-backup is not a
+        test: unquoted, `mv` exits 1 with "<tail>.skill-backup is not a
         directory", the real directory stays, and NEITHER the symlink nor the
         backup is created -- the operator's only recovery path reports success
         while doing nothing.
@@ -173,7 +176,7 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
             f"unquoted path(s) {bare} in the remedy -- a path with a space "
             f"word-splits and the repair silently no-ops: {remedy}",
         )
-        for placeholder in ("<dst>/<name>", "<src>/<name>", "<dst>/<name>.local-backup"):
+        for placeholder in ("<dst>/<name>", "<src>/<name>", "<dst>/../<name>.skill-backup"):
             self.assertIn(f'"{placeholder}"', remedy,
                           f"{placeholder} must be quoted in: {remedy}")
 

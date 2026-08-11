@@ -113,6 +113,23 @@ def main() -> int:
                 f"ag2_sparrow/remote_gateway_bridge.py still has hand-rolled skip check {hand_rolled!r} — "
                 "must route through parse_markers() per #873"
             )
+    # Name-independent grammar ban (mirrors the src/ consumer loop below): the
+    # proactive drain once compiled its own `[channel:...]` regex, which this
+    # guard waved through because only the four src/ bridges were scanned.
+    # Destination-FORMAT validation (e.g. a Matrix `!room:server` shape) is
+    # legitimately local; recognizing the marker grammar itself is not.
+    for m in re.finditer(r"re\.compile\((.{0,120}?)\)", gb_src, re.S):
+        literal = m.group(1)
+        if (
+            "channel:" in literal
+            or "dm-only" in literal
+            or re.search(r"file\s*\|\s*send\s*\|\s*attach", literal)
+        ):
+            return fail(
+                f"ag2_sparrow/remote_gateway_bridge.py compiles a local marker "
+                f"regex ({literal.strip()[:60]}...) — the marker grammar belongs "
+                "solely to result_markers.py; route through parse_markers()"
+            )
 
     # 4. Behavior smoke test of the parser itself
     sys.path.insert(0, str(REPO / "src"))

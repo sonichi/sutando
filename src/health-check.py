@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
-from util_paths import _host_label, claude_home_path, claude_project_slug, shared_personal_path  # noqa: E402
+from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
@@ -4659,6 +4659,25 @@ def _gateway_configured() -> bool:
     return False
 
 
+def _gateway_lock_pids() -> "dict[str, str]":
+    """Role -> PID from state/locks/. Instance identity exists only in the lock;
+    every instance shares the same argv, so the process table cannot separate them."""
+    out: "dict[str, str]" = {}
+    try:
+        locks = sorted((Path(WORKSPACE_DIR) / "state" / "locks").glob("gateway-bridge*.lock"))
+    except Exception:
+        return out
+    for lk in locks:
+        try:
+            d = json.loads(lk.read_text())
+        except Exception:
+            continue
+        role, pid = d.get("role"), d.get("pid")
+        if role and pid:
+            out[str(role)] = str(pid)
+    return out
+
+
 def check_gateway_bridge() -> "dict | None":
     """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
     process that carries MOBILE-app messages from the cloud gateway down to the
@@ -4679,7 +4698,9 @@ def check_gateway_bridge() -> "dict | None":
         return None
     try:
         gw = subprocess.run(
-            ["/usr/bin/pgrep", "-f", r"remote-gateway-bridge\.py$"],
+            # remote-relay-bridge.py is a shipped compat stub running the same
+            # client, so an instance under the old name is a real duplicate.
+            ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
             capture_output=True, text=True,
         )
         pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
@@ -4691,11 +4712,31 @@ def check_gateway_bridge() -> "dict | None":
             "status": "warn",
             "detail": "configured but NOT running — ag2.space mobile messages will not be delivered",
         }
-    if len(pids) > 1:
+    claimed = _gateway_lock_pids()
+    if claimed:
+        # startup.sh gives every instance identical argv, so a supported named
+        # secondary is a duplicate only if no role lock claims its PID.
+        unclaimed = [p for p in pids if p not in set(claimed.values())]
+        if unclaimed:
+            held = ", ".join(f"{r}={pid}" for r, pid in sorted(claimed.items()))
+            return {
+                "name": "gateway-bridge",
+                "status": "warn",
+                "detail": (
+                    f"{len(unclaimed)} gateway process(es) claimed by no instance lock "
+                    f"(PIDs: {','.join(unclaimed)}); locks held: {held}"
+                ),
+            }
+    elif len(pids) > 1:
+        # No lock data at all (pre-lock build, or locks/ unreadable): the count is
+        # all we have, and it over-reports on a multi-instance host.
         return {
             "name": "gateway-bridge",
             "status": "warn",
-            "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})",
+            "detail": (
+                f"multiple processes ({len(pids)} PIDs: {','.join(pids)}) "
+                f"— no instance locks found to attribute them to"
+            ),
         }
     # A live PROCESS is not a serving CONNECTION. The bridge rewrites
     # state/gateway-status.json on every poll outcome, so consult it before
@@ -4893,9 +4934,12 @@ def check_skill_symlinks() -> dict:
         # Reproduced independently by qingyun-wu and bassilkhilo-ag2 (#2660) against
         # `/private/tmp/pr2660 spaced repro .../{src,dst} tree`. The activation test
         # below runs the emitted command under a spaced fixture for this reason.
+        #
+        # The backup goes OUTSIDE <dst>: the skill loader registers every directory
+        # in <dst> as a skill, so a backup left there loads as a phantom duplicate.
         parts.append(
             f"{len(shadowed)} a real dir, not a link (diverges silently; repair with "
-            f'`mv "<dst>/<name>" "<dst>/<name>.local-backup" && ln -s "<src>/<name>" "<dst>/<name>"` '
+            f'`mv "<dst>/<name>" "<dst>/../<name>.skill-backup" && ln -s "<src>/<name>" "<dst>/<name>"` '
             f"— move aside, do NOT `ln -sfn` over it, and keep the backup until you have "
             f"checked it for local edits): "
             f"{', '.join(shadowed[:4])}{'...' if len(shadowed) > 4 else ''}"
@@ -5717,6 +5761,134 @@ def check_notes_split_brain() -> "dict | None":
     }
 
 
+
+
+def _file_digest(path: Path) -> str:
+    """sha256 of a file, or a sentinel that can never equal another file's digest.
+
+    Read errors must NOT make two files compare equal — that would silently turn an
+    unreadable pair into "identical" and hide the divergence this probe reports.
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return f"<unreadable:{path}>"
+
+
+def check_legacy_notes_divergence() -> "dict | None":
+    """Detect a canonical-vs-legacy notes/ divergence the #1266 probe cannot see.
+
+    `check_notes_split_brain` compares <repo>/notes against <workspace>/notes.
+    A host whose repo has no notes/ dir clears that guard and goes quiet, while the
+    pre-v0.8 <legacy workspace>/notes (often a symlink into the memory-sync clone)
+    keeps taking writes. Measured on one host:
+    91 specs canonical, 105 legacy, 83 shared — bidirectional, and the newest
+    canonical spec was 7 days older than the newest legacy one.
+
+    Recursive and extension-agnostic on purpose: the #1266 probe globs top-level
+    `*.md`, and this divergence lives in `sutando-wire/episode-specs/*.yaml`,
+    so an .md-only top-level scan reports clean twice over.
+
+    Reports counts, and NAMES the legacy-only paths — never a "which side is live"
+    verdict. A whole-tree newest-mtime is dominated by whichever file was touched
+    last for any reason: on one host it read "canonical newer by 0.0d" while the
+    subtree that mattered was 7 days older. And a bare ratio invites dismissal —
+    on a second host "2 of 11,442" was first read as nothing to worry about, when
+    those 2 were the files a "delete the legacy tree" cleanup would destroy with
+    no copy anywhere. Legacy-only, not both directions: canonical is the tree the
+    resolver reaches, so a canonical-only file is merely unsynced.
+    """
+    ws_notes = Path(shared_personal_path("notes", WORKSPACE_DIR))
+    legacy_notes = legacy_dotted_workspace() / "notes"
+    if not ws_notes.exists() or not legacy_notes.exists():
+        return None
+    # A read failure must not read as "no divergence": this warning exists to stop a
+    # cleanup discarding the only copy, so silence is the one unsafe direction.
+    def _unreadable(what: str, exc: OSError) -> "dict":
+        return {
+            "name": "legacy-notes-divergence",
+            "status": "warn",
+            "detail": (
+                f"could not compare the two notes/ trees — {what}: {exc}. This is NOT "
+                f"a clean bill of health: the probe exists to catch legacy-only files "
+                f"that a cleanup would destroy, and it could not read them. Resolve the "
+                f"access error before deleting or repointing either tree "
+                f"(canonical {ws_notes}, legacy {legacy_notes})."
+            ),
+        }
+
+    try:
+        if ws_notes.resolve() == legacy_notes.resolve():
+            return None
+    except OSError as exc:
+        return _unreadable("resolving one of them failed", exc)
+
+    def _rel(root: Path) -> "dict[str, Path] | None":
+        """Map relative path -> file. None means the scan FAILED, never "empty"."""
+        out = {}
+        try:
+            for p in root.rglob("*"):
+                if p.is_file():
+                    out[str(p.relative_to(root))] = p
+        except OSError:
+            return None
+        return out
+
+    a, b = _rel(ws_notes), _rel(legacy_notes)
+    for label, scanned in (("the canonical tree", a), ("the legacy tree", b)):
+        if scanned is None:
+            return _unreadable(f"enumerating {label} failed", OSError("scan incomplete"))
+    only_ws, only_legacy = set(a) - set(b), set(b) - set(a)
+    # A shared PATH is not a shared FILE. Comparing name sets alone reports healthy
+    # when both trees hold the same path with different bytes — measured 57 of 1056.
+    differing = sorted(r for r in (set(a) & set(b)) if _file_digest(a[r]) != _file_digest(b[r]))
+    if not only_ws and not only_legacy and not differing:
+        return None
+
+    ranked = sorted(only_legacy, key=lambda p: (Path(p).name.startswith("."), p))
+    named = ", ".join(ranked[:3])
+    more = f" … and {len(only_legacy) - 3} more" if len(only_legacy) > 3 else ""
+    at_risk = (
+        f" LEGACY-ONLY (no copy in the canonical tree): {named}{more}."
+        if only_legacy else ""
+    )
+    # Derived from the computed sets, never asserted: a hardcoded "neither side is a
+    # superset" is FALSE when one is, and would tell cleanup the opposite of the truth.
+    if only_ws and only_legacy:
+        shape = "Neither side is a superset, so pointing a consumer at either one loses files."
+    elif only_legacy:
+        shape = (f"The legacy tree is a strict superset by name — the canonical one is missing "
+                 f"{len(only_legacy)} file(s).")
+    elif only_ws:
+        shape = (f"The canonical workspace is a strict superset by name — the legacy one is "
+                 f"missing {len(only_ws)} file(s).")
+    else:
+        shape = "Names match on both sides; the divergence is entirely in file CONTENT."
+    content = (
+        f" {len(differing)} shared path(s) differ in CONTENT, so deleting either tree "
+        f"loses bytes even where the names match (e.g. {', '.join(differing[:2])})."
+        if differing else ""
+    )
+    return {
+        "name": "legacy-notes-divergence",
+        "status": "warn",
+        "detail": (
+            f"notes/ has diverged from the pre-v0.8 {legacy_notes}: "
+            f"{len(only_ws)} file(s) only in the canonical workspace, "
+            f"{len(only_legacy)} only in the legacy tree, "
+            f"{len(set(a) & set(b))} shared ({len(differing)} of them differing)."
+            f"{at_risk}{content} {shape} Decide which tree is authoritative before "
+            f"'fixing' any path that reads notes/, and compare the SUBTREE you "
+            f"care about — a whole-tree mtime does not say which side is live."
+        ),
+    }
+
+
 def _drop_launcher_parents(pids: list) -> list:
     """Collapse a launcher+child pair to the child that is the real process.
 
@@ -5876,7 +6048,8 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
     return pgrep_status, pids
 
 
-def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Optional[tuple[str, str]]:
+def bridge_log_content_status(name: str, status: str, tail: list[str],
+                              detail: str = "") -> Optional[tuple[str, str]]:
     """Check a bridge's recent log lines for known failure-mode signatures.
 
     Returns an (status, detail) override, or None if nothing to override.
@@ -5892,11 +6065,15 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
       Event Subscriptions clearly ARE enabled and it's a stale false alarm.
     telegram-bridge: a 409 Conflict is a competing getUpdates poller splitting
       updates. Only counts if no message arrived after the last conflict.
+      Overrides the stale-HEARTBEAT warn too, since the heartbeat only advances on
+      an accepted poll; `detail` keeps stale-LOG and dead-inode warns intact.
     """
     if name == "discord-bridge":
         if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
             return "fail", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
-    elif name == "telegram-bridge" and status == "ok":
+    elif name == "telegram-bridge" and (
+            status == "ok"
+            or (status == "warn" and "heartbeat stale" in detail)):
         conflict_idxs = [i for i, ln in enumerate(tail) if "409" in ln and "Conflict" in ln]
         if conflict_idxs:
             # Telegram hands each update to exactly ONE getUpdates caller, so a
@@ -5904,7 +6081,9 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
             received_after = any(ln.lstrip().startswith("@") for ln in tail[conflict_idxs[-1] + 1:])
             if not received_after:
                 return "warn", ("another getUpdates poller is competing — Telegram splits "
-                                "updates between hosts; set SKIP_TELEGRAM=1 on the non-owning host")
+                                "updates between hosts; set SKIP_TELEGRAM=1 on the non-owning "
+                                "host. A stale heartbeat here is a CONSEQUENCE of this, not a "
+                                "separate fault")
     elif name == "slack-bridge" and status == "ok":
         warn_idxs = [i for i, ln in enumerate(tail) if "60s elapsed with zero events" in ln]
         if warn_idxs:
@@ -6911,6 +7090,11 @@ def run_all_checks() -> list[dict]:
     if _notes_sb:
         checks.append(_notes_sb)
 
+    # Sibling of the above, for the pair it cannot reach (see its docstring).
+    _legacy_nd = check_legacy_notes_divergence()
+    if _legacy_nd:
+        checks.append(_legacy_nd)
+
     # Memory sync
     checks.append(check_memory_sync())
 
@@ -7126,12 +7310,13 @@ def run_all_checks() -> list[dict]:
         #   events aren't routing (Slack app Event Subscriptions disabled).
         #   Only overrides "ok" — stale/dead-inode are higher priority.
         # telegram-bridge: a 409 Conflict is a second poller taking a share of
-        #   the updates. Only overrides "ok".
+        #   the updates. Overrides "ok" and the stale-HEARTBEAT warn only; the
+        #   stale-log and dead-inode warns must survive, so detail is passed.
         if (log_file.exists() and name in ("discord-bridge", "slack-bridge", "telegram-bridge")
                 and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                override = bridge_log_content_status(name, status, tail)
+                override = bridge_log_content_status(name, status, tail, detail)
                 if override is not None:
                     status, detail = override
             except OSError:
