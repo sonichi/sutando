@@ -23,6 +23,7 @@ Exit code: 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import importlib.util
+import re
 import tempfile
 import unittest.mock
 from pathlib import Path
@@ -52,13 +53,16 @@ def _pgrep(returncode, stdout):
     return _side_effect
 
 
-def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False, serving=None):
+def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False, serving=None,
+         locks=None):
     """Call check_gateway_bridge() with env, the channel-.env path, and the
     pgrep result all controlled. env=None means the token vars are cleared.
     pgrep_raises=True makes subprocess.run raise (the except-branch path).
     `serving` pins the gateway-status sidecar verdict (None = no opinion) so no
     case depends on whether the host running the tests happens to have a live
-    sidecar — without it, "one process -> ok" flips to warn on a real host."""
+    sidecar — without it, "one process -> ok" flips to warn on a real host.
+    `locks` pins the role->PID instance-lock map; the default {} means "no lock
+    data", so no case reads the real state/locks/ of the host running them."""
     env = env or {}
     # Clear both token vars, then apply the requested env.
     base = {k: v for k, v in hc.os.environ.items()
@@ -69,7 +73,8 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
          unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path), \
          unittest.mock.patch.object(hc.subprocess, "run", run_mock):
-        with unittest.mock.patch.object(hc, "_gateway_serving", lambda *a, **k: serving):
+        with unittest.mock.patch.object(hc, "_gateway_serving", lambda *a, **k: serving), \
+             unittest.mock.patch.object(hc, "_gateway_lock_pids", lambda: dict(locks or {})):
             return hc.check_gateway_bridge()
 
 
@@ -110,6 +115,83 @@ def main() -> int:
     r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0, pgrep_out="111\n222\n")
     check("configured + duplicates → warn", r is not None and r["status"] == "warn", f"got {r!r}")
     check("duplicate detail says multiple", r and "multiple processes" in r["detail"], f"got {r!r}")
+
+    # A supported multi-instance host is not a pileup; only the role locks can
+    # separate instances, so this case fails on any count-only rule.
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+             pgrep_out="111\n222\n", serving=None,
+             locks={"gateway-bridge": "111", "gateway-bridge.dev": "222"})
+    check("primary + named secondary → ok (not a pileup)",
+          r is not None and r["status"] == "ok", f"got {r!r}")
+
+    # 4a-ii) ... and the stale stub is still caught, because no role lock claims it.
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+             pgrep_out="111\n999\n", locks={"gateway-bridge": "111"})
+    check("unclaimed PID alongside a held lock → warn",
+          r is not None and r["status"] == "warn", f"got {r!r}")
+    check("warn names the unclaimed PID, not the claimed one",
+          r and "999" in r["detail"] and "no instance lock" in r["detail"], f"got {r!r}")
+
+    # 4a-iii) Two locks, three processes: the extra is a same-role duplicate.
+    r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
+             pgrep_out="111\n222\n333\n",
+             locks={"gateway-bridge": "111", "gateway-bridge.dev": "222"})
+    check("duplicate beyond the locked instances → warn",
+          r is not None and r["status"] == "warn" and "333" in r["detail"], f"got {r!r}")
+
+    # 4a-iv) The helper reads role/PID off disk and ignores unparseable locks.
+    import json as _json
+    with tempfile.TemporaryDirectory() as _td:
+        _lk = Path(_td) / "state" / "locks"
+        _lk.mkdir(parents=True)
+        (_lk / "gateway-bridge.lock").write_text(_json.dumps({"role": "gateway-bridge", "pid": 4242}))
+        (_lk / "gateway-bridge.dev.lock").write_text(_json.dumps({"role": "gateway-bridge.dev", "pid": 4243}))
+        (_lk / "gateway-bridge.bad.lock").write_text("{not json")
+        (_lk / "supervisor.lock").write_text(_json.dumps({"role": "supervisor", "pid": 1}))
+        with unittest.mock.patch.object(hc, "WORKSPACE_DIR", Path(_td)):
+            got = hc._gateway_lock_pids()
+    check("_gateway_lock_pids reads role→PID, skips malformed, ignores other roles",
+          got == {"gateway-bridge": "4242", "gateway-bridge.dev": "4243"}, f"got {got!r}")
+
+    # 4a-v) An unreadable locks/ must degrade to "no lock data", not raise. The probe
+    # runs on hosts where state/locks/ may not exist or may be permission-denied.
+    class _BoomPath:
+        def __truediv__(self, other):
+            return self
+
+        def glob(self, pattern):
+            raise OSError("locks dir unreadable")
+
+    with unittest.mock.patch.object(hc, "Path", lambda *a, **k: _BoomPath()):
+        got = hc._gateway_lock_pids()
+    check("unreadable locks/ → {} rather than an exception", got == {}, f"got {got!r}")
+
+    # The pattern must match the deprecated filename too, since that stub is a real
+    # instance. Asserted by matching real argv, so a correct rewrite still passes.
+    captured: list = []
+
+    def _capture(cmd, **kw):
+        captured.append(cmd)
+        return _pgrep(1, "")(cmd, **kw)
+
+    with unittest.mock.patch.object(hc, "_gateway_configured", lambda: True), \
+         unittest.mock.patch.object(hc.subprocess, "run", side_effect=_capture):
+        hc.check_gateway_bridge()
+    check("pgrep was invoked", bool(captured), f"got {captured!r}")
+    pattern = captured[0][2] if captured and len(captured[0]) > 2 else ""
+    argvs = {
+        "new name": "/usr/bin/python3 /Users/x/sutando/src/remote-gateway-bridge.py",
+        "deprecated stub": "/usr/bin/python3 /Users/x/sutando/src/remote-relay-bridge.py",
+    }
+    for label, argv in argvs.items():
+        check(f"pattern matches the {label}",
+              re.search(pattern, argv) is not None,
+              f"pattern {pattern!r} did not match {argv!r}")
+    # The filename below must stay fictional: the hermetic-bridge lint greps test
+    # sources for real bridge names, even inside a string only fed to re.search.
+    check("pattern does not match an unrelated bridge",
+          re.search(pattern, "/usr/bin/python3 src/some-other-bridge.py") is None,
+          f"pattern {pattern!r} over-matched")
 
     # 5) configured via the channel .env file (not env var) → detected as ok
     with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
