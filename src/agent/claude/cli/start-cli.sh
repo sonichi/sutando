@@ -180,23 +180,10 @@ fi
 # equivalent so the tmux-wrapped core process writes sessions / memory / state
 # into the workspace tree rather than the global ~/.claude/.
 #
-# Defense in depth:
-#   - M0 helper missing → refuse to start. The helper ships in this repo beside
-#     this script, so its absence means an incomplete checkout, not a supported
-#     layout. Falling back silently would leave CLAUDE_CONFIG_DIR unset and send
-#     the core to Claude Code's user-level default config dir — a DIFFERENT
-#     credential store than every other Sutando process here, which surfaces as
-#     an unrecoverable 401 loop rather than as the install error it actually is.
-#   - Helper present + config valid → export env for every claude invocation
-#     below (no-tmux fallback at L~75, TTY exec at L~115, no-TTY detached at
-#     L~120 all inherit it).
-#   - Helper present + config violates the workspace-sub-folder invariant →
-#     refuse to start. Silently falling back to ~/.claude/ would hide a real
-#     config error AND scatter state into a location the M2 vault sync engine
-#     doesn't include.
-if [ -x "$REPO/scripts/sutando-config.sh" ]; then
-  _ccd_err="$(mktemp -t start-cli-ccd.XXXXXX)"
-  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+# The resolve-or-refuse decision lives in src/claude_config_dir.sh because
+# src/startup.sh makes the same one; only the seeding below is this launcher's.
+source "$REPO/src/claude_config_dir.sh"
+if _ccd="$(resolve_claude_config_dir "$REPO" start-cli)"; then
     mkdir -p "$_ccd"
     export CLAUDE_CONFIG_DIR="$_ccd"
     echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
@@ -326,25 +313,13 @@ if changed:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
 PY
     fi
-  else
-    echo "start-cli: claude_sutando_config_dir invalid — refusing to start core" >&2
-    cat "$_ccd_err" >&2
-    rm -f "$_ccd_err"
-    exit 1
-  fi
-  rm -f "$_ccd_err"
-elif [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-  # Helper absent but the caller already scoped the config dir (e.g. the desktop
-  # app exports it when spawning the core). Nothing to resolve and nothing unsafe
-  # about it — the core reaches the intended credential store either way.
-  echo "  ✓ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 else
-  echo "start-cli: $REPO/scripts/sutando-config.sh missing or not executable, and no" >&2
-  echo "  CLAUDE_CONFIG_DIR from the caller — refusing to start core. It would go unset and" >&2
-  echo "  the core would fall back to Claude Code's user-level default config dir, i.e. a" >&2
-  echo "  different credential store than the rest of Sutando on this host. Re-run once the" >&2
-  echo "  install completes, or export CLAUDE_CONFIG_DIR before launching." >&2
-  exit 1
+  _ccd_rc=$?
+  # 2 = helper absent but the caller already scoped the config dir (e.g. the
+  # desktop app exports it when spawning the core). Nothing to seed, nothing
+  # unsafe — the core reaches the intended credential store either way.
+  [ "$_ccd_rc" = "2" ] || exit 1
+  echo "  ✓ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 fi
 
 # NO --model flag: the core inherits the user's global model, so 1M stays the

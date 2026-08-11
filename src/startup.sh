@@ -179,13 +179,13 @@ core_runtime="$(resolve_startup_core_runtime)"
 # successful `claude-sutando --migrate`. Mirrors src/agent/claude/cli/start-cli.sh
 # (Sutando.app's tmux-wrapped CLI launcher) — same machine-spawn pattern.
 #
-# Defense in depth (matches start-cli):
-#   - Helper missing → silent fallback (legacy install).
-#   - Helper present + config valid → export.
-#   - Helper present + config invalid → refuse to start (don't scatter state).
-if [ -x "$REPO/scripts/sutando-config.sh" ]; then
-  _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
-  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+# The resolve-or-refuse decision lives in src/claude_config_dir.sh because
+# start-cli makes the same one; only the credential seeding below is startup's.
+# This block used to fall through silently when the helper was missing, which
+# left CLAUDE_CONFIG_DIR unset and sent every bridge launched below to a
+# different credential store than the rest of Sutando on this host.
+source "$REPO/src/claude_config_dir.sh"
+if _ccd="$(resolve_claude_config_dir "$REPO" startup)"; then
     mkdir -p "$_ccd"
     # NOTE: the claude core-agent launcher + the `claude-sutando` config-dir
     # onboarding alias now live under src/agent/claude/ (start-cli.sh /
@@ -283,13 +283,12 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
     fi
     fi
     export CLAUDE_CONFIG_DIR="$_ccd"
-  else
-    echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
-    cat "$_ccd_err" >&2
-    rm -f "$_ccd_err"
-    exit 1
-  fi
-  rm -f "$_ccd_err"
+else
+  _ccd_rc=$?
+  # 2 = helper absent but the caller already scoped the config dir. Nothing to
+  # seed, and the services below reach the intended credential store anyway.
+  [ "$_ccd_rc" = "2" ] || exit 1
+  echo "  ~ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 fi
 
 # Boot gate (#2396): verify the SELECTED core can boot authenticated BEFORE any
