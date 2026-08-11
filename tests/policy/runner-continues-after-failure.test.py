@@ -14,6 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 PASSING = 'print("ok")\n'
+STDIN_EATER = 'import sys\nsys.stdin.read()\nprint("ate stdin")\n'
 FAILING = 'import sys\nprint("boom")\nsys.exit(1)\n'
 
 
@@ -125,6 +126,18 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
                             "discovery exited nonzero but the run reported success")
         self.assertNotIn("all passed", r.stdout,
                          "a partial file list must not be summarised as all passed")
+
+    def test_a_test_reading_stdin_does_not_swallow_the_remaining_files(self) -> None:
+        """A child inheriting the pipe's stdin can consume the queued filenames, ending
+        the loop early while it still prints a summary — a green run of a partial list."""
+        files = {"a.test.py": STDIN_EATER}
+        files.update({f"z{i}.test.py": PASSING for i in range(4)})
+        r = self._run(files)
+        ran = r.stdout.count("--- ")
+        self.assertEqual(ran, len(files),
+                         f"ran {ran} of {len(files)} — a test consumed the pending queue")
+        self.assertIn(f"{len(files)} file(s)", r.stdout,
+                      "the summary must report the full count, not the truncated one")
 
     def test_node_modules_is_excluded(self) -> None:
         """A vendored *.test.py must not be executed by the local runner."""
