@@ -38,6 +38,7 @@ DEFAULT_DEVICE_GRANTS = (
     "task.submit", "task.status", "task.get_result", "task.list",
     "task.list_results", "task.details", "task.cancel", "task.subscribe",
     "request.get", "request.wait", "request.list", "human_action.status",
+    "schedule.list",
     # Voice is the wearable's core function — talking to the agent is the same
     # class as submitting work, so a paired device may open a voice stream by
     # default. (approval.respond, restart, terminal.input stay OFF by default.)

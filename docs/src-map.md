@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-217 modules indexed.
+218 modules indexed.
 
 ## `src/`
 
@@ -253,6 +253,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
 - **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
 - **`runtime_view.py`** — Runtime surface for THIS agent: runtime.health / runtime.details.
+- **`schedules_view.py`** — Schedule surface for the Sutando Server: schedule.list.
 - **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
 - **`tasks_view.py`** — Task-pipeline surface for the Sutando Server: task.submit / task.status / task.get_result / task.details / task.cancel.
 - **`voice_bridge.py`** — voice_bridge.py — the boundary between SCP media framing and voice intelligence.

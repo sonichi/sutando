@@ -49,6 +49,7 @@ from agents_view import AgentsView  # noqa: E402
 from identity_view import IdentityView  # noqa: E402
 from tasks_view import TasksView  # noqa: E402
 from runtime_view import RuntimeView  # noqa: E402
+from schedules_view import SchedulesView  # noqa: E402
 import instance_registry  # noqa: E402
 
 def _state_dir() -> Path:
@@ -135,7 +136,13 @@ class RuntimeServer:
                         if state_dir else None),
             runtime_view=(RuntimeView(state_dir, host_label=host_label,
                                       runtime_socket=socket_path)
-                          if state_dir else None))
+                          if state_dir else None),
+            # Same canonical crons.json the dashboard reads: workspace
+            # (state_dir's parent, the TasksView convention) + host label —
+            # never the bare hostname (#1745).
+            schedules_view=(SchedulesView(Path(state_dir).parent / "hosts"
+                                          / host_label / "crons.json")
+                            if state_dir and host_label else None))
 
     def _register_instance(self) -> None:
         """Boot-time manifest write (registry M1). Best-effort: a registry

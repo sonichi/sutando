@@ -47,6 +47,7 @@ READ_ONLY_METHODS = frozenset({
     "task.details",
     "request.get", "request.wait", "request.list",
     "human_action.status",
+    "schedule.list",
 })
 
 

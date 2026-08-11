@@ -116,7 +116,7 @@ class RuntimeDispatcher:
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
                  agents_view=None, identity_view=None, tasks_view=None,
-                 runtime_view=None):
+                 runtime_view=None, schedules_view=None):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
@@ -127,6 +127,7 @@ class RuntimeDispatcher:
         self.identity = identity_view
         self.tasks = tasks_view
         self.runtime = runtime_view
+        self.schedules = schedules_view
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
 
@@ -250,6 +251,11 @@ class RuntimeDispatcher:
                   "runtime.details": self.runtime.details}.get(method)
             if fn is not None:
                 return fn()
+        if method == "schedule.list":
+            if self.schedules is None:
+                raise ProtocolError(-32601,
+                                    "schedule surface is not configured on this daemon")
+            return self.schedules.list_schedules()
         if method.startswith("task."):
             return self._task(method, params)
         raise ProtocolError(-32601, f"unknown method {method}")

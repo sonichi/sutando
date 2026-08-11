@@ -40,6 +40,7 @@ v0 methods:
   human_action.status   {requestId}
   task.list             {}
   request.list          {}
+  schedule.list         {}          (every crons.json entry, owner-tagged)
 
 Error codes follow JSON-RPC: -32700 parse, -32600 invalid request,
 -32601 unknown method, -32602 invalid params, -32000 server error.
@@ -81,6 +82,7 @@ METHODS = (
     "task.list_results",
     "task.subscribe",
     "request.list",
+    "schedule.list",
     "pair.redeem",       # WSS-only: exchange a pairing token for a device credential
     "client.hello",      # WSS-only: a device advertises its live device_type + capabilities
     "voice.open",        # WSS-only: open a media (audio) stream on this connection

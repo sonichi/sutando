@@ -478,38 +478,19 @@ def get_schedules() -> list[dict]:
     Source: <workspace>/hosts/<hostname>/crons.json (see skills/schedule-crons).
     Status is 'active' + next run; last-run history isn't tracked on disk.
     """
-    # Reads via _read_crons() → _crons_path(), which keys off the scutil-first
-    # canonical `_host_label()` (NOT bare hostname) so this panel matches the
-    # WRITER (schedule-crons) and doesn't read the wrong hosts/<host>/ dir under
-    # a DHCP hostname drift (#1745).
-    jobs = _read_crons()
-    now = datetime.now()
+    # Reads via _crons_path(), which keys off the scutil-first canonical
+    # `_host_label()` (NOT bare hostname) so this panel matches the WRITER
+    # (schedule-crons) and doesn't read the wrong hosts/<host>/ dir under a
+    # DHCP hostname drift (#1745). The read policy (parse, owner tag, next-run
+    # formatting) lives in dashboard_schedules; only HTML escaping stays here.
     out = []
-    for job in jobs:
-        expr = job.get("cron", "")
-        kind = f'skill:{job["prompt_skill"]}' if job.get("prompt_skill") else "prompt"
-        nxt = _cron_next_run(expr, now) if expr else None
-        if nxt:
-            mins = int((nxt - now).total_seconds() // 60)
-            if mins < 60:
-                rel = f"in {mins}m"
-            elif mins < 1440:
-                rel = f"in {mins // 60}h{mins % 60:02d}m"
-            else:
-                rel = f"in {mins // 1440}d{(mins % 1440) // 60}h"
-            next_str = f'{nxt.strftime("%a %H:%M")} ({rel})'
-        else:
-            next_str = ">7d" if expr else "invalid"
-        if job.get("description"):
-            desc = job["description"]
-        elif job.get("prompt_skill"):
-            desc = f'Runs the /{job["prompt_skill"]} skill'
-        else:
-            _p = re.sub(r"^Run:?\s*", "", (job.get("prompt") or "").strip())
-            desc = (_p[:100] + "…") if len(_p) > 100 else _p
-        desc = desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        out.append({"name": job.get("name", "?"), "cron": expr, "kind": kind,
-                    "next": next_str, "desc": desc})
+    for s in dashboard_schedules.list_schedules(_crons_path()):
+        kind = (f'skill:{s["prompt_or_skill"]}' if s["kind"] == "skill"
+                else "prompt")
+        desc = (s["description"].replace("&", "&amp;")
+                .replace("<", "&lt;").replace(">", "&gt;"))
+        out.append({"name": s["name"], "cron": s["cron"], "kind": kind,
+                    "next": s["next_run"], "desc": desc})
     return out
 
 
