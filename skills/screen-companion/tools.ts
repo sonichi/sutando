@@ -20,12 +20,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
 import { readSelection as defaultReadSelection, type SelectionResult } from './scripts/read-selection.js';
 import { registerVisionOnContributor, registerVisionFrameHook, callUpdateTools, callRestoreTools, captureSendFrame, getFullToolSurface } from '../../src/vision-tools.js';
-
-function resolveWorkspace(): string {
-	const env = process.env.SUTANDO_WORKSPACE;
-	if (env) return env.replace(/^~/, process.env.HOME ?? '');
-	return join(process.env.HOME ?? '', '.sutando', 'workspace');
-}
+import { resolveWorkspace } from '../../src/workspace_default.js';
 
 // Contributor for the screen-share-started system note. Tells Gemini the
 // screen-companion catalog is available AND names the configs the user can
