@@ -400,6 +400,26 @@ def archive_file(src: "Path", kind: str, task_id: str) -> None:
             pass
 
 
+def _anchor_from_task_file(task_id: str):
+    """Recover the quote-reply anchor from the durable task file.
+
+    `pending_reply_anchors` is in-memory, so a bridge restart between task
+    creation and result delivery drops it and the reply lands unquoted. The id
+    is already written to the task file at creation and was never read back.
+    """
+    path = TASKS_DIR / f"{task_id}.txt"
+    try:
+        if not path.is_file():
+            return None
+        for line in path.read_text(errors="replace").splitlines():
+            if line.startswith("source_message_id:"):
+                raw = line.split(":", 1)[1].strip()
+                return int(raw) if raw.isdigit() else None
+    except Exception:
+        return None
+    return None
+
+
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
     """POST to agent-api /task-done so web UI flips status without waiting
     for its next /tasks/active poll. Best-effort; silent on failure (web UI
@@ -4470,6 +4490,10 @@ async def poll_results():
                 # messages instead of quote-replies. Caught by live test
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
+                if source_message_anchor is None:
+                    # Survives a bridge restart: the in-memory dict is gone but
+                    # the task file still carries source_message_id.
+                    source_message_anchor = _anchor_from_task_file(task_id)
                 # Clear the progress-streamer's tier map here (NOT only in
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
