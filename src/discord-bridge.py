@@ -3120,6 +3120,7 @@ async def _handle_discord_message(message, force=False):
                 is_reply=_is_reply,
                 reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
                 self_id=_self_id,
+                author_id=getattr(message.author, "id", None),
                 other_agent_mentioned=_other_agent_mentioned,
             ):
                 print(f"  [skip] shared channel: not addressed to me "
