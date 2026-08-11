@@ -553,33 +553,17 @@ def _vault_intercept_fns():
     return _VAULT_INTERCEPT_FNS
 
 
-# Self-contained fallback for when _vault_intercept_fns() returns (None, None) —
-# a standalone `ag2-sparrow` package install never ships the monorepo
-# src/vault_intercept.py, so that's not a rare edge case for shipped installs.
-# Mirrors src/vault_intercept.py's own _VAULT_SET_RE/redact_vault_commands
-# closely enough to catch the same shapes, deliberately duplicated rather than
-# imported: this path exists PRECISELY for when that import is unavailable, so
-# it cannot depend on it. review finding (qingyun-wu, 2026-08-11): without
-# this, an owner-tier `vault set KEY "value"` with no interceptor available
-# fell through untouched to filter_chat_secrets(), which doesn't recognize
-# vault-set syntax, and the plaintext value was persisted verbatim.
-_LOCAL_VAULT_SET_RE = re.compile(
-    r'\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))'
-    r'(?=\s|$|[.,!?;])',
-    re.IGNORECASE,
-)
-
-
 def _local_redact_vault_set(text: str) -> str:
-    """Scrub vault-set patterns WITHOUT storing anything — last-resort, no
-    external dependency. Used only when _vault_intercept_fns() found neither
-    the real interceptor nor the real redactor."""
-    if not text:
-        return text
-    return _LOCAL_VAULT_SET_RE.sub(
-        lambda m: f"vault set {m.group(1)} [VAULT-SET-REDACTED: interceptor unavailable]",
-        text,
-    )
+    """Last-resort redaction when _vault_intercept_fns() found neither the
+    real interceptor nor the real redactor (standalone package install with
+    no monorepo src/vault_intercept.py). Delegates to vault_set_grammar,
+    which THIS PACKAGE vendors verbatim from src/ (tools/sync_from_src.py,
+    drift-checked) — a plain in-package import, no runtime search needed,
+    and no hand-copied regex to diverge from the canonical shape (review
+    finding, qingyun-wu 2026-08-11: a duplicated grammar silently drifts the
+    moment the canonical one changes)."""
+    from .vault_set_grammar import redact_vault_commands as _grammar_redact
+    return _grammar_redact(text, placeholder="[VAULT-SET-REDACTED: interceptor unavailable]")
 
 
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
