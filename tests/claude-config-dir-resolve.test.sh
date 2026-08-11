@@ -70,10 +70,8 @@ test_valid_config_returns_dir() {
   cleanup_repo; return 0
 }
 
-# The mutation guard for the -x → -r narrowing. A tarball install can arrive
-# without the exec bit on a helper that `bash <file>` runs perfectly well; the
-# -x form classified that as absent, and with refuse-to-start on absence it
-# would turn a working legacy install into a core that never boots.
+# Mutation guard for -x → -r: a helper stripped of its exec bit still runs under
+# `bash <file>`, so classifying it absent would refuse a resolvable config.
 test_non_executable_helper_still_resolves() {
   setup_repo yes ".claude-sutando"
   chmod -x "$REPO_FAKE/scripts/sutando-config.sh"
@@ -119,9 +117,8 @@ test_absent_helper_no_caller_refuses() {
   cleanup_repo; return 0
 }
 
-# Delegation, both launchers. The blocker on #2803's first shape was that
-# start-cli was fixed and startup.sh kept its own copy of the same policy, so a
-# behavioral test of one launcher could not see the other one's silent fallback.
+# Delegation, both launchers: a behavioral test of one cannot see a second copy
+# of the policy in the other.
 test_both_launchers_delegate() {
   local rc=0 f
   for f in src/agent/claude/cli/start-cli.sh src/startup.sh; do

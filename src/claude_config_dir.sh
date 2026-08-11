@@ -1,38 +1,24 @@
 #!/bin/bash
-# Shared CLAUDE_CONFIG_DIR resolution for the launchers. Source this file with:
+# Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 #
 #   source "$REPO/src/claude_config_dir.sh"
 #   if _ccd="$(resolve_claude_config_dir "$REPO" start-cli)"; then ...
 #
-# Single source for the resolve-or-refuse policy previously duplicated in
-# src/agent/claude/cli/start-cli.sh and src/startup.sh — the second copy is the
-# path CLAUDE.md documents as "To start everything", so a one-launcher fix left
-# the failure reachable through the other door.
+# Prints the resolved dir on stdout. Exit status IS the branch:
+#   0 -> resolved by the M0 helper; caller mkdir -p's, exports, and seeds it.
+#   2 -> helper absent, caller already exported CLAUDE_CONFIG_DIR; echoed back.
+#   1 -> refuse to start; a diagnostic is already on stderr.
 #
-# Prints the resolved config dir on stdout. Exit status IS the branch:
-#   0 → the M0 helper resolved it. The caller must `mkdir -p` and export it,
-#       and owns whatever seeding it does inside that dir.
-#   2 → helper absent, but the caller already exported CLAUDE_CONFIG_DIR (the
-#       desktop app scopes the core this way). Nothing to resolve, nothing
-#       unsafe: the value is echoed back and stays as the caller set it.
-#   1 → refuse to start. A diagnostic is already on stderr.
-#
-# Refusal is the point. Leaving CLAUDE_CONFIG_DIR unset sends the process to
-# Claude Code's user-level default config dir — a DIFFERENT credential store
-# than every other Sutando process on the host, which surfaces as an
-# unrecoverable 401 loop rather than as the install error it actually is.
-#
-# Presence is tested with `-r`, not `-x`: every call site invokes the helper as
-# `bash <file>`, which needs read permission only. An extracted tarball can lose
-# the exec bit on a helper that is still fully usable, and that population's
-# ~/.claude IS their real credential store — refusing to boot there would break
-# a working install to protect it from a problem it does not have.
+# Refusing matters because an unset CLAUDE_CONFIG_DIR silently selects Claude
+# Code's user-level default -- a different credential store than the rest of Sutando.
 
 resolve_claude_config_dir() {
   local repo="$1"
   local label="${2:-start-cli}"
   local helper="$repo/scripts/sutando-config.sh"
 
+  # -r, not -x: every call site runs `bash <helper>`, which needs read only,
+  # and an extracted tarball can drop the exec bit from a usable helper.
   if [ -r "$helper" ]; then
     local err ccd
     err="$(mktemp -t sutando-ccd.XXXXXX)"

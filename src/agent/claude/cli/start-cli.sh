@@ -180,8 +180,7 @@ fi
 # equivalent so the tmux-wrapped core process writes sessions / memory / state
 # into the workspace tree rather than the global ~/.claude/.
 #
-# The resolve-or-refuse decision lives in src/claude_config_dir.sh because
-# src/startup.sh makes the same one; only the seeding below is this launcher's.
+# Resolve-or-refuse is shared with src/startup.sh; only the seeding is ours.
 source "$REPO/src/claude_config_dir.sh"
 if _ccd="$(resolve_claude_config_dir "$REPO" start-cli)"; then
     mkdir -p "$_ccd"
@@ -315,9 +314,8 @@ PY
     fi
 else
   _ccd_rc=$?
-  # 2 = helper absent but the caller already scoped the config dir (e.g. the
-  # desktop app exports it when spawning the core). Nothing to seed, nothing
-  # unsafe — the core reaches the intended credential store either way.
+  # 2 = caller already scoped the config dir; nothing to seed, and the core
+  # still reaches the intended credential store.
   [ "$_ccd_rc" = "2" ] || exit 1
   echo "  ✓ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 fi
