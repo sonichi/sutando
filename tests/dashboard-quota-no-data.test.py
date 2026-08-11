@@ -24,6 +24,7 @@ Plain-python self-runner (no pytest — CI runs these files directly).
 """
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -33,6 +34,24 @@ sys.path.insert(0, str(REPO / "src"))
 spec = importlib.util.spec_from_file_location("dashboard", REPO / "src" / "dashboard.py")
 dashboard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dashboard)
+
+def _tile(html: str, label: str) -> str:
+    """The stat-val of ONE named tile.
+
+    Page-wide substring checks are useless here: "✓" also appears in the
+    Services tile and "0%" can appear anywhere, so an assertion like
+    `">✓<" not in html` fails on an unrelated tile and reads as a real defect.
+    Anchor on the tile's own label instead.
+    """
+    # [^<]* — not (.*?): a dot-any capture starts at the FIRST stat-val on the
+    # page and swallows every tile until it reaches this label, so every tile
+    # "contains" every value and the assertion means nothing.
+    m = re.search(
+        r'<div class="stat-val">([^<]*)</div><div class="stat-label">' + re.escape(label),
+        html)
+    assert m, f"tile {label!r} not found in rendered page"
+    return m.group(1)
+
 
 NO_DATA = {"available": True}                      # exactly what a missing file yields
 HAS_DATA = {                                        # a real reading, for the control
@@ -71,6 +90,7 @@ def _render_with(quota: dict) -> str:
 def test_missing_reading_renders_as_absent_not_zero() -> None:
     html = _render_with(NO_DATA)
     assert "no data" in html, "the age label should still say so"
+    assert _tile(html, "Quota") == "—", "absent reading must render — in the Quota tile"
     # The bug: both utilization tiles fell back to 0 and printed "0%".
     assert ">0%<" not in html, 'absent quota rendered as "0%" — the zero default is back'
     assert html.count(">—<") >= 3, (
@@ -79,9 +99,36 @@ def test_missing_reading_renders_as_absent_not_zero() -> None:
     )
 
 
+UNAVAILABLE = {                                     # a REAL reading the API refused
+    "headers": {
+        "anthropic-ratelimit-unified-5h-utilization": 0.91,
+        "anthropic-ratelimit-unified-7d-utilization": 0.88,
+    },
+    "age_h": 0.1,
+    "stale": False,
+    "available": False,
+}
+
+
+def test_unavailable_reading_still_shows_the_cross() -> None:
+    """Regression for the review P1: `—` is for NO reading, not for a bad one.
+
+    The first cut of this fix swapped `available` for `_quota_has_data()` in the
+    glyph, so a fresh reading with `available: False` — which the writer sets
+    whenever `anthropic-ratelimit-unified-status != "allowed"` — rendered as a
+    green check. That is the same confidently-wrong class the whole fix exists
+    to remove, just pointed at rate-limiting instead of absence.
+    """
+    html = _render_with(UNAVAILABLE)
+    glyph = _tile(html, "Quota")
+    assert glyph == "✗", f"an unavailable reading must render ✗, got {glyph!r}"
+    assert _tile(html, "5h Used") == "91%", "utilization from a real reading should still show"
+
+
 def test_a_real_reading_still_shows_numbers() -> None:
     """Control: the fix must not blank out a genuine reading."""
     html = _render_with(HAS_DATA)
+    assert _tile(html, "Quota") == "✓", "a fresh available reading should render ✓"
     assert ">42%<" in html, "5h utilization should render from a real reading"
     assert ">13%<" in html, "7d utilization should render from a real reading"
     assert ">✓<" in html, "a fresh real reading should still show the check"
@@ -90,4 +137,5 @@ def test_a_real_reading_still_shows_numbers() -> None:
 if __name__ == "__main__":
     test_missing_reading_renders_as_absent_not_zero()
     test_a_real_reading_still_shows_numbers()
+    test_unavailable_reading_still_shows_the_cross()
     print("dashboard-quota-no-data: PASS")
