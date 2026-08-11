@@ -5169,8 +5169,29 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         # same signal as a genuinely stranded reply, which is how a detector
         # trains its readers to ignore it. `find_task_file()` is the canonical
         # locator (it is what the bridge archive paths already use).
-        if find_task_file(tasks_dir, path.stem) is not None:
+        try:
+            task_path = find_task_file(tasks_dir, path.stem)
+        except OSError:
+            # The locator itself stats the path, so it raises for the same
+            # reasons the age read does; both are partial coverage, not clean.
+            unreadable += 1
             continue
+        if task_path is not None:
+            # A CLAIMED task is owned by a running consumer; its lifetime is
+            # not ours to judge, however long it takes.
+            if ".claimed-core-" in task_path.name:
+                continue
+            try:
+                task_age = now - task_path.stat().st_mtime
+            except OSError:
+                # Same treatment as an unreadable result entry: a measurement we
+                # could not take is partial coverage, never a silent clean pass.
+                unreadable += 1
+                continue
+            # A task no bridge created is never collected, so an unclaimed
+            # pair past the threshold is stranded rather than in flight.
+            if task_age < threshold_age_sec:
+                continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
@@ -5184,7 +5205,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(orphans)} result(s) whose task is already archived — never delivered; "
+        "detail": (f"{len(orphans)} result(s) with no consumer coming — never delivered; "
                    f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
     }
 
@@ -6048,7 +6069,8 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
     return pgrep_status, pids
 
 
-def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Optional[tuple[str, str]]:
+def bridge_log_content_status(name: str, status: str, tail: list[str],
+                              detail: str = "") -> Optional[tuple[str, str]]:
     """Check a bridge's recent log lines for known failure-mode signatures.
 
     Returns an (status, detail) override, or None if nothing to override.
@@ -6064,11 +6086,15 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
       Event Subscriptions clearly ARE enabled and it's a stale false alarm.
     telegram-bridge: a 409 Conflict is a competing getUpdates poller splitting
       updates. Only counts if no message arrived after the last conflict.
+      Overrides the stale-HEARTBEAT warn too, since the heartbeat only advances on
+      an accepted poll; `detail` keeps stale-LOG and dead-inode warns intact.
     """
     if name == "discord-bridge":
         if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
             return "fail", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
-    elif name == "telegram-bridge" and status == "ok":
+    elif name == "telegram-bridge" and (
+            status == "ok"
+            or (status == "warn" and "heartbeat stale" in detail)):
         conflict_idxs = [i for i, ln in enumerate(tail) if "409" in ln and "Conflict" in ln]
         if conflict_idxs:
             # Telegram hands each update to exactly ONE getUpdates caller, so a
@@ -6076,7 +6102,9 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
             received_after = any(ln.lstrip().startswith("@") for ln in tail[conflict_idxs[-1] + 1:])
             if not received_after:
                 return "warn", ("another getUpdates poller is competing — Telegram splits "
-                                "updates between hosts; set SKIP_TELEGRAM=1 on the non-owning host")
+                                "updates between hosts; set SKIP_TELEGRAM=1 on the non-owning "
+                                "host. A stale heartbeat here is a CONSEQUENCE of this, not a "
+                                "separate fault")
     elif name == "slack-bridge" and status == "ok":
         warn_idxs = [i for i, ln in enumerate(tail) if "60s elapsed with zero events" in ln]
         if warn_idxs:
@@ -7303,12 +7331,13 @@ def run_all_checks() -> list[dict]:
         #   events aren't routing (Slack app Event Subscriptions disabled).
         #   Only overrides "ok" — stale/dead-inode are higher priority.
         # telegram-bridge: a 409 Conflict is a second poller taking a share of
-        #   the updates. Only overrides "ok".
+        #   the updates. Overrides "ok" and the stale-HEARTBEAT warn only; the
+        #   stale-log and dead-inode warns must survive, so detail is passed.
         if (log_file.exists() and name in ("discord-bridge", "slack-bridge", "telegram-bridge")
                 and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                override = bridge_log_content_status(name, status, tail)
+                override = bridge_log_content_status(name, status, tail, detail)
                 if override is not None:
                     status, detail = override
             except OSError:

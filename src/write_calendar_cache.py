@@ -74,7 +74,13 @@ def normalize_events(raw_events: list) -> list[dict]:
         else:
             raw, cal = str(ev).strip(), ""
         if raw:
-            events.append({"raw": raw, "calendar": cal})
+            ev_out = {"raw": raw, "calendar": cal}
+            # Optional: piped connector events carry no start, and omitting the
+            # key (rather than storing "") keeps readers from special-casing it.
+            start = str(ev.get("start") or "").strip() if isinstance(ev, dict) else ""
+            if start:
+                ev_out["start"] = start
+            events.append(ev_out)
     return events
 
 
@@ -231,11 +237,11 @@ def events_from_gws(now: datetime | None = None, run=None) -> list[dict]:
             if ev.get("status") == "cancelled":
                 continue
             out.append({"raw": event_to_raw(ev), "calendar": cal["id"],
-                        "_sort": (ev.get("start") or {}).get("dateTime")
+                        "start": (ev.get("start") or {}).get("dateTime")
                                  or (ev.get("start") or {}).get("date") or ""})
-    out.sort(key=lambda e: e["_sort"])
-    for e in out:
-        e.pop("_sort", None)
+    out.sort(key=lambda e: e["start"])
+    # `start` must survive: it is what lets a reader tell the day's first event
+    # from the next one. Additive — readers ignore keys they don't know.
     return out
 
 

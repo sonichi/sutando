@@ -123,14 +123,71 @@ def _read_calendar_cache() -> list[dict] | None:
         return None
     events: list[dict] = []
     for ev in raw_events:
+        start = ""
         if isinstance(ev, dict):
             raw = (ev.get("raw") or "").strip()
             cal = ev.get("calendar", "")
+            start = str(ev.get("start") or "").strip()
         else:
             raw, cal = str(ev).strip(), ""
         if raw:
-            events.append({"raw": raw, "calendar": cal})
+            out = {"raw": raw, "calendar": cal}
+            # This loop rebuilds each event, so any field not named here is
+            # dropped — `start` must be carried or _next_event() never fires.
+            if start:
+                out["start"] = start
+            events.append(out)
     return events
+
+
+def _parse_start(ev: dict):
+    """Return an aware datetime for `ev['start']`, or None if absent/unparseable.
+
+    `start` is optional by design: the gws producer supplies an ISO timestamp,
+    while piped connector events and the macOS AppleScript fallback do not. A
+    missing or malformed value must never be treated as "now" or as the epoch —
+    either would silently reorder the day.
+    """
+    raw = str(ev.get("start") or "").strip()
+    if not raw:
+        return None
+    # A bare YYYY-MM-DD is an ALL-DAY event: the DAY is known, the time of day is
+    # not, and midnight would read as already-past for the rest of the day.
+    if "T" not in raw and ":" not in raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:                 # naive but time-bearing: assume local
+        dt = dt.astimezone()
+    return dt
+
+
+def _all_starts_known(events: list[dict]) -> bool:
+    """True only if EVERY event has a usable start.
+
+    Both time-based claims assert something about the whole day, so partial
+    knowledge cannot support either: one unknown-time event may be upcoming.
+    """
+    return bool(events) and all(_parse_start(e) is not None for e in events)
+
+
+def _last_event(events: list[dict]):
+    """The latest event by parsed start — not list order, which may be unsorted."""
+    dated = [(s, e) for e in events if (s := _parse_start(e)) is not None]
+    return max(dated, key=lambda pair: pair[0])[1] if dated else None
+
+
+def _next_event(events: list[dict], now=None):
+    """The earliest event still ahead of `now`, or None.
+
+    Events with no parseable start are skipped rather than assumed upcoming.
+    """
+    now = now or datetime.now().astimezone()
+    future = [(s, e) for e in events
+              if (s := _parse_start(e)) is not None and s > now]
+    return min(future, key=lambda pair: pair[0])[1] if future else None
 
 
 def get_calendar_events() -> list[dict] | None:
@@ -622,8 +679,17 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if count == 1:
             parts.append(f"One meeting today: {events[0]['raw']}.")
         else:
-            next_ev = events[0]["raw"]
-            parts.append(f"{count} meetings today. First up: {next_ev}.")
+            upcoming = _next_event(events) if _all_starts_known(events) else None
+            last = _last_event(events) if _all_starts_known(events) else None
+            if upcoming is not None:
+                parts.append(f"{count} meetings today. Next up: {upcoming['raw']}.")
+            elif last is not None:
+                # Every start known and all past — naming one implies it is ahead.
+                parts.append(f"{count} meetings today, all earlier — "
+                             f"last was {last['raw']}.")
+            else:
+                # Incomplete start times: claim neither, keep the prior wording.
+                parts.append(f"{count} meetings today. First up: {events[0]['raw']}.")
     else:
         parts.append("Your calendar is clear today.")
 
