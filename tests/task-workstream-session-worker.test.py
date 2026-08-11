@@ -571,7 +571,12 @@ def test_bounded_runtime_helper_edges() -> None:
             assert "terminal result" in str(exc)
 
         (workspace / "state").mkdir(parents=True)
-        with mock.patch.object(worker, "_run_process_bounded", return_value=(7, "", "nope")):
+        with (
+            mock.patch.object(worker, "_require_codex_team_sandbox"),
+            mock.patch.object(
+                worker, "_run_process_bounded", return_value=(7, "", "nope")
+            ),
+        ):
             try:
                 worker._run_bounded("codex", "p", REPO, workspace)
                 raise AssertionError("Codex failure must fail closed")
