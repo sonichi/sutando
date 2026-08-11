@@ -1,20 +1,6 @@
 #!/usr/bin/env bash
-# Regression (#2417 review, qingyun P1): start-cli.sh's credential-proxy
-# routing is a three-way launch policy — a live proxy LISTENer forwards
-# ANTHROPIC_BASE_URL into the core env, a dead port omits it, and a
-# caller-set value always wins. Prior suites never exercised
-# ANTHROPIC_BASE_URL, so CI stayed green if the tmux forwarding was
-# dropped or the listener guard inverted.
-#
-# Launch-order race (2026-08 field report): the proxy can bind AFTER the core
-# launches, so when the launchd job is loaded ("expected") start-cli now polls
-# for the listener up to ~10s before giving up unwired. Cases 5-8 pin that
-# policy: expected+late wires, expected+never proceeds unwired with a warning,
-# not-expected and caller-preset launches never wait.
-#
-# Hermetic: lsof AND launchctl are stubbed via PATH (no real port/launchd
-# state), and the --print-core-env probe exits before any tmux interaction —
-# asserts run against the REAL assembled CORE_ENV_ARGS.
+# Pins start-cli's proxy-routing policy: caller-set ANTHROPIC_BASE_URL wins; a
+# loaded proxy job polls bounded for the listener; a dead port is never wired.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
@@ -23,11 +9,8 @@ check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 STARTCLI="$REPO/src/agent/claude/cli/start-cli.sh"
 
-# lsof stubs: "live" exits 0 (a LISTENer holds the port), "dead" exits 1.
-# Every stub dir also carries a launchctl stub (real launchctl lives at /bin,
-# which stays on PATH) so host launchd state can never leak into the asserts:
-# live/dead model a proxy-less host (job not loaded → exit 1); the exp-* dirs
-# model a host where the launchd job IS loaded (exit 0).
+# lsof stubs model port state; every dir also stubs launchctl (job loaded per
+# case) so host launchd state cannot leak into the asserts.
 mkdir -p "$TMP/live-bin" "$TMP/dead-bin" "$TMP/exp-late-bin" "$TMP/exp-never-bin" "$TMP/exp-dead-bin"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/live-bin/lsof"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/dead-bin/lsof"
@@ -59,9 +42,8 @@ out="$(run_probe "$TMP/live-bin")"
 echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
 check $? "live proxy listener forwards ANTHROPIC_BASE_URL=http://localhost:7846"
 
-# 2. Dead port, proxy NOT expected → no ANTHROPIC_BASE_URL, and no wait: the
-#    launch must stay on the fast path (real sleep on PATH; a leaked 10s poll
-#    would trip the elapsed bound (≤5s vs 10s budget)).
+# 2. Dead port, not expected → unwired AND no wait (real sleep on PATH; the
+#    ≤5s elapsed bound trips if the 10s poll leaks onto this path).
 _t0=$(date +%s)
 out="$(run_probe "$TMP/dead-bin")"
 _elapsed=$(( $(date +%s) - _t0 ))
