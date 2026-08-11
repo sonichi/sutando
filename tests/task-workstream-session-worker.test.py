@@ -164,6 +164,57 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
         assert "--json" in team_args
 
 
+def test_team_capability_root_is_the_owner_configured_workspace() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        task_workspace = root / "task-queue"
+        owner_workspace = root / "owner-workspace"
+        owner_workspace.mkdir()
+        owner_workspace = owner_workspace.resolve()
+        (owner_workspace / "owner-project.txt").write_text("team-visible\n")
+
+        claude_log = root / "claude.json"
+        _executable(root / "claude", """#!/usr/bin/env python3
+import json, os, sys
+if '--version' in sys.argv:
+    print('2.1.220 (Claude Code)')
+    raise SystemExit
+json.dump({'args': sys.argv[1:], 'cwd': os.getcwd()}, open(os.environ['PROVIDER_LOG'], 'w'))
+print(json.dumps({'type': 'result', 'result': 'bounded claude result'}))
+""")
+        team = _task(task_workspace, "task-team-owner-workspace", "team")
+        shared_env = {
+            "PATH": f"{root}:{os.environ['PATH']}",
+            "SUTANDO_ISOLATED_WORKING_DIR": str(owner_workspace),
+            "PROVIDER_LOG": str(claude_log),
+        }
+        assert _run("claude", task_workspace, team, shared_env).returncode == 0
+        claude = json.loads(claude_log.read_text())
+        assert claude["cwd"] != str(owner_workspace)
+        assert claude["args"][claude["args"].index("--add-dir") + 1] == str(owner_workspace)
+        settings = json.loads(claude["args"][claude["args"].index("--settings") + 1])
+        assert str(owner_workspace) in settings["sandbox"]["filesystem"]["allowRead"]
+        assert str(owner_workspace) in settings["sandbox"]["filesystem"]["allowWrite"]
+        assert str(REPO) not in settings["sandbox"]["filesystem"]["allowWrite"]
+        prompt = claude["args"][-1]
+        assert f"team workspace at {owner_workspace}" in prompt
+
+        codex_log = root / "codex.json"
+        _executable(root / "codex", """#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+json.dump({'args': args, 'cwd': os.getcwd()}, open(os.environ['PROVIDER_LOG'], 'w'))
+pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
+""")
+        team = _task(task_workspace, "task-team-owner-workspace-codex", "team")
+        shared_env["PROVIDER_LOG"] = str(codex_log)
+        assert _run("codex", task_workspace, team, shared_env).returncode == 0
+        codex = json.loads(codex_log.read_text())
+        assert codex["cwd"] == str(owner_workspace)
+        assert codex["args"][codex["args"].index("-C") + 1] == str(owner_workspace)
+        assert str(REPO) not in codex["args"]
+
+
 def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -287,6 +338,7 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
     shell_command = (
         "printf 'ENV=%s\\n' \"$GITHUB_TOKEN\"; "
         "cat \"$HOME/.aws/team-secret\"; "
+        "printf TEAM_WRITE > \"$TEAM_WORKSPACE/team-output\"; "
         f"curl --max-time 2 -sS http://127.0.0.1:{probe_server.server_port}/probe"
     )
 
@@ -374,6 +426,7 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
                 "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{api_server.server_port}",
                 "ANTHROPIC_API_KEY": "test-only-key",
                 "GITHUB_TOKEN": "ENV_SECRET",
+                "TEAM_WORKSPACE": str(repo),
                 "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
             }
             settings_index = command.index("--settings") + 1
@@ -382,6 +435,7 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
                 command, cwd=repo, env=environment, text=True,
                 capture_output=True, timeout=20,
             )
+            team_write = (repo / "team-output").read_text()
         assert completed.returncode == 0, completed.stderr
         tool_results = [
             item
@@ -396,6 +450,7 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
         assert "ENV_SECRET" not in output and "FILE_SECRET" not in output, output
         assert "ENV=\n" in output, output
         assert "Operation not permitted" in output or "Permission denied" in output, output
+        assert team_write == "TEAM_WRITE"
         assert network_probes == []
     finally:
         api_server.shutdown()
@@ -1311,6 +1366,7 @@ if __name__ == "__main__":
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_uses_owner_claude_native_sandbox_while_guest_stays_legacy()
     test_team_uses_owner_codex_workspace_sandbox_while_guest_stays_legacy()
+    test_team_capability_root_is_the_owner_configured_workspace()
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()
     test_older_claude_fails_closed_before_receiving_team_prompt()

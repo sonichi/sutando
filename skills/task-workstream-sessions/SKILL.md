@@ -10,8 +10,10 @@ This runtime skill first intercepts every explicit Team task before it can
 reach the unrestricted live core. It launches a fresh instance of the owner's
 configured runtime: Claude uses Claude Code's native OS sandbox and a bounded
 tool set, while Codex uses its native workspace-write sandbox. Team can edit
-and test inside the working repository but cannot access credentials or mutate
-external systems. A sandbox/runtime failure publishes a safe terminal result
+and test throughout the owner-configured working directory—the same workspace
+the owner's core uses—rather than being confined to the Sutando source checkout.
+The provider starts without owner account connectors and cannot access credentials
+or mutate external systems. A sandbox/runtime failure publishes a safe terminal result
 and never falls through to the owner core. Guest remains on the pre-existing
 read-only Codex delegation path carried in the task's in-band instructions.
 
