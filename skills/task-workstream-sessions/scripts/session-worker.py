@@ -46,6 +46,16 @@ SESSION_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+CODEX_TEAM_PROFILE = "sutando-team"
+TEAM_WORKSPACE_SECRET_GLOBS = (
+    "**/.env", "**/.env.*", "**/*.env", "**/.npmrc", "**/.pypirc",
+    "**/.netrc", "**/.git-credentials", "**/credentials.json",
+    "**/*credentials*.json", "**/.aws/**", "**/.ssh/**", "**/.kube/**",
+    "**/.config/gh/**", "**/.docker/config.json",
+)
+TEAM_TOOL_SECRET_GLOBS = TEAM_WORKSPACE_SECRET_GLOBS[:9] + (
+    "**/.docker/config.json",
+)
 
 
 def _read_json(path: Path) -> dict:
@@ -199,7 +209,9 @@ def _credential_paths(team_workspace: Path) -> list[str]:
         home / ".claude", home / ".config" / "gh", home / ".docker" / "config.json",
         home / ".npmrc", home / ".git-credentials", team_workspace / ".env",
     ]
-    return [str(path) for path in paths]
+    for pattern in TEAM_WORKSPACE_SECRET_GLOBS:
+        paths.extend(path for path in team_workspace.glob(pattern) if path.is_file())
+    return list(dict.fromkeys(str(path) for path in paths))
 
 
 def _claude_tier_settings(team_workspace: Path, runtime_dir: Optional[Path] = None) -> str:
@@ -212,10 +224,8 @@ def _claude_tier_settings(team_workspace: Path, runtime_dir: Optional[Path] = No
             f"Read(/{absolute})", f"Read(/{absolute}/**)",
             f"Edit(/{absolute})", f"Edit(/{absolute}/**)",
         ])
-    deny_rules.extend([
-        "Read(//**/.env)", "Read(//**/.env.*)",
-        "Edit(//**/.env)", "Edit(//**/.env.*)",
-    ])
+    for pattern in TEAM_TOOL_SECRET_GLOBS:
+        deny_rules.extend([f"Read(//{pattern})", f"Edit(//{pattern})"])
     secret_env = [
         "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "OPENAI_API_KEY",
@@ -284,12 +294,40 @@ def _require_claude_team_sandbox() -> None:
             f"Claude Code {match.group(0)} lacks the required strict sandbox; need 2.1.219+")
 
 
+def _codex_permission_profile_config() -> str:
+    denied = ",".join(f'"{pattern}"="deny"' for pattern in TEAM_WORKSPACE_SECRET_GLOBS)
+    return (
+        f'permissions.{CODEX_TEAM_PROFILE}={{extends=":workspace",'
+        f'filesystem={{":workspace_roots"={{{denied}}}}}}}'
+    )
+
+
+def _require_codex_team_sandbox() -> None:
+    """Fail closed unless Codex supports enforced read-deny workspace carveouts."""
+    try:
+        version = subprocess.run(
+            ["codex", "--version"], text=True, capture_output=True, check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not verify Codex sandbox support: {exc}") from exc
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version.stdout)
+    if version.returncode or not match:
+        raise RuntimeError("could not verify Codex sandbox version")
+    installed = tuple(int(part) for part in match.groups())
+    if installed < (0, 132, 0):
+        raise RuntimeError(
+            f"Codex {match.group(0)} lacks required filesystem deny rules; need 0.132.0+")
+
+
 def _codex_bounded_command(
     prompt: str, team_workspace: Path, output_file: Path,
 ) -> list[str]:
     command = [
         "codex", "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
-        "--json", "--sandbox", "workspace-write", "-C", str(team_workspace),
+        "--strict-config", "-c", _codex_permission_profile_config(),
+        "-c", f'default_permissions="{CODEX_TEAM_PROFILE}"',
+        "--json", "-C", str(team_workspace),
         "-o", str(output_file),
     ]
     model = os.environ.get("SUTANDO_CORE_MODEL", "").strip()
@@ -426,6 +464,7 @@ def _run_bounded(runtime: str, prompt: str, repo: Path, workspace: Path) -> str:
         os.close(fd)
         output_file = Path(output_name)
         try:
+            _require_codex_team_sandbox()
             return_code, _, stderr = _run_process_bounded(
                 _codex_bounded_command(prompt, team_workspace, output_file),
                 team_workspace,

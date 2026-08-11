@@ -9,7 +9,8 @@ user-invocable: false
 This runtime skill first intercepts every explicit Team task before it can
 reach the unrestricted live core. It launches a fresh instance of the owner's
 configured runtime: Claude uses Claude Code's native OS sandbox and a bounded
-tool set, while Codex uses its native workspace-write sandbox. Team can edit
+tool set, while Codex uses a named workspace-write permission profile with
+enforced secret-file deny globs (Codex 0.132.0+). Team can edit
 and test throughout the owner-configured working directory—the same workspace
 the owner's core uses—rather than being confined to the Sutando source checkout.
 The provider starts without owner account connectors and cannot access credentials

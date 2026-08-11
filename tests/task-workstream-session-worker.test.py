@@ -150,6 +150,9 @@ def test_team_uses_owner_codex_workspace_sandbox_while_guest_stays_legacy() -> N
         _executable(root / "codex", """#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if '--version' in args:
+    print('codex-cli 0.146.0')
+    raise SystemExit
 with open(os.environ['PROVIDER_LOG'], 'a') as f: f.write(json.dumps(args) + '\\n')
 pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
 """)
@@ -159,7 +162,11 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
         assert _run("codex", workspace, team, env).returncode == 0
         assert _run("codex", workspace, guest, env).returncode == worker.UNHANDLED
         [team_args] = [json.loads(line) for line in log.read_text().splitlines()]
-        assert team_args[team_args.index("--sandbox") + 1] == "workspace-write"
+        assert "--sandbox" not in team_args
+        assert "--strict-config" in team_args
+        configs = [team_args[index + 1] for index, arg in enumerate(team_args) if arg == "-c"]
+        assert worker._codex_permission_profile_config() in configs
+        assert f'default_permissions="{worker.CODEX_TEAM_PROFILE}"' in configs
         assert "--ignore-user-config" in team_args and "--ephemeral" in team_args
         assert "--json" in team_args
 
@@ -172,6 +179,9 @@ def test_team_capability_root_is_the_owner_configured_workspace() -> None:
         owner_workspace.mkdir()
         owner_workspace = owner_workspace.resolve()
         (owner_workspace / "owner-project.txt").write_text("team-visible\n")
+        (owner_workspace / "project").mkdir()
+        workspace_npmrc = owner_workspace / "project" / ".npmrc"
+        workspace_npmrc.write_text("token=blocked\n")
 
         claude_log = root / "claude.json"
         _executable(root / "claude", """#!/usr/bin/env python3
@@ -196,6 +206,7 @@ print(json.dumps({'type': 'result', 'result': 'bounded claude result'}))
         assert str(owner_workspace) in settings["sandbox"]["filesystem"]["allowRead"]
         assert str(owner_workspace) in settings["sandbox"]["filesystem"]["allowWrite"]
         assert str(REPO) not in settings["sandbox"]["filesystem"]["allowWrite"]
+        assert str(workspace_npmrc) in settings["sandbox"]["filesystem"]["denyWrite"]
         prompt = claude["args"][-1]
         assert f"team workspace at {owner_workspace}" in prompt
 
@@ -203,6 +214,9 @@ print(json.dumps({'type': 'result', 'result': 'bounded claude result'}))
         _executable(root / "codex", """#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if '--version' in args:
+    print('codex-cli 0.146.0')
+    raise SystemExit
 json.dump({'args': args, 'cwd': os.getcwd()}, open(os.environ['PROVIDER_LOG'], 'w'))
 pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
 """)
@@ -213,6 +227,35 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
         assert codex["cwd"] == str(owner_workspace)
         assert codex["args"][codex["args"].index("-C") + 1] == str(owner_workspace)
         assert str(REPO) not in codex["args"]
+
+
+def test_installed_codex_denies_workspace_secrets_but_keeps_workspace_writable() -> None:
+    codex = shutil.which("codex")
+    if not codex:
+        return
+    try:
+        worker._require_codex_team_sandbox()
+    except RuntimeError:
+        return
+    with tempfile.TemporaryDirectory() as td:
+        team_workspace = Path(td).resolve()
+        (team_workspace / "visible.txt").write_text("visible\n")
+        (team_workspace / ".env").write_text("TEAM_SECRET=blocked\n")
+        command = [
+            codex, "sandbox", "-C", str(team_workspace),
+            "-c", worker._codex_permission_profile_config(),
+            "-P", worker.CODEX_TEAM_PROFILE,
+            "/bin/sh", "-c",
+            "cat visible.txt; cat .env; printf changed > visible.txt",
+        ]
+        completed = subprocess.run(
+            command, text=True, capture_output=True, timeout=20,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "visible" in completed.stdout
+        assert "TEAM_SECRET" not in completed.stdout + completed.stderr
+        assert "Operation not permitted" in completed.stderr
+        assert (team_workspace / "visible.txt").read_text() == "changed"
 
 
 def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
@@ -435,8 +478,8 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
                 command, cwd=repo, env=environment, text=True,
                 capture_output=True, timeout=20,
             )
+            assert completed.returncode == 0, completed.stderr
             team_write = (repo / "team-output").read_text()
-        assert completed.returncode == 0, completed.stderr
         tool_results = [
             item
             for request in requests
@@ -478,6 +521,16 @@ def test_bounded_runtime_helper_edges() -> None:
                 raise AssertionError("unparseable Claude version must fail closed")
             except RuntimeError as exc:
                 assert "sandbox version" in str(exc)
+
+        old_codex = subprocess.CompletedProcess([], 0, "codex-cli 0.131.0", "")
+        with mock.patch.object(worker.subprocess, "run", return_value=old_codex):
+            try:
+                worker._require_codex_team_sandbox()
+                raise AssertionError("old Codex must fail closed")
+            except RuntimeError as exc:
+                assert "need 0.132.0+" in str(exc)
+        assert '"**/.env"="deny"' in worker._codex_permission_profile_config()
+        assert '"**/.npmrc"="deny"' in worker._codex_permission_profile_config()
 
         already_done = mock.Mock()
         already_done.poll.return_value = 0
@@ -1367,6 +1420,7 @@ if __name__ == "__main__":
     test_team_uses_owner_claude_native_sandbox_while_guest_stays_legacy()
     test_team_uses_owner_codex_workspace_sandbox_while_guest_stays_legacy()
     test_team_capability_root_is_the_owner_configured_workspace()
+    test_installed_codex_denies_workspace_secrets_but_keeps_workspace_writable()
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()
     test_older_claude_fails_closed_before_receiving_team_prompt()
