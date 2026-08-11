@@ -47,14 +47,21 @@ HAS_DATA = {                                        # a real reading, for the co
 
 
 def _render_with(quota: dict) -> str:
+    """Render with a fully synthetic stats dict — never the real collector.
+
+    `get_system_stats()` shells out to `/usr/bin/pmset`, which does not exist on
+    the Linux CI runner, so calling it and patching only `quota` raised
+    FileNotFoundError before any assertion ran. `render_dashboard()` reads
+    exactly four keys off stats, so a complete fake is cheap and keeps this
+    hermetic on every platform.
+    """
     real = dashboard.get_system_stats
-
-    def fake():
-        stats = real()
-        stats["quota"] = quota
-        return stats
-
-    dashboard.get_system_stats = fake
+    dashboard.get_system_stats = lambda: {
+        "disk_free": "53GB",
+        "battery": "42%",
+        "charging": False,
+        "quota": quota,
+    }
     try:
         return dashboard.render_dashboard()
     finally:
