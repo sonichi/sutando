@@ -35,6 +35,10 @@ def _launch_argv(model_env: "str | None") -> list[str]:
             "PATH": f"{bind}:/bin",
             "HOME": str(td),
             "ARGS_FILE": str(args_file),
+            # start-cli.sh stamps <workspace>/state/session-starts.log; without
+            # this redirect the run appends a fake launch to the LIVE workspace.
+            "SUTANDO_TEST_MODE": "1",
+            "SUTANDO_WORKSPACE": str(td / "workspace"),
         }
         if model_env is not None:
             env["SUTANDO_CORE_MODEL"] = model_env
@@ -175,6 +179,8 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
                 "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
+                "SUTANDO_TEST_MODE": "1",
+                "SUTANDO_WORKSPACE": str(td / "workspace"),
             }
             # The script may exec `tmux attach` and block; that is fine. Kill the
             # whole group after the clear has had its chance to run.
@@ -232,6 +238,8 @@ def case_fresh_socket_server_is_born_unpinned() -> list[str]:
                 "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
+                "SUTANDO_TEST_MODE": "1",
+                "SUTANDO_WORKSPACE": str(td / "workspace"),
                 "SUTANDO_CORE_MODEL": "opus",   # the pin is in the LAUNCHER's env
             }
             out, timed_out = _run_launcher(env, td / "launcher.log")
@@ -304,6 +312,8 @@ def case_bare_invocation_still_warns_on_a_pinned_live_core() -> list[str]:
                 "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
+                "SUTANDO_TEST_MODE": "1",
+                "SUTANDO_WORKSPACE": str(td / "workspace"),
             }
             out, timed_out = _run_launcher(env, td / "launcher.log")
             if timed_out:
