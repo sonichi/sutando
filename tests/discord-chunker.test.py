@@ -79,6 +79,20 @@ def _run_against(mod, label):
     # reassembly; dm-result.py still exposes only its lossless alias.
     chunk = getattr(mod, "_chunk_for_discord_unbounded", mod._chunk_for_discord)
 
+    # The fallback above is deliberate (dm-result names its lossless alias
+    # differently), but it made this suite BLIND: renaming the bridge's primitive
+    # away left every assertion below satisfied by the bounded path, which caps at
+    # DISCORD_DELIVERY_MAX_CHUNKS. Assert the PROPERTY, not the name — a lossless
+    # chunker must exceed that cap on input that needs more.
+    _long = ("x" * 1800 + "\n") * 8
+    _n = len(list(chunk(_long)))
+    _cap = getattr(mod, "DISCORD_DELIVERY_MAX_CHUNKS", None)
+    if _cap is not None:
+        assert _n > _cap, (
+            f"{label}: resolved chunker produced {_n} chunks on ~14k chars, at or under the "
+            f"{_cap}-chunk delivery cap — the lossless primitive is missing and the bounded "
+            f"path was substituted silently")
+
     # Test 1: empty/short
     assert list(chunk("")) == []
     assert list(chunk("hi")) == ["hi"]

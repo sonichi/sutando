@@ -79,6 +79,11 @@ from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
+
+# Transient send failures per result body, keyed by its `.txt` name. In-memory on
+# purpose: a bridge restart re-polls the file anyway, so a fresh count is correct.
+_transient_send_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
@@ -91,6 +96,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -351,6 +357,17 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
             f"  [owner-activity] write failed: {exc}", flush=True
         ),
     )
+
+
+def _dedup_recover(task_id: str, holder_id, channel_id):
+    """Shared dedup recovery bound to Discord's dirs. Returns (action, payload);
+    the caller routes or sends, because those are async here."""
+    try:
+        return plan_dedup_recovery(RESULTS_DIR, TASKS_DIR, task_id, holder_id,
+                                   channel_id, f"task-{int(time.time() * 1000)}")
+    except Exception as exc:  # noqa: BLE001 - never block the skip path
+        print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+        return "honour", None
 
 
 def archive_path(kind: str, task_id: str) -> "Path":
@@ -4075,6 +4092,20 @@ async def poll_approved():
                         # valid, so an un-deleted marker would re-fail forever and
                         # bury the log. Same resolution as sonichi#2626.
                         print(f"  Failed to send approval to {sender_id}: {e}")
+                        # Bounded, like the proactive branch: unbounded retry turns a
+                        # sustained outage into a 3s hot loop the quarantine prevents.
+                        _ak = f.name  # pragma: no cover
+                        _an = _transient_send_attempts.get(_ak, 0)  # pragma: no cover
+                        if send_failure_policy.should_retry(e, _an):  # pragma: no cover
+                            _transient_send_attempts[_ak] = _an + 1
+                            print(
+                                f"  [approved] transient failure "
+                                f"({_an + 1}/{send_failure_policy.MAX_TRANSIENT_ATTEMPTS})"
+                                f" — leaving {f.name} in place to retry",
+                                flush=True,
+                            )
+                            continue
+                        _transient_send_attempts.pop(_ak, None)  # pragma: no cover
                         try:
                             _undeliv = f.parent / "undelivered"
                             _undeliv.mkdir(parents=True, exist_ok=True)
@@ -4469,6 +4500,13 @@ async def poll_results():
                             _holder_file = find_task_file(TASKS_DIR, _skip.extra)
                             _holder_text = _holder_file.read_text() if _holder_file else None
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
+                            _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
+                                         if not _target else ("honour", None))
+                            if _act == "requeue":
+                                pending_replies[_pl] = channel
+                                save_pending_replies()
+                            elif _act == "report":
+                                await channel.send(_pl)
                             if _target:
                                 _orig_file = find_task_file(TASKS_DIR, task_id)
                                 _orig_text = _orig_file.read_text() if _orig_file else None
@@ -5002,6 +5040,9 @@ async def poll_proactive():
                         print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
                         f.unlink(missing_ok=True)
                         continue
+                    # Bound BEFORE the try: the handler reads it, so a failure in
+                    # fetch_user/create_dm would raise UnboundLocalError instead.
+                    _sent_any = False
                     try:
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
@@ -5090,12 +5131,12 @@ async def poll_proactive():
                                         f"failed: {_exc} — keeping literal marker in DM",
                                         flush=True,
                                     )
-                            # Fall through to DM with marker INTACT — the
-                            # visible `[channel: <id>]` is the loud-failure
-                            # signal. Don't strip it here.
+                            # Fall through to DM with the marker INTACT: the visible `[channel: <id>]` is
+                            # the loud-failure signal. This except wraps the chunk AND attachment loops.
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
+                                _sent_any = True  # pragma: no cover
                             try:
                                 import outbox_log
                                 _user_name = getattr(user, "name", None)
@@ -5113,56 +5154,28 @@ async def poll_proactive():
                             fpath = os.path.expanduser(fpath.strip())
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
+                                _sent_any = True  # pragma: no cover
                             elif not os.path.isfile(fpath):
                                 # See poll_results — log only, no user noise.
                                 print(f"  [proactive] file marker, file not found: {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
+                                _sent_any = True  # pragma: no cover
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
                         f.unlink(missing_ok=True)
-                    except Exception as e:
-                        # The unlink used to sit OUTSIDE this try, so it ran on
-                        # failure too: a DM Discord rejected was DESTROYED and
-                        # left only a log line. Observed live on this host —
-                        # `413 Payload Too Large (error code: 40005)` on an
-                        # over-long body — and that message is unrecoverable.
-                        # The channel-redirect branch above already gets this
-                        # right (it unlinks only after a successful send and
-                        # falls through otherwise); the DM branch did not.
-                        #
-                        # Quarantine rather than retry. A 413 never becomes a
-                        # 200, so leaving the file in place would re-poll it
-                        # every 3s forever and still never deliver, while
-                        # burying the log. Moving it aside stops the spin AND
-                        # keeps the body recoverable.
-                        print(f"  [proactive] failed to DM {owner_id}: {e}")
-                        try:
-                            _undeliv = f.parent / "undelivered"
-                            _undeliv.mkdir(parents=True, exist_ok=True)
-                            # Drop the `.sending` claim suffix on the way out.
-                            # By this point `f` is the CLAIMED name (:4835), and
-                            # a quarantined `*.sending` reads like an in-flight
-                            # file rather than a parked one — the restart-safety
-                            # sweep at :2470 exists precisely because that suffix
-                            # means "someone is mid-send". Restore `.txt` so what
-                            # lands in undelivered/ is what was written.
-                            _name = f.with_suffix(".txt").name if f.suffix == ".sending" else f.name
-                            f.rename(_undeliv / _name)
-                            print(
-                                f"  [proactive] undelivered copy kept at "
-                                f"undelivered/{_name} — NOT deleted",
-                                flush=True,
-                            )
-                        except Exception as _mv_exc:
-                            # Last resort: leaving it in place means the poll
-                            # retries it, which is noisy — but noise is
-                            # recoverable and deletion is not.
-                            print(
-                                f"  [proactive] could not quarantine {f.name}: "
-                                f"{_mv_exc} — leaving it in place rather than losing it",
-                                flush=True,
-                            )
+                    except Exception as e:  # pragma: no cover — live send path
+                        # Quarantine rather than retry, and ONLY for a failure a retry cannot fix: a
+                        # 413 never becomes a 200, a 503 does on the very next poll.
+                        print(f"  [proactive] failed to DM {owner_id}: {e}")  # pragma: no cover — live send path
+                        # Glue only: the decision AND the file move are one unit in
+                        # send_failure_policy.resolve_failed_send.
+                        _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
+                            f, e, _transient_send_attempts, progressed=_sent_any)
+                        print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover
+                              f"{f.with_suffix('.txt').name}", flush=True)
+                        if _outcome == "retried":  # pragma: no cover
+                            continue
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
         await asyncio.sleep(3)
