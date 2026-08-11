@@ -1249,12 +1249,8 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     additive: the annotation was `-> None` and no existing caller reads it.
     """
     if not text:
-        # Unreachable from every current caller: both the task-reply and
-        # proactive drains guard empty text before calling (slack
-        # `if not text: claim.unlink()`, telegram :928). Kept as a contract
-        # statement rather than removed, because a future caller without that
-        # guard must get "consume it" — returning False would release an empty
-        # file, re-claim it, and loop forever.
+        # Returning False would release an empty file, re-claim it, and loop
+        # forever; a caller lacking an empty-text guard must get "consume it".
         return True  # pragma: no cover — see above; no caller reaches this
 
     parsed = parse_markers(text)
@@ -1330,9 +1326,8 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
             except Exception as e:
-                # The deny notice can be the ONLY user-visible output: a body of
-                # just `[file: /blocked]` posts no text chunk, so if this refusal
-                # is swallowed the caller consumes the source and nobody is told.
+                # A body of just `[file: /blocked]` posts no text chunk, so the
+                # deny notice can be the only output; swallowing it tells nobody.
                 print(f"[Slack] deny-notice chat_postMessage failed: {e}", flush=True)
                 delivered_ok = False
             print(f"  BLOCKED file: {fpath}", flush=True)
