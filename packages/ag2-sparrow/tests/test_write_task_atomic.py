@@ -32,6 +32,7 @@ def _task(tid="task-1784500000000"):
         "source": "ag2space",
         "channel_id": "!room:ag2.space",
         "user_id": "@qingyun:ag2.space",
+        "access_tier": "owner",
         "timestamp": "2026-07-20T00:00:00Z",
     }
 
