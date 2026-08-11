@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     WS_EXCLUDE, die, emit, git_out, is_ancestor, is_git_checkout,
-    merge_in_progress, read_meta, run_git, tree_dirty, unmerged_paths,
+    merge_in_progress, proposal_path, read_meta, run_git, set_git,
+    tree_dirty, unmerged_paths, write_proposal,
 )
 
 
@@ -48,7 +50,9 @@ def kept_line(scratch: Path, path: str, merged: str, local: str, update: str) ->
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--scratch", required=True, type=Path)
+    ap.add_argument("--git", default=None, help="trusted git executable (overrides $SUTANDO_GIT and PATH)")
     args = ap.parse_args()
+    set_git(args.git)
 
     scratch = args.scratch.resolve()
     if not scratch.is_dir() or not is_git_checkout(scratch):
@@ -90,6 +94,17 @@ def main() -> None:
                % (new_sha[:12], meta["snapshot_branch"], len(conflicted), len(files))]
     summary += [kept_line(scratch, p, merged_sha, snapshot_tip, new_sha) for p in conflicted]
 
+    # Bind the confirmation to THIS exact commit: apply.py refuses any sha that
+    # is not the recorded one. Re-proposing atomically overwrites the record.
+    write_proposal(Path(meta["pending"]), {
+        "merged_sha": merged_sha,
+        "old_sha": meta["old_sha"],
+        "new_sha": new_sha,
+        "snapshot_branch": meta["snapshot_branch"],
+        "scratch": str(scratch),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+
     emit({
         "status": "proposed",
         "merged_sha": merged_sha,
@@ -98,6 +113,7 @@ def main() -> None:
         "files": files,
         "diffstat": diffstat,
         "summary_lines": summary,
+        "proposal_record": str(proposal_path(Path(meta["pending"]))),
     })
 
 

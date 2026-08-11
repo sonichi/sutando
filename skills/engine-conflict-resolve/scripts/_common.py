@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,34 @@ SUTANDO_IDENT = {
 WS_EXCLUDE = ":(exclude)workspace"
 META_NAME = "sutando-engine-conflict.json"
 LOCK_NAME = "ENGINE_UPDATE_LOCK.d"
+PROPOSAL_NAME = "ENGINE_CONFLICT_PROPOSAL.json"
+
+EXIT_NO_GIT = 6
+
+_GIT: Optional[str] = None
+
+
+def set_git(path: Optional[str]) -> None:
+    """CLI --git override; wins over env + PATH resolution."""
+    global _GIT
+    if path:
+        _GIT = path
+
+
+def resolve_git() -> str:
+    """Trusted git: --git flag > $SUTANDO_GIT > PATH. Never a traceback if absent."""
+    global _GIT
+    if _GIT:
+        return _GIT
+    cand = os.environ.get("SUTANDO_GIT") or shutil.which("git")
+    if not cand or not (Path(cand).is_file() and os.access(cand, os.X_OK)):
+        emit({"status": "no-git", "reason": "no-git",
+              "error": "no usable git executable (checked --git, $SUTANDO_GIT, then PATH) — "
+                       "set SUTANDO_GIT to a trusted git (the desktop bundle ships one at "
+                       "<engine-parent>/bin/git) or pass --git"},
+             exit_code=EXIT_NO_GIT)
+    _GIT = cand
+    return _GIT
 
 
 def run_git(repo, *args: str, check: bool = True, ident: bool = False) -> "subprocess.CompletedProcess[str]":
@@ -36,10 +65,15 @@ def run_git(repo, *args: str, check: bool = True, ident: bool = False) -> "subpr
     env["GIT_TERMINAL_PROMPT"] = "0"
     if ident:
         env.update(SUTANDO_IDENT)
-    proc = subprocess.run(
-        ["git", "-C", str(repo)] + list(args),
-        capture_output=True, text=True, env=env,
-    )
+    try:
+        proc = subprocess.run(
+            [resolve_git(), "-C", str(repo)] + list(args),
+            capture_output=True, text=True, env=env,
+        )
+    except OSError as e:
+        emit({"status": "no-git", "reason": "no-git",
+              "error": f"git executable failed to launch ({e}) — set SUTANDO_GIT or pass --git"},
+             exit_code=EXIT_NO_GIT)
     if check and proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed in {repo}: {proc.stderr.strip()}")
     return proc
@@ -114,6 +148,29 @@ def write_meta(scratch: Path, meta: dict) -> None:
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(meta, indent=2))
     os.replace(tmp, p)
+
+
+def proposal_path(pending: Path) -> Path:
+    """The confirmed-proposal record lives beside the pending file (state dir)."""
+    return Path(pending).resolve().parent / PROPOSAL_NAME
+
+
+def write_proposal(pending: Path, record: dict) -> None:
+    p = proposal_path(pending)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(record, indent=2))
+    os.replace(tmp, p)
+
+
+def read_proposal(pending: Path) -> Optional[dict]:
+    p = proposal_path(pending)
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
 
 
 def unmerged_paths(repo: Path) -> List[str]:

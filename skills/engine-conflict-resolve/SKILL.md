@@ -1,15 +1,26 @@
 ---
 name: engine-conflict-resolve
-description: Core-side handler for the desktop app's "Resolve with Sutando" engine-update conflict button. Reproduces the conflicted merge in a scratch git worktree, lets the agent resolve it there, proposes the resolution to the owner, and applies it to the live engine checkout only after explicit confirmation.
+description: Ask Sutando to resolve a conflicted update of a Sutando checkout. When pulling the latest release/main conflicts with local changes, Sutando reproduces the merge in a scratch git worktree, resolves the conflicts there, proposes the resolution to the owner, and fast-forwards the live checkout only after explicit confirmation. First entry path is the desktop app's "Resolve with Sutando" engine-update button.
 ---
 
 # engine-conflict-resolve
 
-When the desktop app's git-aware engine updater hits merge conflicts it aborts
-completely and records `ENGINE_UPDATE_PENDING.json`. "Resolve with Sutando" in
-the app writes a task file `tasks/task-engine-conflict-<epoch>.txt`
+Anyone running Sutando from a git checkout can ask it to pull the latest
+main/release — and when the update conflicts with their local changes, ask
+Sutando to resolve the merge itself. This skill is that protocol: reproduce
+the merge in a scratch worktree, resolve the conflicts there semantically,
+propose the result, and land it in the live checkout only after the owner
+explicitly confirms.
+
+The first producer of the pending state is the desktop app's git-aware engine
+updater: on a conflicted update it aborts completely and records
+`ENGINE_UPDATE_PENDING.json`; the app's "Resolve with Sutando" button then
+writes a task file `tasks/task-engine-conflict-<epoch>.txt`
 (`source: desktop-app`, `interaction_type: system_event`) whose body names the
-pending file and the engine checkout. This skill is the protocol for that task.
+pending file and the engine checkout. That task is one entry path, not the
+feature: the scripts take the pending-file shape as input from any producer
+(a ref-based entry point — merge any two refs with no pending file — plus a
+chat-facing command are queued follow-ups).
 
 **Iron rule: never modify the live checkout until the owner confirms.** All
 merge work happens in a scratch worktree; only `apply.py` touches the live
@@ -29,8 +40,9 @@ python3 skills/engine-conflict-resolve/scripts/prepare.py \
 ```
 
 - `{"status": "clean", "merged_sha": …}` — the merge replays cleanly (the
-  recorded conflict no longer reproduces). Skip step 2; the merged_sha IS the
-  proposal — go to step 3 and report "merged cleanly, no conflicts remained".
+  recorded conflict no longer reproduces). Skip step 2 but still RUN step 3:
+  only `propose.py` records the proposal `apply.py` will accept. Report
+  "merged cleanly, no conflicts remained".
 - `{"status": "conflicts", "scratch": …, "conflicting_files": […]}` — resolve
   in the scratch (step 2).
 - `{"status": "error", "reason": "pending-stale", …}` — the checkout moved
@@ -64,8 +76,13 @@ python3 skills/engine-conflict-resolve/scripts/propose.py --scratch "<scratch>"
 
 - Exit 2 `{"status": "unmerged", …}` — you missed a file; go back to step 2.
 - `{"status": "proposed", "merged_sha": …, "files": …, "diffstat": …,
-  "summary_lines": […]}` — report the proposal. The proposal text must
-  contain:
+  "summary_lines": […], "proposal_record": …}` — the script has atomically
+  recorded this exact `merged_sha` in `ENGINE_CONFLICT_PROPOSAL.json` next to
+  the pending file; `apply.py` will land ONLY that recorded commit. If you
+  change anything in the scratch afterwards, you MUST re-run propose.py (it
+  overwrites the record) and re-report — the owner confirms a specific
+  proposal, never "whatever is in the scratch now". Report the proposal. The
+  proposal text must contain:
   - the `summary_lines` (one line per conflicted file: what was kept), with
     your own one-line semantic note per file where the mechanical verdict
     isn't self-explanatory;
@@ -113,16 +130,37 @@ python3 skills/engine-conflict-resolve/scripts/apply.py \
 Guards (all enforced by the script, not by you): takes the updater's own
 `ENGINE_UPDATE_LOCK.d` mkdir lock (exit 3 = busy, try again shortly);
 re-asserts HEAD still equals the snapshot tip recorded in pending (exit 4 =
-checkout moved — go back to step 1); verifies the merged sha is a descendant
-of HEAD and contains the release; re-asserts the `!/workspace/` sparse guard;
-then `git merge --ff-only`. On success it clears the pending file, removes the
-scratch worktree, and prints `{"status": "applied", …}` — report that to the
-owner (their work remains on the snapshot branch; the engine restarts on the
-new code at the next app restart).
+checkout moved — go back to step 1); requires the `ENGINE_CONFLICT_PROPOSAL.json`
+record to exist, to match the live pending state, and `--merged-sha` to be
+exactly the recorded commit (exit 5 = proposal missing/mismatched — re-run
+propose.py, re-confirm with the owner); verifies the merged sha is a
+descendant of HEAD and contains the release; re-asserts the `!/workspace/`
+sparse guard; then `git merge --ff-only`. On success it clears the pending
+file and the proposal record, removes the scratch worktree, and prints
+`{"status": "applied", …}` — report that to the owner (their work remains on
+the snapshot branch; the engine restarts on the new code at the next app
+restart).
 
 If the owner says discard: remove the scratch
-(`git -C "<engine>" worktree remove --force "<scratch>"`), leave the pending
-file alone (the app's tray still owns that state), and confirm.
+(`git -C "<engine>" worktree remove --force "<scratch>"`), delete the
+`ENGINE_CONFLICT_PROPOSAL.json` record, leave the pending file alone (the
+app's tray still owns that state), and confirm.
+
+## Git resolution (installed hosts)
+
+The scripts never assume a usable `git` on PATH — an installed Mac may have a
+sanitized PATH or only the Xcode-CLT stub. Resolution order: `--git` flag >
+`$SUTANDO_GIT` > `PATH`; if nothing usable resolves, they print
+`{"status": "no-git", …}` (exit 6) instead of a traceback. **For a
+desktop-app task, pass the app's own bundled git — the same binary the
+updater/attach scripts use, at `<engine-parent>/bin/git`** (sibling of
+`ENGINE_UPDATE_PENDING.json`):
+
+```bash
+SUTANDO_GIT="<…/engine>/bin/git" python3 skills/engine-conflict-resolve/scripts/prepare.py …
+```
+
+(or `--git "<…/engine>/bin/git"` on each script; same for propose/apply).
 
 ## Notes
 

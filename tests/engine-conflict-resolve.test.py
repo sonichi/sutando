@@ -40,9 +40,9 @@ def git(repo, *args, check=True):
     return proc
 
 
-def run_script(name, *args):
+def run_script(name, *args, env=None):
     return subprocess.run([sys.executable, str(SCRIPTS / name)] + list(args),
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=env)
 
 
 def out_json(proc):
@@ -111,9 +111,14 @@ class EngineFixture:
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def prepare(self):
+    def prepare(self, env=None):
         return run_script("prepare.py", "--pending", str(self.pending),
-                          "--engine", str(self.engine), "--scratch", str(self.scratch))
+                          "--engine", str(self.engine), "--scratch", str(self.scratch),
+                          env=env)
+
+    @property
+    def proposal(self):
+        return self.engine.parent / "ENGINE_CONFLICT_PROPOSAL.json"
 
     def apply(self, merged_sha):
         return run_script("apply.py", "--pending", str(self.pending),
@@ -145,11 +150,24 @@ class TestCleanMergeFastPath(unittest.TestCase):
         self.assertEqual(git(fx.engine, "rev-parse", "HEAD").stdout.strip(), fx.old_sha)
         self.assertTrue(fx.pending.is_file())
 
+        # No proposal record yet — apply must refuse even a valid merged_sha.
+        early = fx.apply(merged)
+        self.assertEqual(early.returncode, 5, early.stdout + early.stderr)
+        self.assertEqual(out_json(early)["reason"], "proposal-missing")
+        self.assertEqual(git(fx.engine, "rev-parse", "HEAD").stdout.strip(), fx.old_sha)
+
+        # Clean path still runs propose: that is what records the proposal.
+        pr = run_script("propose.py", "--scratch", str(fx.scratch))
+        self.assertEqual(pr.returncode, 0, pr.stdout + pr.stderr)
+        self.assertEqual(out_json(pr)["merged_sha"], merged)
+        self.assertTrue(fx.proposal.is_file())
+
         a = fx.apply(merged)
         self.assertEqual(a.returncode, 0, a.stdout + a.stderr)
         self.assertEqual(out_json(a)["status"], "applied")
         self.assertEqual(git(fx.engine, "rev-parse", "HEAD").stdout.strip(), merged)
         self.assertFalse(fx.pending.exists(), "pending must be cleared")
+        self.assertFalse(fx.proposal.exists(), "proposal record must be cleared")
         self.assertNotIn(str(fx.scratch),
                          git(fx.engine, "worktree", "list", "--porcelain").stdout)
         self.assertFalse(fx.scratch.exists(), "scratch worktree removed")
@@ -250,6 +268,37 @@ class TestConflictEndToEnd(unittest.TestCase):
         self.assertFalse(lock.exists(), "reclaimed lock released after apply")
         fx.assert_invariants(self)
 
+    def test_apply_refuses_unrecorded_descendant(self):
+        """Reviewer P1 repro: a post-proposal scratch commit must not land."""
+        fx = self.fx
+        self.assertEqual(fx.prepare().returncode, 0)
+        self.resolve_in_scratch()
+        merged = out_json(run_script("propose.py", "--scratch", str(fx.scratch)))["merged_sha"]
+
+        # An unreviewed commit on top of the proposal, in the shared object db.
+        (fx.scratch / "sneaky.txt").write_text("never shown to the owner\n")
+        git(fx.scratch, "add", "-A", "--", ".", ":(exclude)workspace")
+        git(fx.scratch, "commit", "-q", "-m", "post-proposal descendant")
+        descendant = git(fx.scratch, "rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(descendant, merged)
+
+        a = fx.apply(descendant)
+        self.assertEqual(a.returncode, 5, a.stdout + a.stderr)
+        self.assertEqual(out_json(a)["reason"], "proposal-mismatch")
+        self.assertEqual(git(fx.engine, "rev-parse", "HEAD").stdout.strip(), fx.old_sha,
+                         "refused apply must leave the checkout untouched")
+        self.assertTrue(fx.pending.is_file())
+        self.assertTrue(fx.proposal.is_file())
+
+        # The recorded proposal itself still lands.
+        a2 = fx.apply(merged)
+        self.assertEqual(a2.returncode, 0, a2.stdout + a2.stderr)
+        self.assertEqual(git(fx.engine, "rev-parse", "HEAD").stdout.strip(), merged)
+        self.assertFalse((fx.engine / "sneaky.txt").exists(),
+                         "the unreviewed descendant's content must not land")
+        self.assertFalse(fx.proposal.exists())
+        fx.assert_invariants(self)
+
     def test_apply_refuses_when_checkout_moved(self):
         fx = self.fx
         self.assertEqual(fx.prepare().returncode, 0)
@@ -279,6 +328,44 @@ class TestConflictEndToEnd(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertEqual(out_json(p)["reason"], "pending-stale")
         self.assertFalse(fx.scratch.exists(), "no scratch created for stale state")
+
+
+class TestGitResolution(unittest.TestCase):
+    """Installed-host runtime: sanitized PATH, possibly no system git at all."""
+
+    def setUp(self):
+        self.fx = EngineFixture(conflicting=True)
+        self.addCleanup(self.fx.cleanup)
+        self.real_git = shutil.which("git")
+        self.assertTrue(self.real_git)
+
+    def sanitized_env(self, **extra):
+        env = dict(os.environ)
+        env["PATH"] = ""
+        env.pop("SUTANDO_GIT", None)
+        env.update(extra)
+        return env
+
+    def test_no_git_is_clean_json_not_a_traceback(self):
+        p = self.fx.prepare(env=self.sanitized_env())
+        self.assertEqual(p.returncode, 6, p.stdout + p.stderr)
+        data = out_json(p)
+        self.assertEqual(data["status"], "no-git")
+        self.assertIn("SUTANDO_GIT", data["error"])
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(self.fx.scratch.exists())
+
+    def test_sutando_git_env_works_without_path(self):
+        p = self.fx.prepare(env=self.sanitized_env(SUTANDO_GIT=self.real_git))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(out_json(p)["status"], "conflicts")
+
+    def test_git_flag_overrides(self):
+        p = run_script("prepare.py", "--pending", str(self.fx.pending),
+                       "--engine", str(self.fx.engine), "--scratch", str(self.fx.scratch),
+                       "--git", self.real_git, env=self.sanitized_env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(out_json(p)["status"], "conflicts")
 
 
 if __name__ == "__main__":
