@@ -5079,7 +5079,8 @@ def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | 
         return True
 
 
-def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
+def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
+                     stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
     backs up either way. Fires when BOTH count and age cross thresholds so
@@ -5103,6 +5104,14 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
             "name": name,
             "status": "warn",
             "detail": f"{len(files)} tasks queued, oldest {oldest_age}s — watcher or core may be stuck",
+        }
+    # ANDing count with age left a single stuck task unreachable, so one owner
+    # message could sit indefinitely while this probe printed its age under "ok".
+    if oldest_age > stuck_age_sec:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"{len(files)} task(s) queued, oldest {oldest_age}s — undrained past {stuck_age_sec}s",
         }
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
