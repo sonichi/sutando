@@ -5178,8 +5178,29 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         # same signal as a genuinely stranded reply, which is how a detector
         # trains its readers to ignore it. `find_task_file()` is the canonical
         # locator (it is what the bridge archive paths already use).
-        if find_task_file(tasks_dir, path.stem) is not None:
+        try:
+            task_path = find_task_file(tasks_dir, path.stem)
+        except OSError:
+            # The locator itself stats the path, so it raises for the same
+            # reasons the age read does; both are partial coverage, not clean.
+            unreadable += 1
             continue
+        if task_path is not None:
+            # A CLAIMED task is owned by a running consumer; its lifetime is
+            # not ours to judge, however long it takes.
+            if ".claimed-core-" in task_path.name:
+                continue
+            try:
+                task_age = now - task_path.stat().st_mtime
+            except OSError:
+                # Same treatment as an unreadable result entry: a measurement we
+                # could not take is partial coverage, never a silent clean pass.
+                unreadable += 1
+                continue
+            # A task no bridge created is never collected, so an unclaimed
+            # pair past the threshold is stranded rather than in flight.
+            if task_age < threshold_age_sec:
+                continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
@@ -5193,7 +5214,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(orphans)} result(s) whose task is already archived — never delivered; "
+        "detail": (f"{len(orphans)} result(s) with no consumer coming — never delivered; "
                    f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
     }
 
