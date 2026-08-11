@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 import re
 import secrets
 import shutil
@@ -46,6 +45,7 @@ except Exception:  # pragma: no cover — bridge must keep running
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -57,6 +57,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
@@ -176,26 +177,14 @@ def extract_forward_note(msg: dict) -> str:
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
-    """Record owner activity — see src/discord-bridge.py for schema."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ts": int(time.time()),
-            "channel": channel,
-            "summary": summary[:80],
-        }
-        if channel_id:
-            payload["channel_id"] = str(channel_id)
-        # Per-PID staging name: this file is written by four processes (this
-        # bridge + slack/discord/sparrow). A shared ".json.tmp" name lets two
-        # concurrent writers truncate and interleave the same temp file, so the
-        # rename can publish torn JSON. A per-PID temp is never shared, and
-        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, OWNER_ACTIVITY_FILE)
-    except Exception as e:
-        print(f"  [owner-activity] write failed: {e}")
+    """Record owner activity using the shared provider-neutral schema."""
+    _write_owner_activity_shared(
+        OWNER_ACTIVITY_FILE,
+        channel,
+        summary,
+        channel_id,
+        on_error=lambda exc: print(f"  [owner-activity] write failed: {exc}"),
+    )
 
 
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
@@ -409,11 +398,24 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     assumed — we consult their return values. The task-reply path passes a
     marker-stripped body and sends parsed.actions attachments itself, then folds
     those into the same event (so file-only replies still report a delivery and
-    the count/outcome stay accurate)."""
-    # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
-    file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
-    files = file_pattern.findall(text)
-    clean_text = file_pattern.sub('', text).strip()
+    the count/outcome stay accurate).
+
+    Marker grammar comes solely from ``result_markers.parse_markers`` — this
+    function must never re-declare it. It previously compiled a local
+    ``file|send|attach`` regex, which stripped attachment markers but left every
+    OTHER marker in the body. The proactive path (``poll_proactive``) passes raw
+    result text, so ``[dm-only]`` and ``[channel:]`` leaked verbatim into the
+    owner's message — the morning briefing is emitted as a proactive result
+    carrying ``[dm-only]``, so it rendered with the marker visible.
+
+    Parsing here (rather than at each call site) mirrors slack-bridge's
+    ``_send_reply`` and makes the function safe for both callers: parse_markers
+    is idempotent on an already-stripped body, so the task path — which passes
+    ``parsed.body`` and sends its own attachments — yields zero actions here and
+    cannot double-send."""
+    parsed = parse_markers(text)
+    files = [a.value for a in parsed.actions if a.kind == "attach"]
+    clean_text = parsed.body
     text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
     delivered_ok = True
     files_sent = 0
@@ -471,6 +473,23 @@ def _recover_orphan_sending_files() -> int:
 # swallowed so the real result still delivers.
 _progress_msgs: dict = {}        # task_id -> {message_id, chat_id, first, last_edit, last_text} | {"expired": True}
 pending_task_tiers: dict = {}    # task_id -> access_tier; in-memory ONLY → fail-closed on restart
+
+
+def _dedup_recover(task_id: str, holder_id, chat_id) -> str | None:
+    """Route the shared dedup-recovery plan; returns a new task id to route."""
+    try:
+        action, payload = plan_dedup_recovery(
+            RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
+            f"task-{int(time.time() * 1000)}")
+        if action == "requeue":
+            print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
+            return payload
+        if action == "report":
+            send_reply(chat_id, payload, task_id=task_id)
+            print(f"  [dedup] unresolved for {task_id}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - never block the skip path
+        print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+    return None
 
 
 def _clear_progress(task_id: str) -> None:
@@ -1082,6 +1101,11 @@ def main():  # pragma: no cover
                 # leaks as literal text in the user's DM (#1381).
                 parsed = parse_markers(reply_text)
                 if any(a.kind == "skip" for a in parsed.actions):
+                    _sk = next(a for a in parsed.actions if a.kind == "skip")
+                    if _sk.value == "deduped":
+                        _rq = _dedup_recover(task_id, _sk.extra, chat_id)
+                        if _rq:
+                            pending_replies[_rq] = chat_id
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                     archive_file(result_file, "results", task_id)

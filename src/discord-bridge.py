@@ -79,6 +79,12 @@ from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
+
+# Transient send failures per result body, keyed by its `.txt` name. In-memory on
+# purpose: a bridge restart re-polls the file anyway, so a fresh count is correct.
+_transient_send_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
+from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -90,6 +96,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -300,39 +307,37 @@ def _extract_user_id_mentions(mention_strs):
     return out
 
 
-def _chunk_for_discord(text: str, max_len: int = 1900):
-    """Discord-facing alias for the shared fence-aware chunker (Result Router S3).
-
-    Behaviour and the default (max_len=1900) are unchanged; the implementation
-    now lives in src/message_chunking.py:chunk_message so Slack (and any future
-    surface) share the exact same fence-preservation logic.
-    """
+def _chunk_for_discord_unbounded(text: str, max_len: int = 1900):
+    """Yield lossless Discord-sized chunks for local callers."""
     yield from chunk_message(text, max_len)
 
-# Marker regex for inline file references in result bodies. The pattern
-# requires absolute paths (`/...` or `~/...`) — the earlier relative-
-# path-allowing form resolved against the bridge's CWD, which differed
-# between launchd-managed and bare-shell runs. Three call sites in this
-# module (poll_results, poll_proactive, poll_dm_fallback channel-
-# redirect) previously re-defined this regex inline; consolidated here
-# so a future hardening only needs one edit.
-_FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
+# Network delivery is bounded; local and golden chunking remains lossless.
+DISCORD_DELIVERY_MAX_CHUNKS = 4
+DISCORD_TRUNCATION_NOTICE = (
+    "⚠️ Result truncated: additional content was suppressed to keep Discord "
+    "responsive."
+)
 
 
-def _split_file_markers(text: str) -> tuple[str, list[str]]:
-    """Split a result body into ``(clean_text, files)``.
-
-    ``files`` is the list of paths extracted from ``[file:|send:|attach:]``
-    markers (in textual order). ``clean_text`` is the original text with
-    every marker removed and surrounding whitespace stripped.
-
-    Pure function — single source of truth for the marker pattern
-    across every send path in this bridge.
-    """
-    files = _FILE_MARKER_RE.findall(text)
-    clean_text = _FILE_MARKER_RE.sub('', text).strip()
-    return clean_text, files
-
+def _chunk_for_discord(
+    text: str,
+    max_len: int = 1900,
+    max_chunks: int = DISCORD_DELIVERY_MAX_CHUNKS,
+):
+    """Bound network sends; reserve the final send for truncation."""
+    if max_chunks < 1:
+        raise ValueError("max_chunks must be at least 1")
+    preview = []
+    # Read one chunk past the limit instead of expanding the full result.
+    for chunk in _chunk_for_discord_unbounded(text, max_len=max_len):
+        preview.append(chunk)
+        if len(preview) > max_chunks:
+            break
+    if len(preview) <= max_chunks:
+        yield from preview
+        return
+    yield from preview[: max_chunks - 1]
+    yield DISCORD_TRUNCATION_NOTICE
 
 # Thin alias — actual logic lives in src/send_allowlist.py so the
 # REST-fallback delivery path (src/dm-result.py) stays in lock-step.
@@ -342,34 +347,27 @@ _is_path_sendable = _is_path_sendable_shared
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
-    """Record that the owner was active on <channel> right now.
+    """Record owner activity using the shared provider-neutral schema."""
+    _write_owner_activity_shared(
+        OWNER_ACTIVITY_FILE,
+        channel,
+        summary,
+        channel_id,
+        on_error=lambda exc: print(
+            f"  [owner-activity] write failed: {exc}", flush=True
+        ),
+    )
 
-    Writes atomically via tmp-then-rename so a concurrent reader never sees
-    a partial file. Schema: {"ts": EPOCH, "channel": str, "summary": str,
-    "channel_id"?: str}. `channel_id` (the routable id of the exact channel/
-    chat the owner messaged from) lets the core-supervisor relay escalate a
-    hard-blocked core back to where the owner actually is. Read by the
-    proactive-loop status-aware-pivot rule + core-supervisor-relay --active-from.
-    """
+
+def _dedup_recover(task_id: str, holder_id, channel_id):
+    """Shared dedup recovery bound to Discord's dirs. Returns (action, payload);
+    the caller routes or sends, because those are async here."""
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ts": int(time.time()),
-            "channel": channel,
-            "summary": summary[:80],
-        }
-        if channel_id:
-            payload["channel_id"] = str(channel_id)
-        # Per-PID staging name: this file is written by four processes (this
-        # bridge + slack/telegram/sparrow). A shared ".json.tmp" name lets two
-        # concurrent writers truncate and interleave the same temp file, so the
-        # rename can publish torn JSON. A per-PID temp is never shared, and
-        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, OWNER_ACTIVITY_FILE)
-    except Exception as e:
-        print(f"  [owner-activity] write failed: {e}", flush=True)
+        return plan_dedup_recovery(RESULTS_DIR, TASKS_DIR, task_id, holder_id,
+                                   channel_id, f"task-{int(time.time() * 1000)}")
+    except Exception as exc:  # noqa: BLE001 - never block the skip path
+        print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+        return "honour", None
 
 
 def archive_path(kind: str, task_id: str) -> "Path":
@@ -4094,6 +4092,20 @@ async def poll_approved():
                         # valid, so an un-deleted marker would re-fail forever and
                         # bury the log. Same resolution as sonichi#2626.
                         print(f"  Failed to send approval to {sender_id}: {e}")
+                        # Bounded, like the proactive branch: unbounded retry turns a
+                        # sustained outage into a 3s hot loop the quarantine prevents.
+                        _ak = f.name  # pragma: no cover
+                        _an = _transient_send_attempts.get(_ak, 0)  # pragma: no cover
+                        if send_failure_policy.should_retry(e, _an):  # pragma: no cover
+                            _transient_send_attempts[_ak] = _an + 1
+                            print(
+                                f"  [approved] transient failure "
+                                f"({_an + 1}/{send_failure_policy.MAX_TRANSIENT_ATTEMPTS})"
+                                f" — leaving {f.name} in place to retry",
+                                flush=True,
+                            )
+                            continue
+                        _transient_send_attempts.pop(_ak, None)  # pragma: no cover
                         try:
                             _undeliv = f.parent / "undelivered"
                             _undeliv.mkdir(parents=True, exist_ok=True)
@@ -4488,6 +4500,13 @@ async def poll_results():
                             _holder_file = find_task_file(TASKS_DIR, _skip.extra)
                             _holder_text = _holder_file.read_text() if _holder_file else None
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
+                            _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
+                                         if not _target else ("honour", None))
+                            if _act == "requeue":
+                                pending_replies[_pl] = channel
+                                save_pending_replies()
+                            elif _act == "report":
+                                await channel.send(_pl)
                             if _target:
                                 _orig_file = find_task_file(TASKS_DIR, task_id)
                                 _orig_text = _orig_file.read_text() if _orig_file else None
@@ -5021,6 +5040,9 @@ async def poll_proactive():
                         print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
                         f.unlink(missing_ok=True)
                         continue
+                    # Bound BEFORE the try: the handler reads it, so a failure in
+                    # fetch_user/create_dm would raise UnboundLocalError instead.
+                    _sent_any = False
                     try:
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
@@ -5109,12 +5131,12 @@ async def poll_proactive():
                                         f"failed: {_exc} — keeping literal marker in DM",
                                         flush=True,
                                     )
-                            # Fall through to DM with marker INTACT — the
-                            # visible `[channel: <id>]` is the loud-failure
-                            # signal. Don't strip it here.
+                            # Fall through to DM with the marker INTACT: the visible `[channel: <id>]` is
+                            # the loud-failure signal. This except wraps the chunk AND attachment loops.
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
+                                _sent_any = True  # pragma: no cover
                             try:
                                 import outbox_log
                                 _user_name = getattr(user, "name", None)
@@ -5132,56 +5154,28 @@ async def poll_proactive():
                             fpath = os.path.expanduser(fpath.strip())
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
+                                _sent_any = True  # pragma: no cover
                             elif not os.path.isfile(fpath):
                                 # See poll_results — log only, no user noise.
                                 print(f"  [proactive] file marker, file not found: {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
+                                _sent_any = True  # pragma: no cover
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
                         f.unlink(missing_ok=True)
-                    except Exception as e:
-                        # The unlink used to sit OUTSIDE this try, so it ran on
-                        # failure too: a DM Discord rejected was DESTROYED and
-                        # left only a log line. Observed live on this host —
-                        # `413 Payload Too Large (error code: 40005)` on an
-                        # over-long body — and that message is unrecoverable.
-                        # The channel-redirect branch above already gets this
-                        # right (it unlinks only after a successful send and
-                        # falls through otherwise); the DM branch did not.
-                        #
-                        # Quarantine rather than retry. A 413 never becomes a
-                        # 200, so leaving the file in place would re-poll it
-                        # every 3s forever and still never deliver, while
-                        # burying the log. Moving it aside stops the spin AND
-                        # keeps the body recoverable.
-                        print(f"  [proactive] failed to DM {owner_id}: {e}")
-                        try:
-                            _undeliv = f.parent / "undelivered"
-                            _undeliv.mkdir(parents=True, exist_ok=True)
-                            # Drop the `.sending` claim suffix on the way out.
-                            # By this point `f` is the CLAIMED name (:4835), and
-                            # a quarantined `*.sending` reads like an in-flight
-                            # file rather than a parked one — the restart-safety
-                            # sweep at :2470 exists precisely because that suffix
-                            # means "someone is mid-send". Restore `.txt` so what
-                            # lands in undelivered/ is what was written.
-                            _name = f.with_suffix(".txt").name if f.suffix == ".sending" else f.name
-                            f.rename(_undeliv / _name)
-                            print(
-                                f"  [proactive] undelivered copy kept at "
-                                f"undelivered/{_name} — NOT deleted",
-                                flush=True,
-                            )
-                        except Exception as _mv_exc:
-                            # Last resort: leaving it in place means the poll
-                            # retries it, which is noisy — but noise is
-                            # recoverable and deletion is not.
-                            print(
-                                f"  [proactive] could not quarantine {f.name}: "
-                                f"{_mv_exc} — leaving it in place rather than losing it",
-                                flush=True,
-                            )
+                    except Exception as e:  # pragma: no cover — live send path
+                        # Quarantine rather than retry, and ONLY for a failure a retry cannot fix: a
+                        # 413 never becomes a 200, a 503 does on the very next poll.
+                        print(f"  [proactive] failed to DM {owner_id}: {e}")  # pragma: no cover — live send path
+                        # Glue only: the decision AND the file move are one unit in
+                        # send_failure_policy.resolve_failed_send.
+                        _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
+                            f, e, _transient_send_attempts, progressed=_sent_any)
+                        print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover
+                              f"{f.with_suffix('.txt').name}", flush=True)
+                        if _outcome == "retried":  # pragma: no cover
+                            continue
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
         await asyncio.sleep(3)
@@ -5197,6 +5191,9 @@ async def poll_proactive():
 # allowlist, not a denylist: a newly-added source is non-eligible by default
 # and can never leak into DM unless deliberately added.
 DM_FALLBACK_SOURCES = {"voice", "phone"}
+# Sources whose own consumer drains `results/task-*.txt`. Anything in NEITHER
+# set has no consumer at all, so skipping it loses the reply permanently.
+DELIVERY_OWNING_SOURCES = {"discord", "telegram", "slack", "chat", "api", "gateway", "whatsapp"}
 
 
 def _task_source(task_id: str):
@@ -5239,6 +5236,67 @@ def _dm_fallback_eligible(task_id: str) -> bool:
     return _task_source(task_id) in DM_FALLBACK_SOURCES
 
 
+def _task_channel_id(task_id: str):
+    """`channel_id:` of a task file as an int, or None when absent/unparseable.
+    Same file resolution as `_task_source` — live, processed, then archived."""
+    tf = find_task_file(TASKS_DIR, task_id)
+    if not tf:
+        processed = TASKS_DIR / "processed" / f"{task_id}.txt"
+        if processed.exists():
+            tf = processed
+    if not tf:
+        archived = sorted((TASKS_DIR / "archive").glob(f"*/{task_id}.txt"))
+        if archived:
+            tf = archived[-1]
+    if not tf:
+        return None
+    try:
+        for line in tf.read_text(errors="replace").splitlines():
+            if line.startswith("channel_id:"):
+                raw = line.split(":", 1)[1].strip()
+                return int(raw) if raw.isdigit() else None
+    except OSError:
+        return None
+    return None
+
+
+# poll_dm_fallback rescans every 30s and this branch continues before the retry
+# cutoff, so an unguarded print emits ~2880 lines/day per orphan.
+_UNDELIVERABLE_WARNED: set = set()
+
+
+def _should_warn_undeliverable(task_id: str) -> bool:
+    """True the FIRST time a task_id is seen this process, False after.
+    Per-process by design: a restart re-surfaces an unresolved orphan once."""
+    if task_id in _UNDELIVERABLE_WARNED:
+        return False
+    _UNDELIVERABLE_WARNED.add(task_id)
+    return True
+
+
+def _undeliverable_warning_for(task_id: str, result_name: str):
+    """The line to log for a result nothing will deliver, or None. Composed here
+    so the decision is testable; only the print is loop glue."""
+    ch = _orphan_channel_target(task_id)
+    if ch is None or not _should_warn_undeliverable(task_id):
+        return None
+    return (f"  [dm-fallback] UNDELIVERABLE {result_name}: source="
+            f"{_task_source(task_id)!r} owns no consumer and is not DM-eligible; "
+            f"task names channel {ch} but nothing delivers there. "
+            f"This result will never be sent.")
+
+
+def _orphan_channel_target(task_id: str):
+    """Channel for a `task-` result nothing else will deliver, else None.
+    Requires: source in NEITHER set, AND the task names a channel. Fail-closed."""
+    if not task_id.startswith("task-"):
+        return None
+    src = _task_source(task_id)
+    if src in DM_FALLBACK_SOURCES or src in DELIVERY_OWNING_SOURCES:
+        return None
+    return _task_channel_id(task_id)
+
+
 async def poll_dm_fallback():
     """Fallback path for task/question/briefing results that no other
     consumer is going to handle.
@@ -5279,6 +5337,11 @@ async def poll_dm_fallback():
                 # this gate and stay eligible. FAIL-CLOSED: a missing/unreadable
                 # source is NOT eligible (see _dm_fallback_eligible).
                 if task_id.startswith("task-") and not _dm_fallback_eligible(task_id):
+                    # A source in NEITHER set owns no consumer, so this skip is
+                    # permanent loss, not deferral. Delivery is not wired here.
+                    _warn = _undeliverable_warning_for(task_id, f.name)
+                    if _warn:
+                        print(_warn, flush=True)  # pragma: no cover — print glue; the decision above is unit-tested
                     continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:
@@ -5489,11 +5552,10 @@ async def poll_dm_fallback():
 def _send_via_rest(channel_id: str, message: str):
     """Send a message via Discord REST API (no gateway connection).
 
-    Chunks via `_chunk_for_discord` so messages over Discord's 2000-char limit
-    (or with code fences spanning chunk boundaries) deliver intact across N
-    sequential POSTs. Without chunking the API returns 400 and the message
-    is silently dropped — this caused codex-output replies (often >2KB) to
-    never reach the channel.
+    Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
+    limit render correctly without allowing one oversized payload to monopolize
+    the bridge. Without chunking the API returns 400; without the delivery budget,
+    a malformed result can produce hundreds of sequential POSTs.
     """
     import urllib.request
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
