@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Screen recording via macOS screencapture -v. Stores PID in a file for stop/status."""
+"""Screen recording via ffmpeg (avfoundation). Stores PID in a file for stop/status."""
 
 import subprocess
 import signal

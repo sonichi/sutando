@@ -25,7 +25,25 @@ from presenter_mode import presenter_mode_active  # noqa: E402
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
-LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
+# No read-fallback to the old root path on purpose: a missing stamp makes the
+# reader notify ONCE rather than suppress, so the move costs one notification.
+LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
+
+
+def write_notify_stamp(questions, now=None):
+    """Record that this question set was just notified.
+
+    Named so it is testable without driving `main`, which fires a real notification.
+    """
+    LAST_NOTIFY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time()) if now is None else now
+    LAST_NOTIFY_FILE.write_text(f"{ts} {questions_key(questions)}")
+    # Retire AFTER the new stamp exists: a crash between the two costs at most a
+    # cooldown. Path derived from LAST_NOTIFY_FILE so a redirected test stays in tmp.
+    try:
+        (LAST_NOTIFY_FILE.parent.parent / ".last-pq-notify").unlink(missing_ok=True)
+    except OSError:
+        pass
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 # How long an UNCHANGED question set stays quiet before it is raised again. This
 # is the floor that stops "notify only when the set changes" from turning an
@@ -455,7 +473,7 @@ def main():
     # exact "claimed an outcome it never achieved" failure this script exists to
     # remove, reproduced in its own control flow.
     summary = deliver(questions, count, titles)
-    LAST_NOTIFY_FILE.write_text(f"{int(time.time())} {questions_key(questions)}")
+    write_notify_stamp(questions)  # pragma: no cover — covered as a unit; reaching here fires a real notification
     print(summary)
 
 
