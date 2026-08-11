@@ -92,10 +92,9 @@ MEDIA_FORMS = frozenset({"attachment", "live_stream"})
 # the schema names). Consumer semantics: highest first, mtime FIFO tiebreak.
 PRIORITIES = ("urgent", "normal", "low")
 
-# Access tiers (CLAUDE.md access-control sections). `owner` is full
-# processing; team/other are sandboxed. A missing header reads as owner for
-# legacy local files — that default belongs to consumers, not this module.
-ACCESS_TIERS = ("owner", "team", "other")
+# `owner` is full, `team` is workspace-write sandboxed, and `guest`/`other` are read-only.
+# Consumers retain the owner default for legacy files without an access header.
+ACCESS_TIERS = ("owner", "team", "guest", "other")
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
@@ -473,6 +472,46 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
     comes from the supplied timestamp, not the wall clock, so writers and
     tests are deterministic around month boundaries."""
     return base / "archive" / iso_timestamp[:7]
+
+
+def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
+    """Locate an archived result across BOTH layouts in use.
+
+    The messaging bridges archive as `archive/<YYYY-MM>/<id>.txt` via
+    `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`.
+    A locator that knows only one silently returns None for the other, which
+    reads as "this task never delivered" — the wrong answer for any caller
+    deciding whether a delivery happened.
+
+    Month scan mirrors `find_archived_task`: scandir, filter on NAME before
+    asking is_dir, newest month first. Rejects malformed ids rather than
+    globbing with them (traversal gate).
+    """
+    if not valid_archive_lookup_id(task_id):
+        return None
+    archive = Path(results_dir) / "archive"
+    fname = f"{task_id}.txt"
+
+    direct = archive / fname
+    if direct.is_file():
+        return direct
+
+    try:
+        with os.scandir(archive) as entries:
+            months = sorted((e.name for e in entries
+                             if _MONTH_DIR_RE.match(e.name) and e.is_dir()),
+                            reverse=True)
+    except (OSError, ValueError):
+        months = []
+    for month in months:
+        candidate = archive / month / fname
+        if candidate.is_file():
+            return candidate
+
+    # glob on a missing or non-directory path yields nothing rather than
+    # raising, so no guard is needed here.
+    flat = sorted(archive.glob(f"{task_id}-*.txt"))
+    return flat[-1] if flat else None
 
 
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
