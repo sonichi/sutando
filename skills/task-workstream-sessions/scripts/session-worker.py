@@ -309,14 +309,23 @@ def _run_process_bounded(command: list[str], cwd: Path) -> tuple[int, str, str]:
     # Claude consumes its own auth before spawning tools; scrub it from Bash,
     # hooks, and MCP subprocesses as defense in depth with sandbox.credentials.
     environment["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+    # Binary pipes read with nonblocking os.read: a text-mode readline() blocks on
+    # a partial line even after select() reports readable, so a provider that emits
+    # bytes without a newline then stalls would wedge the timeout loop forever
+    # (the hard/no-progress deadline never re-checks). os.read on a nonblocking fd
+    # returns whatever is available immediately, so the loop always makes it back
+    # to the deadline checks and can fail closed.
     process = subprocess.Popen(
-        command, cwd=cwd, env=environment, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, bufsize=1, start_new_session=True,
+        command, cwd=cwd, env=environment, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, start_new_session=True,
     )
     assert process.stdout is not None and process.stderr is not None
+    streams = {process.stdout.fileno(): "stdout", process.stderr.fileno(): "stderr"}
+    for fd in streams:
+        os.set_blocking(fd, False)
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    for fd, name in streams.items():
+        selector.register(fd, selectors.EVENT_READ, name)
     output = {"stdout": [], "stderr": []}
     started = last_progress = time.monotonic()
     try:
@@ -327,18 +336,27 @@ def _run_process_bounded(command: list[str], cwd: Path) -> tuple[int, str, str]:
             if now - last_progress >= stall_timeout:
                 raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
             for key, _ in selector.select(timeout=min(0.2, stall_timeout)):
-                chunk = key.fileobj.readline()
+                try:
+                    chunk = os.read(key.fd, 65536)  # nonblocking: never waits for a newline
+                except BlockingIOError:
+                    continue  # spurious readable — re-check the deadlines
                 if chunk:
                     output[key.data].append(chunk)
                     last_progress = time.monotonic()
                 else:
-                    selector.unregister(key.fileobj)
-        return process.wait(), "".join(output["stdout"]), "".join(output["stderr"])
+                    selector.unregister(key.fd)  # EOF
+        return (
+            process.wait(),
+            b"".join(output["stdout"]).decode("utf-8", "replace"),
+            b"".join(output["stderr"]).decode("utf-8", "replace"),
+        )
     except BaseException:
         _terminate_process_group(process)
         raise
     finally:
         selector.close()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def _claude_stream_result(stdout: str) -> str:

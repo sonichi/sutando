@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -199,6 +200,26 @@ def test_stalled_team_runtime_is_killed_and_publishes_safe_result() -> None:
         assert result.returncode == 0
         assert "No unrestricted fallback was used" in (
             workspace / "results" / task.name).read_text()
+
+
+def test_partial_output_then_stall_still_hits_the_deadline() -> None:
+    """Regression: a provider that emits a partial line (no newline) then hangs
+    must NOT wedge the timeout loop. A blocking readline() would block on the
+    incomplete line and never re-check the deadline; nonblocking reads must fail
+    closed at the hard timeout instead of waiting out the 5s child."""
+    child = "import sys, time; sys.stdout.write('partial'); sys.stdout.flush(); time.sleep(5)"
+    started = time.monotonic()
+    with mock.patch.dict(os.environ, {
+        "SUTANDO_TIER_HARD_TIMEOUT": "0.3",
+        "SUTANDO_TIER_STALL_TIMEOUT": "0.2",
+    }):
+        try:
+            worker._run_process_bounded([sys.executable, "-c", child], Path("."))
+            raise AssertionError("expected a TimeoutError, provider was not bounded")
+        except TimeoutError:
+            elapsed = time.monotonic() - started
+            # must trip on the deadline (~0.3s), not wait out the 5s child
+            assert elapsed < 2, f"timeout loop blocked on the partial line ({elapsed:.2f}s)"
 
 
 def test_older_claude_fails_closed_before_receiving_team_prompt() -> None:
@@ -1274,6 +1295,7 @@ if __name__ == "__main__":
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()
     test_older_claude_fails_closed_before_receiving_team_prompt()
+    test_partial_output_then_stall_still_hits_the_deadline()
     test_installed_claude_enforces_team_credential_and_network_boundary()
     test_bounded_runtime_helper_edges()
     test_claude_creates_then_resumes_the_same_durable_session()
