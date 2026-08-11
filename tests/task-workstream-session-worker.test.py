@@ -241,12 +241,13 @@ def test_installed_codex_denies_workspace_secrets_but_keeps_workspace_writable()
         team_workspace = Path(td).resolve()
         (team_workspace / "visible.txt").write_text("visible\n")
         (team_workspace / ".env").write_text("TEAM_SECRET=blocked\n")
+        (team_workspace / ".npmrc").write_text("NPM_SECRET=blocked\n")
         command = [
             codex, "sandbox", "-C", str(team_workspace),
             "-c", worker._codex_permission_profile_config(),
             "-P", worker.CODEX_TEAM_PROFILE,
             "/bin/sh", "-c",
-            "cat visible.txt; cat .env; printf changed > visible.txt",
+            "cat visible.txt; cat .env; cat .npmrc; printf changed > visible.txt",
         ]
         completed = subprocess.run(
             command, text=True, capture_output=True, timeout=20,
@@ -254,6 +255,7 @@ def test_installed_codex_denies_workspace_secrets_but_keeps_workspace_writable()
         assert completed.returncode == 0, completed.stderr
         assert "visible" in completed.stdout
         assert "TEAM_SECRET" not in completed.stdout + completed.stderr
+        assert "NPM_SECRET" not in completed.stdout + completed.stderr
         assert "Operation not permitted" in completed.stderr
         assert (team_workspace / "visible.txt").read_text() == "changed"
 
