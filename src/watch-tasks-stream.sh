@@ -157,18 +157,16 @@ claim_is_ours() {
   [ "$owner_id" = "$WATCHER_ID" ]
 }
 
-# 0 = must-handle, 1 = optional, 2 = UNKNOWN (claim vanished or is short).
-# Unknown must be its own answer. Callers reach this after claim_is_ours has
-# already read the same file, so an unreadable claim means a concurrent path
-# released it — and release happens after that path has emitted, so it owns the
-# task. Collapsing unknown into "optional" makes the permissive branch the
-# default on a read failure, and that branch prints TASK_FILE:, which publishes
-# a Team-tier task to the unrestricted core.
+# 0 = must-handle, 1 = optional, 2 = unknown. Only the two written tokens are
+# recognised: anything else is unknown, because the optional branch publishes to
+# the unrestricted core and must never be reached by default.
 claim_disposition() {
-  local filename="$1" disposition
-  disposition="$(sed -n '4p' "$CLAIMS_DIR/$filename" 2>/dev/null)" || return 2
-  [ -n "$disposition" ] || return 2
-  [ "$disposition" = "must-handle" ]
+  local filename="$1"
+  case "$(sed -n '4p' "$CLAIMS_DIR/$filename" 2>/dev/null)" in
+    must-handle) return 0 ;;
+    fallback) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 publish_terminal_failure() {
@@ -234,7 +232,7 @@ finish_handler_task() {
           printf 'TASK_FILE: %s\n' "$filename" || true
           ;;
         *)
-          echo "watch-tasks-stream: claim for $filename vanished before its disposition could be read; leaving it to the releasing path" >&2
+          echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
           ;;
       esac
       release_task_claim "$filename" || true
@@ -445,7 +443,7 @@ fallback_outstanding_handlers() {
             printf 'TASK_FILE: %s\n' "$filename" || true
             ;;
           *)
-            echo "watch-tasks-stream: claim for $filename vanished before its disposition could be read; leaving it to the releasing path" >&2
+            echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
             ;;
         esac
         release_task_claim "$filename" || true
@@ -478,7 +476,7 @@ fallback_outstanding_handlers() {
         printf 'TASK_FILE: %s\n' "$filename" || true
         ;;
       *)
-        echo "watch-tasks-stream: claim for $filename vanished before its disposition could be read; leaving it to the releasing path" >&2
+        echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
         ;;
     esac
     release_task_claim "$filename" || true

@@ -7,7 +7,6 @@ import importlib.util
 import io
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -1289,37 +1288,60 @@ def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
             process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
-def test_unreadable_claim_is_never_classified_as_optional() -> None:
-    """An unreadable claim must not answer "optional".
-
-    The optional branch prints `TASK_FILE:`, which publishes the task to the
-    unrestricted live core. The previous helper read line 4 with a discarded
-    error and compared it to "must-handle", so an absent or short claim yielded
-    "" -> not must-handle -> optional. That makes the permissive answer the
-    default on a read failure, on a privilege boundary.
-    """
-    source = (REPO / "src" / "watch-tasks-stream.sh").read_text()
-    body = re.search(r"^claim_disposition\(\) \{.*?^\}", source, re.M | re.S)
-    assert body, "claim_disposition() must exist: an unreadable claim needs its own answer"
+def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() -> None:
+    """Drives the real watcher: only the two written tokens may mean "optional"."""
     with tempfile.TemporaryDirectory() as td:
-        claims = Path(td)
-        (claims / "must.txt").write_text("task\nWID\n/p/t.txt\nmust-handle\n")
-        (claims / "optional.txt").write_text("task\nWID\n/p/t.txt\nfallback\n")
-        (claims / "short.txt").write_text("task\nWID\n/p/t.txt\n")  # no line 4
-        # "gone.txt" is deliberately never created.
-        for name, expected, label in (
-            ("must.txt", 0, "must-handle"),
-            ("optional.txt", 1, "optional"),
-            ("short.txt", 2, "unknown (claim truncated)"),
-            ("gone.txt", 2, "unknown (claim vanished)"),
-        ):
-            rc = subprocess.run(
-                ["/bin/bash", "-c", f'CLAIMS_DIR="{claims}"\n{body.group(0)}\nclaim_disposition "{name}"'],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            ).returncode
-            assert rc == expected, f"{name} ({label}): expected rc={expected}, got rc={rc}"
-            if expected == 2:
-                assert rc != 1, f"{name} classified as optional -> would print TASK_FILE:"
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        task = tasks / "task-team-corrupted.txt"
+        task.write_text("access_tier: team\ntask: protected\n")
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\ncase \" $* \" in *\" --probe \"*) exit 4;; esac\nsleep 30\n",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 30\n")
+        process = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(tasks)],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_CORE_RUNTIME": "claude",
+                "SUTANDO_RESULTS_DIR": str(results),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        claim = workspace / "state" / "task-event-handler-claims" / task.name
+        try:
+            deadline = time.monotonic() + 1
+            while not claim.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert claim.exists()
+            lines = claim.read_text().splitlines()
+            assert lines[3] == "must-handle"
+            # Neither written token: the watcher must not read this as optional.
+            lines[3] = "must-handl"
+            claim.write_text("\n".join(lines) + "\n")
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=3)
+            assert "TASK_FILE:" not in stdout, (
+                "an unrecognised disposition was published to the unrestricted core")
+            assert "no recognised disposition" in stderr
+            assert not (workspace / "state" / "task-event-handler-fallbacks" / task.name).exists()
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=2)
 
 
 def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
@@ -1369,6 +1391,6 @@ if __name__ == "__main__":
     test_shutdown_falls_back_without_surviving_workers()
     test_codex_notifier_dispatches_each_isolated_task_once_without_waiting()
     test_codex_notifier_never_submits_a_watcher_claim_to_live_core()
-    test_unreadable_claim_is_never_classified_as_optional()
+    test_unrecognised_claim_disposition_is_never_published_to_the_live_core()
     test_runtime_wiring_is_optional_and_adapter_injected()
     print("task workstream session worker tests passed")
