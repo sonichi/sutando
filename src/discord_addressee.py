@@ -35,6 +35,7 @@ def is_addressed_in_shared_channel(
     reply_author_id,
     self_id,
     other_agent_mentioned: bool = False,
+    author_id=None,
 ) -> bool:
     """Return True iff this message should be processed as addressed to us.
 
@@ -67,7 +68,14 @@ def is_addressed_in_shared_channel(
     if bot_mentioned or role_mentioned or replying_to_me:
         return True
 
-    replying_to_other = bool(is_reply) and not replying_to_me
+    # A human replying to THEIR OWN message is continuing their thread, not
+    # addressing someone else — treat like a fresh message (owner-caught
+    # 2026-08-11: her self-reply follow-up in her private channel was skipped
+    # as "addressed elsewhere" and went unanswered for 10 minutes).
+    replying_to_self = bool(
+        is_reply and author_id is not None and reply_author_id == author_id
+    )
+    replying_to_other = bool(is_reply) and not replying_to_me and not replying_to_self
     if author_is_bot or replying_to_other:
         return False
 

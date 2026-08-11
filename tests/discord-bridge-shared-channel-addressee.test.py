@@ -128,9 +128,27 @@ def main() -> int:
         "discord-bridge.py does not derive peer mentions from message.mentions"
     print("  ok  bridge derives peer mentions from message.mentions")
 
+    assert is_addressed_in_shared_channel(
+        author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+        is_reply=True, reply_author_id=111, self_id=999,
+        other_agent_mentioned=False, author_id=111,
+    ) is True, "human self-reply must be addressed to us"
+    print("  ok  human replies to their OWN message (self-thread, owner 2026-08-11)")
+    assert is_addressed_in_shared_channel(
+        author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+        is_reply=True, reply_author_id=222, self_id=999,
+        other_agent_mentioned=False, author_id=111,
+    ) is False, "reply to a different human must still skip"
+    print("  ok  human replies to a DIFFERENT human -> still skipped")
+    bridge2 = Path(__file__).resolve().parent.parent.joinpath("src", "discord-bridge.py").read_text()
+    assert "author_id=getattr(message.author" in bridge2, \
+        "discord-bridge.py does not pass author_id to the gate"
+    print("  ok  bridge passes author_id for the self-reply carve-out")
+
     print("\nAll addressee-gate cases pass.")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
