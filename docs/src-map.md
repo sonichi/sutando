@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-205 modules indexed.
+207 modules indexed.
 
 ## `src/`
 
@@ -169,6 +169,8 @@ and re-run `python3 scripts/gen-src-map.py`.
 
 ## `src/agent/`
 
+- **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
