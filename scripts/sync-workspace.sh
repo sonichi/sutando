@@ -38,8 +38,11 @@
 # un-ignores exactly the include list. So setting vault.sync.include to add one
 # path silently DROPS every default path — notes/, hosts/*/ and the whole
 # .claude-sutando/projects/*/memory/ corpus — out of the backup, while this
-# script goes on printing "pushed to <branch>" on every run. To add a path you
-# must restate the full carrier set.
+# script goes on printing "pushed to <branch>" on every run. To add an INCLUDE
+# path you must restate the full carrier set.
+#
+# `vault.sync.exclude_extra` appends instead of replacing — use it rather than
+# restating `exclude`. No `include_extra`: unioning a whitelist widens the vault.
 #
 # `exclude` subtracts, carving subpaths out of an included parent (emitted after
 # the includes so gitignore's last-match-wins applies).
