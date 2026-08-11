@@ -22,9 +22,22 @@ that guard the function could exist, pass every case here, and never be called.
 """
 from pathlib import Path
 import ast
+import os
 import sys
 import tempfile
 import unittest
+
+# Isolate CLAUDE_CONFIG_DIR before anything else. This test never imports the
+# bridge — it ast-extracts a single function — so no module-level channel config
+# is resolved. The isolation is kept anyway so that stays true if the test ever
+# grows an import. An empty allowFrom is the safe seed: if anything ever does
+# resolve channel config here it authorises nobody, rather than inheriting the
+# developer's real allowlist.
+_CFG = tempfile.mkdtemp(prefix="anchor-test-cfg-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+_ACCESS = Path(_CFG) / "channels" / "discord" / "access.json"
+_ACCESS.parent.mkdir(parents=True, exist_ok=True)
+_ACCESS.write_text('{"allowFrom": []}')
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "discord-bridge.py"
 
