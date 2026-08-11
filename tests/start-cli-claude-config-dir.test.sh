@@ -175,10 +175,8 @@ cleanup_sandbox() {
 REAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ----------------------------------------------------------------------
-# 1. M0 helper MISSING → refuse to start. The core must NOT launch with
-#    CLAUDE_CONFIG_DIR unset: it would read ~/.claude, a different credential
-#    store than the rest of Sutando on this host, and the visible symptom is an
-#    unrecoverable 401 loop rather than the install error it really is.
+# 1. M0 helper MISSING → refuse to start. An unset CLAUDE_CONFIG_DIR selects
+#    ~/.claude — a different credential store, surfacing as a 401 loop.
 # ----------------------------------------------------------------------
 test_helper_missing_refuses_to_start() {
   setup_sandbox "no" "(unused)"
@@ -206,10 +204,8 @@ test_helper_missing_refuses_to_start() {
 }
 
 # ----------------------------------------------------------------------
-# 1b. M0 helper MISSING but the CALLER already exported CLAUDE_CONFIG_DIR →
-#     start, and pass the caller's value through untouched. The desktop app
-#     scopes the config dir when it spawns the core; refusing there would break
-#     a configuration that already reaches the right credential store.
+# 1b. M0 helper MISSING but the CALLER exported CLAUDE_CONFIG_DIR → start and
+#     pass it through: that value already reaches the right credential store.
 # ----------------------------------------------------------------------
 test_helper_missing_honours_caller_config_dir() {
   setup_sandbox "no" "(unused)"
