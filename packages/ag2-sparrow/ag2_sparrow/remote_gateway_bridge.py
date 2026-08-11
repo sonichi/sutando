@@ -553,6 +553,35 @@ def _vault_intercept_fns():
     return _VAULT_INTERCEPT_FNS
 
 
+# Self-contained fallback for when _vault_intercept_fns() returns (None, None) —
+# a standalone `ag2-sparrow` package install never ships the monorepo
+# src/vault_intercept.py, so that's not a rare edge case for shipped installs.
+# Mirrors src/vault_intercept.py's own _VAULT_SET_RE/redact_vault_commands
+# closely enough to catch the same shapes, deliberately duplicated rather than
+# imported: this path exists PRECISELY for when that import is unavailable, so
+# it cannot depend on it. review finding (qingyun-wu, 2026-08-11): without
+# this, an owner-tier `vault set KEY "value"` with no interceptor available
+# fell through untouched to filter_chat_secrets(), which doesn't recognize
+# vault-set syntax, and the plaintext value was persisted verbatim.
+_LOCAL_VAULT_SET_RE = re.compile(
+    r'\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))'
+    r'(?=\s|$|[.,!?;])',
+    re.IGNORECASE,
+)
+
+
+def _local_redact_vault_set(text: str) -> str:
+    """Scrub vault-set patterns WITHOUT storing anything — last-resort, no
+    external dependency. Used only when _vault_intercept_fns() found neither
+    the real interceptor nor the real redactor."""
+    if not text:
+        return text
+    return _LOCAL_VAULT_SET_RE.sub(
+        lambda m: f"vault set {m.group(1)} [VAULT-SET-REDACTED: interceptor unavailable]",
+        text,
+    )
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 _URL_FALLBACK = ""
 _TOKEN_FILE_FALLBACK = ""
@@ -1498,12 +1527,17 @@ def _write_task(task: dict) -> str | None:
             # owner-tier only — write-side #2638 parity with discord/slack/
             # telegram (see _vault_intercept_fns docstring). Non-owner senders
             # never get Keychain writes; `filter_chat_secrets` below still
-            # catches an unnamed pasted token either way. Any interception
-            # failure (missing src/vault_intercept.py, or an exception inside
-            # it) falls back to `redact_vault_commands` if available, else the
-            # existing filter_chat_secrets call is simply unchanged — a value
-            # is never both left unredacted AND unstored.
+            # catches an unnamed pasted token either way. A value is never both
+            # left unredacted AND unstored: every path below that doesn't
+            # successfully intercept-and-store falls through to SOME redactor —
+            # the real one if `_vault_intercept_fns()` found it, else the
+            # dependency-free `_local_redact_vault_set` (review finding,
+            # qingyun-wu 2026-08-11: the old `elif sender_tier != "owner"` guard
+            # meant an owner-tier sender with no interceptor available — the
+            # standalone `ag2-sparrow` package case — skipped redaction
+            # entirely and the plaintext value reached disk).
             _intercept_fn, _redact_fn = _vault_intercept_fns()
+            _redact_fallback = _redact_fn or _local_redact_vault_set
             if sender_tier == "owner" and _intercept_fn is not None:
                 try:
                     _vault_result = _intercept_fn(_fetched)
@@ -1513,13 +1547,12 @@ def _write_task(task: dict) -> str | None:
                     if _vault_result.failed:
                         _log(f"[vault] store failed (still redacted): {_vault_result.failed}")
                 except Exception as _vault_exc:
-                    if _redact_fn is not None:
-                        _fetched = _redact_fn(_fetched)
+                    _fetched = _redact_fallback(_fetched)
                     _log(f"[vault] intercept errored "
                          f"({type(_vault_exc).__name__}: {_vault_exc}) — "
-                         f"redacted if possible, NOT stored")
-            elif sender_tier != "owner" and _redact_fn is not None:
-                _fetched = _redact_fn(_fetched)
+                         f"redacted, NOT stored")
+            else:
+                _fetched = _redact_fallback(_fetched)
             # Redact pasted secrets BEFORE the body is persisted (#2267 parity
             # with the discord/slack/telegram bridges): a token pasted into a
             # room message must never land on disk. Runs AFTER media
@@ -1532,6 +1565,16 @@ def _write_task(task: dict) -> str | None:
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
             lines.append(f"task: {_one_line(_filtered.text)}")
+            # Make the fully-sanitized body authoritative for every OTHER
+            # persistence sink too, not just the task file. _write_owner_activity()
+            # below re-reads task["task"] independently and only applies the
+            # generic filter_chat_secrets (not vault-aware), so without this the
+            # vault-intercepted/redacted text above stayed local to _fetched and
+            # the raw value still leaked into last-owner-activity.json (review
+            # finding, qingyun-wu 2026-08-11). `task` is this function's own
+            # shallow copy (`task = {**task, ...}` above), so mutating it here
+            # doesn't touch the caller's dict.
+            task["task"] = _filtered.text
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
             # alongside the legacy [File attached:] body line (dual-write) via the

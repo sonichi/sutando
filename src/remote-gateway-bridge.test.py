@@ -1294,6 +1294,51 @@ def main() -> int:
           "intercept exception falls back to redaction — never left unredacted AND unstored")
     rtc._VAULT_INTERCEPT_FNS = (None, None)
     rtc.LOCAL_TIER = _tier_before_vault_block
+
+    # Two P1 findings from review (qingyun-wu, 2026-08-11), both about a
+    # sanitized body not being authoritative for EVERY persistence sink.
+
+    # (1) The interceptor is the ONLY store call site — _write_task() must not
+    # invoke it a second time when it also updates task["task"] for
+    # _write_owner_activity()'s benefit, or an owner's `vault set` would be
+    # stored twice (double Keychain write / double-counted "stored" log).
+    rtc.LOCAL_TIER = "owner"
+    _oa = rtc.OWNER_ACTIVITY_FILE
+    _oa.unlink(missing_ok=True)
+    _vault_calls["intercept"] = _vault_calls["redact"] = 0
+    rtc._VAULT_INTERCEPT_FNS = (_fake_intercept, _fake_redact)
+    rtc._write_task({**TASK, "id": "task-VAULTOWNERACTIVITY", "access_tier": "owner",
+                     "task": "[AG2Space @qingyun] vault set MY_KEY hunter2"})
+    _voa_body = (rtc.TASKS_DIR / "task-VAULTOWNERACTIVITY.txt").read_text()
+    check("hunter2" not in _voa_body and "[STORED]" in _voa_body,
+          "owner-activity regression: task file still sanitized")
+    _oa_data = json.loads(_oa.read_text()) if _oa.exists() else {}
+    check("hunter2" not in json.dumps(_oa_data),
+          "owner-activity file does NOT carry the raw vault secret "
+          "(sanitized task[\"task\"] is authoritative for every sink)")
+    check(_vault_calls["intercept"] == 1,
+          "interceptor invoked exactly once — updating task[\"task\"] for "
+          "_write_owner_activity does not re-run the store")
+    rtc._VAULT_INTERCEPT_FNS = (None, None)
+    rtc.LOCAL_TIER = _tier_before_vault_block
+
+    # (2) No-interceptor-available fallback: an owner-tier sender with
+    # _vault_intercept_fns() == (None, None) — the standalone/package-only
+    # ag2-sparrow install, no monorepo src/vault_intercept.py to find — must
+    # still get SOME redaction (the dependency-free local fallback), not pass
+    # through untouched to the generic filter_chat_secrets.
+    rtc.LOCAL_TIER = "owner"
+    rtc._VAULT_INTERCEPT_FNS = (None, None)
+    rtc._write_task({**TASK, "id": "task-VAULTNOHELPER", "access_tier": "owner",
+                     "task": '[AG2Space @qingyun] vault set API_KEY "secret value here"'})
+    _vnh_body = (rtc.TASKS_DIR / "task-VAULTNOHELPER.txt").read_text()
+    check("secret value here" not in _vnh_body,
+          "owner-tier vault set redacted by the local fallback when NO "
+          "interceptor/redactor is available at all (standalone package case)")
+    check("VAULT-SET-REDACTED" in _vnh_body,
+          "local fallback leaves an explicit placeholder, not silent deletion")
+    rtc.LOCAL_TIER = _tier_before_vault_block
+
     # Onboarding-token parse: the combined "url|secret" form, and the %7C-encoded
     # separator the desktop connect flow emits (ag2space-cinny-desktop#231). A
     # %7C token must decode so URL is populated — otherwise it parses as a bare
