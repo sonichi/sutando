@@ -64,9 +64,8 @@ python3 skills/engine-conflict-resolve/scripts/propose.py --scratch "<scratch>"
 
 - Exit 2 `{"status": "unmerged", …}` — you missed a file; go back to step 2.
 - `{"status": "proposed", "merged_sha": …, "files": …, "diffstat": …,
-  "summary_lines": […]}` — write the task's result file
-  (`results/task-engine-conflict-<epoch>.txt`, same id as the task) so the
-  owner sees the proposal in the originating channel. The result must contain:
+  "summary_lines": […]}` — report the proposal. The proposal text must
+  contain:
   - the `summary_lines` (one line per conflicted file: what was kept), with
     your own one-line semantic note per file where the mechanical verdict
     isn't self-explanatory;
@@ -74,10 +73,30 @@ python3 skills/engine-conflict-resolve/scripts/propose.py --scratch "<scratch>"
   - the `merged_sha` and the `scratch` path (the follow-up session needs both);
   - a clear ask: reply **"apply"** to update the live engine, or "discard".
 
+  **Delivery needs BOTH of the following** — the task's `source` is
+  `desktop-app`, and no bridge polls results for that source, so a result
+  file alone is a dead letter the owner never sees:
+  1. Write the task's result file (`results/task-engine-conflict-<epoch>.txt`,
+     same id as the task) — protocol hygiene: the dashboard, result-watcher,
+     and timeout logic key off it.
+  2. **Actively surface the proposal on the owner's live channel**: post it
+     to the owner's active AG2 Space room via the gateway `op:message` path
+     (the `skills/agent-room-ops/` capabilities — gateway URL + token
+     resolution per `_gateway.py` / `gateway_credentials.py`; the legacy
+     `AG2_REMOTE_TOKEN` in the repo `.env` is an accepted token alias). If no
+     gateway resolves, fall back to the repo's Pending-decisions convention:
+     a macOS notification (`osascript -e 'display notification "Engine
+     conflict resolved — proposal ready" with title "Sutando"'`) **and**
+     append the question to the per-host pending-questions file
+     (`<workspace>/hosts/<hostname>/pending-questions.md`, `<hostname>` =
+     `bash scripts/sutando-config.sh host-label`).
+
 ### 4. WAIT for explicit confirmation
 
-Never auto-apply. Confirmation is a follow-up task from the owner saying
-apply / yes / go ahead. If the reply is unclear, ask again. Also record the
+Never auto-apply. Confirmation is a follow-up task or message from the owner
+saying apply / yes / go ahead — on whatever channel it arrives (the reply
+will NOT come back through the desktop app; that path is one-way). If the
+reply is unclear, ask again. Also record the
 pending action in `state/voice-session-context.json` (`pending_action`:
 `{"kind": "other", "what": "apply engine conflict resolution <merged_sha>",
 "where": "<scratch>"}`) so a later session can pick it up.
