@@ -448,21 +448,22 @@ def archive_path(kind: str, task_id: str) -> "Path":
     return month_dir / f"{task_id}.txt"
 
 
-def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into the archive. Silent on failure — archive is for later
-    analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving"."""
+def archive_file(src: "Path", kind: str, task_id: str) -> bool:
+    """Move src into the archive. Chi's 2026-04-18 ask: "instead of deleting
+    we should archive the tasks. It can be useful for self-improving".
+
+    Returns True when src is no longer in place (archived, or never existed),
+    False when the move failed and src was left where it was."""
     try:
         if src.exists():
             import shutil
             shutil.move(str(src), str(archive_path(kind, task_id)))
+        return True
     except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        # Fall back to unlink so we don't leave stale files.
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+        # Leave src alone: a stale file is recoverable, a deleted one is not,
+        # and preserving the task is the whole point of archiving it.
+        print(f"  archive_file({kind}, {task_id}) failed, left in place: {e}", flush=True)
+        return False
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
@@ -4663,10 +4664,13 @@ async def poll_results():
                 # archive_file() finishing. See DELIVERED_DIR docstring.
                 if _is_delivered(task_id):
                     print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
-                    archive_file(result_file, "results", task_id)
+                    _archived = archive_file(result_file, "results", task_id)
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
-                    _clear_delivered(task_id)
+                    # A surviving result file re-enters this loop; only the
+                    # sentinel stops it being sent twice, so keep it until gone.
+                    if _archived:
+                        _clear_delivered(task_id)
                     continue
 
                 try:
@@ -4870,15 +4874,15 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
-                archive_file(result_file, "results", task_id)
+                _archived = archive_file(result_file, "results", task_id)
                 # find_task_file, not a reconstructed bare name: a claimed
                 # task is `<id>.claimed-core-N.txt` and would strand forever.
                 task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
-                # Delivery succeeded + archived — sentinel has served
-                # its purpose, remove to bound `discord-delivered/`
-                # directory growth.
-                _clear_delivered(task_id)
+                # A failed archive leaves the result file, so the sentinel is
+                # still the only thing preventing a resend — keep it.
+                if _archived:
+                    _clear_delivered(task_id)
             else:
                 # CONSECUTIVE means consecutive: an absent file breaks the run, or a
                 # writer that retries accumulates counts across separate appearances.
