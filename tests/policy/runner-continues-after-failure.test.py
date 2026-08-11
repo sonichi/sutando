@@ -139,6 +139,31 @@ class RunnerContinuesAfterFailureTest(unittest.TestCase):
         self.assertIn(f"{len(files)} file(s)", r.stdout,
                       "the summary must report the full count, not the truncated one")
 
+    def test_partial_sort_is_not_reported_as_a_clean_run(self) -> None:
+        """A `sort` that prints some paths then exits nonzero must not yield a green run —
+        the same false-complete hole as partial discovery, one pipeline stage later."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "tests").mkdir()
+            for i in range(3):
+                (Path(td) / "tests" / f"z{i}.test.py").write_text(PASSING)
+            bin_ = Path(td) / "bin"
+            bin_.mkdir()
+            stub = bin_ / "sort"
+            stub.write_text('#!/bin/sh\n'
+                            'printf "%s\\n" tests/z0.test.py\n'
+                            'echo "sort: write failed" >&2\n'
+                            'exit 1\n')
+            stub.chmod(0o755)
+            r = subprocess.run(
+                ["sh", "-c", self._runner()], cwd=td,
+                env={**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"},
+                capture_output=True, text=True, timeout=120,
+            )
+        self.assertNotEqual(r.returncode, 0,
+                            "sort exited nonzero but the run reported success")
+        self.assertNotIn("all passed", r.stdout,
+                         "a partial ordering must not be summarised as all passed")
+
     def test_node_modules_is_excluded(self) -> None:
         """A vendored *.test.py must not be executed by the local runner."""
         with tempfile.TemporaryDirectory() as td:
