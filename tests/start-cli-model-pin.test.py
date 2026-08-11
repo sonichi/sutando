@@ -12,6 +12,14 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
 
 
+def _isolated_workspace(td: Path) -> str:
+    """A redirected workspace must exist WITH its state/ dir: start-cli.sh writes
+    <ws>/state/core-supervisor-relay-loop.pid and aborts under set -e if it cannot."""
+    ws = td / "workspace"
+    (ws / "state").mkdir(parents=True, exist_ok=True)
+    return str(ws)
+
+
 def _launch_argv(model_env: "str | None") -> list[str]:
     """Run start-cli.sh through its no-tmux fallback and return claude's argv."""
     with tempfile.TemporaryDirectory() as td:
@@ -38,7 +46,7 @@ def _launch_argv(model_env: "str | None") -> list[str]:
             # start-cli.sh stamps <workspace>/state/session-starts.log; without
             # this redirect the run appends a fake launch to the LIVE workspace.
             "SUTANDO_TEST_MODE": "1",
-            "SUTANDO_WORKSPACE": str(td / "workspace"),
+            "SUTANDO_WORKSPACE": _isolated_workspace(td),
         }
         if model_env is not None:
             env["SUTANDO_CORE_MODEL"] = model_env
@@ -180,7 +188,7 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
                 "SUTANDO_TEST_MODE": "1",
-                "SUTANDO_WORKSPACE": str(td / "workspace"),
+                "SUTANDO_WORKSPACE": _isolated_workspace(td),
             }
             # The script may exec `tmux attach` and block; that is fine. Kill the
             # whole group after the clear has had its chance to run.
@@ -239,7 +247,7 @@ def case_fresh_socket_server_is_born_unpinned() -> list[str]:
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
                 "SUTANDO_TEST_MODE": "1",
-                "SUTANDO_WORKSPACE": str(td / "workspace"),
+                "SUTANDO_WORKSPACE": _isolated_workspace(td),
                 "SUTANDO_CORE_MODEL": "opus",   # the pin is in the LAUNCHER's env
             }
             out, timed_out = _run_launcher(env, td / "launcher.log")
@@ -313,7 +321,7 @@ def case_bare_invocation_still_warns_on_a_pinned_live_core() -> list[str]:
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
                 "SUTANDO_TEST_MODE": "1",
-                "SUTANDO_WORKSPACE": str(td / "workspace"),
+                "SUTANDO_WORKSPACE": _isolated_workspace(td),
             }
             out, timed_out = _run_launcher(env, td / "launcher.log")
             if timed_out:
