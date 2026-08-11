@@ -4,17 +4,31 @@ matcher must not swallow prose that merely opens with the same words."""
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import sys
+import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
+
+# Isolate BEFORE import: discord-bridge resolves channel config at module scope,
+# so an unset CLAUDE_CONFIG_DIR reads the operator's real allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-sandbox-sentinel-")
+_cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": []}')
+os.environ.setdefault("DISCORD_BOT_TOKEN", "faketoken")
+
+try:
+    import discord  # noqa: F401
+except ImportError:
+    print("SKIP — discord.py not importable")
+    sys.exit(0)
+
 spec = importlib.util.spec_from_file_location("dbridge", REPO / "src" / "discord-bridge.py")
 mod = importlib.util.module_from_spec(spec)
 sys.modules["dbridge"] = mod
-try:
-    spec.loader.exec_module(mod)
-except SystemExit:
-    pass
+spec.loader.exec_module(mod)
 
 fails = []
 
