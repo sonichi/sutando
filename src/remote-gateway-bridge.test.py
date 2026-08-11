@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +35,7 @@ def check(cond: bool, msg: str) -> None:
 # ── mock gateway ────────────────────────────────────────────────────────────
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
+         "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
          "force_heartbeat_404": False, "force_media_redirect": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
@@ -87,6 +89,21 @@ class Handler(BaseHTTPRequestHandler):
                 "body": json.loads(self.rfile.read(n).decode()),
             })
             self.send_response(200); self.end_headers()
+        elif self.path == "/v1/room":
+            if STATE["force_room_502"]:
+                self.send_response(502); self.end_headers(); return
+            n = int(self.headers.get("Content-Length") or 0)
+            STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
+            if STATE["force_room_empty_200"]:
+                # Deployed-broker failure shape: room-send swallowed server-side,
+                # 200 with no event_id — must NOT count as delivered.
+                body = b"{}"
+            else:
+                body = json.dumps({"ok": True,
+                                   "event_id": f"$evt-{len(STATE['room_posts'])}"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers(); self.wfile.write(body)
         elif self.path == "/v1/heartbeat":
             if STATE["force_heartbeat_404"]:
                 self.send_response(404); self.end_headers(); return
@@ -528,6 +545,233 @@ def main() -> int:
     rtc._save_inflight({"task-MOCK2"})
     rtc._post_ready_results({"task-MOCK2"})
     check("task-MOCK2" not in rtc._load_inflight(), "delivered task removed from persisted inflight")
+
+    # 3.5 proactive drain (REMOTE_PROACTIVE_ROOM)
+    # Unset → no scan, files untouched (existing hosts unchanged).
+    (rtc.RESULTS_DIR / "proactive-t1.txt").write_text("nudge one\n")
+    rtc.PROACTIVE_ROOM = ""
+    rtc._post_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t1.txt").exists() and not STATE["room_posts"],
+          "proactive drain is a no-op without REMOTE_PROACTIVE_ROOM")
+    # Set → delivered as op:message to the room, file archived.
+    rtc.PROACTIVE_ROOM = "!owner:example.org"
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 1
+          and STATE["room_posts"][0] == {"op": "message", "room_id": "!owner:example.org",
+                                          "body": "nudge one"}
+          and not (rtc.RESULTS_DIR / "proactive-t1.txt").exists()
+          and any(x.name.startswith("proactive-t1-") for x in rtc.ARCHIVE_RESULTS_DIR.iterdir()),
+          "proactive file delivered via /v1/room and archived")
+    # Failed POST → claim restored to .txt for retry; nothing archived.
+    (rtc.RESULTS_DIR / "proactive-t2.txt").write_text("nudge two")
+    STATE["force_room_502"] = True
+    rtc._post_proactive()
+    STATE["force_room_502"] = False
+    check((rtc.RESULTS_DIR / "proactive-t2.txt").exists()
+          and len(STATE["room_posts"]) == 1,
+          "failed proactive POST restores the file for retry")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 2 and not (rtc.RESULTS_DIR / "proactive-t2.txt").exists(),
+          "retry after failure delivers")
+    # 200 WITHOUT a delivery signal (server swallowed the room send) → the
+    # file is restored for retry, NOT archived — a bare 200 never proves
+    # delivery (review P1: bad room / kicked agent / power-level denial).
+    (rtc.RESULTS_DIR / "proactive-t2b.txt").write_text("nudge 2b")
+    STATE["force_room_empty_200"] = True
+    rtc._post_proactive()
+    STATE["force_room_empty_200"] = False
+    check((rtc.RESULTS_DIR / "proactive-t2b.txt").exists(),
+          "200 without event_id restores the file (no false archive)")
+    rtc._post_proactive()
+    check(not (rtc.RESULTS_DIR / "proactive-t2b.txt").exists(),
+          "retry with a real delivery signal archives")
+
+    # Empty file → no POST, and NEVER destroyed. A freshly-written empty file
+    # is indistinguishable from a writer mid-flush, so it is re-queued rather
+    # than unlinked (review blocker: the old code unlinked it silently, which
+    # loses the body when the writer's flush lands after the claim).
+    (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("  \n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 4 and (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
+          "empty proactive file is re-queued, not sent and not destroyed")
+
+    # The body the writer was still flushing wins: once it lands, the SAME file
+    # delivers normally. This is the regression for the data-loss race.
+    (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("the late-flushed body")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 5
+          and STATE["room_posts"][-1]["body"] == "the late-flushed body"
+          and not (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
+          "a body flushed after the empty peek is delivered, never lost")
+
+    # Genuinely empty past the settle window → archived (not unlinked), so the
+    # drop is auditable rather than silent.
+    stale = rtc.RESULTS_DIR / "proactive-t3b.txt"
+    stale.write_text("   \n")
+    posts_b4 = len(STATE["room_posts"])
+    aged = time.time() - 3600            # an old file is NOT evidence of abandonment
+    os.utime(stale, (aged, aged))
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4 and stale.exists(),
+          "an aged empty file is retried, never retired on its mtime alone")
+
+    # No abandonment horizon (review blocker, air 2026-07-28): even after many
+    # observations of the same empty file, it is STILL handed back, NEVER
+    # dead-lettered. No amount of watching proves the writer closed its fd; the
+    # old code retired it after _EMPTY_ABANDON_S, which stranded a slow writer's
+    # later flush in the moved inode.
+    for _ in range(5):
+        rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4 and stale.exists()
+          and not any(x.name.startswith("proactive-t3b")
+                      for x in rtc.UNDELIVERABLE_RESULTS_DIR.glob("*.txt")),
+          "an empty file is never dead-lettered, however long it is observed")
+
+    # And its late flush still delivers — into the SAME inode that was never
+    # moved. This is the data-loss race the removed horizon reintroduced.
+    stale.write_text("t3b late body")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4 + 1
+          and STATE["room_posts"][-1]["body"] == "t3b late body"
+          and not stale.exists(),
+          "the late flush of a long-empty file is delivered, never lost")
+
+    # A TRANSIENT post-claim read failure must RESTORE the file to `.txt`, never
+    # strand it as `.sending.<pid>`: _recover_orphan_proactive() refuses to steal
+    # a LIVE pid's claim, so a stranded claim is permanent owner-message loss
+    # until this bridge restarts (review P1). Inject: the pre-claim peek succeeds,
+    # only the post-claim read (on the `.sending.` name) raises.
+    import pathlib as _pl
+    (rtc.RESULTS_DIR / "proactive-readfail.txt").write_text("nudge readfail\n")
+    _real_read_text = _pl.Path.read_text
+
+    def _read_text_fail_on_claim(self, *a, **k):
+        if ".sending." in self.name:      # only the post-claim read raises
+            raise OSError("simulated transient post-claim read failure")
+        return _real_read_text(self, *a, **k)
+
+    posts_rf = len(STATE["room_posts"])
+    _pl.Path.read_text = _read_text_fail_on_claim
+    try:
+        rtc._post_proactive()
+    finally:
+        _pl.Path.read_text = _real_read_text
+    check((rtc.RESULTS_DIR / "proactive-readfail.txt").exists()
+          and not list(rtc.RESULTS_DIR.glob("proactive-readfail.sending.*"))
+          and len(STATE["room_posts"]) == posts_rf,
+          "post-claim read failure restores the .txt (not stranded, not posted)")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_rf + 1
+          and not (rtc.RESULTS_DIR / "proactive-readfail.txt").exists(),
+          "the restored file delivers normally on the next pass")
+
+    # REGRESSION (review blocker, 2026-07-28): an aged-but-still-open file.
+    # mtime cannot distinguish "created, fd still open, not yet written" from
+    # "abandoned" — a file held open with no write keeps its creation mtime.
+    # The old age cutoff therefore archived a nudge whose writer had not
+    # flushed yet; the late write then landed in the ARCHIVED inode, where it
+    # reads as delivered. Reproduce with a real open descriptor.
+    stalled = rtc.RESULTS_DIR / "proactive-t3d.txt"
+    posts_before = len(STATE["room_posts"])
+    fh = open(stalled, "w", encoding="utf-8")     # writer holds the fd open
+    try:
+        aged = time.time() - 3600                  # far past any age cutoff
+        os.utime(stalled, (aged, aged))
+        # Hammer the drain many times while the descriptor stays open and empty
+        # — simulating a writer paused well beyond the old _EMPTY_ABANDON_S
+        # horizon. With no horizon the inode is never moved, so the still-open
+        # fd keeps pointing at the live proactive-*.txt.
+        for _ in range(8):
+            rtc._post_proactive()                  # drain sees empty + old
+        check(stalled.exists(),
+              "aged-but-open empty file is handed back over many passes, not retired")
+        fh.write("late body that should reach the owner")   # writer flushes
+        fh.flush()
+    finally:
+        fh.close()
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_before + 1
+          and STATE["room_posts"][-1]["body"] == "late body that should reach the owner"
+          and not stalled.exists(),
+          "a body flushed after an AGED empty claim is still delivered")
+
+    # Oversized body → dead-lettered once instead of retrying forever, and it
+    # lands in archive/undeliverable so "given up on" is not confused with
+    # "delivered".
+    huge = rtc.RESULTS_DIR / "proactive-t3c.txt"
+    huge.write_text("x" * (rtc._PROACTIVE_MAX_BODY_B + 1))
+    posts_b4_huge = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_huge and not huge.exists()
+          and any(p.name.startswith("proactive-t3c")
+                  for p in rtc.UNDELIVERABLE_RESULTS_DIR.glob("*.txt")),
+          "oversized proactive body is dead-lettered, not retried forever")
+    # Routing protocol (review blocker): a [channel: <discord id>] nudge
+    # belongs to the Discord bridge — this consumer must not claim it, must
+    # not post it, and must leave the .txt in place for the real consumer.
+    foreign = rtc.RESULTS_DIR / "proactive-t5.txt"
+    foreign.write_text("[channel: 1504619109516841121]\nfor discord only\n")
+    posts_before = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(foreign.exists() and len(STATE["room_posts"]) == posts_before,
+          "[channel: <discord id>] nudge is skipped, unclaimed, un-posted")
+    foreign.unlink()
+    # …while a [channel: !room] marker redirects within this bridge's reach:
+    (rtc.RESULTS_DIR / "proactive-t6.txt").write_text(
+        "[channel: !other:example.org]\nrouted nudge\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!other:example.org"
+          and STATE["room_posts"][-1]["body"] == "routed nudge",
+          "[channel: !room] nudge delivers to the routed room, marker stripped")
+    # Marker grammar comes from the CANONICAL parser (result_markers.
+    # parse_markers), so the full protocol holds on proactive files too:
+    # [dm-only] ANYWHERE suppresses a [channel:] redirect (privacy guard) —
+    # the nudge stays in the default owner room with both markers stripped.
+    (rtc.RESULTS_DIR / "proactive-t9.txt").write_text(
+        "[channel: !shared:example.org]\nprivate nudge\n[dm-only]\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!owner:example.org"
+          and STATE["room_posts"][-1]["body"] == "private nudge",
+          "[dm-only] suppresses [channel:] — default room, both markers stripped")
+    # Skip markers archive silently: nothing posted, file archived (protocol:
+    # a [no-send] body is delivered nowhere by every consumer).
+    (rtc.RESULTS_DIR / "proactive-t10.txt").write_text("[no-send]\ninternal note\n")
+    posts_b4_skip = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_skip
+          and not (rtc.RESULTS_DIR / "proactive-t10.txt").exists()
+          and any(p.name.startswith("proactive-t10")
+                  for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
+          "[no-send] proactive nudge is archived silently, never posted")
+
+    # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
+    # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen
+    # (review blocker: bare .sending recovery could steal in-flight claims).
+    dead_pid = 4194303  # above macOS/Linux default pid_max ranges — not alive
+    (rtc.RESULTS_DIR / f"proactive-t4.sending.{dead_pid}").write_text("orphan nudge")
+    live = rtc.RESULTS_DIR / f"proactive-t7.sending.{os.getpid()}"
+    live.write_text("in-flight nudge")
+    rtc._recover_orphan_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t4.txt").exists(),
+          "dead-owner .sending.<pid> claim recovered to .txt")
+    check(live.exists() and not (rtc.RESULTS_DIR / "proactive-t7.txt").exists(),
+          "live worker's in-flight claim is NOT stolen")
+    live.unlink()
+    # Legacy bare .sending (no owner info): fresh → left alone; aged → recovered.
+    legacy = rtc.RESULTS_DIR / "proactive-t8.sending"
+    legacy.write_text("legacy orphan")
+    rtc._recover_orphan_proactive()
+    check(legacy.exists(), "fresh legacy .sending claim left alone (age guard)")
+    old = time.time() - rtc._ORPHAN_MIN_AGE_S - 5
+    os.utime(legacy, (old, old))
+    rtc._recover_orphan_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t8.txt").exists(),
+          "aged legacy .sending claim recovered")
+    (rtc.RESULTS_DIR / "proactive-t8.txt").unlink()
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["body"] == "orphan nudge",
+          "recovered orphan delivers on next drain")
+    rtc.PROACTIVE_ROOM = ""
 
     # 4. auth header was sent on every call
     check(all(a == "Bearer testtoken" for a in STATE["auth_seen"] if a is not None)

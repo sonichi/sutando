@@ -195,6 +195,10 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# Terminal resting place for proactive nudges that can never be delivered
+# (e.g. a body too large for any Matrix event). Kept separate from `archive/`
+# so "delivered" and "given up on" are never confused when auditing.
+UNDELIVERABLE_RESULTS_DIR = ARCHIVE_RESULTS_DIR / "undeliverable"
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
 # via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
@@ -520,6 +524,18 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
+# `results/proactive-*.txt` the agent writes is delivered to that room as a
+# gateway message (POST /v1/room op:message) and archived. This is the
+# transport half of the repo's long-standing "write proactive-{ts}.txt to
+# speak to the user" contract — historically drained only by the Discord/
+# Telegram bridges, so on a gateway-only host those files were dead letters
+# (observed live: a pending-questions DM nudge sat undrained forever while
+# only its macOS notification fired). Unset → no scan, no behavior change.
+# Deliberately an EXPLICIT room id, not auto-learned from recent task
+# channel_ids: a proactive nudge is often owner-private, and auto-targeting
+# the last active room could deliver it to a shared room.
+PROACTIVE_ROOM = os.environ.get("REMOTE_PROACTIVE_ROOM") or ""
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 # rotation (_reload_rotated_token) propagates to their next request without a
@@ -1772,6 +1788,314 @@ def _archive_result(path: Path, tid: str) -> None:
             pass  # best-effort; core may have archived it concurrently
 
 
+# A legacy bare `.sending` claim carries no owner info, so recovery for those
+# falls back to an age guard: younger than this = possibly a live worker's
+# in-flight claim, leave it alone. This guard is DELIBERATELY legacy-only —
+# new claims are pid-scoped, and pid-liveness is a stronger signal than age
+# (it recovers a dead worker's claim immediately instead of after 10 minutes),
+# so it supersedes rather than complements this threshold.
+_ORPHAN_MIN_AGE_S = 600
+
+# An empty body observed right after claiming is a writer mid-flush, so it is
+# always re-queued — and NEVER moved to a terminal resting place.
+#
+# History: this was first an mtime age cutoff, then an observation-time cutoff
+# (_EMPTY_ABANDON_S). Both are unsound for the same reason: NOTHING observable
+# from outside the writer — mtime, size, or how long WE have watched it empty —
+# proves the producer has closed its descriptor. A file held open with no write
+# keeps its creation mtime AND stays empty for as long as the writer is paused,
+# so any finite cutoff dead-letters a still-open writer; its later flush then
+# lands in the moved inode and is silently lost — the exact harm this drain
+# exists to remove (review blocker, air 2026-07-28). So there is no abandonment
+# horizon at all: an empty claim is handed back unconditionally, forever, and a
+# flush at ANY later time is delivered on a subsequent pass. A genuinely
+# orphaned 0-byte file (producer crashed before its first write) is inert — never
+# delivered, never moved by this path, which must not be the thing that decides a
+# producer is done. There is no automatic sweeper for it (checked: neither
+# disk-hygiene.sh nor results-health.sh delete results files — the latter only
+# REPORTS zero-byte counts). It is surfaced by scripts/results-health.sh for
+# deliberate cleanup, and the mtime-keyed archiver excludes it too
+# (archive-stale-results.py, sonichi/sutando#2360) so the never-moved guarantee
+# holds end-to-end. A slowly-accumulating set of 0-byte remnants is the accepted
+# benign cost of never risking a real message.
+#
+# Producers SHOULD publish atomically (write a temp, then rename into
+# proactive-*.txt) so an empty file is never observed at all — but producers are
+# heterogeneous (voice-agent.ts, morning-briefing.py, task-bridge.ts, and the
+# core agent writing ad-hoc), with no single chokepoint to enforce that, so the
+# drain stays correct for the ones that don't.
+
+# Filenames THIS process has already logged as claimed-empty, so a genuinely
+# orphaned nudge is noted once instead of on every pass. Discarded when the file
+# gains a body (so a later empty re-observation logs again).
+_EMPTY_LOGGED: "set[str]" = set()
+
+# Bodies above this never fit a Matrix event, so they are undeliverable no
+# matter how often they are retried; they are dead-lettered instead of looping.
+# Well under the 64 KiB event ceiling to leave room for envelope overhead.
+_PROACTIVE_MAX_BODY_B = 48 * 1024
+
+# Destination FORMAT validation is this bridge's own job ("the bridge
+# validates the id format for its platform when applying" — result_markers).
+# Matrix room ids only; Discord (17-20 digit) / Slack ([CDG]…) redirect
+# targets belong to their own bridges and their files are left unclaimed.
+_MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+
+
+def _proactive_route(body: str) -> "tuple[str, str | None, str]":
+    """('send', room_or_None, stripped-body) | ('foreign', None, '') |
+    ('drop', None, '').
+
+    Marker grammar comes SOLELY from parse_markers() (no private parser —
+    CLAUDE.md result-marker contract); this function only applies the actions
+    this transport supports:
+      * skip markers   → 'drop' (archive silently, deliver nothing)
+      * [dm-only]      → parse_markers already suppressed any redirect, so the
+                         body falls through to the default (owner) room
+      * [channel: !r:s]→ 'send' to that room, marker stripped
+      * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
+                         blocker: claiming it here would leak the raw body)
+      * attach markers → stripped by the parser; uploads are unsupported on
+                         the room-message op, so the actions are ignored
+    """
+    parsed = parse_markers(body)
+    if any(a.kind == "skip" for a in parsed.actions):
+        return ("drop", None, "")
+    redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
+    if redirect is not None:
+        dest = redirect.value
+        if _MATRIX_ROOM_RE.match(dest):
+            return ("send", dest, parsed.body)
+        return ("foreign", None, "")
+    return ("send", None, parsed.body)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but not signalable — treat as alive
+    return True
+
+
+def _recover_orphan_proactive() -> None:
+    """Restart-safety: recover orphan proactive claims back to `.txt` so the
+    next drain re-claims them — WITHOUT stealing a live worker's in-flight
+    claim (review blocker). Claims are pid-scoped (`.sending.<pid>`): a claim
+    whose owner pid is alive is left alone; a dead owner's claim recovers
+    immediately. Legacy bare `.sending` claims (no owner info) recover only
+    past an age threshold."""
+    if not PROACTIVE_ROOM:
+        return
+    for f in list(RESULTS_DIR.glob("proactive-*.sending.*")) \
+            + list(RESULTS_DIR.glob("proactive-*.sending")):
+        name = f.name
+        owner = name.rsplit(".sending.", 1)
+        if len(owner) == 2:  # pid-scoped claim
+            try:
+                pid = int(owner[1])
+            except ValueError:
+                continue  # not ours to interpret
+            if _pid_alive(pid):
+                continue  # live worker's in-flight claim (incl. our own
+                # process's other thread) — never steal
+        else:  # legacy bare .sending — age guard only
+            try:
+                if time.time() - f.stat().st_mtime < _ORPHAN_MIN_AGE_S:
+                    continue
+            except OSError:
+                continue
+        target = f.with_name(name.split(".sending")[0] + ".txt")
+        if target.exists():
+            continue  # collision — leave for an operator, never clobber
+        try:
+            f.rename(target)
+            _log(f"recovered orphan proactive claim {f.name}")
+        except OSError:
+            pass
+
+
+def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
+    """Retire a claimed nudge that was NOT delivered, without destroying it.
+
+    Used by the terminal non-delivery paths (settled-empty, dead-lettered).
+    Deliberately not shared with the delivered path: there the content already
+    reached the owner, so unlinking on an archive failure is harmless, whereas
+    handing the claim back would re-send a duplicate. Here nothing was
+    delivered, so the fallback is the opposite — hand it back as `.txt` rather
+    than unlink, since a duplicate on a later pass beats a lost message.
+    """
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        claim.rename(dest_dir / f"{original.stem}-{int(time.time())}.txt")
+    except OSError as e:
+        _log(f"could not retire proactive {original.name} ({e}) — re-queueing")
+        try:
+            claim.rename(original)
+        except OSError:
+            pass
+
+
+def _post_proactive() -> None:
+    """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
+
+    Claim-by-rename (`.txt` → `.sending`) so a concurrent drain (or a racing
+    legacy bridge on a multi-channel host) can't double-deliver; a delivered
+    file archives beside task results; a failed POST renames the claim back
+    to `.txt` for retry on the next loop pass. Auth errors propagate to the
+    caller (the poll loop owns auth handling); everything else is per-file
+    fail-open — one malformed nudge never blocks the rest. No-op without
+    PROACTIVE_ROOM."""
+    if not PROACTIVE_ROOM:
+        return
+    for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
+        # PEEK before claiming: a file explicitly routed to a non-Matrix
+        # destination ([channel: <discord/slack id>]) belongs to that bridge —
+        # claiming it here would leak the raw body (marker included) to the
+        # gateway room and starve the real consumer (review blocker).
+        try:
+            route, _, _ = _proactive_route(f.read_text(encoding="utf-8"))
+        except OSError:
+            continue  # racing consumer already claimed it
+        if route == "foreign":
+            continue
+        # pid-scoped claim: recovery can tell a live worker's in-flight claim
+        # from a dead one's (review blocker: bare .sending was stealable).
+        claim = f.with_suffix(f".sending.{os.getpid()}")
+        try:
+            f.rename(claim)  # atomic claim; loser of a race just misses
+        except OSError:
+            continue
+        # Re-read and re-route AFTER the claim, and act only on THIS result.
+        # The peek above can observe a writer mid-write (file created, body not
+        # yet flushed); acting on that stale empty read is what silently
+        # destroyed a nudge (review blocker). Renaming does not disturb the
+        # writer's descriptor, so the post-claim read sees the flushed body.
+        try:
+            route, room_override, routed_body = _proactive_route(
+                claim.read_text(encoding="utf-8"))
+        except OSError as exc:
+            # A TRANSIENT post-claim read failure must not strand the nudge: the
+            # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
+            # refuses to steal a LIVE pid's claim, so leaving it here loses the
+            # owner message until THIS bridge process exits (review blocker).
+            # Hand the claim back to the original `.txt` for a later pass; if even
+            # the restore fails, log loudly so the stranded inode is visible.
+            try:
+                claim.rename(f)
+            except OSError as restore_exc:
+                _log(f"CRITICAL: proactive {claim.name} post-claim read failed "
+                     f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
+                     f"owner nudge stranded under live pid until restart")
+            continue
+        if route == "foreign":
+            # A foreign destination that only became visible post-claim: hand
+            # the file back to its real consumer rather than eating it.
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        if route == "drop":
+            # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
+            # archive silently, deliver nothing. Nothing was delivered, so on
+            # an archive failure _retire_proactive hands the claim back rather
+            # than unlinking.
+            _log(f"proactive {f.name} carries a skip marker — archiving, no send")
+            _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
+            continue
+        body = routed_body.strip()
+        if not body:
+            # An empty claim means the producer has not flushed the body yet.
+            # NEVER move this inode: no observable signal proves the writer is
+            # done, so a dead-letter (rename to undeliverable/) would strand a
+            # slow/paused writer's later flush in the moved inode and silently
+            # lose an owner-facing nudge — the exact harm this drain removes.
+            # Hand the claim back UNCONDITIONALLY (no abandonment horizon) so a
+            # flush at any later time is delivered on a subsequent pass; log
+            # once per file so a genuinely orphaned 0-byte remnant (producer
+            # crashed pre-flush, reported by results-health.sh for cleanup) does
+            # not spam every pass.
+            if f.name not in _EMPTY_LOGGED:
+                _EMPTY_LOGGED.add(f.name)
+                _log(f"proactive {f.name} claimed empty — producer has not "
+                     f"flushed yet; handing back (never dead-lettered, a late "
+                     f"flush must still deliver)")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        # Non-empty now — drop any prior empty observation so a file that merely
+        # flushed late can log again if it is ever re-observed empty.
+        _EMPTY_LOGGED.discard(f.name)
+        if len(body.encode("utf-8")) > _PROACTIVE_MAX_BODY_B:
+            # Every failure branch below re-queues unconditionally, so a body
+            # that can NEVER be delivered would retry and log on every loop
+            # pass forever. An oversized body is exactly that case, and it is
+            # decidable here — dead-letter it once instead (review: retry
+            # ceiling). Undeliverable-for-other-reasons (kicked from the room,
+            # typo'd room id) still retries by design, so a misconfigured room
+            # stays loud.
+            _log(f"proactive {f.name} body is "
+                 f"{len(body.encode('utf-8'))}B (> {_PROACTIVE_MAX_BODY_B}B) "
+                 "— dead-lettering, it can never be delivered")
+            _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
+            continue
+        try:
+            resp = _req("POST", "/v1/room",
+                        {"op": "message",
+                         "room_id": room_override or PROACTIVE_ROOM,
+                         "body": body},
+                        timeout=15)
+            # A bare 200 is NOT proof of delivery: the gateway can swallow a
+            # room-send failure server-side (bad room id, kicked agent,
+            # power-level denial) and still answer 200 (review P1). Archive
+            # ONLY on the positive delivery signal — the event id of the
+            # posted message (the deployed broker returns
+            # {"ok": true, "event_id": "$..."}). Anything else is treated as
+            # a failed send: the claim is renamed back and retried next pass,
+            # loudly, so a misconfigured room is visible instead of silently
+            # eating nudges.
+            if not (isinstance(resp, dict) and resp.get("event_id")):
+                _log(f"proactive send for {f.name} got no delivery signal "
+                     f"(response {str(resp)[:120]!r}) — will retry; check "
+                     "REMOTE_PROACTIVE_ROOM and the agent's room membership")
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                try:
+                    claim.rename(f)  # un-claim before auth handling takes over
+                except OSError:
+                    pass
+                raise
+            _log(f"proactive send failed for {f.name}: HTTP {e.code} — will retry")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        except (urllib.error.URLError, TimeoutError) as e:
+            _log(f"proactive send network error for {f.name}: {e} — will retry")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
+        except OSError:
+            claim.unlink(missing_ok=True)
+        _log(f"delivered proactive {f.name}")
+
+
 def _load_inflight() -> set[str]:
     """Restore the in-flight set from disk (fail-open to empty)."""
     try:
@@ -2106,6 +2430,7 @@ def main() -> None:
     if not _acquire_singleton():
         return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
     inflight: set[str] = _load_inflight()
+    _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
@@ -2146,6 +2471,7 @@ def main() -> None:
             for tid in pending_ack:
                 _post_task_ack(tid)
             _post_ready_results(inflight)
+            _post_proactive()
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
