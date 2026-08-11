@@ -41,11 +41,11 @@ import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from util_paths import claude_home_path  # canonical ~/.claude/ resolver (no hand-rolled paths)
+from util_paths import channel_env_path, claude_home_path  # canonical ~/.claude/ resolver (no hand-rolled paths)
 from discord_http import request_json  # 429 Retry-After + 5xx backoff wrapper
 
 ACCESS_FILE = claude_home_path("channels", "discord", "access.json")
-ENV_FILE = claude_home_path("channels", "discord", ".env")
+ENV_FILE = channel_env_path("discord")
 API = "https://discord.com/api/v10"
 
 

@@ -74,7 +74,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
+from util_paths import channel_access_path, channel_env_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
@@ -231,7 +231,7 @@ except Exception:  # pragma: no cover
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 # Tighten perms whenever the token file exists — even when the token is already
 # in process env — so a world-readable .env never survives startup.
-channels_env = claude_home_path("channels", "discord", ".env")
+channels_env = channel_env_path("discord")
 if channels_env.exists():
     try:
         os.chmod(channels_env, 0o600)  # token file — enforce owner-only, mirrors access.json treatment

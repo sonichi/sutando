@@ -78,7 +78,7 @@ from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
+from util_paths import channel_access_path, channel_env_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -128,7 +128,7 @@ APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
 # supervisor-spawned bridge crash-loops on "not set". Mirrors discord-bridge.py.
 # Tighten perms whenever the token file exists — even when the tokens are already
 # in process env — so a world-readable .env never survives startup.
-channels_env = claude_home_path("channels", "slack", ".env")
+channels_env = channel_env_path("slack")
 if channels_env.exists():
     try:
         os.chmod(channels_env, 0o600)  # token file — enforce owner-only, mirrors access.json treatment

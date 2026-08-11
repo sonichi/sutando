@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from util_paths import claude_home_path  # noqa: E402
+from util_paths import channel_env_path, claude_home_path  # noqa: E402
 from discord_http import request_json  # noqa: E402
 
 # Runaway backstop only (not a depth target — depth is governed by --until):
@@ -144,7 +144,7 @@ def _parse_args(argv):
 
 
 def main(argv=None):
-    env = claude_home_path("channels", "discord", ".env")
+    env = channel_env_path("discord")
     token = _load_token(env)
     if not token:
         print(f"Requires DISCORD_BOT_TOKEN in {env}", file=sys.stderr)

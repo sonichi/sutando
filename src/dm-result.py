@@ -32,7 +32,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from util_paths import claude_home_path  # noqa: E402
+from util_paths import channel_env_path, claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
 from result_markers import parse_markers  # noqa: E402  — skip markers ([no-send] etc.)
@@ -84,7 +84,7 @@ def voice_connected() -> bool:
 def _load_token() -> str:
     """Read DISCORD_BOT_TOKEN from the first env file that has it."""
     for env_path in [
-        claude_home_path("channels", "discord", ".env"),
+        channel_env_path("discord"),
         REPO / ".env",
     ]:
         if not env_path.exists():

@@ -51,7 +51,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
-from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from util_paths import _host_label, channel_env_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
@@ -4632,7 +4632,7 @@ def _gateway_configured() -> bool:
     try:
         if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
             return True
-        gw_env = claude_home_path("channels", "ag2space", ".env")
+        gw_env = channel_env_path("ag2space")
         if gw_env.exists():
             return any(
                 ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
@@ -7743,7 +7743,7 @@ def _slack_token_from_env_file() -> str:
     $REPO/.env for hosts that keep it there instead.
     """
     candidates = [
-        claude_home_path("channels", "slack", ".env"),
+        channel_env_path("slack"),
         REPO_DIR / ".env",
     ]
     for env_path in candidates:
