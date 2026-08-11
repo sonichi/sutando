@@ -510,6 +510,49 @@ def _token_from_vault_ag2space(vault_get=None):
     return tok
 
 
+_VAULT_INTERCEPT_FNS: "tuple | None" = None
+
+
+def _vault_intercept_fns():
+    """Lazily locate + import `intercept_vault_commands`/`redact_vault_commands`
+    from the monorepo `src/vault_intercept.py`, same discovery pattern as
+    `_token_from_vault_ag2space` above (sparrow ships standalone, so `src/` may
+    be absent). Memoized; returns (None, None) on any failure so a caller can
+    degrade to `filter_chat_secrets`-only behavior rather than crash.
+
+    Closes the write-side half of #2638 for ag2space: discord/slack/telegram
+    bridges intercept an owner's `vault set KEY VALUE` before task-write so the
+    secret reaches Keychain and never the task file; this bridge only ever read
+    FROM the vault (`_token_from_vault_ag2space`, its own bootstrap token) and
+    never intercepted an inbound `vault set`, so a room-typed `vault set` here
+    silently stored nothing — same class of gap #2638 fixed for the other three.
+    """
+    global _VAULT_INTERCEPT_FNS
+    if _VAULT_INTERCEPT_FNS is not None:
+        return _VAULT_INTERCEPT_FNS
+    try:
+        cur = os.path.dirname(os.path.abspath(__file__))
+        src = ""
+        while True:
+            if os.path.isfile(os.path.join(cur, "src", "vault_intercept.py")):
+                src = os.path.join(cur, "src")
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        if not src:
+            _VAULT_INTERCEPT_FNS = (None, None)
+            return _VAULT_INTERCEPT_FNS
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from vault_intercept import intercept_vault_commands, redact_vault_commands
+        _VAULT_INTERCEPT_FNS = (intercept_vault_commands, redact_vault_commands)
+    except Exception:
+        _VAULT_INTERCEPT_FNS = (None, None)
+    return _VAULT_INTERCEPT_FNS
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 _URL_FALLBACK = ""
 _TOKEN_FILE_FALLBACK = ""
@@ -1421,6 +1464,13 @@ def _write_task(task: dict) -> str | None:
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
     _secret_types: tuple = ()
+    # Resolved ONCE, up front, and reused everywhere below (the task-field vault
+    # interception, the access_tier header line, and the guest/owner in-band
+    # branches) so the tier decision can never diverge between them. Moved
+    # ahead of the field loop (2026-08-11): vault interception on the "task"
+    # field needs the tier before that field is processed, but the loop
+    # reaches "task" before the tail of the function used to compute it.
+    sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -1444,11 +1494,38 @@ def _write_task(task: dict) -> str | None:
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
+            # Intercept `vault set KEY VALUE` BEFORE ordinary secret redaction,
+            # owner-tier only — write-side #2638 parity with discord/slack/
+            # telegram (see _vault_intercept_fns docstring). Non-owner senders
+            # never get Keychain writes; `filter_chat_secrets` below still
+            # catches an unnamed pasted token either way. Any interception
+            # failure (missing src/vault_intercept.py, or an exception inside
+            # it) falls back to `redact_vault_commands` if available, else the
+            # existing filter_chat_secrets call is simply unchanged — a value
+            # is never both left unredacted AND unstored.
+            _intercept_fn, _redact_fn = _vault_intercept_fns()
+            if sender_tier == "owner" and _intercept_fn is not None:
+                try:
+                    _vault_result = _intercept_fn(_fetched)
+                    _fetched = _vault_result.text
+                    if _vault_result.stored:
+                        _log(f"[vault] stored keys: {_vault_result.stored}")
+                    if _vault_result.failed:
+                        _log(f"[vault] store failed (still redacted): {_vault_result.failed}")
+                except Exception as _vault_exc:
+                    if _redact_fn is not None:
+                        _fetched = _redact_fn(_fetched)
+                    _log(f"[vault] intercept errored "
+                         f"({type(_vault_exc).__name__}: {_vault_exc}) — "
+                         f"redacted if possible, NOT stored")
+            elif sender_tier != "owner" and _redact_fn is not None:
+                _fetched = _redact_fn(_fetched)
             # Redact pasted secrets BEFORE the body is persisted (#2267 parity
             # with the discord/slack/telegram bridges): a token pasted into a
             # room message must never land on disk. Runs AFTER media
-            # resolution so a signed media-proxy URL is consumed intact and
-            # only the resolved text is filtered.
+            # resolution (and after any vault interception above consumed a
+            # `vault set` line) so a signed media-proxy URL is consumed intact
+            # and only the resolved text is filtered.
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
                 _secret_types = tuple(_filtered.secret_types)
@@ -1478,9 +1555,9 @@ def _write_task(task: dict) -> str | None:
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
-    # Resolve the broker tier and local cap once for both task authority and presence.
+    # sender_tier is resolved once, ahead of the field loop above (needed there
+    # for the "task" field's vault interception), and reused here unchanged.
     # All preceding fields are newline-stripped, so none can forge a tier header.
-    sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     lines.append(f"access_tier: {sender_tier}")
     # The fixed prose notice follows access_tier without introducing recognized headers.
     if _secret_types:

@@ -1232,6 +1232,68 @@ def main() -> int:
           "no security notice on clean tasks")
     _hdrs = [ln for ln in _sec_body.split("\n") if ln.startswith("access_tier: ")]
     check(len(_hdrs) == 1, "notice introduces no second access_tier line")
+
+    # Write-side vault interception (#2638 parity): an owner-tier `vault set
+    # KEY VALUE` in the task body must reach `_vault_intercept_fns()` and have
+    # its sanitized `.text` persisted — not the raw redact-only fallback.
+    # Faked, not the real vault_intercept module: this suite covers the NEW
+    # wiring inside _write_task, not vault_intercept.py's own regex/keychain
+    # logic (covered by tests/vault-intercept.test.py).
+    class _FakeInterceptResult:
+        def __init__(self, text, stored=(), failed=()):
+            self.text = text
+            self.stored = list(stored)
+            self.failed = list(failed)
+
+    _vault_calls = {"intercept": 0, "redact": 0}
+
+    def _fake_intercept(text):
+        _vault_calls["intercept"] += 1
+        return _FakeInterceptResult(
+            text=text.replace("vault set MY_KEY hunter2", "vault set MY_KEY [STORED]"),
+            stored=["MY_KEY"])
+
+    def _fake_redact(text):
+        _vault_calls["redact"] += 1
+        return text.replace("hunter2", "[VAULT-SET-REDACTED]")
+
+    # TASK's own access_tier field is the broker-attested wire value now (2-arg
+    # _tier_for); LOCAL_TIER is the local cap. Pin both explicitly per case so
+    # the resolved sender_tier is deterministic regardless of suite order.
+    _tier_before_vault_block = rtc.LOCAL_TIER
+    rtc.LOCAL_TIER = "owner"
+    rtc._VAULT_INTERCEPT_FNS = (_fake_intercept, _fake_redact)
+    rtc._write_task({**TASK, "id": "task-VAULTOWNER", "access_tier": "owner",
+                     "task": "[AG2Space @qingyun] vault set MY_KEY hunter2"})
+    _vo_body = (rtc.TASKS_DIR / "task-VAULTOWNER.txt").read_text()
+    check("hunter2" not in _vo_body and "[STORED]" in _vo_body,
+          "owner-tier vault set intercepted and sanitized before persist")
+    check(_vault_calls["intercept"] == 1 and _vault_calls["redact"] == 0,
+          "owner-tier vault set calls intercept, not the plain redactor")
+
+    rtc.LOCAL_TIER = "team"
+    _vault_calls["intercept"] = _vault_calls["redact"] = 0
+    rtc._write_task({**TASK, "id": "task-VAULTTEAM", "access_tier": "owner",
+                     "task": "[AG2Space @qingyun] vault set MY_KEY hunter2"})
+    _vt_body = (rtc.TASKS_DIR / "task-VAULTTEAM.txt").read_text()
+    check("hunter2" not in _vt_body and "[VAULT-SET-REDACTED]" in _vt_body,
+          "non-owner vault set redacted, not stored")
+    check(_vault_calls["intercept"] == 0 and _vault_calls["redact"] == 1,
+          "non-owner vault set never reaches the intercept path")
+
+    def _raising_intercept(text):
+        raise RuntimeError("boom")
+
+    rtc.LOCAL_TIER = "owner"
+    rtc._VAULT_INTERCEPT_FNS = (_raising_intercept, _fake_redact)
+    _vault_calls["redact"] = 0
+    rtc._write_task({**TASK, "id": "task-VAULTRAISE", "access_tier": "owner",
+                     "task": "[AG2Space @qingyun] vault set MY_KEY hunter2"})
+    _vr_body = (rtc.TASKS_DIR / "task-VAULTRAISE.txt").read_text()
+    check("hunter2" not in _vr_body and _vault_calls["redact"] == 1,
+          "intercept exception falls back to redaction — never left unredacted AND unstored")
+    rtc._VAULT_INTERCEPT_FNS = (None, None)
+    rtc.LOCAL_TIER = _tier_before_vault_block
     # Onboarding-token parse: the combined "url|secret" form, and the %7C-encoded
     # separator the desktop connect flow emits (ag2space-cinny-desktop#231). A
     # %7C token must decode so URL is populated — otherwise it parses as a bare
