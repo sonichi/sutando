@@ -1,11 +1,23 @@
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
 	downsample,
 	float32ToInt16,
 	int16ToFloat32,
 	classifyMicError,
+	classifyMicErrorCode,
+	describeAgentFailure,
 	VoiceTransport,
+	CLOSE_CODE_CLIENT_BUSY,
+	CLOSE_CODE_SUPERSEDED_BY_TAKEOVER,
+	CONNECT_TIMEOUT_MS,
+	AGENT_STATE_LEGACY_MS,
+	DISCONNECT_CLOSE_TIMEOUT_MS,
+	VOICE_FAILURE_REMEDIATION,
+	type VoiceConnectFailure,
+	type VoiceTransportOptions,
+	type AgentStateV1,
 } from '../src/web-voice-transport.js';
 
 // Feed a JSON frame straight into the private router. The frame path touches no
@@ -104,7 +116,7 @@ describe('web-voice-transport classifyMicError', () => {
 	});
 });
 
-describe('web-voice-transport turn lifecycle (drift guard vs web-client)', () => {
+describe('web-voice-transport turn lifecycle', () => {
 	it('turn.end fires onTurnEnd and does NOT flush/interrupt (final audio drains)', () => {
 		let ended = 0;
 		let interrupted = 0;
@@ -239,5 +251,1033 @@ describe('web-voice-transport mic-error wording matches the shipped web UI', () 
 	it('classified cases are unaffected by the added message argument', () => {
 		assert.match(classifyMicError('NotAllowedError', 'ignored'), /denied/i);
 		assert.match(classifyMicError('NotFoundError', 'ignored'), /no microphone found/i);
+	});
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Step 15/18 state-machine coverage (impl plan WS1; amendments R10/R12/S6/W5/
+// X6/Z6). The class is driven from Node through the wsFactory seam plus
+// minimal AudioContext/getUserMedia stand-ins — no browser required.
+// ═════════════════════════════════════════════════════════════════════════════
+
+class FakeMicTrack {
+	stopped = false;
+	enabled = true;
+	stop(): void {
+		this.stopped = true;
+	}
+}
+
+class FakeMediaStream {
+	tracks = [new FakeMicTrack()];
+	getTracks(): FakeMicTrack[] {
+		return this.tracks;
+	}
+	getAudioTracks(): FakeMicTrack[] {
+		return this.tracks;
+	}
+}
+
+class FakeAudioContext {
+	static created: FakeAudioContext[] = [];
+	/** State the NEXT constructed context starts in ('running' | 'suspended'). */
+	static nextState = 'running';
+	/** Optional gate awaited inside resume() — lets tests park an attempt
+	 *  inside the exact `await` R10 fences. */
+	static resumeHook: (() => Promise<void>) | null = null;
+
+	state: string;
+	sampleRate = 48000;
+	currentTime = 0;
+	destination = {};
+	bufferSourcesStarted = 0;
+
+	constructor() {
+		this.state = FakeAudioContext.nextState;
+		FakeAudioContext.nextState = 'running';
+		FakeAudioContext.created.push(this);
+	}
+	async resume(): Promise<void> {
+		if (FakeAudioContext.resumeHook) await FakeAudioContext.resumeHook();
+		this.state = 'running';
+	}
+	close(): void {
+		this.state = 'closed';
+	}
+	createMediaStreamSource(): any {
+		return { connect() {} };
+	}
+	createScriptProcessor(): any {
+		return { onaudioprocess: null, connect() {}, disconnect() {} };
+	}
+	createGain(): any {
+		return { gain: { value: 0 }, connect() {} };
+	}
+	createAnalyser(): any {
+		return { fftSize: 0, connect() {} };
+	}
+	createBuffer(_ch: number, len: number, rate: number): any {
+		return { duration: len / rate, getChannelData: () => new Float32Array(len) };
+	}
+	createBufferSource(): any {
+		return {
+			buffer: null,
+			playbackRate: { value: 1 },
+			connect() {},
+			start: () => {
+				this.bufferSourcesStarted++;
+			},
+			stop() {},
+			onended: null,
+		};
+	}
+}
+
+class FakeSocket {
+	static instances: FakeSocket[] = [];
+	url: string;
+	binaryType = '';
+	readyState = 0; // CONNECTING
+	sent: Array<ArrayBuffer | string> = [];
+	closeCalls = 0;
+	onopen: (() => void) | null = null;
+	onmessage: ((ev: { data: unknown }) => void) | null = null;
+	onerror: (() => void) | null = null;
+	onclose: ((ev: { code: number; reason: string }) => void) | null = null;
+
+	constructor(url: string) {
+		this.url = url;
+		FakeSocket.instances.push(this);
+	}
+	send(data: ArrayBuffer | string): void {
+		this.sent.push(data);
+	}
+	close(): void {
+		this.closeCalls++;
+		this.readyState = 3; // CLOSED
+	}
+	// ── test drivers ──
+	open(): void {
+		this.readyState = 1; // OPEN
+		this.onopen?.();
+	}
+	message(obj: unknown): void {
+		this.onmessage?.({ data: JSON.stringify(obj) });
+	}
+	binary(buf: ArrayBuffer): void {
+		this.onmessage?.({ data: buf });
+	}
+	error(): void {
+		this.onerror?.();
+	}
+	serverClose(code: number, reason = ''): void {
+		this.readyState = 3;
+		this.onclose?.({ code, reason });
+	}
+}
+
+// Browser globals the class touches. Each test FILE runs in its own process
+// under the node:test runner, so this stubbing cannot leak into other suites.
+let gumImpl: () => Promise<FakeMediaStream>;
+Object.defineProperty(globalThis, 'AudioContext', {
+	value: FakeAudioContext,
+	configurable: true,
+	writable: true,
+});
+Object.defineProperty(globalThis, 'navigator', {
+	value: { mediaDevices: { getUserMedia: () => gumImpl() } },
+	configurable: true,
+	writable: true,
+});
+
+interface SeenStatus {
+	status: string;
+	detail?: string;
+	close?: { code: number; reason: string };
+}
+
+function harness(opts: Partial<VoiceTransportOptions> = {}) {
+	const statuses: SeenStatus[] = [];
+	const failures: VoiceConnectFailure[] = [];
+	const micErrors: Array<{ name: string; message: string; friendly: string }> = [];
+	const frames: AgentStateV1[] = [];
+	const t = new VoiceTransport({
+		connectTimeoutMs: 20,
+		agentStateLegacyMs: 20,
+		wsFactory: (url: string) => new FakeSocket(url) as unknown as WebSocket,
+		onStatus: (status, detail, close) => statuses.push({ status, detail, close }),
+		onConnectFailure: (f) => failures.push(f),
+		onMicError: (name, message, friendly) => micErrors.push({ name, message, friendly }),
+		onAgentState: (s) => frames.push(s),
+		...opts,
+	});
+	const sock = (): FakeSocket => FakeSocket.instances[FakeSocket.instances.length - 1];
+	return { t, statuses, failures, micErrors, frames, sock };
+}
+
+/** Drive a transport to fully-live over the newest fake socket. */
+async function goLive(h: ReturnType<typeof harness>): Promise<FakeSocket> {
+	await h.t.connect('ws://fake:9900/');
+	const s = h.sock();
+	s.open();
+	await delay(5); // let handleOpen's startMic await settle
+	assert.ok(
+		h.statuses.some((x) => x.status === 'live' && x.detail === 'Live — speak now'),
+		'harness precondition: attempt must reach live',
+	);
+	return s;
+}
+
+beforeEach(() => {
+	FakeSocket.instances = [];
+	FakeAudioContext.created = [];
+	FakeAudioContext.nextState = 'running';
+	FakeAudioContext.resumeHook = null;
+	gumImpl = async () => new FakeMediaStream();
+});
+
+describe('classifyMicErrorCode (Step 15 — machine-readable class)', () => {
+	it('partitions the DOMException names exactly like classifyMicError', () => {
+		for (const n of ['NotAllowedError', 'SecurityError']) {
+			assert.equal(classifyMicErrorCode(n), 'permission');
+		}
+		for (const n of ['NotReadableError', 'AbortError', 'NotFoundError', 'OverconstrainedError']) {
+			assert.equal(classifyMicErrorCode(n), 'device');
+		}
+		assert.equal(classifyMicErrorCode('WeirdError'), 'unknown');
+		assert.equal(classifyMicErrorCode(undefined), 'unknown');
+	});
+});
+
+describe('mute/deafen call controls (Step 15 — reconciled from the cinny surface)', () => {
+	it('setMicMuted gates the capture send path and flips the track', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const processor = (h.t as any).processor;
+		assert.ok(processor?.onaudioprocess, 'capture processor must be wired');
+		const fakeEvent = { inputBuffer: { getChannelData: () => new Float32Array([0.5, -0.5, 0.25, -0.25]) } };
+
+		processor.onaudioprocess(fakeEvent);
+		const sentBefore = s.sent.length;
+		assert.ok(sentBefore > 0, 'unmuted capture must send PCM');
+
+		h.t.setMicMuted(true);
+		processor.onaudioprocess(fakeEvent);
+		assert.equal(s.sent.length, sentBefore, 'muted capture must not send');
+		const track = ((h.t as any).micStream as FakeMediaStream).getAudioTracks()[0];
+		assert.equal(track.enabled, false, 'OS mic indicator: track disabled while muted');
+
+		h.t.setMicMuted(false);
+		processor.onaudioprocess(fakeEvent);
+		assert.ok(s.sent.length > sentBefore, 'unmute resumes sending');
+		assert.equal(track.enabled, true);
+		h.t.disconnect();
+	});
+
+	it('setDeafened drops incoming playback (and undeafen restores it)', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const ctx = FakeAudioContext.created[FakeAudioContext.created.length - 1];
+
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(ctx.bufferSourcesStarted, 1, 'undeafened audio plays');
+
+		h.t.setDeafened(true);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(ctx.bufferSourcesStarted, 1, 'deafened audio is dropped');
+
+		h.t.setDeafened(false);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.equal(ctx.bufferSourcesStarted, 2, 'undeafen resumes playback');
+		h.t.disconnect();
+	});
+});
+
+describe('connect timeout (Step 18 — design 1e)', () => {
+	it('exports the 6s default; the constructor can override it', () => {
+		assert.equal(CONNECT_TIMEOUT_MS, 6000);
+		assert.equal(AGENT_STATE_LEGACY_MS, 3000);
+		assert.equal(DISCONNECT_CLOSE_TIMEOUT_MS, 1500);
+	});
+
+	it('no onopen within the window → latched error + timeout failure; the self-inflicted close never emits closed', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		await delay(45); // > connectTimeoutMs
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'error');
+		assert.equal(h.statuses[h.statuses.length - 1].detail, 'Connection timed out');
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].kind, 'timeout');
+		assert.equal(h.failures[0].remediation, VOICE_FAILURE_REMEDIATION.timeout);
+		assert.ok(s.closeCalls >= 1, 'socket closed on timeout');
+
+		s.serverClose(1006); // the close the timeout triggered
+		assert.ok(!h.statuses.some((x) => x.status === 'closed'), 'terminal latch: no closed after timeout');
+		assert.equal(h.failures.length, 1, 'exactly one failure per attempt');
+	});
+
+	it('timer is cleared on open — a live session never times out retroactively', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		await delay(45);
+		assert.ok(!h.statuses.some((x) => x.status === 'error'), 'no timeout error after open');
+		h.t.disconnect();
+		assert.equal(s.closeCalls, 1);
+	});
+});
+
+describe('attempt-generation fencing (Step 18 / R10)', () => {
+	it('a stale socket\'s onclose cannot clobber a newer attempt', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s1 = h.sock();
+		s1.open();
+		await delay(5);
+		await h.t.connect('ws://fake:9900/'); // second attempt supersedes
+		const s2 = h.sock();
+		assert.notEqual(s1, s2);
+		assert.ok(s1.closeCalls >= 1, 'superseded socket is closed');
+		const before = h.statuses.length;
+		s1.serverClose(1006, 'stale'); // stale close event
+		assert.equal(h.statuses.length, before, 'stale onclose is silently discarded');
+		assert.ok(!h.statuses.some((x) => x.status === 'closed'));
+		h.t.disconnect();
+	});
+
+	it('slow startMic resolving after a second connect() does not touch the new attempt', async () => {
+		const streams: FakeMediaStream[] = [];
+		let releaseFirst!: () => void;
+		const firstGum = new Promise<void>((res) => (releaseFirst = res));
+		let call = 0;
+		gumImpl = async () => {
+			call++;
+			const stream = new FakeMediaStream();
+			streams.push(stream);
+			if (call === 1) await firstGum; // park attempt 1 in the permission prompt
+			return stream;
+		};
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		h.sock().open();
+		await delay(5); // attempt 1 parked inside getUserMedia
+
+		await h.t.connect('ws://fake:9900/'); // supersedes while the prompt is up
+		h.sock().open();
+		await delay(5);
+		const liveCount = h.statuses.filter((x) => x.detail === 'Live — speak now').length;
+		assert.equal(liveCount, 1, 'only the new attempt reports live');
+
+		releaseFirst(); // the old prompt finally resolves
+		await delay(5);
+		assert.equal(streams.length, 2);
+		assert.equal(streams[0].tracks[0].stopped, true, 'stale grant is stopped — no capture leak');
+		assert.equal(streams[1].tracks[0].stopped, false, 'new attempt keeps its mic');
+		assert.equal((h.t as any).micStream, streams[1], 'instance mic belongs to the new attempt');
+		assert.equal(
+			h.statuses.filter((x) => x.detail === 'Live — speak now').length,
+			liveCount,
+			'stale continuation adds no status',
+		);
+		h.t.disconnect();
+	});
+
+	it('disconnect during the connect-side AudioContext.resume await → no replacement socket', async () => {
+		FakeAudioContext.nextState = 'suspended';
+		let release!: () => void;
+		FakeAudioContext.resumeHook = () => new Promise((res) => (release = res));
+		const h = harness();
+		const p = h.t.connect('ws://fake:9900/'); // parks inside resume()
+		await delay(2);
+		assert.equal(FakeSocket.instances.length, 0, 'no socket yet while resume pending');
+		h.t.disconnect();
+		release();
+		await p;
+		await delay(2);
+		assert.equal(FakeSocket.instances.length, 0, 'R10: stale continuation must not create a socket');
+		assert.deepEqual(
+			h.statuses.map((x) => x.status),
+			['connecting', 'closed'],
+			'S6: exactly one synchronous closed; UI not stuck in connecting',
+		);
+	});
+
+	it('disconnect during getUserMedia → grant stopped, exactly one closed, no live', async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((res) => (release = res));
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const stream = new FakeMediaStream();
+			streams.push(stream);
+			await gate;
+			return stream;
+		};
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		h.sock().open();
+		await delay(5); // parked in the prompt
+		h.t.disconnect();
+		release();
+		await delay(5);
+		assert.equal(streams[0].tracks[0].stopped, true, 'no mic capture outlives the attempt');
+		assert.ok(!h.statuses.some((x) => x.detail === 'Live — speak now'));
+		assert.equal(h.statuses.filter((x) => x.status === 'closed').length, 1);
+	});
+});
+
+describe('attempt conclusion invalidates the generation (fix round — server-close-while-parked repro)', () => {
+	/** Park getUserMedia behind a gate and capture every granted stream. */
+	function parkGum() {
+		let release!: () => void;
+		const gate = new Promise<void>((res) => (release = res));
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const stream = new FakeMediaStream();
+			streams.push(stream);
+			await gate;
+			return stream;
+		};
+		return { release: () => release(), streams };
+	}
+
+	it('server close (1006) while getUserMedia is parked → closed stays final, grant stopped, no stats leak', async () => {
+		const gum = parkGum();
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5); // attempt parked in the permission prompt
+		s.serverClose(1006, 'dropped'); // the server drops while the prompt is up
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'closed');
+		assert.equal(h.statuses[h.statuses.length - 1].close?.code, 1006);
+
+		gum.release(); // the user then grants the mic — for a dead attempt
+		await delay(5);
+		assert.equal(
+			h.statuses[h.statuses.length - 1].status,
+			'closed',
+			'the close-derived final status stays — the dead attempt must not resume',
+		);
+		assert.ok(
+			!h.statuses.some((x) => x.detail === 'Live — speak now'),
+			'the dead attempt never reports live',
+		);
+		assert.equal(h.statuses.filter((x) => x.status === 'closed').length, 1, 'exactly one final status');
+		assert.equal(gum.streams.length, 1);
+		assert.equal(gum.streams[0].tracks[0].stopped, true, 'granted tracks stopped — no capture leak');
+		assert.equal((h.t as any).micStream, null, 'no stream captured for the dead attempt');
+		assert.equal((h.t as any).statsTimer, null, 'no statsTimer keeps the runner alive');
+	});
+
+	it('close 4409 while getUserMedia is parked → latched client-busy error survives the late grant', async () => {
+		const gum = parkGum();
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5); // attempt parked in the permission prompt
+		s.serverClose(CLOSE_CODE_CLIENT_BUSY, 'client-busy'); // another surface owns the call
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'error');
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].kind, 'client-busy');
+
+		gum.release();
+		await delay(5);
+		assert.equal(
+			h.statuses[h.statuses.length - 1].status,
+			'error',
+			'latched client-busy error survives — never overwritten by live',
+		);
+		assert.ok(!h.statuses.some((x) => x.detail === 'Live — speak now'));
+		assert.ok(!h.statuses.some((x) => x.status === 'closed'), 'terminal latch holds');
+		assert.equal(h.failures.length, 1, 'exactly one failure per attempt');
+		assert.equal(gum.streams[0].tracks[0].stopped, true, 'granted tracks stopped');
+		assert.equal((h.t as any).statsTimer, null, 'no stats leak');
+	});
+
+	it('R10: disconnect during startMic\'s INTERNAL resume() await — grant stopped, newer attempt untouched', async () => {
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const stream = new FakeMediaStream();
+			streams.push(stream);
+			return stream;
+		};
+		let release!: () => void;
+		const h = harness();
+		await h.t.connect('ws://fake:9900/'); // ctx born 'running' → no connect-side resume
+		h.sock().open(); // handleOpen → startMic parks at the getUserMedia microtask
+		// Suspend the context BEFORE getUserMedia resolves so the await the
+		// attempt parks in is startMic's OWN resume() (post-capture), not
+		// connect()'s — the R10 fence at that await is otherwise uncovered.
+		FakeAudioContext.created[0].state = 'suspended';
+		FakeAudioContext.resumeHook = () => new Promise((res) => (release = res));
+		await delay(5); // getUserMedia resolved → stream captured → parked in resume()
+		assert.equal(streams.length, 1);
+		assert.equal((h.t as any).micStream, streams[0], 'precondition: captured before the resume await');
+
+		h.t.disconnect(); // while parked in resume()
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'closed');
+
+		FakeAudioContext.resumeHook = null; // the newer attempt must not park
+		await h.t.connect('ws://fake:9900/'); // newer attempt while attempt 1 is still parked
+		h.sock().open();
+		await delay(5);
+		assert.equal(streams.length, 2, 'newer attempt captured its own stream');
+		assert.equal((h.t as any).micStream, streams[1], 'newer attempt owns the mic');
+
+		release(); // attempt 1's parked resume finally resolves
+		await delay(5);
+		assert.equal(streams[0].tracks[0].stopped, true, 'attempt-1 grant stopped, not leaked');
+		assert.equal(streams[1].tracks[0].stopped, false, 'stale continuation must not stop the newer mic');
+		assert.equal((h.t as any).micStream, streams[1], 'stale continuation must not clobber micStream');
+		assert.equal(h.statuses.filter((x) => x.status === 'closed').length, 1, 'exactly one closed emitted');
+		assert.equal(
+			h.statuses.filter((x) => x.detail === 'Live — speak now').length,
+			1,
+			'only the newer attempt reports live',
+		);
+		h.t.disconnect();
+	});
+
+	it('a direct second connect() over live flushes the old session\'s scheduled playback', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.ok(((h.t as any).activeSources as unknown[]).length > 0, 'precondition: audio scheduled');
+		await h.t.connect('ws://fake:9900/'); // no disconnect() in between
+		assert.equal(
+			((h.t as any).activeSources as unknown[]).length,
+			0,
+			'old session audio is stopped, not carried into the new attempt',
+		);
+		assert.equal((h.t as any).nextPlayTime, 0, 'playback clock restarts for the new attempt');
+		h.t.disconnect();
+	});
+});
+
+describe('user disconnect() (Step 18 / S6)', () => {
+	it('while connecting: synchronous single closed, socket close, timer cleared', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		h.t.disconnect(); // before open
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'closed');
+		assert.equal(s.closeCalls, 1);
+		s.serverClose(1006); // fenced — must add nothing
+		await delay(45); // past the connect timeout — timer must be cleared
+		assert.equal(h.statuses.filter((x) => x.status === 'closed').length, 1, 'exactly one closed');
+		assert.ok(!h.statuses.some((x) => x.status === 'error'), 'no late timeout after disconnect');
+	});
+
+	it('while live: synchronous single closed + full teardown; double disconnect adds nothing', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const track = ((h.t as any).micStream as FakeMediaStream).getAudioTracks()[0];
+		h.t.disconnect();
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'closed');
+		assert.equal(track.stopped, true, 'mic stopped');
+		assert.equal((h.t as any).statsTimer, null, 'stats stopped');
+		s.serverClose(1000);
+		h.t.disconnect(); // idempotent
+		assert.equal(h.statuses.filter((x) => x.status === 'closed').length, 1, 'exactly one closed');
+	});
+
+	it('after a latched terminal error: cleanup only — the error status is preserved', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		await delay(45); // timeout → latched error
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'error');
+		h.t.disconnect();
+		assert.equal(
+			h.statuses[h.statuses.length - 1].status,
+			'error',
+			'S6: the terminal-error path stays separate — no closed overwrite',
+		);
+	});
+});
+
+describe('disconnect() awaitable teardown (T8 — teardown awaited before lease release)', () => {
+	it('over a live session: the promise resolves only after the socket\'s real close event', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		let resolved = false;
+		const p = h.t.disconnect().then(() => {
+			resolved = true;
+		});
+		assert.equal(
+			h.statuses[h.statuses.length - 1].status,
+			'closed',
+			'the synchronous closed status fires before the promise resolves',
+		);
+		await delay(10);
+		assert.equal(resolved, false, 'not resolved while the close handshake is still in flight');
+		s.serverClose(1000); // the async close handshake completes
+		await p;
+		assert.equal(resolved, true);
+		assert.equal(
+			h.statuses.filter((x) => x.status === 'closed').length,
+			1,
+			'the real close event resolves the promise but adds no second status (still fenced)',
+		);
+	});
+
+	it('close() alias returns the same awaitable completion', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		let resolved = false;
+		void h.t.close().then(() => {
+			resolved = true;
+		});
+		await delay(10);
+		assert.equal(resolved, false, 'alias also waits for the close handshake');
+		s.serverClose(1000);
+		await delay(0);
+		assert.equal(resolved, true);
+	});
+
+	it('with no socket: resolves immediately', async () => {
+		const t = new VoiceTransport();
+		let resolved = false;
+		void t.disconnect().then(() => {
+			resolved = true;
+		});
+		await delay(0);
+		assert.equal(resolved, true, 'no socket ⇒ nothing to await');
+	});
+
+	it('over an already-CLOSED socket: resolves immediately (no close event will ever fire)', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.readyState = 3; // CLOSED under the transport — its event already spent/fenced
+		let resolved = false;
+		void h.t.disconnect().then(() => {
+			resolved = true;
+		});
+		await delay(0);
+		assert.equal(resolved, true, 'already-CLOSED socket ⇒ immediate resolve');
+	});
+
+	it('a wedged handshake is bounded: the fallback resolves after disconnectCloseTimeoutMs', async () => {
+		const h = harness({ disconnectCloseTimeoutMs: 20 });
+		const s = await goLive(h);
+		let resolved = false;
+		void h.t.disconnect().then(() => {
+			resolved = true;
+		});
+		await delay(5);
+		assert.equal(resolved, false, 'still waiting on a close that never comes');
+		await delay(40); // past the injected bound
+		assert.equal(resolved, true, 'fallback fires — a wedged handshake cannot hang teardown');
+		void s; // the fake deliberately never emits close
+	});
+});
+
+describe('closeSettled() — attempt-conclusion close completion (P1: lease release must await the handshake)', () => {
+	it('fresh transport: resolved immediately (no socket ever existed)', async () => {
+		const t = new VoiceTransport();
+		let settled = false;
+		void t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(0);
+		assert.equal(settled, true);
+	});
+
+	it('mic-error while the socket is open → the completion read INSIDE onConnectFailure settles only after the socket close event', async () => {
+		gumImpl = async () => {
+			const err = new Error('denied');
+			err.name = 'NotAllowedError';
+			throw err;
+		};
+		const failures: VoiceConnectFailure[] = [];
+		let atFailure: Promise<void> | null = null;
+		const h = harness({
+			onConnectFailure: (f) => {
+				failures.push(f);
+				// The contract consumers rely on: the completion is already
+				// latched when the failure callback runs.
+				atFailure = h.t.closeSettled();
+			},
+		});
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5); // startMic throws → latched mic error
+		assert.equal(failures[0]?.kind, 'mic-permission');
+		assert.ok(atFailure, 'closeSettled() readable from inside onConnectFailure');
+		assert.ok(s.closeCalls >= 1, 'transport closed its socket');
+		let settled = false;
+		void atFailure!.then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'not settled while the self-inflicted close handshake is in flight');
+		s.serverClose(1006); // the handshake completes
+		await delay(0);
+		assert.equal(settled, true, 'settles once the socket close event fires');
+	});
+
+	it('connect timeout → closeSettled() resolves only after the socket close event', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		await delay(45); // > connectTimeoutMs → latched timeout error
+		assert.equal(h.failures[0]?.kind, 'timeout');
+		let settled = false;
+		void h.t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'timeout latched but the close handshake is still in flight');
+		s.serverClose(1006);
+		await delay(0);
+		assert.equal(settled, true);
+	});
+
+	it('pre-open socket error → closeSettled() resolves only after the trailing close event', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.error(); // pre-open → latched connect-error
+		assert.equal(h.failures[0]?.kind, 'connect-error');
+		let settled = false;
+		void h.t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'error latched but the trailing 1006 close has not fired yet');
+		s.serverClose(1006); // the browser's trailing close
+		await delay(0);
+		assert.equal(settled, true);
+	});
+
+	it('upstream-failed teardown → closeSettled() resolves only after the self-inflicted close event', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.message({
+			type: 'agent.state',
+			v: 1,
+			initialized: true,
+			upstream: 'failed',
+			reason: 'upstream-auth',
+			category: 'auth',
+			clientAttached: true,
+		});
+		assert.equal(h.failures[0]?.kind, 'agent-failed');
+		let settled = false;
+		void h.t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'agent-failed latched but the close handshake is still in flight');
+		s.serverClose(1000); // the self-inflicted close completes
+		await delay(0);
+		assert.equal(settled, true);
+	});
+
+	it('server-initiated closes (plain / 4409 / 4410) → closeSettled() captured at the terminal status is already settled', async () => {
+		for (const code of [4000, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER]) {
+			let captured: Promise<void> | null = null;
+			const h = harness({
+				onStatus: (status, detail, close) => {
+					h.statuses.push({ status, detail, close });
+					if (status === 'closed' || status === 'error' || status === 'superseded') {
+						captured = h.t.closeSettled();
+					}
+				},
+			});
+			const s = await goLive(h);
+			s.serverClose(code, 'server-close');
+			assert.ok(captured, `code ${code}: terminal status observed`);
+			let settled = false;
+			void captured!.then(() => {
+				settled = true;
+			});
+			await delay(0); // no close event, no fallback — a microtask must suffice
+			assert.equal(settled, true, `code ${code}: socket already closed ⇒ completion already settled`);
+		}
+	});
+
+	it('bounded fallback: a wedged self-close handshake resolves after disconnectCloseTimeoutMs', async () => {
+		gumImpl = async () => {
+			const err = new Error('busy');
+			err.name = 'NotReadableError';
+			throw err;
+		};
+		const h = harness({ disconnectCloseTimeoutMs: 20 });
+		await h.t.connect('ws://fake:9900/');
+		h.sock().open();
+		await delay(5); // mic-error latch; the fake deliberately never emits its close event
+		assert.equal(h.failures[0]?.kind, 'mic-device');
+		let settled = false;
+		void h.t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(5);
+		assert.equal(settled, false, 'still awaiting a close that never comes');
+		await delay(40); // past the injected bound
+		assert.equal(settled, true, 'fallback fires — a wedged handshake cannot hang lease release');
+	});
+
+	it('a later disconnect() with the socket already gone returns the still-pending conclusion completion', async () => {
+		// Consumer shape: transport-initiated failure → surface ALSO calls
+		// disconnect() for cleanup. The returned promise must still cover the
+		// in-flight handshake of the socket the latch already closed.
+		gumImpl = async () => {
+			const err = new Error('denied');
+			err.name = 'NotAllowedError';
+			throw err;
+		};
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5); // mic-error latch: socket closed + nulled by the transport
+		assert.equal(h.failures[0]?.kind, 'mic-permission');
+		let settled = false;
+		void h.t.disconnect().then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'disconnect() after the latch still awaits the old handshake');
+		s.serverClose(1006);
+		await delay(0);
+		assert.equal(settled, true);
+	});
+});
+
+describe('`agent.state` client handling (Step 18 — design 1a′)', () => {
+	const frame = (over: Partial<AgentStateV1>): AgentStateV1 => ({
+		type: 'agent.state',
+		v: 1,
+		initialized: true,
+		upstream: 'live',
+		clientAttached: true,
+		...over,
+	});
+
+	it('legacy server: no frame within the window ⇒ behavior identical to today', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		assert.equal(h.t.agentStateSupport, 'unknown');
+		await delay(45); // > agentStateLegacyMs
+		assert.equal(h.t.agentStateSupport, 'legacy');
+		assert.deepEqual(
+			h.statuses.map((x) => x.status),
+			['connecting', 'live', 'live'],
+			'exactly the pre-protocol status sequence — no error, no extra states',
+		);
+		assert.equal(h.failures.length, 0);
+		assert.equal(h.frames.length, 0);
+		h.t.disconnect();
+		void s;
+	});
+
+	it('connecting/backoff frames are progress detail, never an error', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.message(frame({ upstream: 'connecting' }));
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'live');
+		assert.equal(h.statuses[h.statuses.length - 1].detail, 'Waking up…');
+		s.message(frame({ upstream: 'backoff' }));
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'live');
+		assert.equal(h.statuses[h.statuses.length - 1].detail, 'Reconnecting to the model…');
+		assert.equal(h.failures.length, 0, 'backoff must not produce a failure');
+		assert.ok(!h.statuses.some((x) => x.status === 'error'));
+		// idle→connecting→live is the normal wake-up: live after progress restores the live detail
+		s.message(frame({ upstream: 'live' }));
+		assert.equal(h.statuses[h.statuses.length - 1].detail, 'Live — speak now');
+		assert.equal(h.t.agentStateSupport, 'v1');
+		assert.equal(h.frames.length, 3, 'every frame forwarded to onAgentState');
+		h.t.disconnect();
+	});
+
+	it('upstream failed = terminal CLIENT transition: teardown, close, latched classified error, suppressed onclose', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const track = ((h.t as any).micStream as FakeMediaStream).getAudioTracks()[0];
+		s.message(frame({ upstream: 'failed', reason: 'upstream-auth', category: 'auth' }));
+
+		const last = h.statuses[h.statuses.length - 1];
+		assert.equal(last.status, 'error');
+		assert.match(last.detail!, /credential/i, 'classified auth detail');
+		assert.equal(track.stopped, true, 'mic stopped — not streaming behind the error card');
+		assert.equal((h.t as any).statsTimer, null, 'stats stopped');
+		assert.ok(s.closeCalls >= 1, 'client closes the socket itself (server stays reachable)');
+		assert.equal((h.t as any).ws, null);
+
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].kind, 'agent-failed');
+		assert.equal(h.failures[0].reason, 'upstream-auth');
+		assert.equal(h.failures[0].category, 'auth');
+		assert.match(h.failures[0].remediation, /key|voice setup/i);
+
+		s.serverClose(1000); // the self-inflicted close
+		assert.ok(!h.statuses.some((x) => x.status === 'closed'), 'suppressed — error stays latched');
+	});
+
+	it('describeAgentFailure classifies auth/quota/network/other', () => {
+		assert.match(describeAgentFailure('r', 'auth').detail, /credential/i);
+		assert.match(describeAgentFailure('r', 'quota').detail, /quota|credits/i);
+		assert.match(describeAgentFailure('r', 'network').detail, /reach/i);
+		assert.match(describeAgentFailure('r', undefined).detail, /upstream failed/i);
+	});
+});
+
+describe('close-code decoding (Step 18 — W5 client-busy 4409 + superseded 4410)', () => {
+	it('4409 → terminal client-busy error with close info + take-over remediation', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.serverClose(CLOSE_CODE_CLIENT_BUSY, 'client-busy');
+		const last = h.statuses[h.statuses.length - 1];
+		assert.equal(last.status, 'error');
+		assert.equal(last.close?.code, 4409);
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].kind, 'client-busy');
+		assert.equal(h.failures[0].close?.code, 4409);
+		assert.match(h.failures[0].detail, /in use/i);
+		assert.match(h.failures[0].remediation, /take over/i);
+		assert.ok(!h.statuses.some((x) => x.status === 'closed'), 'not a plain close');
+	});
+
+	it('4410 → its own terminal superseded state, no connect failure, disconnect preserves it', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const track = ((h.t as any).micStream as FakeMediaStream).getAudioTracks()[0];
+		s.serverClose(CLOSE_CODE_SUPERSEDED_BY_TAKEOVER, 'superseded-by-takeover');
+		const last = h.statuses[h.statuses.length - 1];
+		assert.equal(last.status, 'superseded');
+		assert.equal(last.close?.code, 4410);
+		assert.equal(track.stopped, true, 'audio torn down for the moved call');
+		assert.equal(h.failures.length, 0, 'a takeover is not a connect failure');
+		h.t.disconnect();
+		assert.equal(
+			h.statuses[h.statuses.length - 1].status,
+			'superseded',
+			'terminal latch: no closed overwrite',
+		);
+	});
+});
+
+describe('pre-open failures (Step 18 / Z6 — the browser-observable kind is connect-error)', () => {
+	it('onerror before open → latched connect-error; the trailing 1006 close is suppressed', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.error();
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'error');
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].kind, 'connect-error');
+		s.serverClose(1006);
+		assert.ok(!h.statuses.some((x) => x.status === 'closed'));
+		assert.equal(h.failures.length, 1, 'exactly one failure per attempt');
+	});
+
+	it('pre-open close without onerror → connect-error carrying the close info', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		h.sock().serverClose(1006, '');
+		const last = h.statuses[h.statuses.length - 1];
+		assert.equal(last.status, 'error');
+		assert.equal(last.close?.code, 1006);
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].kind, 'connect-error');
+		assert.equal(h.failures[0].close?.code, 1006);
+	});
+
+	it('post-open ordinary close stays a plain closed with code/reason (surface reconnect policy)', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.serverClose(4000, 'goodbye');
+		const last = h.statuses[h.statuses.length - 1];
+		assert.equal(last.status, 'closed');
+		assert.equal(last.close?.code, 4000);
+		assert.equal(last.close?.reason, 'goodbye');
+		assert.equal(h.failures.length, 0);
+	});
+});
+
+describe('mic failure classification (Step 18 / R12 + X6)', () => {
+	async function failMic(name: string, message = 'boom') {
+		gumImpl = async () => {
+			const err = new Error(message);
+			err.name = name;
+			throw err;
+		};
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5);
+		return { h, s };
+	}
+
+	it('NotAllowedError → mic-permission failure + onMicError + latched error', async () => {
+		const { h, s } = await failMic('NotAllowedError');
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'error');
+		assert.equal(h.micErrors.length, 1);
+		assert.match(h.micErrors[0].friendly, /denied/i);
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].kind, 'mic-permission');
+		assert.ok(s.closeCalls >= 1, 'no auto-reconnect loop on a hard mic failure');
+		s.serverClose(1006);
+		assert.ok(!h.statuses.some((x) => x.status === 'closed'), 'latched — no closed overwrite');
+	});
+
+	it('NotReadableError → mic-device', async () => {
+		const { h } = await failMic('NotReadableError');
+		assert.equal(h.failures[0].kind, 'mic-device');
+		assert.match(h.failures[0].detail, /in use/i);
+	});
+
+	it('X6: unclassified DOM exception → mic-other with Retry remediation (never credential repair)', async () => {
+		const { h } = await failMic('SomethingNewError');
+		assert.equal(h.failures[0].kind, 'mic-other');
+		assert.equal(h.failures[0].remediation, 'Retry.');
+		assert.doesNotMatch(h.failures[0].remediation, /key|credential|setup/i);
+	});
+});
+
+describe('transport public API additions (Steps 15/16/18)', () => {
+	it('sendTextInput: false when not open, true + JSON frame when live', async () => {
+		const h = harness();
+		assert.equal(h.t.sendTextInput('hi'), false);
+		const s = await goLive(h);
+		const before = s.sent.length;
+		assert.equal(h.t.sendTextInput('hello agent'), true);
+		const sent = s.sent[s.sent.length - 1];
+		assert.equal(typeof sent, 'string');
+		assert.deepEqual(JSON.parse(sent as string), { type: 'text_input', text: 'hello agent' });
+		assert.equal(s.sent.length, before + 1);
+		h.t.disconnect();
+	});
+
+	it('setPlaybackRate drives subsequent playback scheduling', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		h.t.setPlaybackRate(1.2);
+		s.binary(new Int16Array([100, 200, 300]).buffer);
+		assert.equal((h.t as any).playbackRate, 1.2);
+		h.t.disconnect();
+	});
+
+	it('failure-union remediation table covers every kind exactly once', () => {
+		const kinds = [
+			'timeout',
+			'connect-error',
+			'mic-permission',
+			'mic-device',
+			'mic-other',
+			'agent-failed',
+			'service-down',
+			'client-busy',
+		];
+		assert.deepEqual(Object.keys(VOICE_FAILURE_REMEDIATION).sort(), [...kinds].sort());
+		for (const k of kinds) {
+			assert.ok(
+				(VOICE_FAILURE_REMEDIATION as Record<string, string>)[k].length > 0,
+				k + ' has a remediation hint',
+			);
+		}
 	});
 });

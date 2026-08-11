@@ -19,6 +19,7 @@ Usage:
 """
 from __future__ import annotations
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -88,8 +89,16 @@ def _workspace_root() -> Path:
             pass
         # Last-ditch default: the canonical post-v0.8 home-dir location
         # (~/sutando-workspace, matching sutando_config.py resolve_workspace) —
-        # NOT the pre-v0.8 dotted ~/.sutando/workspace, which no longer exists.
+        # The pre-v0.8 dotted path is no longer RESOLVED to, but may still exist
+        # and still take writes — health-check reports that divergence.
         return Path.home() / "sutando-workspace"
+
+
+def legacy_dotted_workspace() -> Path:
+    """The pre-v0.8 dotted workspace dir. NOT resolved to any more — but it can
+    still exist on disk and still take writes, which is why one file owns the
+    literal instead of each caller writing it fresh."""
+    return Path.home() / ".sutando" / "workspace"
 
 
 def _host_label() -> str:
@@ -324,6 +333,19 @@ def claude_home_path(*subpath: str, vanilla: bool = False) -> Path:
     if not subpath:
         return base
     return base.joinpath(*subpath)
+
+
+def claude_project_slug(path: str | Path) -> str:
+    """Derive the project slug Claude Code uses under `projects/<slug>/`.
+
+    Claude Code dashes every non-alphanumeric character of the path, not
+    just "/" — matching only "/" resolves to a nonexistent dir on any path
+    containing a space or dot (e.g. a desktop-bundled checkout under
+    "Application Support/space.ag2.app/"). Every caller must derive the slug
+    through this one function rather than re-implementing the regex, so the
+    derivation can't drift out of sync again.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
 def channel_access_path(source: str) -> Path:
