@@ -2,14 +2,10 @@
 messages. OPT-IN (SPARROW_OBSERVE_REACT=1) — it scopes by room_id alone."""
 from __future__ import annotations
 
-import json
 import os
 import queue
 import threading
 import time
-import urllib.error
-import urllib.request
-from urllib.parse import quote
 
 # 👀 = "observed" — distinct from the task-intake ack the gateway emits
 # server-side, so a glance separates "seen" from "accepted as a task".
@@ -29,21 +25,17 @@ _MAX_AGE_S_DEFAULT = 300.0
 
 
 class ReactObserverHandler:
-    """Tee wrapper: react 👀 to others' new messages, then delegate offer()."""
+    """Tee wrapper: react 👀 to others' new messages, then delegate offer().
 
-    def __init__(self, inner, base_url: str, headers: dict, agent_mxid: str,
-                 log=print, timeout: float = 10.0, queue_cap: int = _QUEUE_CAP,
-                 max_age_s: "float | None" = None):
+    `react(room_id, message_id, key)` is injected by the adapter edge — this
+    module owns receipt policy only, never the room-verb endpoint surface."""
+
+    def __init__(self, inner, react, agent_mxid: str, log=print,
+                 queue_cap: int = _QUEUE_CAP, max_age_s: "float | None" = None):
         self._inner = inner
-        self._base = base_url.rstrip("/")
-        self._headers = dict(headers)
-        self._headers["Content-Type"] = "application/json"
-        # Same explicit UA as the event channel — the gateway's edge rejects
-        # urllib's default UA with 403.
-        self._headers.setdefault("User-Agent", "sutando-gateway-client/1.0")
+        self._react = react
         self._mxid = agent_mxid
         self._log = log
-        self._timeout = timeout
         if max_age_s is None:
             try:
                 max_age_s = float(os.environ.get("SPARROW_OBSERVE_MAX_AGE_S")
@@ -95,14 +87,8 @@ class ReactObserverHandler:
             if isinstance(ts, (int, float)) and ts > 0:
                 if (time.time() - ts / 1000.0) > self._max_age_s:
                     return
-        # safe="" — the default safe="/" would split a room id containing "/"
-        # across path segments and misroute the react.
-        url = f"{self._base}/v1/rooms/{quote(str(room), safe='')}/react"
-        data = json.dumps({"event_id": msg_id, "key": OBSERVE_REACTION}).encode()
-        req = urllib.request.Request(url, data=data, headers=self._headers,
-                                     method="POST")
         try:
-            self._queue.put_nowait((msg_id, req))
+            self._queue.put_nowait((msg_id, room))
         except queue.Full:
             self._log(f"react-observer: queue full, dropping receipt for {msg_id}")
             return
@@ -121,19 +107,17 @@ class ReactObserverHandler:
 
     def _deliver_loop(self) -> None:
         while True:
-            msg_id, req = self._queue.get()
+            msg_id, room = self._queue.get()
             try:
-                self._send(msg_id, req)
+                self._send(msg_id, room)
             finally:
                 self._queue.task_done()
 
-    def _send(self, msg_id, req) -> None:
+    def _send(self, msg_id, room) -> None:
         try:
-            urllib.request.urlopen(req, timeout=self._timeout).close()
-        except urllib.error.HTTPError as e:
-            # Duplicate-react rejections (a previous run already reacted) and
-            # permission degrades are benign for a courtesy receipt.
-            self._log(f"react-observer: HTTP {e.code} reacting to {msg_id} (ignored)")
+            self._react(room, msg_id, OBSERVE_REACTION)
+        # Duplicate-react rejections (a previous run already reacted) and
+        # permission degrades are benign for a courtesy receipt.
         except Exception as e:  # noqa: BLE001 — the worker must never die
             self._log(f"react-observer: error reacting to {msg_id}: {e} (ignored)")
 

@@ -2326,6 +2326,18 @@ def _acquire_singleton() -> bool:
     return True
 
 
+def _react_sender(timeout: int = 10):
+    """The 👀 receipt's room-verb call. Lives here because the room-verb
+    endpoint surface is frozen to this adapter edge, not to sparrow modules."""
+    def _react(room_id, message_id, key) -> None:
+        # safe="" — the default safe="/" would split a room id containing "/"
+        # across path segments and misroute the react.
+        safe_room = urllib.parse.quote(str(room_id), safe="")
+        _req("POST", f"/v1/rooms/{safe_room}/react",
+             {"event_id": message_id, "key": key}, timeout=timeout)
+    return _react
+
+
 def _maybe_start_event_channel() -> None:
     """AWP P0: start the persistent Workspace-Event channel in its OWN daemon
     thread, ISOLATED from task delivery. Opt-in (SPARROW_EVENTS truthy) and
@@ -2370,9 +2382,8 @@ def _maybe_start_event_channel() -> None:
             mxid = os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID")
             if mxid:
                 from .default_observer import ReactObserverHandler
-                handler = ReactObserverHandler(
-                    handler, URL, {"Authorization": f"Bearer {TOKEN}"}, mxid,
-                    log=_log)
+                handler = ReactObserverHandler(handler, _react_sender(), mxid,
+                                               log=_log)
             else:
                 _log("react-observer: AGENT_MXID/AGENT_ID unset — observed-receipt off")
         consumer = EventConsumer(inbox, handler)

@@ -52,8 +52,17 @@ class _Net:
             raise self.raise_exc
 
         class _R:
+            def read(self):
+                return b""
+
             def close(self):
                 pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
         return _R()
 
 
@@ -62,9 +71,23 @@ def _msg(eid="e1", actor="@alice:hs", room="!r:hs", mid="m1", etype="message.cre
             "room_id": room, "content": {"message_id": mid}}
 
 
+_BRIDGE = None
+
+
+def _react_sender():
+    """The REAL sender from the allowlisted adapter edge, so the URL-shape
+    assertions below stay on the code that builds the URL."""
+    global _BRIDGE
+    if _BRIDGE is None:
+        os.environ["AGENT_CONNECT_STATE_DIR"] = tempfile.mkdtemp()
+        os.environ["REMOTE_TASK_URL"] = "https://gw.example/relay"
+        os.environ["REMOTE_TASK_TOKEN"] = "dummy-secret"
+        _BRIDGE = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+    return _BRIDGE._react_sender()
+
+
 def _handler(net, inner=None, mxid="@me:hs"):
-    h = ReactObserverHandler(inner or _Inner(), "https://gw.example/relay",
-                             {"Authorization": "Bearer t"}, mxid,
+    h = ReactObserverHandler(inner or _Inner(), _react_sender(), mxid,
                              log=lambda *_: None)
     urllib.request.urlopen, orig = net, urllib.request.urlopen
     return h, orig
@@ -204,8 +227,7 @@ def test_queue_overflow_drops_never_blocks():
 
     net = _BlockedNet()
     logs = []
-    h = ReactObserverHandler(_Inner(), "https://gw.example/relay",
-                             {"Authorization": "Bearer t"}, "@me:hs",
+    h = ReactObserverHandler(_Inner(), _react_sender(), "@me:hs",
                              log=logs.append, queue_cap=2)
     urllib.request.urlopen, orig = net, urllib.request.urlopen
     try:
