@@ -55,9 +55,10 @@ seconds and return as soon as work is available.
 Return `{"tasks": []}` on long-poll timeout. The client uses an HTTP timeout of
 `wait + 10s`, so the server must respond within `wait` seconds.
 
-A task object **must** carry a unique `"id"`. Any additional string fields
-(`task`, `source`, `channel_id`, `user_id`, `priority`, …) are written verbatim
-into the local task file the core consumes.
+A task object **must** carry a unique `"id"`. Recognized string fields
+(`task`, `source`, `channel_id`, `user_id`, `priority`, …) are newline-confined
+and written into the local task file the core consumes. For AG2 Space, the
+broker also supplies its room-policy `access_tier` attestation.
 
 ### `POST /v1/tasks/<id>/ack`
 
@@ -90,9 +91,13 @@ body: {
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-room-trusted-runtime"]
 }
 ```
+
+`team-room-trusted-runtime` tells the AG2 Space control plane that this gateway
+understands the per-room Team execution policy. Gateways without it safely keep
+Team on their prior read-only path.
 
 ## Media markers (optional)
 
@@ -131,16 +136,22 @@ gateway-controlled URL can never bounce a bearer to another host.
 
 ## Security
 
-- Inbound tasks are **not trusted to set their own access tier.** The bridge
-  stamps every task with the local `REMOTE_TASK_TIER` as the last `access_tier:`
-  line, so a task body cannot forge a higher tier. **Default is `owner`** for the
-  personal-agent model (2026-07-08): the gateway authenticates with its owner's
-  own bearer and the broker owner-scopes every pull, so its tasks are the
-  owner's own (e.g. voice delegations); trust derives from the broker's
-  owner-scoping, not from the gateway process or the task's claim. A **shared /
-  multi-user gateway** (one that could pull tasks not scoped to a single owner)
-  MUST set `REMOTE_TASK_TIER=team` (or `other`) explicitly. An invalid value
-  fails **closed** to `team`.
+- Inbound message text is **not trusted to set its own access tier.** Effective
+  access is the lower of the broker-attested room tier and the owner-controlled
+  local cap (`REMOTE_TASK_TIER`, optionally narrowed per sender by
+  `channels/ag2space/access.json` `tierMap`). Missing or invalid broker values
+  fail closed to Guest. Every serialized wire field is newline-confined, and the
+  bridge emits the resolved `access_tier:` independently, so message text cannot
+  forge a higher tier.
+- A broker-attested AG2 Space **Team** room is the explicit trusted-runtime
+  opt-in. Only when both broker and effective tier are Team does the bridge add
+  one `team_runtime: trusted` line before the task body. A local owner-to-Team
+  cap does not opt a room in; old gateways and missing/malformed stamps keep the
+  established read-only Team path. This setting is therefore controlled per
+  room alongside Owner and Guest, rather than by a host-wide environment flag.
+- The default local cap remains `owner` for the personal-agent model. A shared /
+  multi-user gateway SHOULD set a lower local cap as defense in depth. Invalid
+  local cap values fail closed to Guest.
 - The token is a per-host credential; keep it in the channel `.env`
   (host-local), not in the synced workspace.
 

@@ -30,11 +30,21 @@ assert spec.loader is not None
 spec.loader.exec_module(worker)
 
 
-def _task(workspace: Path, task_id: str, tier: str = "owner") -> Path:
+def _task(
+    workspace: Path,
+    task_id: str,
+    tier: str = "owner",
+    *,
+    trusted_team_room: bool | None = None,
+) -> Path:
     path = workspace / "tasks" / f"{task_id}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if trusted_team_room is None:
+        trusted_team_room = tier == "team"
+    runtime_stamp = "team_runtime: trusted\n" if trusted_team_room else ""
     path.write_text(
-        f"id: {task_id}\nsource: discord\naccess_tier: {tier}\ntask: do the thing\n",
+        f"{runtime_stamp}id: {task_id}\nsource: discord\n"
+        f"access_tier: {tier}\ntask: do the thing\n",
         encoding="utf-8",
     )
     return path
@@ -80,8 +90,7 @@ def test_resolution_routes_bounded_tiers_before_owner_workstreams() -> None:
         assert worker.resolve_workstream(workspace, team) is None
         assert worker.resolve_workstream(workspace, _task(workspace, "task-ungrouped")) is None
         assert worker.probe("claude", workspace, owner) == 0
-        with mock.patch.dict(os.environ, {worker.TEAM_TRUSTED_OPT_IN_ENV: "1"}, clear=False):
-            assert worker.probe("claude", workspace, team) == worker.MUST_HANDLE
+        assert worker.probe("claude", workspace, team) == worker.MUST_HANDLE
         assert worker.probe("claude", workspace, _task(workspace, "task-guest", "guest")) == worker.UNHANDLED
 
 
@@ -91,17 +100,16 @@ def test_team_keeps_the_sandboxed_path_until_an_operator_opts_in() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         workspace = root / "workspace"
-        team = _task(workspace, "task-team-consent", "team")
+        team = _task(
+            workspace, "task-team-consent", "team", trusted_team_room=False)
         results = workspace / "results"
         results.mkdir(parents=True, exist_ok=True)
 
         # A provider on PATH that would fail loudly if it were ever launched.
         _executable(root / "claude", "#!/bin/sh\necho LAUNCHED >&2\nexit 0\n")
-        env = {"PATH": f"{root}:{os.environ['PATH']}",
-             worker.TEAM_TRUSTED_OPT_IN_ENV: "1"}
+        env = {"PATH": f"{root}:{os.environ['PATH']}"}
 
         with mock.patch.dict(os.environ, env, clear=False):
-            os.environ.pop(worker.TEAM_TRUSTED_OPT_IN_ENV, None)
             assert worker.probe("claude", workspace, team) == worker.UNHANDLED
             # Normal direct call declines at probe.
             assert worker.handle("claude", workspace, team, results, REPO) == worker.UNHANDLED
@@ -118,39 +126,29 @@ def test_team_keeps_the_sandboxed_path_until_an_operator_opts_in() -> None:
             "a declined team task must not publish a result"
 
 
-def test_team_opt_in_is_an_allow_list_not_truthiness() -> None:
-    """bool("false") is True, so a truthy-looking value must not grant the
-    trusted runtime."""
+def test_team_room_opt_in_requires_one_trusted_pre_body_stamp() -> None:
     with tempfile.TemporaryDirectory() as td:
         workspace = Path(td)
-        team = _task(workspace, "task-team-parse", "team")
-        for value in ("false", "0", "no", "off", "", "  ", "maybe", "2", "disabled"):
-            with mock.patch.dict(os.environ,
-                                 {worker.TEAM_TRUSTED_OPT_IN_ENV: value}, clear=False):
-                assert worker.team_trusted_runtime_enabled() is False, \
-                    f"{value!r} must not enable the trusted runtime"
-                assert worker.probe("claude", workspace, team) == worker.UNHANDLED
-        for value in ("1", "true", "TRUE", " yes ", "on"):
-            with mock.patch.dict(os.environ,
-                                 {worker.TEAM_TRUSTED_OPT_IN_ENV: value}, clear=False):
-                assert worker.team_trusted_runtime_enabled() is True, \
-                    f"{value!r} must enable the trusted runtime"
+        for value in ("false", "1", "owner", "", "trusted-now"):
+            team = _task(
+                workspace, f"task-team-{value or 'empty'}", "team",
+                trusted_team_room=False,
+            )
+            team.write_text(f"team_runtime: {value}\n" + team.read_text())
+            assert worker.team_trusted_runtime_enabled(team) is False
+            assert worker.probe("claude", workspace, team) == worker.UNHANDLED
 
-
-def test_team_opt_in_uses_declared_manifest_default_after_env() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        manifest = Path(td) / "manifest.json"
-        manifest.write_text(json.dumps({"config": {
-            worker.TEAM_TRUSTED_OPT_IN_ENV: "1",
-        }}))
-        assert worker.team_trusted_runtime_enabled({}, manifest) is True
+        trusted = _task(workspace, "task-team-trusted", "team")
+        assert worker.team_trusted_runtime_enabled(trusted) is True
+        duplicate = _task(workspace, "task-team-duplicate-stamp", "team")
+        duplicate.write_text("team_runtime: trusted\n" + duplicate.read_text())
+        assert worker.team_trusted_runtime_enabled(duplicate) is False
+        after_body = _task(
+            workspace, "task-team-after-body", "team", trusted_team_room=False)
+        after_body.write_text(after_body.read_text() + "team_runtime: trusted\n")
+        assert worker.team_trusted_runtime_enabled(after_body) is False
         assert worker.team_trusted_runtime_enabled(
-            {worker.TEAM_TRUSTED_OPT_IN_ENV: "0"}, manifest) is False
-        manifest.write_text("not json")
-        assert worker.team_trusted_runtime_enabled({}, manifest) is False
-
-    shipped = json.loads(worker.TEAM_MANIFEST_PATH.read_text())
-    assert shipped["config"][worker.TEAM_TRUSTED_OPT_IN_ENV] == "0"
+            workspace / "tasks" / "missing.txt") is False
 
 
 def test_tier_parser_prevents_task_body_escalation_and_fails_closed() -> None:
@@ -193,7 +191,6 @@ print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
         settings.write_text("{}")
         env = {
             "PATH": f"{root}:{os.environ['PATH']}",
-            worker.TEAM_TRUSTED_OPT_IN_ENV: "1",
             "PROVIDER_LOG": str(log),
             "SUTANDO_ISOLATED_WORKING_DIR": str(project),
             "SUTANDO_ISOLATED_CLAUDE_SETTINGS": str(settings),
@@ -243,7 +240,6 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('safe codex result\\n')
 """)
         env = {
             "PATH": f"{root}:{os.environ['PATH']}",
-            worker.TEAM_TRUSTED_OPT_IN_ENV: "1",
             "PROVIDER_LOG": str(log),
             "SUTANDO_ISOLATED_WORKING_DIR": str(project),
         }
@@ -265,6 +261,83 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('safe codex result\\n')
         assert (workspace / "results" / team.name).read_text() == "safe codex result\n"
 
 
+def test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        project = root / "project"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        project.mkdir()
+
+        package_root = REPO / "packages" / "ag2-sparrow"
+        sys.path.insert(0, str(package_root))
+        try:
+            import ag2_sparrow.remote_gateway_bridge as gateway
+        finally:
+            sys.path.remove(str(package_root))
+
+        saved = {
+            "TASKS_DIR": gateway.TASKS_DIR,
+            "ARCHIVE_RESULTS_DIR": gateway.ARCHIVE_RESULTS_DIR,
+            "LOCAL_TIER": gateway.LOCAL_TIER,
+            "_load_tier_map": gateway._load_tier_map,
+        }
+        gateway.TASKS_DIR = tasks
+        gateway.ARCHIVE_RESULTS_DIR = results / "archive"
+        gateway.LOCAL_TIER = "owner"
+        gateway._load_tier_map = lambda: {}
+        try:
+            task_id = gateway._write_task({
+                "id": "task-room-team-e2e",
+                "task": "create the requested artifact",
+                "source": "ag2space",
+                "user_id": "@teammate:ag2.space",
+                "access_tier": "team",
+            })
+            assert task_id == "task-room-team-e2e"
+            team_task = tasks / f"{task_id}.txt"
+            serialized = team_task.read_text()
+            assert serialized.count("team_runtime: trusted") == 1
+            assert serialized.index("team_runtime: trusted") < serialized.index("task:")
+
+            _executable(root / "claude", """#!/usr/bin/env python3
+import json, pathlib
+pathlib.Path('room-team-work.txt').write_text('completed by Team\\n')
+print(json.dumps({'type': 'result', 'result': 'room Team task complete'}))
+""")
+            scanner = types.SimpleNamespace(
+                filter_chat_secrets=lambda body: types.SimpleNamespace(
+                    detected=False, secret_types=(), text=body))
+            with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
+                run = _run("claude", workspace, team_task, {
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "SUTANDO_ISOLATED_WORKING_DIR": str(project),
+                })
+            assert run.returncode == 0
+            assert (project / "room-team-work.txt").read_text() == "completed by Team\n"
+            assert (results / team_task.name).read_text() == "room Team task complete"
+
+            # A node-side owner→Team cap is a safety downgrade, not room consent.
+            gateway.LOCAL_TIER = "team"
+            capped_id = gateway._write_task({
+                "id": "task-local-team-cap-e2e",
+                "task": "must stay read-only",
+                "source": "ag2space",
+                "user_id": "@owner:ag2.space",
+                "access_tier": "owner",
+            })
+            capped_task = tasks / f"{capped_id}.txt"
+            assert "access_tier: team" in capped_task.read_text()
+            assert "team_runtime: trusted" not in capped_task.read_text()
+            assert worker.probe("claude", workspace, capped_task) == worker.UNHANDLED
+        finally:
+            for name, value in saved.items():
+                setattr(gateway, name, value)
+
+
 def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -274,8 +347,9 @@ def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
             "#!/bin/sh\nprintf 'provider unavailable\\n' >&2\nexit 9\n",
         )
         task = _task(workspace, "task-team-fail-closed", "team")
-        result = _run("claude", workspace, task, {"PATH": f"{root}:{os.environ['PATH']}",
-             worker.TEAM_TRUSTED_OPT_IN_ENV: "1"})
+        result = _run("claude", workspace, task, {
+            "PATH": f"{root}:{os.environ['PATH']}",
+        })
         assert result.returncode == 0
         body = (workspace / "results" / task.name).read_text()
         assert "configured runtime was unavailable" in body
@@ -294,7 +368,6 @@ def test_stalled_team_runtime_is_killed_and_publishes_safe_result() -> None:
         started = time.monotonic()
         result = _run("claude", workspace, task, {
             "PATH": f"{root}:{os.environ['PATH']}",
-            worker.TEAM_TRUSTED_OPT_IN_ENV: "1",
             "SUTANDO_TIER_STALL_TIMEOUT": "0.15",
             "SUTANDO_TIER_HARD_TIMEOUT": "1",
         })
@@ -358,8 +431,7 @@ print(json.dumps({{'type': 'result', 'result': 'token={secret}'}}))
         with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
             result = _run(
                 "claude", workspace, task,
-                {"PATH": f"{root}:{os.environ['PATH']}",
-             worker.TEAM_TRUSTED_OPT_IN_ENV: "1"},
+                {"PATH": f"{root}:{os.environ['PATH']}"},
             )
         assert result.returncode == 0
         published = (workspace / "results" / task.name).read_text()
@@ -384,8 +456,7 @@ print(json.dumps({'type': 'result', 'result': 'ordinary result'}))
         with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
             result = _run(
                 "claude", workspace, task,
-                {"PATH": f"{root}:{os.environ['PATH']}",
-             worker.TEAM_TRUSTED_OPT_IN_ENV: "1"},
+                {"PATH": f"{root}:{os.environ['PATH']}"},
             )
         published = (workspace / "results" / task.name).read_text()
         assert "configured runtime was unavailable" in published
@@ -509,10 +580,7 @@ def test_team_empty_results_and_duplicate_claims_fail_safely() -> None:
         results = workspace / "results"
         results.mkdir()
         task = _task(workspace, "task-team-empty", "team")
-        opt_in = mock.patch.dict(
-            os.environ, {worker.TEAM_TRUSTED_OPT_IN_ENV: "1"}, clear=False)
         with (
-            opt_in,
             mock.patch.object(worker, "_run_team", return_value="   "),
             redirect_stderr(io.StringIO()),
         ):
@@ -521,7 +589,6 @@ def test_team_empty_results_and_duplicate_claims_fail_safely() -> None:
 
         duplicate = _task(workspace, "task-team-duplicate", "team")
         with (
-            mock.patch.dict(os.environ, {worker.TEAM_TRUSTED_OPT_IN_ENV: "1"}, clear=False),
             mock.patch.object(worker, "_completed_result_exists", side_effect=[False, True]),
             mock.patch.object(worker, "_run_team") as run_team,
         ):
@@ -628,8 +695,9 @@ def test_nonzero_provider_stdout_is_never_written_as_a_result() -> None:
         )
         task = _task(workspace, "task-fail")
         _store(workspace, {"task-fail": {"workstream_id": "workstream-a"}})
-        result = _run("claude", workspace, task, {"PATH": f"{root}:{os.environ['PATH']}",
-             worker.TEAM_TRUSTED_OPT_IN_ENV: "1"})
+        result = _run("claude", workspace, task, {
+            "PATH": f"{root}:{os.environ['PATH']}",
+        })
         assert result.returncode == 1
         assert not (workspace / "results" / "task-fail.txt").exists()
         assert not (workspace / "state" / "task-workstream-sessions.json").exists()
@@ -647,8 +715,9 @@ def test_archived_result_is_not_replayed_on_restart_scan() -> None:
         archive = workspace / "results" / "archive" / "2026-08"
         archive.mkdir(parents=True)
         (archive / "task-done.txt").write_text("already delivered\n")
-        result = _run("claude", workspace, task, {"PATH": f"{root}:{os.environ['PATH']}",
-             worker.TEAM_TRUSTED_OPT_IN_ENV: "1"})
+        result = _run("claude", workspace, task, {
+            "PATH": f"{root}:{os.environ['PATH']}",
+        })
         assert result.returncode == 0
         assert not invoked.exists()
 
@@ -780,16 +849,16 @@ if os.environ['PROVIDER_MODE'] == 'error':
 pathlib.Path(args[args.index('-o') + 1]).write_text('unused result')
 print('not-json')
 """)
-        base_env = {"PATH": f"{root}:{os.environ['PATH']}",
-             worker.TEAM_TRUSTED_OPT_IN_ENV: "1"}
+        base_env = {"PATH": f"{root}:{os.environ['PATH']}"}
         assert _run("codex", workspace, task, {**base_env, "PROVIDER_MODE": "error"}).returncode == 1
         assert _run("codex", workspace, task, {**base_env, "PROVIDER_MODE": "no-id"}).returncode == 1
 
         fake_claude = _executable(root / "claude", "#!/bin/sh\nprintf '   \\n'\n")
         _store(workspace, {"task-empty": {"workstream_id": "workstream-a"}})
         empty = _task(workspace, "task-empty")
-        assert _run("claude", workspace, empty, {"PATH": f"{root}:{os.environ['PATH']}",
-             worker.TEAM_TRUSTED_OPT_IN_ENV: "1"}).returncode == 1
+        assert _run("claude", workspace, empty, {
+            "PATH": f"{root}:{os.environ['PATH']}",
+        }).returncode == 1
 
         with mock.patch.object(worker, "_completed_result_exists", side_effect=[False, True]):
             assert worker.handle("claude", workspace, empty, workspace / "results", REPO) == 0
@@ -1493,11 +1562,11 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
 if __name__ == "__main__":
     test_resolution_routes_bounded_tiers_before_owner_workstreams()
     test_team_keeps_the_sandboxed_path_until_an_operator_opts_in()
-    test_team_opt_in_is_an_allow_list_not_truthiness()
-    test_team_opt_in_uses_declared_manifest_default_after_env()
+    test_team_room_opt_in_requires_one_trusted_pre_body_stamp()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan()
     test_team_codex_uses_normal_workspace_and_owner_configuration()
+    test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end()
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()
     test_team_result_leaks_are_withheld_without_logging_secret_values()

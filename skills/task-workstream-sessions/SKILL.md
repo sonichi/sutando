@@ -6,16 +6,16 @@ user-invocable: false
 
 # Task workstream sessions
 
-This runtime skill intercepts explicit Team tasks before they can reach the
-unrestricted live core, but only when this install has opted in by setting
-`SUTANDO_TEAM_TRUSTED_RUNTIME=1`. This declared setting lives in the skill's
-config-only `manifest.json` with a safe `0` default; an environment override
-wins over that default per the skill-config contract. Without the opt-in it
-declines Team tasks, so they keep the read-only sandboxed path they had before
-this runtime existed — existing Team mappings were granted under that contract
-and an upgrade alone must not widen them. When enabled, it launches a fresh
-instance of the owner's configured runtime with the normal configured workspace,
-tools, integrations, network, and provider settings. A Team-specific prompt
+This runtime skill intercepts Team tasks before they can reach the unrestricted
+live core only when the AG2 Space broker attests that the room's access setting
+is Team. The remote gateway turns that room policy into one pre-body
+`team_runtime: trusted` execution stamp. Missing, malformed, duplicate, locally
+forged, or body-positioned stamps fail closed to the established read-only path;
+a local owner-to-Team cap is not treated as room consent. This makes the opt-in
+per room, configured alongside Owner and Guest in AG2 Space, with no host-wide
+environment toggle. When opted in, the worker launches a fresh instance of the
+owner's configured runtime with the normal configured workspace, tools,
+integrations, network, and provider settings. A Team-specific prompt
 identifies the sender as a trusted collaborator rather than the owner and
 requires cautious, scoped work without disclosing credentials or unrelated owner
 context. Before delivery, the handler scans the final response with Sutando's

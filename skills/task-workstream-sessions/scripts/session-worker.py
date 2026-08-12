@@ -18,7 +18,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Optional
 
 
 UNHANDLED = 3
@@ -168,33 +168,20 @@ def resolve_access_tier(task_file: Path) -> str:
     return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
-TEAM_TRUSTED_OPT_IN_ENV = "SUTANDO_TEAM_TRUSTED_RUNTIME"
-_TEAM_TRUSTED_OPT_IN_VALUES = frozenset({"1", "true", "yes", "on"})
-TEAM_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "manifest.json"
-
-
-def _team_manifest_default(manifest_path: Path = TEAM_MANIFEST_PATH) -> Optional[str]:
-    """Read the declared Team opt-in default; malformed manifests fail closed."""
-    config = _read_json(manifest_path).get("config")
-    if not isinstance(config, dict):
-        return None
-    value = config.get(TEAM_TRUSTED_OPT_IN_ENV)
-    return str(value) if value is not None else None
-
-
-def team_trusted_runtime_enabled(
-    environ: Optional[Mapping[str, str]] = None,
-    manifest_path: Path = TEAM_MANIFEST_PATH,
-) -> bool:
-    """Resolve env override > declared manifest default; invalid values deny opt-in."""
-    env = os.environ if environ is None else environ
-    raw = env.get(TEAM_TRUSTED_OPT_IN_ENV)
-    if raw is None:
-        raw = _team_manifest_default(manifest_path)
-    if not isinstance(raw, str):
+def team_trusted_runtime_enabled(task_file: Path) -> bool:
+    """Accept only the gateway's pre-body room-policy execution stamp."""
+    try:
+        content = task_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
         return False
-    # Allow-list, not truthiness: "false"/"0"/"off" are all True to bool().
-    return raw.strip().lower() in _TEAM_TRUSTED_OPT_IN_VALUES
+    before_task = content.split("\ntask:", 1)[0]
+    values = [
+        line.partition(":")[2].strip().lower()
+        for line in before_task.splitlines()
+        if line.startswith("team_runtime:")
+    ]
+    # Exactly one allow-listed value: duplicates and malformed values fail closed.
+    return values == ["trusted"]
 
 
 def _team_prompt(task_file: Path) -> str:
@@ -589,7 +576,7 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
     if tier == "team":
         # Not opted in: decline the task so it keeps the sandboxed path it had
         # before this runtime existed, exactly as guest does.
-        return MUST_HANDLE if team_trusted_runtime_enabled() else UNHANDLED
+        return MUST_HANDLE if team_trusted_runtime_enabled(task_file) else UNHANDLED
     if tier == "guest":
         return UNHANDLED
     workstream_id = resolve_workstream(workspace, task_file)
@@ -608,7 +595,7 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
     if tier == "team":
         # Independent of probe(): a direct call must not reach the trusted
         # runtime, so the opt-in is re-checked at the launch site itself.
-        if not team_trusted_runtime_enabled():
+        if not team_trusted_runtime_enabled(task_file):
             return UNHANDLED
         if _completed_result_exists(results_dir, task_file.name):
             return 0
