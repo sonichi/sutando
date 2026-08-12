@@ -307,7 +307,11 @@ def notify_discord_dm(questions):
     # Each body is a whole snapshot, so a stale one is wrong, not redundant. Look
     # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
     superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
-    path.write_text("\n".join(lines))
+    # Appear at the deliverable name in one step. Bridges claim-by-rename on sight,
+    # and write_text truncates first, so a poll can claim a 0-byte body and DM it.
+    tmp = RESULTS_DIR / f".{path.name}.tmp"
+    tmp.write_text("\n".join(lines))
+    os.replace(tmp, path)
     for old in superseded:
         old.unlink(missing_ok=True)
 

@@ -126,5 +126,41 @@ with tempfile.TemporaryDirectory() as td:
     ok("our own reminder is still written",
        (Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_AB)}.txt").exists())
 
+# T9: the body must appear at its deliverable name in one step. Bridges claim
+# proactive-*.txt by rename the moment they see it, so a truncate-then-write
+# leaves a window where the claimable file is empty — a DM with no body.
+with tempfile.TemporaryDirectory() as td:
+    _mod.RESULTS_DIR = Path(td)
+    seen_incomplete = []
+    _real_open = Path.open
+    _looking = False
+
+    def _observing_open(self, *a, **kw):
+        # Runs the bridge's poll inside the real gap, not a simulated one.
+        global _looking
+        fh = _real_open(self, *a, **kw)
+        if _looking or "w" not in kw.get("mode", a[0] if a else ""):
+            return fh
+        _looking = True
+        try:
+            for p in Path(td).iterdir():
+                if p.name.startswith("proactive-") and p.suffix == ".txt":
+                    with _real_open(p) as g:
+                        if not g.read().startswith("⚠️"):
+                            seen_incomplete.append(p.name)
+        finally:
+            _looking = False
+        return fh
+
+    Path.open = _observing_open
+    try:
+        _mod.notify_discord_dm(Q_AB)
+    finally:
+        Path.open = _real_open
+    ok("a claimable body is never observed incomplete", not seen_incomplete)
+    ok("no scratch file is left behind",
+       {f.name for f in Path(td).iterdir()} ==
+       {f"proactive-pending-q-{_mod.questions_key(Q_AB)}.txt"})
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(0 if _failed == 0 else 1)
