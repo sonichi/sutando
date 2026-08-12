@@ -29,14 +29,22 @@ echo "startup watch-tasks-stream reaper ownership:"
 # shellcheck source=../src/startup-runtime.sh
 source "$REPO/src/startup-runtime.sh"
 
-if ! declare -F reap_stale_task_watcher > /dev/null; then
+# A tree without the helper still has to reach the wiring assertions at the
+# bottom — those are the ones that name the defect on a pre-fix tree. Bailing
+# here would make this suite *skip* on base rather than fail, which proves
+# nothing about the behavior it exists to guard.
+have_fn=1
+if declare -F reap_stale_task_watcher > /dev/null; then
+  ok "reap_stale_task_watcher is defined in src/startup-runtime.sh"
+else
   bad "reap_stale_task_watcher is defined in src/startup-runtime.sh" "not found"
-  echo "FAILED (1)"
-  exit 1
+  have_fn=0
 fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+if [ "$have_fn" -eq 1 ]; then
 
 dead_pid() {
   # A pid that is certainly not running: spawn and reap one.
@@ -127,6 +135,7 @@ if reap_stale_task_watcher "$TMP/absent.pid" > /dev/null 2>&1; then
 else
   bad "absent sentinel: no-op, rc 0" "non-zero rc"
 fi
+fi  # have_fn
 
 # --- wiring: startup.sh must delegate, not re-implement ------------------------
 if grep -q 'reap_stale_task_watcher "\$WORKSPACE/state/watch-tasks-stream.pid"' "$REPO/src/startup.sh"; then

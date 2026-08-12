@@ -319,6 +319,8 @@ reap_wedged_voice_agent() {
 # own cleanup() is: the watcher stamps its sentinel once at startup and never
 # again, so deleting a sentinel this reap did not inspect leaves a LIVE watcher
 # permanently untrackable by every reader that keys off the file.
+# A re-stamp between the re-read and the unlink is still possible; closing that
+# needs an atomic claim in the sentinel protocol itself, not in this reaper.
 reap_stale_task_watcher() {
   local pid_file="$1" stale_pid current
   [ -f "$pid_file" ] || return 0
