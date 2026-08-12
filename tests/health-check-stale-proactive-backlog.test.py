@@ -175,6 +175,19 @@ class StaleProactiveBacklogTest(unittest.TestCase):
         self.assertEqual(verdict["status"], "warn")
         self.assertIn("unreadable", verdict["detail"])
 
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
+    def test_an_unscannable_results_dir_is_not_read_as_clean(self) -> None:
+        # The per-file guard cannot cover this: the failure is on the directory
+        # itself, and glob() answers [] there — the same answer as "no backlog".
+        self._write("results/proactive-hidden.txt", TWO_HOURS)
+        os.chmod(self.ws / "results", 0o000)
+        try:
+            verdict = hc.check_stale_proactive_backlog()
+        finally:
+            os.chmod(self.ws / "results", 0o755)
+        self.assertEqual(verdict["status"], "warn")
+        self.assertIn("could not scan results/", verdict["detail"])
+
     # --- wiring ----------------------------------------------------------
 
     def test_probe_is_registered_in_the_check_list(self) -> None:

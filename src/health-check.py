@@ -5404,7 +5404,14 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
     if not results_dir.exists():
         return {"name": name, "status": "ok", "detail": "results/ not yet created"}
     now = time.time()
-    entries = list(results_dir.glob("proactive-*"))
+    try:
+        # scandir, not glob: glob swallows a directory-level EACCES/EIO and
+        # yields nothing, so an unscannable results/ would report a clean one.
+        entries = [results_dir / e.name for e in os.scandir(results_dir)
+                   if e.name.startswith("proactive-")]
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/: {exc}"}
     stale, abandoned, unreadable = [], [], 0
     for path in entries:
         # Decide by suffix, and skip any shape neither side of the protocol
