@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
-"""Run guarded Team tasks and assigned owner work in the selected core runtime.
-
-Team tasks are intercepted before the unrestricted live core sees them only
-when SUTANDO_TEAM_TRUSTED_RUNTIME opts this install in; they then execute in a
-fresh instance of the owner's configured runtime with normal workspace and tool
-access, a Team-specific trust prompt, and an outbound secret scan. Without the
-opt-in, Team retains the read-only Codex path, as Guest always does.
-
-Exit 0 means the task was handled (including an already-existing result).
-Exit 3 means the caller must use its unchanged legacy live-core path. Exit 4
-means the task is security-sensitive and must be handled without live-core
-fallback. Any other exit means an owner workstream worker was attempted but
-failed and may use the legacy at-least-once fallback.
-
-Tradeoff: assigned workstreams run as headless provider sessions, so their live
-transcript is not rendered in the canonical core pane.  That keeps provider
-session ids resumable across core restarts without multiplying task watchers;
-ungrouped work remains on the visible legacy core session.
-"""
+"""Run opted-in Team tasks and assigned owner work in bounded provider sessions."""
 
 from __future__ import annotations
 
@@ -36,7 +18,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 
 UNHANDLED = 3
@@ -188,12 +170,27 @@ def resolve_access_tier(task_file: Path) -> str:
 
 TEAM_TRUSTED_OPT_IN_ENV = "SUTANDO_TEAM_TRUSTED_RUNTIME"
 _TEAM_TRUSTED_OPT_IN_VALUES = frozenset({"1", "true", "yes", "on"})
+TEAM_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "manifest.json"
 
 
-def team_trusted_runtime_enabled() -> bool:
-    """Existing `team` mappings predate the trusted runtime, so they keep the
-    read-only contract until an operator opts in for this install."""
-    raw = os.environ.get(TEAM_TRUSTED_OPT_IN_ENV, "")
+def _team_manifest_default(manifest_path: Path = TEAM_MANIFEST_PATH) -> Optional[str]:
+    """Read the declared Team opt-in default; malformed manifests fail closed."""
+    config = _read_json(manifest_path).get("config")
+    if not isinstance(config, dict):
+        return None
+    value = config.get(TEAM_TRUSTED_OPT_IN_ENV)
+    return str(value) if value is not None else None
+
+
+def team_trusted_runtime_enabled(
+    environ: Optional[Mapping[str, str]] = None,
+    manifest_path: Path = TEAM_MANIFEST_PATH,
+) -> bool:
+    """Resolve env override > declared manifest default; invalid values deny opt-in."""
+    env = os.environ if environ is None else environ
+    raw = env.get(TEAM_TRUSTED_OPT_IN_ENV)
+    if raw is None:
+        raw = _team_manifest_default(manifest_path)
     if not isinstance(raw, str):
         return False
     # Allow-list, not truthiness: "false"/"0"/"off" are all True to bool().
@@ -345,9 +342,8 @@ def _claude_stream_result(stdout: str) -> str:
     raise RuntimeError("claude did not emit a terminal result event")
 
 
-def _scan_team_result(body: str, repo: Path) -> str:
-    if TEAM_RESULT_CONTROL.search(body):
-        raise TeamResultLeakError("result delivery control marker")
+def _load_team_result_scanner(repo: Path):
+    """Load and retain the trusted scanner before Team-controlled execution."""
     source_dir = str((repo / "src").resolve())
     if source_dir not in sys.path:
         sys.path.insert(0, source_dir)
@@ -355,6 +351,13 @@ def _scan_team_result(body: str, repo: Path) -> str:
         from chat_secret_filter import filter_chat_secrets
     except Exception as exc:
         raise RuntimeError("Team result secret scanner is unavailable") from exc
+    return filter_chat_secrets
+
+
+def _scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
+    if TEAM_RESULT_CONTROL.search(body):
+        raise TeamResultLeakError("result delivery control marker")
+    filter_chat_secrets = secret_filter or _load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)
     except Exception as exc:
@@ -368,13 +371,16 @@ def _run_team(runtime: str, prompt: str, repo: Path, workspace: Path) -> str:
     cwd = Path(os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo))).expanduser()
     if not cwd.is_dir():
         raise RuntimeError(f"Team working directory is unavailable: {cwd}")
+    # The provider can mutate the repository. Capture the trusted callable first,
+    # so rewriting chat_secret_filter.py cannot change this run's delivery check.
+    secret_filter = _load_team_result_scanner(repo)
     if runtime == "claude":
         return_code, stdout, stderr = _run_process_bounded(
             _claude_team_command(prompt), cwd)
         if return_code:
             raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
         body = _claude_stream_result(stdout)
-        return _scan_team_result(body, repo)
+        return _scan_team_result(body, repo, secret_filter)
     (workspace / "state").mkdir(parents=True, exist_ok=True)
     fd, output_name = tempfile.mkstemp(
         prefix=".tier-result.", suffix=".txt", dir=workspace / "state")
@@ -385,7 +391,8 @@ def _run_team(runtime: str, prompt: str, repo: Path, workspace: Path) -> str:
             _codex_team_command(prompt, cwd, output_file), cwd)
         if return_code:
             raise RuntimeError(stderr.strip() or f"codex exited {return_code}")
-        return _scan_team_result(output_file.read_text(encoding="utf-8"), repo)
+        return _scan_team_result(
+            output_file.read_text(encoding="utf-8"), repo, secret_filter)
     finally:
         output_file.unlink(missing_ok=True)
 

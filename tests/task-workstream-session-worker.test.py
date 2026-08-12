@@ -129,6 +129,22 @@ def test_team_opt_in_is_an_allow_list_not_truthiness() -> None:
                     f"{value!r} must enable the trusted runtime"
 
 
+def test_team_opt_in_uses_declared_manifest_default_after_env() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        manifest = Path(td) / "manifest.json"
+        manifest.write_text(json.dumps({"config": {
+            worker.TEAM_TRUSTED_OPT_IN_ENV: "1",
+        }}))
+        assert worker.team_trusted_runtime_enabled({}, manifest) is True
+        assert worker.team_trusted_runtime_enabled(
+            {worker.TEAM_TRUSTED_OPT_IN_ENV: "0"}, manifest) is False
+        manifest.write_text("not json")
+        assert worker.team_trusted_runtime_enabled({}, manifest) is False
+
+    shipped = json.loads(worker.TEAM_MANIFEST_PATH.read_text())
+    assert shipped["config"][worker.TEAM_TRUSTED_OPT_IN_ENV] == "0"
+
+
 def test_tier_parser_prevents_task_body_escalation_and_fails_closed() -> None:
     with tempfile.TemporaryDirectory() as td:
         workspace = Path(td)
@@ -374,6 +390,50 @@ print(json.dumps({'type': 'result', 'result': 'ordinary result'}))
                 raise AssertionError("missing result scanner must fail closed")
             except RuntimeError as exc:
                 assert str(exc) == "Team result secret scanner is unavailable"
+
+
+def test_team_provider_cannot_rewrite_the_scanner_used_for_its_result() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        repo = root / "repo"
+        scanner_path = repo / "src" / "chat_secret_filter.py"
+        scanner_path.parent.mkdir(parents=True)
+        scanner_path.write_text(
+            "from types import SimpleNamespace\n"
+            "def filter_chat_secrets(body):\n"
+            "    return SimpleNamespace(detected='SECRET-TOKEN' in body, "
+            "secret_types=('Fixture Secret',), text=body)\n"
+        )
+        project = root / "project"
+        project.mkdir()
+        workspace = root / "workspace"
+        _executable(root / "codex", """#!/usr/bin/env python3
+import os, pathlib, sys
+pathlib.Path(os.environ['SCANNER_PATH']).write_text(
+    'from types import SimpleNamespace\\n'
+    'def filter_chat_secrets(body):\\n'
+    '    return SimpleNamespace(detected=False, secret_types=(), text=body)\\n')
+args = sys.argv[1:]
+pathlib.Path(args[args.index('-o') + 1]).write_text('SECRET-TOKEN')
+""")
+        previous = sys.modules.pop("chat_secret_filter", None)
+        try:
+            with mock.patch.dict(os.environ, {
+                "PATH": f"{root}:{os.environ['PATH']}",
+                "SCANNER_PATH": str(scanner_path),
+                "SUTANDO_ISOLATED_WORKING_DIR": str(project),
+            }, clear=False):
+                try:
+                    worker._run_team("codex", "task", repo, workspace)
+                    raise AssertionError("rewritten scanner must not release the secret")
+                except worker.TeamResultLeakError as exc:
+                    assert str(exc) == "Fixture Secret"
+            assert "detected=False" in scanner_path.read_text(), \
+                "the provider mutation control did not execute"
+        finally:
+            sys.modules.pop("chat_secret_filter", None)
+            if previous is not None:
+                sys.modules["chat_secret_filter"] = previous
 
 
 def test_team_request_injection_stays_inside_json_boundary() -> None:
@@ -1426,6 +1486,7 @@ if __name__ == "__main__":
     test_resolution_routes_bounded_tiers_before_owner_workstreams()
     test_team_keeps_the_sandboxed_path_until_an_operator_opts_in()
     test_team_opt_in_is_an_allow_list_not_truthiness()
+    test_team_opt_in_uses_declared_manifest_default_after_env()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan()
     test_team_codex_uses_normal_workspace_and_owner_configuration()
@@ -1433,6 +1494,7 @@ if __name__ == "__main__":
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()
     test_team_result_leaks_are_withheld_without_logging_secret_values()
     test_team_result_scanner_failure_fails_closed()
+    test_team_provider_cannot_rewrite_the_scanner_used_for_its_result()
     test_team_request_injection_stays_inside_json_boundary()
     test_team_result_filter_uses_runtime_fallback_patterns()
     test_team_output_injection_cannot_control_bridge_delivery()
