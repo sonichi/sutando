@@ -7532,6 +7532,13 @@ def run_all_checks() -> list[dict]:
             # actually couldn't determine state. Surface as a transient warn
             # with the cause so it's debuggable, not a routine "app is down."
             checks.append({"name": "sutando-app", "status": "warn", "detail": f"detection failed (pgrep: {pgrep_err or 'unknown error'}) — actual app state unknown"})
+    else:
+        # Neither path exists, so the probe never ran. Emitting nothing here
+        # made "not checked" indistinguishable from "checked and fine".
+        checks.append({"name": "sutando-app", "status": "warn", "detail": (
+            "not checked — no binary at either path, so app state is UNKNOWN, not ok. "
+            f"Looked for: {dev_bin} (dev build) and {app_bin} (installed bundle). "
+            "Build the dev binary or install the bundle to make this probe meaningful.")})
 
     # Battery and memory health checks
 
