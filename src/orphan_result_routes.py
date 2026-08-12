@@ -9,6 +9,10 @@ This module answers only "which destination did the task file declare, and is
 it safe for this transport to use it". Delivery, claiming and marker handling
 stay with the adapter, which injects its own id validator because a Discord
 snowflake, a Telegram chat id and a Matrix room id are not interchangeable.
+
+The bound is on candidates EXAMINED, not on routes returned: the caller polls
+every second, so an unroutable backlog would otherwise re-walk the archive on
+every tick. A cursor makes the scan round-robin so nothing starves.
 """
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 sys.path.insert(0, str(Path(__file__).parent))
-from local_task_protocol import parse_task_headers  # noqa: E402
+from local_task_protocol import find_archived_task, parse_task_headers  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 
 # Transports that own their own delivery loop. Their ids can coincidentally
@@ -29,28 +33,15 @@ FOREIGN_SOURCES = frozenset({"telegram", "slack", "ag2space", "phone", "voice"})
 DEFAULT_LIMIT = 25
 
 
-def _find_task_file(task_id: str, tasks_dir: Path, archive_dir: Path) -> Path | None:
-    """Live file via the shared finder (it also matches `.claimed-core-N`), then
-    the archive — by result time the core has usually already archived the task."""
-    live = find_task_file(tasks_dir, task_id)
-    if live is not None:
-        return live
-    try:
-        # rglob, not a fixed month dir: the archive layout is the core's to choose.
-        return next(archive_dir.rglob(f"{task_id}.txt"), None)
-    except OSError:
-        return None
-
-
 def orphan_result_routes(
     results_dir: Path,
     tasks_dir: Path,
-    archive_tasks_dir: Path,
     known_ids: Iterable[str],
     is_valid_channel_id: Callable[[str], bool],
     limit: int = DEFAULT_LIMIT,
-) -> dict[str, str]:
-    """Map task_id -> declared channel_id for undeliverable results.
+    cursor: str = "",
+) -> tuple[dict[str, str], str]:
+    """(task_id -> declared channel_id, next cursor) for undeliverable results.
 
     Every skip is deliberate: no task file means no declared destination, and
     guessing one would post a private body to whatever channel was handy.
@@ -61,20 +52,28 @@ def orphan_result_routes(
         # scandir, not glob: glob swallows a directory-level EACCES and yields
         # nothing, so an unreadable results/ would look like a clean backlog.
         entries = sorted(
-            (p for p in results_dir.iterdir()
-             if p.name.startswith("task-") and p.suffix == ".txt"),
-            key=lambda p: p.name,
+            p for p in results_dir.iterdir()
+            if p.name.startswith("task-") and p.suffix == ".txt"
         )
     except OSError:
-        return routes
+        return routes, cursor
+    if not entries:
+        return routes, ""
 
-    for path in entries:
-        if len(routes) >= limit:
-            break
+    # Round-robin from the cursor. Bounding successful ROUTES would leave the
+    # per-candidate lookup unbounded, and this runs once a second.
+    start = next((i for i, p in enumerate(entries) if p.name > cursor), 0)
+    order = entries[start:] + entries[:start]
+
+    last = cursor
+    for path in order[:limit]:
+        last = path.name
         task_id = path.stem
         if task_id in known:
             continue
-        task_file = _find_task_file(task_id, tasks_dir, archive_tasks_dir)
+        # Two helpers, not one: find_task_file is the only one that matches a
+        # CLAIMED `<id>.claimed-core-N`; find_archived_task is the measured walk.
+        task_file = find_task_file(tasks_dir, task_id) or find_archived_task(tasks_dir, task_id)
         if task_file is None:
             continue
         try:
@@ -87,4 +86,4 @@ def orphan_result_routes(
         if not channel_id or not is_valid_channel_id(channel_id):
             continue
         routes[task_id] = channel_id
-    return routes
+    return routes, ("" if last == entries[-1].name else last)

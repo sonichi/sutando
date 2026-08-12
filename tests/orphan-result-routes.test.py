@@ -23,6 +23,8 @@ _ccd = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
 _ccd.mkdir(parents=True, exist_ok=True)
 (_ccd / "access.json").write_text('{"allowFrom": [], "groups": {}}')
 
+import task_archive as _task_archive  # noqa: E402  (after the sys.path insert)
+
 spec = importlib.util.spec_from_file_location(
     "orphan_result_routes", REPO / "src" / "orphan_result_routes.py"
 )
@@ -58,10 +60,13 @@ class OrphanResultRoutesTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def routes(self, known=(), limit=orr.DEFAULT_LIMIT):
+    def call(self, known=(), limit=orr.DEFAULT_LIMIT, cursor=""):
         return orr.orphan_result_routes(
-            self.results, self.tasks, self.archive, known, snowflake_ok, limit
+            self.results, self.tasks, known, snowflake_ok, limit, cursor
         )
+
+    def routes(self, known=(), limit=orr.DEFAULT_LIMIT, cursor=""):
+        return self.call(known, limit, cursor)[0]
 
     def _result(self, task_id="task-newsradar-1"):
         (self.results / f"{task_id}.txt").write_text("the answer")
@@ -160,6 +165,40 @@ class OrphanResultRoutesTest(unittest.TestCase):
             (self.tasks / f"{tid}.txt").write_text(task_text())
         self.assertEqual(len(self.routes(limit=2)), 2)
 
+    def test_the_bound_is_on_WORK_examined_not_routes_returned(self):
+        # 100 unroutable results with limit=1 used to run 100 task lookups per
+        # tick, each able to walk the archive — and poll_results runs every 1s.
+        for i in range(100):
+            self._result(f"task-unroutable-{i:03d}")
+        calls = []
+        real_a, real_f = orr.find_archived_task, orr.find_task_file
+        orr.find_archived_task = lambda d, i: (calls.append(i), real_a(d, i))[1]
+        orr.find_task_file = lambda d, i: (calls.append(i), real_f(d, i))[1]
+        try:
+            routes, _ = self.call(limit=1)
+        finally:
+            orr.find_archived_task, orr.find_task_file = real_a, real_f
+        self.assertEqual(routes, {})
+        self.assertLessEqual(len(calls), 2, f"{len(calls)} lookups for limit=1 (<=2: one per helper)")
+
+    def test_the_cursor_advances_so_nothing_starves(self):
+        # A permanently-unroutable prefix must not hide a routable entry behind it.
+        for i in range(3):
+            self._result(f"task-a-unroutable-{i}")
+        tid = self._result("task-z-routable")
+        (self.tasks / f"{tid}.txt").write_text(task_text())
+        seen, cursor = {}, ""
+        for _ in range(6):
+            routes, cursor = self.call(limit=1, cursor=cursor)
+            seen.update(routes)
+        self.assertEqual(seen, {tid: SNOWFLAKE}, "round-robin never reached the routable entry")
+
+    def test_the_cursor_resets_at_the_end_of_the_listing(self):
+        tid = self._result()
+        (self.tasks / f"{tid}.txt").write_text(task_text())
+        _, cursor = self.call(limit=99)
+        self.assertEqual(cursor, "", "a full pass must wrap, not pin the cursor at the last name")
+
     def test_an_undecodable_task_file_is_skipped_not_fatal(self):
         tid = self._result()
         (self.tasks / f"{tid}.txt").write_bytes(b"source: x\n\xff\xfetask: hi\n")
@@ -201,6 +240,27 @@ class WiringTest(unittest.TestCase):
         body = self.src.split("async def poll_results(")[1]
         self.assertIn("orphan_result_routes(", body,
                       "poll_results never calls it, so nothing adopts an orphan route")
+
+    def test_delivery_cleanup_archives_a_CLAIMED_task_not_a_rebuilt_bare_name(self):
+        # The resolver deliberately finds `<id>.claimed-core-N`, so the cleanup
+        # that follows delivery must resolve the same path or strand it forever.
+        # Anchored on the comment block: a SIBLING site also ends in
+        # _clear_delivered and already used this idiom, so a looser anchor
+        # matches that one and passes at the parent, proving nothing.
+        m = re.search(r"task_file = ([^\n]*)\n"
+                      r"\s*archive_file\(task_file, \"tasks\", task_id\)\n"
+                      r"(?:\s*#[^\n]*\n)+"
+                      r"\s*_clear_delivered\(task_id\)", self.src)
+        self.assertIsNotNone(
+            m, "the post-delivery cleanup rebuilds a bare task path; a claimed task strands")
+        with tempfile.TemporaryDirectory() as td:
+            tasks = Path(td)
+            claimed = tasks / "task-99.claimed-core-1.txt"
+            claimed.write_text("body")
+            ns = {"find_task_file": _task_archive.find_task_file,
+                  "TASKS_DIR": tasks, "task_id": "task-99"}
+            self.assertEqual(eval(m.group(1), ns), claimed,
+                             "cleanup resolves the bare name, not the claimed file")
 
     def test_the_bridge_injects_a_snowflake_validator(self):
         m = re.search(r"def _is_discord_channel_id\(value: str\) -> bool:.*?return ([^\n]+)",

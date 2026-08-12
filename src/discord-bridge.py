@@ -97,6 +97,11 @@ from task_archive import find_task_file  # noqa: E402
 from orphan_result_routes import orphan_result_routes  # noqa: E402
 
 
+# Round-robin position for the orphan-route scan, so a large unroutable
+# backlog cannot starve entries that sort after it.
+_orphan_route_cursor = ""
+
+
 def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
@@ -4473,11 +4478,14 @@ async def poll_results():
         # A task written straight into tasks/ was never in pending_replies, so
         # its result would sit forever. Adopt the route it declared, then let
         # the existing resolution below turn it into a channel.
-        for task_id, channel_id_str in orphan_result_routes(
-            RESULTS_DIR, TASKS_DIR, ARCHIVE_TASKS_DIR,
+        global _orphan_route_cursor
+        _adopted, _orphan_route_cursor = orphan_result_routes(
+            RESULTS_DIR, TASKS_DIR,
             set(pending_replies) | set(_recovered_replies),
             _is_discord_channel_id,
-        ).items():
+            cursor=_orphan_route_cursor,
+        )
+        for task_id, channel_id_str in _adopted.items():
             _recovered_replies.setdefault(task_id, channel_id_str)
 
         # Merge recovered replies into pending_replies (resolve channel objects)
@@ -4809,7 +4817,9 @@ async def poll_results():
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
+                # find_task_file, not a reconstructed bare name: a claimed
+                # task is `<id>.claimed-core-N.txt` and would strand forever.
+                task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
                 # Delivery succeeded + archived — sentinel has served
                 # its purpose, remove to bound `discord-delivered/`
