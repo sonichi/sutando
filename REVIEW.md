@@ -94,6 +94,13 @@ and loads whichever repo it reviews.
    "changes requested: …" / "LGTM, non-blocking". And it is only honest if you actually
    ran these criteria on *this* PR — a readiness claim with no evidence attached
    (no test run, no failure-mode named, no blast-radius call) is an over-claim.
+   **Findings are not a verdict.** A review that ends on analysis leaves the author unable
+   to tell "these are blockers" from "these are notes and I would merge it", so say which,
+   and for anything short of ready, name the one thing that would change it.
+   The verdict is a **recommendation, never a gate**: it does not substitute for the merge
+   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, two recorded
+   approvals). *Grounded by:* a #2824 review that listed one clarity question and two minor
+   notes and never said it was ready; the owner had to ask "do you recommend approval?".
 
 9. **A negative result is not evidence until the instrument is shown able to produce a
    positive.** Much of a PR's evidence is a *zero*: "no other call sites", "no conflicts",
