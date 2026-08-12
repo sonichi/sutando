@@ -76,7 +76,7 @@ SEND_ALLOWED_PREFIXES: tuple[str, ...] = (
 )
 
 
-def is_path_sendable(fpath: str) -> bool:
+def is_path_sendable(fpath: str, extra_roots: tuple[str, ...] = ()) -> bool:
     """True iff `fpath` is a regular file AND its `realpath` resolves
     under one of ``SEND_ALLOWED_ROOTS`` or starts with one of
     ``SEND_ALLOWED_PREFIXES``.
@@ -89,6 +89,13 @@ def is_path_sendable(fpath: str) -> bool:
     realpath collapse), or a path that simply doesn't match any
     allowed root/prefix all return False. Callers should fail-closed
     on False (log + skip; never deliver the file).
+
+    `extra_roots` lets ONE adapter extend the policy with a root that is
+    genuinely its own without that root becoming global. Slack passes its
+    inbound `slack-inbox/` so an uploaded file can be echoed back; nothing
+    else may send from there. Extra roots go through the SAME realpath +
+    boundary check as the canonical ones — they widen the allowlist, never
+    the matching rule, so a symlink escape is still caught.
     """
     if not os.path.isfile(fpath):
         return False
@@ -96,7 +103,7 @@ def is_path_sendable(fpath: str) -> bool:
         real = os.path.realpath(fpath)
     except OSError:
         return False
-    for root in SEND_ALLOWED_ROOTS:
+    for root in (*SEND_ALLOWED_ROOTS, *extra_roots):
         root_real = os.path.realpath(root)
         if real == root_real or real.startswith(root_real + os.sep):
             return True

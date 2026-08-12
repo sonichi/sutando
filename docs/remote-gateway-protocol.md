@@ -23,10 +23,16 @@ The bridge reads these from the environment (typically sourced from
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`other` for a shared gateway (see Security). |
+| `REMOTE_PROACTIVE_ROOM` | no | — | Default room id to deliver `results/proactive-*.txt` nudges to (`POST /v1/room` op:message, claim-by-rename, archive on success). Unset → proactive files are not scanned. Deliberately explicit — never auto-learned from task channel_ids, since a nudge may be owner-private. Result-body markers are honored via the shared parser (`result_markers.parse_markers`): a `[channel: !room:server]` first line redirects that one nudge, `[dm-only]` suppresses any redirect (nudge stays here), skip markers archive silently, and a foreign `[channel:]` destination (Discord/Slack id) leaves the file to its own bridge. |
+| `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
 > **Legacy / bootstrap shortcut:** the bridge also accepts a *combined* token of the form `REMOTE_TASK_TOKEN="https://relay.example.com|<secret>"` (URL and secret joined by `|`), which it splits at startup. This exists only so a one-shot onboarding string can carry both halves. If you use it, **quote it in `.env`** — an unquoted `|` is a shell pipe when the file is sourced. Prefer the split form for anything persistent.
+
+Older installs using `AG2_REMOTE_URL` / `AG2_REMOTE_TOKEN` remain supported by
+both the bridge launcher and the core-independent health-alert sender during
+the compatibility window.
 
 ## Transport
 

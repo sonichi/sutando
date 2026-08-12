@@ -13,6 +13,7 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 import importlib.util
+import json
 import os
 import tempfile
 import time
@@ -51,11 +52,57 @@ class TestCommSweepFreshness(unittest.TestCase):
             os.utime(p, (t, t))
         return p
 
-    def test_missing_stamp_warns_not_down(self):
+    def _schedule_comm_sweep(self, entry: dict | None = None) -> None:
+        """Wire a comm-sweep cron into THIS fake host's crons.json."""
+        host = self.hc._host_label()
+        d = self.ws / "hosts" / host
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "crons.json").write_text(json.dumps([
+            {"name": "main-loop", "cron": "*/3 * * * *", "prompt_skill": "proactive-loop"},
+            entry if entry is not None
+            else {"name": "comm-sweep", "cron": "26 * * * *", "prompt_skill": "comm-sweep"},
+        ]))
+
+    def test_missing_stamp_on_non_owning_host_is_ok_not_a_permanent_warn(self):
+        # Comm handling is a SINGLE-OWNER lane: the driver runs on one host by
+        # design (a second cron would duplicate sweeps over the owner's comms).
+        # A host that does not schedule it has nothing to adopt, so warning here
+        # warns forever — and a permanent warn is how a health output gets
+        # ignored, taking this probe's real alarms down with it.
         out = self.hc.check_comm_sweep_freshness()
         self.assertEqual(out["name"], "comm-sweep")
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("N/A", out["detail"])
+
+    def test_missing_stamp_on_the_OWNING_host_still_warns(self):
+        # The alarm must survive on the host that actually schedules the driver:
+        # cron present + never stamped = wired but not producing. If this went
+        # quiet too, the lane-awareness fix would have silenced the whole probe.
+        self._schedule_comm_sweep()
+        out = self.hc.check_comm_sweep_freshness()
         self.assertEqual(out["status"], "warn")
-        self.assertIn("not wired", out["detail"])
+        self.assertIn("not producing", out["detail"])
+
+    def test_prompt_body_scheduling_counts_as_wired(self):
+        # The driver may be scheduled as a prompt body rather than prompt_skill.
+        # Keying only on prompt_skill would read the owning host as non-owning
+        # and silence its alarm — the exact failure direction to avoid.
+        self._schedule_comm_sweep(
+            {"name": "sweep", "cron": "26 * * * *",
+             "prompt": "Run bash skills/comm-sweep/scripts/comm-sweep.sh collect"}
+        )
+        self.assertEqual(self.hc.check_comm_sweep_freshness()["status"], "warn")
+
+    def test_stalled_stays_down_even_when_no_cron_is_configured(self):
+        # THE DANGEROUS DIRECTION. Lane-gating is applied to the ABSENT branch
+        # only. If the age thresholds were gated on config too, deleting the
+        # cron entry would silently disarm a real stall — turning a "comm
+        # handling stopped" page into silence. A stamp that EXISTS proves the
+        # driver ran here, so its staleness is judged unconditionally.
+        self._stamp(7.0)
+        out = self.hc.check_comm_sweep_freshness()
+        self.assertEqual(out["status"], "down")
+        self.assertIn("silently stopped", out["detail"])
 
     def test_fresh_is_ok(self):
         self._stamp(0.1)

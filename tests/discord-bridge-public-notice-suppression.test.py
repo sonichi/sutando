@@ -15,7 +15,7 @@ makes poll_results swallow the sandbox sentinel for non-DM destinations
 (no-send archive + best-effort owner DM).
 
 Under test:
-  - SANDBOX_FALLBACK_SENTINEL: single source of truth — the tier-instruction
+  - is_sandbox_fallback_sentinel(): single source of truth — the tier-instruction
     templates must render the exact same literal the guard checks.
   - _is_sandbox_fallback_result(body, is_dm): pure suppression predicate
   - _send_seed_notice_to_owner(owner_id, notice): DM-only delivery
@@ -132,21 +132,25 @@ class _FakeClient:
 
 
 # ---------------------------------------------------------------------------
-# SANDBOX_FALLBACK_SENTINEL — single source of truth
+# is_sandbox_fallback_sentinel — single source of truth
 # ---------------------------------------------------------------------------
 
 def case_sentinel_constant() -> list[str]:
     fails = []
-    if bridge.SANDBOX_FALLBACK_SENTINEL != SENTINEL:
-        fails.append("a) SANDBOX_FALLBACK_SENTINEL literal drifted")
-    # The tier-instruction templates must still render the EXACT sentinel the
-    # guard checks — the writer and the suppressor may never drift apart.
-    src = (REPO / "src" / "discord-bridge.py").read_text()
-    if "write '{SANDBOX_FALLBACK_SENTINEL}'" not in src:
-        fails.append("a) Stage-2 fallback templates should interpolate the constant")
-    if src.count("Sandbox unavailable; refusing non-owner task.") != 1:
-        # exactly one literal: the constant's definition
-        fails.append("a) sentinel literal should appear exactly once (the constant)")
+    # The recogniser is the contract now, not one constant: main replaced the
+    # single sentinel with a legacy literal plus two generated forms.
+    if not bridge.is_sandbox_fallback_sentinel(SENTINEL):
+        fails.append("a) legacy sentinel must still be recognised")
+    if not bridge.is_sandbox_fallback_sentinel(
+            "Sandbox unavailable (codex exit 3) — no reply generated."):
+        fails.append("a) nonzero-exit sentinel must be recognised")
+    if not bridge.is_sandbox_fallback_sentinel(
+            "Sandbox unavailable (codex exited 0 with no output) — no reply generated."):
+        fails.append("a) no-output sentinel must be recognised")
+    # Prefix-only prose is ordinary content and must NOT be suppressed.
+    if bridge.is_sandbox_fallback_sentinel(
+            "Sandbox unavailable after upgrading — can you diagnose it?"):
+        fails.append("a) prefix-matching prose must not be treated as a sentinel")
     return fails
 
 
@@ -160,8 +164,13 @@ def case_predicate() -> list[str]:
         fails.append("b) sentinel to a guild channel must suppress")
     if not bridge._is_sandbox_fallback_result(f"  {SENTINEL}\n", False):
         fails.append("b) surrounding whitespace must not defeat the guard")
-    if not bridge._is_sandbox_fallback_result(SENTINEL + " (extra)", False):
-        fails.append("b) startswith: appended wrapper text must not reopen the leak")
+    # Exact match, per main's is_sandbox_fallback_sentinel: a prefix rule would
+    # archive ordinary prose that merely opens with the same words.
+    if bridge._is_sandbox_fallback_result(SENTINEL + " (extra)", False):
+        fails.append("b) exact-match: wrapped text is prose, not a sentinel")
+    if bridge._is_sandbox_fallback_result(
+            "Sandbox unavailable after upgrading — can you diagnose it?", False):
+        fails.append("b) prefix-matching prose must deliver, not be suppressed")
     if bridge._is_sandbox_fallback_result(SENTINEL, True):
         fails.append("b) DM destination keeps current behavior (deliver)")
     if bridge._is_sandbox_fallback_result("a normal answer", False):

@@ -53,6 +53,7 @@ task-last; until then both parsers exist and are named for their trust model.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,10 +92,9 @@ MEDIA_FORMS = frozenset({"attachment", "live_stream"})
 # the schema names). Consumer semantics: highest first, mtime FIFO tiebreak.
 PRIORITIES = ("urgent", "normal", "low")
 
-# Access tiers (CLAUDE.md access-control sections). `owner` is full
-# processing; team/other are sandboxed. A missing header reads as owner for
-# legacy local files — that default belongs to consumers, not this module.
-ACCESS_TIERS = ("owner", "team", "other")
+# `owner` is full, `team` is workspace-write sandboxed, and `guest`/`other` are read-only.
+# Consumers retain the owner default for legacy files without an access header.
+ACCESS_TIERS = ("owner", "team", "guest", "other")
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
@@ -110,7 +110,8 @@ KNOWN_HEADER_KEYS = (
     "id", "timestamp", "task", "source", "access_tier", "user_id",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
-    "parent_message_id", "reminder", "author_name", "author_id", "chat_id",
+    "parent_message_id", "reply_chain_ids", "reminder", "author_name",
+    "author_id", "chat_id",
     "thread_ts", "reply_to_event", "reply_to_me", "callSid", "caller",
     "from", "call_sid", "hint", "instructions", "transcript",
     # interaction-model 4D, step 1.5 — structured media metadata. Listing them
@@ -473,21 +474,87 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
     return base / "archive" / iso_timestamp[:7]
 
 
+def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
+    """Locate an archived result across BOTH layouts in use.
+
+    The messaging bridges archive as `archive/<YYYY-MM>/<id>.txt` via
+    `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`.
+    A locator that knows only one silently returns None for the other, which
+    reads as "this task never delivered" — the wrong answer for any caller
+    deciding whether a delivery happened.
+
+    Month scan mirrors `find_archived_task`: scandir, filter on NAME before
+    asking is_dir, newest month first. Rejects malformed ids rather than
+    globbing with them (traversal gate).
+    """
+    if not valid_archive_lookup_id(task_id):
+        return None
+    archive = Path(results_dir) / "archive"
+    fname = f"{task_id}.txt"
+
+    direct = archive / fname
+    if direct.is_file():
+        return direct
+
+    try:
+        with os.scandir(archive) as entries:
+            months = sorted((e.name for e in entries
+                             if _MONTH_DIR_RE.match(e.name) and e.is_dir()),
+                            reverse=True)
+    except (OSError, ValueError):
+        months = []
+    for month in months:
+        candidate = archive / month / fname
+        if candidate.is_file():
+            return candidate
+
+    # glob on a missing or non-directory path yields nothing rather than
+    # raising, so no guard is needed here.
+    flat = sorted(archive.glob(f"{task_id}-*.txt"))
+    return flat[-1] if flat else None
+
+
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
     `_isVoiceTask` walks. Returns the first existing path or None. Rejects
-    malformed ids rather than globbing with them (traversal gate)."""
+    malformed ids rather than globbing with them (traversal gate).
+
+    The month scan uses `os.scandir` and filters on the NAME before asking
+    whether the entry is a directory. The archive root holds one file per
+    archived task and only a handful of `YYYY-MM/` dirs, so it grows without
+    bound while the thing being looked for stays tiny — on a live host it was
+    5,716 entries to find 3 month dirs, and this lookup cost 182 ms. Measured
+    there, per call:
+
+        sorted(iterdir())                 121 ms   <- Path.__lt__ on 5,716 objects
+        iterdir() + is_dir() on every one  88 ms   <- one stat syscall each
+        scandir() + is_dir() on every one  11 ms   <- dirent type is already cached
+
+    Both halves of the old cost were avoidable: `sorted()` paid to order 5,716
+    Path objects when only the matching month names need ordering, and
+    `Path.is_dir()` stat'd every entry when `os.DirEntry.is_dir()` reads the
+    type the kernel already returned. Sorting the handful of matched NAMES
+    preserves the previous candidate order exactly.
+
+    This is not micro-optimisation for its own sake: `agent-api.py` calls this
+    once per result file in a loop of up to 10 (`_remember_done_result_file`),
+    so the old cost showed up as ~1.8 s of directory scanning on a single
+    dashboard poll.
+    """
     if not valid_archive_lookup_id(task_id):
         return None
     fname = f"{task_id}.txt"
     candidates = [tasks_dir / fname, tasks_dir / "processed" / fname,
                   tasks_dir / "archive" / fname]
     archive_root = tasks_dir / "archive"
-    if archive_root.is_dir():
-        for entry in sorted(archive_root.iterdir()):
-            if entry.is_dir() and _MONTH_DIR_RE.match(entry.name):
-                candidates.append(entry / fname)
+    try:
+        with os.scandir(archive_root) as entries:
+            months = sorted(e.name for e in entries
+                            if _MONTH_DIR_RE.match(e.name) and e.is_dir())
+    except (OSError, ValueError):
+        months = []          # missing/unreadable archive is "no months", not an error
+    candidates.extend(archive_root / m / fname for m in months)
     for p in candidates:
         if p.exists():
             return p
