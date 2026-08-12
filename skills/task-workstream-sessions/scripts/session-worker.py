@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Run guarded Team tasks and assigned owner work in the selected core runtime.
 
-Team tasks are intercepted before the unrestricted live core sees them. They
-execute in a fresh instance of the owner's configured runtime with normal
-workspace and tool access, a Team-specific trust prompt, and an outbound secret
-scan. Guest tasks retain the existing read-only Codex path.
+Team tasks are intercepted before the unrestricted live core sees them only
+when SUTANDO_TEAM_TRUSTED_RUNTIME opts this install in; they then execute in a
+fresh instance of the owner's configured runtime with normal workspace and tool
+access, a Team-specific trust prompt, and an outbound secret scan. Without the
+opt-in, Team retains the read-only Codex path, as Guest always does.
 
 Exit 0 means the task was handled (including an already-existing result).
 Exit 3 means the caller must use its unchanged legacy live-core path. Exit 4
