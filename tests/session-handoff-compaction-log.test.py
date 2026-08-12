@@ -307,5 +307,49 @@ class CallSitePassesTheResolvedTranscript(unittest.TestCase):
         self.assertEqual(rec["transcript"], "")
 
 
+
+class ALockThisCallDidNotTakeIsNotReleased(unittest.TestCase):
+    """The bounded wait must not become a licence to write unlocked AND free the
+    holder's lock — that lets a third writer in under the very condition it tolerates."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.ws = Path(self._td.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        self.log = self.ws / "state" / "compactions.jsonl"
+        self.lock = self.ws / "state" / "compactions.jsonl.lock"
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_a_foreign_lock_survives_the_call(self):
+        self.lock.mkdir()
+        _run(self.ws, ("/tmp/t.jsonl", "precompact"))
+        self.assertTrue(self.lock.is_dir(),
+                        "removed a lock it never acquired — the holder is now unprotected")
+
+    def test_the_event_is_still_recorded_when_the_lock_is_held(self):
+        """Giving up on the lock must not cost the event: a single short append
+        is atomic, so only the trim needs exclusion."""
+        self.lock.mkdir()
+        _run(self.ws, ("/tmp/t.jsonl", "held-lock"))
+        rec = json.loads(self.log.read_text().strip().splitlines()[-1])
+        self.assertEqual(rec["trigger"], "held-lock")
+
+    def test_the_trim_is_SKIPPED_while_another_writer_holds_the_lock(self):
+        """The trim is the read-modify-write. Running it unlocked is the data loss
+        the lock exists to prevent, so it must not run on the give-up path."""
+        self.lock.mkdir()
+        self.log.write_text('{"ts":"x","epoch":0,"trigger":"seed"}\n' * 600)
+        _run(self.ws, ("/tmp/t.jsonl", "no-trim"))
+        lines = self.log.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 601,
+                         "trimmed without holding the lock (expected 600 seed + 1 appended)")
+
+    def test_an_acquired_lock_is_still_released(self):
+        _run(self.ws, ("/tmp/t.jsonl", "precompact"))
+        self.assertFalse(self.lock.exists(), "leaked a lock it did acquire")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

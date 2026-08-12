@@ -103,7 +103,7 @@ _ch_json_escape() {
 }
 
 record_compaction_event() {
-    local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line lock tmp i=0
+    local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line lock tmp i=0 acquired=0
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
     line="$(printf '{"ts":"%s","epoch":%s,"host":"%s","transcript":"%s","trigger":"%s"}' \
@@ -114,19 +114,24 @@ record_compaction_event() {
     # Trim-then-append is read-modify-write on one shared file, so overlapping
     # hooks drop events with no malformed line to show for it. One writer at a time.
     lock="$log.lock"
-    while ! mkdir "$lock" 2>/dev/null; do
-        i=$((i + 1))
+    while [ "$i" -lt 100 ]; do
         # Never block a PreCompact hook forever: a dead holder must not wedge it.
-        [ "$i" -ge 100 ] && break
+        if mkdir "$lock" 2>/dev/null; then acquired=1; break; fi
+        i=$((i + 1))
         sleep 0.05
     done
-    if [ -f "$log" ] && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -ge 500 ]; then
+    # Only the TRIM is read-modify-write, so only it needs the lock; a single
+    # short O_APPEND line does not, which is why giving up still records.
+    if [ "$acquired" = 1 ] && [ -f "$log" ] \
+        && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -ge 500 ]; then
         tmp="$(mktemp "${log}.tmp.XXXXXX" 2>/dev/null)" || tmp="${log}.tmp.$$"
         tail -n 499 "$log" > "$tmp" 2>/dev/null && mv "$tmp" "$log" 2>/dev/null
         rm -f "$tmp" 2>/dev/null
     fi
     printf '%s\n' "$line" >> "$log" 2>/dev/null || true
-    rmdir "$lock" 2>/dev/null
+    # Releasing a lock this call never created would let a third writer in.
+    [ "$acquired" = 1 ] && rmdir "$lock" 2>/dev/null
+    return 0
 }
 record_compaction_event "${TRANSCRIPT:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact}"
 
