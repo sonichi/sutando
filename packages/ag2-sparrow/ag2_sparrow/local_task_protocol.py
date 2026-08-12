@@ -92,9 +92,15 @@ MEDIA_FORMS = frozenset({"attachment", "live_stream"})
 # the schema names). Consumer semantics: highest first, mtime FIFO tiebreak.
 PRIORITIES = ("urgent", "normal", "low")
 
-# `owner` is full, `team` is workspace-write sandboxed, and `guest`/`other` are read-only.
-# Consumers retain the owner default for legacy files without an access header.
-ACCESS_TIERS = ("owner", "team", "guest", "other")
+# ── Durable Work Model ───────────────────────────────────────────────────────
+
+# pending = file in tasks/; result_written = same-id result file (the
+# canonical completion marker); archived = under tasks/archive/.
+LIFECYCLE_STATES = ("pending", "result_written", "archived")
+
+# `owner` is full, `team` is workspace-write sandboxed, `guest`/`other` are
+# read-only, and `ambient` is sandboxed observation — never instructions.
+ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
