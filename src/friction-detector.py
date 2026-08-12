@@ -150,20 +150,15 @@ def check_stale_tasks():
     return issues
 
 
-# `gh issue list` defaults to 30 rows, newest-first. A staleness probe reading
-# that window sees the LEAST stale issues by construction, so it must page past
-# the default. Report is capped separately — the query must be complete even
-# when the output is not.
+# `gh issue list` defaults to 30 rows newest-first, so a staleness probe must
+# page past it. Query and report bounds are separate on purpose.
 _GH_QUERY_LIMIT = 500
 _GH_REPORT_CAP = 10
 
 
 def check_github_issues():
-    """Find open issues that haven't been updated in >7 days.
-
-    Issues only: open PRs are `pr_flag.py`'s domain, and duplicating them here
-    would report the same backlog twice under two different names.
-    """
+    """Find open issues not updated in >7 days. Issues only — open PRs are
+    `pr_flag.py`'s domain and would otherwise be reported twice."""
     issues = []
     try:
         result = subprocess.run(
