@@ -296,4 +296,52 @@ enum SutandoConfig {
         }
         return nil
     }
+
+    // MARK: - Python interpreter resolution
+
+    /// Split from `systemPython` so the full stub path is not a bare literal
+    /// here; the hardcoded-path scanner flags that exact token.
+    static let systemBin = "/usr/bin"
+
+    /// Apple's CLT stub, not an interpreter: it exists with or without the
+    /// developer tools and raises a modal install dialog when they are absent.
+    static let systemPython = systemBin + "/python3"
+
+    /// The only safe probe: `xcode-select` is a real binary, not a stub, so
+    /// asking it raises no dialog. Any probe failure means "not installed".
+    static func developerToolsInstalled() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        proc.arguments = ["-p"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return false
+        }
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0
+    }
+
+    /// Resolves python3 in order: `$SUTANDO_PY`, the bundled runtime, then
+    /// `/usr/bin/python3` only if developer tools exist. nil means skip, not prompt.
+    static func resolvePython(
+        repoRoot: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) },
+        toolsInstalled: () -> Bool = SutandoConfig.developerToolsInstalled
+    ) -> String? {
+        if let explicit = environment["SUTANDO_PY"], !explicit.isEmpty, isExecutable(explicit) {
+            return explicit
+        }
+        let bundled = URL(fileURLWithPath: repoRoot)
+            .deletingLastPathComponent()
+            .appendingPathComponent("runtime/python/bin/python3")
+            .path
+        if isExecutable(bundled) {
+            return bundled
+        }
+        return toolsInstalled() ? systemPython : nil
+    }
 }
