@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """A friction report must not be a second copy of pending-questions.md: past a
-threshold the section collapses to a count plus a sample, below it is unchanged.
-"""
+threshold the section collapses to a count plus a sample, below it is unchanged."""
 from datetime import date, timedelta
 from pathlib import Path
 import importlib.util
