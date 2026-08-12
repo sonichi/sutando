@@ -129,6 +129,11 @@ def unmerged(workspace: pathlib.Path):
             if not live.exists():
                 out.append((batch.name, rel, None))
                 continue
+            # A saved path can now resolve to a DIRECTORY (skills/<name> became a
+            # symlinked dir) — read_text() then raises IsADirectoryError and takes
+            # the whole sync down. Treat it as "not a comparable file".
+            if not live.is_file():
+                continue
             live_text = live.read_text(errors="replace")
             extra = _new_content(saved_text, live_text)
             if extra:
