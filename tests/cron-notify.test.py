@@ -142,6 +142,21 @@ def main() -> int:
             req = uo.call_args[0][0]
             check("_post_to_room targets <base>/v1/room",
                   req.full_url == "https://x.example/relay/v1/room", req.full_url)
+        # The LIVE gateway answers {"ok": true} with no event_id. Keying the
+        # return on event_id reported every real success as a failure, and the
+        # caller rolls back its cooldown and re-sends on a falsy return.
+        resp_ok = um.MagicMock()
+        resp_ok.read.return_value = json.dumps({"ok": True}).encode()
+        with um.patch.object(cn, "_load_gateway", return_value=("https://x.example/relay", "sekret")), \
+             um.patch("urllib.request.urlopen", return_value=resp_ok):
+            r_ok = cn._post_to_room("!r:x", "hello", str(env))
+            check("_post_to_room {\"ok\":true} → truthy (live gateway shape)", bool(r_ok), r_ok)
+        resp_bare = um.MagicMock()
+        resp_bare.read.return_value = b""
+        with um.patch.object(cn, "_load_gateway", return_value=("https://x.example/relay", "sekret")), \
+             um.patch("urllib.request.urlopen", return_value=resp_bare):
+            r_bare = cn._post_to_room("!r:x", "hello", str(env))
+            check("_post_to_room empty 2xx body → truthy (a 2xx IS delivery)", bool(r_bare), r_bare)
         import urllib.error as ue
         with um.patch.object(cn, "_load_gateway", return_value=("https://x.example/relay", "s")), \
              um.patch("urllib.request.urlopen", side_effect=ue.URLError("down")):
