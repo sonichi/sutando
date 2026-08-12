@@ -3863,11 +3863,8 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     the proxy. Only the core launcher (`src/agent/claude/cli/start-cli.sh`)
     exports ANTHROPIC_BASE_URL=http://localhost:7846, and only when the proxy
     port already has a listener at launch — so a core started outside the
-    launcher, or started before the proxy bound, stays unrouted for its whole
-    session. Result on such a host: the proxy is healthy and listening, every
-    check is green, and quota telemetry is silently absent forever. The
-    proactive loop's per-pass budget check reads "unknown" on every pass and
-    nobody is told why.
+    launcher, or started before it bound, stays unrouted and every other check
+    still reads green.
 
     The existing credential-proxy check can't catch this: it is a plain
     TCP-listening probe (correctly so — a forwarding proxy has no liveness

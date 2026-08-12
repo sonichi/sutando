@@ -6,11 +6,8 @@ The gap it covers: quota-state.json is written by the credential proxy from
 upstream response headers, so it only appears if a core actually ROUTES
 through the proxy. Only the core launcher (src/agent/claude/cli/start-cli.sh)
 exports ANTHROPIC_BASE_URL, and only when the proxy port already has a listener
-at launch. TWO conditions leave a core unrouted, and the probe cannot tell them
-apart: the core was started outside the launcher (straight from tmux, no
-startup.sh, no start-cli.sh), or it was started by the launcher before the proxy
-bound -- routine when both are supervised. Both were observed on live hosts, one
-each. On such a host the proxy is healthy and listening,
+at launch — so a core started outside the launcher, or started by it before the
+proxy bound, stays unrouted. On such a host the proxy is healthy and listening,
 every check is green, and quota telemetry is silently absent forever — the
 proactive loop's budget check reads "unknown" every pass with no explanation.
 
@@ -83,16 +80,14 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         self.assertIn("ANTHROPIC_BASE_URL", r["detail"])
 
     def test_absent_message_names_the_condition_not_one_cause(self):
-        """The probe sees an unrouted core; it cannot see WHICH way it got there.
-        Two causes were each observed on a live host — launched outside the
-        launcher entirely, and launched by it before the proxy bound — so naming
-        either alone sends the reader on the other host to an absent bug."""
+        """The probe sees an unrouted core, not WHICH way it got there, so naming
+        one of the two causes sends the reader on the other host to an absent bug."""
         d = self.hc.check_quota_telemetry("ok")["detail"]
         self.assertIn("src/agent/claude/cli/start-cli.sh", d)
         self.assertIn("outside the launcher", d)
         self.assertIn("before the proxy bound", d)
-        # startup.sh stopped being the exporter in #2417; pointing at it sends
-        # the reader to "the supervisor bypasses startup.sh", an absent bug.
+        # startup.sh is no longer the exporter; naming it would send the reader
+        # to "the supervisor bypasses startup.sh", an absent bug.
         self.assertNotIn("startup.sh", d)
 
     def test_proxy_down_stays_silent(self):
