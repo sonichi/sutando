@@ -1,6 +1,5 @@
 """Guard: `test:py` must run EVERY discovered file, and must never report a green
-run it did not measure — early failure, zero discovery, or a failed `find`.
-"""
+run it did not measure — early failure, zero discovery, or a failed `find`."""
 
 from __future__ import annotations
 
