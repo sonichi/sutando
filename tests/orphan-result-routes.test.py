@@ -210,6 +210,22 @@ class OrphanResultRoutesTest(unittest.TestCase):
         (self.tasks / f"{tid}.txt").write_bytes(b"source: x\n\xff\xfetask: hi\n")
         self.assertEqual(self.routes(), {})
 
+    def test_a_RAISING_lookup_skips_the_item_instead_of_killing_the_poll(self):
+        # The chmod test below cannot carry this on its own: Path.exists()
+        # delegates to os.path.exists on 3.14 (returns False) but calls stat()
+        # directly on 3.12 (raises EACCES), so the realistic fixture passes
+        # vacuously on a newer local interpreter and only fails on CI.
+        tid = self._result()
+        (self.tasks / f"{tid}.txt").write_text(task_text())
+        real = orr.find_archived_task
+        orr.find_archived_task = lambda d, i: (_ for _ in ()).throw(
+            PermissionError(13, "Permission denied"))
+        orr.find_task_file, real_f = (lambda d, i: None), orr.find_task_file
+        try:
+            self.assertEqual(self.routes(), {})
+        finally:
+            orr.find_archived_task, orr.find_task_file = real, real_f
+
     @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
     def test_an_unreadable_archive_skips_the_item_without_raising(self):
         tid = self._result()
