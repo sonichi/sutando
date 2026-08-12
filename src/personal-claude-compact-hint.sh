@@ -26,12 +26,6 @@
 # is ~12k tokens) keep a small always-on core without splitting into two
 # files. No marker → the whole file is injected.
 #
-# A truncated reload is indistinguishable from a full one, so the block names an
-# EOF sentinel up top; its absence at the bottom is the proof of truncation.
-#
-# Past SUTANDO_COMPACT_CORE_BYTES (default 1200) with no COMPACT-CORE-END marker,
-# injection is head-only and trimmed to a full line so the preview stays coherent.
-#
 # Best-effort: any failure exits 0 so the hook never blocks a session start.
 
 set -euo pipefail
