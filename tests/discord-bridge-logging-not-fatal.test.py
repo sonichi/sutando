@@ -38,9 +38,20 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+# Isolate host config BEFORE anything touches the bridge. This test only execs
+# two extracted blocks, but `channel_access_path()` falls back to the real
+# `~/.claude/channels/<ch>/access.json`, so an isolated dir is the only way the
+# guarantee survives a future edit that imports the module for real.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-logging-not-fatal-")
+_CFG = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_CFG.mkdir(parents=True, exist_ok=True)
+(_CFG / "access.json").write_text('{"allowFrom": []}')
 
 REPO = Path(__file__).resolve().parent.parent
 
