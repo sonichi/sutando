@@ -54,6 +54,16 @@ for req in START RESTART PROBE IDENTITY; do
   if [ -z "${!req}" ]; then echo "missing required --$(echo "$req" | tr '[:upper:]' '[:lower:]')" >&2; exit 2; fi
 done
 
+# An unvalidated bound is worse than no bound: `[ n -ge nope ]` errors every
+# iteration, so the timeout branch never fires and the wait runs forever.
+for num in READY_TIMEOUT:1 SETTLE:0; do
+  var="${num%%:*}"; min="${num##*:}"; val="${!var}"
+  if ! printf '%s' "$val" | grep -Eq '^[0-9]+$' || [ "$val" -lt "$min" ]; then
+    echo "--$(echo "$var" | tr '[:upper:]_' '[:lower:]-') must be an integer >= $min (got: $val)" >&2
+    usage; exit 2
+  fi
+done
+
 # run <cmd> on the configured target; forwards exit code + output.
 run() {
   case "$TARGET" in
@@ -80,7 +90,9 @@ wait_ready() {
       sleep 2
     done
   fi
-  sleep "$SETTLE"; return 0
+  # `sleep` failing must not read as ready — the settle is part of the contract.
+  sleep "$SETTLE" || return 1
+  return 0
 }
 
 utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
