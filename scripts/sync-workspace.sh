@@ -187,28 +187,33 @@ if [ -z "$VAULT_URL" ] && [ -n "${SUTANDO_MEMORY_REPO:-}" ]; then
     echo "sync-workspace: SUTANDO_MEMORY_REPO is deprecated; move vault URL to sutando.config.local.json under vault.remote_url." >&2
 fi
 
-# Priority 5: the workspace repo's own origin. The root test rejects the code
-# repo's remote; the `host/*` probe rejects any other remote we never pushed to.
+# Priority 5: the workspace repo's own origin, adopted only when it already
+# carries THIS workspace's own `host/*/<wsId>` branch.
 if [ -z "$VAULT_URL" ] \
    && [ "$(git -C "$WORKSPACE_DIR" rev-parse --show-toplevel 2>/dev/null || true)" \
         = "$(cd "$WORKSPACE_DIR" && pwd -P)" ]; then
     _origin_url="$(git -C "$WORKSPACE_DIR" remote get-url origin 2>/dev/null || true)"
-    if [ -n "$_origin_url" ]; then
+    # Read the id, never mint one: _ws_id() is defined below and persists a
+    # fresh id, which would invent an identity no vault can be carrying.
+    _wsid="$(tr -d '[:space:]' < "$WORKSPACE_DIR/.sutando-vault/ws-id" 2>/dev/null || true)"
+    if [ -n "$_origin_url" ] && [ -z "$_wsid" ]; then
+        echo "sync-workspace: no vault URL configured, and this workspace has no .sutando-vault/ws-id to identify its vault branch; refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+    elif [ -n "$_origin_url" ]; then
         # Unreachable is not the same answer as not-a-vault, and an operator
         # told the wrong one edits the wrong thing.
         _ls_rc=0
-        _ls_out="$(GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$_origin_url" 'host/*' 2>/dev/null)" || _ls_rc=$?
+        _ls_out="$(GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$_origin_url" "host/*/$_wsid" 2>/dev/null)" || _ls_rc=$?
         if [ "$_ls_rc" != "0" ]; then
             echo "sync-workspace: could not reach the workspace repo's origin ($_origin_url) to confirm it is a vault; not recovering a URL from it this run." >&2
         elif [ -n "$_ls_out" ]; then
             VAULT_URL="$_origin_url"
             echo "sync-workspace: no vault URL configured; recovered it from the workspace repo's own origin ($VAULT_URL). Restore vault.remote_url in sutando.config.local.json to silence this." >&2
         else
-            echo "sync-workspace: the workspace repo's origin ($_origin_url) advertises no host/* branch, so it is not a vault this script has pushed to; refusing to recover a vault URL from it." >&2
+            echo "sync-workspace: the workspace repo's origin ($_origin_url) carries no host/*/$_wsid branch, so it is not a vault this workspace has pushed to; refusing to recover a vault URL from it." >&2
         fi
         unset _ls_rc _ls_out
     fi
-    unset _origin_url
+    unset _origin_url _wsid
 fi
 
 # --------------------------------------------------------------------------- #

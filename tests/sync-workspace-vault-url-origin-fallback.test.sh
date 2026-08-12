@@ -20,6 +20,9 @@ export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
 TMP="$(mktemp -d -t sutando-vault-url-fallback.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
+# This workspace's own identity. A remote is its vault only if it carries this.
+WSID="ab12cd"
+
 # A bare remote carrying exactly one branch. $1 = name, $2 = branch ref.
 # A vault is identified by its `host/<host>/<wsId>` branches and nothing else.
 mk_remote() {
@@ -37,7 +40,8 @@ mk_remote() {
 # that case's workspace. $1 = case dir, $2 = vault-url the stub reports.
 mk_skel() {
     local skel="$TMP/$1" url="${2:-}"
-    mkdir -p "$skel/scripts" "$skel/workspace"
+    mkdir -p "$skel/scripts" "$skel/workspace/.sutando-vault"
+    printf '%s\n' "$WSID" > "$skel/workspace/.sutando-vault/ws-id"
     cp "$SYNC" "$skel/scripts/sync-workspace.sh"
     cat > "$skel/scripts/sutando-config.sh" << STUB
 #!/usr/bin/env bash
@@ -63,16 +67,22 @@ run_sync() {
 
 echo "vault URL recovery from the workspace repo's own origin:"
 
-VAULT_REMOTE="$(mk_remote vault 'host/testhost/ws1')"
+# The vault carries our wsId under a DIFFERENT host segment than the one this
+# test runs on, so a pass here means the id matched, not the hostname.
+VAULT_REMOTE="$(mk_remote vault "host/testhost/$WSID")"
 PLAIN_REMOTE="$(mk_remote plain 'main')"
+FOREIGN_REMOTE="$(mk_remote foreign 'host/someone-else/99ffee')"
 
-# The whole discriminator rests on this pattern matching across the slashes.
-if [ -n "$(git ls-remote --heads "$VAULT_REMOTE" 'host/*')" ] \
-   && [ -z "$(git ls-remote --heads "$PLAIN_REMOTE" 'host/*')" ]; then
-    ok "the host/* probe separates a vault remote from a plain one"
+# Must cross the slashes AND reject another workspace's branch; the last clause
+# is the anti-vacuity anchor — FOREIGN does satisfy the broad `host/*` pattern.
+if [ -n "$(git ls-remote --heads "$VAULT_REMOTE" "host/*/$WSID")" ] \
+   && [ -z "$(git ls-remote --heads "$PLAIN_REMOTE" "host/*/$WSID")" ] \
+   && [ -z "$(git ls-remote --heads "$FOREIGN_REMOTE" "host/*/$WSID")" ] \
+   && [ -n "$(git ls-remote --heads "$FOREIGN_REMOTE" 'host/*')" ]; then
+    ok "the host/*/<wsId> probe accepts only this workspace's own vault"
 else
-    bad "the host/* probe separates a vault remote from a plain one" \
-        "vault=$(git ls-remote --heads "$VAULT_REMOTE" 'host/*') plain=$(git ls-remote --heads "$PLAIN_REMOTE" 'host/*')"
+    bad "the host/*/<wsId> probe accepts only this workspace's own vault" \
+        "vault=$(git ls-remote --heads "$VAULT_REMOTE" "host/*/$WSID") foreign-scoped=$(git ls-remote --heads "$FOREIGN_REMOTE" "host/*/$WSID") foreign-broad=$(git ls-remote --heads "$FOREIGN_REMOTE" 'host/*')"
 fi
 
 # --- 1: no config URL, workspace is a git repo whose origin is a vault --------
@@ -154,7 +164,7 @@ if echo "$out" | grep VAULT_URL | grep -qF "$PLAIN_REMOTE"; then
 else
     ok "a non-vault origin at the workspace's own root is refused"
 fi
-if echo "$out" | grep -q 'advertises no host/\* branch'; then
+if echo "$out" | grep -q "carries no host/\*/$WSID branch"; then
     ok "the refusal names why, so the operator can restore the real URL"
 else
     bad "the refusal names why, so the operator can restore the real URL" "got: $out"
@@ -164,6 +174,43 @@ if echo "$out" | grep -q 'cross-machine sync disabled'; then
     ok "the wrong-origin case still reports sync disabled"
 else
     bad "the wrong-origin case still reports sync disabled" "got: $out"
+fi
+
+# --- 6b: the origin IS a vault, but somebody else's --------------------------
+# A `host/*` naming convention is not identity: any remote can advertise one.
+skel="$(mk_skel foreign-origin)"
+git -C "$skel/workspace" init -q
+git -C "$skel/workspace" remote add origin "$FOREIGN_REMOTE"
+out="$(run_sync "$skel" --status)"
+if echo "$out" | grep VAULT_URL | grep -qF "$FOREIGN_REMOTE"; then
+    bad "an origin carrying only ANOTHER workspace's host/* branch is refused" \
+        "adopted it anyway: $(echo "$out" | grep VAULT_URL)"
+else
+    ok "an origin carrying only ANOTHER workspace's host/* branch is refused"
+fi
+out="$(run_sync "$skel")"
+if echo "$out" | grep -q 'cross-machine sync disabled'; then
+    ok "the foreign-vault case still reports sync disabled"
+else
+    bad "the foreign-vault case still reports sync disabled" "got: $out"
+fi
+
+# --- 6c: no ws-id -> no identity to confirm, so nothing is adopted -----------
+skel="$(mk_skel no-wsid)"
+rm -f "$skel/workspace/.sutando-vault/ws-id"
+git -C "$skel/workspace" init -q
+git -C "$skel/workspace" remote add origin "$VAULT_REMOTE"
+out="$(run_sync "$skel" --status)"
+if echo "$out" | grep VAULT_URL | grep -qF "$VAULT_REMOTE"; then
+    bad "a workspace with no ws-id adopts nothing, even from a real vault" \
+        "adopted: $(echo "$out" | grep VAULT_URL)"
+else
+    ok "a workspace with no ws-id adopts nothing, even from a real vault"
+fi
+if echo "$out" | grep -q 'no .sutando-vault/ws-id'; then
+    ok "the no-ws-id refusal names the missing identity file"
+else
+    bad "the no-ws-id refusal names the missing identity file" "got: $out"
 fi
 
 # --- 7: an unreachable origin is reported as unreachable, not as not-a-vault --
