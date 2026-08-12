@@ -64,6 +64,7 @@
 #   2. sutando.config.local.json → vault.remote_url (per-clone canonical)
 #   3. sutando.config.json → vault.remote_url (tracked default)
 #   4. .env SUTANDO_MEMORY_REPO (deprecated legacy alias; warn-and-honor for one release)
+#   5. the workspace repo's own `origin` remote (recovery — see Priority 5 below)
 #
 # Note: SUTANDO_VAULT env var (introduced in PR-1 = #1445) is REMOVED in PR-2.
 # Brand new, no users to deprecate; CLI flag + config-file is the canonical surface.
@@ -184,6 +185,17 @@ fi
 if [ -z "$VAULT_URL" ] && [ -n "${SUTANDO_MEMORY_REPO:-}" ]; then
     VAULT_URL="$SUTANDO_MEMORY_REPO"
     echo "sync-workspace: SUTANDO_MEMORY_REPO is deprecated; move vault URL to sutando.config.local.json under vault.remote_url." >&2
+fi
+
+# Priority 5: the workspace repo's own origin. `--init` is this remote's only
+# writer, so an origin here is a URL this script already accepted and pushed to.
+if [ -z "$VAULT_URL" ] \
+   && [ "$(git -C "$WORKSPACE_DIR" rev-parse --show-toplevel 2>/dev/null || true)" \
+        = "$(cd "$WORKSPACE_DIR" && pwd -P)" ]; then
+    VAULT_URL="$(git -C "$WORKSPACE_DIR" remote get-url origin 2>/dev/null || true)"
+    if [ -n "$VAULT_URL" ]; then
+        echo "sync-workspace: no vault URL configured; recovered it from the workspace repo's own origin ($VAULT_URL). Restore vault.remote_url in sutando.config.local.json to silence this." >&2
+    fi
 fi
 
 # --------------------------------------------------------------------------- #
