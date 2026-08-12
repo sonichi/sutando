@@ -5,7 +5,7 @@ Discord-DM reminder files (`proactive-pending-q-*.txt`) are named from
 `questions_key()`, a hash of the sorted pending-question set. Covers: the key
 is order-independent and stable for a given set, changes when a question is
 added or answered, and that a reminder supersedes any earlier undelivered one
-— of ours only, and never a claimed `.sending` body.
+— ours only, never a `.sending` NAME, and never one written after we looked.
 
 Run: python3 tests/check-pending-questions-collapse.test.py
 """
@@ -102,6 +102,29 @@ with tempfile.TemporaryDirectory() as td:
     _mod.notify_discord_dm(Q_AB)
     ok("first reminder is written when there is nothing to supersede",
        len(list(Path(td).glob("proactive-pending-q-*.txt"))) == 1)
+
+# T8: the sweep must not take a body that appeared AFTER we enumerated. Two
+# overlapping runs that each glob post-write delete each other's file, and zero
+# notifications is worse than the stale one this supersede exists to remove.
+with tempfile.TemporaryDirectory() as td:
+    _mod.RESULTS_DIR = Path(td)
+    rival = Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_ABC)}.txt"
+    _real_write = Path.write_text
+
+    def _racing_write(self, *a, **kw):
+        # Stands in for an overlapping run finishing between our look and sweep.
+        if not rival.exists():
+            _real_write(rival, "the other run's snapshot")
+        return _real_write(self, *a, **kw)
+
+    Path.write_text = _racing_write
+    try:
+        _mod.notify_discord_dm(Q_AB)
+    finally:
+        Path.write_text = _real_write
+    ok("a body written after the enumeration survives the sweep", rival.exists())
+    ok("our own reminder is still written",
+       (Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_AB)}.txt").exists())
 
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(0 if _failed == 0 else 1)
