@@ -7648,7 +7648,15 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         if state_file is None:
             state_file = WORKSPACE_DIR / "state" / "health-last-alerted.json"
         if tasks_dir is None:
-            tasks_dir = WORKSPACE_DIR / "tasks"
+            # Durable-lane address comes from the endpoint resolver; this is
+            # the crash-path writer, so descriptor failure falls back locally.
+            try:
+                from agent_endpoint import load_descriptor, resolve
+                tasks_dir = Path(resolve("self", "durable", load_descriptor()).address)
+            except Exception as e:
+                print(f"health-check: endpoint resolve failed ({e}); "
+                      f"falling back to workspace tasks dir", file=sys.stderr)
+                tasks_dir = WORKSPACE_DIR / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -7672,25 +7680,22 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         # how much time has passed. Only a transition re-alerts.
         return
 
-    # Build task content. task: is placed LAST (after trusted metadata fields)
-    # so that the multi-line bullet body cannot shadow source/access_tier/priority
-    # even in the theoretical case where check detail strings ever carry
-    # external data. Consistent with the bridge field-order convention.
+    # task-last shape via the protocol's write side: the multi-line bullet
+    # body cannot shadow source/access_tier/priority.
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     bullet_str = "\n".join(f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures)
-    body = (
-        f"id: task-health-{now_ms}\n"
-        f"timestamp: {ts_iso}\n"
-        f"source: health-check\n"
-        f"interaction_type: system_event\n"
-        f"user_id: health-check\n"
-        f"access_tier: owner\n"
-        f"priority: low\n"
-        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
-        f"{bullet_str}\n"
-    )
-    task_path = tasks_dir / f"task-health-{now_ms}.txt"
-    task_path.write_text(body)
+    from local_task_protocol import write_task_file
+    task_path = write_task_file(
+        tasks_dir, f"task-health-{now_ms}",
+        [("id", f"task-health-{now_ms}"),
+         ("timestamp", ts_iso),
+         ("source", "health-check"),
+         ("interaction_type", "system_event"),
+         ("user_id", "health-check"),
+         ("access_tier", "owner"),
+         ("priority", "low")],
+        "Health check found issues. Decide whether to restart, DM owner, "
+        "or treat as transient:\n" + bullet_str)
 
     # Update history. Prune timestamp entries older than 24h to bound file
     # size — `_LAST_HASH_KEY` is a hash string, not a timestamp, so it's
