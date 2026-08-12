@@ -74,6 +74,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -538,6 +539,23 @@ def _set_pending_reply(task_id: str, info: dict) -> None:
     with pending_replies_lock:
         pending_replies[task_id] = info
         _atomic_write_pending_replies(dict(pending_replies))
+
+
+def _dedup_recover(task_id: str, holder_id, target) -> None:
+    """Route the shared dedup-recovery plan; Slack owns only the send."""
+    try:
+        action, payload = plan_dedup_recovery(
+            RESULTS_DIR, TASKS_DIR, task_id, holder_id,
+            (target or {}).get("channel", ""), f"task-{int(time.time() * 1000)}")
+        if action == "requeue":
+            _set_pending_reply(payload, dict(target or {}))
+            print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
+        elif action == "report" and target:
+            _send_reply(target["channel"], target.get("thread_ts"), payload,
+                        task_id=task_id, access_tier=target.get("access_tier", "unknown"))
+            print(f"  [dedup] unresolved for {task_id}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - never block the skip path
+        print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
 
 
 def _pop_pending_reply(task_id: str):
@@ -1156,6 +1174,82 @@ def _resolve_username(user_id: str) -> str | None:
     return name
 
 
+_EMPTY_MENTION_CLARIFICATION = (
+    "The user mentioned the bot without any task text, and no recoverable "
+    "same-user message was found in the Slack conversation. Acknowledge the mention "
+    "and ask briefly what they would like help with."
+)
+
+# A split turn is near-simultaneous; a same-user message from far back in the
+# page is a stale instruction, so bound recovery to a short window.
+_EMPTY_MENTION_RECOVERY_MAX_AGE_S = 600  # 10 minutes
+
+
+def _resolve_mention_text(event: dict, stripped_text: str) -> tuple[str, bool]:
+    """Recover an empty mention from the sender's prior turn: same thread and sender
+    only, so no one else's text is attributed to them; else a clarification task."""
+    if stripped_text:
+        return stripped_text, False
+
+    channel = event.get("channel")
+    thread_ts = event.get("thread_ts")
+    current_ts = event.get("ts")
+    user_id = event.get("user")
+    if channel and current_ts and user_id:
+        try:
+            if thread_ts:
+                response = app.client.conversations_replies(
+                    channel=channel,
+                    ts=thread_ts,
+                    limit=100,
+                )
+            else:
+                response = app.client.conversations_history(
+                    channel=channel,
+                    latest=current_ts,
+                    inclusive=False,
+                    limit=100,
+                )
+            messages = response.get("messages") or []
+            # replies are oldest-first; channel history is newest-first.
+            newest_first = reversed(messages) if thread_ts else messages
+            for message in newest_first:
+                if message.get("ts", "") >= current_ts:
+                    continue
+                # A bot reply means the prior turn was already answered, so stop rather than
+                # skipping past it and re-running that instruction.
+                if message.get("bot_id"):
+                    break
+                # Do not jump across another human participant and attribute an
+                # older instruction to the current sender.
+                if message.get("user") != user_id:
+                    break
+                # Newest-first: once one message is past the window the rest are older, so
+                # stop rather than continue.
+                try:
+                    if float(current_ts) - float(message.get("ts", "0")) > _EMPTY_MENTION_RECOVERY_MAX_AGE_S:
+                        break
+                except (TypeError, ValueError):
+                    # Unknown age must fail closed: recovered text becomes a live task, so an
+                    # unparseable ts would bypass the recency bound it cannot evaluate.
+                    break
+                candidate = (message.get("text") or "").strip()
+                without_mentions = re.sub(
+                    r"(?:^|\s)<@[A-Z0-9]+>(?=\s|$)",
+                    " ",
+                    candidate,
+                ).strip()
+                if without_mentions:
+                    return candidate, True
+                # A mention-only prior message is an already-served turn, not one to skip:
+                # continuing would reach an older instruction that turn already answered.
+                break
+        except Exception as exc:
+            print(f"  [empty-mention] thread context lookup failed: {exc}", flush=True)
+
+    return _EMPTY_MENTION_CLARIFICATION, False
+
+
 @app.event("app_mention")
 def handle_mention(event, say):
     """Channel @mention → task file."""
@@ -1164,7 +1258,9 @@ def handle_mention(event, say):
     raw = event.get("text", "")
     # Strip the leading <@BOTID> mention from the text body for cleanliness.
     text = re.sub(r"^<@[A-Z0-9]+>\s*", "", raw).strip()
-    _write_task(event, "Slack mention", text, username)
+    text, recovered = _resolve_mention_text(event, text)
+    prefix = "Slack mention (recovered prior message)" if recovered else "Slack mention"
+    _write_task(event, prefix, text, username)
 
 
 @app.event("message")
@@ -1434,6 +1530,8 @@ def result_watcher():
                 _skip_parsed = parse_markers(reply_text)
                 _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
                 if _skip_action is not None:
+                    if _skip_action.value == "deduped":
+                        _dedup_recover(task_id, _skip_action.extra, target)
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     # §7 audit ledger: skip-marked results are resolved deliveries
                     # (no_send / deduped), not silent voids. One line per result.

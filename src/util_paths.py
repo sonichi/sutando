@@ -89,26 +89,22 @@ def _workspace_root() -> Path:
             pass
         # Last-ditch default: the canonical post-v0.8 home-dir location
         # (~/sutando-workspace, matching sutando_config.py resolve_workspace) —
-        # NOT the pre-v0.8 dotted ~/.sutando/workspace, which no longer exists.
+        # The pre-v0.8 dotted path is no longer RESOLVED to, but may still exist
+        # and still take writes — health-check reports that divergence.
         return Path.home() / "sutando-workspace"
 
 
-# Retired as a RESOLUTION target (see `_workspace_root`) but still holds real
-# content on pre-v0.8 hosts — import this instead of re-hardcoding the literal.
-_LEGACY_DOTTED_WORKSPACE = Path.home() / ".sutando" / "workspace"
+def legacy_dotted_workspace() -> Path:
+    """The pre-v0.8 dotted workspace dir. NOT resolved to any more — but it can
+    still exist on disk and still take writes, which is why one file owns the
+    literal instead of each caller writing it fresh."""
+    return Path.home() / ".sutando" / "workspace"
 
 
 def legacy_dotted_workspace_path(*subpath: str) -> Path:
-    """Path under the retired pre-v0.8 dotted workspace default.
-
-    The location itself is spelled exactly once, in `_LEGACY_DOTTED_WORKSPACE`.
-
-    NOT a resolution fallback — `_workspace_root()` owns that, and this must
-    never be used to resolve the live workspace. It exists for the narrow case
-    of reaching content written there before the v0.8 move that has not been
-    migrated, so exactly one file carries the literal.
-    """
-    return _LEGACY_DOTTED_WORKSPACE.joinpath(*subpath)
+    """Subpath under `legacy_dotted_workspace()`, which owns the literal.
+    Reaches unmigrated pre-v0.8 content; never resolves the live workspace."""
+    return legacy_dotted_workspace().joinpath(*subpath)
 
 
 def _host_label() -> str:

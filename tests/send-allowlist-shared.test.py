@@ -139,13 +139,8 @@ def test_send_allowlist_module_has_documented_set():
 
 
 def test_rendered_episode_root_is_allowed():
-    """Rendered episode bundles must be deliverable.
-
-    Renders land under the legacy workspace's notes tree, which on some
-    hosts is a symlink out to the sync root — outside every other root,
-    so every autonomously rendered mp4 was silently refused as an
-    attachment.
-    """
+    """Renders land under the legacy workspace's notes tree, outside every
+    other root, so without this root every rendered mp4 is refused."""
     sys.path.insert(0, str(SRC))
     import send_allowlist as sa
     from util_paths import legacy_dotted_workspace_path
@@ -158,12 +153,8 @@ def test_rendered_episode_root_is_allowed():
 
 
 def test_symlinked_root_resolves_and_stays_scoped():
-    """A symlinked root resolves; siblings outside it stay refused.
-
-    Pins two properties at once: `is_path_sendable` realpaths the ROOT
-    (so a symlinked notes tree still matches), and scoping the root at
-    `generated/` keeps the rest of notes/ undeliverable.
-    """
+    """Pins two properties: `is_path_sendable` realpaths the ROOT, and scoping
+    at `generated/` keeps the rest of notes/ refused."""
     import tempfile
 
     sys.path.insert(0, str(SRC))
