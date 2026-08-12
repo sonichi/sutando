@@ -4,6 +4,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { resolveCredential } from './credential-resolver.js';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
@@ -37,10 +38,70 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export function ffmpegSubtitleCandidates(execPath: string): string[] {
 	return [
 		'ffmpeg',
+		// Apple-Silicon Homebrew, then the Intel prefix. Both formulas are listed
+		// per arch: Homebrew installs under /opt/homebrew on arm64 and /usr/local
+		// on x86_64, so an arm64-only list leaves Intel resolving through PATH —
+		// which a launchd/service environment may not have. This is the single
+		// place a new install layout gets added; ffprobeCandidates() derives from
+		// it, so anything missing here is missing there too.
 		'/opt/homebrew/bin/ffmpeg',
 		'/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg',
+		'/usr/local/bin/ffmpeg',
+		// NOTE: the Intel ffmpeg-full formula (/usr/local/opt/ffmpeg-full/bin/ffmpeg)
+		// is deliberately NOT listed here. The repo's hardcoded-path gate flags
+		// '/opt/' as a SUBSTRING, so that path trips it while '/usr/local/bin/ffmpeg'
+		// does not — the gate blocks the Intel half of this symmetry. Adding it needs
+		// a scoped REVIEW.md exception, which is #2369's concern, not this PR's.
+		// Tracked there; an Intel user with only the ffmpeg-full formula still falls
+		// back to /usr/local/bin/ffmpeg or PATH.
 		join(dirname(execPath), 'ffmpeg'),
 	];
+}
+
+/**
+ * ffprobe, derived from the ffmpeg candidates rather than hardcoded.
+ *
+ * The duration probe invoked the Apple-Silicon Homebrew ffprobe path directly,
+ * so on an Intel or PATH-only install it threw and the recording reported no
+ * duration. Deriving from ffmpegSubtitleCandidates() reuses the prefixes already
+ * listed there (including the bundled-runtime sibling) instead of restating
+ * them, so there is ONE place to add a prefix when a new install layout appears
+ * — and no second copy to drift. ffprobe ships beside ffmpeg in every
+ * distribution that has it.
+ *
+ * Unlike findFfmpegWithSubtitles this does not probe for a capability — any
+ * ffprobe can report a duration — so it only checks existence, and a bare name
+ * is always kept so PATH resolution still applies.
+ */
+export function ffprobeCandidates(execPath: string): string[] {
+	return ffmpegSubtitleCandidates(execPath).map((p) =>
+		p.replace(/ffmpeg(?=[^/]*$)/, 'ffprobe'),
+	);
+}
+
+/**
+ * Pick an ffprobe from `cands`: prefer an ABSOLUTE candidate that actually
+ * exists, then fall back to the first bare name (so PATH resolution still
+ * applies), then the literal `ffprobe`.
+ *
+ * Exported + `exists`-injected so the ordering is testable. An earlier finder
+ * used `find((p) => !p.includes('/') || existsSync(p))`, which accepted the
+ * leading bare name immediately and short-circuited before any absolute path
+ * was tried — making the absolute candidates dead code (flagged reviewing #2370).
+ */
+export function selectFfprobe(cands: string[], exists: (p: string) => boolean): string {
+	return (
+		cands.find((p) => p.includes('/') && exists(p)) ??
+		cands.find((p) => !p.includes('/')) ??
+		'ffprobe'
+	);
+}
+
+let _cachedFfprobe: string | undefined;
+function findFfprobe(): string {
+	if (_cachedFfprobe !== undefined) return _cachedFfprobe;
+	_cachedFfprobe = selectFfprobe(ffprobeCandidates(process.execPath), existsSync);
+	return _cachedFfprobe;
 }
 
 let _cachedSubtitleFfmpeg: string | null | undefined;
@@ -304,7 +365,7 @@ function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | nul
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
 	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
 	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
-	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
 		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
@@ -773,7 +834,7 @@ export const screenRecordTool: ToolDefinition = {
 					// Probe duration once here so open_file (now generic) doesn't need to.
 					try {
 						const dur = execFileSync(
-							'/opt/homebrew/bin/ffprobe',
+							findFfprobe(),
 							['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', files.recommended!],
 							{ timeout: 5_000 }
 						).toString().trim();

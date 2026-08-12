@@ -14,7 +14,23 @@ ARGUMENTS: $ARGUMENTS
 
 ## What to gather
 
-**Step 0 — Base data (canonical, always run first):**
+**Step 0 — Calendar cache. CONDITIONAL: Google-calendar hosts only.**
+
+`src/morning-briefing.py` cannot reach the owner's Google Workspace calendar; it reads a cache the
+*agent* writes. Omitting this is silent: the briefing reports "couldn't read your calendar", or
+falls back to a local macOS Calendar read that stalls and can miss the work account entirely. Pull
+today's local-day events from the Google connector, then:
+
+```bash
+echo '[{"raw":"9:00-9:30am 1:1 w/ Sam","calendar":"work"}]' | python3 src/write_calendar_cache.py
+python3 src/write_calendar_cache.py --empty   # ONLY for a genuinely empty day
+```
+
+**Hosts with no Google connector skip STEP 0 ONLY** — the reader falls back to local macOS
+Calendar. Step 1 below still runs on every host. See "Calendar source (Google Workspace) —
+activation" for the full contract.
+
+**Step 1 — Base data (canonical; runs on EVERY host, including hosts that skipped Step 0):**
 
 ```bash
 WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
@@ -54,7 +70,9 @@ echo "📧 Email: [count] unread. [summary]
 - **Reader:** `get_calendar_events()` prefers the cache. Set `MORNING_BRIEFING_CALENDAR_SOURCE=google` to make the cache the *only trusted source* — if it's missing/stale the briefing reports "couldn't read your calendar" rather than falling back to a local macOS Calendar that may not include the work account (the 2026-07-21 "falsely clear" bug, #2256).
 - **Without a Google connector:** skip the producer step and the env var; the reader falls back to local macOS Calendar via AppleScript.
 
-The producer must be **invoked by the schedule** (below) — nothing writes the cache automatically, so a morning-briefing cron that only runs the reader will report unread on a `google`-source host.
+Nothing writes the cache automatically, so **a briefing that only runs the reader reports unread on a Google-source host.** The producer is therefore step 0 of this skill's own flow (above), which covers both `/morning-briefing` and a cron declared as `"prompt_skill": "morning-briefing"` — the natural config. The expanded cron prompt under "Scheduling" below remains valid but is no longer the only place the producer appears.
+
+Observed on Chis-Mac-mini: `state/calendar-today.json` was last written **2026-07-30 07:28** and the host's cron was `{"name": "morning-briefing", "prompt_skill": "morning-briefing"}`, so nothing invoked the producer. Three consecutive briefings reported no calendar, and the local fallback added a ~23s AppleScript stall before returning nothing.
 
 ## Scheduling
 

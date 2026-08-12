@@ -26,6 +26,46 @@ set -euo pipefail
 # environment. Clear it once here so the shim can actually take effect.
 unset SUTANDO_HOST_LABEL
 
+# ── REAL-REPO DENY-BY-DEFAULT + TRIPWIRE (incident 2026-07-30, Mini second-host) ──
+# This suite drives the REAL sync scripts 17 times. Neutralising ONE case (Test 18)
+# was not enough — another path also resolved the operator's real memory repo.
+#
+# Capture the real target FIRST, from the INHERITED env, resolved the way the scripts
+# resolve it. That capture is what the tripwire checks.
+#
+# Two things the first fix got wrong, both surfaced only by running on a second host:
+#   * GIT_ALLOW_PROTOCOL=none does NOT stop a FILE-PATH remote, and a core can carry
+#     SUTANDO_MEMORY_REPO=/Users/.../.sutando/memory-sync — a path, not a URL.
+#   * The leak is TWO-HOP: test -> real LOCAL CLONE -> origin on the next legit sync.
+#     "origin unchanged" therefore proves nothing. The first hop is the harm, so the
+#     tripwire watches the LOCAL CLONE.
+#   * HEAD ALONE IS NOT THE HARM. A reached clone can be left dirty without HEAD
+#     moving at all — an untracked probe file, a staged-but-uncommitted write, or a
+#     commit that failed after `git add`. Each leaves `rev-parse HEAD` identical and
+#     the guard green, and an untracked file in the operator's clone is carried by
+#     the next legitimate sync: exactly the two-hop leak this suite exists to stop.
+#     So snapshot the index/worktree too. Compare BEFORE vs AFTER rather than
+#     asserting clean — the operator's clone may legitimately be dirty already.
+_REAL_SYNC_DIR="${SUTANDO_MEMORY_SYNC_DIR:-$HOME/.sutando/memory-sync}"
+# The guard lives in tests/lib/real-clone-guard.sh so it is itself testable —
+# see tests/real-clone-guard.test.sh. Keeping it inline is why its HEAD-only
+# blind spot survived review: the only way to exercise it was to dirty the
+# operator's own clone by hand.
+# shellcheck source=lib/real-clone-guard.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/real-clone-guard.sh"
+rcg_snapshot "$_REAL_SYNC_DIR"
+
+# Deny by default. Per-test fixtures still set these explicitly per invocation.
+_DENIED_SYNC_DIR="$(mktemp -d -t sync-ws-denied.XXXXXX)"
+export SUTANDO_MEMORY_REPO=
+export SUTANDO_MEMORY_SYNC_DIR="$_DENIED_SYNC_DIR"
+
+_assert_real_clone_untouched() {
+  # Runs on EXIT regardless of pass/fail. The suite can be 89/89 green and still
+  # have written to the operator's clone — that is precisely what happened.
+  rcg_assert || exit 1
+}
+
 # Same class, second inheritance: the suite makes real git commits in its
 # fixtures, so it also depends on the CALLER having a git identity. On a dev box
 # that is set globally and the dependency is invisible; on the ubuntu-latest
@@ -41,7 +81,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEST_ROOT="$(mktemp -d -t sync-workspace-test.XXXXXX)"
-trap "rm -rf '$TEST_ROOT'" EXIT
+# bash traps REPLACE rather than stack, so the tripwire must run from the SAME EXIT
+# trap as the cleanup or a later trap silently discards it.
+trap '_assert_real_clone_untouched; rm -rf "$TEST_ROOT" "$_DENIED_SYNC_DIR"' EXIT
 
 fail=0
 pass=0
@@ -101,6 +143,8 @@ touch "$FIXTURE_REPO/CLAUDE.md"
 git init -q "$FIXTURE_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$FIXTURE_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$FIXTURE_REPO/src/"
 cat > "$FIXTURE_REPO/sutando.config.json" <<'JSON'
 {
@@ -773,9 +817,30 @@ SYNC_MEM="$FIXTURE_REPO/scripts/sync-memory.sh"
 
 # Invoke with a flag that triggers early exit (e.g. SUTANDO_MEMORY_REPO unset
 # → script bails). We just want to see if the banner emits.
+# NEUTRALISE the REAL memory-repo resolution before invoking (incident 2026-07-30).
+# The comment above assumed "SUTANDO_MEMORY_REPO unset -> script bails". On a host
+# where it IS set (from .env or sutando.config.local.json) the script does NOT bail:
+# it rsyncs the operator's real memory tree into ~/.sutando/memory-sync and PUSHES
+# to the real remote. That happened — commit 8de3582 landed on
+# github.com/sonichi/sutando-memory authored `sync-workspace-test@invalid`, 360
+# files, while this suite reported 89/89 PASS.
+#
+# It was previously masked: the push died on "Author identity unknown". Pinning a git
+# identity for CI (#2438) removed that accidental brake and turned a hard failure into
+# a silent successful push. The identity pin is correct; relying on its ABSENCE as a
+# safety net was the latent bug.
+#
+# So: override every input the script uses to find a real repo — the URL, the local
+# clone dir, and HOME (which the default clone path is derived from). A test must not
+# be able to reach a real remote even when the host is fully configured.
+_t18_home="$(mktemp -d)"
 out_banner=$(env \
     SUTANDO_REPO_DIR="$FIXTURE_REPO" \
     SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    HOME="$_t18_home" \
+    SUTANDO_MEMORY_REPO= \
+    SUTANDO_MEMORY_SYNC_DIR="$_t18_home/memory-sync" \
+    GIT_ALLOW_PROTOCOL=none \
     bash "$SYNC_MEM" 2>&1 || true)
 
 case "$out_banner" in
@@ -1000,6 +1065,8 @@ touch "$WSA_REPO/CLAUDE.md"
 git init -q "$WSA_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$WSA_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$WSA_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$WSA_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$WSA_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$WSA_REPO/"
 WSA_SLUG=$(printf '%s' "$WSA_REPO" | sed 's|/|-|g')
@@ -1023,6 +1090,8 @@ touch "$WSB_REPO/CLAUDE.md"
 git init -q "$WSB_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$WSB_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$WSB_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$WSB_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$WSB_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$WSB_REPO/"
 WSB_SLUG=$(printf '%s' "$WSB_REPO" | sed 's|/|-|g')
@@ -1098,6 +1167,8 @@ touch "$HOSTA_REPO/CLAUDE.md"
 git init -q "$HOSTA_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$HOSTA_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$HOSTA_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$HOSTA_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$HOSTA_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$HOSTA_REPO/"
 HOSTA_SLUG=$(printf '%s' "$HOSTA_REPO" | sed 's|/|-|g')
@@ -1126,6 +1197,8 @@ touch "$HOSTB_REPO/CLAUDE.md"
 git init -q "$HOSTB_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$HOSTB_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$HOSTB_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$HOSTB_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$HOSTB_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$HOSTB_REPO/"
 HOSTB_SLUG=$(printf '%s' "$HOSTB_REPO" | sed 's|/|-|g')
@@ -1268,6 +1341,8 @@ touch "$T27_REPO/CLAUDE.md"
 git init -q "$T27_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$T27_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$T27_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$T27_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$T27_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$T27_REPO/"
 

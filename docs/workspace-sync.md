@@ -77,14 +77,21 @@ The workspace tree is the unit of sync. Every file under `<workspace>/` is poten
 - **Build artifacts** — generated videos, screenshots, derived caches.
 - **Anything in `<workspace>/.git/info/exclude`** — this is where the carrier writes its sync rules as of [#1460](https://github.com/sonichi/sutando/pull/1460), so the workspace's user-tracked `.gitignore` stays clean of system-level excludes.
 
-**Customize per workspace** — `sync-workspace.sh` reads `vault.sync.include` and `vault.sync.exclude` from `sutando.config.local.json` to extend or contract what's tracked. The carrier writes these patterns into `<workspace>/.git/info/exclude` on each sync tick (mechanism: [#1447](https://github.com/sonichi/sutando/pull/1447) + [#1460](https://github.com/sonichi/sutando/pull/1460) — not the workspace's `.gitignore`, to avoid leaking the carrier-set rules into operator-tracked state).
+**Customize per workspace** — `sync-workspace.sh` reads `vault.sync.include` and `vault.sync.exclude` from `sutando.config.local.json`. ⚠ **`include` REPLACES the default carrier set wholesale — it does not add to it.** Config arrays are replaced, not merged (`_deep_merge` in `src/sutando_config.py`; pinned by `tests/sutando-config.test.py::test_local_replaces_arrays_wholesale`). The carrier is a **whitelist** — `*` ignores everything, then the include list is un-ignored — so an override that lists only your extra paths silently drops `notes/`, `hosts/*/` and the whole memory corpus out of the backup, **while sync keeps reporting success**. To add an **include** path you must restate the full default set alongside it. `exclude` does subtract, carving subpaths out of an included parent — and to ADD a carve-out without losing the shipped ones, use **`vault.sync.exclude_extra`**, which appends instead of replacing (shipped denies stay first, duplicates dropped). There is deliberately no `include_extra`: `include` is the whitelist, and unioning it would widen what the vault carries. The carrier writes these patterns into `<workspace>/.git/info/exclude` on each sync tick (mechanism: [#1447](https://github.com/sonichi/sutando/pull/1447) + [#1460](https://github.com/sonichi/sutando/pull/1460) — not the workspace's `.gitignore`, to avoid leaking the carrier-set rules into operator-tracked state).
 
 ```json
 {
   "vault": {
     "remote_url": "https://github.com/your-org/your-workspace.git",
     "sync": {
-      "include": ["custom-research/", "drafts/"],
+      "_comment": "include REPLACES the default set — copy the CURRENT list from sutando.config.json (that file is the source of truth; the paths below are what it ships as of this page's revision) and add yours after it",
+      "include": [
+        "notes/",
+        "hosts/*/",
+        ".claude-sutando/projects/*/memory/",
+        "custom-research/",
+        "drafts/"
+      ],
       "exclude": ["state/cache/", "data/large-snapshots/"]
     }
   }
@@ -92,6 +99,13 @@ The workspace tree is the unit of sync. Every file under `<workspace>/` is poten
 ```
 
 Patterns are standard gitignore syntax.
+
+`hosts/*/` is the fleet-wide durable namespace and should remain in any local
+override of `vault.sync.include`; do not narrow it to only this machine's
+`hosts/<label>/` directory. The sync engine widens that exact legacy shape
+automatically. It also refuses to push staged deletions under another host's
+subtree unless `SUTANDO_FORCE_SYNC=1` is explicitly set, so a stale carrier
+rule cannot silently erase peer state.
 
 ## Conflict model
 
@@ -110,8 +124,9 @@ First-cross-host pull is handled specially — [#1458](https://github.com/sonich
 | Key | Default | Notes |
 |---|---|---|
 | `vault.remote_url` | (required) | git URL of your private workspace repo |
-| `vault.sync.include` | `[]` | extra gitignore-negation patterns to add to the carrier |
-| `vault.sync.exclude` | `[]` | extra gitignore patterns to add to the carrier |
+| `vault.sync.include` | the list shipped in **`sutando.config.json`** — that file is the source of truth; read it rather than trusting any copy, including this page | **REPLACES** that list — not additive. An override must restate every default path it still wants carried. (`resolve_vault()`'s own fallback is `[]`, but the shipped config supplies the real default, so `[]` never describes what you actually get.) |
+| `vault.sync.exclude` | `[]` | subtractive — carves subpaths out of an included parent (emitted after the includes, so gitignore last-match wins) |
+| `vault.sync.exclude_extra` | `[]` | **additive** — appended to `exclude` rather than replacing it, so a local override keeps the shipped carve-outs. Shipped denies stay first; duplicates dropped. No `include_extra` counterpart by design |
 | `--vault-url` (CLI flag) | (overrides config) | per-invocation override |
 
 The workspace path is resolved via the standard helper (`bash scripts/sutando-config.sh workspace`); no separate sync-side configuration needed.

@@ -21,7 +21,9 @@ The fix adds a startup sweep:
 Both rename `*.sending` back to `*.txt` so the normal claim-and-
 deliver flow picks them up on the next poll iteration.
 
-This test exercises BOTH bridges' recovery helpers directly.
+This legacy integration test exercises the Discord and Telegram wrappers
+directly. `tests/proactive-recovery.test.py` owns the shared policy contract
+and verifies Discord, Slack, and Telegram all delegate to it.
 """
 
 import importlib.util
