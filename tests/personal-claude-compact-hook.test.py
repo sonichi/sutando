@@ -230,10 +230,8 @@ with tempfile.TemporaryDirectory() as ws:
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         fail("integrity framing", f"bad output {r.stdout[:200]!r} ({e})")
 
-# ── Test 10: a truncated preview is DETECTABLE (sentinel drops, header stays) ──
-# Simulate Claude Code truncating the additionalContext to a top preview: the
-# header (top) survives and tells the agent to look for the EOF sentinel, which
-# is gone — so the partial load is distinguishable from a full one.
+# Test 10: truncating to a top preview keeps the header and drops the EOF
+# sentinel, which is what makes a partial load distinguishable from a full one.
 with tempfile.TemporaryDirectory() as ws:
     big = "## Rules\n" + ("- filler rule line to exceed a small preview\n" * 400)
     with open(os.path.join(ws, "PERSONAL_CLAUDE.md"), "w") as f:
@@ -244,9 +242,8 @@ with tempfile.TemporaryDirectory() as ws:
     try:
         ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
         preview = ctx[:2000]  # a ~2KB top preview, per the reported failure mode
-        # Detection semantic (per the header wording): the block must END with
-        # the sentinel. The header NAMES the sentinel at the top, so a mere
-        # substring check is wrong — a truncated preview ends mid-content.
+        # The block must END with the sentinel, not merely contain it: the header
+        # names it at the top, so a substring check would pass on a truncated preview.
         detectable = ("INTEGRITY:" in preview) and (not preview.rstrip().endswith(eof))
         full_ok = ctx.rstrip().endswith(eof)
         if detectable and full_ok:

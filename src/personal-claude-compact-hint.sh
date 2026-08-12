@@ -26,17 +26,11 @@
 # is ~12k tokens) keep a small always-on core without splitting into two
 # files. No marker → the whole file is injected.
 #
-# Truncation-detectable framing: Claude Code silently truncates a large hook
-# additionalContext to a top preview, so a partial reload looks identical to a
-# full one. The injection is wrapped with a top INTEGRITY header (naming an EOF
-# sentinel) and that sentinel at the very bottom; a missing sentinel is
-# self-evident proof of truncation, telling the agent to Read the file in full.
+# A truncated reload is indistinguishable from a full one, so the block names an
+# EOF sentinel up top; its absence at the bottom is the proof of truncation.
 #
-# Bounded core: with no COMPACT-CORE-END marker, a file over
-# SUTANDO_COMPACT_CORE_BYTES (default 1200) is injected head-only, trimmed to a
-# full line, so the surviving preview is coherent top-of-file rules — not an
-# arbitrary mid-content cut. Set the marker to choose the boundary; set the env
-# to 0 to inject the whole file (old behavior).
+# Past SUTANDO_COMPACT_CORE_BYTES (default 1200) with no COMPACT-CORE-END marker,
+# injection is head-only and trimmed to a full line so the preview stays coherent.
 #
 # Best-effort: any failure exits 0 so the hook never blocks a session start.
 
