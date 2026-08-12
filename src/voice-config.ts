@@ -45,6 +45,12 @@ export interface VoiceConfig {
 	googleSearch: boolean;
 	/** Skill-wide default for owner-mode. Safe default: false (read-only). */
 	owner_mode: boolean;
+	/** Run a second (batch gemini-2.5-flash) transcription pass and LOG
+	 * divergences from what the Live model heard. Observation-only. Default false. */
+	shadowStt: boolean;
+	/** With shadowStt: on a detected mishear, speak a one-sentence
+	 * self-correction. Default false. */
+	divergenceCorrection: boolean;
 	/** Per-channel overrides, keyed by voice channel id. */
 	channels: Record<string, VoiceChannelConfig>;
 }
@@ -53,6 +59,8 @@ export const VOICE_CONFIG_DEFAULTS: VoiceConfig = {
 	model: 'gemini-2.5-flash-native-audio-preview-12-2025',
 	googleSearch: true,
 	owner_mode: false,
+	shadowStt: false,
+	divergenceCorrection: false,
 	channels: {},
 };
 

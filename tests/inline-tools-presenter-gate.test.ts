@@ -34,10 +34,15 @@ const OWNER_ONLY_BLOCK = extractBlock(
 );
 
 describe('inline-tools — presenter-mode sentinel gate (#1171)', () => {
-	it('declares _presenterActive derived from existsSync(...presenter-mode.sentinel)', () => {
-		assert.match(
+	it('declares _presenterActive via the expiry-aware policy, not bare existence', () => {
+		// Expiry semantics live in src/presenter-mode.ts (behavior-tested in
+		// tests/presenter-mode.test.ts); this guards that the gate consumes the
+		// policy rather than regressing to existsSync, whose existence-only
+		// reading kept the gate active forever after a lapsed-not-stopped talk.
+		assert.match(SRC, /_presenterActive\s*=\s*presenterModeActive\(\s*WORKSPACE_DIR\s*\)/);
+		assert.doesNotMatch(
 			SRC,
-			/_presenterActive\s*=\s*existsSync\(\s*join\(WORKSPACE_DIR,\s*['"]state['"]\s*,\s*['"]presenter-mode\.sentinel['"]\s*\)\s*\)/,
+			/_presenterActive\s*=\s*existsSync\(/,
 		);
 	});
 

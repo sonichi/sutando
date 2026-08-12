@@ -95,6 +95,27 @@ and loads whichever repo it reviews.
    ran these criteria on *this* PR — a readiness claim with no evidence attached
    (no test run, no failure-mode named, no blast-radius call) is an over-claim.
 
+9. **A negative result is not evidence until the instrument is shown able to produce a
+   positive.** Much of a PR's evidence is a *zero*: "no other call sites", "no conflicts",
+   "no hardcoded paths", "the check is silent at HEAD". Every one is produced by an
+   instrument — a grep, a query, a script run — and an instrument that cannot fire returns
+   the same zero as a genuinely clean tree. For any load-bearing negative, ask what was run
+   and whether it was ever demonstrated to return non-zero. A control is cheap: run it where
+   the thing DOES exist, or against the parent commit, and show it counting.
+   *Grounded by:* four instances in one 2026-08-04 session, three of them the reviewer's own.
+   (a) `gh pr list --json reviewDecision | select(==null)` was used to conclude "zero
+   unreviewed PRs" — this repo requires reviews, so that field is never null and the query
+   could not have returned anything; the same run also silently truncated at `--limit 100`
+   of 105 open PRs. (b) An orphan-memory scan reported 4 unrecallable files; its pattern was
+   `[a-z0-9_]+` and one filename contained an uppercase letter — the true count was 0.
+   (c) Two before/after health-check runs both printed nothing, which reads as "the change
+   didn't fire"; `MEMORY_DIR` is repo-slug scoped, so from a worktree it resolved to a
+   directory that does not exist and the probe returned `None` — the code was correct both
+   times and the harness was wrong. (d) A peer's probe reported `1 pending question` against
+   a true 38 and delivered that number to the owner.
+   The tell is that a broken instrument and a clean result are *byte-identical*, so the
+   author's confidence carries no information.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml

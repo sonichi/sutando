@@ -26,6 +26,9 @@ MAX_PAGES = 200
 # Ordinary messages are clipped so a long scroll stays scannable; FORWARDS are
 # exempt (see _render) because a forward is usually the substance, not chatter.
 CLIP = 200
+# Reply targets are clipped harder than bodies: the point is to identify WHICH
+# message is being answered, not to re-read it.
+REPLY_CLIP = 110
 
 
 def _load_token(env):
@@ -47,7 +50,34 @@ def _fetch(extra, channel_id, page, headers):
     return request_json(req, timeout=10)
 
 
-def _render(msg):
+def _reply_context(msg, clip=REPLY_CLIP):
+    """The message this one is REPLYING to, or None.
+
+    A terse reply is uninterpretable without its target. Measured 2026-08-04 in
+    the owner channel: `2 merge` and `2y\n3 I didn't delete it.` are both
+    replies, and both rendered here as bare text with nothing indicating what
+    they answered. Read from the channel alone they are unreadable; they only
+    parsed because the task file happened to carry a `[Replying to ...]` block,
+    which exists only when a message becomes a task.
+
+    That matters because this is the reader `context-reconstruct` runs on every
+    pass — the same reason the forward bug above was worth fixing. A peer hit
+    the consequence directly: it re-asked an owner the same question twice after
+    missing that a bare `2` was the answer to an enumerated question.
+
+    LABELLED, never inlined — for the same reason forwards are labelled:
+    attributing a quoted message to the replier is its own misreading.
+    """
+    ref = msg.get("referenced_message")
+    if not isinstance(ref, dict):
+        return None
+    author = (ref.get("author") or {}).get("username", "?")
+    body = " ".join((_render(ref, clip) or "").split())
+    return f"\u21b3 replying to {author}: {body[:clip] if clip is not None else body}" if body else \
+           f"\u21b3 replying to {author}: (no readable body)"
+
+
+def _render(msg, clip=CLIP):
     """One message's readable body, INCLUDING forwarded content.
 
     A Discord *forward* carries empty top-level `content` and puts the real
@@ -69,7 +99,7 @@ def _render(msg):
     body = (msg.get("content") or "").strip()
     snaps = msg.get("message_snapshots") or []
     if not snaps:
-        return body[:CLIP]
+        return body[:clip] if clip is not None else body
     fwd = (snaps[0].get("message") or {})
     fwd_body = (fwd.get("content") or "").strip()
     extra = []
@@ -107,6 +137,8 @@ def _parse_args(argv):
     parser.add_argument("--limit", type=int, default=10, help="Per-call page size (Discord caps at 100). With --until this is the page size, not the total.")
     parser.add_argument("--after", default=None, help="Snowflake ID — fetch messages after this ID (newer)")
     parser.add_argument("--before", default=None, help="Snowflake ID — fetch messages before this ID (older), one page.")
+    parser.add_argument("--full", action="store_true",
+                        help="Do not clip bodies. Use when the read is a VERIFICATION instrument ('did my message land?') rather than a scan: a grep past the 200-char clip returns 0 for text that WAS delivered, and a false negative there causes a duplicate send.")
     parser.add_argument("--until", default=None, help="Snowflake ID or ISO date/time (e.g. 2026-06-24T23:25) — page BACKWARD until reaching this boundary, then stop. Condition-based depth, NOT a message count: use to reconstruct context however far back the referent / conversational boundary is.")
     return parser.parse_args(argv)
 
@@ -148,7 +180,11 @@ def main(argv=None):
             continue
         author = msg.get("author", {}).get("username", "?")
         ts = msg.get("timestamp", "")[:19]
-        print(f"[{ts}] {author}: {_render(msg)}")
+        clip = None if args.full else CLIP
+        print(f"[{ts}] {author}: {_render(msg, clip)}")
+        ctx = _reply_context(msg, None if args.full else REPLY_CLIP)
+        if ctx:
+            print(f"    {ctx}")
     return 0
 
 

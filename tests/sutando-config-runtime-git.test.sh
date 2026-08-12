@@ -64,6 +64,8 @@ if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
         # otherwise the test passes/fails on the last commit rather than on the
         # change under review.
         cp "$REPO/scripts/sutando-config.sh" "$TMP/wt/scripts/sutando-config.sh"
+        # sutando-config.sh sources this helper (#2599)
+        cp "$REPO/scripts/python-binary.sh" "$TMP/wt/scripts/python-binary.sh"
         if [ -f "$TMP/wt/.git" ]; then ok "fixture: linked worktree .git is a FILE" yes
         else ok "fixture: linked worktree .git is a FILE" no "not a file"; fi
         c=$(code_field "$TMP/wt" commit)

@@ -56,8 +56,30 @@ def _resolver_and_guard_snippet() -> str:
     """Sanity-check the source still resolves $PY and guards the seed with it
     (fails loudly if the fix is reverted to bare python3)."""
     txt = SCRIPT.read_text()
-    assert 'PY="$SUTANDO_PY"' in txt, "start-cli.sh no longer honors SUTANDO_PY for $PY"
-    assert 'runtime/python/bin/python3' in txt, "start-cli.sh lost the bundled-python fallback"
+
+    # The $PY cascade moved into scripts/python-binary.sh (#2599) so three
+    # callers stop duplicating it. Asserting the LITERAL here made this test
+    # location-tied: it failed on a refactor that preserved the behaviour
+    # exactly. Assert the BEHAVIOUR instead, by running the resolver — that
+    # survives the logic moving again, and is what "honors SUTANDO_PY" means.
+    resolver = REPO / "scripts" / "python-binary.sh"
+    assert resolver.is_file(), "scripts/python-binary.sh missing — start-cli sources it"
+    with tempfile.TemporaryDirectory() as _d:
+        _explicit = Path(_d) / "explicit-python3"
+        _explicit.write_text("#!/bin/sh\nexit 0\n")
+        _explicit.chmod(0o755)
+        _got = subprocess.run(
+            ["bash", "-c", f'. "{resolver}"; resolve_python "{REPO}"'],
+            capture_output=True, text=True,
+            env={**os.environ, "SUTANDO_PY": str(_explicit), "PATH": "/usr/bin:/bin"},
+        ).stdout.strip()
+    assert _got == str(_explicit), \
+        f"the resolver no longer honors $SUTANDO_PY for $PY (got {_got!r})"
+    assert 'runtime/python/bin/python3' in resolver.read_text(), \
+        "the resolver lost the bundled-python tier"
+
+    # This one stays source-tied on purpose: it is about start-cli.sh's OWN
+    # invocation, not the cascade.
     assert '"$PY" - <<' in txt or "\"$PY\" -" in txt, \
         "the Chrome seed no longer invokes the resolved \"$PY\""
     # And that no bare `python3 ` invocation remains in the seed/daemon launches

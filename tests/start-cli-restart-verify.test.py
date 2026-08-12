@@ -112,6 +112,10 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
             "CORE_MARK": str(core_mark),
             # keep the run fast: the fix polls in 0.2s ticks up to a few seconds.
             "SUTANDO_TMUX_SOCKET": str(td / "sock"),
+            # start-cli.sh appends to <workspace>/state/session-starts.log and
+            # logs/restart-attempts.log; unredirected, the run writes LIVE state.
+            "SUTANDO_TEST_MODE": "1",
+            "SUTANDO_WORKSPACE": str(td / "workspace"),
         }
         if wedged:
             env["WEDGED"] = "1"
@@ -191,6 +195,28 @@ def case_force_restart_wedged_escalates_to_sigkill():
     return fails
 
 
+def _live_log_lines() -> "tuple[int, int]":
+    """Line counts of the two logs start-cli.sh appends to in the LIVE workspace."""
+    ws = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
+                        capture_output=True, text=True).stdout.strip()
+    def count(rel: str) -> int:
+        f = Path(ws) / rel
+        return len(f.read_text().splitlines()) if ws and f.exists() else 0
+    return count("state/session-starts.log"), count("logs/restart-attempts.log")
+
+
+def case_run_does_not_touch_the_live_workspace():
+    """start-cli.sh stamps state/session-starts.log and logs/restart-attempts.log;
+    a stub run reaching the live copies fabricates a real-looking session boundary."""
+    before = _live_log_lines()
+    _run(restart=True, session=True, core=True)
+    after = _live_log_lines()
+    if after != before:
+        return [f"a stub run appended to the live workspace: "
+                f"(session-starts, restart-attempts) {before} -> {after}"]
+    return []
+
+
 def main() -> int:
     cases = [
         ("fresh-start-core-down-exits-nonzero", case_fresh_start_core_down_exits_nonzero),
@@ -199,6 +225,7 @@ def main() -> int:
         ("restart-does-not-reuse-orphan", case_restart_does_not_reuse_orphan),
         ("restart-wedged-aborts-not-kills", case_restart_wedged_aborts_not_kills),
         ("force-restart-wedged-escalates-to-sigkill", case_force_restart_wedged_escalates_to_sigkill),
+        ("run-does-not-touch-the-live-workspace", case_run_does_not_touch_the_live_workspace),
     ]
     all_failures = []
     for label, fn in cases:
