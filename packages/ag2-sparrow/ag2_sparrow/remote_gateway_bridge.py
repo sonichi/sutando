@@ -1458,10 +1458,8 @@ def _write_task(task: dict) -> str | None:
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    # Collaborator is an additive v2 control over the legacy-safe wire shape:
-    # access_tier remains guest and requested_access_tier carries Team so older
-    # nodes stay sandboxed. Only the broker-attested exact boolean may promote
-    # the effective tier; message text and string values cannot opt themselves in.
+    # Promote only the exact broker boolean plus Team request; the legacy Guest
+    # wire tier keeps old nodes restricted and body text cannot opt itself in.
     broker_tier = _normalized_tier(task.get("access_tier"))
     requested_tier = _normalized_tier(task.get("requested_access_tier"))
     broker_collaborator = (

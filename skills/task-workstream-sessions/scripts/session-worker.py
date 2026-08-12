@@ -335,11 +335,8 @@ def _load_team_result_scanner(repo: Path):
     if source_dir not in sys.path:
         sys.path.insert(0, source_dir)
     try:
-        # chat_secret_filter imports this lazily on each call. Import it into
-        # the parent now, then warm the public filter so detect-secrets loads
-        # its configured plugins too. The Team provider is a child process: it
-        # may rewrite these source files, but it cannot replace the module and
-        # plugin objects already retained in the parent's sys.modules graph.
+        # Warm the full scanner graph before Team runs; later source rewrites
+        # cannot replace the retained parent-process module objects.
         from chat_secret_filter import filter_chat_secrets
         try:
             from secret_scanner import scan_and_redact as retained_scan_and_redact
@@ -591,8 +588,7 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
         return UNHANDLED
     tier = resolve_access_tier(task_file)
     if tier == "team":
-        # Not opted in: decline the task so it keeps the sandboxed path it had
-        # before this runtime existed, exactly as guest does.
+        # Without explicit collaboration, retain the established restricted path.
         return MUST_HANDLE if team_collaborator_enabled(task_file) else UNHANDLED
     if tier == "guest":
         return UNHANDLED
