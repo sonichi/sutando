@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""A compaction must leave a durable trace, and the recorder must be reachable.
-
-Does not run session-handoff.sh end to end: a temp repo with its own
-sutando.config.local.json still resolved to the LIVE workspace when measured, so
-a harness that "ran the script" would write into the owner's real state/.
-"""
+"""A compaction must leave a durable trace. NOT run end to end: a temp
+sutando.config.local.json still resolved to the LIVE workspace when measured."""
 from pathlib import Path
 import json
 import re
@@ -153,6 +149,100 @@ class TheRecordItWrites(unittest.TestCase):
         ws.mkdir()
         (ws / "state").write_text("a file where the dir must go")
         self.assertEqual(_run(ws, ("/x.jsonl", "precompact")).returncode, 0)
+
+
+class ControlCharactersAreEscaped(unittest.TestCase):
+    """JSON forbids every raw U+0000-U+001F, not only the three whitespace ones."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.ws = Path(self._td.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        self.log = self.ws / "state" / "compactions.jsonl"
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_a_control_char_outside_tab_newline_cr_still_parses(self):
+        _run(self.ws, ("/t.jsonl", "pre\x01compact"))
+        line = self.log.read_text().strip().splitlines()[-1]
+        rec = json.loads(line)          # raised "Invalid control character" pre-fix
+        self.assertNotIn("\x01", rec["trigger"])
+
+    def test_every_c0_control_character_is_removed(self):
+        """One positive control per character, so no single survivor hides."""
+        for code in list(range(1, 32)) + [127]:
+            with self.subTest(code=code):
+                self.log.unlink(missing_ok=True)
+                _run(self.ws, ("/t.jsonl", f"pre{chr(code)}compact"))
+                rec = json.loads(self.log.read_text().strip().splitlines()[-1])
+                self.assertNotIn(chr(code), rec["trigger"])
+
+    def test_the_escaper_does_not_smuggle_the_class_name(self):
+        """A literal [[:cntrl:]] mismatch would replace nothing and still pass a
+        weaker assertion; prove an ordinary character survives untouched."""
+        _run(self.ws, ("/t.jsonl", "precompact-ok"))
+        rec = json.loads(self.log.read_text().strip().splitlines()[-1])
+        self.assertEqual(rec["trigger"], "precompact-ok")
+
+
+class ConcurrentWritersDoNotLoseEvents(unittest.TestCase):
+    """Trim-then-append is read-modify-write on one shared file. Drives the
+    PRODUCTION function, not a re-typed recipe."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.ws = Path(self._td.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        self.log = self.ws / "state" / "compactions.jsonl"
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_32_concurrent_writers_at_the_bound_lose_nothing(self):
+        # Pre-seed at the cap so every writer takes the trim path.
+        self.log.write_text(''.join(
+            '{"ts":"x","epoch":0,"trigger":"seed"}\n' for _ in range(500)))
+        scripts = []
+        for i in range(32):
+            body = [f'WORKSPACE_DIR={self.ws!s}', _fn_source(),
+                    f"{FN} /t.jsonl {shlex.quote(f'concurrent-{i}')}", "exit 0"]
+            fh = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+            fh.write("\n".join(body))
+            fh.close()
+            scripts.append(fh.name)
+        procs = [subprocess.Popen(["bash", s], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL) for s in scripts]
+        for pr in procs:
+            pr.wait(timeout=60)
+        text = self.log.read_text()
+        missing = [i for i in range(32) if f'"concurrent-{i}"' not in text]
+        self.assertEqual(missing, [], f"lost events: {missing}")
+
+    def test_every_line_is_still_parseable_after_the_race(self):
+        """A lost event and a torn line are different failures; check both."""
+        self.log.write_text(''.join(
+            '{"ts":"x","epoch":0,"trigger":"seed"}\n' for _ in range(500)))
+        procs = []
+        for i in range(16):
+            body = [f'WORKSPACE_DIR={self.ws!s}', _fn_source(),
+                    f"{FN} /t.jsonl {shlex.quote(f'torn-{i}')}", "exit 0"]
+            fh = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+            fh.write("\n".join(body))
+            fh.close()
+            procs.append(subprocess.Popen(["bash", fh.name],
+                                          stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL))
+        for pr in procs:
+            pr.wait(timeout=60)
+        for n, line in enumerate(self.log.read_text().strip().splitlines(), 1):
+            json.loads(line)
+
+    def test_no_lock_or_temp_is_left_behind(self):
+        _run(self.ws, ("/t.jsonl", "precompact"))
+        leftovers = sorted(p.name for p in (self.ws / "state").iterdir()
+                           if p.name != "compactions.jsonl")
+        self.assertEqual(leftovers, [], f"stale artifacts: {leftovers}")
 
 
 if __name__ == "__main__":

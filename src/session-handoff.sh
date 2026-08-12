@@ -101,11 +101,11 @@ STATE_FILE="$WORKSPACE_DIR/session-state.md"
 _ch_json_escape() {
     local s=${1//\\/\\\\}
     s=${s//\"/\\\"}
-    printf '%s' "${s//[$'\n\t\r']/ }"
+    printf '%s' "${s//[[:cntrl:]]/ }"
 }
 
 record_compaction_event() {
-    local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line
+    local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line lock tmp i=0
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
     line="$(printf '{"ts":"%s","epoch":%s,"host":"%s","transcript":"%s","trigger":"%s"}' \
@@ -113,11 +113,22 @@ record_compaction_event() {
         "$(_ch_json_escape "${SUTANDO_HOST_LABEL:-$(hostname -s 2>/dev/null)}")" \
         "$(_ch_json_escape "$(basename "${1:-}" 2>/dev/null)")" \
         "$(_ch_json_escape "${2:-precompact}")")"
-    # Bound it: keep the newest 500 so a long-lived core cannot grow this forever.
+    # Trim-then-append is read-modify-write on one shared file, so overlapping
+    # hooks drop events with no malformed line to show for it. One writer at a time.
+    lock="$log.lock"
+    while ! mkdir "$lock" 2>/dev/null; do
+        i=$((i + 1))
+        # Never block a PreCompact hook forever: a dead holder must not wedge it.
+        [ "$i" -ge 100 ] && break
+        sleep 0.05
+    done
     if [ -f "$log" ] && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -ge 500 ]; then
-        tail -n 499 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log" 2>/dev/null
+        tmp="$(mktemp "${log}.tmp.XXXXXX" 2>/dev/null)" || tmp="${log}.tmp.$$"
+        tail -n 499 "$log" > "$tmp" 2>/dev/null && mv "$tmp" "$log" 2>/dev/null
+        rm -f "$tmp" 2>/dev/null
     fi
     printf '%s\n' "$line" >> "$log" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null
 }
 record_compaction_event "${1:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact}"
 
