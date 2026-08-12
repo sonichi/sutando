@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """workspace-root-tidy must not flag a file the personal-asset resolver reads there.
-
-The workspace root is that resolver's last step, so a copy there is a supported
-resolution target and the probe's "move it to state/" remedy would break it.
-"""
+The root is that resolver's last step, so a "move it to state/" remedy breaks it."""
 import fnmatch
 import importlib.util
 import os
@@ -42,11 +39,8 @@ def load(name, relpath):
 
 
 def derive_personal_path_names():
-    """Filenames reachable through the personal-asset resolver.
-
-    Shell call sites live inside embedded python heredocs, which neither
-    `lint-class-rules.py` extractor sees, so they get their own scan here.
-    """
+    """Filenames reachable through the personal-asset resolver. The shell call sites
+    hide in python heredocs, which neither lint-class-rules.py extractor reaches."""
     lcr = load("lcr", "scripts/lint-class-rules.py")
     names = set()
     for sub in ("src", "scripts", "skills"):
