@@ -159,6 +159,12 @@ class OrphanResultRoutesTest(unittest.TestCase):
 
     # --- failure modes must not read as "nothing to route" --------------
 
+    def test_an_empty_results_dir_returns_a_reset_cursor(self):
+        # results/ exists and is empty — distinct from the unreadable case, and
+        # the only path that returns the cursor reset without examining anything.
+        routes, cursor = self.call(cursor="task-anything.txt")
+        self.assertEqual((routes, cursor), ({}, ""))
+
     def test_the_scan_is_bounded(self):
         for i in range(5):
             tid = self._result(f"task-{i}")
