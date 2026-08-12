@@ -870,6 +870,64 @@ def test_bounded_runtime_helper_edges() -> None:
                 assert str(exc) == "nope"
 
 
+def test_capsule_helper_rejects_malformed_and_private_inputs() -> None:
+    for value in ("", "/absolute", "../escape", "nested/.GIT/config"):
+        try:
+            worker._relative_path(value)
+            raise AssertionError(f"unsafe path must fail: {value!r}")
+        except RuntimeError as exc:
+            assert "unsafe capsule path" in str(exc)
+
+    for value in (
+        ".ssh/id_ed25519", ".config/gh/hosts.yml", ".docker/config.json", "prod.env",
+    ):
+        assert worker._is_secret_path(worker.PurePosixPath(value))
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        project = _git_project(root / "project", {"tracked.txt": "tracked\n"})
+        workspace = project / "private-workspace"
+        config = project / "private-config"
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}, clear=False):
+            assert worker.PurePosixPath("private-config") in worker._private_project_roots(
+                project, workspace)
+
+        try:
+            worker._private_project_roots(project, project)
+            raise AssertionError("a private workspace cannot also be the Team project")
+        except RuntimeError as exc:
+            assert "private workspace" in str(exc)
+
+        directory = project / "directory"
+        directory.mkdir()
+        try:
+            worker._file_state(directory)
+            raise AssertionError("non-file project entries must fail")
+        except RuntimeError as exc:
+            assert "unsupported project entry" in str(exc)
+
+        try:
+            worker._safe_symlink(project, worker.PurePosixPath("link"), "/escape")
+            raise AssertionError("absolute symlinks must fail")
+        except RuntimeError as exc:
+            assert "symlink is absolute" in str(exc)
+
+        try:
+            worker._git(project, "not-a-git-command")
+            raise AssertionError("Git failures must propagate")
+        except RuntimeError as exc:
+            assert "not-a-git-command" in str(exc)
+
+        with mock.patch.object(worker.tempfile, "gettempdir", return_value=str(project)):
+            try:
+                with worker._team_capsule(
+                    project, workspace, (worker.PurePosixPath("private-workspace"),)
+                ):
+                    raise AssertionError("capsules cannot be created inside the project")
+            except RuntimeError as exc:
+                assert "no capsule location" in str(exc)
+
+
 def test_claude_creates_then_resumes_the_same_durable_session() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -1728,6 +1786,7 @@ if __name__ == "__main__":
     test_closes_pipes_then_stalls_still_hits_the_deadline()
     test_installed_claude_enforces_team_credential_and_network_boundary()
     test_bounded_runtime_helper_edges()
+    test_capsule_helper_rejects_malformed_and_private_inputs()
     test_claude_creates_then_resumes_the_same_durable_session()
     test_nonzero_provider_stdout_is_never_written_as_a_result()
     test_archived_result_is_not_replayed_on_restart_scan()
