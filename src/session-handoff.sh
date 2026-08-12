@@ -94,10 +94,8 @@ WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of thi
 # after every compaction (sutando-migrate classifies it newest-mtime).
 STATE_FILE="$WORKSPACE_DIR/session-state.md"
 
-# Append-only record that a compaction happened. Nothing else on disk marks one,
-# so "did context roll over just before that failure?" was previously unanswerable.
-# JSON-escape one value. host/transcript/trigger are external input, and an
-# unescaped " or \\ makes the whole line unparseable to every later reader.
+# JSON-escape one value. host/transcript/trigger are external input, and any
+# raw control char or quote makes the whole line unparseable to every reader.
 _ch_json_escape() {
     local s=${1//\\/\\\\}
     s=${s//\"/\\\"}
@@ -130,7 +128,7 @@ record_compaction_event() {
     printf '%s\n' "$line" >> "$log" 2>/dev/null || true
     rmdir "$lock" 2>/dev/null
 }
-record_compaction_event "${1:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact}"
+record_compaction_event "${TRANSCRIPT:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact}"
 
 # Build state from available signals
 {

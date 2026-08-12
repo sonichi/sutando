@@ -245,5 +245,67 @@ class ConcurrentWritersDoNotLoseEvents(unittest.TestCase):
         self.assertEqual(leftovers, [], f"stale artifacts: {leftovers}")
 
 
+
+class CallSitePassesTheResolvedTranscript(unittest.TestCase):
+    """The stock hook supplies transcript_path on STDIN, not argv. Passing $1
+    to the recorder logs an empty transcript on exactly that path."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.ws = Path(self._td.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        self.log = self.ws / "state" / "compactions.jsonl"
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _stdin_path_script(self) -> str:
+        """Real top-level lines, extracted — the assignment, the stdin parse and
+        the call. A re-typed copy could not observe the argument bug."""
+        text = SCRIPT.read_text()
+        assign = re.search(r'^TRANSCRIPT="\$1".*$', text, re.M)
+        parse = re.search(r'^if \[ -z "\$TRANSCRIPT" \] && \[ ! -t 0 \]; then.*?^fi$',
+                          text, re.S | re.M)
+        call = re.search(r'^record_compaction_event .*$', text, re.M)
+        for name, m in (("assignment", assign), ("stdin parse", parse), ("call site", call)):
+            if not m:
+                raise AssertionError(f"{name} not found in {SCRIPT}")
+        return "\n".join([f"WORKSPACE_DIR={self.ws!s}", _fn_source(),
+                           assign.group(0), parse.group(0), call.group(0), "exit 0"])
+
+    def _run_with_stdin(self, payload: str) -> subprocess.CompletedProcess:
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(self._stdin_path_script())
+            path = fh.name
+        return subprocess.run(["bash", path], input=payload, capture_output=True,
+                              text=True, timeout=30)
+
+    def test_transcript_from_stdin_reaches_the_log(self):
+        self._run_with_stdin('{"transcript_path": "/tmp/x/transcript-stdin.jsonl"}')
+        self.assertTrue(self.log.is_file(), "no line written on the stdin hook path")
+        rec = json.loads(self.log.read_text().strip().splitlines()[-1])
+        self.assertEqual(
+            rec["transcript"], "transcript-stdin.jsonl",
+            "the call site passed $1 instead of the stdin-resolved $TRANSCRIPT, so the "
+            "record names no transcript on the ONLY path the stock hook uses")
+
+    def test_an_explicit_argv_path_still_wins(self):
+        """Manual invocation passes $1; stdin parsing must not displace it."""
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(self._stdin_path_script().replace(
+                "exit 0", "").replace(f"WORKSPACE_DIR={self.ws!s}",
+                                      f"WORKSPACE_DIR={self.ws!s}\nset -- /tmp/y/argv-one.jsonl"))
+            path = fh.name
+        subprocess.run(["bash", path], input="", capture_output=True, text=True, timeout=30)
+        rec = json.loads(self.log.read_text().strip().splitlines()[-1])
+        self.assertEqual(rec["transcript"], "argv-one.jsonl")
+
+    def test_neither_source_present_is_empty_not_a_crash(self):
+        r = self._run_with_stdin("")
+        self.assertEqual(r.returncode, 0)
+        rec = json.loads(self.log.read_text().strip().splitlines()[-1])
+        self.assertEqual(rec["transcript"], "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
