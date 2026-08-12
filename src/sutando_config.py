@@ -535,12 +535,8 @@ def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
 
 
 def resolve_core_effort(repo_root: Optional[Path] = None) -> str:
-    """Return the configured reasoning-effort level for the core, or "" if unset.
-
-    ``SUTANDO_CORE_EFFORT`` is an invocation-scoped launcher override; otherwise
-    ``core.effort`` is read from merged config. Empty means "pass no --effort",
-    so an install that configures nothing keeps the CLI's own default.
-    """
+    """Reasoning-effort level for the core, or "" when unset (no --effort passed).
+    ``SUTANDO_CORE_EFFORT`` overrides ``core.effort`` for one invocation."""
     core = load_config(repo_root).get("core") or {}
     configured = str(core.get("effort") or "").strip()
     effort = os.environ.get("SUTANDO_CORE_EFFORT", "").strip() or configured

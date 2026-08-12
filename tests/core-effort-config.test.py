@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""core.effort must resolve from config AND actually reach claude's argv.
-
-The resolver half alone would not have caught the bug this fixes: CLAUDE_EFFORT
-was set in the core's environment and nothing read it, so a "configured" level
-had no effect. The launcher cases below assert the flag on the real argv.
-"""
+"""core.effort must resolve from config AND reach claude's argv — a resolver-only
+test would pass against the bug this fixes (a value nothing consumes)."""
 from __future__ import annotations
 
 import json
