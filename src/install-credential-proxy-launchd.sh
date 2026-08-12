@@ -103,9 +103,8 @@ case "$cmd" in
             fi
         fi
         BREW_BIN="$(resolve_brew_bin)"
-        # Canonical config dir, baked in because launchd inherits no shell env.
-        # The helper owns every supported fallback; an empty value would install
-        # a proxy that silently reads the vanilla keychain item instead.
+        # Baked in because launchd inherits no shell env; an empty value would
+        # install a proxy that silently reads the vanilla keychain item.
         CLAUDE_CFG="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
         [ -n "$CLAUDE_CFG" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; exit 1; }
         echo "Installing $LABEL"

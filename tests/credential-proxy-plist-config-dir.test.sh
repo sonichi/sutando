@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
-# Regression: the credential-proxy launchd job must carry CLAUDE_CONFIG_DIR.
-#
-# The proxy picks its keychain item by hashing CLAUDE_CONFIG_DIR and falls back
-# to the vanilla `Claude Code-credentials` when it is unset. launchd inherits no
-# shell environment, so a plist without the key leaves the proxy able to resolve
-# only the vanilla item — while an interactive /login in a namespaced core
-# writes the scoped one. Both then exist, the proxy keeps refreshing the wrong
-# one, and every routed request bills an account the owner never chose.
-#
-# The assertions read the RENDERED plist, not the installer's source text: the
-# bug being pinned is a missing key in a generated file, and a grep for the
-# substitution line would still pass if the template dropped the key.
-#
-# Isolation: HOME and PATH are redirected so the real user's LaunchAgents and
-# launchd domain are never touched — `launchctl` is shadowed by a no-op stub.
+# The credential-proxy launchd job must carry CLAUDE_CONFIG_DIR. Assertions read
+# the RENDERED plist; a grep for the sed line passes even if the template drops.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
@@ -94,14 +81,11 @@ check $? "a config dir containing & still renders a parseable plist"
 check $? "the & path round-trips to the literal value launchd will export"
 
 # --- 3: an unresolvable config dir fails the install, it does not ship empty --
-# Stage scripts/ as a real dir whose sutando-config.sh returns nothing for a
-# bare claude-home-path and delegates everything else, so only that one lookup
-# fails. Installing a plist with an empty value is the silent-wrong-account
-# outcome, so the installer must refuse instead.
+# A stub scripts/ fails only the bare claude-home-path lookup: shipping an empty
+# value is the silent-wrong-account outcome, so the install must refuse.
 STAGE2="$TMP/repo-noconfig"; mkdir -p "$STAGE2/dist" "$STAGE2/scripts" "$STAGE2/src"
-# src/ is a real dir of per-file symlinks, not a symlinked dir: the kernel
-# resolves `src/..` through a dir symlink back to the real repo, which reaches
-# the real scripts/ and would bypass the stub below.
+# Per-file symlinks, not a symlinked dir: the kernel resolves `src/..` through a
+# dir symlink to the real repo, reaching the real scripts/ and skipping the stub.
 for f in install-credential-proxy-launchd.sh workspace_resolve.sh launchd; do
   ln -s "$REPO/src/$f" "$STAGE2/src/$f"
 done
