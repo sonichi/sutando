@@ -124,6 +124,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'find-pids.test.py failed' }
           python tests/single-instance.test.py
           if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
+          python tests/voice-lock-windows.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'voice-lock-windows.test.py failed' }
+
+      - name: Run voice-agent crash-only integration
+        shell: pwsh
+        run: |
+          .\node_modules\.bin\tsx.cmd --test --test-force-exit tests\voice-agent-crash-only.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'voice-agent-crash-only.test.ts failed' }
 
       - name: Compile Windows Python entry points
         run: >-

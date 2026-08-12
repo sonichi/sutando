@@ -43,12 +43,17 @@ import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
-	if (process.platform !== 'darwin' && process.env.SUTANDO_TEST_MODE !== '1') {
+	if (process.platform === 'win32') {
 		console.warn(
 			`[voice-agent] running on ${process.platform} — voice + screen capture + clipboard ` +
 			`work, but AppleScript-driven tools (switch_app, type_text, slide_control, etc.) ` +
 			`will return macOSOnly errors. See README "Windows support" section.`,
 		);
+		return;
+	}
+	if (process.platform !== 'darwin' && process.env.SUTANDO_TEST_MODE !== '1') {
+		console.error('Sutando requires macOS or Windows');
+		process.exit(1);
 	}
 }
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
@@ -193,7 +198,10 @@ function acquirePidLock(): void {
 		// writer — a second writer implementation would reopen the lock races
 		// the guarded helper exists to close.
 		console.error(`${ts()} [Startup] FATAL: cannot resolve a usable python3 for the voice lock helper — ${py.detail}`);
-		console.error(`${ts()} [Startup] Lock operations fail closed. Fix: install python3 (brew install python), set SUTANDO_PY to a working interpreter, or run xcode-select --install. Exiting.`);
+		const fix = process.platform === 'win32'
+			? 'install Python from python.org so python or py -3 works, or set SUTANDO_PY'
+			: 'install python3 (brew install python), set SUTANDO_PY, or run xcode-select --install';
+		console.error(`${ts()} [Startup] Lock operations fail closed. Fix: ${fix}. Exiting.`);
 		process.exit(1);
 	}
 	const res = acquireVoiceLock({
