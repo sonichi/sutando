@@ -3861,12 +3861,11 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
 
     quota-state.json is written by the proxy from the quota headers on
     upstream responses, so it only appears if a core actually ROUTES through
-    the proxy. `src/startup.sh` is the only thing that exports
-    ANTHROPIC_BASE_URL=http://localhost:7846 — and a core launched by the
-    desktop supervisor never runs startup.sh. Result on such a host: the
-    proxy is healthy and listening, every check is green, and quota
-    telemetry is silently absent forever. The proactive loop's per-pass
-    budget check reads "unknown" on every pass and nobody is told why.
+    the proxy. Only the core launcher (`src/agent/claude/cli/start-cli.sh`)
+    exports ANTHROPIC_BASE_URL=http://localhost:7846, and only when the proxy
+    port already has a listener at launch — so a core started outside the
+    launcher, or started before it bound, stays unrouted and every other check
+    still reads green.
 
     The existing credential-proxy check can't catch this: it is a plain
     TCP-listening probe (correctly so — a forwarding proxy has no liveness
@@ -3963,16 +3962,22 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
                 f"working ({int(agent_age / 60)}m since the last loop pass) — the proxy "
                 "is up but nothing is routing through it any more, so the file on disk "
                 "is a leftover from when it was. Quota-based budgeting is quoting stale "
-                "numbers as current. Check ANTHROPIC_BASE_URL on the running core "
-                "(exported by src/startup.sh; a supervisor-launched core never runs it)."
+                "numbers as current. Check ANTHROPIC_BASE_URL on the running core: only "
+                "the core launcher (src/agent/claude/cli/start-cli.sh) exports it, and "
+                "only when the proxy port already has a listener at launch — so a core "
+                "started outside the launcher, or started before the proxy bound, stays "
+                "unrouted for its whole session."
             )
         return check
     check["status"] = "warn"
     check["detail"] = (
-        "credential proxy is up but has never written quota-state.json — "
-        "nothing is routing through it (ANTHROPIC_BASE_URL unset; set by "
-        "src/startup.sh, which a supervisor-launched core never runs). "
-        "Quota-based budgeting is blind on this host."
+        "credential proxy is up but has never written quota-state.json — nothing "
+        "is routing through it (ANTHROPIC_BASE_URL unset on the running core). "
+        "Only the core launcher (src/agent/claude/cli/start-cli.sh) exports it, "
+        "and only when the proxy port already has a listener at launch — so a "
+        "core started outside the launcher, or started before the proxy bound, "
+        "stays unrouted for its whole session. Quota-based budgeting is blind "
+        "on this host."
     )
     return check
 
@@ -5121,13 +5126,10 @@ def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | 
         return True
 
 
-def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
-    """Detect a task-queue pileup — tasks/ directory growing without
-    being drained. Independent of which watcher / loop is dying: the queue
-    backs up either way. Fires when BOTH count and age cross thresholds so
-    a transient spike of fresh tasks (normal during heavy use) doesn't
-    alert.
-    """
+def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
+                     stuck_age_sec: int = 900) -> dict:
+    """Detect a task-queue pileup, independent of which watcher or loop is dying.
+    Two branches: count AND age together, or age alone past stuck_age_sec."""
     name = "task-queue"
     tasks_dir = WORKSPACE_DIR / "tasks"
     if not tasks_dir.exists():
@@ -5145,6 +5147,14 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
             "name": name,
             "status": "warn",
             "detail": f"{len(files)} tasks queued, oldest {oldest_age}s — watcher or core may be stuck",
+        }
+    # ANDing count with age left a single stuck task unreachable, so one owner
+    # message could sit indefinitely while this probe printed its age under "ok".
+    if oldest_age > stuck_age_sec:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"{len(files)} task(s) queued, oldest {oldest_age}s — undrained past {stuck_age_sec}s",
         }
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
