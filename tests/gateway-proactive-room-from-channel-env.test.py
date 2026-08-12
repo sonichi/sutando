@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """REMOTE_PROACTIVE_ROOM must come from the channel .env even when the token
-does not — the .env is the deployment's config file, not only a token store.
-
-Run: python3 tests/gateway-proactive-room-from-channel-env.test.py
-"""
+does not — the .env is the deployment's config file, not only a token store."""
 from __future__ import annotations
 
 import contextlib
@@ -162,6 +159,67 @@ class ProactiveRoomFromChannelEnv(unittest.TestCase):
                 "rgb_proactive_no_shadow",
             ) as mod:
                 self.assertEqual(mod.PROACTIVE_ROOM, ROOM)
+
+    def test_a_present_but_empty_value_wins_over_a_later_candidate(self):
+        # Symmetric with the env layer: a blank the operator wrote is a decision.
+        # Falling through would re-acquire the room the higher file disabled.
+        with _channel_env(
+            f"REMOTE_PROACTIVE_ROOM={ROOM}\n"
+        ) as cfg, tempfile.TemporaryDirectory() as devdir:
+            dev = Path(devdir) / ".env"
+            dev.write_text(
+                "REMOTE_TASK_TOKEN=https://gw|dev\nREMOTE_PROACTIVE_ROOM=\n",
+                encoding="utf-8",
+            )
+            with _load(
+                {
+                    "CLAUDE_CONFIG_DIR": cfg,
+                    "AG2_DEVICE_ENV": str(dev),
+                    "REMOTE_TASK_TOKEN": None,
+                    "REMOTE_PROACTIVE_ROOM": None,
+                },
+                "rgb_proactive_file_blank",
+            ) as mod:
+                self.assertEqual(mod.PROACTIVE_ROOM, "")
+
+    def test_an_undecodable_candidate_does_not_shadow_the_next(self):
+        # Reading every candidate up front widened the set of files that must
+        # survive parsing; UnicodeDecodeError is not caught by `except OSError`.
+        with _channel_env(
+            f"REMOTE_TASK_TOKEN=https://gw|s\nREMOTE_PROACTIVE_ROOM={ROOM}\n"
+        ) as cfg, tempfile.TemporaryDirectory() as devdir:
+            dev = Path(devdir) / ".env"
+            dev.write_bytes(b"REMOTE_TASK_URL=https://x.example\xff\n")
+            with _load(
+                {
+                    "CLAUDE_CONFIG_DIR": cfg,
+                    "AG2_DEVICE_ENV": str(dev),
+                    "REMOTE_TASK_TOKEN": None,
+                    "REMOTE_PROACTIVE_ROOM": None,
+                },
+                "rgb_proactive_undecodable_first",
+            ) as mod:
+                self.assertEqual(mod.PROACTIVE_ROOM, ROOM)
+
+    def test_an_undecodable_later_candidate_is_not_an_import_error(self):
+        # The bridge that will not import delivers no proactive body at all —
+        # this PR's own symptom, reached by a different route.
+        with tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as devdir:
+            d = Path(cfg) / "channels" / "ag2space"
+            d.mkdir(parents=True)
+            (d / ".env").write_bytes(b"REMOTE_TASK_URL=https://x.example\xff\n")
+            dev = Path(devdir) / ".env"
+            dev.write_text("REMOTE_TASK_TOKEN=https://gw|dev\n", encoding="utf-8")
+            with _load(
+                {
+                    "CLAUDE_CONFIG_DIR": cfg,
+                    "AG2_DEVICE_ENV": str(dev),
+                    "REMOTE_TASK_TOKEN": None,
+                    "REMOTE_PROACTIVE_ROOM": None,
+                },
+                "rgb_proactive_undecodable_last",
+            ) as mod:
+                self.assertEqual(mod.PROACTIVE_ROOM, "")
 
     def test_the_instance_channel_dir_is_honored(self):
         # A named instance reads its OWN channels/<dir>/.env, so it cannot pick
