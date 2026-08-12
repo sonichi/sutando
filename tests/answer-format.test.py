@@ -78,6 +78,26 @@ check("list-grouped-decimals",
 # followed by "2000" (4 digits, not a valid 3-digit grouping) → a separator.
 check("list-nospace-plain-numbers",
       nz.normalize_list("1000,2000"), "1000, 2000")
+# Three-digit SECOND element. Grouping is a property of the whole token: no
+# grouped number has a four-digit lead group, so "1000,200" is two elements.
+# Deciding per-comma made this one element (qingyun CR on #2382).
+check("list-three-digit-second-item",
+      nz.normalize_list("1000,200"), "1000, 200")
+check("list-three-digit-second-item-number-items",
+      nz.normalize_list("1000,200", number_items=True), "1000, 200")
+# Same token, split inconsistently before: only the last comma separated, so
+# "1000,200,30" came back as ["1000,200", "30"].
+check("list-three-digit-middle-item",
+      nz.normalize_list("1000,200,30"), "1000, 200, 30")
+# The lead group governs, not the element count: "1,0000" is not grouped.
+check("list-four-digit-tail-not-grouped",
+      nz.normalize_list("1,0000"), "1, 0000")
+# Boundary the fix nearly broke: a grouped number may be FOLLOWED by a separator
+# comma, so the trailing guard must reject a digit only, not a comma.
+check("list-grouped-then-grouped",
+      nz.normalize_list("1,000,000, 500,000"), "1,000,000, 500,000")
+check("list-grouped-between-words",
+      nz.normalize_list("a, 1,000, b"), "a, 1,000, b")
 # Auto mode routes a multi-grouped-number answer to list and keeps 3 elements
 # (previously 7 garbage fragments).
 check("auto-list-grouped-numbers",

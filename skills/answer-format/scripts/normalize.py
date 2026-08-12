@@ -39,13 +39,27 @@ _PURE_NUMBER_COMMAS = re.compile(r"^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
 _CURRENCY_PREFIX = re.compile(r"^(?:[$€£¥]|USD|EUR|GBP|JPY)\s*", re.IGNORECASE)
 _LEADING_ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
 # List elements are comma-separated, but a thousands-grouping comma inside a
-# numeric element ("1,000,000") is NOT an element boundary. A grouping comma is
-# preceded by a digit AND followed by exactly three digits then a non-digit/end;
-# split on every OTHER comma. (bassil CR 2026-08-03: naive text.split(",")
-# shredded "1,000,000, 500,000" into seven fragments, and _infer_kind routes any
-# multi-number comma answer — the GAIA multi-value shape this skill targets —
-# straight into the list path.)
-_LIST_SEP = re.compile(r"(?<!\d),|,(?!\d{3}(?:\D|$))")
+# numeric element ("1,000,000") is NOT an element boundary. Grouping is a
+# property of the WHOLE token, not of one comma: "1000,200" cannot be grouped
+# because no grouped number has a four-digit lead group, so its comma separates
+# elements. Deciding per-comma also split one token inconsistently —
+# "1000,200,30" became ["1000,200", "30"].
+# Trailing guard is (?!\d), not (?![\d,]): a grouped number may be followed by a
+# separator comma ("1,000,000, 500,000"). Greedy (?:,\d{3})+ already prevents
+# stopping mid-group, so only a digit may not follow.
+_GROUPED_NUMBER = re.compile(r"(?<![\d,])-?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?!\d)")
+
+
+def _split_list_elements(text: str) -> list[str]:
+    """Split on element commas, keeping grouping commas inside their number."""
+    grouped = [m.span() for m in _GROUPED_NUMBER.finditer(text)]
+    parts, start = [], 0
+    for i, ch in enumerate(text):
+        if ch == "," and not any(a <= i < b for a, b in grouped):
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
 
 
 def _expand_magnitude(text: str) -> str | None:
@@ -130,7 +144,7 @@ def normalize_list(text: str, sort: bool = False, number_items: bool = False) ->
     """Comma-separated, single space after each comma. Per-element trimming; each
     element optionally normalized as a number. Sorting is opt-in (graders rarely
     want it) and case-insensitive."""
-    parts = [p.strip() for p in _LIST_SEP.split(text)]
+    parts = [p.strip() for p in _split_list_elements(text)]
     parts = [p for p in parts if p]
     if number_items:
         parts = [normalize_number(p) for p in parts]
