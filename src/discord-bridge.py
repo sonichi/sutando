@@ -902,6 +902,23 @@ def _format_seed_notice(owner_id, author_mention, parent_label, thread_id_str):
         f"`/discord:access group rm {thread_id_str}` to undo."
     )
 
+async def _maybe_notify_owner_of_seed(access_data, sender_id, sender_mention,
+                                      parent_label, thread_id_str):
+    """DM the canonical owner when a NON-owner seeds a thread. Never in-thread:
+    posting it publicly leaks access-control plumbing. Log-only on failure."""
+    canonical_owner = discord_config.resolve_owner_id(access_data)
+    if not _should_notify_owner_on_seed(sender_id, canonical_owner):
+        return False
+    try:
+        await _send_seed_notice_to_owner(
+            canonical_owner,
+            _format_seed_notice(canonical_owner, sender_mention, parent_label, thread_id_str))
+        return True
+    except Exception as e:
+        print(f"  [thread-engage] owner-notice DM failed (no public fallback): {e}", flush=True)
+        return False
+
+
 async def _send_seed_notice_to_owner(owner_id, notice):
     """Deliver the auto-seed notice to the owner's DM.
 
@@ -3079,17 +3096,10 @@ async def _handle_discord_message(message, force=False):
                     # posting the notice into the seeded thread leaked internal
                     # access-control plumbing into a public AG2-community thread
                     # (2026-07-29 incident). Failure path is log-only by design.
-                    # Canonical owner, not allowFrom[0]: the list is ordered by
-                    # nothing, and a team-tier member in it is not the owner.
-                    canonical_owner = discord_config.resolve_owner_id(access_data)
-                    if _should_notify_owner_on_seed(message.author.id, canonical_owner):
-                        try:
-                            parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
-                            await _send_seed_notice_to_owner(
-                                canonical_owner,
-                                _format_seed_notice(canonical_owner, message.author.mention, parent_label, thread_id_str))
-                        except Exception as e:
-                            print(f"  [thread-engage] owner-notice DM failed (no public fallback): {e}", flush=True)
+                    parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
+                    await _maybe_notify_owner_of_seed(
+                        access_data, message.author.id, message.author.mention,
+                        parent_label, thread_id_str)
             except Exception as e:
                 print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
 
@@ -4331,6 +4341,20 @@ def _is_sandbox_fallback_result(body, is_dm):
     return is_sandbox_fallback_sentinel(body)
 
 
+async def _swallow_sandbox_fallback(channel, task_id, result_file, reply_text, is_dm):
+    """Archive a sandbox-fallback result instead of posting it to a guild channel.
+    Returns True when swallowed; a DM destination is delivered as before."""
+    if not _is_sandbox_fallback_result(reply_text, is_dm):
+        return False
+    print(f"  [sandbox-suppress] swallowed sandbox-fallback result for {task_id} (guild channel {channel.id})", flush=True)
+    _record_skip_audit(task_id, "no-send")
+    await _notify_owner_sandbox_suppressed(channel, task_id)
+    archive_file(result_file, "results", task_id)
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+    return True
+
+
 async def _notify_owner_sandbox_suppressed(channel, task_id):
     """Best-effort owner DM when a sandbox-fallback sentinel was suppressed.
 
@@ -4645,13 +4669,9 @@ async def poll_results():
                 # when that channel is a guild thread. Swallow it for non-DM
                 # destinations: no-send archive + best-effort owner DM. DMs keep
                 # current behavior (a 1:1 refusal to the requester is fine).
-                if _is_sandbox_fallback_result(reply_text, isinstance(channel, discord.DMChannel)):
-                    print(f"  [sandbox-suppress] swallowed sandbox-fallback result for {task_id} (guild channel {channel.id})", flush=True)
-                    _record_skip_audit(task_id, "no-send")
-                    await _notify_owner_sandbox_suppressed(channel, task_id)
-                    archive_file(result_file, "results", task_id)
-                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
+                if await _swallow_sandbox_fallback(
+                        channel, task_id, result_file, reply_text,
+                        isinstance(channel, discord.DMChannel)):
                     continue
 
                 # Idempotency check: if the previous run already sent

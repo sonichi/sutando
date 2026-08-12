@@ -32,6 +32,7 @@ Exit 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 import importlib.util
 import os
 import sys
@@ -327,11 +328,87 @@ def case_source_wiring() -> list[str]:
     if "message.channel.send(\n                                _format_seed_notice" in src \
             or "message.channel.send(_format_seed_notice" in src:
         fails.append("h) seed notice must NOT be posted to the seeded thread")
-    # poll_results must consult the predicate before delivering.
-    if "_is_sandbox_fallback_result(reply_text" not in src:
-        fails.append("h) poll_results must gate delivery on _is_sandbox_fallback_result")
+    # The delivery loop must consult the guard. After the extraction the
+    # predicate lives in the helper, so assert the CALL SITE, not the predicate.
+    if "await _swallow_sandbox_fallback(" not in src:
+        fails.append("h) delivery loop must gate on _swallow_sandbox_fallback")
     return fails
 
+
+
+# ---------------------------------------------------------------------------
+# _swallow_sandbox_fallback / _maybe_notify_owner_of_seed — the extracted blocks
+# ---------------------------------------------------------------------------
+
+def case_swallow_guard() -> list[str]:
+    fails = []
+    archived = []
+    bridge.archive_file = lambda p, kind, tid: archived.append((kind, tid))
+    bridge._record_skip_audit = lambda tid, why: archived.append(("audit", why))
+    notified = []
+
+    async def _fake_notify(channel, task_id):
+        notified.append(task_id)
+
+    bridge._notify_owner_sandbox_suppressed = _fake_notify
+
+    class _Chan:
+        id = 424242
+
+    # Guild destination + sentinel -> swallowed, archived, owner notified.
+    got = asyncio.run(bridge._swallow_sandbox_fallback(
+        _Chan(), "task-s1", pathlib.Path("/tmp/nonexistent-result.txt"), SENTINEL, False))
+    if got is not True:
+        fails.append("i) guild sentinel must be swallowed")
+    if "task-s1" not in notified:
+        fails.append("i) owner must be notified when swallowing")
+    if ("audit", "no-send") not in archived:
+        fails.append("i) swallow must record a no-send skip audit")
+
+    # DM destination -> delivered as before.
+    if asyncio.run(bridge._swallow_sandbox_fallback(
+            _Chan(), "task-s2", pathlib.Path("/tmp/x.txt"), SENTINEL, True)) is not False:
+        fails.append("i) DM destination must NOT be swallowed")
+
+    # Ordinary prose -> delivered.
+    if asyncio.run(bridge._swallow_sandbox_fallback(
+            _Chan(), "task-s3", pathlib.Path("/tmp/x.txt"), "a normal answer", False)) is not False:
+        fails.append("i) ordinary body must NOT be swallowed")
+    return fails
+
+
+def case_maybe_notify_seed() -> list[str]:
+    fails = []
+    sent = []
+
+    async def _fake_send(owner_id, notice):
+        sent.append((owner_id, notice))
+
+    bridge._send_seed_notice_to_owner = _fake_send
+    access = {"allowFrom": ["team-user", "owner-user"],
+              "tierMap": {"team-user": "team", "owner-user": "owner"}}
+
+    # Team-tier seeder -> owner IS notified, and the DM targets the canonical owner.
+    if asyncio.run(bridge._maybe_notify_owner_of_seed(
+            access, "team-user", "@team", "#parent", "9001")) is not True:
+        fails.append("j) team-tier seeder must notify the owner")
+    if not sent or sent[-1][0] != "owner-user":
+        fails.append(f"j) DM must target the canonical owner, got {sent[-1][0] if sent else None}")
+
+    # Owner seeding their own thread -> no ping.
+    if asyncio.run(bridge._maybe_notify_owner_of_seed(
+            access, "owner-user", "@owner", "#parent", "9002")) is not False:
+        fails.append("j) owner seeder must NOT notify")
+
+    # Delivery failure is log-only, never raises.
+    async def _boom(owner_id, notice):
+        raise RuntimeError("dm down")
+
+    bridge._send_seed_notice_to_owner = _boom
+    if asyncio.run(bridge._maybe_notify_owner_of_seed(
+            access, "team-user", "@team", "#parent", "9003")) is not False:
+        fails.append("j) a failed DM must report False, not raise")
+    return fails
 
 def main() -> int:
     cases = [
@@ -343,6 +420,8 @@ def main() -> int:
         ("f-suppress-never-raises", case_suppress_notice_never_raises),
         ("g-notice-body", case_seed_notice_body),
         ("h-source-wiring", case_source_wiring),
+        ("i-swallow-guard", case_swallow_guard),
+        ("j-maybe-notify-seed", case_maybe_notify_seed),
     ]
     failures: list[str] = []
     for name, fn in cases:
