@@ -309,3 +309,29 @@ reap_wedged_voice_agent() {
   fi
   return 0
 }
+
+# Reap a stale watch-tasks-stream watcher from a prior session. The in-session
+# Stop hook handles clean shutdown; a hard crash (SIGKILL, panic, force-quit,
+# power loss) skips it and leaves an orphan fswatch process + stale PID file.
+# The cmdline check is what keeps a RECYCLED pid from being killed blindly.
+#
+# The removal is compare-and-delete for the same reason watch-tasks-stream.sh's
+# own cleanup() is: the watcher stamps its sentinel once at startup and never
+# again, so deleting a sentinel this reap did not inspect leaves a LIVE watcher
+# permanently untrackable by every reader that keys off the file.
+reap_stale_task_watcher() {
+  local pid_file="$1" stale_pid current
+  [ -f "$pid_file" ] || return 0
+  stale_pid="$(cat "$pid_file" 2>/dev/null || true)"
+  if [ -n "$stale_pid" ] && ps -p "$stale_pid" -o args= 2>/dev/null | grep -q "watch-tasks-stream"; then
+    kill "$stale_pid" 2>/dev/null || true
+    echo "  ✓ reaped stale watch-tasks-stream watcher (pid $stale_pid)"
+  fi
+  current="$(cat "$pid_file" 2>/dev/null || true)"
+  if [ "$current" = "$stale_pid" ]; then
+    rm -f "$pid_file"
+  else
+    echo "  ⚠ watch-tasks-stream sentinel changed under the reap (now ${current:-<empty>}) — a live watcher owns it, leaving it in place"
+  fi
+  return 0
+}

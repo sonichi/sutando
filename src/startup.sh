@@ -643,24 +643,7 @@ if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
   bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
-# Reap any stale watch-tasks-stream watcher from a prior session. The
-# in-session Stop hook (.claude/settings.json) handles clean shutdown, but
-# a hard crash (SIGKILL, panic, force-quit, power loss) skips it and leaves
-# an orphan fswatch process + stale PID file. On a fresh startup we kill
-# the orphan (if the PID still names a live `watch-tasks-stream` process)
-# and remove the PID file so the new session's watcher writes a fresh one.
-# Skipping kills when the PID has been recycled by an unrelated process is
-# important — `kill $PID` without the cmdline check would target whatever
-# new program happens to hold the recycled PID.
-WATCHER_PID_FILE="$WORKSPACE/state/watch-tasks-stream.pid"
-if [ -f "$WATCHER_PID_FILE" ]; then
-  STALE_PID="$(cat "$WATCHER_PID_FILE" 2>/dev/null || true)"
-  if [ -n "$STALE_PID" ] && ps -p "$STALE_PID" -o args= 2>/dev/null | grep -q "watch-tasks-stream"; then
-    kill "$STALE_PID" 2>/dev/null || true
-    echo "  ✓ reaped stale watch-tasks-stream watcher (pid $STALE_PID)"
-  fi
-  rm -f "$WATCHER_PID_FILE"
-fi
+reap_stale_task_watcher "$WORKSPACE/state/watch-tasks-stream.pid"
 
 # Post-M0: repo-root tasks/results/data are NOT created. Pre-M0 this block
 # ran `mkdir -p tasks results data` as back-compat for unmigrated scripts —
