@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """The verdict is everything after the LAST marker; the rest of stdout is codex's
-trace, which --stall needs, so a consumer must extract instead of taking the stream.
-"""
+trace, which --stall needs, so a consumer must extract instead of taking the stream."""
 from __future__ import annotations
 
 import os
