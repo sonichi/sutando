@@ -1,92 +1,98 @@
 #!/usr/bin/env python3
-"""Regression guard: a logging failure must not stop delivery.
+"""Regression guard: a logging failure must not stop delivery — or drop inbound.
 
 ## The bug
 
 `discord-bridge.py` line-buffers stdout, so EVERY `print()` flushes at the
 newline. When the far end of stdout goes away (supervisor exits, pipe closed,
 launcher reaped), that flush raises `BrokenPipeError` *inside whatever code was
-logging*.
+logging*, and nothing catches it.
 
-In `poll_results` the sequence is:
+Two halves, and the second is the one that loses data.
+
+**Delivery.** In `poll_results`:
 
   1. `channel.send(...)`            — the DM actually goes out
   2. `_mark_delivered(task_id)`
   3. `print(f"  Replied: ...", flush=True)`   <-- raises
-  4. `except Exception as e: print(f"  Reply failed: {e}", flush=True)`  <-- raises again,
-     inside the handler, so it propagates
+  4. `except Exception as e: print(...)`      <-- raises again, inside the handler
   5. `archive_file(result_file, ...)`  — sits AFTER the try, never reached
 
 `poll_results` has no loop-level try/except, so the exception escapes
-`while True` and the coroutine ends permanently. The process stays alive and
-keeps receiving, so every cheap probe reports a healthy bridge while it can no
-longer reply. The message had already been sent, but the result file was left on
-disk and nothing was logged — which reads as "never delivered" and invites a
-resend (that is exactly how a duplicate DM got sent that night).
+`while True` and the coroutine ends permanently. The process stays alive, so
+every cheap probe reports a healthy bridge while it can no longer reply.
+
+**Receive.** In `on_message` the DM checkpoint advances inside a `try` (it
+survives), and the very next statement is an unguarded `print`. The allowlist
+check, the tier stamp and the `tasks/task-*.txt` write all sit below it — so the
+handler dies before the message becomes a task. Because the checkpoint already
+advanced, the REST catch-up skips it too: the message is destroyed, not delayed.
 
 ## The fix, in two independent halves
 
 - `_NeverFatalStream` wraps stdout/stderr and swallows `OSError` on
-  write/flush, so logging can no longer raise at all.
+  write/flush, so logging can no longer raise at all — anywhere in the process.
 - `_supervise_loop` restarts any `poll_*` coroutine that escapes its body, so a
-  crash from ANY cause degrades to a 5s gap instead of permanent silence.
+  crash from ANY cause degrades to a short gap instead of permanent silence.
 
-Both are asserted here. The first two tests exercise the ORIGINAL failure mode
-(a stream whose writes raise EPIPE), not a happy path.
+Both are asserted here against the REAL module (imported with `discord` stubbed
+and `CLAUDE_CONFIG_DIR` isolated), not against a copy — an earlier draft exec'd
+extracted source blocks, which passes but attributes no coverage to the file
+under test and would let the shipped lines rot untested.
 """
 from __future__ import annotations
 
 import asyncio
+import atexit
 import importlib.util
 import os
+import shutil
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
-# Isolate host config BEFORE anything touches the bridge. This test only execs
-# two extracted blocks, but `channel_access_path()` falls back to the real
-# `~/.claude/channels/<ch>/access.json`, so an isolated dir is the only way the
-# guarantee survives a future edit that imports the module for real.
-os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-logging-not-fatal-")
-_CFG = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
-_CFG.mkdir(parents=True, exist_ok=True)
-(_CFG / "access.json").write_text('{"allowFrom": []}')
-
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+# The bridge constructs a client at import; stub `discord` when it is absent.
+try:  # pragma: no cover - depends on the runner's site-packages
+    import discord  # noqa: F401
+except ImportError:
+    _d = types.ModuleType("discord")
+    _d.Intents = type("I", (), {"default": staticmethod(lambda: type("X", (), {"message_content": False})())})
+    _d.Client = type("C", (), {"__init__": lambda self, **k: None, "event": staticmethod(lambda fn: fn)})
+    _d.File = type("F", (), {})
+    _d.Message = type("M", (), {})
+    _d.DMChannel = type("DM", (), {})
+    _d.AllowedMentions = type("AM", (), {"__init__": lambda self, **k: None})
+    _d.MessageType = type("MT", (), {"default": 0, "reply": 19})
+    sys.modules["discord"] = _d
+
+# The bridge resolves channel access at import and falls back to the real
+# ~/.claude, so CLAUDE_CONFIG_DIR and HOME must be isolated BEFORE the import.
+_CFG = tempfile.mkdtemp(prefix="ccd-logging-not-fatal-")
+atexit.register(lambda: shutil.rmtree(_CFG, ignore_errors=True))
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+os.environ["HOME"] = _CFG
+os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
+_chan = Path(_CFG) / "channels" / "discord"
+_chan.mkdir(parents=True, exist_ok=True)
+(_chan / "access.json").write_text('{"allowFrom": []}')
 
 
-def _load_bridge_symbols():
-    """Import the two symbols under test without importing the whole bridge.
-
-    `discord-bridge.py` needs `discord`, a token, and workspace state at import
-    time, so the module is parsed and only the relevant definitions are
-    executed. That keeps this test hermetic (bar: bridge tests must not read
-    host config).
-    """
-    src = (REPO / "src" / "discord-bridge.py").read_text()
-    tree = compile(
-        _extract(src, ["class _NeverFatalStream:", "async def _supervise_loop("]),
-        "<bridge-subset>",
-        "exec",
+def _load_bridge():
+    spec = importlib.util.spec_from_file_location(
+        "_logging_not_fatal_bridge", REPO / "src" / "discord-bridge.py"
     )
-    ns: dict = {"asyncio": asyncio, "POLL_LOOP_RESTART_SEC": 0}
-    exec(tree, ns)
-    return ns
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _extract(src: str, headers: list[str]) -> str:
-    """Return the source of each top-level block whose first line matches."""
-    lines = src.splitlines()
-    out: list[str] = []
-    for header in headers:
-        start = next(i for i, line in enumerate(lines) if line.startswith(header))
-        end = start + 1
-        while end < len(lines) and (lines[end].startswith((" ", "\t")) or not lines[end].strip()):
-            end += 1
-        out.extend(lines[start:end])
-        out.append("")
-    return "\n".join(out)
+BRIDGE = _load_bridge()
 
 
 class BrokenStream:
@@ -94,6 +100,7 @@ class BrokenStream:
 
     def __init__(self):
         self.attempts = 0
+        self.encoding = "utf-8"
 
     def write(self, data):
         self.attempts += 1
@@ -102,85 +109,149 @@ class BrokenStream:
     def flush(self):
         raise BrokenPipeError(32, "Broken pipe")
 
-    encoding = "utf-8"
+
+class TypeErrorStream(BrokenStream):
+    """A stream whose failure is NOT the EPIPE class — must still propagate."""
+
+    def write(self, data):
+        raise TypeError("not a pipe problem")
 
 
-class LoggingNotFatalTest(unittest.TestCase):
-    def setUp(self):
-        self.ns = _load_bridge_symbols()
+class NeverFatalStreamTest(unittest.TestCase):
+    def test_write_swallows_epipe_and_reports_accepted(self):
+        raw = BrokenStream()
+        s = BRIDGE._NeverFatalStream(raw)
+        self.assertEqual(s.write("hello"), len("hello"))
+        self.assertEqual(raw.attempts, 1)
 
-    def test_print_through_wrapper_survives_a_dead_pipe(self):
-        """The exact original trigger: print() to a stream that raises EPIPE."""
-        broken = BrokenStream()
-        wrapped = self.ns["_NeverFatalStream"](broken)
+    def test_flush_swallows_epipe(self):
+        s = BRIDGE._NeverFatalStream(BrokenStream())
+        s.flush()  # must not raise
 
-        # Control first — the instrument must be able to produce the failure,
-        # otherwise "no exception" below proves nothing (REVIEW.md criterion 9).
-        with self.assertRaises(BrokenPipeError):
-            print("  Replied: ...", file=broken, flush=True)
+    def test_print_through_wrapper_does_not_raise(self):
+        """The original failure: print() flushing into a dead pipe."""
+        raw = BrokenStream()
+        saved = sys.stdout
+        sys.stdout = BRIDGE._NeverFatalStream(raw)
+        try:
+            print("  Replied: task-123", flush=True)
+        finally:
+            sys.stdout = saved
+        self.assertGreaterEqual(raw.attempts, 1)
 
-        # Same call through the wrapper must not raise.
-        print("  Replied: ...", file=wrapped, flush=True)
-        self.assertGreater(broken.attempts, 1, "wrapper should still attempt the write")
+    def test_non_oserror_still_propagates(self):
+        s = BRIDGE._NeverFatalStream(TypeErrorStream())
+        with self.assertRaises(TypeError):
+            s.write("x")
 
-    def test_wrapper_does_not_mask_non_oserror(self):
-        """Only the EPIPE/EBADF class is swallowed; real bugs still surface."""
+    def test_getattr_delegates_to_wrapped_stream(self):
+        s = BRIDGE._NeverFatalStream(BrokenStream())
+        self.assertEqual(s.encoding, "utf-8")
 
-        class Weird:
-            def write(self, data):
-                raise ValueError("not a pipe problem")
 
-            def flush(self):
-                pass
-
-        wrapped = self.ns["_NeverFatalStream"](Weird())
-        with self.assertRaises(ValueError):
-            wrapped.write("x")
-
-    def test_wrapper_delegates_unknown_attributes(self):
-        wrapped = self.ns["_NeverFatalStream"](BrokenStream())
-        self.assertEqual(wrapped.encoding, "utf-8")
-
-    def test_supervisor_restarts_a_crashing_loop(self):
-        """A loop that escapes its body is restarted, not silently dropped."""
-        calls = {"n": 0}
+class SuperviseLoopTest(unittest.TestCase):
+    def test_crashing_loop_is_restarted(self):
+        calls = []
 
         async def flaky():
-            calls["n"] += 1
-            if calls["n"] < 3:
+            calls.append(1)
+            if len(calls) < 3:
                 raise BrokenPipeError(32, "Broken pipe")
-            await asyncio.sleep(3600)  # third entry: behave like a live loop
+            raise asyncio.CancelledError
 
-        async def drive():
-            task = asyncio.ensure_future(self.ns["_supervise_loop"](flaky, "flaky"))
-            for _ in range(200):
-                await asyncio.sleep(0)
-                if calls["n"] >= 3:
-                    break
-            task.cancel()
+        async def run():
+            saved = BRIDGE.POLL_LOOP_RESTART_SEC
+            BRIDGE.POLL_LOOP_RESTART_SEC = 0
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                with self.assertRaises(asyncio.CancelledError):
+                    await BRIDGE._supervise_loop(flaky, "flaky")
+            finally:
+                BRIDGE.POLL_LOOP_RESTART_SEC = saved
 
-        asyncio.run(drive())
-        self.assertGreaterEqual(calls["n"], 3, "supervisor should re-enter after each crash")
+        asyncio.run(run())
+        self.assertEqual(len(calls), 3)
 
-    def test_supervisor_propagates_cancellation(self):
-        """Shutdown must stay prompt — CancelledError is not a 'crash'."""
+    def test_loop_returning_is_also_restarted(self):
+        calls = []
 
-        async def sleeper():
-            await asyncio.sleep(3600)
+        async def returns_early():
+            calls.append(1)
+            if len(calls) >= 2:
+                raise asyncio.CancelledError
+            return None
 
-        async def drive():
-            task = asyncio.ensure_future(self.ns["_supervise_loop"](sleeper, "sleeper"))
-            await asyncio.sleep(0)
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
+        async def run():
+            saved = BRIDGE.POLL_LOOP_RESTART_SEC
+            BRIDGE.POLL_LOOP_RESTART_SEC = 0
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await BRIDGE._supervise_loop(returns_early, "returns_early")
+            finally:
+                BRIDGE.POLL_LOOP_RESTART_SEC = saved
 
-        asyncio.run(drive())
+        asyncio.run(run())
+        self.assertEqual(len(calls), 2)
+
+
+class OnReadyStartsSupervisedLoopsTest(unittest.TestCase):
+    """The poll loops must be started through the supervisor, and only once.
+
+    `on_ready` fires again on every reconnect. Before the singleton guard, each
+    reconnect leaked another copy of every poll loop; N reconnects meant N+1
+    `poll_progress` loops all posting their own placeholder for the same task.
+    """
+
+    def _run_on_ready(self, created):
+        # Neutralise everything in on_ready that touches the filesystem or the
+        # network. _recover_orphan_sending_files() renames real results/*.sending
+        # back to .txt — a test must never run it against a live workspace.
+        saved = {
+            "_recover_orphan_sending_files": BRIDGE._recover_orphan_sending_files,
+            "_catchup_missed_dms": BRIDGE._catchup_missed_dms,
+        }
+        BRIDGE._recover_orphan_sending_files = lambda: 0
+
+        async def _noop_catchup():
+            return None
+
+        BRIDGE._catchup_missed_dms = _noop_catchup
+
+        class _Loop:
+            @staticmethod
+            def create_task(coro):
+                # `_supervise_loop(fn, name)` has not started yet, so its frame
+                # still holds the argument — that is the loop's identity.
+                frame = getattr(coro, "cr_frame", None)
+                created.append(frame.f_locals.get("name") if frame else None)
+                coro.close()
+                return None
+
+        class _Client:
+            user = "test-bot"
+            loop = _Loop()
+
+        saved_client = BRIDGE.client
+        BRIDGE.client = _Client()
+        try:
+            asyncio.run(BRIDGE.on_ready())
+        finally:
+            BRIDGE.client = saved_client
+            for k, v in saved.items():
+                setattr(BRIDGE, k, v)
+
+    def test_loops_start_once_and_are_supervised(self):
+        BRIDGE._poll_loops_started = False
+        created: list = []
+        self._run_on_ready(created)
+        for expected in ("poll_results", "poll_progress", "poll_approved",
+                         "poll_proactive", "poll_dm_fallback"):
+            self.assertIn(expected, created)
+
+        # Second on_ready (a reconnect) must NOT start another set.
+        again: list = []
+        self._run_on_ready(again)
+        self.assertEqual([c for c in again if c], [])
 
 
 if __name__ == "__main__":
-    sys.exit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)
+    unittest.main(verbosity=2)
