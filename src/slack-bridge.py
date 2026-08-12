@@ -1186,15 +1186,8 @@ _EMPTY_MENTION_RECOVERY_MAX_AGE_S = 600  # 10 minutes
 
 
 def _resolve_mention_text(event: dict, stripped_text: str) -> tuple[str, bool]:
-    """Recover an empty mention from the sender's immediately prior thread turn.
-
-    Slack only emits ``app_mention`` for the second half of a split turn such as
-    ``Run it now`` followed by ``@Sutando``.  Previously the empty mention was
-    dropped by ``_write_task`` and the user saw silence.  Restrict recovery to
-    the same thread and same sender so another participant's text can never be
-    attributed to the mentioning user.  If recovery is unavailable, create a
-    clarification task instead of silently returning.
-    """
+    """Recover an empty mention from the sender's prior turn: same thread and sender
+    only, so no one else's text is attributed to them; else a clarification task."""
     if stripped_text:
         return stripped_text, False
 

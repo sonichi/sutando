@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral tests for empty Slack @mention context recovery.
-
-Run: python3 tests/slack-bridge-empty-mention-context.test.py
-"""
+"""Behavioural tests for empty Slack @mention context recovery."""
 from __future__ import annotations
 
 import importlib.util
