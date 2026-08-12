@@ -67,9 +67,8 @@ except ImportError:
 
 MARKER = "<!-- COMPACT-CORE-END -->"
 
-# Opt-in (0 = whole file): the platform's preview cap is undocumented, and a
-# 3,349-byte file was observed arriving intact, so a default bound would cut
-# what already fits. Set the byte budget on installs large enough to be cut.
+# Opt-in (0 = whole file): the platform's preview cap is undocumented, so a
+# default bound would truncate files it already delivers intact.
 try:
     CORE_BYTES = int(os.environ.get("SUTANDO_COMPACT_CORE_BYTES", "0"))
 except ValueError:
