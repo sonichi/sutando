@@ -29,7 +29,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sqlite3
 import stat
 import sys
@@ -251,6 +253,30 @@ class RuntimeServer:
         ctx.load_cert_chain(str(cert), str(key))
         return ctx
 
+    def _start_advertiser(self, agent: "str | None", port: int):
+        """mDNS-announce the SCP listener (_sutando-scp._tcp) as a CHILD of this
+        process, so the advertisement lives and dies with the listener it names.
+        A standalone advertiser survives its server and keeps promising a dead
+        port; a supervised server that respawns re-advertises automatically.
+        macOS-only (dns-sd); other platforms skip silently. Best-effort."""
+        if sys.platform != "darwin" or shutil.which("dns-sd") is None:
+            return None
+        # Instance name = the agent LOCALPART ("sutando-qingyun-001"), matching
+        # what device firmware pins via the agent= TXT field. Full mxids don't
+        # travel — the @/: characters are also hostile to DNS-SD names.
+        name = (agent or "sutando").split(":")[0].lstrip("@") or "sutando"
+        try:
+            proc = subprocess.Popen(
+                ["dns-sd", "-R", name, "_sutando-scp._tcp.", "local",
+                 str(port), f"agent={name}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _log(f"mDNS advertise: {name} on _sutando-scp._tcp :{port} "
+                 f"(pid {proc.pid})")
+            return proc
+        except OSError as e:
+            _log(f"mDNS advertise failed (non-fatal): {e}")
+            return None
+
     async def _maybe_start_wss(self):
         """Start the LAN WSS transport iff SUTANDO_SCP_WSS_ENABLE is truthy.
         Best-effort: any failure here must NOT stop the UDS daemon from
@@ -324,6 +350,7 @@ class RuntimeServer:
             if host not in ("127.0.0.1", "localhost", "::1"):
                 _log(f"SCP WSS is LAN-exposed on {host}:{port} "
                      f"(bearer-gated, read-only method set)")
+                self._advertiser = self._start_advertiser(wss_agent, port)
             return started
         except Exception as e:  # noqa: BLE001
             _log(f"SCP WSS start failed (non-fatal, UDS unaffected): {e}")
@@ -591,6 +618,9 @@ class RuntimeServer:
         finally:
             for t in (wss or []):
                 await t.cleanup()
+            adv = getattr(self, "_advertiser", None)
+            if adv is not None:
+                adv.terminate()
 
 
 def main() -> None:

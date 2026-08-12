@@ -986,44 +986,18 @@ if [ "${SUTANDO_SCP_WSS_ENABLE:-0}" = "1" ]; then
   else
     echo "  ✓ voice host (already running)"
   fi
-  if ! lsof -i "${SUTANDO_SCP_WSS_PORT:-8787}" > /dev/null 2>&1; then
-    if [ -n "$PY" ]; then
-      echo "  Starting Sutando Server (SCP WSS :${SUTANDO_SCP_WSS_PORT:-8787})..."
-      SUTANDO_VOICE_HOST_URL="${SUTANDO_VOICE_HOST_URL:-http://127.0.0.1:8788}" \
-        "$PY" src/runtime-api/server.py > "$LOGS_DIR/runtime-api.log" 2>&1 &
-      echo "  ✓ sutando server"
-    else
-      echo "  ⊘ sutando server skipped — no runnable python3"
-    fi
+  if [ -n "$PY" ]; then
+    # Supervised: scp-server-supervisor keeps the gateway alive for the life
+    # of this session and respawns it on crash. Idempotent via pidfile; must
+    # be a session child — launchd can't run a ~/Documents checkout (TCC).
+    bash src/scp-server-supervisor.sh > /dev/null 2>&1 &
+    echo "  ✓ sutando server (supervised; respawns on crash)"
   else
-    echo "  ✓ sutando server (already running)"
+    echo "  ⊘ sutando server skipped — no runnable python3"
   fi
-  # Bonjour/mDNS advertise (_sutando-scp._tcp) so companions find this Mac by
-  # NAME on whatever network both landed on (office, hotspot) — no IP config.
-  # The instance name is the AGENT this server fronts (owner→agents→runtimes
-  # model): with several Sutandos on one LAN, clients must see WHICH agent
-  # answers, never silently join the nearest one.
-  SCP_AGENT_NAME=$(python3 - << 'PYAGENT' 2>/dev/null
-import json, os, sys
-sys.path.insert(0, "src")
-try:
-    from workspace_default import resolve_workspace
-    p = resolve_workspace() / "state" / "auth" / "ag2space.json"
-    aid = json.loads(p.read_text()).get("agent_id") or ""
-    print(aid.split(":")[0].lstrip("@") or "sutando")
-except Exception:
-    print("sutando")
-PYAGENT
-)
-  SCP_AGENT_NAME="${SCP_AGENT_NAME:-sutando}"
-  if ! pgrep -f "dns-sd -R .* _sutando-scp" > /dev/null 2>&1; then
-    dns-sd -R "$SCP_AGENT_NAME" _sutando-scp._tcp. local \
-      "${SUTANDO_SCP_WSS_PORT:-8787}" "agent=$SCP_AGENT_NAME" \
-      > /dev/null 2>&1 &
-    echo "  ✓ mDNS advertise ($SCP_AGENT_NAME on _sutando-scp._tcp :${SUTANDO_SCP_WSS_PORT:-8787})"
-  else
-    echo "  ✓ mDNS advertise (already running)"
-  fi
+  # mDNS advertisement is owned by the server itself (runtime-api spawns a
+  # dns-sd child on WSS start) so it lives and dies with the listener —
+  # a standalone advertiser here outlived crashes and promised a dead port.
 fi
 
 # 5a-bis. Portfolio + research dashboard (port 8899) — idempotent self-guard.
