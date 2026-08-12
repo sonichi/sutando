@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
-# The vault URL survives the loss of the per-clone config that named it.
-#
-# `vault.remote_url` lives in sutando.config.local.json, which is gitignored and
-# per-clone. When it goes missing the URL resolves empty and the default (cron)
-# path skips silently — sync looks healthy and backs up nothing. The workspace
-# repo still carries the same URL as its `origin`, so resolution recovers it
-# from there before concluding sync is disabled.
-#
-# The dangerous shape is the DEFAULT workspace, `<repo>/workspace/`, which sits
-# INSIDE the code checkout: a naive `git remote get-url origin` there walks up
-# and returns the code repo's origin, i.e. sync would push private workspace
-# state to the public code remote. Test 5 pins that.
-#
-# Run: bash tests/sync-workspace-vault-url-origin-fallback.test.sh
-# Exit: 0 = all pass, 1 = failure
+# The vault URL survives losing the per-clone config, and is never recovered
+# from a remote that is not a vault this script has already pushed to.
 
 set -u
 
@@ -32,6 +19,19 @@ export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
 
 TMP="$(mktemp -d -t sutando-vault-url-fallback.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
+
+# A bare remote carrying exactly one branch. $1 = name, $2 = branch ref.
+# A vault is identified by its `host/<host>/<wsId>` branches and nothing else.
+mk_remote() {
+    local bare="$TMP/$1.git" seed="$TMP/$1-seed"
+    git init -q --bare "$bare"
+    git init -q "$seed"
+    : > "$seed/f"
+    git -C "$seed" add f
+    git -C "$seed" commit -qm seed
+    git -C "$seed" push -q "$bare" "HEAD:refs/heads/$2"
+    printf '%s' "$bare"
+}
 
 # One skeleton per case: a copy of the REAL script plus a stub config resolving
 # that case's workspace. $1 = case dir, $2 = vault-url the stub reports.
@@ -63,15 +63,27 @@ run_sync() {
 
 echo "vault URL recovery from the workspace repo's own origin:"
 
-# --- 1: no config URL, workspace is a git repo with origin -> recovered -------
+VAULT_REMOTE="$(mk_remote vault 'host/testhost/ws1')"
+PLAIN_REMOTE="$(mk_remote plain 'main')"
+
+# The whole discriminator rests on this pattern matching across the slashes.
+if [ -n "$(git ls-remote --heads "$VAULT_REMOTE" 'host/*')" ] \
+   && [ -z "$(git ls-remote --heads "$PLAIN_REMOTE" 'host/*')" ]; then
+    ok "the host/* probe separates a vault remote from a plain one"
+else
+    bad "the host/* probe separates a vault remote from a plain one" \
+        "vault=$(git ls-remote --heads "$VAULT_REMOTE" 'host/*') plain=$(git ls-remote --heads "$PLAIN_REMOTE" 'host/*')"
+fi
+
+# --- 1: no config URL, workspace is a git repo whose origin is a vault --------
 skel="$(mk_skel with-origin)"
 git -C "$skel/workspace" init -q
-git -C "$skel/workspace" remote add origin "https://example.invalid/vault.git"
+git -C "$skel/workspace" remote add origin "$VAULT_REMOTE"
 out="$(run_sync "$skel" --status)"
-if echo "$out" | grep -q 'VAULT_URL:.*https://example.invalid/vault.git'; then
-    ok "origin adopted as the vault URL"
+if echo "$out" | grep VAULT_URL | grep -qF "$VAULT_REMOTE"; then
+    ok "a vault origin is adopted as the vault URL"
 else
-    bad "origin adopted as the vault URL" "status said: $(echo "$out" | grep VAULT_URL)"
+    bad "a vault origin is adopted as the vault URL" "status said: $(echo "$out" | grep VAULT_URL)"
 fi
 if echo "$out" | grep -q "recovered it from the workspace repo's own origin"; then
     ok "the recovery is announced, not silent"
@@ -102,7 +114,7 @@ fi
 # --- 4: a configured URL still wins over the workspace's origin ---------------
 skel="$(mk_skel configured-wins https://example.invalid/configured.git)"
 git -C "$skel/workspace" init -q
-git -C "$skel/workspace" remote add origin "https://example.invalid/origin.git"
+git -C "$skel/workspace" remote add origin "$VAULT_REMOTE"
 out="$(run_sync "$skel" --status)"
 if echo "$out" | grep -q 'VAULT_URL:.*https://example.invalid/configured.git'; then
     ok "configured vault.remote_url outranks the origin fallback"
@@ -112,8 +124,7 @@ else
 fi
 
 # --- 5: workspace NESTED in a git repo must not adopt the PARENT's origin -----
-# This is the default layout (`<repo>/workspace/`), so getting it wrong would
-# push private workspace state to the code checkout's remote.
+# This is the default layout, so getting it wrong publishes private state.
 skel="$(mk_skel nested)"
 git -C "$skel" init -q
 git -C "$skel" remote add origin "https://example.invalid/CODE-REPO.git"
@@ -129,6 +140,46 @@ if echo "$out" | grep -q 'cross-machine sync disabled'; then
     ok "the nested case still reports sync disabled"
 else
     bad "the nested case still reports sync disabled" "got: $out"
+fi
+
+# --- 6: own git root, but the origin is NOT a vault ---------------------------
+# A restored backup or mis-aimed clone reaches here with a public remote.
+skel="$(mk_skel wrong-origin)"
+git -C "$skel/workspace" init -q
+git -C "$skel/workspace" remote add origin "$PLAIN_REMOTE"
+out="$(run_sync "$skel" --status)"
+if echo "$out" | grep VAULT_URL | grep -qF "$PLAIN_REMOTE"; then
+    bad "a non-vault origin at the workspace's own root is refused" \
+        "adopted it anyway: $(echo "$out" | grep VAULT_URL)"
+else
+    ok "a non-vault origin at the workspace's own root is refused"
+fi
+if echo "$out" | grep -q 'advertises no host/\* branch'; then
+    ok "the refusal names why, so the operator can restore the real URL"
+else
+    bad "the refusal names why, so the operator can restore the real URL" "got: $out"
+fi
+out="$(run_sync "$skel")"
+if echo "$out" | grep -q 'cross-machine sync disabled'; then
+    ok "the wrong-origin case still reports sync disabled"
+else
+    bad "the wrong-origin case still reports sync disabled" "got: $out"
+fi
+
+# --- 7: an unreachable origin is reported as unreachable, not as not-a-vault --
+skel="$(mk_skel unreachable-origin)"
+git -C "$skel/workspace" init -q
+git -C "$skel/workspace" remote add origin "$TMP/does-not-exist.git"
+out="$(run_sync "$skel" --status)"
+if echo "$out" | grep -q 'could not reach the workspace repo'; then
+    ok "an unreachable origin is reported as unreachable"
+else
+    bad "an unreachable origin is reported as unreachable" "got: $out"
+fi
+if echo "$out" | grep VAULT_URL | grep -q 'does-not-exist'; then
+    bad "an unreachable origin is not adopted" "adopted: $(echo "$out" | grep VAULT_URL)"
+else
+    ok "an unreachable origin is not adopted"
 fi
 
 if [ "$fail" = "0" ]; then
