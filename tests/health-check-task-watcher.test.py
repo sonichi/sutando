@@ -20,13 +20,25 @@ Covers:
   g) the check is registered in run_checks' output
   h) _proc_argv against real PIDs (live + nonexistent) — the OS-facing half
   i) _proc_argv swallows a probe failure rather than failing the health check
+  r) supervised watcher + absent sentinel exposes the pid --fix can re-stamp
+  s) --fix re-stamps it and the RE-RUN check reports ok (no restart needed)
+  t) --fix refuses to stamp a pid that is no longer the watcher (PID reuse)
+  u) --fix never clobbers a sentinel a watcher re-claimed meanwhile
+  v) a check with no repairable pid is declined, not stamped with junk
+  w) an unwritable state dir is reported, never raised into the caller
+  x) `--fix` actually REACHES the repair (warn never enters `issues`)
+  y) under `--json` the repair line stays off stdout, so JSON still parses
 
 Run: python3 tests/health-check-task-watcher.test.py
 Exit code: 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+import contextlib
 import importlib.util
+import io
+import json
+import shutil
 import os
 import sys
 import tempfile
@@ -35,7 +47,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
+MOD_PATH = REPO / "src" / "health-check.py"
+spec = importlib.util.spec_from_file_location("health_check", MOD_PATH)
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
 
@@ -72,6 +85,173 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
             return hc.check_task_watcher()
         finally:
             hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees = orig_ws, orig_probe, orig_trees
+
+
+@contextlib.contextmanager
+def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
+                       argv: str = "bash src/watch-tasks-stream.sh"):
+    """A workspace the caller can INSPECT after the check — `run_check` deletes
+    its tempdir, so the repair cases (which assert on a written file) need this.
+
+    Patches the probes into the ONE state `--fix` repairs: a single watcher
+    tree whose parent is a live session (not init), i.e. supervised.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        ws = make_workspace(Path(td), core_alive=True, pid_text=pid_text)
+        saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
+                 hc._ps_snapshot, hc._pid_parent)
+        try:
+            hc.WORKSPACE_DIR = ws
+            hc._proc_argv = lambda p: argv
+            hc._watcher_trees = lambda *a, **k: {pid: {pid}}
+            hc._ps_snapshot = lambda *a, **k: ""
+            hc._pid_parent = lambda p, ps=None: "500"
+            yield ws
+        finally:
+            (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
+             hc._ps_snapshot, hc._pid_parent) = saved
+
+
+def case_r_supervised_watcher_exposes_restamp_pid() -> list[str]:
+    with supervised_watcher() as ws:
+        r = hc.check_task_watcher()
+    fails = []
+    if r["status"] != "warn":
+        fails.append(f"r) expected warn, got {r['status']}")
+    if r.get("_sentinel_restamp_pid") != "7100":
+        fails.append("r) the repairable pid must be exposed as data, not left "
+                     f"for --fix to parse out of prose: {r!r}")
+    return fails
+
+
+def case_s_fix_restamps_and_recheck_is_ok() -> list[str]:
+    fails = []
+    with supervised_watcher() as ws:
+        checks = [hc.check_task_watcher()]
+        buf = io.StringIO()
+        hc.apply_task_watcher_sentinel_fix(checks, stream=buf)
+        sentinel = ws / "state" / "watch-tasks-stream.pid"
+        if not sentinel.exists() or sentinel.read_text().strip() != "7100":
+            fails.append("s) --fix must write the live watcher's pid, got "
+                         f"{sentinel.read_text().strip() if sentinel.exists() else '<ABSENT>'}")
+        # The check dict must carry the POST-fix state, re-measured.
+        if checks[0]["status"] != "ok":
+            fails.append(f"s) re-run check should be ok, got {checks[0]}")
+        if "_sentinel_restamp_pid" in checks[0]:
+            fails.append("s) the repaired check still advertises a repair")
+        if "re-stamped" not in buf.getvalue():
+            fails.append(f"s) the repair should be reported, got {buf.getvalue()!r}")
+    return fails
+
+
+def case_t_fix_refuses_a_recycled_pid() -> list[str]:
+    """Between the check and the repair the pid can become someone else's.
+    Stamping it would author the PID-reuse lie the probe exists to catch."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        hc._proc_argv = lambda p: "/usr/sbin/cupsd -l"
+        msg = hc.fix_task_watcher_sentinel(check)
+        if (ws / "state" / "watch-tasks-stream.pid").exists():
+            fails.append("t) --fix stamped a pid that is no longer the watcher")
+        if "no longer the watcher" not in msg:
+            fails.append(f"t) should say why it refused, got {msg!r}")
+    return fails
+
+
+def case_u_fix_never_clobbers_a_reclaimed_sentinel() -> list[str]:
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        # A watcher claimed the sentinel after the check ran.
+        (ws / "state" / "watch-tasks-stream.pid").write_text("9999\n")
+        msg = hc.fix_task_watcher_sentinel(check)
+        held = (ws / "state" / "watch-tasks-stream.pid").read_text().strip()
+        if held != "9999":
+            fails.append(f"u) --fix overwrote a live claim: sentinel now {held}")
+        if "re-claimed" not in msg:
+            fails.append(f"u) should say why it declined, got {msg!r}")
+    return fails
+
+
+def case_v_fix_declines_without_a_pid() -> list[str]:
+    fails = []
+    with supervised_watcher() as ws:
+        msg = hc.fix_task_watcher_sentinel({"name": "task-watcher", "status": "warn"})
+        if (ws / "state" / "watch-tasks-stream.pid").exists():
+            fails.append("v) --fix wrote a sentinel with no pid to write")
+        if "no re-stampable" not in msg:
+            fails.append(f"v) should decline explicitly, got {msg!r}")
+    return fails
+
+
+def case_w_fix_reports_a_write_failure() -> list[str]:
+    """--fix runs inside health-check; an OSError here would abort every later
+    repair pass, so the fixer must return the failure as text."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        shutil.rmtree(ws / "state")
+        (ws / "state").write_text("not a directory\n")
+        try:
+            msg = hc.fix_task_watcher_sentinel(check)
+        except OSError as e:
+            return [f"w) raised instead of reporting: {e!r}"]
+        if "could not write" not in msg:
+            fails.append(f"w) should report the write failure, got {msg!r}")
+    return fails
+
+
+def _run_main_fix(argv: list[str]) -> tuple[bool, str, str]:
+    """Run main() over a fresh module with the repair stubbed.
+
+    A unit test of the fixer proves the decision, never that anything calls it:
+    `warn` is excluded from `issues` by construction, so the wiring is the part
+    that historically broke (see health-check-symlink-fix-reachable).
+    """
+    spec = importlib.util.spec_from_file_location("hc_wiring", MOD_PATH)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    called = []
+    m.fix_task_watcher_sentinel = lambda c: (called.append(c["name"]), "re-stamped")[1]
+    m.check_task_watcher = lambda: {"name": "task-watcher", "status": "ok",
+                                    "detail": "re-measured: streaming watcher alive"}
+    m.run_all_checks = lambda: [{"name": "task-watcher", "status": "warn",
+                                 "_sentinel_restamp_pid": "7100", "detail": "no sentinel"}]
+    saved, sys.argv = sys.argv, ["health-check.py"] + argv
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            m.main()
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = saved
+    return bool(called), out.getvalue(), err.getvalue()
+
+
+def case_x_fix_is_reachable_from_main() -> list[str]:
+    fired, out, _ = _run_main_fix(["--fix"])
+    fails = []
+    if not fired:
+        fails.append("x) --fix never reached the task-watcher repair")
+    if "re-measured" not in out:
+        fails.append(f"x) the reported verdict must come from the RE-RUN, got {out!r}")
+    return fails
+
+
+def case_y_json_repair_line_goes_to_stderr() -> list[str]:
+    fired, out, err = _run_main_fix(["--fix", "--json"])
+    fails = []
+    if not fired:
+        fails.append("y) --fix --json never reached the repair")
+    try:
+        json.loads(out)
+    except ValueError:
+        fails.append(f"y) the repair line corrupted the JSON on stdout: {out!r}")
+    if "re-stamped" not in err:
+        fails.append(f"y) the repair should still be reported on stderr, got {err!r}")
+    return fails
 
 
 def case_a_no_core_is_ok() -> list[str]:
@@ -327,6 +507,14 @@ def main() -> int:
         ("o", case_o_trees_excludes_our_own_pid),
         ("p", case_p_trees_runs_real_ps),
         ("q", case_q_trees_swallows_probe_failure),
+        ("r", case_r_supervised_watcher_exposes_restamp_pid),
+        ("s", case_s_fix_restamps_and_recheck_is_ok),
+        ("t", case_t_fix_refuses_a_recycled_pid),
+        ("u", case_u_fix_never_clobbers_a_reclaimed_sentinel),
+        ("v", case_v_fix_declines_without_a_pid),
+        ("w", case_w_fix_reports_a_write_failure),
+        ("x", case_x_fix_is_reachable_from_main),
+        ("y", case_y_json_repair_line_goes_to_stderr),
     ]
     all_failures = []
     for label, fn in cases:
