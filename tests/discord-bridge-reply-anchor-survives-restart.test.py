@@ -93,6 +93,27 @@ class AnchorRecovery(unittest.TestCase):
         (self.tasks / "task-7.txt").write_text("id: task-7\nsource_message_id: nope\n")
         self.assertIsNone(self.fn("task-7"))
 
+    def test_an_unreadable_candidate_is_skipped_not_raised(self):
+        """A directory where a task file is expected: recovery is best-effort
+        and must never take down the delivery loop."""
+        (self.tasks / "task-8.txt").mkdir()
+        self._archived("2026-05", "task-8.txt", "task-8")
+        self.assertEqual(self.fn("task-8"), ANCHOR,
+                         "should skip the unreadable one and read the archive")
+
+    def test_a_failing_locator_degrades_to_none(self):
+        """If the locator itself raises, return None rather than propagating."""
+        def boom(*_a, **_k):
+            raise OSError("locator exploded")
+        tree = ast.parse(SRC.read_text())
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "_anchor_from_task_file")
+        ns = {"TASKS_DIR": self.tasks, "ARCHIVE_TASKS_DIR": self.archive,
+              "find_task_file": boom, "Path": Path}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(SRC), "exec"), ns)
+        self.assertIsNone(ns["_anchor_from_task_file"]("task-9"))
+
 
 class Wiring(unittest.TestCase):
     def test_delivery_path_consults_the_fallback(self):
