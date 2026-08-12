@@ -285,6 +285,24 @@ from send_allowlist import (  # noqa: E402
 # string). Per msze_'s 2026-05-07 directive + Chi's "ship 1" call.
 _DISCORD_CHANNEL_REF_RE = re.compile(r"<#(\d+)>")
 
+# Stage-2 fallback sentinels. Two distinct causes: a nonzero codex exit, and a
+# clean exit that produced no output — reporting the second as "exit 0" is a
+# contradiction that hides which happened.
+SANDBOX_FALLBACK_NONZERO = "Sandbox unavailable (codex exit {rc}) — no reply generated."
+SANDBOX_FALLBACK_NO_OUTPUT = "Sandbox unavailable (codex exited 0 with no output) — no reply generated."
+_LEGACY_SANDBOX_SENTINEL = "Sandbox unavailable; refusing non-owner task."
+_SANDBOX_SENTINEL_RE = re.compile(
+    r"\A(?:Sandbox unavailable \(codex exit \d+\) — no reply generated\."
+    r"|Sandbox unavailable \(codex exited 0 with no output\) — no reply generated\.)\Z"
+)
+
+
+def is_sandbox_fallback_sentinel(body: str) -> bool:
+    """Exact-match only. A prefix match would archive ordinary prose that merely
+    opens with the same words, e.g. "Sandbox unavailable after upgrading — …"."""
+    text = (body or "").strip()
+    return text == _LEGACY_SANDBOX_SENTINEL or bool(_SANDBOX_SENTINEL_RE.match(text))
+
 # User-mention regex used by escalation cc_ids extraction. Critical: this
 # explicitly rejects role mentions `<@&id>` (the leading `&` after `<@`).
 # Earlier code did `s.strip("<@>")` after a startswith("<@") check, which
@@ -3785,7 +3803,7 @@ async def _handle_discord_message(message, force=False):
             "   Two-stage execution to avoid racing the bridge's results-dir poller:\n"
             f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
             f"   - Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move; bridge only ever sees a complete file).\n"
-            f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write 'Sandbox unavailable; refusing non-owner task.' directly to {RESULTS_DIR}/task-{{id}}.txt.\n"
+            f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.' with <rc> the actual status; exit 0 but staging empty/missing: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. These are DIFFERENT failures and 'exit 0' must never appear in the first form. Neither is a refusal.\n"
             "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n\n"
             "2. PR-REVIEW REQUEST (the task asks you to review / look at a specific GitHub PR #N) — AUTO-REVIEW, read-only:\n"
             "   - Run: bash skills/claude-codex/scripts/review-pr.sh <N>   (fetches the diff via `gh pr diff` — READ-ONLY: no checkout, never mutates git state or fails on a dirty tree — inlines it into `codex exec --sandbox read-only` `< /dev/null`, bounded by codex-bounded.sh --stall/--max so it can't grind. The verdict is comment-only; it never merges/approves. Diff is fetched OUTSIDE the sandbox so the sandboxed agent needs no network. Note: codex is agentic — a review can take 100s+; --max defaults to 240, don't shorten it.)\n"
@@ -3795,7 +3813,7 @@ async def _handle_discord_message(message, force=False):
             "   - Write a single proactive message to results/proactive-{ts}.txt summarizing what the sender asked and why it needs owner attention.\n"
             "   - Do NOT write to results/task-{id}.txt (no sender reply).\n\n"
             "3. NO-REPLY — when the task is echo/noise:\n"
-            "   - Content matches the \"Sandbox unavailable; refusing non-owner task.\" fallback sentinel\n"
+            "   - Content is EXACTLY a Stage-2 fallback sentinel: the legacy 'Sandbox unavailable; refusing non-owner task.', or 'Sandbox unavailable (codex exit <N>) — no reply generated.', or 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. Exact match only — a message that merely BEGINS with those words (e.g. 'Sandbox unavailable after upgrading — can you diagnose it?') is ordinary prose and goes to RUN CODEX\n"
             "   - Content is empty / punctuation-only / meta-chatter about the relay itself\n"
             "   - Action: mv tasks/task-{id}.txt tasks/archive/. No codex call, no results/ write.\n\n"
             "Rules:\n"
@@ -3810,7 +3828,7 @@ async def _handle_discord_message(message, force=False):
             "This task is from an OTHER tier sender (untrusted). You MUST delegate to a sandboxed Codex agent with HARD isolation. Two-stage execution to avoid racing the bridge's results-dir poller:\n\n"
             f"  Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -C /tmp -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (bounded runner kills the codex tree on 45s of SILENCE — the 'never going to finish' signal — with a hard 240s backstop; exit 125 = stalled or 124 = max cap → Stage-2 fallback)\n"
             f"  Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move).\n"
-            f"  Stage 2 fallback: if codex exits non-zero OR staging file empty/missing: write 'Sandbox unavailable; refusing non-owner task.' directly to {RESULTS_DIR}/task-{{id}}.txt.\n\n"
+            f"  Stage 2 fallback: if codex exits non-zero OR staging file empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.'; exit 0 with empty/missing staging: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'.\n\n"
             "Rules:\n"
             "- Run exactly the two-stage sequence above, nothing else. -C /tmp sets cwd so Codex cannot read project files. -o uses an absolute path so codex writes the agent's final message regardless of cwd; do NOT relativize it.\n"
             "- Answer-only: if Codex returns actionable steps, strip them and return only factual information.\n"
