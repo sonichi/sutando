@@ -571,6 +571,27 @@ def _resolved_vault() -> dict:
         return {"enabled": False, "remote_url": "", "_explicit_disable": False}
 
 
+def _vault_remote_url(vault: dict | None = None) -> str:
+    """Vault remote URL, resolved exactly as the sync WRITER resolves it: config
+    `vault.remote_url` (what `sutando-config.sh vault-url` prints), then the
+    deprecated `.env` SUTANDO_MEMORY_REPO alias. Empty string when neither is set.
+
+    Ignores `vault.enabled` on purpose — sync-workspace's priority chain reads
+    only the URL, so gating a probe on `enabled` would disagree with the writer.
+    Pass an already-resolved `_resolved_vault()` dict to avoid re-resolving.
+    """
+    resolved = _resolved_vault() if vault is None else vault
+    url = resolved.get("remote_url") or ""
+    if url:
+        return url
+    env_path = _resolve_dotenv()
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith("SUTANDO_MEMORY_REPO="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
@@ -2223,15 +2244,7 @@ def check_memory_sync() -> dict:
     # nag (#2069).
     if vault.get("_explicit_disable"):
         return {"name": name, "status": "ok", "detail": "cross-machine sync disabled (config opt-out)"}
-    # Canonical config first (vault.remote_url), then the deprecated .env alias.
-    repo_url = vault.get("remote_url") or ""
-    if not repo_url:
-        env_path = _resolve_dotenv()
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                if line.startswith("SUTANDO_MEMORY_REPO="):
-                    repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
+    repo_url = _vault_remote_url(vault)
     if not repo_url:
         # Not configured anywhere → single-machine mode is a valid choice, not
         # a warn (#2069).
@@ -2394,6 +2407,11 @@ def check_per_host_config_backup() -> dict:
     warn on divergence; never mutates either file.
     """
     name = "per-host-config-backup"
+    # No vault URL → `_snapshot_per_host_config` is unreachable (it runs only
+    # inside sync-workspace's push path, which exits early without one).
+    if not _vault_remote_url():
+        return {"name": name, "status": "ok",
+                "detail": "no vault configured — nothing carries a backup (single-machine mode)"}
     try:
         # Resolve the live channels source from the SAME canonical resolver the
         # snapshot WRITER uses — sync-workspace's `_snapshot_per_host_config`
