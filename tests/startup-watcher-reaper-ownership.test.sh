@@ -1,17 +1,10 @@
 #!/usr/bin/env bash
 # startup's watch-tasks-stream reaper must only delete the sentinel it inspected.
 #
-# The watcher stamps state/watch-tasks-stream.pid ONCE at startup and never
-# again (watch-tasks-stream.sh), and its cleanup() already refuses to remove a
-# sentinel it no longer owns (#2652). The reaper on the startup side had no such
-# guard: it read the pid, skipped the kill when that pid was dead/recycled, then
-# `rm -f`'d unconditionally. A watcher that stamps its own pid inside that window
-# is left with no sentinel at all — alive, draining tasks, and invisible to every
-# reader that keys off the file (health-check's task-watcher probe,
-# services_status, the next startup's reap).
-#
-# Case 3 is that window, made deterministic: the `ps` shim re-stamps the file
-# while the production function is mid-reap. It fails without the guard.
+# The sentinel is stamped once at startup and never again, so a reaper that
+# unlinks one it did not inspect strands a live watcher with no sentinel —
+# invisible to every reader that keys off the file. Case 3 makes that window
+# deterministic: the `ps` shim re-stamps the file mid-reap.
 #
 # Run: bash tests/startup-watcher-reaper-ownership.test.sh
 # Exit: 0 = all pass, 1 = failure

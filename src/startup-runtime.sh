@@ -310,19 +310,11 @@ reap_wedged_voice_agent() {
   return 0
 }
 
-# Reap a stale watch-tasks-stream watcher from a prior session. The watcher's
-# own EXIT trap handles clean shutdown (the #1065 Stop hook that used to is gone
-# — see DEPRECATED_HOOKS in install-claude-hooks.sh); a hard crash (SIGKILL,
-# panic, force-quit, power loss) skips the trap and leaves an orphan fswatch
-# process + stale PID file.
-# The cmdline check is what keeps a RECYCLED pid from being killed blindly.
-#
-# The removal is compare-and-delete for the same reason watch-tasks-stream.sh's
-# own cleanup() is: the watcher stamps its sentinel once at startup and never
-# again, so deleting a sentinel this reap did not inspect leaves a LIVE watcher
-# permanently untrackable by every reader that keys off the file.
-# A re-stamp between the re-read and the unlink is still possible; closing that
-# needs an atomic claim in the sentinel protocol itself, not in this reaper.
+# The cmdline check keeps a RECYCLED pid from being killed blindly; the removal
+# compares before deleting because the sentinel is stamped once and never again,
+# so unlinking one this reap did not inspect strands a LIVE watcher untrackable.
+# A re-stamp between the re-read and the unlink still needs an atomic claim in
+# the sentinel protocol, which this reaper cannot provide alone.
 reap_stale_task_watcher() {
   local pid_file="$1" stale_pid current
   [ -f "$pid_file" ] || return 0
