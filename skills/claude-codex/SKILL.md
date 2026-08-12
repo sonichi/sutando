@@ -83,7 +83,8 @@ bash "$SKILL_DIR/scripts/review-pr.sh" 1754 --max 300  # longer cap for a big di
 ```
 
 Prints `VERDICT-MARKER: <token>` as stdout line 1, then Codex's verdict preceded by that token. The token is a per-RUN nonce, never shown to Codex, so a diff or verdict quoting a marker literal cannot pose as it. **The verdict
-is only the text after the LAST such line.** The rest of the stream is Codex's exec trace,
+is only the text after the LAST such line**, which holds the mechanical checks as well as
+Codex's verdict — so a consumer taking the tail truncates the checks. The rest of the stream is Codex's exec trace,
 left unredirected on purpose so `codex-bounded.sh --stall` can watch it — it contains
 repository source the agent inlined while working, so a consumer that takes the whole
 stream (or its tail) quotes that source as the PR's own content. Extract after the last
