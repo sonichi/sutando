@@ -43,11 +43,16 @@ REPO = Path(__file__).resolve().parent.parent
 
 # Isolate CLAUDE_CONFIG_DIR BEFORE the bridge is exec'd so this test never
 # reads or writes the host's real channel config (per the #2428/#2429 rule).
-_CFG = Path(tempfile.mkdtemp(prefix="dbps-cfg-"))
-os.environ["CLAUDE_CONFIG_DIR"] = str(_CFG)
+_CFG_DIR = tempfile.mkdtemp(prefix="dbps-cfg-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG_DIR
+_CFG = Path(_CFG_DIR)
 _env_dir = _CFG / "channels" / "discord"
 _env_dir.mkdir(parents=True, exist_ok=True)
 (_env_dir / ".env").write_text("DISCORD_BOT_TOKEN=test-stub-token\n")
+# access.json too: channel_access_path() falls back to the real ~/.claude copy
+# when the canonical file is absent, so a token stub alone is not isolation.
+(_env_dir / "access.json").write_text(
+    '{"allowFrom": ["111"], "tierMap": {"111": "owner"}}\n')
 
 # Stub minimal discord module BEFORE the bridge is exec'd.
 _discord_stub = types.ModuleType("discord")
