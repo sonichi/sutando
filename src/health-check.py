@@ -5389,11 +5389,7 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600) -> dict:
     if not results_dir.exists():
         return {"name": name, "status": "ok", "detail": "results/ not yet created"}
     now = time.time()
-    try:
-        entries = list(results_dir.glob("proactive-*.txt"))
-    except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
-        return {"name": name, "status": "warn",
-                "detail": f"could not scan results/: {e}"}
+    entries = list(results_dir.glob("proactive-*.txt"))
     stale, unreadable = [], 0
     for path in entries:
         # Per-file isolation, as in check_orphaned_results: one unreadable entry

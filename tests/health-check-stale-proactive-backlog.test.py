@@ -98,6 +98,14 @@ class StaleProactiveBacklogTest(unittest.TestCase):
         self._write("results/undelivered/proactive-rejected.txt", TWO_HOURS)
         self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
 
+    def test_a_directory_named_like_a_body_is_not_reported(self) -> None:
+        # stat() succeeds on a directory, so without the is_file guard this is
+        # reported as a body — an age, a name, and nothing to deliver.
+        (self.ws / "results" / "proactive-adir.txt").mkdir()
+        stamp = time.time() - TWO_HOURS
+        os.utime(self.ws / "results" / "proactive-adir.txt", (stamp, stamp))
+        self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
+
     def test_missing_results_dir_is_clean(self) -> None:
         hc.WORKSPACE_DIR = self.ws / "nope"
         self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
