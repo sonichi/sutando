@@ -5361,6 +5361,73 @@ def _proc_argv(pid: int) -> str:
         return ""
 
 
+def check_stale_proactive_backlog(threshold_age_sec: int = 3600) -> dict:
+    """Report `results/proactive-*.txt` that no consumer has taken.
+
+    A proactive body is the one message the owner did not ask for and therefore
+    cannot miss the absence of: nothing is waiting on a reply, so an undelivered
+    one leaves no gap anywhere a human or a probe would look. That is the whole
+    hazard — a task reply that never sends eventually reads as a one-sided
+    conversation, while a proactive file that never sends reads as silence, and
+    silence is what a healthy system also looks like.
+
+    Nothing else covers it. `check_orphaned_results` excludes this family by
+    name ("their own delivery lifecycles"), and that exclusion is right: these
+    have no task to pair against, so its whole predicate is inapplicable.
+    `check_proactive_quarantine` reads `results/undelivered/`, i.e. bodies a
+    consumer took and a transport refused — the opposite end, after something
+    ran. A file no consumer ever claimed is in neither place.
+
+    Deliberately `warn`, and deliberately not gated on any consumer being
+    configured. The two states that produce a backlog — every bridge down, or a
+    drain that is present but points nowhere — are indistinguishable from here
+    and have the same consequence for the owner, so the probe reports the
+    consequence and leaves the cause to the reader.
+    """
+    name = "stale-proactive-backlog"
+    results_dir = WORKSPACE_DIR / "results"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    now = time.time()
+    try:
+        entries = list(results_dir.glob("proactive-*.txt"))
+    except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/: {e}"}
+    stale, unreadable = [], 0
+    for path in entries:
+        # Per-file isolation, as in check_orphaned_results: one unreadable entry
+        # must not decide the answer for the directory.
+        try:
+            if not path.is_file():
+                continue
+            age = now - path.stat().st_mtime
+        except OSError:
+            unreadable += 1
+            continue
+        # A claim-by-rename is a consumer mid-delivery, not a backlog. The claim
+        # suffix carries the claiming pid, so match the marker, not a full name.
+        if ".sending" in path.name:
+            continue
+        if age < threshold_age_sec:
+            continue
+        stale.append((path.name, int(age)))
+    partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
+    if not stale:
+        status = "warn" if unreadable else "ok"
+        return {"name": name, "status": status,
+                "detail": f"no undelivered proactive bodies{partial}"}
+    stale.sort(key=lambda item: -item[1])
+    oldest_name, oldest_age = stale[0]
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(stale)} proactive body(ies) nobody has delivered; "
+                   f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
+                   f"{partial}"),
+    }
+
+
 # The argv must BE the script invocation, not merely mention it. A substring
 # test counts the observer: any shell whose command line contains the name —
 # a `ps | grep watch-tasks-stream`, or the wrapper running this very check —
@@ -7474,6 +7541,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
     checks.append(check_proactive_quarantine())
+    checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
