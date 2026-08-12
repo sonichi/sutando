@@ -110,16 +110,11 @@ def check_pending_questions():
                     pass
     flush()
 
-    # Enumerating every open question turns the friction report into a copy of
-    # pending-questions.md — 52 of 60 lines on this host, and check-pending-
-    # questions.py already owns that list with its own rate limit. Past the
-    # threshold, collapse to a count plus the oldest few so the remaining
-    # signal (stale notes, tasks, issues) is still readable.
+    # check-pending-questions.py owns this list and rate-limits it; enumerating
+    # it here buries the signal no other probe produces.
     if len(found) > _PQ_ENUMERATE_MAX:
-        # Only claim "oldest" when something is actually dated. Sections carry
-        # `**Asked:**` inconsistently, and on a file with none, sorting is a
-        # no-op — calling the first three "oldest" would be a label the data
-        # does not support.
+        # `**Asked:**` is inconsistent, so sorting an undated file is a no-op:
+        # only claim "oldest" when something is actually dated.
         dated = [p for p in found if p[0] >= 0]
         if dated:
             dated.sort(key=lambda p: p[0], reverse=True)

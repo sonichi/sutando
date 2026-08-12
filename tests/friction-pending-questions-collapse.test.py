@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
-"""A friction report must not be a second copy of pending-questions.md.
-
-On this host the detector emitted 52 of its 60 lines from pending-questions.md,
-which `check-pending-questions.py` already owns (with its own rate limit). The
-8 lines carrying unique signal — stale notes — were unreadable underneath.
-
-Past a threshold the section collapses to a count plus a small sample. Below it,
-enumeration is unchanged, so short lists keep their existing behaviour.
-
-Run: python3 tests/friction-pending-questions-collapse.test.py
-Exit code: 0 on pass, 1 on fail.
+"""A friction report must not be a second copy of pending-questions.md: past a
+threshold the section collapses to a count plus a sample, below it is unchanged.
 """
 from datetime import date, timedelta
 from pathlib import Path
