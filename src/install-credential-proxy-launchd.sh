@@ -103,10 +103,16 @@ case "$cmd" in
             fi
         fi
         BREW_BIN="$(resolve_brew_bin)"
+        # Canonical config dir, baked in because launchd inherits no shell env.
+        # The helper owns every supported fallback; an empty value would install
+        # a proxy that silently reads the vanilla keychain item instead.
+        CLAUDE_CFG="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
+        [ -n "$CLAUDE_CFG" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; exit 1; }
         echo "Installing $LABEL"
         echo "  repo:      $REPO"
         echo "  workspace: $WORKSPACE"
         echo "  brew bin:  $BREW_BIN"
+        echo "  config:    $CLAUDE_CFG"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
         # SUTANDO_NODE is caller-controlled and lands inside plist XML via sed
@@ -115,11 +121,15 @@ case "$cmd" in
         _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
             | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
         _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
+        _cfg_xml="$(printf '%s' "$CLAUDE_CFG" \
+            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+        _cfg_sed="$(printf '%s' "$_cfg_xml" | sed -e 's/[\\&|]/\\&/g')"
         sed \
             -e "s|__REPO__|$REPO|g" \
             -e "s|__WORKSPACE__|$WORKSPACE|g" \
             -e "s|__BREW_BIN__|$BREW_BIN|g" \
             -e "s|__SUTANDO_NODE__|${_node_sed}|g" \
+            -e "s|__CLAUDE_CONFIG_DIR__|${_cfg_sed}|g" \
             -e "s|__HOME__|$HOME|g" \
             "$TEMPLATE" > "$DEST"
         bootout_if_loaded
