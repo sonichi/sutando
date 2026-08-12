@@ -1,37 +1,5 @@
-"""default_observer — the built-in 👀 observed-receipt (OPT-IN).
-
-When the event channel is running, every `message.created` authored by someone
-OTHER than this agent gets a 👀 reaction posted back to the room — the visible
-"this agent saw it" receipt. Enable with SPARROW_OBSERVE_REACT=1; OFF by
-default even when SPARROW_EVENTS is on.
-
-Why opt-in and not default-on (#2319 review): this module scopes reactions by
-the incoming room_id alone — no owner/DM restriction, no per-room allowlist, no
-membership-size bound, no addressed/mention test. Default-on would therefore
-make enabling the event plane post visible reactions to every human message in
-every subscribed SHARED room, where the other participants gave no consent and
-have no opt-out. Until that scoping policy is decided, the default must not be
-able to surprise a room.
-
-Why client-side (and not a server default): the receipt's meaning is "THIS
-agent's consumer observed the event", so it must live and die with the agent's
-own event consumption. A server-side default would emit receipts on behalf of
-dead agents — a false liveness signal.
-
-Shape: a chain-transparent WRAPPER around the consumer's handler, not a chain
-member. HandlerChain routes each event to ONE claiming handler; the receipt is
-a side effect that must fire for every event while leaving routing/settlement
-(taskify batching, decision routing) untouched — so offer() tees the react and
-returns the inner handler's result unchanged. Reacting is a courtesy signal:
-every failure is swallowed + logged, and can never break event consumption.
-
-Delivery is asynchronous: offer() only enqueues the prepared request onto a
-bounded queue drained by a single daemon worker, so a slow or wedged /react
-endpoint can never delay the inner handler or the sequential event drain.
-Overflow policy: when the queue is full the receipt is dropped and logged —
-never blocked, never retried (it's a courtesy signal, not a delivery
-guarantee; the message stays marked seen so redelivery won't double-react).
-"""
+"""👀 observed-receipt: a chain-transparent tee reacting to other actors' fresh
+messages. OPT-IN (SPARROW_OBSERVE_REACT=1) — it scopes by room_id alone."""
 from __future__ import annotations
 
 import json
@@ -51,20 +19,12 @@ OBSERVE_REACTION = "\U0001F440"
 # double-react. FIFO eviction; 4096 message-ids ≈ weeks of a busy room.
 _SEEN_CAP = 4096
 
-# Pending-receipt bound: with the 10s network timeout this is minutes of
-# backlog against a wedged endpoint before receipts start dropping — far past
-# the point where they stopped being a meaningful "seen just now" signal.
+# Pending-receipt bound: past this a wedged endpoint drops receipts rather
+# than blocking — a stale "seen just now" is worth less than a live drain.
 _QUEUE_CAP = 256
 
-# Catch-up guard: only react to messages younger than this (seconds). A fresh
-# install's first event drain replays the room's FULL history (observed live:
-# a new inbox consumed cursor 0→570 in seconds) — an armed observer would 👀
-# every historical message across rooms, bounded only by _SEEN_CAP. The
-# receipt means "seen just NOW", so old events get marked seen without a
-# react. Events without a usable `ts` are treated as live (the field is
-# gateway-standard; dropping receipts on a missing field would silently
-# disable the feature). Tune with SPARROW_OBSERVE_MAX_AGE_S; 0/negative
-# disables the guard.
+# Max message age (s) to react to; SPARROW_OBSERVE_MAX_AGE_S overrides, <=0
+# disables. A first drain replays full room history — do not 👀 all of it.
 _MAX_AGE_S_DEFAULT = 300.0
 
 
@@ -128,18 +88,15 @@ class ReactObserverHandler:
         if not room or not msg_id or msg_id in self._seen:
             return
         self._mark_seen(msg_id)
-        # Catch-up guard: a backlog/replayed event (first-boot inbox drain,
-        # deep reconnect) is marked seen but NOT reacted — the receipt means
-        # "seen just now", and first-boot history would otherwise be 👀-spammed
-        # across every room. ts is epoch-millis (gateway event schema).
+        # Replayed backlog is marked seen but NOT reacted. ts is epoch-millis;
+        # a missing/unusable ts counts as live so the feature can't go silent.
         if self._max_age_s > 0:
             ts = event.get("ts")
             if isinstance(ts, (int, float)) and ts > 0:
                 if (time.time() - ts / 1000.0) > self._max_age_s:
                     return
-        # safe="" so every reserved char in the room id is escaped — the
-        # default safe="/" would leave a room id containing "/" split across
-        # URL path segments, misrouting the react.
+        # safe="" — the default safe="/" would split a room id containing "/"
+        # across path segments and misroute the react.
         url = f"{self._base}/v1/rooms/{quote(str(room), safe='')}/react"
         data = json.dumps({"event_id": msg_id, "key": OBSERVE_REACTION}).encode()
         req = urllib.request.Request(url, data=data, headers=self._headers,

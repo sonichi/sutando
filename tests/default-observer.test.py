@@ -1,6 +1,4 @@
-"""Tests for the built-in 👀 observed-receipt (default_observer) — the tee
-wrapper's chain transparency, react targeting, self-echo/dedup suppression, and
-failure isolation; plus the bridge's default-on / opt-out / no-mxid wiring.
+"""Tests for the 👀 observed-receipt (default_observer) and its bridge wiring.
 No real network (urlopen monkeypatched). Exit 0/1."""
 import importlib
 import os
@@ -271,22 +269,8 @@ def _start_and_grab_handler(m):
 
 
 def test_unrelated_shared_room_message_gets_no_reaction_by_default():
-    """The #2319 review's exact ask: prove that enabling the event plane does
-    NOT react to an unrelated shared-room message by default.
-
-    Asserted on BEHAVIOUR, not on the wrapper type. The sibling wiring test
-    checks which handler is installed, which is a proxy: a future refactor
-    could keep ReactObserverHandler in the chain and gate the POST elsewhere,
-    and a type assertion would not notice. What the other room's participants
-    actually care about is whether a request reaches /react — so this drives a
-    real message.created from another actor through the started consumer and
-    asserts the network stayed silent.
-
-    Deliberately no SPARROW_OBSERVE_REACT in the environment: the default is
-    the thing under test. AGENT_MXID *is* set, so the observer is not merely
-    off for want of an identity — that is the other reason it could stay quiet,
-    and it would make this test pass for the wrong reason.
-    """
+    """Asserts on /react traffic, not handler type. AGENT_MXID is set on
+    purpose so a missing identity can't make this pass for the wrong reason."""
     with tempfile.TemporaryDirectory() as d:
         m = _load_bridge(pathlib.Path(d))
         net = _Net()
@@ -313,13 +297,8 @@ def test_unrelated_shared_room_message_gets_no_reaction_by_default():
 
 
 def test_opted_in_still_reacts_so_the_default_test_is_not_vacuous():
-    """POSITIVE CONTROL for the test above.
-
-    Without this, `reacts == []` would also hold if the harness simply never
-    delivers events, or if _Net stopped recording — i.e. the default test could
-    pass while proving nothing. Same setup, SPARROW_OBSERVE_REACT=1, and the
-    react MUST appear.
-    """
+    """Positive control: without it, the default test's `reacts == []` would
+    also hold if the harness never delivered events at all."""
     with tempfile.TemporaryDirectory() as d:
         m = _load_bridge(pathlib.Path(d))
         net = _Net()
@@ -347,9 +326,8 @@ def test_opted_in_still_reacts_so_the_default_test_is_not_vacuous():
 
 def test_catchup_guard_skips_backlog():
     import time as _time
-    # Old event (beyond max_age) → marked seen, NOT reacted; a redelivery of
-    # the same message also stays silent. Fresh event → reacted. ts-less
-    # events are treated as live. max_age_s=0 disables the guard.
+    # Old → seen, not reacted (and stays silent on redelivery); fresh →
+    # reacted; ts-less → live; max_age_s=0 disables the guard.
     net = _Net()
     h, orig = _handler(net)
     try:
@@ -389,7 +367,7 @@ def test_bridge_wiring_is_OPT_IN_not_default_on():
         os.environ.pop("SPARROW_OBSERVE_REACT", None)
         h = _start_and_grab_handler(m)
         check(type(h).__name__ == "TaskifyHandler",
-              "wiring: env unset → observer OFF (opt-in, #2319 review)")
+              "wiring: env unset → observer OFF (opt-in)")
 
         os.environ["SPARROW_OBSERVE_REACT"] = "0"
         h = _start_and_grab_handler(m)

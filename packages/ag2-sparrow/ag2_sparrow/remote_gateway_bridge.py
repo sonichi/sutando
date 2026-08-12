@@ -1892,29 +1892,8 @@ def _maybe_start_event_channel() -> None:
                                     ha_room, log=_log,
                                     include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
                                     .strip().lower() in ("1", "true", "yes", "on"))
-        # Built-in 👀 observed-receipt — OPT-IN (set SPARROW_OBSERVE_REACT=1
-        # to enable). It was default-on with the event plane; #2319 review
-        # (john-the-dev 2026-07-30T01:33) is right that default-on is not
-        # sound yet: the observer reacts to every fresh message.created from
-        # another actor using only the incoming room_id, with no owner/DM
-        # scope, per-room allowlist, membership bound, or mention check. So
-        # enabling the event plane would silently start posting visible
-        # reactions to every human message in every subscribed SHARED room,
-        # and the other participants there never consented and cannot opt out.
-        # The reviewer offered two resolutions — narrow the default scope, or
-        # make the feature opt-in until that policy exists. Taking opt-in: the
-        # scoping decision is the owner's (an allowlist vs a membership-size
-        # floor vs addressed-only are different products), and opt-in is the
-        # one that cannot surprise a room while that decision is open. It is
-        # also trivially reversible once the policy lands, which the scope
-        # choice is not. Wrapped OUTERMOST and
-        # chain-transparent, so decision routing + taskify see exactly the
-        # same stream and settlement they would without it. Needs the agent's
-        # own id for self-echo suppression; without it the receipt stays off
-        # (an agent 👀-ing its own messages is noise, not a signal).
-        # AGENT_ID is honored as a fallback name: live-deployment finding — a
-        # real install's durable env carried AGENT_ID, and reading only
-        # AGENT_MXID left the "default-on" receipt silently off.
+        # 👀 receipt: OPT-IN because it scopes by room_id alone, so default-on
+        # would react in shared rooms. Wrapped OUTERMOST, chain-transparent.
         if (str(os.environ.get("SPARROW_OBSERVE_REACT", "")).strip().lower()
                 in ("1", "true", "yes", "on")):
             mxid = os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID")
