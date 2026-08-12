@@ -1267,6 +1267,24 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: install would have trained operators to ignore the detector.
 WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
 
+#: Personal assets whose LAST resolution step is the workspace root. For these
+#: the probe's remedy is not merely noise, it is wrong: `personal_path()` /
+#: `personalPath()` probe `hosts/<label>/` then the legacy per-host memory dir
+#: then `<workspace>/<name>` — and never `state/`. Moving one into `state/` on
+#: the probe's advice breaks the reader that found it.
+#:
+#: Not a hand-kept list: `tests/health-check-root-tidy-personal-assets.test.py`
+#: re-derives the resolver's call sites from src/, scripts/ and skills/, so a
+#: personal asset added later fails CI here instead of becoming a permanent
+#: false warning. `pending-questions.md` is the same family and is already in
+#: WORKSPACE_ROOT_ALLOWED.
+WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
+    "PERSONAL_CLAUDE.md",
+    "stand-identity.json",
+    "stand-avatar.png",
+    "voice-context-active",
+})
+
 
 def check_workspace_root_tidy() -> "dict | None":
     """Flag loose FILES at the workspace root — state that escaped `state/`.
@@ -1300,6 +1318,7 @@ def check_workspace_root_tidy() -> "dict | None":
             p.name for p in WORKSPACE_DIR.iterdir()
             if p.is_file()
             and p.name not in WORKSPACE_ROOT_ALLOWED
+            and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
             and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
         )
     except OSError:
