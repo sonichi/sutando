@@ -243,15 +243,8 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         self.assertIn("reload", out["detail"].lower())
 
     def test_warn_states_every_billing_outcome_with_its_condition(self):
-        """This check reads item NAMES and sees no request, yet both of the
-        proxy's branches turn on exactly that unread state: it substitutes its
-        own token only when `verdict === 'ok'` AND the request carries an
-        authorization header, and forwards the client's credential only under
-        `else if (hasClientAuth)`. So a sentence naming a billing outcome must
-        carry its condition; an unconditional one sends an operator after a
-        charge that may be on their own account. Asserted below: the old
-        unconditional phrasing is gone, pass-through and the header qualifier
-        are named, and no clause mentions billing without a conditional."""
+        """Both proxy branches turn on request state this check never reads, so
+        no clause may name a billing outcome without its condition."""
         core = "/Users/x/ws/.claude-sutando"
         out = self._run(core_cfg=core, plist_cfg=None,
                         existing_services={_scoped(core), VANILLA})
@@ -288,12 +281,8 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         self.assertIn(_scoped(core), out["detail"])
 
     def test_ok_reports_the_name_match_not_an_injection(self):
-        """The agreeing branch has the same defect the warn branch had, and it
-        is the one that gets quoted: a reviewer cited this detail on #2843 as
-        evidence the proxy injects, which a name comparison cannot show. A
-        proxy whose stored token is unusable resolves the SAME item and passes
-        through on every request — measured on a live host, 4718 `pass-through
-        engaged` lines against a name match. Report what was compared."""
+        """A proxy whose stored token is unusable resolves the SAME item and
+        passes through, so a name match cannot report an injection."""
         core = "/Users/x/ws/.claude-sutando"
         out = self._run(core_cfg=core, plist_cfg=core,
                         existing_services={_scoped(core), VANILLA})
