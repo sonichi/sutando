@@ -5545,6 +5545,8 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     # stamp if it went stale mid-write.
     if not _is_watcher_argv(_proc_argv(int(pid))):
         try:
+            # Read-then-unlink, NOT arbitrated the way the write above is:
+            # POSIX has no conditional unlink, so a claim landing here is lost.
             if pid_file.read_text().strip() == pid:
                 pid_file.unlink()
         except OSError as e:
@@ -8868,7 +8870,10 @@ def main():
         emit_task_for_failures(checks)
 
     if as_json:
-        print(json.dumps({"checks": checks, "issues": len(issues), "total": len(checks)}, indent=2))
+        # Underscore keys are the fix pass's internal channel, and whether one
+        # is present depends on the flags — so they must not reach consumers.
+        payload = [{k: v for k, v in c.items() if not k.startswith("_")} for c in checks]
+        print(json.dumps({"checks": payload, "issues": len(issues), "total": len(checks)}, indent=2))
         return
 
     # --quiet: print only issues (or nothing if clean). Exit code reflects state.

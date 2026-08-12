@@ -37,6 +37,7 @@ Covers:
   w2) ...including when it is the exclusive create, not the mkdir, that fails
   x) `--fix` actually REACHES the repair (warn never enters `issues`)
   y) under `--json` the repair line stays off stdout, so JSON still parses
+  y2) ...and the repair pass's own `_`-prefixed keys stay out of the payload
 
 Run: python3 tests/health-check-task-watcher.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -438,6 +439,29 @@ def case_y_json_repair_line_goes_to_stderr() -> list[str]:
     return fails
 
 
+def case_y2_private_keys_stay_out_of_the_json_payload() -> list[str]:
+    """`_sentinel_restamp_pid` is the fix pass's internal channel, and whether it
+    is present depends on the flags — so `--json` must not publish it."""
+    fails = []
+    _fired, out, _err = _run_main_fix(["--json"])
+    try:
+        payload = json.loads(out)
+    except ValueError:
+        return [f"y2) --json did not emit parseable JSON: {out!r}"]
+    checks = payload.get("checks") or []
+    if not checks:
+        return ["y2) the payload carried no checks — this case covers nothing"]
+    leaked = sorted({k for c in checks for k in c if k.startswith("_")})
+    if leaked:
+        fails.append(f"y2) private key(s) reached --json: {leaked}")
+    if payload.get("total") != len(checks):
+        fails.append(f"y2) filtering changed the count: total={payload.get('total')} "
+                     f"vs {len(checks)} check(s)")
+    if checks[0].get("name") != "task-watcher" or "detail" not in checks[0]:
+        fails.append(f"y2) the public fields must survive the filter, got {checks[0]!r}")
+    return fails
+
+
 def case_a_no_core_is_ok() -> list[str]:
     # The anti-latch guard: a host with no core running must not sit red.
     r = run_check(core_alive=False, pid_text=None)
@@ -705,6 +729,7 @@ def main() -> int:
         ("w2", case_w2_unwritable_state_dir_is_reported),
         ("x", case_x_fix_is_reachable_from_main),
         ("y", case_y_json_repair_line_goes_to_stderr),
+        ("y2", case_y2_private_keys_stay_out_of_the_json_payload),
     ]
     all_failures = []
     for label, fn in cases:
