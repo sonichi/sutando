@@ -150,13 +150,21 @@ def check_stale_tasks():
     return issues
 
 
+# `gh issue list` defaults to 30 rows newest-first, so a staleness probe must
+# page past it. Query and report bounds are separate on purpose.
+_GH_QUERY_LIMIT = 500
+_GH_REPORT_CAP = 10
+
+
 def check_github_issues():
-    """Find open issues/PRs that haven't been updated in >7 days."""
+    """Find open issues not updated in >7 days. Issues only — open PRs are
+    `pr_flag.py`'s domain and would otherwise be reported twice."""
     issues = []
     try:
         result = subprocess.run(
-            ["gh", "issue", "list", "--state", "open", "--json", "number,title,updatedAt"],
-            capture_output=True, text=True, timeout=10
+            ["gh", "issue", "list", "--state", "open", "--limit", str(_GH_QUERY_LIMIT),
+             "--json", "number,title,updatedAt"],
+            capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
             # A failed probe is not an absence of stale issues. Saying nothing
@@ -165,12 +173,24 @@ def check_github_issues():
             return [UNCHECKED + "GitHub issues (gh exited "
                     f"{result.returncode})"]
         items = json.loads(result.stdout)
+        if len(items) >= _GH_QUERY_LIMIT:
+            # Hit the cap we passed: the read is truncated and the oldest issues
+            # are the ones most likely missing. Say so rather than under-report.
+            return [UNCHECKED + f"GitHub issues (returned {len(items)} == the "
+                    f"{_GH_QUERY_LIMIT} cap, so the list is truncated)"]
         now = datetime.now(timezone.utc)
+        stale = []
         for item in items:
             updated = datetime.fromisoformat(item["updatedAt"].replace("Z", "+00:00"))
             age_days = (now - updated).days
             if age_days > 7:
-                issues.append(f"GitHub issue #{item['number']} stale ({age_days}d): {item['title'][:60]}")
+                stale.append((age_days, item))
+        stale.sort(key=lambda p: p[0], reverse=True)
+        for age_days, item in stale[:_GH_REPORT_CAP]:
+            issues.append(f"GitHub issue #{item['number']} stale ({age_days}d): {item['title'][:60]}")
+        if len(stale) > _GH_REPORT_CAP:
+            issues.append(f"...and {len(stale) - _GH_REPORT_CAP} more stale issue(s) "
+                          f"beyond the {_GH_REPORT_CAP} oldest shown")
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
         return [UNCHECKED + f"GitHub issues ({type(e).__name__})"]
     return issues

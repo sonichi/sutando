@@ -20,6 +20,7 @@ Checks:
   - Notes directory
 """
 
+import functools
 import hashlib
 import fnmatch
 import json
@@ -4819,6 +4820,35 @@ def check_disk_space() -> dict:
     return {"name": name, "status": "ok", "detail": where}
 
 
+@functools.lru_cache(maxsize=1)
+def _ephemeral_roots() -> tuple:
+    """Temp roots whose contents do not survive a sweep or reboot, asked of the
+    platform: naming them literally puts a host path in the tree the scan forbids."""
+    roots = set()
+    for cand in (tempfile.gettempdir(), "/tmp"):
+        for p in (cand, os.path.realpath(cand)):
+            p = p.rstrip("/")
+            if not p:
+                continue
+            roots.add(p)
+            # macOS $TMPDIR is <base>/folders/xx/yyy/T. The shared base counts too, so
+            # another session's scratch dir is still recognised as ephemeral.
+            head, sep, _ = p.partition("/folders/")
+            if sep:
+                roots.add(head + "/folders")
+    return tuple(sorted(roots))
+
+
+def _is_ephemeral(target: str) -> bool:
+    """True if `target` IS a temp root or lives under one.
+
+    Equality counts: a link pointing AT the root is as ephemeral as one pointing
+    inside it, and a trailing-slash prefix test answers False for exactly that case.
+    """
+    t = os.path.normpath(target).rstrip("/") or "/"
+    return any(t == r or t.startswith(r + "/") for r in _ephemeral_roots())
+
+
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
     the Claude home's skills/ dir. A missing symlink means Claude Code never
@@ -4868,6 +4898,7 @@ def check_skill_symlinks() -> dict:
     # reported "all 60 skills linked". The drift was one ruff E401 import split
     # -- harmless that time, which is exactly why it survived unnoticed.
     shadowed: list[str] = []   # real dir where a symlink belongs -> NOT auto-fixed
+    misdirected: list[tuple[str, str]] = []  # resolves, but into a temp dir
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
             continue
@@ -4885,6 +4916,11 @@ def check_skill_symlinks() -> dict:
             unlinked.append(skill_name)
         elif dst.is_dir() and not dst.is_symlink():
             shadowed.append(skill_name)
+        elif (dst.is_symlink() and _is_ephemeral(os.path.realpath(dst))
+              and not _is_ephemeral(str(skills_src.resolve()))):
+            # The MISMATCH is the defect, not temp-rootedness: a temp-rooted repo
+            # is self-consistent, and another DURABLE clone is a supported layout.
+            misdirected.append((skill_name, os.path.realpath(dst)))
 
     # Dangling links whose skill is NOT in this repo are missed by the loop
     # above, which only walks repo skills. They are still dead entries that make
@@ -4903,7 +4939,7 @@ def check_skill_symlinks() -> dict:
     except OSError:
         pass
 
-    if not unlinked and not broken and not orphaned and not shadowed:
+    if not unlinked and not broken and not orphaned and not shadowed and not misdirected:
         return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
 
     parts = []
@@ -4913,6 +4949,12 @@ def check_skill_symlinks() -> dict:
         parts.append(f"{len(unlinked)} unlinked: {', '.join(unlinked[:4])}{'...' if len(unlinked) > 4 else ''}")
     if orphaned:
         parts.append(f"{len(orphaned)} dangling not in this repo: {', '.join(orphaned[:4])}{'...' if len(orphaned) > 4 else ''}")
+    if misdirected:
+        parts.append(
+            f"{len(misdirected)} loaded from temp (vanishes on sweep): "
+            + ", ".join(f"{n} -> {t}" for n, t in misdirected[:2])
+            + ("..." if len(misdirected) > 2 else "")
+        )
     if shadowed:
         # The remedy must MOVE the real directory aside first. `ln -sfn` alone
         # does NOT repair this state: with the directory still present, macOS
