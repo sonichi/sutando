@@ -5527,13 +5527,36 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     # exists to catch, and this file is what the Stop hook kills.
     if "watch-tasks-stream" not in (_proc_argv(int(pid)) or ""):
         return f"pid {pid} is no longer the watcher — not re-stamped"
-    if pid_file.exists():
-        return "a watcher re-claimed the sentinel — left its file alone"
     try:
+        # Separate try: mkdir raises FileExistsError when state/ is a plain
+        # file, which is a write failure, not a competing claim.
         pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(f"{pid}\n")
     except OSError as e:
         return f"could not write {pid_file}: {e}"
+    try:
+        # Exclusive create, not exists()-then-write: the OS is the only thing
+        # that can arbitrate against a watcher claiming the sentinel in the
+        # same instant, and a lost race here leaves the file naming a dead pid
+        # that the live owner's content-gated cleanup will never remove.
+        with open(pid_file, "x") as fh:
+            fh.write(f"{pid}\n")
+    except FileExistsError:
+        return "a watcher re-claimed the sentinel — left its file alone"
+    except OSError as e:
+        return f"could not write {pid_file}: {e}"
+    # The argv probe above was a snapshot taken BEFORE publication. Re-validate
+    # after, and retract our own stamp if it went stale mid-write — leaving it
+    # would author the PID-reuse lie this fixer exists to avoid.
+    if "watch-tasks-stream" not in (_proc_argv(int(pid)) or ""):
+        try:
+            if pid_file.read_text().strip() == pid:
+                pid_file.unlink()
+        except OSError as e:
+            # Reporting a withdrawal that did not happen is the same class of
+            # lie as the stale stamp; the operator needs the real state.
+            return (f"pid {pid} stopped being the watcher mid-write and the "
+                    f"stamp could not be withdrawn: {e}")
+        return f"pid {pid} stopped being the watcher mid-write — sentinel withdrawn"
     return f"re-stamped the sentinel for live watcher pid {pid}"
 
 

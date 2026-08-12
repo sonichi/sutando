@@ -24,8 +24,14 @@ Covers:
   s) --fix re-stamps it and the RE-RUN check reports ok (no restart needed)
   t) --fix refuses to stamp a pid that is no longer the watcher (PID reuse)
   u) --fix never clobbers a sentinel a watcher re-claimed meanwhile
+  u2) ...nor one claimed INSIDE the write window, where only the kernel can
+     arbitrate (an exists()-then-write cannot see it)
+  u3) a pid that stops being the watcher mid-write has its stamp withdrawn —
+     the pre-write probe is a snapshot, so publication is re-validated
+  u4) ...and a withdrawal the OS denied is reported as such, never as done
   v) a check with no repairable pid is declined, not stamped with junk
   w) an unwritable state dir is reported, never raised into the caller
+  w2) ...including when it is the exclusive create, not the mkdir, that fails
   x) `--fix` actually REACHES the repair (warn never enters `issues`)
   y) under `--json` the repair line stays off stdout, so JSON still parses
 
@@ -51,6 +57,9 @@ MOD_PATH = REPO / "src" / "health-check.py"
 spec = importlib.util.spec_from_file_location("health_check", MOD_PATH)
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
+
+# Captured before any case swaps it in, so a failing case cannot leak a stub.
+_REAL_PROC_ARGV = hc._proc_argv
 
 
 def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
@@ -171,6 +180,125 @@ def case_u_fix_never_clobbers_a_reclaimed_sentinel() -> list[str]:
             fails.append(f"u) --fix overwrote a live claim: sentinel now {held}")
         if "re-claimed" not in msg:
             fails.append(f"u) should say why it declined, got {msg!r}")
+    return fails
+
+
+def case_u2_competing_claim_inside_the_write_window_survives() -> list[str]:
+    """Case (u) covers the SEQUENTIAL order — the sentinel already exists when
+    the fixer runs, so any pre-write existence check sees it. This one lands
+    the claim INSIDE the window instead: after that check, before publication.
+    The fixer's `mkdir` of the state dir is its only call in that window, so
+    claiming from mkdir is how a unit fixture schedules a write there.
+
+    An exists()-then-write_text() truncates the newer claim; an exclusive
+    create cannot, because the kernel — not the fixer — arbitrates."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        pid_file = ws / "state" / "watch-tasks-stream.pid"
+        real_mkdir = Path.mkdir
+
+        def _mkdir_then_claim(self, *a, **kw):
+            result = real_mkdir(self, *a, **kw)
+            if Path(self) == pid_file.parent and not pid_file.exists():
+                pid_file.write_text("9999\n")   # a starting watcher's own stamp
+            return result
+
+        Path.mkdir = _mkdir_then_claim
+        try:
+            msg = hc.fix_task_watcher_sentinel(check)
+        finally:
+            Path.mkdir = real_mkdir
+        held = pid_file.read_text().strip() if pid_file.exists() else "<ABSENT>"
+        if held != "9999":
+            fails.append(f"u2) --fix truncated a claim made mid-write: sentinel now {held}")
+        if "re-claimed" not in msg:
+            fails.append(f"u2) should report the lost race, got {msg!r}")
+    return fails
+
+
+def case_u3_pid_stale_after_publication_is_withdrawn() -> list[str]:
+    """The pre-write argv probe is a snapshot; the pid can stop being the
+    watcher before the file lands. Leaving that stamp would author the exact
+    PID-reuse lie the probe exists to catch, and the Stop hook kills what this
+    file names."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        pid_file = ws / "state" / "watch-tasks-stream.pid"
+        seen = {"n": 0}
+
+        def _argv_then_exit(pid):
+            seen["n"] += 1
+            return "bash src/watch-tasks-stream.sh" if seen["n"] == 1 else "zsh -l"
+
+        hc._proc_argv = _argv_then_exit
+        try:
+            msg = hc.fix_task_watcher_sentinel(check)
+        finally:
+            hc._proc_argv = _REAL_PROC_ARGV
+        if pid_file.exists():
+            fails.append(f"u3) left a stamp for a dead watcher: {pid_file.read_text()!r}")
+        if "withdrawn" not in msg:
+            fails.append(f"u3) should report the withdrawal, got {msg!r}")
+    return fails
+
+
+def case_u4_a_withdrawal_that_failed_is_not_reported_as_done() -> list[str]:
+    """(u3) with the retraction's own unlink denied. The fixer must not raise,
+    and must not claim a withdrawal it could not perform — a stamp naming a
+    dead pid is exactly what the operator has to know is still there."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        state = ws / "state"
+        pid_file = state / "watch-tasks-stream.pid"
+        seen = {"n": 0}
+
+        def _argv_then_lock(pid):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return "bash src/watch-tasks-stream.sh"
+            state.chmod(0o555)      # file still readable, dir denies unlink
+            return "zsh -l"
+
+        hc._proc_argv = _argv_then_lock
+        try:
+            msg = hc.fix_task_watcher_sentinel(check)
+        except OSError as e:
+            state.chmod(0o755)
+            return [f"u4) raised instead of reporting: {e!r}"]
+        finally:
+            hc._proc_argv = _REAL_PROC_ARGV
+        state.chmod(0o755)
+        if not pid_file.exists():
+            fails.append("u4) the unlink was supposed to be denied — this case "
+                         "covers nothing if the stamp actually went away")
+        if "could not be withdrawn" not in msg:
+            fails.append(f"u4) must report the failed withdrawal, got {msg!r}")
+    return fails
+
+
+def case_w2_unwritable_state_dir_is_reported() -> list[str]:
+    """(w) fails in `mkdir`; this one gets past it — the dir exists, so
+    `exist_ok=True` succeeds — and fails in the exclusive create instead.
+    Both are write failures the fixer owes the operator as text."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        state = ws / "state"
+        state.chmod(0o555)
+        try:
+            msg = hc.fix_task_watcher_sentinel(check)
+        except OSError as e:
+            state.chmod(0o755)
+            return [f"w2) raised instead of reporting: {e!r}"]
+        state.chmod(0o755)
+        if (state / "watch-tasks-stream.pid").exists():
+            fails.append("w2) the create was supposed to be denied — this case "
+                         "covers nothing if the sentinel was written")
+        if "could not write" not in msg:
+            fails.append(f"w2) should report the write failure, got {msg!r}")
     return fails
 
 
@@ -511,8 +639,12 @@ def main() -> int:
         ("s", case_s_fix_restamps_and_recheck_is_ok),
         ("t", case_t_fix_refuses_a_recycled_pid),
         ("u", case_u_fix_never_clobbers_a_reclaimed_sentinel),
+        ("u2", case_u2_competing_claim_inside_the_write_window_survives),
+        ("u3", case_u3_pid_stale_after_publication_is_withdrawn),
+        ("u4", case_u4_a_withdrawal_that_failed_is_not_reported_as_done),
         ("v", case_v_fix_declines_without_a_pid),
         ("w", case_w_fix_reports_a_write_failure),
+        ("w2", case_w2_unwritable_state_dir_is_reported),
         ("x", case_x_fix_is_reachable_from_main),
         ("y", case_y_json_repair_line_goes_to_stderr),
     ]
