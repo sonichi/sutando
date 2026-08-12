@@ -96,13 +96,23 @@ STATE_FILE="$WORKSPACE_DIR/session-state.md"
 
 # Append-only record that a compaction happened. Nothing else on disk marks one,
 # so "did context roll over just before that failure?" was previously unanswerable.
+# JSON-escape one value. host/transcript/trigger are external input, and an
+# unescaped " or \\ makes the whole line unparseable to every later reader.
+_ch_json_escape() {
+    local s=${1//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "${s//[$'\n\t\r']/ }"
+}
+
 record_compaction_event() {
     local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
     line="$(printf '{"ts":"%s","epoch":%s,"host":"%s","transcript":"%s","trigger":"%s"}' \
-        "$ts" "$(date +%s)" "${SUTANDO_HOST_LABEL:-$(hostname -s 2>/dev/null)}" \
-        "$(basename "${1:-}" 2>/dev/null)" "${2:-precompact}")"
+        "$ts" "$(date +%s)" \
+        "$(_ch_json_escape "${SUTANDO_HOST_LABEL:-$(hostname -s 2>/dev/null)}")" \
+        "$(_ch_json_escape "$(basename "${1:-}" 2>/dev/null)")" \
+        "$(_ch_json_escape "${2:-precompact}")")"
     # Bound it: keep the newest 500 so a long-lived core cannot grow this forever.
     if [ -f "$log" ] && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -ge 500 ]; then
         tail -n 499 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log" 2>/dev/null

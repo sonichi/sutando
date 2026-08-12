@@ -1,40 +1,43 @@
 #!/usr/bin/env python3
 """A compaction must leave a durable trace, and the recorder must be reachable.
 
-Nothing on disk marked a context compaction, so "did context roll over just
-before that failure?" was unanswerable. Written as .test.py because CI collects
-`find tests -name '*.test.py'` — a .test.sh sibling is never run.
-
-Nothing here runs session-handoff.sh end to end. There is no verified way to
-point it at a throwaway workspace: a temp repo carrying its own
+Does not run session-handoff.sh end to end: a temp repo with its own
 sutando.config.local.json still resolved to the LIVE workspace when measured, so
 a harness that "ran the script" would write into the owner's real state/.
 """
 from pathlib import Path
 import json
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "src" / "session-handoff.sh"
 FN = "record_compaction_event"
+HELPERS = ["_ch_json_escape"]
 
 
 def _fn_source() -> str:
-    """The real function body, extracted — never a re-typed copy."""
+    """The real bodies, extracted — never a re-typed copy. HELPERS must ride
+    along: an extracted function whose callee is missing silently writes ""."""
     text = SCRIPT.read_text()
-    m = re.search(rf"^{FN}\(\) \{{.*?^\}}", text, re.S | re.M)
-    if not m:
-        raise AssertionError(f"{FN} not found in {SCRIPT}")
-    return m.group(0)
+    out = []
+    for name in HELPERS + [FN]:
+        m = re.search(rf"^{name}\(\) \{{.*?^\}}", text, re.S | re.M)
+        if not m:
+            raise AssertionError(f"{name} not found in {SCRIPT}")
+        out.append(m.group(0))
+    return "\n".join(out)
 
 
 def _run(workspace: Path, *calls: tuple) -> subprocess.CompletedProcess:
     """Exec the extracted function against a temp WORKSPACE_DIR."""
     body = [f'WORKSPACE_DIR={workspace!s}', _fn_source()]
     for transcript, trigger in calls:
-        body.append(f'{FN} "{transcript}" "{trigger}"')
+        # shlex.quote, not an f-string: a " in the VALUE would otherwise close
+        # the shell string and the harness would test a different input.
+        body.append(f"{FN} {shlex.quote(transcript)} {shlex.quote(trigger)}")
     body.append("exit 0")
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
         fh.write("\n".join(body))
@@ -123,6 +126,26 @@ class TheRecordItWrites(unittest.TestCase):
         self.assertLessEqual(len(lines), 500, "unbounded")
         self.assertIn("third.jsonl", lines[-1],
                       "the trim must keep the NEWEST event, not the oldest")
+
+    def test_a_quote_in_any_field_still_yields_parseable_json(self):
+        """host/transcript/trigger are external input; unescaped they break the
+        whole line for every later reader."""
+        _run(self.ws, ('/tmp/tra"nscript.jsonl', 'pre"compact'))
+        rec = json.loads(self.log.read_text().strip().splitlines()[-1])
+        self.assertEqual(rec["transcript"], 'tra"nscript.jsonl')
+        self.assertEqual(rec["trigger"], 'pre"compact')
+
+    def test_a_backslash_survives_as_a_backslash(self):
+        _run(self.ws, (r'/tmp/back\slash.jsonl', "precompact"))
+        rec = json.loads(self.log.read_text().strip().splitlines()[-1])
+        self.assertIn("\\", rec["transcript"])
+
+    def test_a_newline_cannot_split_one_event_into_two_lines(self):
+        """jsonl is line-delimited, so an embedded newline is not just ugly."""
+        _run(self.ws, ("/tmp/a.jsonl", "pre\ncompact"))
+        lines = self.log.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 1, f"one event became {len(lines)} lines")
+        json.loads(lines[0])
 
     def test_an_unwritable_log_is_never_fatal(self):
         """This runs inside PreCompact; a nonzero exit is worse than no line."""
