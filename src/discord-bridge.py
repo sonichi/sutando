@@ -854,11 +854,8 @@ def load_channel_context_blacklist(channel_id):
     return set()
 
 def _should_notify_owner_on_seed(sender_id, owner_id):
-    """True iff a non-owner seeded the thread, so the owner needs the notice.
-
-    Takes the CANONICAL owner, not the allowFrom list: every allowlisted user is
-    not an owner, so membership would suppress the notice for a team sender.
-    """
+    """True iff a non-owner seeded the thread. Takes the CANONICAL owner, not
+    allowFrom: membership would suppress the notice for a team sender."""
     return bool(owner_id) and str(sender_id) != str(owner_id)
 
 def _has_sibling_bots(access_data, self_id):
@@ -888,13 +885,8 @@ def _has_sibling_bots(access_data, self_id):
         return False
 
 def _format_seed_notice(owner_id, author_mention, parent_label, thread_id_str):
-    """Owner-facing notice for a freshly auto-seeded thread. Pure (no I/O).
-
-    Delivered to the owner's DM — NOT posted into the seeded thread. The
-    notice exists purely for owner visibility (_should_notify_owner_on_seed
-    fires only when a non-owner seeded), and posting it in-thread leaked
-    internal access-control plumbing into a public AG2-community thread on
-    2026-07-29. The `<#thread_id>` mention makes the DM self-locating."""
+    """Owner-facing auto-seed notice, pure. The `<#thread_id>` mention is what
+    makes it self-locating in a DM, which is its only delivery path."""
     return (
         f"<@{owner_id}> 🌱 Auto-seeded thread <#{thread_id_str}> to access.json "
         f"(first message from {author_mention}, parent {parent_label}). "
@@ -920,11 +912,8 @@ async def _maybe_notify_owner_of_seed(access_data, sender_id, sender_mention,
 
 
 async def _send_seed_notice_to_owner(owner_id, notice):
-    """Deliver the auto-seed notice to the owner's DM.
-
-    No public fallback by design: on any failure we only log — the notice
-    must never land in the seeded (possibly public) thread, which is the
-    exact leak this replaces (2026-07-29 AG2-community incident)."""
+    """Deliver the auto-seed notice to the owner's DM. No public fallback by
+    design: on failure, log only — it must never reach the seeded thread."""
     user = await client.fetch_user(int(owner_id))
     dm = await user.create_dm()
     await dm.send(notice)
@@ -3089,13 +3078,8 @@ async def _handle_discord_message(message, force=False):
                     # only: never flip an already-False gate back to True.
                     require_mention = require_mention and bool(thread_entry.get('requireMention', True))
                     print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
-                    # Owner-visibility ping (one-shot, first seed only): when a
-                    # non-owner seeds the thread, DM the owner so an auto-opened
-                    # thread can't silently accumulate sandboxed replies the
-                    # owner never sees (#1498 slip-risk). DM — never in-thread:
-                    # posting the notice into the seeded thread leaked internal
-                    # access-control plumbing into a public AG2-community thread
-                    # (2026-07-29 incident). Failure path is log-only by design.
+                    # DM only, never in-thread: the notice names access-control
+                    # internals, and the seeded thread may be public.
                     parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
                     await _maybe_notify_owner_of_seed(
                         access_data, message.author.id, message.author.mention,
@@ -4326,16 +4310,8 @@ def _record_skip_audit(task_id: str, skip_value: str) -> None:
 
 
 def _is_sandbox_fallback_result(body, is_dm):
-    """True iff this outbound result body is the internal Stage-2 sandbox
-    fallback sentinel headed for a non-DM (guild/thread) destination.
-
-    The sentinel is bridge-internal plumbing: the tier instructions have the
-    agent write it to results/ when codex can't serve a non-owner task. In a
-    DM the refusal is 1:1 with the requester and stays deliverable; in a guild
-    channel it posts internals publicly (the 2026-07-29 AG2-community "bad
-    comments"), so poll_results suppresses it. startswith (on the stripped
-    body) so a wrapper line appended by a future template tweak cannot silently
-    reopen the leak."""
+    """True iff this body is the Stage-2 sandbox sentinel bound for a non-DM
+    destination. startswith, so an appended wrapper line cannot reopen the leak."""
     if is_dm:
         return False
     return is_sandbox_fallback_sentinel(body)
@@ -4356,12 +4332,8 @@ async def _swallow_sandbox_fallback(channel, task_id, result_file, reply_text, i
 
 
 async def _notify_owner_sandbox_suppressed(channel, task_id):
-    """Best-effort owner DM when a sandbox-fallback sentinel was suppressed.
-
-    Keeps the owner aware that a non-owner asked something in a public channel
-    and got no reply (the sender is NOT re-notified — the whole point is that
-    nothing internal posts publicly). Never raises: suppression must complete
-    (archive + audit) even when the owner can't be resolved or DM'd."""
+    """Best-effort owner DM for a suppressed sentinel; the sender is NOT told.
+    Never raises: the archive + audit must complete even with no reachable owner."""
     try:
         try:
             access_data = json.loads(ACCESS_FILE.read_text())
@@ -4662,13 +4634,8 @@ async def poll_results():
                 # etc.) so downstream handling operates on clean content.
                 reply_text = _parsed.body
 
-                # Outbound leak guard (2026-07-29 AG2-community incident): the
-                # Stage-2 sandbox fallback writes a fallback sentinel as
-                # the result body, and this loop would deliver it straight into
-                # the originating channel — internal plumbing posted publicly
-                # when that channel is a guild thread. Swallow it for non-DM
-                # destinations: no-send archive + best-effort owner DM. DMs keep
-                # current behavior (a 1:1 refusal to the requester is fine).
+                # The Stage-2 fallback sentinel is a result body like any other,
+                # so without this guard the loop posts it to a public channel.
                 if await _swallow_sandbox_fallback(
                         channel, task_id, result_file, reply_text,
                         isinstance(channel, discord.DMChannel)):
