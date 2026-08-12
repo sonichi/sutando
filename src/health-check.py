@@ -5369,35 +5369,15 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
                                   claim_threshold_age_sec: int = 7200) -> dict:
     """Report `results/proactive-*` bodies no consumer has delivered.
 
-    A proactive body is the one message the owner did not ask for and therefore
-    cannot miss the absence of: nothing is waiting on a reply, so an undelivered
-    one leaves no gap anywhere a human or a probe would look. That is the whole
-    hazard — a task reply that never sends eventually reads as a one-sided
-    conversation, while a proactive file that never sends reads as silence, and
-    silence is what a healthy system also looks like.
+    Neither adjacent probe covers this: `check_orphaned_results` excludes the
+    family by name, and `check_proactive_quarantine` reads
+    `results/undelivered/` — bodies a consumer already took.
 
-    Nothing else covers it. `check_orphaned_results` excludes this family by
-    name ("their own delivery lifecycles"), and that exclusion is right: these
-    have no task to pair against, so its whole predicate is inapplicable.
-    `check_proactive_quarantine` reads `results/undelivered/`, i.e. bodies a
-    consumer took and a transport refused — the opposite end, after something
-    ran. A file no consumer ever claimed is in neither place.
-
-    Deliberately `warn`, and deliberately not gated on any consumer being
-    configured. The two states that produce a backlog — every bridge down, or a
-    drain that is present but points nowhere — are indistinguishable from here
-    and have the same consequence for the owner, so the probe reports the
-    consequence and leaves the cause to the reader.
-
-    Two shapes, because a claim is a body too. Consumers claim by rename —
-    `f.with_suffix(".sending")` — which REPLACES `.txt`, so a claimed body is
-    `proactive-<id>.sending`. A consumer that dies mid-send leaves that name
-    behind: not in `results/undelivered/` (nothing refused it) and restored only
-    by the next startup sweep, so between the crash and that restart it is
-    exactly "a body nobody delivered" and the one shape a `*.txt` glob cannot
-    see. Its grace is longer than an unclaimed body's because the system does
-    have a recovery for this shape and none for the other; a live send is
-    seconds, so hours means abandoned either way.
+    Two shapes, because a claim is a body too. Consumers claim by rename,
+    `f.with_suffix(".sending")`, which REPLACES `.txt` — so a claimed body is
+    `proactive-<id>.sending`, the one shape a `*.txt` glob cannot see. Its
+    grace is longer because the startup sweep restores that shape and nothing
+    restores the other.
     """
     name = "stale-proactive-backlog"
     results_dir = WORKSPACE_DIR / "results"

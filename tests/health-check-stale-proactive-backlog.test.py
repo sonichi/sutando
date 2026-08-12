@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """Regression coverage for check_stale_proactive_backlog.
 
-A proactive body is the message nobody is waiting for, so an undelivered one
-leaves no gap: the conversation it would have started simply never happens, and
-that is indistinguishable from a quiet system. The two probes either side of it
-both decline the case on purpose — `check_orphaned_results` excludes the
-`proactive-*` family by name, and `check_proactive_quarantine` reads
-`results/undelivered/`, which is where a body lands after a consumer took it and
-a transport refused. A file no consumer ever claimed is in neither.
-
-Both directions are covered. A detector that only ever warns carries no
-information, so the negatives — fresh bodies, claimed bodies, other namespaces —
-matter as much as the positive, and the registration case matters because a
-probe that is never appended to `checks` passes its own unit test forever.
+Covers both directions — a detector that only ever warns carries no
+information — plus registration, since a probe never appended to `checks`
+passes every unit test here and still reports nothing on a real run.
 
 Run: python3 tests/health-check-stale-proactive-backlog.test.py
 """
@@ -37,10 +28,8 @@ spec.loader.exec_module(hc)
 
 TWO_HOURS = 7200
 
-# The literal claim the bridges produce, not a hand-written approximation of it:
-# with_suffix REPLACES .txt, so the claimed name carries no .txt and no pid. The
-# previous fixture wrote both, which is a filename the system never emits — the
-# guard it covered was unreachable for real input.
+# The literal claim the bridges produce: with_suffix REPLACES .txt, so the
+# claimed name carries no .txt and no pid. Hand-writing it invents a shape.
 CLAIMED = Path("proactive-1786480017.txt").with_suffix(".sending").name
 
 
@@ -74,10 +63,8 @@ class StaleProactiveBacklogTest(unittest.TestCase):
         self.assertIn("proactive-1786480017.txt", verdict["detail"])
 
     def test_an_abandoned_claim_is_reported(self) -> None:
-        # The shape a *.txt glob cannot see: a consumer took it and died. It is
-        # not in results/undelivered/ (nothing refused it), and the startup
-        # sweep only restores it at the next restart — until then it is a body
-        # nobody delivered, and every other probe reads ok.
+        # The shape a *.txt glob cannot see: a consumer took it and died. Not
+        # in results/undelivered/, and restored only at the next restart.
         self._write(f"results/{CLAIMED}", TWO_HOURS * 3)
         verdict = hc.check_stale_proactive_backlog()
         self.assertEqual(verdict["status"], "warn")
@@ -122,9 +109,8 @@ class StaleProactiveBacklogTest(unittest.TestCase):
         self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
 
     def test_a_claim_inside_its_grace_is_not_reported(self) -> None:
-        # A restart is minutes and the startup sweep restores the file, so the
-        # claim's grace is longer than an unclaimed body's — an age that warns
-        # for a *.txt must stay quiet for a claim.
+        # The startup sweep restores a claim, so its grace is longer: an age
+        # that warns for a *.txt must stay quiet for a claim.
         self._write(f"results/{CLAIMED}", TWO_HOURS - 60)
         self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
 
@@ -191,8 +177,6 @@ class StaleProactiveBacklogTest(unittest.TestCase):
     # --- wiring ----------------------------------------------------------
 
     def test_probe_is_registered_in_the_check_list(self) -> None:
-        # A probe that is never appended passes every unit test above and still
-        # reports nothing on a real run.
         # assertIn would echo the whole module into the failure message.
         src = inspect.getsource(hc)
         self.assertTrue(
