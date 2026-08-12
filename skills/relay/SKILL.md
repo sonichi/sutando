@@ -12,7 +12,7 @@ Pass the baton to the next Sutando session. Where `session-handoff.sh` writes st
 
 ## Why this exists
 
-Catchup-after-startup pulls together 10 categories of structured state for the next session. But "I was about to land PR #X and Mini's review said Y matters most" isn't captured by `git log`, `gh pr list`, or `pending-questions.md` tail. The next session reads structured facts but has to RE-INFER the continuity, which costs context and frequently misses the load-bearing decision.
+`src/session-handoff.sh` pulls together the structured state for the next session — system status, recent commits, open PRs, pending questions, tasks, conversation tail, quota, repo stats — and writes it to `session-state.md`. But "I was about to land PR #X and Mini's review said Y matters most" isn't captured by `git log`, `gh pr list`, or `pending-questions.md` tail. The next session reads structured facts but has to RE-INFER the continuity, which costs context and frequently misses the load-bearing decision.
 
 The relay note encodes intent + judgment — the thing only the LLM that lived through the session can write.
 
@@ -41,7 +41,7 @@ Write a narrative note (~150–300 words typical, no fixed schema) covering:
 3. **What might go wrong + recovery** — known failure modes + how to detect them. ("If session-state.md has no `## Relay Notes` section, the relay/ dir is probably orphaned; check `ls workspace/relay/`.")
 4. **Implicit context** — the why-behind-the-what, decisions that haven't been committed yet, things you'd want a colleague to know if they walked in cold.
 
-Don't write things that are already in the structured snapshot (recent commits, open PRs, pending-questions tail). Catchup will print those anyway. Relay's value is the things the structured snapshot can't reach.
+Don't write things that are already in the structured snapshot (recent commits, open PRs, pending-questions tail). `session-state.md` already carries those. Relay's value is the things the structured snapshot can't reach.
 
 ## Steps
 
