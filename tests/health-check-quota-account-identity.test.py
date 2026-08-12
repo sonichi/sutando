@@ -20,6 +20,7 @@ import hashlib
 import importlib.util
 import os
 import plistlib
+import re
 import sys
 import tempfile
 import unittest
@@ -241,15 +242,16 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         self.assertIn("com.sutando.credential-proxy.plist", out["detail"])
         self.assertIn("reload", out["detail"].lower())
 
-    def test_warn_does_not_assert_a_billing_outcome_it_cannot_observe(self):
-        """The check reads item NAMES; it never reads a token. So it cannot know
-        whether the proxy's item is injectable, and the proxy only bills that
-        account when it is: credential-proxy.ts injects on `verdict === 'ok'`
-        and otherwise forwards the client's own credential untouched. Stating
-        the billing outcome flatly sends an operator after a charge that, in the
-        pass-through case, is on their own account — while the real fault (a
-        proxy permanently degraded to pass-through, caching nothing) goes
-        unnamed. Name both outcomes, or name neither."""
+    def test_warn_states_every_billing_outcome_with_its_condition(self):
+        """This check reads item NAMES and sees no request, yet both of the
+        proxy's branches turn on exactly that unread state: it substitutes its
+        own token only when `verdict === 'ok'` AND the request carries an
+        authorization header, and forwards the client's credential only under
+        `else if (hasClientAuth)`. So a sentence naming a billing outcome must
+        carry its condition; an unconditional one sends an operator after a
+        charge that may be on their own account. Asserted below: the old
+        unconditional phrasing is gone, pass-through and the header qualifier
+        are named, and no clause mentions billing without a conditional."""
         core = "/Users/x/ws/.claude-sutando"
         out = self._run(core_cfg=core, plist_cfg=None,
                         existing_services={_scoped(core), VANILLA})
@@ -262,6 +264,18 @@ class TestQuotaAccountIdentity(unittest.TestCase):
             "pass-through", detail.lower(),
             "the other outcome — stored token unusable, client credential "
             "forwarded — must be named too")
+        self.assertIn(
+            "authorization header", detail.lower(),
+            "injection is gated on the request carrying one; without that "
+            "qualifier the injecting branch still reads as unconditional")
+        # Clause-level: naming a charge without its condition is the defect,
+        # wherever in the sentence it sits.
+        billing = [c for c in re.split(r"[.;]", detail) if "bill" in c.lower()]
+        self.assertTrue(billing, "the billing outcome must still be named")
+        for clause in billing:
+            self.assertRegex(
+                clause.lower(), r"\b(if|unless|when|usable|unusable)\b",
+                f"billing asserted with no condition attached: {clause.strip()!r}")
 
     # ---- agreement cases: must NOT warn -----------------------------------
 
