@@ -328,13 +328,27 @@ class ALockThisCallDidNotTakeIsNotReleased(unittest.TestCase):
         self.assertTrue(self.lock.is_dir(),
                         "removed a lock it never acquired — the holder is now unprotected")
 
-    def test_the_event_is_still_recorded_when_the_lock_is_held(self):
-        """Giving up on the lock must not cost the event: a single short append
-        is atomic, so only the trim needs exclusion."""
+    def test_a_give_up_parks_the_event_and_never_touches_the_log(self):
+        """The trim REPLACES the pathname, so an unlocked append is discarded by
+        the holder's mv. Park it instead — durable, and out of the race."""
         self.lock.mkdir()
+        self.log.write_text('{"ts":"x","epoch":0,"trigger":"pre-existing"}\n')
         _run(self.ws, ("/tmp/t.jsonl", "held-lock"))
-        rec = json.loads(self.log.read_text().strip().splitlines()[-1])
-        self.assertEqual(rec["trigger"], "held-lock")
+        pending = self.ws / "state" / "compactions.jsonl.pending"
+        self.assertTrue(pending.is_file(), "the event was not parked anywhere")
+        self.assertEqual(json.loads(pending.read_text().strip())["trigger"], "held-lock")
+        self.assertEqual(self.log.read_text().count("held-lock"), 0,
+                         "wrote the main log without the lock — the mv would drop it")
+
+    def test_the_next_locked_writer_folds_the_sidecar_in(self):
+        """Parking is only safe if something absorbs it."""
+        pending = self.ws / "state" / "compactions.jsonl.pending"
+        pending.write_text('{"ts":"x","epoch":0,"trigger":"parked-earlier"}\n')
+        _run(self.ws, ("/tmp/t.jsonl", "now-locked"))
+        body = self.log.read_text()
+        self.assertIn("parked-earlier", body, "the parked event was never absorbed")
+        self.assertIn("now-locked", body)
+        self.assertFalse(pending.exists(), "sidecar left behind; it would be folded twice")
 
     def test_the_trim_is_SKIPPED_while_another_writer_holds_the_lock(self):
         """The trim is the read-modify-write. Running it unlocked is the data loss
@@ -343,8 +357,8 @@ class ALockThisCallDidNotTakeIsNotReleased(unittest.TestCase):
         self.log.write_text('{"ts":"x","epoch":0,"trigger":"seed"}\n' * 600)
         _run(self.ws, ("/tmp/t.jsonl", "no-trim"))
         lines = self.log.read_text().strip().splitlines()
-        self.assertEqual(len(lines), 601,
-                         "trimmed without holding the lock (expected 600 seed + 1 appended)")
+        self.assertEqual(len(lines), 600,
+                         "the give-up path must neither trim nor append to the main log")
 
     def test_an_acquired_lock_is_still_released(self):
         _run(self.ws, ("/tmp/t.jsonl", "precompact"))

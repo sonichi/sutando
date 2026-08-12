@@ -103,7 +103,7 @@ _ch_json_escape() {
 }
 
 record_compaction_event() {
-    local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line lock tmp i=0 acquired=0
+    local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line lock tmp pend i=0 acquired=0
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
     line="$(printf '{"ts":"%s","epoch":%s,"host":"%s","transcript":"%s","trigger":"%s"}' \
@@ -120,17 +120,28 @@ record_compaction_event() {
         i=$((i + 1))
         sleep 0.05
     done
-    # Only the TRIM is read-modify-write, so only it needs the lock; a single
-    # short O_APPEND line does not, which is why giving up still records.
-    if [ "$acquired" = 1 ] && [ -f "$log" ] \
-        && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -ge 500 ]; then
+    # The trim REPLACES the pathname, so an unlocked append lands in the old
+    # inode and the mv discards it. Nothing may touch "$log" without the lock.
+    if [ "$acquired" != 1 ]; then
+        printf '%s\n' "$line" >> "$log.pending" 2>/dev/null || true
+        return 0
+    fi
+    # Absorb anything earlier give-up callers parked. Rename first: an appender
+    # racing us then creates a fresh sidecar instead of writing into the one we read.
+    if [ -f "$log.pending" ]; then
+        pend="$(mktemp "${log}.pending.XXXXXX" 2>/dev/null)" || pend="${log}.pending.$$"
+        if mv "$log.pending" "$pend" 2>/dev/null; then
+            cat "$pend" >> "$log" 2>/dev/null || true
+        fi
+        rm -f "$pend" 2>/dev/null
+    fi
+    if [ -f "$log" ] && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -ge 500 ]; then
         tmp="$(mktemp "${log}.tmp.XXXXXX" 2>/dev/null)" || tmp="${log}.tmp.$$"
         tail -n 499 "$log" > "$tmp" 2>/dev/null && mv "$tmp" "$log" 2>/dev/null
         rm -f "$tmp" 2>/dev/null
     fi
     printf '%s\n' "$line" >> "$log" 2>/dev/null || true
-    # Releasing a lock this call never created would let a third writer in.
-    [ "$acquired" = 1 ] && rmdir "$lock" 2>/dev/null
+    rmdir "$lock" 2>/dev/null
     return 0
 }
 record_compaction_event "${TRANSCRIPT:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact}"
