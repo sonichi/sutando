@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-"""A staleness probe must not read a newest-first default window.
-
-`gh issue list` returns 30 rows by default, ordered newest-first, so a probe
-looking for the OLDEST issues sees the least stale ones by construction.
-Measured on sonichi/sutando before the fix: 138 open issues, 109 stale >7d,
-and exactly 1 of them inside the default 30 — the probe reported 1 of 109.
-
-Every assertion here fails against the pre-fix source, which passed no
-`--limit` at all and sorted nothing.
-
-Run: python3 tests/friction-github-probe-is-not-capped.test.py
-Exit code: 0 on pass, 1 on fail.
-"""
+"""A staleness probe must not read a newest-first default window: `gh issue list`
+returns 30 rows newest-first, so looking for the OLDEST sees the least stale."""
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import importlib.util
