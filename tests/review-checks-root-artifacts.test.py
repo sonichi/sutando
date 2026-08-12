@@ -89,15 +89,71 @@ modified = (
 )
 check("modifying an existing root file is not a violation", paths(modified), [])
 
-# A rename carries `+++ b/<new>` with no `new file mode`. Git already tracked
-# the content, so it is not a fresh artifact.
-renamed = (
-    "diff --git a/old.md b/prbody.md\n"
+# --- a rename is an ARRIVAL, so it counts ------------------------------------
+# Verbatim `git diff` output for `git mv notes/old-notes.md prbody.md`. No
+# `+++ b/` line and no `new file mode`, so an is_new-only rule misses it — and
+# in a base..head diff a detected rename means the file was already committed,
+# which is precisely how an artifact reaches the root without being "added".
+pure_rename = (
+    "diff --git a/notes/old-notes.md b/prbody.md\n"
     "similarity index 100%\n"
-    "rename from old.md\n"
+    "rename from notes/old-notes.md\n"
     "rename to prbody.md\n"
 )
-check("a pure rename emits no +++ line and is clean", paths(renamed), [])
+check("a pure rename INTO the root is a violation",
+      paths(pure_rename), ["prbody.md"])
+
+rename_modify = (
+    "diff --git a/notes/old-notes.md b/prbody.md\n"
+    "similarity index 87%\n"
+    "rename from notes/old-notes.md\n"
+    "rename to prbody.md\n"
+    "--- a/notes/old-notes.md\n"
+    "+++ b/prbody.md\n"
+    "@@ -1 +1,2 @@\n"
+    " body\n"
+    "+more\n"
+)
+check("rename+modify into the root is a violation (counted once)",
+      paths(rename_modify), ["prbody.md"])
+
+# The mirror: moving an artifact OUT of the root is the fix, not the offence.
+rename_out = (
+    "diff --git a/prbody.md b/notes/prbody.md\n"
+    "similarity index 100%\n"
+    "rename from prbody.md\n"
+    "rename to notes/prbody.md\n"
+)
+check("renaming an artifact OUT of the root is clean", paths(rename_out), [])
+check("a rename to an unmatched root name is clean",
+      paths(pure_rename.replace("prbody.md", "CHANGELOG.md")), [])
+
+# --- git-quoted paths --------------------------------------------------------
+# core.quotePath is on by default: a non-ASCII path arrives C-escaped inside
+# quotes. Left encoded it matches no glob, so the gate would pass it silently.
+# The escape must fall AFTER the part the glob matches, or the decoded name
+# would not match anyway and the test would pass for the wrong reason.
+quoted = (
+    'diff --git "a/prbody\\303\\251.md" "b/prbody\\303\\251.md"\n'
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    '+++ "b/prbody\\303\\251.md"\n'
+)
+check("a quoted non-ASCII root path is decoded and flagged",
+      paths(quoted), ["prbodyé.md"])
+check("_unquote leaves an ordinary path untouched",
+      ra._unquote("prbody.md"), "prbody.md")
+check("_unquote falls back to the raw inner text on undecodable bytes",
+      ra._unquote('"pr\\377body.md"').endswith("body.md"), True)
+check("the quoted diff header still resets state for the next file",
+      paths(quoted + modified), ["prbodyé.md"])
+check("a quoted rename destination is decoded and flagged",
+      paths('diff --git "a/notes/x.md" "b/prbody\\303\\251.md"\n'
+            'rename to "prbody\\303\\251.md"\n'), ["prbodyé.md"])
+# Defensive: a `+++` line that is neither /dev/null nor a b/ path is malformed
+# input, not an arrival — it must not be read as a root-level filename.
+check("a +++ line without the b/ prefix is ignored",
+      paths(added("prbody.md").replace("+++ b/prbody.md", "+++ prbody.md")), [])
 
 # --- the is_new flag must not leak across files ------------------------------
 # One `diff --git` per file resets it; without that reset the file AFTER an
