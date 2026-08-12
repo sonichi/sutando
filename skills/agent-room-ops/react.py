@@ -2,8 +2,15 @@
 """room-ops · react — add / remove an agent's reaction on a room event.
 
 Native m.reaction add (`react`) + redact (`unreact`) — the Discord auto-react
-instant-ack parity (👀 on receipt, ✅/⚠️ on done/fail). The event is typically
+instant-ack parity (🫡 on receipt, ✅/⚠️ on done/fail). The event is typically
 the task's source_message_id. Gateway-only; membership enforced gateway-side.
+
+Emoji convention (owner-finalized): 🫡 = task acknowledged (accepted into the
+queue), 👀 = event merely OBSERVED. "received" is a task-ack, so it is 🫡 — 👀
+belongs to ambient observation (events_acceptance.OBSERVE_REACTION) and must
+not double as the receipt ack, which is the collision this convention retires.
+The broker also emits 🫡 server-side at task intake (ag2space-backend#188), so
+this client alias agrees with that one glyph everywhere.
 """
 from __future__ import annotations
 
@@ -12,7 +19,7 @@ import os
 from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason,
                     quote, HTTPError, URLError)
 
-ACK = {"received": "👀", "working": "⏳", "done": "✅", "fail": "⚠️"}
+ACK = {"received": "🫡", "working": "⏳", "done": "✅", "fail": "⚠️"}
 
 
 def _result(ok, *, room_id=None, event_id=None, key=None, reason=None):

@@ -178,7 +178,11 @@ def main() -> None:
     req = urllib.request.Request(
         f"{base.rstrip('/')}/api/feedback",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Sutando-Feedback/1.0",
+        },
         method="POST",
     )
     try:

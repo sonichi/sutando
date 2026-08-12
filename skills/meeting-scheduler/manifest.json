@@ -1,0 +1,16 @@
+{
+  "name": "meeting-scheduler",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Schedule a small meeting end-to-end: resolve attendee emails via Gmail, check the owner's calendar for the slot, dedup-check, then create + email the Google Calendar invite. Mechanical core only; availability negotiation stays interactive.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-only",
+    "secrets": "none"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

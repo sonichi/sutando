@@ -12,10 +12,18 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py react  <room> <event_id> (--ack received|working|done|fail | --key 🎉) [--agent mxid]
     python3 room_ops.py unreact <room> <event_id> (--ack … | --key …) [--agent mxid]
     python3 room_ops.py join   <room> [--agent mxid]                 # accept own invite
+    python3 room_ops.py rooms  [--agent mxid]                        # joined-rooms list
+    python3 room_ops.py events subscribe <room> --types a,b [--filters json]
+    python3 room_ops.py events unsubscribe <room>
+    python3 room_ops.py events list
+    python3 room_ops.py events pull [--cursor N] [--wait S]
+    python3 room_ops.py events stream [--cursor-file PATH] [--once] [--max-events N]
 
 Every subcommand prints a structured JSON result and **exits 0** for any
 structured result (a graceful `ok:false` "no context / no-op" is not a failed
 task); usage errors exit 2. See SKILL.md for the boundary + the parity epic.
+`events stream` is the one JSONL surface: one compact JSON line per delivered
+event (journal-friendly), then a one-line summary.
 """
 from __future__ import annotations
 
@@ -30,6 +38,54 @@ import react as _react     # noqa: E402
 import join as _join       # noqa: E402
 import resolve as _resolve # noqa: E402
 import mention as _mention # noqa: E402
+import rooms as _rooms     # noqa: E402
+import events as _events   # noqa: E402
+
+
+def _events_stream(a):
+    """`events stream`: one compact JSON line per event (journal-friendly), a
+    one-line JSON summary last. Exits 0 for any structured outcome — a
+    disconnect without --cursor-file is a structured ok:false, not a crash.
+    With --cursor-file the durable-cursor wrapper reconnects forever (#184);
+    without it, one connection is made and its end is reported."""
+    max_events = 1 if a.once else a.max_events
+    seen = {"n": 0, "cursor": None}
+
+    def on_event(cur, envelope):
+        seen["n"] += 1
+        seen["cursor"] = cur
+        print(json.dumps(envelope, ensure_ascii=False), flush=True)
+
+    try:
+        if a.cursor_file:
+            cur = _events.stream_with_resume(a.cursor_file, on_event, max_events=max_events)
+        else:
+            cur = _events.stream(cursor=a.cursor, on_event=on_event, max_events=max_events)
+        out = {"ok": True, "events": seen["n"], "cursor": cur}
+    except KeyboardInterrupt:
+        out = {"ok": True, "events": seen["n"], "cursor": seen["cursor"], "reason": "interrupted"}
+    except (_events.StreamDisconnected, RuntimeError) as e:
+        out = {"ok": False, "events": seen["n"], "cursor": seen["cursor"], "reason": str(e)}
+    print(json.dumps(out, ensure_ascii=False), flush=True)
+    return 0
+
+
+def _dispatch_events(a):
+    if a.events_cmd == "subscribe":
+        types = [t.strip() for t in (a.types or "").split(",") if t.strip()]
+        filters = None
+        if a.filters:
+            try:
+                filters = json.loads(a.filters)
+            except ValueError as e:
+                # Structured error, exit 0 — same convention as doc's --file failure.
+                return {"ok": False, "reason": f"--filters is not valid JSON: {e}"}
+        return _events.subscribe(a.room_id, types, filters=filters, agent_mxid=a.agent_mxid)
+    if a.events_cmd == "unsubscribe":
+        return _events.unsubscribe(a.room_id, agent_mxid=a.agent_mxid)
+    if a.events_cmd == "list":
+        return _events.subscriptions(a.agent_mxid)
+    return _events.pull(cursor=a.cursor, wait=a.wait)  # pull
 
 
 def _main(argv):
@@ -76,6 +132,33 @@ def _main(argv):
         g.add_argument("--ack", choices=sorted(_react.ACK))
         p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    p = sub.add_parser("rooms", help="list this agent's joined rooms")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
+    p = sub.add_parser("events", help="event subscriptions + delivery (#184 client half)")
+    esub = p.add_subparsers(dest="events_cmd", required=True)
+    e = esub.add_parser("subscribe", help="subscribe this agent to a room's events")
+    e.add_argument("room_id")
+    e.add_argument("--types", required=True,
+                   help="comma-separated event types (e.g. message.created,reaction.added)")
+    e.add_argument("--filters", default=None, help="JSON filter object (passed through verbatim)")
+    e.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    e = esub.add_parser("unsubscribe", help="drop this agent's subscription on a room")
+    e.add_argument("room_id")
+    e.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    e = esub.add_parser("list", help="list this agent's own subscriptions")
+    e.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    e = esub.add_parser("pull", help="one long-poll round for pending events")
+    e.add_argument("--cursor", type=int, default=0)
+    e.add_argument("--wait", type=int, default=_events.DEFAULT_WAIT)
+    e = esub.add_parser("stream", help="SSE-follow events; one JSON line per event")
+    e.add_argument("--cursor-file", default=None,
+                   help="durable resume cursor (enables reconnect-with-backoff)")
+    e.add_argument("--cursor", type=int, default=None,
+                   help="explicit start cursor (no --cursor-file)")
+    e.add_argument("--once", action="store_true", help="exit after the first event")
+    e.add_argument("--max-events", type=int, default=None)
+
     p = sub.add_parser("resolve", help="resolve a friendly handle -> agent mxid (via /v1/agents)")
     p.add_argument("handle")
 
@@ -83,6 +166,17 @@ def _main(argv):
     p.add_argument("handle")
     p.add_argument("message")
     p.add_argument("room_id")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
+    p = sub.add_parser("grant", help="make a room authoritative — its access policy "
+                                     "GRANTS access, overriding agents' local allowFrom (#429)")
+    p.add_argument("room_id")
+    p.add_argument("--tier", dest="tiers", action="append", metavar="@user:hs=owner|guest",
+                   help="grant a specific member a tier (repeatable)")
+    p.add_argument("--default-tier", dest="default_tier", choices=("owner", "guest"),
+                   help="tier for members not named by --tier")
+    p.add_argument("--revoke", action="store_true",
+                   help="disable the grant (authoritative=false); leaves other policy fields intact")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     a = ap.parse_args(argv)
@@ -114,10 +208,25 @@ def _main(argv):
                 res = _doc.doc_rm(a.room, a.name, folder=a.folder, agent_mxid=a.agent)
     elif a.cmd == "join":
         res = _join.join_room(a.room_id, a.agent_mxid)
+    elif a.cmd == "rooms":
+        res = _rooms.joined_rooms(a.agent_mxid)
+    elif a.cmd == "events":
+        if a.events_cmd == "stream":
+            return _events_stream(a)  # prints JSONL itself; summary is one line
+        res = _dispatch_events(a)
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
         res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid)
+    elif a.cmd == "grant":
+        import grant as _grant
+        try:
+            tiers = _grant.parse_tier_pairs(a.tiers)
+        except ValueError as e:
+            res = {"ok": False, "reason": str(e)}
+        else:
+            res = _grant.grant_room(a.room_id, tiers=tiers, default_tier=a.default_tier,
+                                    revoke=a.revoke, agent_mxid=a.agent_mxid)
     else:  # react / unreact
         key = a.key or _react.ACK[a.ack]
         fn = _react.react if a.cmd == "react" else _react.unreact

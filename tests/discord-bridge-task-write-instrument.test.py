@@ -196,8 +196,12 @@ class TestHandleMessageCallSite(unittest.TestCase):
 
         self._orig_load_allowed = bridge.load_allowed
         self._orig_load_policy = bridge.load_policy
+        self._orig_load_tier_map = bridge.load_tier_map
+        self._orig_ensure_tier_map_seeded = bridge.ensure_tier_map_seeded
         bridge.load_allowed = lambda: {"999"}
         bridge.load_policy = lambda: "allowlist"
+        bridge.load_tier_map = lambda: {"999": "owner"}
+        bridge.ensure_tier_map_seeded = lambda: True
 
         self._orig_intercept = bridge.intercept_vault_commands
         bridge.intercept_vault_commands = lambda t: types.SimpleNamespace(
@@ -241,6 +245,8 @@ class TestHandleMessageCallSite(unittest.TestCase):
         bridge._observe_for_mod = self._orig_observe
         bridge.load_allowed = self._orig_load_allowed
         bridge.load_policy = self._orig_load_policy
+        bridge.load_tier_map = self._orig_load_tier_map
+        bridge.ensure_tier_map_seeded = self._orig_ensure_tier_map_seeded
         bridge.intercept_vault_commands = self._orig_intercept
         if self._orig_write_owner is not None:
             bridge.write_owner_activity = self._orig_write_owner

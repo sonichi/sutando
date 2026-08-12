@@ -46,7 +46,7 @@ def main() -> int:
 
     # The access_tier determination block. Find it by the sentinel comment.
     match = re.search(
-        r"# Determine access tier\s*\n([\s\S]{0,2000}?)(?=\n    # Dedup:|\n    # Deterministic tier|\n\ndef |\Z)",
+        r"# Determine access tier\s*\n([\s\S]{0,3500}?)(?=\n    # Dedup:|\n    # Deterministic tier|\n\ndef |\Z)",
         src,
     )
     if not match:
@@ -61,12 +61,15 @@ def main() -> int:
         print(block, file=sys.stderr)
         return 1
 
-    # 2. if sender_id in allowed → owner
-    if not re.search(r"if\s+sender_id\s+in\s+allowed\s*:\s*\n\s+access_tier\s*=\s*[\'\"]owner[\'\"]", block):
-        print('FAIL: expected `if sender_id in allowed: access_tier = "owner"` pattern', file=sys.stderr)
-        print("---block---", file=sys.stderr)
-        print(block, file=sys.stderr)
-        return 1
+    # 2. if sender_id in allowed → owner ONLY via tierMap (post-2026-07-17:
+    #    allowlist membership no longer grants owner unconditionally; a seeded
+    #    tierMap gates it, new additions default to team). Assert the gated form.
+    if not re.search(r"if\s+sender_id\s+in\s+allowed\s*:", block):
+        print('FAIL: expected `if sender_id in allowed:` guard', file=sys.stderr)
+        print("---block---", file=sys.stderr); print(block, file=sys.stderr); return 1
+    if "ensure_tier_map_seeded()" not in block or "load_tier_map()" not in block:
+        print('FAIL: in-allowed branch must consult the seeded tierMap (default read-only)', file=sys.stderr)
+        print("---block---", file=sys.stderr); print(block, file=sys.stderr); return 1
 
     # 3. else branch checks channel-level allowFroms → team
     if not re.search(r"team_ids\.update\s*\(\s*ch_cfg\.get\s*\(\s*[\'\"]allowFrom[\'\"]", block):
@@ -81,11 +84,14 @@ def main() -> int:
         print(block, file=sys.stderr)
         return 1
 
-    # 4. Order of checks matters: global `allowed` FIRST, then team as fallback.
-    owner_idx = block.find('access_tier = "owner"')
-    team_idx = block.find('access_tier = "team"')
-    if owner_idx < 0 or team_idx < 0 or owner_idx >= team_idx:
-        print("FAIL: owner tier assignment must appear before team tier assignment in the block", file=sys.stderr)
+    # 4. Order of checks matters: the global `allowed` branch (which can yield
+    #    owner via the seeded tierMap) is evaluated FIRST, then the channel
+    #    team_ids fallback. Post-2026-07-17 owner is assigned via a .get()
+    #    default rather than a literal, so anchor on the branch structure.
+    allowed_idx = block.find('if sender_id in allowed:')
+    team_idx = block.find('team_ids.update')
+    if allowed_idx < 0 or team_idx < 0 or allowed_idx >= team_idx:
+        print("FAIL: global-allowed branch must precede the channel team_ids fallback", file=sys.stderr)
         return 1
 
     print("PASS: discord-bridge.py access_tier classification looks correct.")

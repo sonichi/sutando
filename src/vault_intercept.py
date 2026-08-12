@@ -42,6 +42,9 @@ import sys
 from datetime import datetime, timezone
 from typing import NamedTuple
 
+from vault_set_grammar import VAULT_SET_RE as _VAULT_SET_RE
+from vault_set_grammar import redact_vault_commands as _grammar_redact_vault_commands
+
 _ACCOUNT = "sutando"
 
 # The manifest is the NON-SECRET index of key NAMES (values live in macOS
@@ -105,17 +108,8 @@ def _read_manifest() -> dict:
 #   - FP: "the vault set command works fine" → key="command" (not env-shaped),
 #     value="works" (not a secret) → skip, left as prose
 #   - FN: "hey vault set APOLLO_KEY sk-..." mid-prose → "sk-..." is OpenAI → store
-# Key/value separator is whitespace OR `=` (with optional surrounding spaces),
-# so `vault set KEY VALUE`, `vault set KEY=VALUE`, and `vault set KEY = VALUE`
-# all intercept. The KEY group stops at the first space or `=` (`[^\s=]+`) so
-# the `=` form isn't swallowed whole — that swallowing is what let an owner's
-# `vault set X_BEARER_TOKEN=…` slip past uncaught and land in plaintext on disk
-# (2026-06-22 incident). Group numbering preserved: key=group(1), value
-# alternatives=groups 2-5 (separator is non-capturing).
-_VAULT_SET_RE = re.compile(
-    r'\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))(?=\s|$|[.,!?;])',
-    re.IGNORECASE,
-)
+# Grammar is canonical in vault_set_grammar.py, imported above as _VAULT_SET_RE — not
+# redefined here. This file adds the storage half (Keychain, detect-secrets) on top.
 
 # #2074: an unquoted value the FP guard doesn't recognize isn't proof of
 # prose — it can be a real secret the classifier missed (a 32-char Discord
@@ -335,8 +329,12 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # entirely) to store it for real.
                 failed.append(key)
                 return (
-                    f"vault set {key} [vault: unrecognized value — NOT stored. "
-                    f"Resend quoted (e.g. vault set {key} \"value\") to store it.]"
+                    f"vault set {key} [vault: value not recognized as a secret, so it was "
+                    f"NOT STORED **and the text you sent has been discarded** — nothing was "
+                    f"kept anywhere, so you will need the value again. Resend it QUOTED: "
+                    f"vault set {key} \"value\" — quoting skips this classifier and "
+                    f"ATTEMPTS storage; you are stored only if the reply says "
+                    f"[STORED-IN-KEYCHAIN].]"
                 )
         try:
             _store_in_keychain(key, value)
@@ -355,11 +353,8 @@ def redact_vault_commands(text: str) -> str:
     """Scrub vault-set patterns from text WITHOUT touching the Keychain.
 
     Use for non-owner-tier messages: prevents secrets from landing in task files
-    while ensuring the Keychain is never written by an untrusted sender.
+    while ensuring the Keychain is never written by an untrusted sender. Delegates
+    to the canonical vault_set_grammar implementation (single source, see the
+    module-level note above _VAULT_SET_RE) rather than reimplementing it here.
     """
-    if not text:
-        return text
-    return _VAULT_SET_RE.sub(
-        lambda m: f"vault set {m.group(1)} [vault: non-owner tier — ignored]",
-        text,
-    )
+    return _grammar_redact_vault_commands(text, placeholder="[vault: non-owner tier — ignored]")

@@ -43,6 +43,15 @@ PATTERN_ENV='(process\.env|process\.env\[)["'\'']?SUTANDO_WORKSPACE|os\.environ(
 PATTERN_HARDCODED_HOME='\.sutando/workspace'
 PATTERN_REPO_WALK='Path\(__file__\)\.resolve\(\)\.parent\.parent'
 
+# LINE-scoped opt-out. A file-level ALLOWED entry excuses the WHOLE file, which is a
+# blind spot rather than an exemption: @john-the-dev demonstrated it on #2639 by adding a
+# real `Path(__file__).resolve().parent.parent / "workspace"` to an allowlisted file and
+# watching this lint exit 0. Every explicitly-listed repo-tooling script carries the same
+# hole. A trailing pragma exempts ONE line and leaves every other line in that file
+# visible — the token-specific discipline REVIEW.md already requires of fixture
+# exclusions, so one exemption cannot hide a second real offender.
+PRAGMA_ALLOW_REPO_ROOT='lint-workspace-resolution: allow-repo-root'
+
 # Doc-notation pattern (markdown + SKILL.md only). Flags the legacy
 # env-var-as-path form `$SUTANDO_WORKSPACE/<anything>` in user-facing
 # docs — the canonical form post-M0 is `<workspace>/path` with the
@@ -62,13 +71,33 @@ PATTERN_DOC_ENV_PATH='\$SUTANDO_WORKSPACE/'
 # installs). The fallback path is documented in each script's comments;
 # new contributors should still go through the wrapper.
 #
+# scripts/check-python39-compat.py is the same category: it scans tracked
+# files under src/ to enforce the interpreter floor, so it needs the REPO
+# root and has no workspace to resolve. Listed explicitly rather than
+# spelled `parents[1]` to dodge the regex — evading the lint by rewording
+# would defeat the point of having it.
+#
+# scripts/review-preflight.py is the same category again: it reads REVIEW.md
+# from the REPO root to print the review criteria, and has no workspace to
+# resolve. It prefers `git rev-parse --show-toplevel` and only walks from
+# __file__ when git is unavailable. Listed here rather than reworded to
+# `parents[1]`, per the note above — dodging the regex would defeat the lint.
+#
+# scripts/hermetic-workspace-guard.py is the same category once more, and the
+# distinction is worth stating because the file's NAME suggests otherwise: it
+# resolves the REPO root only to locate `tests/hermetic-workspace-exemptions.txt`
+# and to put `src/` on sys.path. The workspace it actually cares about is obtained
+# THROUGH the loader (`from workspace_default import resolve_workspace`) — which is
+# the contract this lint exists to enforce, so the guard already complies where it
+# counts. Listed here rather than reworded to `parents[1]`, per the note above.
+#
 # scripts/gen-src-map.py uses PATTERN_REPO_WALK to resolve the REPO ROOT
 # (to read tracked files under src/ and write docs/), NOT a workspace — same
 # category as scripts/check-utc-z-strftime.py and scripts/dedup-conversation-store.py,
 # which predate this --diff lint and are grandfathered. A repo-tooling script has
 # no workspace to go through the wrapper for; the wrapper resolves the workspace,
 # which is the wrong directory here.
-ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
+ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/check-python39-compat\.py|scripts/review-preflight\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
 
 # Allowed .md files — legitimate uses of `$SUTANDO_WORKSPACE/path` in
 # prose, e.g. the workspace contract docs that DESCRIBE the legacy form
@@ -124,14 +153,22 @@ for f in $files; do
 
   if [[ "$mode" == "--diff" ]]; then
     # Only flag lines ADDED in the diff (begin with `+` but not `+++`).
-    added="$(git diff "$base"...HEAD -- "$f" | grep -E '^\+[^+]' || true)"
+    # A pragma'd line is exempt from the REPO-ROOT walk ONLY, and only when it does
+    # not also derive a workspace — otherwise the pragma becomes a way to hide the very
+    # thing this lint exists to catch, which is the file-level blind spot again at line
+    # granularity. Keep the line whenever it mentions a workspace, so a spoofed pragma
+    # still fails. The pragma text itself contains "workspace", so it is stripped
+    # before that test — otherwise the marker always matches its own guard.
+    added="$(git diff "$base"...HEAD -- "$f" | grep -E '^\+[^+]' \
+      | awk -v p="$PRAGMA_ALLOW_REPO_ROOT" '{ rest=$0; sub(p,"",rest); if (index($0,p)==0 || tolower(rest) ~ /workspace/) print }' || true)"
     if grep -E -q "$PATTERN_ENV|$PATTERN_HARDCODED_HOME|$PATTERN_REPO_WALK" <<< "$added"; then
       hits="$(grep -E -n "$PATTERN_ENV|$PATTERN_HARDCODED_HOME|$PATTERN_REPO_WALK" <<< "$added" | head -3 || true)"
       offenders+="  • $f"$'\n'"$hits"$'\n'
     fi
   else
-    if grep -E -l "$PATTERN_ENV|$PATTERN_HARDCODED_HOME|$PATTERN_REPO_WALK" "$f" >/dev/null 2>&1; then
-      hits="$(grep -E -n "$PATTERN_ENV|$PATTERN_HARDCODED_HOME|$PATTERN_REPO_WALK" "$f" | head -3 || true)"
+    _scan="$(awk -v p="$PRAGMA_ALLOW_REPO_ROOT" '{ rest=$0; sub(p,"",rest); if (index($0,p)==0 || tolower(rest) ~ /workspace/) print }' "$f" || true)"
+    if grep -E -q "$PATTERN_ENV|$PATTERN_HARDCODED_HOME|$PATTERN_REPO_WALK" <<< "$_scan"; then
+      hits="$(grep -E -n "$PATTERN_ENV|$PATTERN_HARDCODED_HOME|$PATTERN_REPO_WALK" <<< "$_scan" | head -3 || true)"
       offenders+="  • $f"$'\n'"$hits"$'\n'
     fi
   fi

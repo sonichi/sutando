@@ -9,4 +9,4 @@ The modules here are the canonical AG2 Space relay client, kept in lockstep with
 sonichi/sutando `src/` via tools/sync_from_src.py (a drift-check test fails CI if
 they diverge — single source of truth, no hand-maintained fork).
 """
-__version__ = "0.2.0"
+__version__ = "0.3.0"

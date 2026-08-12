@@ -32,6 +32,15 @@ if grep -q 'voice agent disabled' <<<"$with_voice_key"; then
   exit 1
 fi
 
+printf 'SKIP_VOICE=1\nGEMINI_API_KEY=file-key\n' > "$TMP/.env"
+with_key_and_skip="$(run_runtime_config)"
+rm "$TMP/.env"
+grep -q 'SKIP_VOICE=0' <<<"$with_key_and_skip"
+if grep -q 'voice agent disabled' <<<"$with_key_and_skip"; then
+  echo "voice was disabled despite a configured credential overriding SKIP_VOICE" >&2
+  exit 1
+fi
+
 # The phone stack shares the Gemini voice session and must stay down when
 # credential-free startup sets SKIP_VOICE, even if Twilio is configured.
 phone_gate="$(env -i PATH="/usr/bin:/bin" bash -c '
@@ -51,6 +60,8 @@ BIN="$TMP/bin"
 mkdir -p "$BIN" "$TMP/repo/src" "$TMP/repo/scripts" "$TMP/repo/node_modules"
 cp "$REPO/src/verify-setup.sh" "$TMP/repo/src/"
 cp "$REPO/scripts/sutando-config.sh" "$TMP/repo/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$TMP/repo/scripts/"
 cp "$REPO/src/sutando_config.py" "$TMP/repo/src/"
 touch "$TMP/repo/src/__init__.py"
 printf '{"core":{"runtime":"codex"}}\n' > "$TMP/repo/sutando.config.json"

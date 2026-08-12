@@ -8,6 +8,8 @@ for processing by the cron loop.
 Endpoints:
   POST /task              — submit a task (JSON: {from, task, priority?, callback_url?})
   GET  /result/<id>       — poll for task result
+  GET  /tasks/history     — authenticated archive-backed task history
+  POST /tasks/workstreams/infer — authenticated manual workstream-classifier trigger
   GET  /status            — current health + capabilities
   GET  /ping              — alive check
   POST /twilio/voice      — inbound call webhook (Twilio)
@@ -101,25 +103,48 @@ def validate_twilio_signature(handler, body: str) -> bool:
 #               stay aligned with these writes.
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 import local_task_protocol  # noqa: E402
+import task_workstreams  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
+TASK_WORKSTREAM_GROUPING_SKILL = REPO_DIR / "skills" / "task-workstream-grouping" / "SKILL.md"
 PORT = 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+
+
+def _emit_task_processed(content: str) -> None:
+    """Anonymous, opt-out product telemetry for tasks this API creates —
+    relay-voice (POST /delegation/tasks), local web/API chat (the ``api``
+    surface), and the Twilio voice/SMS/voicemail surfaces. Mirrors the discord/slack/
+    telegram bridges, which emit at their own accept points; those surfaces are
+    counted, these weren't. Source is read from the task body's own ``source:``
+    header. Fire-and-forget: never blocks or breaks task creation; no-op when
+    telemetry is opted out / unconfigured. Never carries task content or ids.
+    """
+    try:  # pragma: no cover — fire-and-forget glue; logic tested in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        m = re.search(r"^source:\s*(\S+)", content, re.MULTILINE)
+        task_processed(m.group(1) if m else "unknown")
+    except Exception:  # pragma: no cover — telemetry must never break the API
+        pass
+
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 
 RESULT_DIR = WORKSPACE_DIR / "results"
-TASK_DIR.mkdir(exist_ok=True)
-RESULT_DIR.mkdir(exist_ok=True)
+TASK_DIR.mkdir(parents=True, exist_ok=True)
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory task history (survives file cleanup, lost on restart)
 # {task_id: {status, text, time, result}}
@@ -196,7 +221,6 @@ def _remember_done_result_file(result_file: Path) -> None:
 # **Status:** markers) while the writer still required a **Status:**/**Options:**
 # line, so every free-form question was listed but unanswerable — POST /answer
 # 404'd on every id. Both paths stay on this function.
-PQ_ARCHIVE_RE = re.compile(r'^#\s+Resolved\b', re.MULTILINE)
 PQ_SECTION_RE = re.compile(r'^## ', re.MULTILINE)
 PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', re.IGNORECASE)
 PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
@@ -227,8 +251,7 @@ def parse_pending_questions(content: str) -> list[dict]:
     Sections below the `# Resolved` divider are the audit trail, not open
     questions (same cut as check-pending-questions.py:95).
     """
-    archive = PQ_ARCHIVE_RE.search(content)
-    active = content[:archive.start()] if archive else content
+    active = active_region(content)
     starts = [m.start() for m in PQ_SECTION_RE.finditer(active)]
     questions: list[dict] = []
     for n, start in enumerate(starts):
@@ -302,6 +325,114 @@ def get_status() -> dict:
             "status": "GET /status",
             "ping": "GET /ping",
         },
+    }
+
+
+def _active_task_rows() -> list[dict]:
+    """Reconcile task/result files into the ten most recent history rows."""
+    # Classifier tasks are machinery, not user work, so they stay out of the
+    # history the UI shows.
+    for task_file in sorted(
+        (
+            path
+            for path in TASK_DIR.glob("*.txt")
+            if not path.stem.startswith(
+                (
+                    task_workstreams.CLASSIFIER_TASK_PREFIX,
+                    task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
+                )
+            )
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:10]:
+        task_id = task_file.stem
+        content = task_file.read_text()
+        # First `source:` and `task:` regardless of field order; body
+        # lookalikes must not override the real headers.
+        task_line, source_line = _task_display_fields(content)
+        result_file = RESULT_DIR / task_file.name
+        existing = task_history.get(task_id, {})
+        # Priority: live file, then in-memory history, then archive. The
+        # archive lookup is what survives a restart, when history is empty.
+        archived_file = None
+        for month_dir in (RESULT_DIR / "archive").glob("*/"):
+            candidate = month_dir / task_file.name
+            if candidate.exists():
+                archived_file = candidate
+                break
+        if result_file.exists():
+            status = "done"
+            result_text = result_file.read_text().strip()
+        elif existing.get("status") == "done" or existing.get("result"):
+            status = "done"
+            result_text = existing.get("result", "")
+        elif archived_file is not None:
+            status = "done"
+            result_text = archived_file.read_text().strip()
+        else:
+            status = "working"
+            result_text = ""
+        task_history[task_id] = {
+            "status": status,
+            "text": task_line or existing.get("text", task_id),
+            "time": task_file.stat().st_mtime,
+            "result": result_text,
+            "source": source_line or existing.get("source", ""),
+        }
+
+    # Results may outlive their task files after bridge cleanup.
+    for result_file in sorted(
+        RESULT_DIR.glob("task-*.txt"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:10]:
+        _remember_done_result_file(result_file)
+
+    # Reconcile stale rows after the disk scans above.
+    import time as _time
+
+    stale_ids = []
+    for task_id, task_data in list(task_history.items()):
+        if task_data.get("status") != "working":
+            continue
+        task_file = TASK_DIR / f"{task_id}.txt"
+        result_file = RESULT_DIR / f"{task_id}.txt"
+        if result_file.exists():
+            task_data["status"] = "done"
+            task_data["result"] = result_file.read_text().strip()
+        elif not task_file.exists() and _time.time() - task_data.get("time", 0) > 300:
+            stale_ids.append(task_id)
+    for task_id in stale_ids:
+        del task_history[task_id]
+
+    recent = sorted(
+        task_history.items(), key=lambda item: item[1].get("time", 0), reverse=True
+    )[:10]
+    rows = [{"id": task_id, **task_data} for task_id, task_data in recent]
+    # Join inferred workstream metadata onto the rows; the classifier filter
+    # above is the other half of the same feature.
+    return task_workstreams.enrich_task_rows(WORKSPACE_DIR, rows)
+
+
+def _pending_question_rows() -> list[dict]:
+    """Return open questions without parser-only splice offsets."""
+    pending_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
+    if not pending_file.exists():
+        return []
+    return [
+        {key: value for key, value in question.items() if key not in ("start", "end")}
+        for question in parse_pending_questions(pending_file.read_text())
+    ]
+
+
+def _active_tasks_payload(watcher_ok: bool, core_ok: bool) -> dict:
+    """Build the stable response payload for GET /tasks/active."""
+    return {
+        "tasks": _active_task_rows(),
+        "watcher": watcher_ok,
+        "claude": core_ok,
+        "questions": _pending_question_rows(),
     }
 
 
@@ -418,6 +549,7 @@ def delegation_submit_task(data: dict):
             except FileNotFoundError:
                 pass
         os.close(task_dir_fd)
+    _emit_task_processed(content)
     return 200, {"ok": True, "task_id": tid}
 
 
@@ -595,6 +727,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def send_private_json(self, status: int, data: dict):
+        """JSON for owner-history routes: no cross-origin read permission."""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def check_private_history_auth(self) -> bool:
+        """Fail closed for browsers and non-loopback clients without a token."""
+        import hmac as _hmac
+
+        if API_TOKEN:
+            token = self.headers.get("Authorization", "").replace("Bearer ", "")
+            if _hmac.compare_digest(token, API_TOKEN):
+                return True
+            self.send_private_json(401, {"error": "unauthorized"})
+            return False
+        try:
+            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            loopback = False
+        # The same-origin web-client proxy and local CLI callers send no
+        # Origin. A browser page always does for cross-origin fetches, so this
+        # also blocks hostile sites from reading localhost history.
+        if loopback and not self.headers.get("Origin"):
+            return True
+        self.send_private_json(403, {"error": "task history requires a local proxy or API token"})
+        return False
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -622,6 +784,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
             self.send_json(200, get_status())
+        elif path == "/tasks/history":
+            if not self.check_private_history_auth():
+                return
+            # Reconstruct durable history from immutable live + archived task
+            # records, then join inferred workstream metadata from its sidecar.
+            # This GET is read-only; inference has a separate authenticated
+            # POST trigger used by the same-origin dashboard proxy.
+            payload = task_workstreams.task_history_payload(WORKSPACE_DIR, limit=500)
+            try:
+                inference = task_workstreams.classifier_status(WORKSPACE_DIR)
+            except Exception:
+                # Workstream inference is optional maintenance. History stays
+                # useful when classifier state is temporarily unavailable.
+                inference = task_workstreams.ClassifierQueueResult(
+                    pending=True, enqueued=False, reason="classifier-unavailable"
+                )
+            payload["inference"] = {
+                "pending": inference.pending,
+                "enqueued": inference.enqueued,
+                "reason": inference.reason,
+                "snapshot_hash": inference.snapshot_hash,
+            }
+            self.send_private_json(200, payload)
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
             watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
@@ -637,74 +822,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ).returncode == 0
             except OSError:
                 claude_ok = False
-            # Scan disk for active tasks, update history (preserve existing text)
-            for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
-                task_id = f.stem
-                content = f.read_text()
-                # Capture the first `source:` and first `task:` regardless of
-                # field order — voice/chat tasks put `source:` before `task:`,
-                # but discord/slack tasks put `task:` first. The `not …` guards
-                # keep the real header `source:` from being overridden by any
-                # `source:` line inside the task body (#1781 review, sonichi).
-                task_line, source_line = _task_display_fields(content)
-                result_file = RESULT_DIR / f.name
-                existing = task_history.get(task_id, {})
-                # Look for the result in three places, in priority order:
-                # (1) live results/ dir, (2) prior in-memory history (covers
-                # the case where the bridge has already archived the file),
-                # (3) results/archive/<YYYY-MM>/. Without (3), an agent-api
-                # restart loses every prior task's result and the web UI
-                # shows them all as "working" with no body.
-                archived_file = None
-                for month_dir in (RESULT_DIR / "archive").glob("*/"):
-                    candidate = month_dir / f.name
-                    if candidate.exists():
-                        archived_file = candidate
-                        break
-                if result_file.exists():
-                    status = "done"
-                    result_text = result_file.read_text().strip()
-                elif existing.get("status") == "done" or existing.get("result"):
-                    status = "done"
-                    result_text = existing.get("result", "")
-                elif archived_file is not None:
-                    status = "done"
-                    result_text = archived_file.read_text().strip()
-                else:
-                    status = "working"
-                    result_text = ""
-                task_history[task_id] = {"status": status, "text": task_line or existing.get("text", task_id), "time": f.stat().st_mtime, "result": result_text, "source": source_line or existing.get("source", "")}
-            # Also check for result files without task files (already cleaned up)
-            for f in sorted(RESULT_DIR.glob("task-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
-                _remember_done_result_file(f)
-            # Reconcile stale entries: if task file is gone and result exists, mark done;
-            # if task file is gone, no result, and older than 5 min, remove from history
-            import time as _time
-            stale_ids = []
-            for tid, tdata in list(task_history.items()):
-                if tdata.get("status") == "working":
-                    task_file = TASK_DIR / f"{tid}.txt"
-                    result_file = RESULT_DIR / f"{tid}.txt"
-                    if result_file.exists():
-                        tdata["status"] = "done"
-                        tdata["result"] = result_file.read_text().strip()
-                    elif not task_file.exists() and _time.time() - tdata.get("time", 0) > 300:
-                        stale_ids.append(tid)
-            for tid in stale_ids:
-                del task_history[tid]
-            # Return most recent 10 from history
-            sorted_tasks = sorted(task_history.items(), key=lambda x: x[1].get("time", 0), reverse=True)[:10]
-            tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
-            # Parse pending questions. `start`/`end` are the writer's splice
-            # offsets — internal, not part of the wire format.
-            questions = []
-            pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
-            if pq_file.exists():
-                questions = [
-                    {k: v for k, v in q.items() if k not in ("start", "end")}
-                    for q in parse_pending_questions(pq_file.read_text())
-                ]
-            self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
+            self.send_json(200, _active_tasks_payload(watcher_ok, claude_ok))
         elif path == "/delegation/results":
             # TaskDelegationService relay backend (#1947): list results/ for
             # the split-host watcher. Read-only but bearer-gated like the
@@ -749,8 +867,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Recent activity: git commits + processed tasks
             activity = []
             try:
+                # git_argv raises GitUnavailable (an OSError) on a host with no
+                # runnable git — absorbed by the `except Exception` below, which
+                # already degrades this endpoint to "no commit activity". Never
+                # hardcode /usr/bin/git: on a Mac without developer tools it is
+                # the CLT shim and raises a modal install dialog.
                 git_log = subprocess.run(
-                    ["/usr/bin/git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
+                    git_argv("-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"),
                     capture_output=True, text=True, timeout=5
                 ).stdout.strip()
                 for line in git_log.split("\n"):
@@ -891,6 +1014,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: Incoming phone call from {safe_caller}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
 
         # TwiML: greet caller, record message
         self.send_twiml(
@@ -925,6 +1049,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: SMS from {safe_sender}: {confine_user_content(body)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
 
         # Reply with acknowledgment
         self.send_twiml(
@@ -951,6 +1076,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"task: Voicemail from {safe_caller}: {confine_user_content(text)}\n"
             )
             (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+            _emit_task_processed(task_content)
         self.send_json(200, {"ok": True})
 
     def do_POST(self):
@@ -1111,6 +1237,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(400, {"error": str(e)})
             return
 
+        if path == "/tasks/workstreams/infer":
+            if not self.check_private_history_auth():
+                return
+            try:
+                queued = task_workstreams.maybe_enqueue_classifier_task(
+                    WORKSPACE_DIR, skill_file=TASK_WORKSTREAM_GROUPING_SKILL
+                )
+                self.send_private_json(200, {
+                    "pending": queued.pending,
+                    "enqueued": queued.enqueued,
+                    "reason": queued.reason,
+                    "snapshot_hash": queued.snapshot_hash,
+                })
+            except Exception:
+                self.send_private_json(503, {"error": "task workstream classifier unavailable"})
+            return
+
         if path != "/task":
             self.send_json(404, {"error": "not found"})
             return
@@ -1180,6 +1323,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: {confine_user_content(task)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
+
+        # Dashboard replies name their parent task explicitly. Give those
+        # follow-ups the same workstream immediately; unrelated new tasks remain
+        # ungrouped until the idle classifier can inspect them.
+        parent_match = re.fullmatch(r"web-reply:(task-[a-zA-Z0-9_.-]+)", from_agent)
+        if parent_match:
+            task_workstreams.inherit_assignment(WORKSPACE_DIR, task_id, parent_match.group(1))
 
         # Register webhook callback if provided
         if callback_url:
@@ -1258,6 +1409,18 @@ if __name__ == "__main__":
     # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
     # dashboard, #1709).
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
+    workstream_maintenance_stop = threading.Event()
+    workstream_maintenance = threading.Thread(
+        target=task_workstreams.run_classifier_maintenance,
+        kwargs={
+            "workspace": WORKSPACE_DIR,
+            "skill_file": TASK_WORKSTREAM_GROUPING_SKILL,
+            "stop_event": workstream_maintenance_stop,
+        },
+        name="task-workstream-maintenance",
+        daemon=True,
+    )
+    workstream_maintenance.start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")
@@ -1269,3 +1432,7 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDone.")
+    finally:
+        workstream_maintenance_stop.set()
+        workstream_maintenance.join(timeout=1)
+        server.server_close()

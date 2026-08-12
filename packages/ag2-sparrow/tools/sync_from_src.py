@@ -22,7 +22,11 @@ MAP = {
     "task_archive.py": "task_archive.py",
     "local_task_protocol.py": "local_task_protocol.py",
     "result_markers.py": "result_markers.py",
+    "result_ready.py": "result_ready.py",
+    "dedup_recovery.py": "dedup_recovery.py",
     "workspace_lock.py": "workspace_lock.py",
+    "chat_secret_filter.py": "chat_secret_filter.py",
+    "vault_set_grammar.py": "vault_set_grammar.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"

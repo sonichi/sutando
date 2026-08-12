@@ -8,8 +8,8 @@ lease-based scheduler; today this is just machine-readable metadata.
 Defaults by source (writers emit these; consumers can override per call):
   voice, phone            -> "urgent"   (sub-second response expected)
   chat, context-drop      -> "normal"   (owner foreground)
-  discord, telegram (owner-tier)        -> "normal"
-  discord, telegram (team/other-tier)   -> "low"
+  discord, telegram, slack (owner-tier)        -> "normal"
+  discord, telegram, slack (team/other-tier)   -> "low"
   health-check, sync-memory, sync-workspace, cron -> "low"
 
 Anything not recognized parses as "normal" (fail-open). Order on disk:
@@ -43,9 +43,12 @@ def default_priority_for_source(source: str, access_tier: str | None = None) -> 
         return "urgent"
     if s in ("chat", "context-drop"):
         return "normal"
-    if s in ("discord", "telegram"):
+    if s in ("discord", "telegram", "slack"):
         # Owner-tier traffic stays at normal; team/other gets demoted so a
-        # public-channel ping never preempts an owner-DM follow-up.
+        # public-channel ping never preempts an owner-DM follow-up. Slack was
+        # omitted originally (Air's finding 2026-07-24) — it carries the exact
+        # same owner/team/other tier model as discord, so its non-owner tasks
+        # must demote identically or a team-tier Slack ping outranks owner work.
         return "normal" if (access_tier or "owner").lower() == "owner" else "low"
     if s in ("health-check", "sync-memory", "sync-workspace", "cron"):
         return "low"

@@ -118,6 +118,23 @@ def format_event(event_type: str, payload: dict):
     return None
 
 
+def _emit_github_telemetry() -> None:
+    """Fire-and-forget product telemetry: count `github` as a task source so
+    DAU/WAU includes webhook-driven activity. PR #2274 added `github` to the
+    telemetry allowlist but this writer never emitted, so the bucket could
+    never fire (CR by liususan091219). Mirrors the discord/slack/telegram
+    bridges + agent-api, which emit at their own accept points. Never blocks or
+    breaks task emission; no-op when telemetry is opted out. Never carries task
+    content or ids.
+    """
+    try:  # pragma: no cover — fire-and-forget glue; logic in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        task_processed("github")
+    except Exception:  # pragma: no cover — telemetry must never break webhook handling
+        pass
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -170,8 +187,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 f"access_tier: other\n"
                 f"task: {safe_task}\n"
             )
-            TASKS_DIR.mkdir(exist_ok=True)
+            TASKS_DIR.mkdir(parents=True, exist_ok=True)
             (TASKS_DIR / f"{task_id}.txt").write_text(task_content)
+            _emit_github_telemetry()
             print(f"[{time.strftime('%H:%M:%S')}] {event_type}/{payload.get('action', '')} → {task_id}")
 
         self.send_response(200)

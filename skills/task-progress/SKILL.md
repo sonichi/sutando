@@ -116,6 +116,16 @@ Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`
 - **Discord** — REST v10 messages, token from `$CLAUDE_CONFIG_DIR/channels/discord/.env` (`DISCORD_BOT_TOKEN`)
 - **Telegram** — `sendMessage`, token from `$CLAUDE_CONFIG_DIR/channels/telegram/.env` (`TELEGRAM_BOT_TOKEN`)
 
+### Discord mentions
+
+Discord mention validation is on by default. Use a resolved user snowflake
+(`<@USER_ID>`), not a GitHub-style `@handle`. Before posting, `notify.py`
+checks each user ID through Discord; after posting, it verifies the response's
+`mentions` array. An unresolved mention exits 1 with an agent-visible error.
+
+For intentional plain-text handles that should not ping anyone, pass
+`--no-validate-mentions`.
+
 ## Fail-open
 
 A failed send (missing token, network error) prints a warning to stderr and exits 1.
