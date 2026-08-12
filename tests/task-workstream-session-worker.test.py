@@ -69,6 +69,31 @@ def _executable(path: Path, body: str) -> Path:
     return path
 
 
+def _git_project(path: Path, files: dict[str, str]) -> Path:
+    path.mkdir(parents=True)
+    for relative, body in files.items():
+        target = path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    environment = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+    subprocess.run(["git", "init", "--quiet", str(path)], check=True, env=environment)
+    subprocess.run(["git", "-C", str(path), "add", "--all"], check=True, env=environment)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "--quiet", "-m", "baseline"],
+        check=True,
+        env=environment,
+    )
+    return path.resolve()
+
+
 def test_resolution_routes_bounded_tiers_before_owner_workstreams() -> None:
     with tempfile.TemporaryDirectory() as td:
         workspace = Path(td)
@@ -148,7 +173,7 @@ def test_team_uses_owner_codex_workspace_sandbox_while_guest_stays_legacy() -> N
         workspace = root / "workspace"
         log = root / "codex-args.jsonl"
         _executable(root / "codex", """#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, subprocess, sys
 args = sys.argv[1:]
 if '--version' in args:
     print('codex-cli 0.146.0')
@@ -166,79 +191,96 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
         assert "--strict-config" in team_args
         configs = [team_args[index + 1] for index, arg in enumerate(team_args) if arg == "-c"]
         assert worker._codex_permission_profile_config() in configs
+        assert worker._codex_shell_environment_config() in configs
         assert f'default_permissions="{worker.CODEX_TEAM_PROFILE}"' in configs
         assert "--ignore-user-config" in team_args and "--ephemeral" in team_args
         assert "--json" in team_args
 
 
-def test_team_capability_root_is_the_owner_configured_workspace() -> None:
+def test_team_capsule_imports_normal_work_without_copying_owner_secrets() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        task_workspace = root / "task-queue"
-        owner_workspace = root / "owner-workspace"
-        owner_workspace.mkdir()
-        owner_workspace = owner_workspace.resolve()
-        (owner_workspace / "owner-project.txt").write_text("team-visible\n")
-        (owner_workspace / "project").mkdir()
-        workspace_npmrc = owner_workspace / "project" / ".npmrc"
-        workspace_npmrc.write_text("token=blocked\n")
-        workspace_env = owner_workspace / ".env"
-        workspace_env.write_text("API_KEY=blocked\n")
-        # Sutando's own credential state lives INSIDE the team root once the capability
-        # root is the owner workspace, so it needs deny coverage like any dotfile secret.
-        sutando_secrets = []
-        for rel, body in (
-            ("state/auth/cloud-auth.json", '{"token":"blocked"}\n'),
-            ("state/auth/device.json", '{"device":"blocked"}\n'),
+        owner_project = _git_project(root / "owner-project", {
+            ".gitignore": "workspace/\n.claude-sutando/\n.env\n.npmrc\n",
+            ".env.example": "SAFE_PLACEHOLDER=1\n",
+            "fixtures/credentials.json": "TRACKED_SECRET\n",
+            "project.txt": "committed\n",
+            "check.sh": "#!/bin/sh\ntest -f project.txt\n",
+        })
+        task_workspace = owner_project / "workspace"
+        (owner_project / "project.txt").write_text("owner dirty state\n")
+        for relative, body in (
+            (".env", "OWNER_ENV_SECRET\n"),
+            (".npmrc", "OWNER_NPM_SECRET\n"),
+            ("workspace/state/auth/cloud-auth.json", "OWNER_CLOUD_SECRET\n"),
+            ("workspace/state/secret-vault/key", "OWNER_VAULT_SECRET\n"),
+            (".claude-sutando/channels/discord/.env", "OWNER_CHANNEL_SECRET\n"),
         ):
-            path = owner_workspace / rel
+            path = owner_project / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body)
-            sutando_secrets.append(path)
 
         claude_log = root / "claude.json"
         _executable(root / "claude", """#!/usr/bin/env python3
-import json, os, sys
+import json, os, pathlib, subprocess, sys
 if '--version' in sys.argv:
     print('2.1.220 (Claude Code)')
     raise SystemExit
-json.dump({'args': sys.argv[1:], 'cwd': os.getcwd()}, open(os.environ['PROVIDER_LOG'], 'w'))
+cwd = pathlib.Path.cwd()
+subprocess.run(['sh', 'check.sh'], check=True)
+seen = {
+    'project': (cwd / 'project.txt').read_text(),
+    'example': (cwd / '.env.example').read_text(),
+    'env': (cwd / '.env').exists(),
+    'npmrc': (cwd / '.npmrc').exists(),
+    'workspace': (cwd / 'workspace').exists(),
+    'claude': (cwd / '.claude-sutando').exists(),
+    'credentials': (cwd / 'fixtures/credentials.json').exists(),
+}
+(cwd / 'project.txt').write_text('changed by team\\n')
+(cwd / 'new-file.txt').write_text('created by team\\n')
+json.dump({'args': sys.argv[1:], 'cwd': os.getcwd(), 'seen': seen},
+          open(os.environ['PROVIDER_LOG'], 'w'))
 print(json.dumps({'type': 'result', 'result': 'bounded claude result'}))
 """)
-        team = _task(task_workspace, "task-team-owner-workspace", "team")
+        team = _task(task_workspace, "task-team-capsule", "team")
         shared_env = {
             "PATH": f"{root}:{os.environ['PATH']}",
-            "SUTANDO_ISOLATED_WORKING_DIR": str(owner_workspace),
+            "SUTANDO_ISOLATED_WORKING_DIR": str(owner_project),
             "PROVIDER_LOG": str(claude_log),
         }
         assert _run("claude", task_workspace, team, shared_env).returncode == 0
         claude = json.loads(claude_log.read_text())
-        assert claude["cwd"] != str(owner_workspace)
-        assert claude["args"][claude["args"].index("--add-dir") + 1] == str(owner_workspace)
+        capsule = claude["cwd"]
+        assert capsule != str(owner_project) and not Path(capsule).exists()
+        assert not Path(capsule).is_relative_to(owner_project)
+        assert claude["args"][claude["args"].index("--add-dir") + 1] == capsule
         settings = json.loads(claude["args"][claude["args"].index("--settings") + 1])
-        assert str(owner_workspace) in settings["sandbox"]["filesystem"]["allowRead"]
-        assert str(owner_workspace) in settings["sandbox"]["filesystem"]["allowWrite"]
-        assert str(REPO) not in settings["sandbox"]["filesystem"]["allowWrite"]
-        assert str(workspace_npmrc) in settings["sandbox"]["filesystem"]["denyWrite"]
-        # Read-deny must hold at the sandbox boundary: Read()/Edit() deny rules bind tools,
-        # and Bash is allowed, so denyWrite alone still permits `cat .env`.
-        deny_read = settings["sandbox"]["filesystem"]["denyRead"]
-        assert str(workspace_env) in deny_read, deny_read
-        assert str(workspace_npmrc) in deny_read, deny_read
-        assert settings["permissions"]["allow"].count("Bash") == 1
-        # Denied by DIRECTORY, not per-file: globbing these would enumerate thousands of
-        # files per task on a real workspace. The parent dir covers everything beneath it.
-        deny_write = settings["sandbox"]["filesystem"]["denyWrite"]
-        for rel in ("state/auth",):
-            assert str(owner_workspace / rel) in deny_read, (rel, deny_read)
-            assert str(owner_workspace / rel) in deny_write, rel
-        for secret in sutando_secrets:
-            assert any(str(secret).startswith(d + "/") for d in deny_read), (secret, deny_read)
-        # An ordinary workspace file stays fully usable — the denies are targeted, not a
-        # blanket lockout of the team root.
-        assert str(owner_workspace / "owner-project.txt") not in deny_read
-        prompt = claude["args"][-1]
-        assert f"team workspace at {owner_workspace}" in prompt
+        filesystem = settings["sandbox"]["filesystem"]
+        assert filesystem["allowRead"] == [capsule]
+        assert filesystem["allowWrite"] == [capsule]
+        assert str(owner_project) not in filesystem["allowRead"]
+        assert str(owner_project) not in filesystem["allowWrite"]
+        assert claude["seen"] == {
+            "project": "owner dirty state\n",
+            "example": "SAFE_PLACEHOLDER=1\n",
+            "env": False,
+            "npmrc": False,
+            "workspace": False,
+            "claude": False,
+            "credentials": False,
+        }
+        assert (owner_project / "project.txt").read_text() == "changed by team\n"
+        assert (owner_project / "new-file.txt").read_text() == "created by team\n"
+        assert (owner_project / ".env").read_text() == "OWNER_ENV_SECRET\n"
+        assert (owner_project / "workspace/state/auth/cloud-auth.json").read_text() == (
+            "OWNER_CLOUD_SECRET\n")
+        intent = subprocess.run(
+            ["git", "-C", str(owner_project), "ls-files", "--error-unmatch", "new-file.txt"],
+            capture_output=True,
+            check=False,
+        )
+        assert intent.returncode == 0  # Imported files remain visible to later capsules.
 
         codex_log = root / "codex.json"
         _executable(root / "codex", """#!/usr/bin/env python3
@@ -247,19 +289,28 @@ args = sys.argv[1:]
 if '--version' in args:
     print('codex-cli 0.146.0')
     raise SystemExit
-json.dump({'args': args, 'cwd': os.getcwd()}, open(os.environ['PROVIDER_LOG'], 'w'))
+cwd = pathlib.Path.cwd()
+(cwd / 'project.txt').write_text('changed by codex team\\n')
+json.dump({'args': args, 'cwd': os.getcwd(), 'has_env': (cwd / '.env').exists()},
+          open(os.environ['PROVIDER_LOG'], 'w'))
 pathlib.Path(args[args.index('-o') + 1]).write_text('bounded codex result\\n')
 """)
-        team = _task(task_workspace, "task-team-owner-workspace-codex", "team")
+        team = _task(task_workspace, "task-team-capsule-codex", "team")
         shared_env["PROVIDER_LOG"] = str(codex_log)
         assert _run("codex", task_workspace, team, shared_env).returncode == 0
         codex = json.loads(codex_log.read_text())
-        assert codex["cwd"] == str(owner_workspace)
-        assert codex["args"][codex["args"].index("-C") + 1] == str(owner_workspace)
-        assert str(REPO) not in codex["args"]
+        assert codex["cwd"] != str(owner_project) and not Path(codex["cwd"]).exists()
+        assert codex["args"][codex["args"].index("-C") + 1] == codex["cwd"]
+        assert str(owner_project) not in [
+            codex["args"][index + 1]
+            for index, argument in enumerate(codex["args"][:-1])
+            if argument in {"-C", "--add-dir"}
+        ]
+        assert codex["has_env"] is False
+        assert (owner_project / "project.txt").read_text() == "changed by codex team\n"
 
 
-def test_installed_codex_denies_workspace_secrets_but_keeps_workspace_writable() -> None:
+def test_installed_codex_limits_reads_and_writes_to_the_capsule() -> None:
     codex = shutil.which("codex")
     if not codex:
         return
@@ -268,26 +319,158 @@ def test_installed_codex_denies_workspace_secrets_but_keeps_workspace_writable()
     except RuntimeError:
         return
     with tempfile.TemporaryDirectory() as td:
-        team_workspace = Path(td).resolve()
-        (team_workspace / "visible.txt").write_text("visible\n")
-        (team_workspace / ".env").write_text("TEAM_SECRET=blocked\n")
-        (team_workspace / ".npmrc").write_text("NPM_SECRET=blocked\n")
+        root = Path(td).resolve()
+        capsule = root / "capsule"
+        owner = root / "owner"
+        capsule.mkdir()
+        owner.mkdir()
+        (capsule / "visible.txt").write_text("visible\n")
+        (owner / "secret.txt").write_text("OWNER_SECRET\n")
         command = [
-            codex, "sandbox", "-C", str(team_workspace),
+            codex, "sandbox", "-C", str(capsule),
             "-c", worker._codex_permission_profile_config(),
             "-P", worker.CODEX_TEAM_PROFILE,
-            "/bin/sh", "-c",
-            "cat visible.txt; cat .env; cat .npmrc; printf changed > visible.txt",
+            "/bin/sh", "-c", "cat visible.txt; printf changed > visible.txt; cat \"$1\"",
+            "sh", str(owner / "secret.txt"),
         ]
         completed = subprocess.run(
             command, text=True, capture_output=True, timeout=20,
         )
-        assert completed.returncode == 0, completed.stderr
+        assert completed.returncode != 0, completed.stderr
         assert "visible" in completed.stdout
-        assert "TEAM_SECRET" not in completed.stdout + completed.stderr
-        assert "NPM_SECRET" not in completed.stdout + completed.stderr
+        assert "OWNER_SECRET" not in completed.stdout + completed.stderr
         assert "Operation not permitted" in completed.stderr
-        assert (team_workspace / "visible.txt").read_text() == "changed"
+        assert (capsule / "visible.txt").read_text() == "changed"
+
+
+def test_capsule_import_rejects_protected_outputs_and_concurrent_owner_edits() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        source = _git_project(root / "source", {"file.txt": "baseline\n"})
+        workspace = root / "workspace"
+        workspace.mkdir()
+        with worker._team_capsule(source, workspace) as capsule:
+            (capsule.project / ".env").write_text("TEAM_CREATED_SECRET\n")
+            try:
+                worker._apply_capsule_changes(capsule)
+                raise AssertionError("protected Team output must not be imported")
+            except RuntimeError as exc:
+                assert "protected path" in str(exc)
+        assert not (source / ".env").exists()
+
+        with worker._team_capsule(source, workspace) as capsule:
+            (capsule.project / "file.txt").write_text("team edit\n")
+            (source / "file.txt").write_text("owner edit\n")
+            try:
+                worker._apply_capsule_changes(capsule)
+                raise AssertionError("concurrent owner changes must win")
+            except RuntimeError as exc:
+                assert "changed concurrently" in str(exc)
+        assert (source / "file.txt").read_text() == "owner edit\n"
+
+        with worker._team_capsule(source, workspace) as capsule:
+            (capsule.project / "escape").symlink_to("../../owner-secret")
+            try:
+                worker._apply_capsule_changes(capsule)
+                raise AssertionError("Team-created escaping symlink must be rejected")
+            except RuntimeError as exc:
+                assert "symlink escapes" in str(exc)
+
+
+def test_capsule_import_enforces_file_count_and_patch_size_bounds() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        source = _git_project(root / "source", {"file.txt": "baseline\n"})
+        workspace = root / "workspace"
+        workspace.mkdir()
+        with worker._team_capsule(source, workspace) as capsule:
+            (capsule.project / "one.txt").write_text("one\n")
+            (capsule.project / "two.txt").write_text("two\n")
+            with mock.patch.object(worker, "TEAM_CAPSULE_MAX_CHANGED_FILES", 1):
+                try:
+                    worker._apply_capsule_changes(capsule)
+                    raise AssertionError("oversized file set must be rejected")
+                except RuntimeError as exc:
+                    assert "too many files" in str(exc)
+        with worker._team_capsule(source, workspace) as capsule:
+            (capsule.project / "file.txt").write_text("a patch larger than one byte\n")
+            with mock.patch.object(worker, "TEAM_CAPSULE_MAX_PATCH_BYTES", 1):
+                try:
+                    worker._apply_capsule_changes(capsule)
+                    raise AssertionError("oversized patch must be rejected")
+                except RuntimeError as exc:
+                    assert "patch is too large" in str(exc)
+
+
+def test_capsule_import_handles_deletes_modes_and_safe_symlinks() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        source = _git_project(root / "source", {
+            "delete.txt": "delete me\n",
+            "script.sh": "#!/bin/sh\necho ok\n",
+            "target.txt": "target\n",
+        })
+        workspace = root / "workspace"
+        workspace.mkdir()
+        with worker._team_capsule(source, workspace) as capsule:
+            (capsule.project / "delete.txt").unlink()
+            (capsule.project / "script.sh").chmod(0o755)
+            (capsule.project / "link.txt").symlink_to("target.txt")
+            assert worker._apply_capsule_changes(capsule) == 3
+        assert not (source / "delete.txt").exists()
+        assert os.access(source / "script.sh", os.X_OK)
+        assert (source / "link.txt").is_symlink()
+        assert os.readlink(source / "link.txt") == "target.txt"
+
+
+def test_capsule_rejects_escape_symlinks_and_non_root_projects() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        source = _git_project(root / "source", {"safe.txt": "safe\n"})
+        outside = root / "outside-secret"
+        outside.write_text("secret\n")
+        (source / "escape").symlink_to("../outside-secret")
+        subprocess.run(
+            ["git", "-C", str(source), "add", "escape"], check=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+        workspace = root / "workspace"
+        workspace.mkdir()
+        try:
+            with worker._team_capsule(source, workspace):
+                raise AssertionError("escaping tracked symlink must fail capsule creation")
+        except RuntimeError as exc:
+            assert "symlink escapes" in str(exc)
+
+        with mock.patch.dict(
+            os.environ, {"SUTANDO_ISOLATED_WORKING_DIR": str(source / "subdir")}, clear=False,
+        ):
+            (source / "subdir").mkdir()
+            try:
+                worker._team_source(REPO, workspace)
+                raise AssertionError("a project subdirectory must not widen to its Git root")
+            except RuntimeError as exc:
+                assert "root of a Git working tree" in str(exc)
+
+
+def test_capsule_policy_size_is_constant_for_a_populated_private_workspace() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        source = _git_project(root / "source", {"project.txt": "visible\n"})
+        workspace = source / "workspace"
+        private = workspace / ".claude-sutando" / "channels"
+        for index in range(400):
+            path = private / str(index) / ".env"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"SECRET_{index}\n")
+        source, excluded = worker._team_source(source, workspace)
+        with worker._team_capsule(source, workspace, excluded) as capsule:
+            assert (capsule.project / "project.txt").is_file()
+            assert not (capsule.project / "workspace").exists()
+            settings = worker._claude_tier_settings(capsule.project, (source, workspace))
+            assert json.loads(settings)["sandbox"]["filesystem"]["denyRead"] == []
+            assert len(settings) < 10000
+            assert len(worker._codex_permission_profile_config()) < 300
 
 
 def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
@@ -413,7 +596,9 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
     shell_command = (
         "printf 'ENV=%s\\n' \"$GITHUB_TOKEN\"; "
         "cat \"$HOME/.aws/team-secret\"; "
-        "printf TEAM_WRITE > \"$TEAM_WORKSPACE/team-output\"; "
+        "cat \"$OWNER_PROJECT/.env\"; "
+        "cat \"$OWNER_PROJECT/.claude-sutando/channels/discord/.env\"; "
+        "printf TEAM_WRITE > \"$TEAM_CAPSULE/team-output\"; "
         f"curl --max-time 2 -sS http://127.0.0.1:{probe_server.server_port}/probe"
     )
 
@@ -486,22 +671,35 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
-            repo = root / "repo"
+            owner_project = root / "owner-project"
+            repo = root / "capsule"
             (home / ".aws").mkdir(parents=True)
             repo.mkdir()
+            (owner_project / ".claude-sutando/channels/discord").mkdir(parents=True)
             (home / ".aws" / "team-secret").write_text("FILE_SECRET")
+            (owner_project / ".env").write_text("PROJECT_SECRET")
+            (owner_project / ".claude-sutando/channels/discord/.env").write_text(
+                "CHANNEL_SECRET")
+            for index in range(600):
+                path = owner_project / ".claude-sutando/projects" / str(index) / "state.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("PRIVATE_STATE")
+            config_dir = owner_project / ".claude-sutando"
             with mock.patch.object(worker.Path, "home", return_value=home):
-                settings = worker._claude_tier_settings(repo)
-            command = worker._claude_bounded_command("run the requested probe", repo)
+                settings = worker._claude_tier_settings(
+                    repo, (owner_project, config_dir))
+            command = worker._claude_bounded_command(
+                "run the requested probe", repo, (owner_project, config_dir))
             command[0] = claude
-            command.insert(2, "--bare")
             environment = {
                 **os.environ,
                 "HOME": str(home),
+                "CLAUDE_CONFIG_DIR": str(config_dir),
                 "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{api_server.server_port}",
                 "ANTHROPIC_API_KEY": "test-only-key",
                 "GITHUB_TOKEN": "ENV_SECRET",
-                "TEAM_WORKSPACE": str(repo),
+                "TEAM_CAPSULE": str(repo),
+                "OWNER_PROJECT": str(owner_project),
                 "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
             }
             settings_index = command.index("--settings") + 1
@@ -511,7 +709,10 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
                 capture_output=True, timeout=20,
             )
             assert completed.returncode == 0, completed.stderr
-            team_write = (repo / "team-output").read_text()
+            team_write = (
+                (repo / "team-output").read_text()
+                if (repo / "team-output").exists() else "MISSING"
+            )
         tool_results = [
             item
             for request in requests
@@ -522,10 +723,13 @@ def test_installed_claude_enforces_team_credential_and_network_boundary() -> Non
         ]
         assert tool_results
         output = str(tool_results[-1].get("content") or "")
-        assert "ENV_SECRET" not in output and "FILE_SECRET" not in output, output
+        for secret in (
+            "ENV_SECRET", "FILE_SECRET", "PROJECT_SECRET", "CHANNEL_SECRET",
+        ):
+            assert secret not in output, output
         assert "ENV=\n" in output, output
         assert "Operation not permitted" in output or "Permission denied" in output, output
-        assert team_write == "TEAM_WRITE"
+        assert team_write == "TEAM_WRITE", output
         assert network_probes == []
     finally:
         api_server.shutdown()
@@ -574,11 +778,14 @@ def test_bounded_runtime_helper_edges() -> None:
                 raise AssertionError("old Codex must fail closed")
             except RuntimeError as exc:
                 assert "need 0.132.0+" in str(exc)
-        assert '"**/.env"="deny"' in worker._codex_permission_profile_config()
-        # Same Sutando workspace credential coverage on the Codex side, from the one glob list.
-        for pattern in ("**/state/auth/**",):
-            assert f'"{pattern}"="deny"' in worker._codex_permission_profile_config(), pattern
-        assert '"**/.npmrc"="deny"' in worker._codex_permission_profile_config()
+        profile = worker._codex_permission_profile_config()
+        assert '":root"="deny"' in profile
+        assert '":minimal"="read"' in profile
+        assert '":tmpdir"="deny"' in profile
+        assert "**" not in profile  # Profile size cannot grow with workspace contents.
+        environment = worker._codex_shell_environment_config()
+        assert "ignore_default_excludes=false" in environment
+        assert '"OPENAI_*"="exclude"' in environment
 
         already_done = mock.Mock()
         already_done.poll.return_value = 0
@@ -622,10 +829,10 @@ def test_bounded_runtime_helper_edges() -> None:
             clear=False,
         ):
             try:
-                worker._team_workspace(REPO)
-                raise AssertionError("missing Team workspace must fail closed")
+                worker._team_source(REPO, workspace)
+                raise AssertionError("missing Team project must fail closed")
             except RuntimeError as exc:
-                assert "team workspace is unavailable" in str(exc)
+                assert "Team project is unavailable" in str(exc)
         workspace_file = root / "workspace-file"
         workspace_file.write_text("not a directory\n")
         with mock.patch.dict(
@@ -634,10 +841,20 @@ def test_bounded_runtime_helper_edges() -> None:
             clear=False,
         ):
             try:
-                worker._team_workspace(REPO)
-                raise AssertionError("non-directory Team workspace must fail closed")
+                worker._team_source(REPO, workspace)
+                raise AssertionError("non-directory Team project must fail closed")
             except RuntimeError as exc:
-                assert "team workspace is not a directory" in str(exc)
+                assert "Team project is not a directory" in str(exc)
+        not_git = root / "not-git"
+        not_git.mkdir()
+        with mock.patch.dict(
+            os.environ, {"SUTANDO_ISOLATED_WORKING_DIR": str(not_git)}, clear=False,
+        ):
+            try:
+                worker._team_source(REPO, workspace)
+                raise AssertionError("non-Git Team project must fail closed")
+            except RuntimeError as exc:
+                assert "not a git repository" in str(exc).lower()
 
         (workspace / "state").mkdir(parents=True)
         with (
@@ -1495,8 +1712,13 @@ if __name__ == "__main__":
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_uses_owner_claude_native_sandbox_while_guest_stays_legacy()
     test_team_uses_owner_codex_workspace_sandbox_while_guest_stays_legacy()
-    test_team_capability_root_is_the_owner_configured_workspace()
-    test_installed_codex_denies_workspace_secrets_but_keeps_workspace_writable()
+    test_team_capsule_imports_normal_work_without_copying_owner_secrets()
+    test_installed_codex_limits_reads_and_writes_to_the_capsule()
+    test_capsule_import_rejects_protected_outputs_and_concurrent_owner_edits()
+    test_capsule_import_enforces_file_count_and_patch_size_bounds()
+    test_capsule_import_handles_deletes_modes_and_safe_symlinks()
+    test_capsule_rejects_escape_symlinks_and_non_root_projects()
+    test_capsule_policy_size_is_constant_for_a_populated_private_workspace()
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()
     test_older_claude_fails_closed_before_receiving_team_prompt()

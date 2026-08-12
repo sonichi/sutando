@@ -9,13 +9,20 @@ user-invocable: false
 This runtime skill first intercepts every explicit Team task before it can
 reach the unrestricted live core. It launches a fresh instance of the owner's
 configured runtime: Claude uses Claude Code's native OS sandbox and a bounded
-tool set, while Codex uses a named workspace-write permission profile with
-enforced secret-file deny globs (Codex 0.132.0+). Team can edit
-and test throughout the owner-configured working directory—the same workspace
-the owner's core uses—rather than being confined to the Sutando source checkout.
-The provider starts without owner account connectors and cannot access credentials
-or mutate external systems. A sandbox/runtime failure publishes a safe terminal result
-and never falls through to the owner core. Guest remains on the pre-existing
+tool set, while Codex uses a root-denied permission profile (Codex 0.132.0+).
+The trusted handler projects the configured Git project's tracked working-tree
+state into a disposable capsule, excluding ignored files, known credential
+paths, and Sutando's private workspace/config roots. Team can edit and run
+offline tests there without receiving the owner tree. When the provider exits,
+the handler imports a bounded Git patch only if protected paths and concurrent
+owner changes are absent. Imported new files are marked intent-to-add so a
+later Team capsule can continue the work without staging their contents.
+
+The provider retains its own authentication in the trusted client process, but
+spawned commands receive a scrubbed environment, no owner account connectors,
+and no network. A missing Git root, sandbox/runtime failure, unsafe symlink,
+protected output, oversized patch, or import conflict publishes a safe terminal
+result and never falls through to the owner core. Guest remains on the existing
 read-only Codex delegation path carried in the task's in-band instructions.
 
 For owner tasks, the skill reads existing assignments from
