@@ -120,6 +120,26 @@ and loads whichever repo it reviews.
 
 ```yaml
 checks:
+  root-artifacts:
+    # Added files at the REPO ROOT matching these are PR-draft leftovers, not
+    # source. Root-only on purpose: tests/ and skills/ carry .md and .patch
+    # fixtures, and a rule that reaches them gets disabled the first time it
+    # blocks a real one. Key is `root_artifact_glob`, not `flag`, because
+    # review-checks.sh parses section keys FLAT — a second `flag:` would merge
+    # into hardcoded-paths' list.
+    root_artifact_glob:
+      - 'prbody*'
+      - 'pr-body*'
+      - 'pr_body*'
+      - 'reply*.md'
+      - 'comment*.md'
+      - 'draft*.md'
+      - '*.patch'
+      - '*.diff'
+      - '*.orig'
+      - '*.rej'
+      - 'nohup.out'
+
   hardcoded-paths:
     # Added lines containing any of these substrings are flagged as errors...
     flag:

@@ -73,6 +73,7 @@ FLAGS="$(parse_list flag)"
 FLAGS_EXACT="$(parse_list flag_exact)"
 ALLOWS="$(parse_list allow)"
 ALLOW_PAIRED="$(parse_list allow_paired)"
+ROOT_GLOBS="$(parse_list root_artifact_glob)"
 NOTE=""
 if [[ -z "${FLAGS//[$' \t\r\n']/}" ]]; then
     FLAGS=$'/Users/\n/home/'
@@ -99,11 +100,29 @@ fi
 
 [[ -n "$NOTE" ]] && echo "review-checks: $NOTE" >&2
 
+# --- scan ADDED FILE PATHS for PR-draft artifacts at the repo root -----------
+# Separate scanner: a stray root file is a diff HEADER, never an added line, so
+# the content scanner above cannot see it however its patterns are written.
+ROOT_HITS="$(printf '%s' "$DIFF" | RC_ROOT_ARTIFACT_GLOBS="$ROOT_GLOBS" python3 "$HERE/review-checks-root-artifacts.py")"
+ROOT_RC=$?
+if [[ $ROOT_RC -ne 0 ]]; then
+    echo "review-checks: ERROR — root-artifacts scanner failed to run (exit $ROOT_RC); failing closed (NOT a pass)." >&2
+    exit 2
+fi
+
+FAILED=0
 if [[ "$HITS" =~ [^[:space:]] ]]; then
     echo "review-checks: FAIL — hardcoded-paths:" >&2
     printf '%s\n' "$HITS" >&2
     echo "review-checks: $(printf '%s\n' "$HITS" | grep -c '') violation(s). Resolve via workspace/config helpers, or add a scoped allow to REVIEW.md if it's a genuine fixture." >&2
-    exit 1
+    FAILED=1
 fi
-echo "review-checks: PASS (hardcoded-paths clean)"
+if [[ "$ROOT_HITS" =~ [^[:space:]] ]]; then
+    echo "review-checks: FAIL — root-artifacts:" >&2
+    printf '%s\n' "$ROOT_HITS" >&2
+    echo "review-checks: $(printf '%s\n' "$ROOT_HITS" | grep -c '') artifact(s) at the repo root. Delete them from the branch, or add the name to root-artifacts in REVIEW.md if it is genuinely source." >&2
+    FAILED=1
+fi
+[[ $FAILED -eq 1 ]] && exit 1
+echo "review-checks: PASS (hardcoded-paths + root-artifacts clean)"
 exit 0
