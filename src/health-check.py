@@ -20,6 +20,7 @@ Checks:
   - Notes directory
 """
 
+import functools
 import hashlib
 import fnmatch
 import json
@@ -3860,12 +3861,11 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
 
     quota-state.json is written by the proxy from the quota headers on
     upstream responses, so it only appears if a core actually ROUTES through
-    the proxy. `src/startup.sh` is the only thing that exports
-    ANTHROPIC_BASE_URL=http://localhost:7846 — and a core launched by the
-    desktop supervisor never runs startup.sh. Result on such a host: the
-    proxy is healthy and listening, every check is green, and quota
-    telemetry is silently absent forever. The proactive loop's per-pass
-    budget check reads "unknown" on every pass and nobody is told why.
+    the proxy. Only the core launcher (`src/agent/claude/cli/start-cli.sh`)
+    exports ANTHROPIC_BASE_URL=http://localhost:7846, and only when the proxy
+    port already has a listener at launch — so a core started outside the
+    launcher, or started before it bound, stays unrouted and every other check
+    still reads green.
 
     The existing credential-proxy check can't catch this: it is a plain
     TCP-listening probe (correctly so — a forwarding proxy has no liveness
@@ -3962,16 +3962,22 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
                 f"working ({int(agent_age / 60)}m since the last loop pass) — the proxy "
                 "is up but nothing is routing through it any more, so the file on disk "
                 "is a leftover from when it was. Quota-based budgeting is quoting stale "
-                "numbers as current. Check ANTHROPIC_BASE_URL on the running core "
-                "(exported by src/startup.sh; a supervisor-launched core never runs it)."
+                "numbers as current. Check ANTHROPIC_BASE_URL on the running core: only "
+                "the core launcher (src/agent/claude/cli/start-cli.sh) exports it, and "
+                "only when the proxy port already has a listener at launch — so a core "
+                "started outside the launcher, or started before the proxy bound, stays "
+                "unrouted for its whole session."
             )
         return check
     check["status"] = "warn"
     check["detail"] = (
-        "credential proxy is up but has never written quota-state.json — "
-        "nothing is routing through it (ANTHROPIC_BASE_URL unset; set by "
-        "src/startup.sh, which a supervisor-launched core never runs). "
-        "Quota-based budgeting is blind on this host."
+        "credential proxy is up but has never written quota-state.json — nothing "
+        "is routing through it (ANTHROPIC_BASE_URL unset on the running core). "
+        "Only the core launcher (src/agent/claude/cli/start-cli.sh) exports it, "
+        "and only when the proxy port already has a listener at launch — so a "
+        "core started outside the launcher, or started before the proxy bound, "
+        "stays unrouted for its whole session. Quota-based budgeting is blind "
+        "on this host."
     )
     return check
 
@@ -4819,6 +4825,35 @@ def check_disk_space() -> dict:
     return {"name": name, "status": "ok", "detail": where}
 
 
+@functools.lru_cache(maxsize=1)
+def _ephemeral_roots() -> tuple:
+    """Temp roots whose contents do not survive a sweep or reboot, asked of the
+    platform: naming them literally puts a host path in the tree the scan forbids."""
+    roots = set()
+    for cand in (tempfile.gettempdir(), "/tmp"):
+        for p in (cand, os.path.realpath(cand)):
+            p = p.rstrip("/")
+            if not p:
+                continue
+            roots.add(p)
+            # macOS $TMPDIR is <base>/folders/xx/yyy/T. The shared base counts too, so
+            # another session's scratch dir is still recognised as ephemeral.
+            head, sep, _ = p.partition("/folders/")
+            if sep:
+                roots.add(head + "/folders")
+    return tuple(sorted(roots))
+
+
+def _is_ephemeral(target: str) -> bool:
+    """True if `target` IS a temp root or lives under one.
+
+    Equality counts: a link pointing AT the root is as ephemeral as one pointing
+    inside it, and a trailing-slash prefix test answers False for exactly that case.
+    """
+    t = os.path.normpath(target).rstrip("/") or "/"
+    return any(t == r or t.startswith(r + "/") for r in _ephemeral_roots())
+
+
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
     the Claude home's skills/ dir. A missing symlink means Claude Code never
@@ -4868,6 +4903,7 @@ def check_skill_symlinks() -> dict:
     # reported "all 60 skills linked". The drift was one ruff E401 import split
     # -- harmless that time, which is exactly why it survived unnoticed.
     shadowed: list[str] = []   # real dir where a symlink belongs -> NOT auto-fixed
+    misdirected: list[tuple[str, str]] = []  # resolves, but into a temp dir
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
             continue
@@ -4885,6 +4921,11 @@ def check_skill_symlinks() -> dict:
             unlinked.append(skill_name)
         elif dst.is_dir() and not dst.is_symlink():
             shadowed.append(skill_name)
+        elif (dst.is_symlink() and _is_ephemeral(os.path.realpath(dst))
+              and not _is_ephemeral(str(skills_src.resolve()))):
+            # The MISMATCH is the defect, not temp-rootedness: a temp-rooted repo
+            # is self-consistent, and another DURABLE clone is a supported layout.
+            misdirected.append((skill_name, os.path.realpath(dst)))
 
     # Dangling links whose skill is NOT in this repo are missed by the loop
     # above, which only walks repo skills. They are still dead entries that make
@@ -4903,7 +4944,7 @@ def check_skill_symlinks() -> dict:
     except OSError:
         pass
 
-    if not unlinked and not broken and not orphaned and not shadowed:
+    if not unlinked and not broken and not orphaned and not shadowed and not misdirected:
         return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
 
     parts = []
@@ -4913,6 +4954,12 @@ def check_skill_symlinks() -> dict:
         parts.append(f"{len(unlinked)} unlinked: {', '.join(unlinked[:4])}{'...' if len(unlinked) > 4 else ''}")
     if orphaned:
         parts.append(f"{len(orphaned)} dangling not in this repo: {', '.join(orphaned[:4])}{'...' if len(orphaned) > 4 else ''}")
+    if misdirected:
+        parts.append(
+            f"{len(misdirected)} loaded from temp (vanishes on sweep): "
+            + ", ".join(f"{n} -> {t}" for n, t in misdirected[:2])
+            + ("..." if len(misdirected) > 2 else "")
+        )
     if shadowed:
         # The remedy must MOVE the real directory aside first. `ln -sfn` alone
         # does NOT repair this state: with the directory still present, macOS
@@ -5079,13 +5126,10 @@ def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | 
         return True
 
 
-def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
-    """Detect a task-queue pileup — tasks/ directory growing without
-    being drained. Independent of which watcher / loop is dying: the queue
-    backs up either way. Fires when BOTH count and age cross thresholds so
-    a transient spike of fresh tasks (normal during heavy use) doesn't
-    alert.
-    """
+def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
+                     stuck_age_sec: int = 900) -> dict:
+    """Detect a task-queue pileup, independent of which watcher or loop is dying.
+    Two branches: count AND age together, or age alone past stuck_age_sec."""
     name = "task-queue"
     tasks_dir = WORKSPACE_DIR / "tasks"
     if not tasks_dir.exists():
@@ -5103,6 +5147,14 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
             "name": name,
             "status": "warn",
             "detail": f"{len(files)} tasks queued, oldest {oldest_age}s — watcher or core may be stuck",
+        }
+    # ANDing count with age left a single stuck task unreachable, so one owner
+    # message could sit indefinitely while this probe printed its age under "ok".
+    if oldest_age > stuck_age_sec:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"{len(files)} task(s) queued, oldest {oldest_age}s — undrained past {stuck_age_sec}s",
         }
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
@@ -5169,8 +5221,29 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         # same signal as a genuinely stranded reply, which is how a detector
         # trains its readers to ignore it. `find_task_file()` is the canonical
         # locator (it is what the bridge archive paths already use).
-        if find_task_file(tasks_dir, path.stem) is not None:
+        try:
+            task_path = find_task_file(tasks_dir, path.stem)
+        except OSError:
+            # The locator itself stats the path, so it raises for the same
+            # reasons the age read does; both are partial coverage, not clean.
+            unreadable += 1
             continue
+        if task_path is not None:
+            # A CLAIMED task is owned by a running consumer; its lifetime is
+            # not ours to judge, however long it takes.
+            if ".claimed-core-" in task_path.name:
+                continue
+            try:
+                task_age = now - task_path.stat().st_mtime
+            except OSError:
+                # Same treatment as an unreadable result entry: a measurement we
+                # could not take is partial coverage, never a silent clean pass.
+                unreadable += 1
+                continue
+            # A task no bridge created is never collected, so an unclaimed
+            # pair past the threshold is stranded rather than in flight.
+            if task_age < threshold_age_sec:
+                continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
@@ -5184,7 +5257,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(orphans)} result(s) whose task is already archived — never delivered; "
+        "detail": (f"{len(orphans)} result(s) with no consumer coming — never delivered; "
                    f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
     }
 
@@ -5296,6 +5369,70 @@ def _proc_argv(pid: int) -> str:
         return out.stdout.strip()
     except Exception:  # noqa: BLE001 — a probe failure must not fail the check
         return ""
+
+
+def _age_hm(age_sec: int) -> str:
+    return f"{age_sec // 3600}h{age_sec % 3600 // 60}m"
+
+
+def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
+                                  claim_threshold_age_sec: int = 7200) -> dict:
+    """A claim is a body too: `with_suffix(".sending")` REPLACES `.txt`, the one
+    shape a `*.txt` glob cannot see — and the startup sweep restores only it."""
+    name = "stale-proactive-backlog"
+    results_dir = WORKSPACE_DIR / "results"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    now = time.time()
+    try:
+        # scandir, not glob: glob swallows a directory-level EACCES/EIO and
+        # yields nothing, so an unscannable results/ would report a clean one.
+        entries = [results_dir / e.name for e in os.scandir(results_dir)
+                   if e.name.startswith("proactive-")]
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/: {exc}"}
+    stale, abandoned, unreadable = [], [], 0
+    for path in entries:
+        # Decide by suffix, and skip any shape neither side of the protocol
+        # writes rather than guessing what it meant.
+        if path.suffix == ".txt":
+            bucket, limit = stale, threshold_age_sec
+        elif path.suffix == ".sending":
+            bucket, limit = abandoned, claim_threshold_age_sec
+        else:
+            continue
+        # Per-file isolation, as in check_orphaned_results: one unreadable entry
+        # must not decide the answer for the directory.
+        try:
+            if not path.is_file():
+                continue
+            age = now - path.stat().st_mtime
+        except OSError:
+            unreadable += 1
+            continue
+        if age < limit:
+            continue
+        bucket.append((path.name, int(age)))
+    partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
+    if not stale and not abandoned:
+        status = "warn" if unreadable else "ok"
+        return {"name": name, "status": status,
+                "detail": f"no undelivered proactive bodies{partial}"}
+    parts = []
+    if stale:
+        stale.sort(key=lambda item: -item[1])
+        oldest_name, oldest_age = stale[0]
+        parts.append(f"{len(stale)} proactive body(ies) nobody has delivered; "
+                     f"oldest {oldest_name} ({_age_hm(oldest_age)}); "
+                     f"deliver or remove them — nothing clears these on its own")
+    if abandoned:
+        abandoned.sort(key=lambda item: -item[1])
+        oldest_name, oldest_age = abandoned[0]
+        parts.append(f"{len(abandoned)} claimed body(ies) abandoned mid-send; "
+                     f"oldest {oldest_name} ({_age_hm(oldest_age)}); "
+                     f"restart a consumer to run its startup .sending sweep")
+    return {"name": name, "status": "warn", "detail": "; ".join(parts) + partial}
 
 
 # The argv must BE the script invocation, not merely mention it. A substring
@@ -7411,6 +7548,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
     checks.append(check_proactive_quarantine())
+    checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
@@ -7510,7 +7648,15 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         if state_file is None:
             state_file = WORKSPACE_DIR / "state" / "health-last-alerted.json"
         if tasks_dir is None:
-            tasks_dir = WORKSPACE_DIR / "tasks"
+            # Durable-lane address comes from the endpoint resolver; this is
+            # the crash-path writer, so descriptor failure falls back locally.
+            try:
+                from agent_endpoint import load_descriptor, resolve
+                tasks_dir = Path(resolve("self", "durable", load_descriptor()).address)
+            except Exception as e:
+                print(f"health-check: endpoint resolve failed ({e}); "
+                      f"falling back to workspace tasks dir", file=sys.stderr)
+                tasks_dir = WORKSPACE_DIR / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -7534,25 +7680,22 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         # how much time has passed. Only a transition re-alerts.
         return
 
-    # Build task content. task: is placed LAST (after trusted metadata fields)
-    # so that the multi-line bullet body cannot shadow source/access_tier/priority
-    # even in the theoretical case where check detail strings ever carry
-    # external data. Consistent with the bridge field-order convention.
+    # task-last shape via the protocol's write side: the multi-line bullet
+    # body cannot shadow source/access_tier/priority.
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     bullet_str = "\n".join(f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures)
-    body = (
-        f"id: task-health-{now_ms}\n"
-        f"timestamp: {ts_iso}\n"
-        f"source: health-check\n"
-        f"interaction_type: system_event\n"
-        f"user_id: health-check\n"
-        f"access_tier: owner\n"
-        f"priority: low\n"
-        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
-        f"{bullet_str}\n"
-    )
-    task_path = tasks_dir / f"task-health-{now_ms}.txt"
-    task_path.write_text(body)
+    from local_task_protocol import write_task_file
+    task_path = write_task_file(
+        tasks_dir, f"task-health-{now_ms}",
+        [("id", f"task-health-{now_ms}"),
+         ("timestamp", ts_iso),
+         ("source", "health-check"),
+         ("interaction_type", "system_event"),
+         ("user_id", "health-check"),
+         ("access_tier", "owner"),
+         ("priority", "low")],
+        "Health check found issues. Decide whether to restart, DM owner, "
+        "or treat as transient:\n" + bullet_str)
 
     # Update history. Prune timestamp entries older than 24h to bound file
     # size — `_LAST_HASH_KEY` is a hash string, not a timestamp, so it's

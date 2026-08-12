@@ -92,9 +92,15 @@ MEDIA_FORMS = frozenset({"attachment", "live_stream"})
 # the schema names). Consumer semantics: highest first, mtime FIFO tiebreak.
 PRIORITIES = ("urgent", "normal", "low")
 
-# `owner` is full, `team` is workspace-write sandboxed, and `guest`/`other` are read-only.
-# Consumers retain the owner default for legacy files without an access header.
-ACCESS_TIERS = ("owner", "team", "guest", "other")
+# ── Durable Work Model ───────────────────────────────────────────────────────
+
+# pending = file in tasks/; result_written = same-id result file (the
+# canonical completion marker); archived = under tasks/archive/.
+LIFECYCLE_STATES = ("pending", "result_written", "archived")
+
+# `owner` is full, `team` is workspace-write sandboxed, `guest`/`other` are
+# read-only, and `ambient` is sandboxed observation — never instructions.
+ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
@@ -593,3 +599,46 @@ def _has_task_line(path: Path) -> bool:
                    path.read_text(errors="replace").split("\n"))
     except OSError:
         return False
+
+
+# ── Write side (task-last, the convergence shape) ────────────────────────────
+
+def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) -> str:
+    """Serialize a task file in the task-last trust shape: every header
+    precedes the single `task:` line; only the body after it may span lines.
+
+    Header values must be single-line — a newline in a value could forge a
+    header, so it raises instead of writing a corrupt file.
+    """
+    lines = []
+    for key, value in headers:
+        if key == "task":
+            raise ValueError("pass the body via task_body, not as a header")
+        if key not in _KNOWN_KEY_SET:
+            raise ValueError(f"unknown header key {key!r} — add it to KNOWN_HEADER_KEYS first")
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"header {key!r} value contains a newline")
+        lines.append(f"{key}: {value}")
+    lines.append(f"task: {task_body}")
+    return "\n".join(lines) + "\n"
+
+
+def write_task_file(tasks_dir: "Path | str", task_id: str,
+                    headers: "Iterable[tuple[str, str]]", task_body: str) -> Path:
+    """Write `<tasks_dir>/<task_id>.txt` in the task-last shape. The task
+    enters the Durable Work Model's `pending` state the moment this returns."""
+    if not valid_task_id(task_id):
+        raise ValueError(f"not a canonical task id: {task_id!r}")
+    hdrs = list(headers)
+    supplied = [v for k, v in hdrs if k == "id"]
+    if any(v != task_id for v in supplied):
+        raise ValueError(
+            f"id header {supplied!r} disagrees with task_id {task_id!r} — "
+            "the filesystem key and the in-band id must be the same identity")
+    if not supplied:
+        hdrs.insert(0, ("id", task_id))
+    d = Path(tasks_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{task_id}.txt"
+    path.write_text(serialize_task_last(hdrs, task_body))
+    return path
