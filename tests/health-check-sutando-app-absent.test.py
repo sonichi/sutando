@@ -1,98 +1,160 @@
 #!/usr/bin/env python3
-"""A probe that emits nothing when it cannot run is indistinguishable from a pass.
-
-`run_all_checks()` guards the sutando-app probe on `dev_bin.exists() or
-app_bin.exists()`. When neither exists the block was skipped with no `else`, so
-no `sutando-app` row reached the report — and the summary line reads
-"No failures", which is what a healthy probe also produces.
-
-Structural rather than behavioural on purpose: exercising the branch means
-calling `run_all_checks()`, which runs ~100 probes with subprocesses and
-network. So this parses the guard's `else` out of the source and asserts what it
-emits. Validated against the parent — see the negative-control note in the PR.
+"""A headless install must stay healthy; a host that asked for the app must not
+go quiet when the binary is gone.
 
 Run: python3 tests/health-check-sutando-app-absent.test.py
 """
 from __future__ import annotations
 
 import ast
+import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "health-check.py"
 
 
-def _guard_node() -> ast.If:
-    """The `if dev_bin.exists() or app_bin.exists():` statement."""
-    tree = ast.parse(SRC.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
-        if {"dev_bin", "app_bin"} <= names:
-            return node
-    raise AssertionError("guard `dev_bin.exists() or app_bin.exists()` not found")
+def _load():
+    spec = importlib.util.spec_from_file_location("hc", SRC)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    return mod
 
 
-def _appended_check_names(body: list[ast.stmt]) -> list[str]:
-    """Literal `name` values of every `checks.append({...})` dict in `body`."""
-    out: list[str] = []
-    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-            continue
-        if node.func.attr != "append":
-            continue
-        for arg in node.args:
-            if not isinstance(arg, ast.Dict):
-                continue
-            for k, v in zip(arg.keys, arg.values):
-                if isinstance(k, ast.Constant) and k.value == "name" and isinstance(v, ast.Constant):
-                    out.append(v.value)
-    return out
+hc = _load()
 
 
-def _statuses(body: list[ast.stmt], for_name: str) -> list[str]:
-    out: list[str] = []
-    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
-        if not isinstance(node, ast.Dict):
-            continue
-        pairs = {k.value: v for k, v in zip(node.keys, node.values)
-                 if isinstance(k, ast.Constant)}
-        nm, st = pairs.get("name"), pairs.get("status")
-        if isinstance(nm, ast.Constant) and nm.value == for_name and isinstance(st, ast.Constant):
-            out.append(st.value)
-    return out
+class MenubarAppStateTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.dev = root / "dev" / "Sutando"
+        self.app = root / "app" / "Sutando"
+        self.plist = root / "com.sutando.menubar.plist"
+        self.chips = root / "contextual-chips.json"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _touch(self, p: Path):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+
+    # --- the control the review asked for --------------------------------
+
+    def test_a_HEADLESS_host_is_not_unhealthy(self):
+        # Linux/cloud core: no binaries, no plist, not macOS. The OSS core is
+        # deliberately headless, so this is a supported install, not a fault.
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=False),
+            "not-applicable")
+
+    def test_macos_without_the_optional_app_is_not_unhealthy(self):
+        # An operator who simply never installed the menu-bar app.
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=True),
+            "not-applicable")
+
+    # --- but a configured host must stay visible --------------------------
+
+    def test_a_host_that_ASKED_for_the_app_and_lacks_it_is_flagged(self):
+        # launchd job installed, binary gone: that is a broken install, and the
+        # bug this file exists for is that it used to emit no row at all.
+        self._touch(self.plist)
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=True),
+            "expected-missing")
+
+    def test_a_plist_on_a_non_macos_host_is_still_not_applicable(self):
+        self._touch(self.plist)
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=False),
+            "not-applicable")
+
+    # --- present in either location -> the existing probe runs -------------
+
+    def test_dev_build_present_is_installed(self):
+        self._touch(self.dev)
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=True),
+            "installed")
+
+    def test_installed_bundle_present_is_installed(self):
+        self._touch(self.app)
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=False),
+            "installed")
+
+    def test_installed_wins_over_a_stale_plist(self):
+        self._touch(self.plist)
+        self._touch(self.dev)
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=True),
+            "installed")
 
 
-class SutandoAppAbsentTest(unittest.TestCase):
-    def test_the_guard_has_an_else_branch(self):
-        # Without it the probe is simply absent from the report, and absence
-        # is the one outcome a "No failures" summary cannot distinguish.
-        self.assertTrue(_guard_node().orelse,
-                        "no else on the sutando-app guard: when neither binary "
-                        "exists the report omits the row entirely")
+    # --- the OTHER install path: app run without launchd ------------------
 
-    def test_the_else_emits_a_sutando_app_row(self):
-        names = _appended_check_names(_guard_node().orelse)
-        self.assertIn("sutando-app", names,
-                      f"else branch appends {names or 'nothing'} — the row must exist "
-                      "so 'not checked' is visible")
+    def test_a_RECENT_chips_file_means_the_app_ran_here(self):
+        # This host runs the app with no launchd plist, so plist-only would
+        # leave exactly this configuration silent.
+        self._touch(self.chips)
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips,
+                                 is_macos=True),
+            "expected-missing")
 
-    def test_that_row_is_NOT_ok(self):
-        # An 'ok' here would be worse than silence: it asserts health for a
-        # thing that was never looked at.
-        sts = _statuses(_guard_node().orelse, "sutando-app")
-        self.assertTrue(sts, "no status literal for the sutando-app row")
-        for s in sts:
-            self.assertNotEqual(s, "ok", "unchecked state must not report ok")
+    def test_a_STALE_chips_file_stops_nagging(self):
+        # Deliberate uninstall: the marker ages out instead of warning forever.
+        self._touch(self.chips)
+        import os
+        old = self.chips.stat().st_mtime - (30 * 86400)
+        os.utime(self.chips, (old, old))
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips,
+                                 is_macos=True),
+            "not-applicable")
 
-    def test_the_detail_names_both_paths_it_looked_for(self):
-        # A warn that doesn't say where it looked sends the reader to grep.
-        body = ast.get_source_segment(SRC.read_text(encoding="utf-8"),
-                                      _guard_node()) or ""
-        _, _, tail = body.partition("\n    else:")
-        self.assertIn("dev_bin", tail, "detail should name the dev-build path")
-        self.assertIn("app_bin", tail, "detail should name the installed-bundle path")
+    def test_chips_on_a_non_macos_host_is_still_not_applicable(self):
+        self._touch(self.chips)
+        self.assertEqual(
+            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips,
+                                 is_macos=False),
+            "not-applicable")
+
+
+class CallSiteTest(unittest.TestCase):
+    """The pure function is useless if run_all_checks stops consulting it."""
+
+    src = SRC.read_text(encoding="utf-8")
+
+    def _guard(self) -> ast.If:
+        for node in ast.walk(ast.parse(self.src)):
+            if isinstance(node, ast.If):
+                names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+                if "_menubar" in names:
+                    return node
+        raise AssertionError("run_all_checks no longer branches on _menubar")
+
+    def test_the_call_site_branches_on_the_state(self):
+        self.assertTrue(self._guard().orelse, "no expected-missing branch")
+
+    def test_not_applicable_emits_NO_row(self):
+        # The whole point of the fix: silence is correct here and only here.
+        tail = self.src.split("_menubar ==")[-1]
+        block = tail.split("# Battery and memory health checks")[0]
+        self.assertNotIn("not-applicable", block,
+                         "not-applicable must fall through without appending a check")
+
+    def test_expected_missing_emits_a_non_ok_row(self):
+        self.assertIn('"expected-missing"', self.src)
+        seg = self.src.split('elif _menubar == "expected-missing":')[1][:600]
+        self.assertIn('"sutando-app"', seg)
+        self.assertIn('"warn"', seg)
 
 
 if __name__ == "__main__":

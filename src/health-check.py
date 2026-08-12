@@ -7111,6 +7111,35 @@ def check_core_model_pin() -> dict:
     return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 
+MENUBAR_LABEL = "com.sutando.menubar"
+MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
+MENUBAR_RECENT_S = 7 * 86400
+
+
+def menubar_app_state(dev_bin, app_bin, plist, chips, is_macos: bool,
+                      now: float | None = None,
+                      recent_s: int = MENUBAR_RECENT_S) -> str:
+    """installed | expected-missing | not-applicable for the optional menu-bar app.
+
+    Only a host that asked for the app can be MISSING it — a headless install
+    has neither signal, so absence there is a configuration, not a fault.
+    """
+    if dev_bin.exists() or app_bin.exists():
+        return "installed"
+    if not is_macos:
+        return "not-applicable"
+    if plist.exists():
+        return "expected-missing"
+    # The app is the sole writer of contextual-chips.json, so a RECENT one means
+    # it ran here; ageing it out stops a deliberate uninstall nagging forever.
+    try:
+        if (now or time.time()) - chips.stat().st_mtime < recent_s:
+            return "expected-missing"
+    except OSError:
+        pass
+    return "not-applicable"
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -7476,7 +7505,11 @@ def run_all_checks() -> list[dict]:
     # the menu bar check to run so dashboard reports accurate status.
     dev_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     app_bin = Path("/Applications/Sutando.app/Contents/MacOS/Sutando")
-    if dev_bin.exists() or app_bin.exists():
+    _menubar = menubar_app_state(
+        dev_bin, app_bin, MENUBAR_PLIST,
+        status_read_path("contextual-chips.json", WORKSPACE_DIR),
+        sys.platform == "darwin")
+    if _menubar == "installed":
         # Distinguish pgrep failures (exit code != 0 and != 1) from a real
         # no-match (exit code 1). Pre-fix the bare try/except swallowed
         # subprocess errors AND empty results into a single "no pids" path,
@@ -7532,13 +7565,12 @@ def run_all_checks() -> list[dict]:
             # actually couldn't determine state. Surface as a transient warn
             # with the cause so it's debuggable, not a routine "app is down."
             checks.append({"name": "sutando-app", "status": "warn", "detail": f"detection failed (pgrep: {pgrep_err or 'unknown error'}) — actual app state unknown"})
-    else:
-        # Neither path exists, so the probe never ran. Emitting nothing here
-        # made "not checked" indistinguishable from "checked and fine".
+    elif _menubar == "expected-missing":
+        # Only a host that ASKED for the app can be missing it; a headless
+        # install has no plist and gets no row, like check_gateway_bridge().
         checks.append({"name": "sutando-app", "status": "warn", "detail": (
-            "not checked — no binary at either path, so app state is UNKNOWN, not ok. "
-            f"Looked for: {dev_bin} (dev build) and {app_bin} (installed bundle). "
-            "Build the dev binary or install the bundle to make this probe meaningful.")})
+            f"launchd job {MENUBAR_LABEL} is installed but no binary exists at "
+            f"{dev_bin} or {app_bin} — app state UNKNOWN, not ok")})
 
     # Battery and memory health checks
 
