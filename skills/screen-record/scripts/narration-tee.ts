@@ -12,24 +12,8 @@
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
-// ffmpeg was hardcoded as /opt/homebrew/bin/ffmpeg at both mux call sites. That
-// prefix is Apple-Silicon Homebrew only — Intel installs under /usr/local, and a
-// host without Homebrew has neither. Both sites sit inside try/catch, so on such
-// a host recording still starts and stops but NO *-narrated.mov is ever produced:
-// the narration is captured and then silently discarded at the mux.
-//
-// Resolve through PATH rather than a candidate list of absolute paths — the TS
-// half of the same change made in record.py, kept identical on purpose so the
-// two halves of one skill cannot drift.
-//
-// The list this replaces named `/opt/homebrew/bin/ffmpeg` and
-// `/usr/local/bin/ffmpeg` literally, which REVIEW.md's hardcoded-path scan
-// denies. `command -v` is the shell equivalent of Python's `shutil.which()`
-// (Node has no built-in), and it resolves via PATH with no machine-specific
-// literal left to exempt.
-//
-// Falls back to the bare name so a missing ffmpeg fails at exec time with a
-// readable error, exactly as the old final candidate did.
+// `command -v` is Node's stand-in for shutil.which(); mirrors record.py so the
+// two halves of one skill cannot drift. Bare-name fallback fails at exec time.
 const FFMPEG = (() => {
 	try {
 		const found = execFileSync('/usr/bin/env', ['sh', '-c', 'command -v ffmpeg'], {

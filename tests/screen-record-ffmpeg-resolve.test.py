@@ -1,30 +1,6 @@
 #!/usr/bin/env python3
-"""Process-boundary evidence for the screen-record ffmpeg resolver (#2368).
-
-The three call sites in `skills/screen-record/scripts/record.py` used to hardcode
-`/opt/homebrew/bin/ffmpeg`. Two of them fail SILENTLY when that path is absent:
-`_list_audio_devices()` swallows the exception and returns `[]`, and the
-volumedetect guard sits inside `except Exception: pass` — so the very warning it
-exists to emit can never fire. Only `start()` surfaced anything.
-
-Static resolver assertions cannot show that. This runs the REAL functions against
-a REAL child process and asserts the resolved binary is actually executed.
-
-Fixture design follows the pattern @john-the-dev accepted on #2475 (the sibling
-"resolve python instead of hardcoding" fix): a SELF-CONTAINED `/bin/sh` fake, so
-the test never depends on an ambient `ffmpeg` and passes on a host that has none.
-His approval there recorded the reasoning verbatim — "I did not reproduce on a
-physical no-CLT macOS host, so the controlled process-boundary tests remain the
-evidence for that environment."
-
-The discriminator that matters: the fake is installed on a temp PATH entry that is
-**not** `/opt/homebrew/bin`. On the pre-fix code the hardcoded literal cannot see
-it, so the audio path returns `[]` and these tests fail. A resolved value equal to
-the removed literal would prove nothing; a resolved value somewhere else proves
-resolution.
-
-Run: python3 tests/screen-record-ffmpeg-resolve.test.py
-"""
+"""Process-boundary evidence for the screen-record ffmpeg resolver: a self-contained
+/bin/sh fake on a temp PATH entry, so the pre-fix hardcode cannot see it."""
 import importlib.util
 import os
 import subprocess
@@ -90,9 +66,8 @@ def main():
     os.environ["PATH"] = f"{tmp}:{orig_path}"
     rec = load_record()
 
-    # getattr, not attribute access: on the PRE-FIX code there is no module-level
-    # FFMPEG at all, and a hard AttributeError would abort before the BEHAVIOURAL
-    # checks below — which are the ones that actually demonstrate the bug.
+    # getattr: pre-fix there is no module-level FFMPEG, and an AttributeError
+    # would abort before the behavioural checks that demonstrate the bug.
     resolved = getattr(rec, "FFMPEG", None)
     ok("resolves the ffmpeg that is actually on PATH", resolved == str(fake),
        f"got {resolved!r}")
@@ -112,12 +87,8 @@ def main():
     ok("_pick_audio_device() returns a real index, not None", picked is not None,
        f"got {picked!r}")
 
-    # volumedetect: the guard lives inline inside stop() under `except: pass`,
-    # so exercise the same command shape it runs and assert the parse it depends on.
-    # Use the module's OWN resolved value with no fallback. An earlier draft wrote
-    # `resolved or "ffmpeg"`, which made this assertion pass on the pre-fix code too
-    # (it silently used the PATH fake instead of the hardcode) — an assertion that
-    # passes in both directions is decoration, not evidence.
+    # stop()'s volumedetect guard is inline under `except: pass`, so run its
+    # command shape. No `or "ffmpeg"` fallback — that would pass pre-fix too.
     try:
         r = subprocess.run([resolved, "-i", "x.mov", "-af", "volumedetect",
                             "-vn", "-f", "null", "/dev/null"],
