@@ -25,10 +25,8 @@ _MAX_AGE_S_DEFAULT = 300.0
 
 
 class ReactObserverHandler:
-    """Tee wrapper: react 👀 to others' new messages, then delegate offer().
-
-    `react(room_id, message_id, key)` is injected by the adapter edge — this
-    module owns receipt policy only, never the room-verb endpoint surface."""
+    """Tee: react 👀 to others' new messages, then delegate offer(). `react` is
+    injected by the adapter edge; this module never names the room-verb endpoint."""
 
     def __init__(self, inner, react, agent_mxid: str, log=print,
                  queue_cap: int = _QUEUE_CAP, max_age_s: "float | None" = None):
