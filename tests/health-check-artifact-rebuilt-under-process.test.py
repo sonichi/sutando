@@ -1,50 +1,19 @@
 #!/usr/bin/env python3
-"""
-Tests for the ARTIFACT-VS-PROCESS comparison in `mark_stale_if_outdated`
-(`src/health-check.py`) — "the binary was rebuilt after the process that
-executes it started, so the running process is not the deployed code."
-
-The helper already had two comparisons, and both use source mtime as the
-reference point:
-
-    src_mtime - bin_mtime   > threshold  -> "rebuild needed"
-    src_mtime - proc_start  > threshold  -> "restart needed"
-
-`bin_mtime - proc_start` did not exist. For a compiled/bundled service
-that is what actually matters: the process executes the ARTIFACT, so a
-deploy that refreshes the artifact without touching source is invisible
-to both comparisons — the first yields a negative (binary NEWER than
-source) and the second never fires (source untouched). "Deployed" reads
-as "running".
-
-Observed 2026-08-11 on this host: `dist/credential-proxy.js` was
-refreshed at 11:30:38 under a proxy process that had started ~11:28.
-The source `.ts` was untouched from an earlier day, so health-check
-reported the service healthy while it was executing the pre-deploy
-artifact.
+"""Regression test: `mark_stale_if_outdated` must compare the ARTIFACT against
+the process start, not only source-vs-binary and source-vs-process.
 
 Cases:
   a) artifact rebuilt AFTER the process started    -> stale, "restart needed"
-  b) artifact rebuilt BEFORE the process started
-     (the normal deploy-then-restart order)        -> ok
-  c) rebuild lands within `artifact_threshold_sec`
-     of the start (build finishing just after a
-     launch)                                       -> ok
+  b) artifact rebuilt BEFORE the process started   -> ok
+  c) rebuild within `artifact_threshold_sec`       -> ok
   d) `binary_path` is None (the tsx callers)       -> comparison skipped
   e) the artifact vanishes between `exists()` and
-     `stat()` (an atomic deploy renaming over it)  -> no crash, falls
-                                                     through to the
-                                                     source comparison
+     `stat()`                                      -> confined; the source
+                                                     comparison still decides
 
-(a) is the new behavior: it FAILS on the parent commit, where the branch
-does not exist. (b)-(d) are the guard rails that keep it from being a
-blanket flag.
-
-Sibling suite: `tests/health-check-compiled-artifact-stale.test.py`
-covers the OTHER compiled-artifact comparison (binary older than source
--> "rebuild needed") and its git content cross-check. That suite stubs
-pgrep to return no PIDs, so it short-circuits before the code under test
-here; this file stubs pgrep and `ps` to present a live process instead.
+Sibling suite `tests/health-check-compiled-artifact-stale.test.py` covers the
+binary-older-than-source comparison; it stubs pgrep to return no PIDs, so it
+short-circuits before the code under test here.
 
 Run: python3 tests/health-check-artifact-rebuilt-under-process.test.py
 Exit 0 on pass, 1 on fail.
@@ -89,15 +58,8 @@ def _set_mtime(p: Path, ts: float) -> None:
 
 
 class _BinaryThatVanishes:
-    """`binary_path` whose FIRST stat succeeds and whose every later stat
-    raises, while `exists()` keeps answering truthfully — an atomic deploy
-    renaming over the target between the artifact block's own two calls.
-
-    Patching `Path.stat` cannot express this: whether `Path.exists()` bottoms
-    out through `Path.stat` is a CPython detail that changed in 3.14, so the
-    patch either raises inside `exists()` (which swallows OSError, returns
-    False, and skips the branch under test) or lands on a different call.
-    """
+    """`binary_path` whose FIRST stat succeeds and whose every later stat raises,
+    while `exists()` keeps answering truthfully — what an atomic deploy does."""
 
     def __init__(self, real: Path):
         self._real = real
@@ -136,9 +98,8 @@ class ArtifactRebuiltUnderProcessTests(unittest.TestCase):
         self.addCleanup(self._patch.stop)
 
         self.now = time.time()
-        # Source is old and untouched — that is the whole point. If source
-        # were newer than proc_start the pre-existing comparison would flag
-        # anyway and these cases would not isolate the artifact check.
+        # Source must stay older than proc_start, or the pre-existing
+        # comparison flags anyway and these cases isolate nothing.
         self.src = self.repo / "src" / "proxy.ts"
         self.src.parent.mkdir(parents=True, exist_ok=True)
         self.src.write_text("export const x = 1\n")
@@ -151,12 +112,8 @@ class ArtifactRebuiltUnderProcessTests(unittest.TestCase):
         self.proc_start = self.now - 2 * 3600
 
     def _fake_run(self, cmd, *args, **kwargs):
-        """Present one live PID that belongs to this checkout.
-
-        `_filter_pids_this_checkout` probes `ps -o command=` first and keeps
-        a PID whose argv contains `<REPO_DIR>/`, so the argv answer must be
-        repo-rooted or the PID is dropped and the whole branch is skipped.
-        """
+        """Present one live PID that belongs to this checkout: the argv answer
+        must be repo-rooted or `_filter_pids_this_checkout` drops the PID."""
         joined = " ".join(str(c) for c in cmd)
         if "pgrep" in str(cmd[0]):
             return subprocess.CompletedProcess(cmd, 0, stdout=FAKE_PID + "\n", stderr="")
@@ -203,24 +160,8 @@ class ArtifactRebuiltUnderProcessTests(unittest.TestCase):
         check = self._run(binary_path=None)
         self.assertEqual(check["status"], "ok")
 
-    # (e) the artifact disappears between the artifact block's own
-    # `exists()` and its `stat()` — what an atomic deploy (write tmp, rename
-    # over the target) does to a concurrent reader.
-    #
-    # The property is stateful, not ordinal: once the artifact block's OWN
-    # stat raises, the failure must stay confined to the artifact check and
-    # the source comparison must still return its verdict. Source is made
-    # NEWER than the process so that verdict is observable — the function's
-    # outer handler also catches OSError, so without the inner `except` the
-    # error unwinds past the SOURCE comparison too and the service reads
-    # "ok". "stale" vs "ok" is exactly the difference the guard makes.
-    #
-    # An earlier version counted `Path.stat` calls and raised on the 4th.
-    # That ordinal is a CPython implementation detail: on 3.14 the helper
-    # reaches only 2, so the count assertion failed AND — worse — the OSError
-    # never fired, leaving the guard uncovered. `.raised` below asserts the
-    # inner `except` was actually entered, which is the thing the count was
-    # standing in for.
+    # Without the inner `except`, the OSError unwinds past the SOURCE
+    # comparison too and the service reads "ok" — that is the difference here.
     def test_artifact_vanishing_between_exists_and_stat_is_confined(self):
         _set_mtime(self.binary, self.proc_start + 3600)
         _set_mtime(self.src, self.proc_start + 3600)

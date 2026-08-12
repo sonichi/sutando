@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
-"""
-Tests for `check_credential_proxy` (`src/health-check.py`) — the live caller
-of the artifact-vs-process comparison.
+"""Tests for `check_credential_proxy` (`src/health-check.py`) — the live caller
+of the artifact-vs-process comparison, which the sibling suite cannot pin.
 
-The comparison itself is covered by
-`tests/health-check-artifact-rebuilt-under-process.test.py`. That suite proves
-the branch WORKS; it cannot prove anything CALLS it. Before this wiring the
-only `binary_path=` caller was the Sutando app check, so the incident the
-comparison was written for — `dist/credential-proxy.js` refreshed under a
-running proxy — still reported healthy.
-
-The artifact is passed only when the running process executes it. A bundled
-host runs `node <repo>/dist/credential-proxy.js`; a dev host runs the `.ts`
-through tsx and may hold an old build it never executes, where "binary older
-than source" would be a false "rebuild needed".
+The artifact is passed only when the running process executes it: a dev host
+runs the `.ts` through tsx and may hold a build it never executes.
 
 Cases:
   a) bundled proxy, artifact rebuilt after start -> stale, "restart needed"
-     (end-to-end through the real helper)
   b) bundled proxy -> the artifact is what gets passed
   c) dev/tsx proxy -> binary_path is None
   d) proxy down    -> warn "not running (optional)", no staleness check

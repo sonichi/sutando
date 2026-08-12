@@ -3119,16 +3119,13 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         # Pick the OLDEST start time — the tsx wrapper spawns a child node
         # process; we want the parent's launch time, not the child's.
         proc_start = min(starts)
-        # A compiled service executes the ARTIFACT, so src-vs-process is blind
-        # to a deploy that refreshes the artifact without touching source --
-        # which is exactly what an app-bundle update does.
+        # A compiled service executes the ARTIFACT, so src-vs-process cannot see
+        # a deploy that refreshes the artifact without touching source.
         if binary_path is not None and binary_path.exists():
             try:
                 bin_mtime = binary_path.stat().st_mtime
-                # Separate, much smaller threshold: `threshold_sec` tolerates
-                # `git checkout` mtime bumps on tracked source, but a build
-                # artifact is written by a build/deploy, never by a branch
-                # switch, so that tolerance would only hide real redeploys.
+                # Smaller than the source threshold, which exists to absorb
+                # `git checkout` mtime bumps -- those never touch an artifact.
                 if bin_mtime - proc_start > artifact_threshold_sec:
                     age_min = int((bin_mtime - proc_start) / 60)
                     check["status"] = "stale"
@@ -7001,11 +6998,7 @@ def check_core_model_pin() -> dict:
 
 def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
     """True when a live process matching `pgrep_pattern` has `artifact` in argv.
-
-    Bundled installs exec the compiled artifact; dev installs run the source
-    through tsx. A dev host can hold a build it never executes, so the
-    artifact comparison is gated on the running process, not on the file.
-    """
+    A dev host can hold a build it never executes, so gate on the process."""
     if not artifact.exists():
         return False
     try:
@@ -7018,19 +7011,8 @@ def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
 
 
 def check_credential_proxy() -> dict:
-    """Credential proxy (port 7846) — the OAuth-injection + quota-header path.
-
-    Plain TCP-listening check (probe=False): it's a forwarding proxy with no
-    liveness endpoint, so an HTTP probe would be forwarded upstream and misread
-    as "wedged". Optional (not every node routes through it) -> down is a
-    warning, not a failure.
-
-    The proxy is the service the artifact-vs-process comparison exists for: a
-    bundled host runs `node dist/credential-proxy.js`, so a redeploy under the
-    live process leaves it executing pre-deploy code while every other signal
-    reads healthy. The artifact is passed only when the running process is the
-    one executing it.
-    """
+    """Credential proxy (port 7846). probe=False: a forwarding proxy has no
+    liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
     check = check_port(7846, "credential-proxy", probe=False)
     if check["status"] == "down":
         check["status"] = "warn"
