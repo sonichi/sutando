@@ -462,11 +462,23 @@ def archive_file(src: "Path", kind: str, task_id: str) -> bool:
     except Exception as e:
         print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
     try:
-        # Never delete: a stale file is recoverable, a deleted one is not. But
-        # the suffix must leave the *.txt glob, or it is polled again forever.
-        src.rename(src.with_suffix(src.suffix + ".archive-failed"))
-        print(f"  archive_file({kind}, {task_id}) quarantined as "
-              f"{src.name}.archive-failed", flush=True)
+        # Never delete, and never overwrite: rename() replaces an existing file
+        # on POSIX, so a repeated id would destroy the earlier quarantine.
+        base = src.with_suffix(src.suffix + ".archive-failed")
+        dest, n = base, 0
+        while dest.exists():
+            n += 1
+            dest = base.with_name(f"{base.name}.{n}")
+        # link() REFUSES an existing dest, so a lost race errors instead of
+        # clobbering; the suffix leaves the *.txt glob so it stops being polled.
+        os.link(str(src), str(dest))
+    except Exception as e:
+        print(f"  archive_file({kind}, {task_id}) STILL in the live queue, "
+              f"expect reprocessing: {e}", flush=True)
+        return False
+    try:
+        src.unlink()
+        print(f"  archive_file({kind}, {task_id}) quarantined as {dest.name}", flush=True)
         return True
     except Exception as e:
         print(f"  archive_file({kind}, {task_id}) STILL in the live queue, "
@@ -4672,10 +4684,13 @@ async def poll_results():
                 # archive_file() finishing. See DELIVERED_DIR docstring.
                 if _is_delivered(task_id):
                     print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
-                    archive_file(result_file, "results", task_id)
+                    _gone = archive_file(result_file, "results", task_id)
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
-                    _clear_delivered(task_id)
+                    # A result still under its live *.txt name re-enters this
+                    # loop; the sentinel is all that stops a second send.
+                    if _gone:
+                        _clear_delivered(task_id)
                     continue
 
                 try:
@@ -4879,14 +4894,15 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
-                archive_file(result_file, "results", task_id)
+                _gone = archive_file(result_file, "results", task_id)
                 # find_task_file, not a reconstructed bare name: a claimed
                 # task is `<id>.claimed-core-N.txt` and would strand forever.
                 task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
-                # Delivery succeeded + archived — sentinel has served its
-                # purpose; remove it to bound `discord-delivered/` growth.
-                _clear_delivered(task_id)
+                # Clear only once the result has actually left the live queue —
+                # otherwise the sentinel is the only guard against a resend.
+                if _gone:
+                    _clear_delivered(task_id)
             else:
                 # CONSECUTIVE means consecutive: an absent file breaks the run, or a
                 # writer that retries accumulates counts across separate appearances.

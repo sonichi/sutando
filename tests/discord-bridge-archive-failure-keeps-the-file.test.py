@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """A failed archive must not destroy the task, nor silently re-enter the queue.
-
-`archive_file()` used to `unlink()` its source whenever the move raised, deleting
-the file whose preservation is the reason archiving exists. Simply leaving it
-instead makes it poll forever, so the failure path now quarantines it off the
-`*.txt` glob.
-"""
+Quarantine must not overwrite an earlier one, and callers must honour False."""
 from pathlib import Path
 import ast
 import os
@@ -31,7 +26,7 @@ def _load(tasks_archive, results_archive):
     missing = wanted - {n.name for n in body}
     if missing:
         raise AssertionError(f"not found in {SRC}: {sorted(missing)}")
-    ns = {"Path": Path, "ARCHIVE_TASKS_DIR": tasks_archive,
+    ns = {"Path": Path, "os": os, "ARCHIVE_TASKS_DIR": tasks_archive,
           "ARCHIVE_RESULTS_DIR": results_archive}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SRC), "exec"), ns)
     return ns["archive_file"]
@@ -83,15 +78,20 @@ class ArchiveFailureIsNotDeletion(unittest.TestCase):
                          ["task-3.txt.archive-failed"])
 
     def test_returns_False_only_when_it_is_still_live(self):
-        """Quarantine can fail too — then the caller is owed the truth."""
-        src = self.d / "task-4.txt"
+        """Quarantine can fail too — then the caller is owed the truth. A
+        read-only parent blocks the link; a taken name no longer does, since the
+        collision loop routes around it."""
+        sub = self.d / "ro"
+        sub.mkdir()
+        src = sub / "task-4.txt"
         src.write_text("body")
-        # An occupied non-empty directory at the target makes rename() raise.
-        blocker = self.d / "task-4.txt.archive-failed"
-        blocker.mkdir()
-        (blocker / "occupied").write_text("x")
-        self.assertFalse(self._broken()(src, "tasks", "task-4"))
-        self.assertTrue(src.exists(), "still live, and still not deleted")
+        fn = self._broken()
+        os.chmod(sub, 0o500)
+        try:
+            self.assertFalse(fn(src, "tasks", "task-4"))
+            self.assertTrue(src.exists(), "still live, and still not deleted")
+        finally:
+            os.chmod(sub, 0o700)
 
     def test_absent_source_reports_success(self):
         fn = _load(self.d / "arch-tasks", self.d / "arch-results")
@@ -105,12 +105,64 @@ class ArchiveFailureIsNotDeletion(unittest.TestCase):
         self.assertEqual(len(list((self.d / "arch-results").rglob("task-6.txt"))), 1)
         self.assertEqual(len(list((self.d / "arch-tasks").rglob("*.txt"))), 0)
 
-    def test_archive_file_never_unlinks(self):
+    def test_quarantine_never_overwrites_an_earlier_one(self):
+        """rename() replaces an existing file on POSIX; a repeated task id would
+        destroy the only preserved copy."""
+        src = self.d / "task-7.txt"
+        src.write_text("new")
+        prior = self.d / "task-7.txt.archive-failed"
+        prior.write_text("old")
+        self.assertTrue(self._broken()(src, "tasks", "task-7"))
+        self.assertEqual(prior.read_text(), "old",
+                         "the earlier quarantine must survive intact")
+        survivors = sorted(p.name for p in self.d.glob("task-7.txt.archive-failed*"))
+        self.assertEqual(survivors,
+                         ["task-7.txt.archive-failed", "task-7.txt.archive-failed.1"])
+        self.assertEqual((self.d / "task-7.txt.archive-failed.1").read_text(), "new")
+
+    def test_archive_file_never_unlinks_its_source_before_a_copy_exists(self):
+        """It may unlink only after the hard link is in place — an unlink that
+        can run on the failure path is the deletion bug returning."""
         text = SRC.read_text()
         start = text.index("def archive_file(")
         end = text.index("\ndef ", start + 1)
-        self.assertNotIn("unlink", text[start:end],
-                         "archive_file must never delete its source")
+        body = text[start:end]
+        self.assertIn("os.link(", body, "quarantine must link before unlinking")
+        self.assertLess(body.index("os.link("), body.index("src.unlink()"),
+                        "unlink must come after the link, never before")
+
+
+class CallersHonourTheReturn(unittest.TestCase):
+    """A False return that every caller discards is not a contract."""
+
+    def test_delivery_sentinel_clears_only_when_the_result_is_gone(self):
+        tree = ast.parse(SRC.read_text())
+        clears = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id == "_clear_delivered"]
+        gated = [c for n in ast.walk(tree)
+                 if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+                 and n.test.id == "_gone"
+                 for c in ast.walk(ast.Module(body=n.body, type_ignores=[]))
+                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                 and c.func.id == "_clear_delivered"]
+        self.assertGreaterEqual(len(clears), 2)
+        self.assertEqual(len(gated), len(clears),
+                         "every _clear_delivered must sit behind `if _gone:` — "
+                         "clearing while the result is still live permits a resend")
+
+    def test_the_gate_reads_the_RESULT_archive(self):
+        tree = ast.parse(SRC.read_text())
+        assigns = [n for n in ast.walk(tree)
+                   if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "_gone" for t in n.targets)
+                   and isinstance(n.value, ast.Call)
+                   and getattr(n.value.func, "id", None) == "archive_file"
+                   and n.value.args
+                   and getattr(n.value.args[0], "id", None) == "result_file"]
+        self.assertGreaterEqual(len(assigns), 2,
+                                "each gated site needs its own "
+                                "`_gone = archive_file(result_file, ...)`")
 
 
 if __name__ == "__main__":
