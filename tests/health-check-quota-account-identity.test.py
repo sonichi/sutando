@@ -241,6 +241,28 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         self.assertIn("com.sutando.credential-proxy.plist", out["detail"])
         self.assertIn("reload", out["detail"].lower())
 
+    def test_warn_does_not_assert_a_billing_outcome_it_cannot_observe(self):
+        """The check reads item NAMES; it never reads a token. So it cannot know
+        whether the proxy's item is injectable, and the proxy only bills that
+        account when it is: credential-proxy.ts injects on `verdict === 'ok'`
+        and otherwise forwards the client's own credential untouched. Stating
+        the billing outcome flatly sends an operator after a charge that, in the
+        pass-through case, is on their own account — while the real fault (a
+        proxy permanently degraded to pass-through, caching nothing) goes
+        unnamed. Name both outcomes, or name neither."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=None,
+                        existing_services={_scoped(core), VANILLA})
+        detail = out["detail"]
+        self.assertNotIn(
+            "Quota numbers describe the proxy's account, not yours", detail,
+            "the billing consequence is conditional on the proxy's token being "
+            "injectable, which this check cannot observe")
+        self.assertIn(
+            "pass-through", detail.lower(),
+            "the other outcome — stored token unusable, client credential "
+            "forwarded — must be named too")
+
     # ---- agreement cases: must NOT warn -----------------------------------
 
     def test_matching_config_dirs_ok(self):

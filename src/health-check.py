@@ -4258,11 +4258,16 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
         "name": name,
         "status": "warn",
         "detail": (
-            f"the credential proxy injects a DIFFERENT login than this core's: proxy "
-            f"resolves '{proxy_service}', core would resolve '{core_service}'. Quota "
-            f"numbers describe the proxy's account, not yours, and requests bill it — "
-            f"a `/login` here will not reach the proxy. Cause is almost always the "
-            f"launchd plist omitting CLAUDE_CONFIG_DIR (launchd inherits no shell env): "
+            f"the credential proxy resolves a DIFFERENT login than this core's: proxy "
+            f"resolves '{proxy_service}', core would resolve '{core_service}'. Which of "
+            f"two things follows turns on whether the proxy's stored token is usable, "
+            f"which this check does not read: usable, the proxy injects it — quota "
+            f"numbers then describe that account, requests bill it, and a `/login` here "
+            f"will not reach the proxy; unusable, the proxy engages pass-through and "
+            f"forwards this core's own credential untouched — the mismatch stays latent "
+            f"but the proxy caches nothing, which is the only reason it runs. Either way "
+            f"the cause is almost always the launchd plist omitting CLAUDE_CONFIG_DIR "
+            f"(launchd inherits no shell env): "
             f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
             f"Fix: pin CLAUDE_CONFIG_DIR in "
             f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
