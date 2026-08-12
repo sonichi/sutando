@@ -13,18 +13,12 @@ bad()  { echo "FAIL $1"; fail=$((fail+1)); }
 TMPD="$(mktemp -d -t handoff-compaction.XXXXXX)"
 trap 'rm -rf "$TMPD"' EXIT
 
-run_handoff() {
-    # Point the script at a throwaway workspace, never the real one.
-    local ws="$1"; shift
-    mkdir -p "$ws"
-    cat > "$TMPD/sutando.config.local.json" <<JSON
-{"workspace": "$ws"}
-JSON
-    ( cd "$REPO" && SUTANDO_REPO_DIR="$REPO" \
-        SUTANDO_CONFIG_FILE="$TMPD/sutando.config.local.json" \
-        SUTANDO_WORKSPACE_OVERRIDE="$ws" \
-        bash "$SCRIPT" "${1:-/nonexistent/transcript.jsonl}" ) >/dev/null 2>&1
-}
+# NOTE ON COVERAGE, deliberately stated rather than papered over: nothing here
+# runs session-handoff.sh end to end. There is no verified way to point it at a
+# throwaway workspace -- a temp repo carrying its own sutando.config.local.json
+# still resolved to the LIVE workspace when measured, so a harness that "ran the
+# script" would write into the owner's real state/. The checks below are
+# structural about the call site plus behavioural about the function body.
 
 # --- the function exists and is CALLED, not merely defined --------------------
 if grep -q "record_compaction_event()" "$SCRIPT"; then
@@ -32,11 +26,32 @@ if grep -q "record_compaction_event()" "$SCRIPT"; then
 else
     bad "record_compaction_event is not defined"
 fi
-# A definition with no call site is the defect this whole change is about.
-if grep -qE '^record_compaction_event "' "$SCRIPT"; then
-    ok "record_compaction_event is invoked at top level"
+
+# A definition with no call site is the defect this whole change is about, so a
+# bare grep is not enough: it matches a call nested inside a function or an if.
+# Require the call AFTER the definition's closing brace and at column 0.
+DEF_LINE=$(grep -n "^record_compaction_event() {" "$SCRIPT" | head -1 | cut -d: -f1)
+END_LINE=$(awk -v s="$DEF_LINE" 'NR>s && /^}/ {print NR; exit}' "$SCRIPT")
+CALL_LINE=$(grep -nE '^record_compaction_event "' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$CALL_LINE" ]; then
+    ok "record_compaction_event has a column-0 call site (line $CALL_LINE)"
 else
     bad "record_compaction_event is defined but never called"
+fi
+if [ -n "$CALL_LINE" ] && [ -n "$END_LINE" ] && [ "$CALL_LINE" -gt "$END_LINE" ]; then
+    ok "the call is outside the definition (def ends $END_LINE, call $CALL_LINE)"
+else
+    bad "call site is not after the function body — it may be nested/unreached"
+fi
+# Column 0 rules out `if ...; then <indented call>`, but not a top-level `if`
+# wrapping it. Assert no unclosed conditional opens between the body and the call.
+BETWEEN=$(awk -v a="$END_LINE" -v b="$CALL_LINE" 'NR>a && NR<b' "$SCRIPT" 2>/dev/null)
+OPENS=$(printf '%s\n' "$BETWEEN" | grep -cE '^(if|case|while|until|for) ' || true)
+CLOSES=$(printf '%s\n' "$BETWEEN" | grep -cE '^(fi|esac|done)$' || true)
+if [ "${OPENS:-0}" -le "${CLOSES:-0}" ]; then
+    ok "no unclosed conditional between the body and the call (opens=$OPENS closes=$CLOSES)"
+else
+    bad "an unclosed conditional precedes the call — it may not run unconditionally"
 fi
 
 # --- it writes under state/, not the workspace root ---------------------------
