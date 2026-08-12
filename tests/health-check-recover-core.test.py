@@ -1,39 +1,5 @@
 #!/usr/bin/env python3
-"""
-Tests for the core wedge auto-recovery (`recover_core_if_wedged`) in
-src/health-check.py.
-
-Motivated by the 2026-06-02 incident: the core crossed into 1M extended
-context, hit the interactive `/usage-credits` gate (which cannot be
-pre-authorized for an unattended agent), and looped silently — alive (heartbeat
-ticking) but draining nothing. --notify-slack makes that visible; this makes it
-self-healing by restarting the core via src/agent/start-cli.sh --restart. The
-restart preserves whatever model the core is configured for; it never pins one.
-
-Because auto-restarting a 24/7 agent is consequential, the guards are the whole
-point. These cover:
-  a) healthy / no queued work        → no action, no restart, no DM
-  b) wedged but core just booted     → no action (catching up, not stuck)
-  c) wedged, first observation       → "observed", no restart (confirm window)
-  d) wedged, within confirm window   → "confirming", no restart
-  e) wedged + confirmed              → restart, DM sent, NO model override
-  f) within cooldown after a restart → no second restart
-  g) recurs after cooldown           → restarts again, still NO model override
-  h) give-up cap (3/hr)              → DMs "gave up", stops restarting
-  i) restart launch fails            → no cooldown/history burned, retries
-  j) dead core (no heartbeat, not booted) → relaunched (session-died gap)
-  k) draining backlog (oldest task   → never restarts (queue is healthy, just
-     differs each pass)                 busy) — review blocker 3
-  l) core makes progress             → resets, never restarts a long live task;
-     (core-status.json advances)        a FROZEN status with same task does fire
-  m) concurrent invocation (lock     → second caller no-ops with "locked"
-     held)                              — review suggestion
-  n) restart DM fails                → still restarts, records dm_sent=False
-                                        — review blocker 2
-
-Run: python3 tests/health-check-recover-core.test.py
-Exit code: 0 on pass, 1 on fail.
-"""
+"""Tests for the core wedge auto-recovery (`recover_core_if_wedged`) in"""
 
 from __future__ import annotations
 import importlib.util
@@ -271,13 +237,7 @@ def case_j_dead_core_relaunches() -> list[str]:
 
 
 def case_j2_dead_core_before_after_output() -> list[str]:
-    """BEFORE/AFTER health-check output for the dead-core relaunch:
-    run the SAME recover-core check in two states and capture the action + the
-    DM the owner would see.
-      BEFORE (healthy, non-wedged core): no action, no restart, no DM.
-      AFTER  (a confirmed-dead core):    'restarted' + the skull 'core is down /
-                                          Auto-relaunching' DM, restart called once.
-    """
+    """BEFORE/AFTER health-check output for the dead-core relaunch:"""
     fails = []
     # BEFORE — a healthy core with only fresh work: nothing happens (no output).
     with tempfile.TemporaryDirectory() as td:
@@ -303,9 +263,7 @@ def case_j2_dead_core_before_after_output() -> list[str]:
 
 
 def case_k_draining_backlog_never_restarts() -> list[str]:
-    """A busy-but-healthy core surfaces a DIFFERENT oldest task each pass as it
-    drains the queue. The identity check must reset the window every time, so
-    the confirm window never completes and no restart fires (review blocker 3)."""
+    """A busy-but-healthy core surfaces a DIFFERENT oldest task each pass as it"""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         h = Harness(Path(td) / "rec.json")
@@ -323,10 +281,7 @@ def case_k_draining_backlog_never_restarts() -> list[str]:
 
 
 def case_l_progress_resets_long_task() -> list[str]:
-    """Same oldest task across passes, but core-status.json advances → the core
-    is making progress on a long task, not wedged → reset, no restart. A FROZEN
-    status (same task, status unchanged) DOES restart — proving it's the
-    progress signal, not mere status presence, that protects the task."""
+    """Same oldest task across passes, but core-status.json advances → the core"""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         h = Harness(Path(td) / "rec.json")
@@ -372,9 +327,7 @@ def case_m_lock_prevents_concurrent_restart() -> list[str]:
 
 
 def case_n_failed_dm_still_restarts_and_records() -> list[str]:
-    """If the wedge-restart DM fails, recovery still restarts (recovery >
-    notification) but records dm_sent=False so the restart isn't invisible
-    (review blocker 2)."""
+    """If the wedge-restart DM fails, recovery still restarts (recovery >"""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         sf = Path(td) / "rec.json"
@@ -395,10 +348,7 @@ def case_n_failed_dm_still_restarts_and_records() -> list[str]:
 
 
 def case_o_launch_env_path() -> list[str]:
-    """Regression for the 2026-07-10 launchd restart bug: under launchd's minimal
-    PATH, start-cli.sh --restart failed rc=127 (node/claude not found).
-    _resolve_launch_env must PREPEND homebrew, ~/.local/bin, and (when present)
-    the bundled runtime so the tools resolve."""
+    """Regression for the 2026-07-10 launchd restart bug: under launchd's minimal"""
     import os
     fails = []
     saved = os.environ.get("PATH")
@@ -514,18 +464,8 @@ def case_r_local_liveness_ignores_peer_heartbeats():
 
 
 def case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet():
-    """Pin the WIRING, not just the function.
-
-    Case r proves `_local_core_alive` is correct. It does NOT prove the actuator
-    USES it: `Harness` always injects `alive_fn`, so the default is never
-    exercised. I verified that by reverting `alive_fn = alive_fn or
-    _local_core_alive` back to `_any_core_alive` — case r still passed. A test
-    that cannot fail in the broken state proves nothing about it.
-
-    So this one calls the actuator with NO injected alive_fn, against a
-    workspace where only a PEER is beating. With the fleet-wide default the core
-    reads alive and nothing is observed; with the local default it observes.
-    """
+    """The default alive_fn is LOCAL, not fleet-wide: a live peer must never make
+    this host look alive."""
     import os
     import pathlib
     import tempfile
@@ -565,18 +505,8 @@ def case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet():
 
 
 def case_t_unresolvable_host_label_reads_NOT_alive():
-    """The fail-safe direction, which is the whole reason this branch exists.
-
-    `_local_core_alive` resolves this host's name through
-    `util_paths._host_label()`. If that cannot be resolved, the function must
-    return False — NOT alive — so an unidentifiable host produces an extra
-    observation rather than a SUPPRESSED relaunch. Failing the other way would
-    silently disable core recovery on exactly the hosts whose identity is
-    already broken.
-
-    Reachable in practice: `util_paths` is imported inside the function, so an
-    import error, a renamed helper, or a raising label resolver all land here.
-    """
+    """An unresolvable host label reads NOT alive, so a label failure cannot be
+    mistaken for a healthy core."""
     import pathlib
     import sys as _sys
     import tempfile
@@ -621,29 +551,8 @@ def case_t_unresolvable_host_label_reads_NOT_alive():
 
 
 def case_x_uncertainty_between_two_deaths_invalidates_the_window():
-    """An UNKNOWN probe must not be a free pass.
-
-    The first fix suppressed the restart on UNKNOWN but deliberately LEFT the
-    confirmation window intact, on the reasoning that an intermittently-failing
-    probe would otherwise reset it forever and silently disable recovery.
-    Reproduced at the exact head, that reasoning was backwards:
-
-        liveness  dead -> UNKNOWN -> dead
-        actions   observed / probe-failed / RESTARTED    restart_calls == [False]
-
-    A single post-uncertainty DEAD reading inherited a window opened BEFORE the
-    uncertainty, so "the death persists across a pass" did not hold — the middle
-    pass confirmed nothing at all. For a DESTRUCTIVE actuator that is the wrong
-    direction to fail: a probe too flaky to give two consecutive affirmative
-    deaths means the state is genuinely unknown, and not restarting is correct.
-
-    BOTH halves are asserted, because the first alone would also pass if I had
-    simply disabled recovery:
-      1. dead -> UNKNOWN -> dead            must NOT restart
-      2. ... -> dead -> dead (window clear) MUST restart
-
-    Without (2) this case cannot tell "correctly re-observing" from "broken".
-    """
+    """An UNKNOWN reading between two deaths invalidates the confirmation window: a probe
+    too flaky for two consecutive deaths means unknown, and a destructive actuator must not fire."""
     import pathlib
     import tempfile
     fails = []
@@ -683,18 +592,8 @@ def case_x_uncertainty_between_two_deaths_invalidates_the_window():
 
 
 def case_w_every_three_state_branch_of_both_helpers():
-    """Direct branch coverage for the three-state helpers.
-
-    Cases t and v pin the DANGEROUS transitions. The Coverage Gate then showed
-    the rest of `_local_core_started_within` was never executed at all — only
-    its label-exception path — so most of the new contract was asserted by
-    inspection rather than by running it. Diff coverage read 82.3%, missing
-    src/health-check.py 6331-6332, 6878, 6888-6889, 6892-6897.
-
-    Each assertion is `is`, not truthiness: the whole point of three states is
-    that None and False are different, and `assert not x` cannot tell them
-    apart (which is exactly how case t stayed green over the bug).
-    """
+    """Every three-state branch of both helpers, so a change that collapses UNKNOWN
+    into DEAD or ALIVE cannot pass by covering only the two it kept."""
     import json as _json
     import pathlib
     import sys as _sys
@@ -769,21 +668,8 @@ def case_w_every_three_state_branch_of_both_helpers():
 
 
 def case_v_an_unknown_probe_must_not_restart_a_healthy_core():
-    """The paired unknown-state control.
-
-    Case t pins the helper; this pins the ACTUATOR, because they failed
-    independently — the helper returning False was only dangerous once
-    `dead = not alive` turned it into a destructive action.
-
-    Reviewer's exact repro, which reproduced on the pre-fix head: make
-    `_host_label()` raise, then run the actuator twice across the confirm
-    window with the DEFAULT liveness/boot guards. It returned `observed` then
-    `restarted`, killing a core it never established was down.
-
-    Two passes, not one: a single pass returns `observed` under BOTH the broken
-    and fixed versions, so a one-pass assertion is another test that cannot
-    fail. The restart only appears after the confirm window elapses.
-    """
+    """An unknown probe result must not restart a healthy core — the actuator is
+    destructive, so absence of evidence is not evidence of death."""
     import pathlib
     import sys as _sys
     import tempfile
@@ -827,18 +713,8 @@ def case_v_an_unknown_probe_must_not_restart_a_healthy_core():
 
 
 def case_u_peer_boot_does_not_suppress_local_recovery():
-    """The boot guard had the same local-vs-fleet leak.
-
-    Fixing liveness was half of it. `_core_started_within` still globbed every
-    host, so a PEER that just booted satisfied the just-booted guard: local
-    liveness said dead, the guard said "wait", and `recover_core_if_wedged`
-    returned None — no recovery state, no confirm window ever started. A peer
-    boot suppressed local dead-core recovery for the whole startup window.
-
-    Exercised through the ACTUATOR with no injected fns, because that is where
-    the leak lived; asserting on the two helpers alone would not have caught the
-    wiring (the lesson from cases r and s one commit earlier).
-    """
+    """A peer's recent boot must not suppress LOCAL recovery; the boot grace is
+    per-host, and reading it fleet-wide silently disables recovery on this one."""
     import json as _json
     import pathlib
     import tempfile
