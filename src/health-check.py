@@ -571,14 +571,13 @@ def _resolved_vault() -> dict:
         return {"enabled": False, "remote_url": "", "_explicit_disable": False}
 
 
-def _vault_remote_url(vault: dict | None = None) -> str:
-    """Vault remote URL, resolved exactly as the sync WRITER resolves it: config
-    `vault.remote_url` (what `sutando-config.sh vault-url` prints), then the
-    deprecated `.env` SUTANDO_MEMORY_REPO alias. Empty string when neither is set.
+def _vault_remote_url(vault: "dict | None" = None) -> str:
+    """Vault remote URL as the sync writer's CRON path resolves it: config
+    `vault.remote_url`, then the deprecated `.env` SUTANDO_MEMORY_REPO alias.
 
-    Ignores `vault.enabled` on purpose — sync-workspace's priority chain reads
-    only the URL, so gating a probe on `enabled` would disagree with the writer.
-    Pass an already-resolved `_resolved_vault()` dict to avoid re-resolving.
+    Does not see `--vault-url`, an inherited (not file-resident)
+    SUTANDO_MEMORY_REPO, or a workspace-tier `.env` the writer never sources.
+    Ignores `vault.enabled` on purpose — the writer's chain reads only the URL.
     """
     resolved = _resolved_vault() if vault is None else vault
     url = resolved.get("remote_url") or ""

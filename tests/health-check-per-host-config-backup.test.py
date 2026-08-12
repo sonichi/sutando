@@ -283,14 +283,8 @@ def case_m_reads_canonical_tree_not_env_home() -> list[str]:
 
 
 def case_n_no_vault_configured_ok() -> list[str]:
-    """No vault URL → informational ok, even with a live channel and no backup.
-
-    `_snapshot_per_host_config` runs only inside sync-workspace's push path, and
-    that path exits before it when no vault URL resolves. So on a single-machine
-    host the probe's own remedy ("a full sync-workspace should refresh it") is a
-    documented no-op: the warn can never be cleared by any action the owner takes.
-    Same call the sibling check_memory_sync makes for the same reason — an opt-out
-    of cross-machine sync is a valid choice, not a recurring nag."""
+    """No vault URL → informational ok, even with a live channel and no backup:
+    the push path exits before `_snapshot_per_host_config`, so nothing clears it."""
     with tempfile.TemporaryDirectory() as td:
         with _Harness(Path(td), vault_url="") as h:
             h.write_live("discord", b'{"allowFrom":["123"]}')      # no carrier at all
