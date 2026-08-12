@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # startup's watch-tasks-stream reaper must only delete the sentinel it inspected.
 #
-# The sentinel is stamped once at startup and never again, so a reaper that
-# unlinks one it did not inspect strands a live watcher with no sentinel —
-# invisible to every reader that keys off the file. Case 3 makes that window
-# deterministic: the `ps` shim re-stamps the file mid-reap.
+# Unlinking a sentinel this reap did not inspect strands a live watcher untrackable.
+# Case 3 makes that window deterministic: the `ps` shim re-stamps the file mid-reap.
 #
 # Run: bash tests/startup-watcher-reaper-ownership.test.sh
 # Exit: 0 = all pass, 1 = failure
@@ -22,10 +20,8 @@ echo "startup watch-tasks-stream reaper ownership:"
 # shellcheck source=../src/startup-runtime.sh
 source "$REPO/src/startup-runtime.sh"
 
-# A tree without the helper still has to reach the wiring assertions at the
-# bottom — those are the ones that name the defect on a pre-fix tree. Bailing
-# here would make this suite *skip* on base rather than fail, which proves
-# nothing about the behavior it exists to guard.
+# Bailing on a missing helper would make this suite skip on base rather than fail,
+# proving nothing; the wiring assertions below are what name the defect pre-fix.
 have_fn=1
 if declare -F reap_stale_task_watcher > /dev/null; then
   ok "reap_stale_task_watcher is defined in src/startup-runtime.sh"
@@ -91,9 +87,7 @@ else
 fi
 
 # --- case 3 (the guard): a live watcher re-stamps DURING the reap -------------
-# The shim stands in for `ps` only, so the function under test is unchanged.
-# It writes the new owner's pid exactly where a real watcher's startup stamp
-# would land: after the reaper read the file, before it deletes.
+# The `ps` shim re-stamps where a real watcher would: after the read, before delete.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/ps" << 'SH'
 #!/bin/bash

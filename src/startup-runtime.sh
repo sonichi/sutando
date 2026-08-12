@@ -310,11 +310,8 @@ reap_wedged_voice_agent() {
   return 0
 }
 
-# The cmdline check keeps a RECYCLED pid from being killed blindly; the removal
-# compares before deleting because the sentinel is stamped once and never again,
-# so unlinking one this reap did not inspect strands a LIVE watcher untrackable.
-# A re-stamp between the re-read and the unlink still needs an atomic claim in
-# the sentinel protocol, which this reaper cannot provide alone.
+# The sentinel is stamped once and never again, so unlinking one this reap did not
+# inspect strands a live watcher; a re-stamp mid-reap still needs an atomic claim.
 reap_stale_task_watcher() {
   local pid_file="$1" stale_pid current
   [ -f "$pid_file" ] || return 0
