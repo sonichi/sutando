@@ -239,8 +239,8 @@ def case_j_large_fresh_queue() -> list[str]:
 
 def case_k_small_old_queue() -> list[str]:
     fails = []
-    # Small queue but old — age alone shouldn't alarm. The user might have
-    # 1-2 long-tail tasks that take a while; not stuck.
+    # Age alone shouldn't alarm BELOW the bar: 600s is under stuck_age_sec
+    # (900), which is what separates this from j0 where age alone must warn.
     def setup(d):
         for i in range(2):
             write_task(d, f"task-{i}.txt", age_sec=600)
