@@ -377,11 +377,8 @@ CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
 
 
 def _channel_env_candidates():
-    """Every readable channel-.env candidate, in precedence order, parsed.
-
-    Returns [(path, vals)]. Callers take the first entry carrying the key they
-    want — a file that parses but lacks it must not shadow a later candidate.
-    """
+    """Readable channel-.env candidates in precedence order, as [(path, vals)].
+    A candidate lacking a key must not shadow a later one that carries it."""
     candidates = [os.environ.get("AG2_DEVICE_ENV")]
     _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if _cfg:
@@ -393,7 +390,9 @@ def _channel_env_candidates():
         try:
             with open(path, encoding="utf-8") as fh:
                 lines = fh.read().splitlines()
-        except OSError:
+        # Every candidate is read eagerly now, so one the old early-return never
+        # opened can be undecodable — and that is not an OSError.
+        except (OSError, UnicodeDecodeError):
             continue
         vals = {}
         for ln in lines:
@@ -407,16 +406,11 @@ def _channel_env_candidates():
 
 
 def _config_from_channel_env(key: str) -> str:
-    """Read one non-secret config key from the channel .env.
-
-    Separate from the token reader because that one returns early once a token
-    is found — and never runs at all when a launcher exported the token, which
-    is where config read through it silently went missing.
-    """
+    """First candidate CARRYING `key`, else "". Presence decides, not truth: an
+    explicit blank is a decision here exactly as it is in the environment."""
     for _path, vals in _channel_env_candidates():
-        val = vals.get(key)
-        if val:
-            return val
+        if key in vals:
+            return vals[key]
     return ""
 
 

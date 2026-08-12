@@ -17,6 +17,12 @@ The bridge reads these from the environment. `channels/<provider>/.env` is not
 sourced by every launcher, so the bridge also reads that file directly for the
 keys marked *(.env too)* below — an exported value always wins.
 
+Those file reads happen **at import**, so a `.env` edit needs a bridge restart
+to take effect (unlike `REMOTE_TASK_TOKEN`, which is re-read on rotation). In
+the file as in the environment, **presence decides, not truthiness**: a key
+written with an empty value is an explicit "off" and does not fall through to a
+lower-precedence candidate.
+
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `REMOTE_TASK_URL` | yes | — | Relay base URL (e.g. `https://relay.example.com`). |
