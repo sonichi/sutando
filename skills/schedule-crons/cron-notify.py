@@ -230,9 +230,8 @@ def _post_to_room(room_id, body, repo=None):
         body_json = json.loads(r.read().decode() or "{}")
     except (urllib.error.URLError, urllib.error.HTTPError):
         return None
-    # A 2xx IS delivery. The live gateway answers {"ok": true} with no
-    # event_id, so keying on that field reports every success as a failure —
-    # and the caller rolls back its cooldown and re-sends on a falsy return.
+    # A 2xx IS delivery: the gateway may answer {"ok": true} with no event_id,
+    # so keying the return on that field reports every success as a failure.
     return body_json.get("event_id") or body_json.get("ok") or True
 
 

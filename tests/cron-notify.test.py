@@ -142,9 +142,8 @@ def main() -> int:
             req = uo.call_args[0][0]
             check("_post_to_room targets <base>/v1/room",
                   req.full_url == "https://x.example/relay/v1/room", req.full_url)
-        # The LIVE gateway answers {"ok": true} with no event_id. Keying the
-        # return on event_id reported every real success as a failure, and the
-        # caller rolls back its cooldown and re-sends on a falsy return.
+        # The gateway can answer {"ok": true} with no event_id; the return must
+        # still be truthy or the caller re-sends.
         resp_ok = um.MagicMock()
         resp_ok.read.return_value = json.dumps({"ok": True}).encode()
         with um.patch.object(cn, "_load_gateway", return_value=("https://x.example/relay", "sekret")), \
