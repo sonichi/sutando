@@ -24,6 +24,30 @@ import tempfile
 import time
 from pathlib import Path
 
+# This suite drives the real `run()` tick, which emits cron telemetry via
+# `_emit_cron_telemetry` -> `task_processed(..., flush=True)`. The flush path is
+# a BLOCKING `urlopen` to the PostHog host, so without this every tick here
+# makes a real network request and the suite's timing becomes a function of an
+# external service. `test_run_acquires_shared_state_lock` gives the worker
+# `join(2)`; a tick measured at 0.72-0.82s against that 2s ceiling is a ~2x
+# margin, which holds on an idle laptop and intermittently does not on a shared
+# clean-install runner:
+#
+#   0.716s run()
+#    └─ 0.713s _emit_cron_telemetry
+#        └─ 0.678s urllib.request.urlopen        <- real network
+#
+# Opting out drops the tick to 0.001-0.002s (~1100x margin) and makes the suite
+# hermetic. `opted_out()` is re-read on every capture and never cached, so
+# setting it here covers every test in the file. Same lever, and the same
+# clean-install motivation, as agent-api-task-field-injection.test.py and
+# github-webhook-access-tier.test.py.
+#
+# The two tests that assert telemetry DOES fire are unaffected: one replaces
+# `telemetry.task_processed` wholesale, the other runs a subprocess against a
+# fake `telemetry.py` that never consults the opt-out.
+os.environ["SUTANDO_TELEMETRY"] = "0"
+
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("cron_runner", REPO / "src" / "cron-runner.py")
 assert _spec and _spec.loader

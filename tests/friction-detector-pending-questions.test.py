@@ -13,11 +13,14 @@ Exit: 0 = pass, 1 = fail
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 # Load friction-detector (hyphenated filename) via importlib.
 import importlib
@@ -230,6 +233,69 @@ class TestCheckGithubIssues(unittest.TestCase):
             any("#99" in i for i in issues),
             f"Fresh issue should not be reported; got: {issues}",
         )
+
+
+class TestCheckStaleTasks(unittest.TestCase):
+    """Completed task/result pairs must not be reported as stale work."""
+
+    def _call(self, result_location: Optional[str]) -> list:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            tasks = workspace / "tasks"
+            results = workspace / "results"
+            tasks.mkdir()
+            results.mkdir()
+
+            name = "task-cron-main-loop-123.txt"
+            task = tasks / name
+            task.write_text("source: cron\n")
+            old = time.time() - 2 * 3600
+            os.utime(task, (old, old))
+
+            if result_location == "live":
+                (results / name).write_text("[no-send]\n")
+            elif result_location == "bridge-archive":
+                archive = results / "archive" / "2026-08"
+                archive.mkdir(parents=True)
+                (archive / name).write_text("[no-send]\n")
+            elif result_location == "flat-archive":
+                archive = results / "archive"
+                archive.mkdir()
+                (archive / name).write_text("[no-send]\n")
+            elif result_location == "non-file":
+                (results / name).mkdir()
+            elif result_location == "retention-archive":
+                archive = results / "archive-2026-08-02"
+                archive.mkdir()
+                (archive / name).write_text("[no-send]\n")
+
+            original_workspace = _fd_mod.WORKSPACE
+            original_results = _fd_mod.RESULTS_DIR
+            _fd_mod.WORKSPACE = workspace
+            _fd_mod.RESULTS_DIR = results
+            try:
+                return _fd_mod.check_stale_tasks()
+            finally:
+                _fd_mod.WORKSPACE = original_workspace
+                _fd_mod.RESULTS_DIR = original_results
+
+    def test_unprocessed_old_task_is_reported(self):
+        self.assertEqual(len(self._call(None)), 1)
+
+    def test_live_result_marks_task_complete(self):
+        self.assertEqual(self._call("live"), [])
+
+    def test_bridge_archived_result_marks_task_complete(self):
+        self.assertEqual(self._call("bridge-archive"), [])
+
+    def test_flat_archived_result_marks_task_complete(self):
+        self.assertEqual(self._call("flat-archive"), [])
+
+    def test_result_named_directory_does_not_mark_task_complete(self):
+        self.assertEqual(len(self._call("non-file")), 1)
+
+    def test_retention_archived_result_marks_task_complete(self):
+        self.assertEqual(self._call("retention-archive"), [])
 
 
 class TestFreFormParserStructural(unittest.TestCase):

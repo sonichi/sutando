@@ -94,11 +94,55 @@ and loads whichever repo it reviews.
    "changes requested: …" / "LGTM, non-blocking". And it is only honest if you actually
    ran these criteria on *this* PR — a readiness claim with no evidence attached
    (no test run, no failure-mode named, no blast-radius call) is an over-claim.
+   **Findings are not a verdict.** A review that ends on analysis leaves the author unable
+   to tell "these are blockers" from "these are notes and I would merge it", so say which,
+   and for anything short of ready, name the one thing that would change it.
+   The verdict is a **recommendation, never a gate**: it does not substitute for the merge
+   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, two recorded
+   approvals). *Grounded by:* a #2824 review that listed one clarity question and two minor
+   notes and never said it was ready; the owner had to ask "do you recommend approval?".
+
+9. **A negative result is not evidence until the instrument is shown able to produce a
+   positive.** Much of a PR's evidence is a *zero*: "no other call sites", "no conflicts",
+   "no hardcoded paths", "the check is silent at HEAD". Every one is produced by an
+   instrument — a grep, a query, a script run — and an instrument that cannot fire returns
+   the same zero as a genuinely clean tree. For any load-bearing negative, ask what was run
+   and whether it was ever demonstrated to return non-zero. A control is cheap: run it where
+   the thing DOES exist, or against the parent commit, and show it counting.
+   *Grounded by:* four instances in one 2026-08-04 session, three of them the reviewer's own.
+   (a) `gh pr list --json reviewDecision | select(==null)` was used to conclude "zero
+   unreviewed PRs" — this repo requires reviews, so that field is never null and the query
+   could not have returned anything; the same run also silently truncated at `--limit 100`
+   of 105 open PRs. (b) An orphan-memory scan reported 4 unrecallable files; its pattern was
+   `[a-z0-9_]+` and one filename contained an uppercase letter — the true count was 0.
+   (c) Two before/after health-check runs both printed nothing, which reads as "the change
+   didn't fire"; `MEMORY_DIR` is repo-slug scoped, so from a worktree it resolved to a
+   directory that does not exist and the probe returned `None` — the code was correct both
+   times and the harness was wrong. (d) A peer's probe reported `1 pending question` against
+   a true 38 and delivered that number to the owner.
+   The tell is that a broken instrument and a clean result are *byte-identical*, so the
+   author's confidence carries no information.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
 checks:
+  root-artifacts:
+    # Added files at the REPO ROOT matching these are PR-draft leftovers. Root
+    # only; omitting the key uses these defaults rather than disabling the check.
+    root_artifact_glob:
+      - 'prbody*'
+      - 'pr-body*'
+      - 'pr_body*'
+      - 'reply*.md'
+      - 'comment*.md'
+      - 'draft*.md'
+      - '*.patch'
+      - '*.diff'
+      - '*.orig'
+      - '*.rej'
+      - 'nohup.out'
+
   hardcoded-paths:
     # Added lines containing any of these substrings are flagged as errors...
     flag:
@@ -141,4 +185,29 @@ checks:
       - '/usr/fake'
       - '/tmp/'
       - 'example.com'
+    # Tokens allowed ONLY when the SAME added line also carries a companion path
+    # for the SAME binary — i.e. the portable candidate-list shape, never a naked
+    # literal. Encoded as 'TOKEN_PREFIX :: COMPANION_PREFIX'.
+    #
+    # The companion is matched by BASENAME, not as a bare substring:
+    # '/opt/homebrew/bin/ffmpeg' is exempt only beside '/usr/local/bin/ffmpeg'.
+    # A substring test would exempt the naked form whenever any unrelated
+    # '/usr/local/...' shared the line, re-opening the blind spot.
+    #
+    # Why paired and not a plain allow: '/opt/homebrew/' is Apple-Silicon-only
+    # (Intel Homebrew installs under /usr/local), so an UNPAIRED use still breaks
+    # a supported host — exactly the bug class rule 6 exists to catch. A global
+    # prefix allow would hide that naked form too, which is broader than the need.
+    # Pairing keeps the portable form legal while a bare
+    # `X = "/opt/homebrew/bin/ffmpeg"` stays flagged.
+    #
+    # Scope note: this is a SAME-LINE test. The candidate lists it exists for are
+    # written on one line (see skills/screen-record narration-tee.ts + record.py).
+    # A list split across lines will still flag — deliberately: a multi-line
+    # window would re-admit the naked form whenever a same-named companion
+    # appeared anywhere nearby. Reformat the list onto one line, or resolve via a
+    # shared helper. Controls for both directions live in
+    # tests/review-checks.test.sh ('candidate-list' / 'naked' / 'unrelated').
+    allow_paired:
+      - '/opt/homebrew/ :: /usr/local/'
 ```

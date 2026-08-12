@@ -260,7 +260,15 @@ with tempfile.TemporaryDirectory() as td5:
 
     # POSITIVE control in the same block: the exact name still resolves, so the
     # negatives above cannot be passing merely because everything returns None.
-    _stub(b, "ps", "#!/bin/sh\necho 'claude --name sutando-core --resume'\n")
+    # PID-AWARE on purpose. A blanket `ps` that answers with the core's argv for
+    # EVERY pid cannot distinguish "this pane is the core" from "this pane is a
+    # leftover shell", so it silently decides which resolver branch wins. Here
+    # only 4242 (pgrep's hit) is the core; the session's pane 777 is a shell, so
+    # the session-scoped lookup correctly declines and this stays a test of the
+    # process-name branch — which is what the assertion below is about.
+    _stub(b, "ps", "#!/bin/sh\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\n"
+                   "case \"$last\" in 4242) echo 'claude --name sutando-core --resume' ;; "
+                   "*) echo '-zsh' ;; esac\n")
     check("CONTROL: the EXACT session name still resolves (negatives aren't vacuous)",
           _REAL_CORE_PID("/tmp/s.sock") == 4242)
 
@@ -319,7 +327,12 @@ with tempfile.TemporaryDirectory() as td7:
     # `pgrep -x` should print only pids, but a hostile/odd binary could emit a
     # header row; the `isdigit()` guard must skip it and still match the real pid.
     _stub(b7, "pgrep", "#!/bin/sh\necho 'PID'\necho 4321\n")
-    _stub(b7, "ps", "#!/bin/sh\necho 'claude --name sutando-core'\n")
+    # PID-aware for the same reason as the control above: pane 555 must read as a
+    # shell so the session-scoped lookup declines and execution actually reaches
+    # the pgrep branch whose `isdigit()` guard this case exists to exercise.
+    _stub(b7, "ps", "#!/bin/sh\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\n"
+                    "case \"$last\" in 4321) echo 'claude --name sutando-core' ;; "
+                    "*) echo '-zsh' ;; esac\n")
     os.environ["PATH"] = f"{b7}:{_ORIG_PATH}"
     check("a non-numeric pgrep line is skipped, the real row still matches",
           _REAL_CORE_PID("/tmp/s.sock") == 4321)

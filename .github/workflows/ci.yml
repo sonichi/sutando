@@ -6,6 +6,10 @@ on:
   push:
     branches: [main, staging-interaction-planes]
 
+# Tests must never emit product telemetry (no PostHog writes from CI).
+env:
+  SUTANDO_TELEMETRY: "0"
+
 jobs:
   typecheck-and-test:
     name: tsc + tests (clean install)
@@ -140,6 +144,7 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_human_action.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_vault_token_tier.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
           timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
           timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py

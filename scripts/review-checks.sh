@@ -52,10 +52,12 @@ parse_list() {  # $1 = flag|allow ; reads $GUIDE
         /^```yaml/ {y=1; next}
         /^```/     {y=0}
         !y {next}
-        /^[[:space:]]*flag:[[:space:]]*$/       {s="flag";       next}
-        /^[[:space:]]*flag_exact:[[:space:]]*$/ {s="flag_exact"; next}
-        /^[[:space:]]*allow:[[:space:]]*$/      {s="allow";      next}
-        /^[[:space:]]*[A-Za-z_-]+:[[:space:]]*$/ {s=""}
+        # Section keys are matched generically so a new list (e.g. allow_paired)
+        # needs no parser change — previously only flag:/allow: were recognized
+        # and every other key reset the state, silently dropping new sections.
+        /^[[:space:]]*[A-Za-z_-]+:[[:space:]]*$/ {
+            s=$0; sub(/^[[:space:]]*/,"",s); sub(/:[[:space:]]*$/,"",s); next
+        }
         s==want && /^[[:space:]]*-[[:space:]]/ {
             v=$0; sub(/^[[:space:]]*-[[:space:]]*/,"",v)
             sub(/[[:space:]]+#.*$/,"",v)
@@ -70,10 +72,20 @@ FLAGS="$(parse_list flag)"
 # rejects the real, separate '/usr/bin/swift-inspect' binary (#2474 review).
 FLAGS_EXACT="$(parse_list flag_exact)"
 ALLOWS="$(parse_list allow)"
+ALLOW_PAIRED="$(parse_list allow_paired)"
+ROOT_GLOBS="$(parse_list root_artifact_glob)"
 NOTE=""
+ROOT_NOTE=""
+# Defaulted independently of the FLAGS fallback: the two go empty for different
+# reasons, and sharing a condition left this one silently unscanned.
+if [[ -z "${ROOT_GLOBS//[$' \t\r\n']/}" ]]; then
+    ROOT_GLOBS=$'prbody*\npr-body*\npr_body*\nreply*.md\ncomment*.md\ndraft*.md\n*.patch\n*.diff\n*.orig\n*.rej\nnohup.out'
+    ROOT_NOTE="no root_artifact_glob in ${GUIDE#$REPO/}; used generic root-artifact defaults"
+fi
 if [[ -z "${FLAGS//[$' \t\r\n']/}" ]]; then
     FLAGS=$'/Users/\n/home/'
     ALLOWS=$'/nonexistent\n/usr/fake\n/tmp/\nexample.com'
+    ALLOW_PAIRED=''
     NOTE="no repo review guide (or no checks: block) at ${GUIDE#$REPO/}; used generic defaults"
 fi
 
@@ -84,7 +96,7 @@ fi
 # — so a large PR diff (~8MB) can't hit 'Argument list too long' and make the
 # scanner fail to launch while we blindly print PASS (#2281). `printf` is a bash
 # builtin, so piping the whole diff carries no exec-size limit.
-HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_FLAGS_EXACT="$FLAGS_EXACT" RC_ALLOWS="$ALLOWS" python3 "$HERE/review-checks.py")"
+HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_FLAGS_EXACT="$FLAGS_EXACT" RC_ALLOWS="$ALLOWS" RC_ALLOW_PAIRED="$ALLOW_PAIRED" python3 "$HERE/review-checks.py")"
 SCAN_RC=$?
 # Fail closed: if the scanner didn't run to completion (exec failure, crash),
 # its exit is non-zero. Do NOT interpret an empty stdout as "clean" — error out.
@@ -94,12 +106,31 @@ if [[ $SCAN_RC -ne 0 ]]; then
 fi
 
 [[ -n "$NOTE" ]] && echo "review-checks: $NOTE" >&2
+[[ -n "$ROOT_NOTE" ]] && echo "review-checks: $ROOT_NOTE" >&2
 
+# --- scan ADDED FILE PATHS for PR-draft artifacts at the repo root -----------
+# Separate scanner: a stray root file is a diff HEADER, so the content scan
+# above cannot see it whatever its patterns.
+ROOT_HITS="$(printf '%s' "$DIFF" | RC_ROOT_ARTIFACT_GLOBS="$ROOT_GLOBS" python3 "$HERE/review-checks-root-artifacts.py")"
+ROOT_RC=$?
+if [[ $ROOT_RC -ne 0 ]]; then
+    echo "review-checks: ERROR — root-artifacts scanner failed to run (exit $ROOT_RC); failing closed (NOT a pass)." >&2
+    exit 2
+fi
+
+FAILED=0
 if [[ "$HITS" =~ [^[:space:]] ]]; then
     echo "review-checks: FAIL — hardcoded-paths:" >&2
     printf '%s\n' "$HITS" >&2
     echo "review-checks: $(printf '%s\n' "$HITS" | grep -c '') violation(s). Resolve via workspace/config helpers, or add a scoped allow to REVIEW.md if it's a genuine fixture." >&2
-    exit 1
+    FAILED=1
 fi
-echo "review-checks: PASS (hardcoded-paths clean)"
+if [[ "$ROOT_HITS" =~ [^[:space:]] ]]; then
+    echo "review-checks: FAIL — root-artifacts:" >&2
+    printf '%s\n' "$ROOT_HITS" >&2
+    echo "review-checks: $(printf '%s\n' "$ROOT_HITS" | grep -c '') artifact(s) at the repo root. Delete them from the branch, or add the name to root-artifacts in REVIEW.md if it is genuinely source." >&2
+    FAILED=1
+fi
+[[ $FAILED -eq 1 ]] && exit 1
+echo "review-checks: PASS (hardcoded-paths + root-artifacts clean)"
 exit 0
