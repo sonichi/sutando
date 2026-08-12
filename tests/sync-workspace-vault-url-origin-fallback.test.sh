@@ -229,6 +229,62 @@ else
     ok "an unreachable origin is not adopted"
 fi
 
+# --- 8: a git WORKTREE layout (.git is a FILE) is not, by itself, a refusal ---
+# The guard is about the remote's identity, not the workspace's on-disk layout.
+skel="$(mk_skel worktree-layout)"
+git init -q "$TMP/wt-main"
+: > "$TMP/wt-main/f"
+git -C "$TMP/wt-main" add f
+git -C "$TMP/wt-main" commit -qm seed
+rm -rf "$skel/workspace"
+git -C "$TMP/wt-main" worktree add -q --detach "$skel/workspace"
+mkdir -p "$skel/workspace/.sutando-vault"
+printf '%s\n' "$WSID" > "$skel/workspace/.sutando-vault/ws-id"
+git -C "$skel/workspace" remote add origin "$VAULT_REMOTE"
+if [ -f "$skel/workspace/.git" ]; then
+    ok "the worktree fixture really has a .git FILE, not a directory"
+else
+    bad "the worktree fixture really has a .git FILE, not a directory" \
+        "fixture did not reproduce the layout under test"
+fi
+out="$(run_sync "$skel" --status)"
+if echo "$out" | grep VAULT_URL | grep -qF "$VAULT_REMOTE"; then
+    ok "a worktree workspace still adopts its own vault origin"
+else
+    bad "a worktree workspace still adopts its own vault origin" \
+        "status said: $(echo "$out" | grep VAULT_URL)"
+fi
+
+# --- 9: end-to-end — a sync-INITIALIZED workspace pointed at a public remote --
+# The refusal above is a message; this asserts the consequence. ws-id satisfies
+# _assert_sync_initialized, so nothing but the vault check stands between this
+# workspace and a push to whatever origin happens to be configured.
+skel="$(mk_skel public-origin-no-leak)"
+git init -q --bare "$TMP/public-code.git"
+git -C "$TMP/seed-public" init -q 2>/dev/null || git init -q "$TMP/seed-public"
+: > "$TMP/seed-public/README.md"
+git -C "$TMP/seed-public" add -A
+git -C "$TMP/seed-public" commit -qm "public code"
+git -C "$TMP/seed-public" push -q "$TMP/public-code.git" HEAD:refs/heads/main
+printf 'SECRET-CREDENTIAL-DO-NOT-PUBLISH\n' > "$skel/workspace/private-state.txt"
+git -C "$skel/workspace" init -q
+git -C "$skel/workspace" add -A
+git -C "$skel/workspace" commit -qm "private state"
+git -C "$skel/workspace" remote add origin "$TMP/public-code.git"
+run_sync "$skel" > /dev/null 2>&1
+if [ -z "$(git ls-remote --heads "$TMP/public-code.git" "host/*")" ]; then
+    ok "no workspace branch is pushed to a non-vault origin"
+else
+    bad "no workspace branch is pushed to a non-vault origin" \
+        "pushed: $(git ls-remote --heads "$TMP/public-code.git" 'host/*')"
+fi
+if git --git-dir="$TMP/public-code.git" grep -q 'SECRET-CREDENTIAL' --all 2>/dev/null; then
+    bad "no workspace CONTENT reaches a non-vault origin" \
+        "the secret is present in an object on the public remote"
+else
+    ok "no workspace CONTENT reaches a non-vault origin"
+fi
+
 if [ "$fail" = "0" ]; then
     echo "ALL TESTS PASS"
     exit 0
