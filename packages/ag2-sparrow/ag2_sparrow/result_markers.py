@@ -1,13 +1,20 @@
 """
-Unified parsing for the result-body protocol markers used by every bridge
-(discord, slack, telegram, voice/task-bridge). Closes #873.
+Unified parsing for the result-body protocol markers used by every delivery
+consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the
+`src/dm-result.py` REST fallback). Closes #873.
 
 Why centralize: each bridge previously hand-rolled its own marker recognition,
 which (a) drifted (telegram never recognized [deduped:], slack never recognized
 [channel:]), and (b) leaked literal marker text to the user when the bridge
 didn't honor it. This module is the single source of truth for marker
-shapes; bridges call `parse_markers(text)` and apply the actions they CAN
+shapes; consumers call `parse_markers(text)` and apply the actions they CAN
 support, silently stripping the rest from the body so nothing ever leaks.
+
+No consumer may define its own marker regex. discord-bridge.py and
+dm-result.py each carried a private `_FILE_MARKER_RE` that matched only
+`/...` or `~/...` values; markers this parser strips were therefore delivered
+as literal text by the fallback. Both copies are gone and
+`tests/bridge-marker-no-leak.test.py` guards their return.
 
 This module deliberately does NOT enforce path allowlists. File-marker
 extraction returns paths; the bridge's own `_is_path_sendable()` check
@@ -278,6 +285,25 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None)
     return None
 
 
+def dedup_holder_delivered(holder_result_text: str | None) -> bool:
+    """Whether a `[deduped: task-X]` holder actually produced a user-facing reply.
+
+    A dedup is only valid if the holder answered. When the holder's own result
+    was empty or was itself a skip marker, honouring the dedup archives the
+    asking task against a delivery that never happened, and every retry carrying
+    the same marker is archived the same way — the ask can never be answered.
+
+    Pure: the caller supplies the holder's archived result text (None when the
+    archive has no record of it).
+    """
+    if holder_result_text is None:
+        return False
+    body = holder_result_text.strip()
+    if not body:
+        return False
+    return not any(a.kind == "skip" for a in parse_markers(body).actions)
+
+
 _REQUEUE_COUNT_RE = re.compile(r"^dedup_requeue_count:\s*(\d+)\s*$", re.MULTILINE)
 
 
@@ -293,8 +319,41 @@ def dedup_requeue_count(task_text: str | None) -> int:
     return int(m.group(1)) if m else 0
 
 
+def dedup_decision(holder_result_text: str | None, orig_task_text: str | None) -> str:
+    """What to do with a `[deduped: <holder>]` result.
+
+    ``"honour"``  — the holder answered; archive silently as before.
+    ``"requeue"`` — it did not; re-ask so the question actually gets answered.
+    ``"report"``  — re-asking already failed once; tell the owner instead of looping.
+
+    Pure. The caller supplies the holder's archived result text (None when the
+    archive has no record) and the original task text (for the loop guard).
+    """
+    if dedup_holder_delivered(holder_result_text):
+        return "honour"
+    if dedup_requeue_count(orig_task_text) >= 1:
+        return "report"
+    return "requeue"
+
+
+_REQUEUE_REASONS = {
+    "cross-channel": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder task is in a "
+        f"DIFFERENT channel. Dedup is per-channel only — a cross-channel dedup leaves this "
+        f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
+        "Do NOT [deduped:] across channels.\n"
+    ),
+    "holder-empty": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder delivered nothing, "
+        "so this question was never answered. Answer THIS task directly and in full. Only use "
+        "[deduped:] when the holder task carries the complete reply.\n"
+    ),
+}
+
+
 def build_requeued_task(
-    orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str
+    orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str,
+    reason: str = "cross-channel",
 ) -> str:
     """Rewrite an original task for re-processing after a REJECTED cross-channel
     dedup. Keeps the original fields (channel_id, access_tier, source, body, …)
@@ -324,11 +383,10 @@ def build_requeued_task(
         lines.append(f"dedup_requeue_count: {count}")
     note = (
         "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-        f"Your previous result used [deduped: {holder_id}], but that holder task is in a "
-        f"DIFFERENT channel. Dedup is per-channel only — a cross-channel dedup leaves this "
-        f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
-        "Do NOT [deduped:] across channels.\n"
-        "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        + _REQUEUE_REASONS.get(reason, _REQUEUE_REASONS["cross-channel"])(
+            holder_id, asking_channel
+        )
+        + "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
     )
     return "\n".join(lines) + note
 

@@ -214,11 +214,9 @@ def send_telegram(chat_id: str, message: str) -> bool:
     )
 
 
-# Gateway provider names come from task files, i.e. from OUTSIDE the trust
-# boundary — a `source` like `../evil` must never become a path segment
-# (traversal reads an arbitrary .env-shaped file and posts its bearer to the
-# URL named in that same file). Safe slug only.
-_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# `source` is untrusted input that becomes a path segment: safe slug only, dots
+# only BETWEEN alphanumerics, so every traversal shape is rejected up front.
+_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
 
 
 def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
@@ -226,7 +224,8 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
     if not _SOURCE_SLUG_RE.match(source or ""):
         print(f"[task-progress] invalid gateway source {source!r} — "
-              "provider names must match ^[a-z0-9][a-z0-9_-]*$", file=sys.stderr)
+              "provider names are lowercase slugs; dots allowed only between "
+              "alphanumerics (e.g. dev.ag2.space)", file=sys.stderr)
         return False
     # Mirrors util_paths.claude_home_path ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude).
     _base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
