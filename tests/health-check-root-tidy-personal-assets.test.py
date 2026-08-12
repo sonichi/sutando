@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 """workspace-root-tidy must not flag a file the personal-asset resolver reads there.
 
-`personal_path()` / `personalPath()` probe `hosts/<label>/`, then the legacy
-per-host memory dir, then `<workspace>/<name>` — and never `state/`. The
-workspace root is the LAST resolution step for every call site, including the
-ones that pass an explicit workspace (they pass the same workspace the probe
-walks). So a copy at the root is a supported resolution target, and the probe's
-remedy ("State belongs under state/") would break the reader that found it.
-
-The set is re-derived here from the sources rather than restated, so a personal
-asset added later fails this test instead of becoming a permanent false warning
-— the failure mode the probe's own sentinel-glob comment already names.
-
-Run: python3 tests/health-check-root-tidy-personal-assets.test.py
-Exit: 0 = all pass, 1 = failure
+The workspace root is that resolver's last step, so a copy there is a supported
+resolution target and the probe's "move it to state/" remedy would break it.
 """
 import fnmatch
 import importlib.util
@@ -55,11 +44,8 @@ def load(name, relpath):
 def derive_personal_path_names():
     """Filenames reachable through the personal-asset resolver.
 
-    Reuses the extractors in `scripts/lint-class-rules.py` rather than
-    re-deriving them: the Python one walks the AST, so that file's own
-    docstring — which documents this same call shape — is not mistaken for a
-    call site. Shell files carry the calls inside embedded python heredocs,
-    which neither extractor sees, so they get a comment-skipping scan here.
+    Shell call sites live inside embedded python heredocs, which neither
+    `lint-class-rules.py` extractor sees, so they get their own scan here.
     """
     lcr = load("lcr", "scripts/lint-class-rules.py")
     names = set()
