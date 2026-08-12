@@ -67,12 +67,13 @@ except ImportError:
 
 MARKER = "<!-- COMPACT-CORE-END -->"
 
-# The platform's preview cap is undocumented, so this bound is best-effort
-# coherence rather than an exact fit; 0 injects the whole file.
+# Opt-in (0 = whole file): the platform's preview cap is undocumented, and a
+# 3,349-byte file was observed arriving intact, so a default bound would cut
+# what already fits. Set the byte budget on installs large enough to be cut.
 try:
-    CORE_BYTES = int(os.environ.get("SUTANDO_COMPACT_CORE_BYTES", "1200"))
+    CORE_BYTES = int(os.environ.get("SUTANDO_COMPACT_CORE_BYTES", "0"))
 except ValueError:
-    CORE_BYTES = 1200
+    CORE_BYTES = 0
 
 
 def _bounded_head(text, limit):

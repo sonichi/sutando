@@ -44,7 +44,7 @@ def fail(label: str, detail: str = "") -> None:
     _fail += 1
 
 
-def run_hint(workspace: str) -> subprocess.CompletedProcess:
+def run_hint(workspace: str, core_bytes: str = None) -> subprocess.CompletedProcess:
     """Run the hint script with workspace resolution pinned to a temp dir.
 
     Uses the test-only escape hatch in src/sutando_config.py:
@@ -54,6 +54,8 @@ def run_hint(workspace: str) -> subprocess.CompletedProcess:
     env["SUTANDO_TEST_MODE"] = "1"
     env["SUTANDO_WORKSPACE"] = workspace
     env["SUTANDO_CORE_SESSION"] = "1"  # pass the core-session scope gate
+    if core_bytes is not None:
+        env["SUTANDO_COMPACT_CORE_BYTES"] = core_bytes
     return subprocess.run(
         ["bash", HINT], capture_output=True, text=True, env=env, timeout=30
     )
@@ -256,11 +258,11 @@ with tempfile.TemporaryDirectory() as ws:
 
 # ── Test 11: no marker + oversized file → bounded coherent head (not mid-cut) ──
 with tempfile.TemporaryDirectory() as ws:
-    # 400 numbered lines, well over the default 1200-byte core bound.
+    # 400 numbered lines, well over the 1200-byte budget this case opts into.
     lines = "\n".join(f"rule line {i:03d} — some operating doctrine text" for i in range(400))
     with open(os.path.join(ws, "PERSONAL_CLAUDE.md"), "w") as f:
         f.write(lines + "\n")
-    r = run_hint(ws)
+    r = run_hint(ws, core_bytes="1200")
     try:
         ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
         # body is bounded: early lines present, later lines dropped, and the cut
@@ -278,7 +280,7 @@ with tempfile.TemporaryDirectory() as ws:
     except (json.JSONDecodeError, KeyError) as e:
         fail("bounded core", f"bad output {r.stdout[:200]!r} ({e})")
 
-# ── Test 12: SUTANDO_COMPACT_CORE_BYTES=0 → whole file injected (old behavior) ─
+# ── Test 12: SUTANDO_COMPACT_CORE_BYTES=0 → whole file injected ───────────────
 with tempfile.TemporaryDirectory() as ws:
     lines = "\n".join(f"line {i:03d}" for i in range(400))
     with open(os.path.join(ws, "PERSONAL_CLAUDE.md"), "w") as f:
@@ -290,11 +292,31 @@ with tempfile.TemporaryDirectory() as ws:
     try:
         ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
         if "line 000" in ctx and "line 399" in ctx and "bounded to stay" not in ctx:
-            ok("SUTANDO_COMPACT_CORE_BYTES=0 → whole file injected (opt-out)")
+            ok("SUTANDO_COMPACT_CORE_BYTES=0 → whole file injected")
         else:
             fail("core-bytes opt-out", f"ctx tail={ctx[-120:]!r}")
     except (json.JSONDecodeError, KeyError) as e:
         fail("core-bytes opt-out", f"bad output {r.stdout[:200]!r} ({e})")
+
+
+# ── Test 13: the DEFAULT must not bound a file the platform already delivers ──
+with tempfile.TemporaryDirectory() as ws:
+    # 3,349 bytes was observed arriving intact through a real SessionStart(compact),
+    # so a default that cuts this size removes rules nothing was truncating.
+    body = "\n".join(f"rule line {i:03d} — some operating doctrine text" for i in range(70))
+    with open(os.path.join(ws, "PERSONAL_CLAUDE.md"), "w") as f:
+        f.write(body + "\n")
+    r = run_hint(ws)
+    try:
+        ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+        if "rule line 000" in ctx and "rule line 069" in ctx and "bounded to stay" not in ctx:
+            ok("default injects the whole file — no bound unless opted in")
+        else:
+            fail("default is unbounded",
+                 f"first={'rule line 000' in ctx} last={'rule line 069' in ctx} "
+                 f"bounded={'bounded to stay' in ctx}")
+    except (json.JSONDecodeError, KeyError) as e:
+        fail("default is unbounded", f"bad output {r.stdout[:200]!r} ({e})")
 
 
 print(f"\n{_pass} passed, {_fail} failed")
