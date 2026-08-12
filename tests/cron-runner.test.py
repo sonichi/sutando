@@ -643,5 +643,107 @@ def test_shell_timeout_override_rejects_unusable_values():
     check(cr._shell_timeout_for({"shell_timeout_s": True}) == d, "bool -> default")
 
 
+def test_kill_tree_survives_a_process_that_vanished():
+    """getpgid/killpg raise once the process is already reaped; the harness must
+    return quietly rather than propagate out of the timeout handler."""
+    class _Gone:
+        pid = 999999
+        def wait(self, timeout=None):
+            return 0
+    import unittest.mock as _m
+    with _m.patch.object(cr.os, "getpgid", side_effect=OSError(3, "no such process")):
+        cr._kill_process_tree(_Gone())          # 290-291
+    check(True, "vanished process: getpgid OSError is swallowed")
+    with _m.patch.object(cr.os, "getpgid", return_value=4242), \
+         _m.patch.object(cr.os, "killpg", side_effect=OSError(1, "not permitted")):
+        cr._kill_process_tree(_Gone())          # 295-296
+    check(True, "killpg OSError is swallowed")
+
+
+def test_kill_tree_escalates_to_sigkill_when_term_is_ignored():
+    """A tree that ignores SIGTERM must still be killed — the loop continues to
+    SIGKILL rather than returning after the first signal."""
+    import unittest.mock as _m
+    sent = []
+    class _Stubborn:
+        pid = 4242
+        def __init__(self):
+            self.calls = 0
+        def wait(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:                 # 300-301: TERM ignored
+                raise subprocess.TimeoutExpired("cmd", timeout or 5)
+            return 0
+    with _m.patch.object(cr.os, "getpgid", return_value=4242), \
+         _m.patch.object(cr.os, "killpg", side_effect=lambda g, s: sent.append(s)):
+        cr._kill_process_tree(_Stubborn())
+    check(sent == [cr.signal.SIGTERM, cr.signal.SIGKILL],
+          f"TERM then KILL escalation (sent={sent})")
+
+
+def test_drain_that_hangs_after_the_kill_still_returns_124():
+    """If the post-kill drain also hangs, the runner must not hang with it."""
+    import unittest.mock as _m
+    class _Hang:
+        pid = 4242
+        returncode = None
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("cmd", timeout or 1)
+    with _m.patch.object(cr.subprocess, "Popen", return_value=_Hang()), \
+         _m.patch.object(cr, "_kill_process_tree", lambda p: None):
+        rc = cr._run_shell_command("hang", "irrelevant", timeout_s=1)   # 335-336
+    check(rc == 124, f"hung drain still returns 124 (got {rc})")
+
+
+def test_unspawnable_command_is_reported_not_raised():
+    """Popen itself can fail (ENOENT/EMFILE); that must become a logged 127."""
+    import unittest.mock as _m
+    with _m.patch.object(cr.subprocess, "Popen", side_effect=OSError(2, "nope")):
+        rc = cr._run_shell_command("bad", "irrelevant", timeout_s=5)    # 341-344
+    check(rc == 127, f"unspawnable command returns 127 (got {rc})")
+    log = cr._shell_log_path().read_text()
+    # Not the class name: OSError(2, ...) promotes to FileNotFoundError, so assert
+    # on the message that actually has to reach an operator.
+    check("nope" in log, "the spawn failure detail is persisted in the log")
+
+
+def test_malformed_shell_command_is_skipped_and_not_retried():
+    """A non-string or blank shell_command must be skipped loudly AND have its
+    state advanced, or the runner retries the same bad entry every tick."""
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.REPO_ROOT = root
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": "blank", "cron": "2 6 * * *", "shell_command": "   ",
+                 "launchd": True},
+                {"name": "nonstring", "cron": "2 6 * * *", "shell_command": 123,
+                 "launchd": True},
+            ]))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                cr.run(now_epoch=fire)                       # 466, 470-471
+            msg = err.getvalue()
+            check("shell_command must be a non-empty string" in msg,
+                  "malformed shell_command is reported on stderr")
+            check(msg.count("shell_command must be a non-empty string") == 2,
+                  "both malformed entries are reported")
+            state = json.loads(cr.STATE_FILE.read_text())
+            check(state.get("blank") == fire and state.get("nonstring") == fire,
+                  "state advanced so the bad entry is not retried every tick")
+            check(not list((root / "tasks").glob("*.txt")) if (root / "tasks").is_dir() else True,
+                  "no task file emitted for a malformed shell entry")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
 if __name__ == "__main__":
     _run_all()
