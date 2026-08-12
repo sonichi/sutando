@@ -239,11 +239,10 @@ class EmptyMentionContextTest(unittest.TestCase):
         BRIDGE.handle_mention(mention_event(), None)
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
-    def test_malformed_timestamp_does_not_crash_recovery(self):
-        # Defensive (recency bound): a message whose ts cannot be parsed as a float
-        # must not crash the recovery walk — the check swallows the parse error and
-        # falls through to the normal same-user/text logic (fail-open to prior
-        # behavior). Here the unparseable-ts message still recovers its text.
+    def test_unparseable_timestamp_fails_closed(self):
+        # An unparseable ts means the age is UNKNOWN, and recovered text becomes a
+        # live task — so recovery must stop and ask, not proceed. Fail-open here
+        # would let the one input the recency bound cannot evaluate bypass it.
         BRIDGE.app.client.conversations_replies = lambda **kwargs: {
             "messages": [
                 {"ts": "", "user": "UOWNER", "text": "Run it now"},
@@ -251,10 +250,21 @@ class EmptyMentionContextTest(unittest.TestCase):
             ]
         }
         BRIDGE.handle_mention(mention_event(), None)
-        self.assertEqual(
-            self.captured[0][1:],
-            ("Slack mention (recovered prior message)", "Run it now", "Rui"),
-        )
+        self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
+
+    def test_unparseable_timestamp_does_not_resurface_destructive_text(self):
+        # Non-empty but non-numeric ts, and it must sort BELOW the mention's ts:
+        # the `message["ts"] >= current_ts` guard above is a STRING compare, so a
+        # malformed ts sorting high is skipped before the parse is ever reached.
+        BRIDGE.app.client.conversations_replies = lambda **kwargs: {
+            "messages": [
+                {"ts": "1700000001.bad", "user": "UOWNER", "text": "delete the prod database"},
+                {"ts": "1700000002.000003", "user": "UOWNER", "text": "<@UBOT>"},
+            ]
+        }
+        BRIDGE.handle_mention(mention_event(), None)
+        self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
+        self.assertNotIn("delete the prod database", str(self.captured))
 
     def test_recovery_within_window_still_succeeds(self):
         # Positive control: an instruction well within the window (2 min before

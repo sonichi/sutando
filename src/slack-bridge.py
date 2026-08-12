@@ -937,7 +937,10 @@ def _resolve_mention_text(event: dict, stripped_text: str) -> tuple[str, bool]:
                     if float(current_ts) - float(message.get("ts", "0")) > _EMPTY_MENTION_RECOVERY_MAX_AGE_S:
                         break
                 except (TypeError, ValueError):
-                    pass
+                    # Unknown age must fail CLOSED. Recovered text becomes a live
+                    # task, so an unparseable ts would let the recency bound be
+                    # bypassed by the one input it cannot evaluate.
+                    break
                 candidate = (message.get("text") or "").strip()
                 without_mentions = re.sub(
                     r"(?:^|\s)<@[A-Z0-9]+>(?=\s|$)",
