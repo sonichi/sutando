@@ -83,22 +83,36 @@ def _is_login_class(signal: dict) -> bool:
     return signal.get("state") == "logged-out" or signal.get("kind") == "login"
 
 
+#: A record older than this is a core that stopped beating; the socket it names
+#: may no longer exist, so pointing the owner at it is worse than generic phrasing.
+_ALIVE_STALE_SEC = 90
+
+
+def _core_host_label() -> str:
+    """Must match the label `core_heartbeat` WROTE the file under, not this
+    process's hostname — DHCP drift makes those disagree and the read misses."""
+    try:
+        from util_paths import _host_label
+        return _host_label()
+    except Exception:
+        return platform.node().split(".")[0]
+
+
 def _derive_backend() -> "dict | None":
     """The core's own recorded backend, or None when it isn't knowable here.
-
-    `core_heartbeat` writes `socket` into `state/cores/<host>.alive` precisely so a
-    reader need not guess it; an embedded core records no tmux backend and gets None.
-    """
+    An embedded core records no tmux backend, and a stale record gets None."""
     try:
         import json
         import sys
+        import time
         from pathlib import Path
         # Resolve src/ from THIS file, not ambient sys.path: run as a script sys.path[0]
         # is src/, but loaded as a module it is not, and the import would silently fail.
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from workspace_default import resolve_workspace
-        host = platform.node().split(".")[0]
-        p = Path(resolve_workspace()) / "state" / "cores" / f"{host}.alive"
+        p = Path(resolve_workspace()) / "state" / "cores" / f"{_core_host_label()}.alive"
+        if time.time() - p.stat().st_mtime > _ALIVE_STALE_SEC:
+            return None
         d = json.loads(p.read_text())
         sock = (d.get("socket") or "").strip()
         # A socket alone is the tmux case; anything else is not addressable as a console.
@@ -123,21 +137,20 @@ def compose_message(signal: dict) -> str:
         # echo is what gives way to stay inside the message-length bound.
         msg += f": {excerpt[:110]}"
     if _is_login_class(signal):
-        host = platform.node().split(".")[0] or "the host"
+        host = _core_host_label() or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"
                 " `bash src/restart.sh` from the repo, then complete /login."
                 " A chat reply can't resolve this.")
     else:
-        host = platform.node().split(".")[0] or "the host"
-        # No fixed LITERAL is correct (the core may be embedded, the socket is
-        # env-overridable) but the running core records its own socket, so derive it.
-        # Guard at the CALL SITE, not only inside the helper: this message is the only
-        # channel the owner has here, so nothing in derivation may crash the escalation.
+        host = _core_host_label() or "the host"
+        # Guard at the CALL SITE too: this message is the owner's only channel
+        # here, so nothing in derivation may crash the escalation.
         try:
             be = _derive_backend()
         except Exception:
             be = None
-        where = (f"at the core's terminal on {host} (tmux socket {be['socket']})"
+        # A bare socket path is not actionable; the attach command is.
+        where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} attach`"
                  if be else f"where the core is running on {host}")
         msg += f" — answer it {where}. A chat reply can't answer it."
     return msg

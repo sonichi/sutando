@@ -499,5 +499,98 @@ class TestResolveActiveTarget(unittest.TestCase):
             self.assertEqual(resolve_active_target(self._write(td, [1, 2, 3])), ("", ""))
 
 
+
+class TestBackendRecordContract(unittest.TestCase):
+    """`_derive_backend` reads the file `core_heartbeat` wrote. The label and the
+    freshness rule must match the writer's, or it silently resolves to nothing."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.ws = os.path.join(self._td.name, "ws")
+        os.makedirs(os.path.join(self.ws, "state", "cores"))
+        self._saved = os.environ.get("SUTANDO_HOST_LABEL")
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("SUTANDO_HOST_LABEL", None)
+        else:
+            os.environ["SUTANDO_HOST_LABEL"] = self._saved
+        self._td.cleanup()
+
+    @contextlib.contextmanager
+    def _workspace(self):
+        """Inject the workspace the helper imports, so the real resolver is not
+        consulted and the test cannot silently read the live workspace."""
+        import sys, types
+        stub = types.ModuleType("workspace_default")
+        stub.resolve_workspace = lambda: self.ws
+        prev = sys.modules.get("workspace_default")
+        sys.modules["workspace_default"] = stub
+        try:
+            yield
+        finally:
+            if prev is None:
+                sys.modules.pop("workspace_default", None)
+            else:
+                sys.modules["workspace_default"] = prev
+
+    def _write_alive(self, label, socket_path="/tmp/sutando-tmux.sock", age_sec=0):
+        f = os.path.join(self.ws, "state", "cores", f"{label}.alive")
+        with open(f, "w") as fh:
+            json.dump({"host": label, "socket": socket_path}, fh)
+        if age_sec:
+            old = os.path.getmtime(f) - age_sec
+            os.utime(f, (old, old))
+        return f
+
+    def test_reads_the_label_the_heartbeat_wrote_under(self):
+        """The writer uses util_paths._host_label(); a reader on platform.node()
+        misses the file whenever DHCP drifts the hostname away from the label."""
+        os.environ["SUTANDO_HOST_LABEL"] = "Label-Not-The-Hostname"
+        self._write_alive("Label-Not-The-Hostname")
+        with self._workspace():
+            be = _mod._derive_backend()
+        self.assertIsNotNone(
+            be, "read under the process hostname instead of the host-label contract")
+        self.assertEqual(be["socket"], "/tmp/sutando-tmux.sock")
+
+    def test_a_stale_record_is_not_a_target(self):
+        """Written under BOTH labels on purpose: with only one, a reader that used
+        the wrong label would return None and pass this for the wrong reason."""
+        import platform as _pl
+        os.environ["SUTANDO_HOST_LABEL"] = "StaleHost"
+        self._write_alive("StaleHost", age_sec=600)
+        self._write_alive(_pl.node().split(".")[0], age_sec=600)
+        with self._workspace():
+            self.assertIsNone(_mod._derive_backend(),
+                              "a record past the staleness bound is not a live target")
+
+    def test_a_fresh_record_still_resolves(self):
+        os.environ["SUTANDO_HOST_LABEL"] = "FreshHost"
+        self._write_alive("FreshHost", socket_path="/tmp/other.sock")
+        with self._workspace():
+            be = _mod._derive_backend()
+        self.assertEqual(be["socket"], "/tmp/other.sock")
+
+    def test_absent_record_is_none_not_a_crash(self):
+        os.environ["SUTANDO_HOST_LABEL"] = "NoSuchHost"
+        with self._workspace():
+            self.assertIsNone(_mod._derive_backend())
+
+
+class TestTargetIsRunnable(unittest.TestCase):
+    def test_the_message_gives_a_command_not_a_path(self):
+        """A bare socket path is not something the owner can act on."""
+        with _backend({"socket": "/tmp/sutando-tmux.sock"}):
+            msg = compose_message(_HUNG)
+        self.assertIn("tmux -S /tmp/sutando-tmux.sock attach", msg)
+
+    def test_no_backend_still_degrades_to_generic_phrasing(self):
+        with _no_backend():
+            msg = compose_message(_HUNG)
+        self.assertIn("where the core is running", msg)
+        self.assertNotIn("tmux -S", msg)
+
+
 if __name__ == "__main__":
     unittest.main()
