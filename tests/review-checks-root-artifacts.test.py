@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/review-checks-root-artifacts.py (the stray-root-file
-scanner behind review-checks.sh). The shell-level behaviour is covered by
-tests/review-checks-root-artifacts.test.sh; this pins the diff-parsing branches
-and gives the diff-coverage gate real coverage of the new file — the gate runs
-tests/**/*.test.py only, so a .sh-only test measures as zero."""
+"""Unit tests for scripts/review-checks-root-artifacts.py. Pins the diff-parsing
+branches; the coverage gate runs tests/**/*.test.py only, so a .sh test scores 0."""
 import contextlib
 import importlib.util
 import io
@@ -59,9 +56,7 @@ check("reply1.md at the root is a violation", paths(added("reply1.md")), ["reply
 check("the matched glob is reported alongside the path",
       ra.violations(added("prbody.md"), GLOBS), [("prbody.md", "prbody*")])
 
-# --- root-only scoping -------------------------------------------------------
-# Not a nicety: tests/ and skills/ carry .md and .patch fixtures, and a rule
-# that reaches them is one a maintainer switches off.
+# --- root-only scoping: a rule reaching tests/ fixtures gets switched off ----
 check("the same name one level down is out of scope",
       paths(added("tests/reply1.md")), [])
 check("...and at any depth", paths(added("a/b/c/prbody.md")), [])
@@ -89,11 +84,7 @@ modified = (
 )
 check("modifying an existing root file is not a violation", paths(modified), [])
 
-# --- a rename is an ARRIVAL, so it counts ------------------------------------
-# Verbatim `git diff` output for `git mv notes/old-notes.md prbody.md`. No
-# `+++ b/` line and no `new file mode`, so an is_new-only rule misses it — and
-# in a base..head diff a detected rename means the file was already committed,
-# which is precisely how an artifact reaches the root without being "added".
+# --- a rename is an ARRIVAL: `git mv` output has no `+++ b/`, no `new file` ---
 pure_rename = (
     "diff --git a/notes/old-notes.md b/prbody.md\n"
     "similarity index 100%\n"
@@ -128,11 +119,8 @@ check("renaming an artifact OUT of the root is clean", paths(rename_out), [])
 check("a rename to an unmatched root name is clean",
       paths(pure_rename.replace("prbody.md", "CHANGELOG.md")), [])
 
-# --- git-quoted paths --------------------------------------------------------
-# core.quotePath is on by default: a non-ASCII path arrives C-escaped inside
-# quotes. Left encoded it matches no glob, so the gate would pass it silently.
-# The escape must fall AFTER the part the glob matches, or the decoded name
-# would not match anyway and the test would pass for the wrong reason.
+# --- git-quoted paths: C-escaped, so left encoded they match no glob ---------
+# The escape must fall AFTER the glob-matching prefix, or this passes vacuously.
 quoted = (
     'diff --git "a/prbody\\303\\251.md" "b/prbody\\303\\251.md"\n'
     "new file mode 100644\n"
@@ -155,9 +143,8 @@ check("a quoted rename destination is decoded and flagged",
 check("a +++ line without the b/ prefix is ignored",
       paths(added("prbody.md").replace("+++ b/prbody.md", "+++ prbody.md")), [])
 
-# --- the is_new flag must not leak across files ------------------------------
-# One `diff --git` per file resets it; without that reset the file AFTER an
-# addition inherits is_new and a plain modification reads as an addition.
+# --- is_new must not leak across files ---------------------------------------
+# Without the per-header reset, a modification after an addition reads as one.
 leak = added("CHANGELOG.md") + modified
 check("is_new resets at each diff header", paths(leak), [])
 
@@ -203,9 +190,8 @@ rc, out = run_main(added("CHANGELOG.md"), "prbody*")
 check("main() prints nothing on a clean diff", out, "")
 check("main() exits 0 on a clean diff", rc, 0)
 
-# An unconfigured scan has checked nothing, so it must not be able to report a
-# clean tree — returning 0 here is what let the runner print "root-artifacts
-# clean" with the gate switched off. Non-zero is the runner's fail-closed signal.
+# An unconfigured scan has checked nothing; 0 here let the runner print "clean"
+# with the gate off. Non-zero is its fail-closed signal.
 rc, out = run_main(added("prbody.md"), None)
 check("an unset glob env is a config error, not a pass", rc, 2)
 check("...and prints nothing on stdout that could read as a result", out, "")

@@ -121,15 +121,8 @@ and loads whichever repo it reviews.
 ```yaml
 checks:
   root-artifacts:
-    # Omitting this key does NOT disable the check — the runner installs these
-    # same defaults and says so on stderr. Narrow the list here to scope it; an
-    # absent key used to mean a silent pass that still printed "clean".
-    # Added files at the REPO ROOT matching these are PR-draft leftovers, not
-    # source. Root-only on purpose: tests/ and skills/ carry .md and .patch
-    # fixtures, and a rule that reaches them gets disabled the first time it
-    # blocks a real one. Key is `root_artifact_glob`, not `flag`, because
-    # review-checks.sh parses section keys FLAT — a second `flag:` would merge
-    # into hardcoded-paths' list.
+    # Added files at the REPO ROOT matching these are PR-draft leftovers. Root
+    # only; omitting the key uses these defaults rather than disabling the check.
     root_artifact_glob:
       - 'prbody*'
       - 'pr-body*'

@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
-"""Flag PR-draft artifacts committed to the REPO ROOT, for review-checks.sh.
-
-A sibling of review-checks.py rather than part of it: that scanner reasons about
-added LINE CONTENT, this one about added FILE PATHS, and a stray root file never
-appears as an added line at all — only as a diff header. Globs arrive via env
-(RC_ROOT_ARTIFACT_GLOBS); the diff is read from STDIN, never argv, so a large PR
-diff cannot hit 'Argument list too long' and make the scan silently skip.
-
-Root-only by design: `tests/` and `skills/` legitimately carry .md and .patch
-fixtures, and a rule reaching into them is one a maintainer disables the first
-time it blocks a real fixture.
-
-Prints one `path: <reason>` per violation. Exit 0 whether or not there are hits —
-the caller decides pass/fail from the output — and non-zero if this scanner
-cannot do its job, so the runner fails closed. An empty glob list counts as
-cannot: a scan that ran no patterns has not established anything.
-"""
+"""Flag PR-draft artifacts at the REPO ROOT. Scans added FILE PATHS, not line
+content, because a stray root file is a diff header. Exit non-zero = cannot scan."""
 import fnmatch
 import os
 import re
@@ -44,12 +29,8 @@ def _unquote(p):
 
 
 def violations(diff_text, globs):
-    """Paths ARRIVING at the repo root that match a flagged glob.
-
-    Arrival, not authorship: a rename lands an artifact at the root just as an
-    add does, and in a base..head diff a detected rename means the file was
-    already committed — so `is_new` alone would miss it.
-    """
+    """Paths ARRIVING at the repo root that match a flagged glob. Arrival, not
+    authorship: a rename lands one there too, so is_new alone would miss it."""
     hits = []
     is_new = False
 
@@ -91,15 +72,13 @@ def violations(diff_text, globs):
 
 
 def main():
-    # Strip before the emptiness test, so a whitespace-only value is the config
-    # error it is rather than one glob that matches nothing — matching how the
-    # shell runner decides whether to install its defaults.
+    # Strip first: a whitespace-only value is a config error, not one glob that
+    # matches nothing.
     raw = os.environ.get("RC_ROOT_ARTIFACT_GLOBS", "").split("\n")
     globs = [g for g in (s.strip() for s in raw) if g]
     if not globs:
-        # An unconfigured scan has checked nothing. Returning 0 would let the
-        # caller print "root-artifacts clean" — the shape of green check this
-        # whole gate exists to prevent. The runner reads non-zero as fail-closed.
+        # A scan that ran no patterns has established nothing; 0 here would let
+        # the caller print "clean". Non-zero is the runner's fail-closed signal.
         print("review-checks-root-artifacts: RC_ROOT_ARTIFACT_GLOBS is empty; "
               "refusing to report a clean tree from a scan that ran no patterns.",
               file=sys.stderr)

@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# A PR-draft artifact committed to the repo root must fail the review gate.
-# Nothing gated this: it is a diff HEADER, so the hardcoded-paths content
-# scanner cannot see it however its patterns are written.
-#
-# Run: bash tests/review-checks-root-artifacts.test.sh
-# Exit: 0 = all pass, 1 = failure
+# A PR-draft artifact at the repo root must fail the gate. Run:
+# bash tests/review-checks-root-artifacts.test.sh   (0 = pass, 1 = failure)
 set -uo pipefail
 
 REPO="${REPO_UNDER_TEST:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -86,9 +82,7 @@ else
 fi
 
 # --- the gate must not switch itself off when the guide is thin ---------------
-# Both cases printed "PASS (hardcoded-paths + root-artifacts clean)" at rc=0
-# while scanning nothing. The missing-KEY one is the worse of the two: it
-# emitted no note at all, because the guide parsed fine for hardcoded-paths.
+# Both printed "PASS ... clean" at rc=0 while scanning nothing.
 run_guide() { printf '%s' "$2" | bash "$RC" --guide "$1" 2>&1; }
 ART="$(added_file_diff prbody.md)"
 HARDCODED="$(printf 'diff --git a/src/x.py b/src/x.py\nindex 1..2 100644\n--- a/src/x.py\n+++ b/src/x.py\n@@ -1 +1,2 @@\n a\n+P = "/Users/someone/x"\n')"
