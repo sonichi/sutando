@@ -1,20 +1,8 @@
 #!/usr/bin/env python3
-"""End-to-end tests for the dashboard's state-changing-request gate.
+"""Gate for state-changing dashboard requests.
 
-This PR lets a schedule carry a ``shell_command`` that ``src/cron-runner.py``
-executes, which makes ``POST /api/schedules`` a command-scheduling endpoint. The
-review of head ``1fc86eb1`` flagged that the route had no authentication and no
-same-origin gate, so an attacker-controlled page could schedule a command on the
-host: a CORS-safelisted ``text/plain`` POST skips the preflight, and CORS then
-hides only the *response*, not the state change.
-
-These run a real ``ThreadingHTTPServer`` on loopback and issue real requests, so
-they exercise the deployed handler path rather than the pure gate alone. The
-load-bearing assertion in each negative case is that ``crons.json`` is
-**byte-identical afterwards** — a 403 that still wrote the job would pass a
-status-code-only test.
-
-Standalone script (``python3 tests/dashboard-mutation-gate.test.py``).
+Each negative case asserts crons.json is byte-identical afterwards: a 403
+that still wrote the job would pass a status-code-only test.
 """
 
 import http.client
@@ -150,6 +138,26 @@ def main():
         "http://192.168.1.9:7844", "192.168.1.9:7844", "application/json",
         expect_body=True, bind="192.168.1.9")
     check("an explicit LAN bind accepts its own origin", ok)
+
+    # A wildcard bind names no host, so a LAN browser sends its own interface
+    # address and never the bind literal.
+    ok, why = dashboard.mutation_request_allowed(
+        "http://192.168.1.9:7844", "192.168.1.9:7844", "application/json",
+        expect_body=True, bind="0.0.0.0")
+    check("wildcard bind with no declared hosts refuses, and says why",
+          not ok and "DASHBOARD_ALLOWED_HOSTS" in (why or ""))
+    ok, _ = dashboard.mutation_request_allowed(
+        "http://192.168.1.9:7844", "192.168.1.9:7844", "application/json",
+        expect_body=True, bind="0.0.0.0", allowed_hosts="192.168.1.9")
+    check("wildcard bind + declared host accepts the LAN origin", ok)
+    ok, _ = dashboard.mutation_request_allowed(
+        "http://127.0.0.1:7844", "127.0.0.1:7844", "application/json",
+        expect_body=True, bind="0.0.0.0", allowed_hosts="192.168.1.9")
+    check("wildcard bind + declared host still accepts loopback", ok)
+    ok, _ = dashboard.mutation_request_allowed(
+        "http://evil.example", "evil.example", "application/json",
+        expect_body=True, bind="0.0.0.0", allowed_hosts="192.168.1.9")
+    check("wildcard bind + declared host still refuses a rebound Host", not ok)
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
     return 1 if failures else 0

@@ -723,6 +723,9 @@ def render_dashboard() -> str:
 # CORS hides a cross-origin *response*; it does not stop the request being made,
 # and a safelisted `text/plain` POST reaches the handler without a preflight.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# A wildcard bind names no host, so the legitimate Host set cannot be derived
+# from it; DASHBOARD_ALLOWED_HOSTS supplies it explicitly for LAN mode.
+_WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
 
 
 def _authority_host(value: str) -> str:
@@ -733,12 +736,26 @@ def _authority_host(value: str) -> str:
     return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
 
 
+def _allowed_mutation_hosts(bind: str, declared: str) -> "set[str] | None":
+    """Host names a mutation may carry. None = wildcard bind with none declared."""
+    names = {h for h in (_authority_host(x) for x in (declared or "").split(",")) if h}
+    if (bind or "").strip().lower() in _WILDCARD_BINDS:
+        return (_LOOPBACK_HOSTS | names) if names else None
+    return _LOOPBACK_HOSTS | {bind.strip().lower()} | names
+
+
 def mutation_request_allowed(origin, host, content_type, *, expect_body,
-                             bind="127.0.0.1"):
+                             bind="127.0.0.1", allowed_hosts=""):
     """Fail-closed gate for state-changing dashboard requests → (ok, reason)."""
-    if _authority_host(host) not in (_LOOPBACK_HOSTS | {bind.strip().lower()}):
-        # DNS rebinding: the attacker's name resolves to loopback, so only the
-        # Host header still carries it.
+    permitted = _allowed_mutation_hosts(bind, allowed_hosts)
+    if permitted is None:
+        # Refusing loudly beats 403-ing every save with "host not allowed": on a
+        # wildcard bind the operator must name the hosts, or rebinding is free.
+        return False, ("wildcard DASHBOARD_BIND requires DASHBOARD_ALLOWED_HOSTS "
+                       "(comma-separated) before mutations are accepted")
+    if _authority_host(host) not in permitted:
+        # DNS rebinding: the attacker's name resolves to us, so only the Host
+        # header still carries it.
         return False, "host not allowed"
     if not origin:
         return False, "missing Origin"
@@ -791,8 +808,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ok, why = mutation_request_allowed(
             self.headers.get("Origin"), self.headers.get("Host", ""),
             self.headers.get("Content-Type"), expect_body=expect_body,
-            bind=os.environ.get("DASHBOARD_BIND", "127.0.0.1"))
+            bind=os.environ.get("DASHBOARD_BIND", "127.0.0.1"),
+            allowed_hosts=os.environ.get("DASHBOARD_ALLOWED_HOSTS", ""))
         if not ok:
+            # Drain first: replying and closing with the body still unread makes
+            # the peer see a connection reset instead of the 403.
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                self.rfile.read(n)
             self._reply_json(403, {"error": why})
         return ok
 
