@@ -12,8 +12,9 @@ fixtures, and a rule reaching into them is one a maintainer disables the first
 time it blocks a real fixture.
 
 Prints one `path: <reason>` per violation. Exit 0 whether or not there are hits —
-the caller decides pass/fail from the output — and non-zero only if this scanner
-itself fails, so the runner can fail closed.
+the caller decides pass/fail from the output — and non-zero if this scanner
+cannot do its job, so the runner fails closed. An empty glob list counts as
+cannot: a scan that ran no patterns has not established anything.
 """
 import fnmatch
 import os
@@ -90,9 +91,19 @@ def violations(diff_text, globs):
 
 
 def main():
-    globs = [g for g in os.environ.get("RC_ROOT_ARTIFACT_GLOBS", "").split("\n") if g]
+    # Strip before the emptiness test, so a whitespace-only value is the config
+    # error it is rather than one glob that matches nothing — matching how the
+    # shell runner decides whether to install its defaults.
+    raw = os.environ.get("RC_ROOT_ARTIFACT_GLOBS", "").split("\n")
+    globs = [g for g in (s.strip() for s in raw) if g]
     if not globs:
-        return 0
+        # An unconfigured scan has checked nothing. Returning 0 would let the
+        # caller print "root-artifacts clean" — the shape of green check this
+        # whole gate exists to prevent. The runner reads non-zero as fail-closed.
+        print("review-checks-root-artifacts: RC_ROOT_ARTIFACT_GLOBS is empty; "
+              "refusing to report a clean tree from a scan that ran no patterns.",
+              file=sys.stderr)
+        return 2
     for p, g in violations(sys.stdin.read(), globs):
         print("%s: PR-draft artifact added at the repo root (matches '%s')" % (p, g))
     return 0

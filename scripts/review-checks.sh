@@ -75,6 +75,15 @@ ALLOWS="$(parse_list allow)"
 ALLOW_PAIRED="$(parse_list allow_paired)"
 ROOT_GLOBS="$(parse_list root_artifact_glob)"
 NOTE=""
+ROOT_NOTE=""
+# Defaulted INDEPENDENTLY of the FLAGS fallback below, because the two go empty
+# for different reasons: a guide can parse fine for hardcoded-paths and simply
+# not carry this key. Tying them together left ROOT_GLOBS empty on that path,
+# and the scan then reported "root-artifacts clean" without ever running.
+if [[ -z "${ROOT_GLOBS//[$' \t\r\n']/}" ]]; then
+    ROOT_GLOBS=$'prbody*\npr-body*\npr_body*\nreply*.md\ncomment*.md\ndraft*.md\n*.patch\n*.diff\n*.orig\n*.rej\nnohup.out'
+    ROOT_NOTE="no root_artifact_glob in ${GUIDE#$REPO/}; used generic root-artifact defaults"
+fi
 if [[ -z "${FLAGS//[$' \t\r\n']/}" ]]; then
     FLAGS=$'/Users/\n/home/'
     ALLOWS=$'/nonexistent\n/usr/fake\n/tmp/\nexample.com'
@@ -99,6 +108,7 @@ if [[ $SCAN_RC -ne 0 ]]; then
 fi
 
 [[ -n "$NOTE" ]] && echo "review-checks: $NOTE" >&2
+[[ -n "$ROOT_NOTE" ]] && echo "review-checks: $ROOT_NOTE" >&2
 
 # --- scan ADDED FILE PATHS for PR-draft artifacts at the repo root -----------
 # Separate scanner: a stray root file is a diff HEADER, never an added line, so

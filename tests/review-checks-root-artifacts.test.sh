@@ -85,5 +85,65 @@ else
     bad "a clean diff still passes" "rc=$rc out=$(printf '%s' "$out" | tr '\n' ' ')"
 fi
 
+# --- the gate must not switch itself off when the guide is thin ---------------
+# Both cases printed "PASS (hardcoded-paths + root-artifacts clean)" at rc=0
+# while scanning nothing. The missing-KEY one is the worse of the two: it
+# emitted no note at all, because the guide parsed fine for hardcoded-paths.
+run_guide() { printf '%s' "$2" | bash "$RC" --guide "$1" 2>&1; }
+ART="$(added_file_diff prbody.md)"
+HARDCODED="$(printf 'diff --git a/src/x.py b/src/x.py\nindex 1..2 100644\n--- a/src/x.py\n+++ b/src/x.py\n@@ -1 +1,2 @@\n a\n+P = "/Users/someone/x"\n')"
+
+out="$(run_guide /dev/null "$ART")"; rc=$?
+if [[ $rc -eq 1 && "$out" == *"prbody.md"* ]]; then
+    ok "a MISSING guide still gates root artifacts (defaults installed)"
+else
+    bad "a MISSING guide still gates root artifacts" "rc=$rc out=$(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# A real guide that parses for hardcoded-paths but carries no root_artifact_glob.
+NOKEY="$(mktemp)"; trap 'rm -f "$NOKEY"' EXIT
+python3 - "$REPO/REVIEW.md" "$NOKEY" <<'PYEOF'
+import re, sys, pathlib
+t = pathlib.Path(sys.argv[1]).read_text()
+out = re.sub(r"\n  root-artifacts:.*?(?=\n  [a-z-]+:\n|\Z)", "\n", t, flags=re.S)
+assert "root_artifact_glob" not in out, "fixture still carries the key"
+assert "hardcoded-paths:" in out, "fixture lost the control section"
+pathlib.Path(sys.argv[2]).write_text(out)
+PYEOF
+
+out="$(run_guide "$NOKEY" "$ART")"; rc=$?
+if [[ $rc -eq 1 && "$out" == *"prbody.md"* ]]; then
+    ok "a guide MISSING the key still gates root artifacts"
+else
+    bad "a guide MISSING the key still gates root artifacts" "rc=$rc out=$(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# The note is what tells an operator the defaults are in play rather than their
+# own list; without it the substitution is silent.
+out="$(run_guide "$NOKEY" "$ART")"
+if [[ "$out" == *"root_artifact_glob"* && "$out" == *"default"* ]]; then
+    ok "...and says so, so the substitution is not silent"
+else
+    bad "...and says so" "no default note in: $(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# The fixture must still exercise the OTHER check, or these three prove nothing
+# about a guide that parses — they would just be re-testing the missing-guide path.
+out="$(run_guide "$NOKEY" "$HARDCODED")"; rc=$?
+if [[ $rc -eq 1 && "$out" == *"hardcoded-paths"* && "$out" != *"used generic defaults"* ]]; then
+    ok "control: the no-key guide DOES parse for hardcoded-paths"
+else
+    bad "control: the no-key guide DOES parse for hardcoded-paths" "rc=$rc out=$(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# Defense in depth: the scanner itself must refuse an unconfigured run, so a
+# future caller that forgets the env cannot resurrect the silent pass.
+out="$(printf '%s' "$ART" | RC_ROOT_ARTIFACT_GLOBS="" python3 "$REPO/scripts/review-checks-root-artifacts.py" 2>&1)"; rc=$?
+if [[ $rc -ne 0 ]]; then
+    ok "the scanner refuses an unconfigured run rather than passing"
+else
+    bad "the scanner refuses an unconfigured run" "rc=$rc"
+fi
+
 if [[ $fails -eq 0 ]]; then echo "PASS"; exit 0; fi
 echo "FAILED ($fails)"; exit 1

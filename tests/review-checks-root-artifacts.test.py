@@ -203,12 +203,16 @@ rc, out = run_main(added("CHANGELOG.md"), "prbody*")
 check("main() prints nothing on a clean diff", out, "")
 check("main() exits 0 on a clean diff", rc, 0)
 
-# An unset/empty env is a misconfigured caller, not a clean tree. Returning
-# early keeps it silent rather than flagging every added root file.
+# An unconfigured scan has checked nothing, so it must not be able to report a
+# clean tree — returning 0 here is what let the runner print "root-artifacts
+# clean" with the gate switched off. Non-zero is the runner's fail-closed signal.
 rc, out = run_main(added("prbody.md"), None)
-check("no globs in the env short-circuits before reading stdin", (rc, out), (0, ""))
+check("an unset glob env is a config error, not a pass", rc, 2)
+check("...and prints nothing on stdout that could read as a result", out, "")
 rc, out = run_main(added("prbody.md"), "")
-check("an empty glob env is treated the same", (rc, out), (0, ""))
+check("an empty glob env is a config error too", rc, 2)
+rc, out = run_main(added("prbody.md"), "\n \n")
+check("a whitespace-only glob env is a config error too", rc, 2)
 
 # A blank line in the env list must not become a glob: fnmatch("x", "") is
 # False today, but an empty pattern in the list is a caller bug either way.
