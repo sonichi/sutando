@@ -227,6 +227,10 @@ def upsert_schedule(path: Path, body: dict) -> tuple[int, dict]:
         elif (body.get("prompt") or "").strip():
             merged.pop("prompt_skill", None)
             merged.pop("shell_command", None)
+        if (merged.get("shell_command") or "").strip():
+            # Only the launchd runner executes shell jobs and the session
+            # scheduler skips them, so an unflagged one would never run at all.
+            merged["launchd"] = True
         err = validate_job(merged)
         if err:
             return 400, {"error": err}

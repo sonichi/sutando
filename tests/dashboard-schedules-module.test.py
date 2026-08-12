@@ -198,6 +198,30 @@ _j2 = next(j for j in ds.read_crons(p4) if j["name"] == "j2")
 check("switching back to skill removes prompt",
       "prompt" not in _j2 and _j2.get("prompt_skill") == "morning-briefing", str(_j2))
 
+# A shell job is executable ONLY by the launchd runner; the session scheduler
+# skips it. Unflagged, a newly posted one would never run at all.
+ds.upsert_schedule(p4, {"name": "mech", "cron": "*/5 * * * *",
+                        "shell_command": "echo hi"})
+_m = next(j for j in ds.read_crons(p4) if j["name"] == "mech")
+check("a new shell job is flagged launchd-owned", _m.get("launchd") is True, str(_m))
+
+# Converting an existing job must claim ownership too. Use a FRESH prompt job
+# with no launchd flag — reusing one that already carries it would pass whether
+# or not the code claims ownership.
+ds.upsert_schedule(p4, {"name": "conv", "cron": "0 9 * * *", "prompt": "plain"})
+_pre = next(j for j in ds.read_crons(p4) if j["name"] == "conv")
+check("fixture starts unflagged, so the next assertion can fail",
+      "launchd" not in _pre, str(_pre))
+ds.upsert_schedule(p4, {"name": "conv", "shell_command": "echo converted"})
+_conv = next(j for j in ds.read_crons(p4) if j["name"] == "conv")
+check("converting a prompt job to shell claims launchd ownership",
+      _conv.get("launchd") is True and "prompt" not in _conv, str(_conv))
+ds.delete_schedule(p4, "conv")
+
+# restore the fixture for the assertions below (they assert an exact count)
+ds.upsert_schedule(p4, {"name": "j2", "prompt_skill": "morning-briefing"})
+ds.delete_schedule(p4, "mech")
+
 # upsert replaces by name rather than duplicating
 ds.upsert_schedule(p4, {"name": "j2", "cron": "0 11 * * *"})
 check("upsert replaces by name (no duplicate)",
