@@ -1109,7 +1109,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
-                             "core-status", "team-room-trusted-runtime"],
+                             "core-status", "team-collaborator"],
         }
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).
@@ -1458,15 +1458,20 @@ def _write_task(task: dict) -> str | None:
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    # Resolved once, reused everywhere below so the tier decision can never diverge;
-    # must run before the "task" field is reached in the loop below.
-    sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
-    # AG2 Space room access settings are the Team trusted-runtime opt-in. Stamp
-    # it before the untrusted task body only when the broker itself attested Team
-    # and the effective local cap remains Team. A local owner→team downgrade is
-    # not consent to widen that room's historical read-only Team contract.
+    # Collaborator is an additive v2 control over the legacy-safe wire shape:
+    # access_tier remains guest and requested_access_tier carries Team so older
+    # nodes stay sandboxed. Only the broker-attested exact boolean may promote
+    # the effective tier; message text and string values cannot opt themselves in.
     broker_tier = _normalized_tier(task.get("access_tier"))
-    trusted_team_room = broker_tier == "team" and sender_tier == "team"
+    requested_tier = _normalized_tier(task.get("requested_access_tier"))
+    broker_collaborator = (
+        task.get("collaborator") is True
+        and (broker_tier == "team" or requested_tier == "team")
+    )
+    attested_tier = "team" if broker_collaborator else broker_tier
+    # Resolved once and reused below so routing and owner-activity cannot diverge.
+    sender_tier = _tier_for(task.get("user_id"), attested_tier)
+    collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
@@ -1484,8 +1489,8 @@ def _write_task(task: dict) -> str | None:
         elif f == "task" and task.get("task") not in (None, ""):
             # Keep the established id/timestamp prefix stable, but place this
             # trusted execution-policy header before all untrusted body text.
-            if trusted_team_room:
-                lines.append("team_runtime: trusted")
+            if collaborator_enabled:
+                lines.append("collaborator: true")
             # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
             # reaches the agent as body content (owner directive 2026-07-16) —
             # see _strip_room_ops_meta. Runs first so the stripped body is what

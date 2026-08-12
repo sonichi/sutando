@@ -288,11 +288,12 @@ Slack uses TOFU onboarding for owner enrollment: the first DM to the bot auto-en
 
 AG2 Space configures Owner, Team, and Guest per room. The broker-attested
 `access_tier` is independently capped by the local gateway policy. A room set to
-**Team** is the explicit opt-in to the trusted-collaborator runtime: the gateway
-adds a pre-body `team_runtime: trusted` stamp only when the broker says Team and
-the effective tier is still Team. Missing or invalid broker tiers, old gateways,
-and local owner-to-Team downgrades do not add the stamp and therefore retain the
-read-only path.
+**Team** alone retains the established restricted path. An agent's explicit
+Agent Native **Collaborator access** control is the trusted-runtime opt-in: the
+gateway requires broker-attested `collaborator: true` together with Team, then
+adds one pre-body `collaborator: true` stamp only when the effective local tier
+is still Team. Missing or invalid controls, old gateways, and local owner-to-Team
+downgrades retain the restricted path.
 
 Opted-in AG2 Space Team can use the normal configured workspace, tools,
 integrations, environment, and network. It is an owner-capability trust boundary

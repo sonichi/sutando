@@ -35,13 +35,13 @@ def _task(
     task_id: str,
     tier: str = "owner",
     *,
-    trusted_team_room: bool | None = None,
+    collaborator: bool | None = None,
 ) -> Path:
     path = workspace / "tasks" / f"{task_id}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if trusted_team_room is None:
-        trusted_team_room = tier == "team"
-    runtime_stamp = "team_runtime: trusted\n" if trusted_team_room else ""
+    if collaborator is None:
+        collaborator = tier == "team"
+    runtime_stamp = "collaborator: true\n" if collaborator else ""
     path.write_text(
         f"{runtime_stamp}id: {task_id}\nsource: discord\n"
         f"access_tier: {tier}\ntask: do the thing\n",
@@ -101,7 +101,7 @@ def test_team_keeps_the_sandboxed_path_until_an_operator_opts_in() -> None:
         root = Path(td)
         workspace = root / "workspace"
         team = _task(
-            workspace, "task-team-consent", "team", trusted_team_room=False)
+            workspace, "task-team-consent", "team", collaborator=False)
         results = workspace / "results"
         results.mkdir(parents=True, exist_ok=True)
 
@@ -126,28 +126,28 @@ def test_team_keeps_the_sandboxed_path_until_an_operator_opts_in() -> None:
             "a declined team task must not publish a result"
 
 
-def test_team_room_opt_in_requires_one_trusted_pre_body_stamp() -> None:
+def test_team_collaborator_requires_one_exact_pre_body_stamp() -> None:
     with tempfile.TemporaryDirectory() as td:
         workspace = Path(td)
         for value in ("false", "1", "owner", "", "trusted-now"):
             team = _task(
                 workspace, f"task-team-{value or 'empty'}", "team",
-                trusted_team_room=False,
+                collaborator=False,
             )
-            team.write_text(f"team_runtime: {value}\n" + team.read_text())
-            assert worker.team_trusted_runtime_enabled(team) is False
+            team.write_text(f"collaborator: {value}\n" + team.read_text())
+            assert worker.team_collaborator_enabled(team) is False
             assert worker.probe("claude", workspace, team) == worker.UNHANDLED
 
         trusted = _task(workspace, "task-team-trusted", "team")
-        assert worker.team_trusted_runtime_enabled(trusted) is True
+        assert worker.team_collaborator_enabled(trusted) is True
         duplicate = _task(workspace, "task-team-duplicate-stamp", "team")
-        duplicate.write_text("team_runtime: trusted\n" + duplicate.read_text())
-        assert worker.team_trusted_runtime_enabled(duplicate) is False
+        duplicate.write_text("collaborator: true\n" + duplicate.read_text())
+        assert worker.team_collaborator_enabled(duplicate) is False
         after_body = _task(
-            workspace, "task-team-after-body", "team", trusted_team_room=False)
-        after_body.write_text(after_body.read_text() + "team_runtime: trusted\n")
-        assert worker.team_trusted_runtime_enabled(after_body) is False
-        assert worker.team_trusted_runtime_enabled(
+            workspace, "task-team-after-body", "team", collaborator=False)
+        after_body.write_text(after_body.read_text() + "collaborator: true\n")
+        assert worker.team_collaborator_enabled(after_body) is False
+        assert worker.team_collaborator_enabled(
             workspace / "tasks" / "missing.txt") is False
 
 
@@ -295,13 +295,15 @@ def test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end() 
                 "task": "create the requested artifact",
                 "source": "ag2space",
                 "user_id": "@teammate:ag2.space",
-                "access_tier": "team",
+                "access_tier": "guest",
+                "requested_access_tier": "team",
+                "collaborator": True,
             })
             assert task_id == "task-room-team-e2e"
             team_task = tasks / f"{task_id}.txt"
             serialized = team_task.read_text()
-            assert serialized.count("team_runtime: trusted") == 1
-            assert serialized.index("team_runtime: trusted") < serialized.index("task:")
+            assert serialized.count("collaborator: true") == 1
+            assert serialized.index("collaborator: true") < serialized.index("task:")
 
             _executable(root / "claude", """#!/usr/bin/env python3
 import json, pathlib
@@ -331,7 +333,7 @@ print(json.dumps({'type': 'result', 'result': 'room Team task complete'}))
             })
             capped_task = tasks / f"{capped_id}.txt"
             assert "access_tier: team" in capped_task.read_text()
-            assert "team_runtime: trusted" not in capped_task.read_text()
+            assert "collaborator: true" not in capped_task.read_text()
             assert worker.probe("claude", workspace, capped_task) == worker.UNHANDLED
         finally:
             for name, value in saved.items():
@@ -1658,7 +1660,7 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
 if __name__ == "__main__":
     test_resolution_routes_bounded_tiers_before_owner_workstreams()
     test_team_keeps_the_sandboxed_path_until_an_operator_opts_in()
-    test_team_room_opt_in_requires_one_trusted_pre_body_stamp()
+    test_team_collaborator_requires_one_exact_pre_body_stamp()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan()
     test_team_codex_uses_normal_workspace_and_owner_configuration()

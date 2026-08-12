@@ -91,13 +91,13 @@ body: {
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-room-trusted-runtime"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator"]
 }
 ```
 
-`team-room-trusted-runtime` tells the AG2 Space control plane that this gateway
-understands the per-room Team execution policy. Gateways without it safely keep
-Team on their prior read-only path.
+`team-collaborator` tells the AG2 Space control plane that this gateway
+understands the per-agent Collaborator control layered over Team. Gateways
+without it safely keep Team on their prior restricted path.
 
 ## Media markers (optional)
 
@@ -143,12 +143,13 @@ gateway-controlled URL can never bounce a bearer to another host.
   fail closed to Guest. Every serialized wire field is newline-confined, and the
   bridge emits the resolved `access_tier:` independently, so message text cannot
   forge a higher tier.
-- A broker-attested AG2 Space **Team** room is the explicit trusted-runtime
-  opt-in. Only when both broker and effective tier are Team does the bridge add
-  one `team_runtime: trusted` line before the task body. A local owner-to-Team
-  cap does not opt a room in; old gateways and missing/malformed stamps keep the
-  established read-only Team path. This setting is therefore controlled per
-  room alongside Owner and Guest, rather than by a host-wide environment flag.
+- A broker-attested AG2 Space **Team** tier plus exact boolean
+  `collaborator: true` is the explicit trusted-runtime opt-in. The legacy wire
+  tier remains Guest with `requested_access_tier: team`, so older gateways stay
+  restricted. A capable bridge promotes that signed combination and adds one
+  `collaborator: true` line before the task body. A local owner-to-Team cap does
+  not opt a room in; missing/malformed controls fail closed. This setting is
+  controlled per room and per agent rather than by a host-wide environment flag.
 - The default local cap remains `owner` for the personal-agent model. A shared /
   multi-user gateway SHOULD set a lower local cap as defense in depth. Invalid
   local cap values fail closed to Guest.

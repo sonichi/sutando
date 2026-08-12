@@ -168,8 +168,8 @@ def resolve_access_tier(task_file: Path) -> str:
     return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
-def team_trusted_runtime_enabled(task_file: Path) -> bool:
-    """Accept only the gateway's pre-body room-policy execution stamp."""
+def team_collaborator_enabled(task_file: Path) -> bool:
+    """Accept only the gateway's exact pre-body collaborator stamp."""
     try:
         content = task_file.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -178,10 +178,10 @@ def team_trusted_runtime_enabled(task_file: Path) -> bool:
     values = [
         line.partition(":")[2].strip().lower()
         for line in before_task.splitlines()
-        if line.startswith("team_runtime:")
+        if line.startswith("collaborator:")
     ]
     # Exactly one allow-listed value: duplicates and malformed values fail closed.
-    return values == ["trusted"]
+    return values == ["true"]
 
 
 def _team_prompt(task_file: Path) -> str:
@@ -593,7 +593,7 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
     if tier == "team":
         # Not opted in: decline the task so it keeps the sandboxed path it had
         # before this runtime existed, exactly as guest does.
-        return MUST_HANDLE if team_trusted_runtime_enabled(task_file) else UNHANDLED
+        return MUST_HANDLE if team_collaborator_enabled(task_file) else UNHANDLED
     if tier == "guest":
         return UNHANDLED
     workstream_id = resolve_workstream(workspace, task_file)
@@ -612,7 +612,7 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
     if tier == "team":
         # Independent of probe(): a direct call must not reach the trusted
         # runtime, so the opt-in is re-checked at the launch site itself.
-        if not team_trusted_runtime_enabled(task_file):
+        if not team_collaborator_enabled(task_file):
             return UNHANDLED
         if _completed_result_exists(results_dir, task_file.name):
             return 0

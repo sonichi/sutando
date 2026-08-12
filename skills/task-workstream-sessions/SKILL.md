@@ -7,12 +7,12 @@ user-invocable: false
 # Task workstream sessions
 
 This runtime skill intercepts Team tasks before they can reach the unrestricted
-live core only when the AG2 Space broker attests that the room's access setting
-is Team. The remote gateway turns that room policy into one pre-body
-`team_runtime: trusted` execution stamp. Missing, malformed, duplicate, locally
-forged, or body-positioned stamps fail closed to the established read-only path;
-a local owner-to-Team cap is not treated as room consent. This makes the opt-in
-per room, configured alongside Owner and Guest in AG2 Space, with no host-wide
+live core only when the AG2 Space broker also attests the target agent's explicit
+Agent Native `collaborator: true` setting. The remote gateway turns that signed
+combination into one pre-body `collaborator: true` execution stamp. Missing,
+malformed, duplicate, locally forged, or body-positioned stamps fail closed to
+the established restricted path; a local owner-to-Team cap is not treated as
+room consent. This makes the opt-in per room and per agent, with no host-wide
 environment toggle. When opted in, the worker launches a fresh instance of the
 owner's configured runtime with the normal configured workspace, tools,
 integrations, network, and provider settings. A Team-specific prompt
