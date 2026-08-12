@@ -305,6 +305,11 @@ def notify_discord_dm(questions):
         f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
     )
     path.write_text("\n".join(lines))
+    # This body is a whole snapshot of the queue, so an older undelivered one is
+    # not redundant but wrong. A claimed file is `.sending` and never matches.
+    for old in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt"):
+        if old != path:
+            old.unlink(missing_ok=True)
 
 
 # A proactive-*.txt is only a DELIVERY if some bridge drains it. On a host where

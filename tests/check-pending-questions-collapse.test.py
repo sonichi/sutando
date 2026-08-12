@@ -4,8 +4,8 @@
 Discord-DM reminder files (`proactive-pending-q-*.txt`) are named from
 `questions_key()`, a hash of the sorted pending-question set. Covers: the key
 is order-independent and stable for a given set, changes when a question is
-added or answered, and that repeated reminders for the same set reuse one file
-while a changed set produces a new one.
+added or answered, and that a reminder supersedes any earlier undelivered one
+— of ours only, and never a claimed `.sending` body.
 
 Run: python3 tests/check-pending-questions-collapse.test.py
 """
@@ -66,13 +66,42 @@ with tempfile.TemporaryDirectory() as td:
     body = files[0].read_text() if files else ""
     ok("proactive content lists the question set", "Q1" in body and "Q2" in body)
 
-# T5: a changed set produces a distinct file.
+# T5: a changed set supersedes the earlier undelivered reminder rather than
+# queueing beside it — the old body states a count that is no longer true.
 with tempfile.TemporaryDirectory() as td:
     _mod.RESULTS_DIR = Path(td)
     _mod.notify_discord_dm(Q_AB)
     _mod.notify_discord_dm(Q_B)  # Q1 answered -> different set
-    files = list(Path(td).glob("proactive-pending-q-*.txt"))
-    ok("set change -> 2 distinct files", len(files) == 2)
+    names = {f.name for f in Path(td).glob("proactive-pending-q-*.txt")}
+    # Compare the whole SET: asserting on files[0] passes on a 2-file directory
+    # whenever the glob happens to yield the new one first.
+    ok("set change -> only the NEW set's file remains",
+       names == {f"proactive-pending-q-{_mod.questions_key(Q_B)}.txt"})
+    ok("the old set's file is gone",
+       f"proactive-pending-q-{_mod.questions_key(Q_AB)}.txt" not in names)
+    survivor = Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_B)}.txt"
+    body = survivor.read_text() if survivor.exists() else ""
+    ok("the surviving body states the new count", body.startswith("⚠️ 1 pending question "))
+
+# T6: superseding is scoped to OUR reminders. results/ is a shared namespace —
+# other proactive producers' bodies must survive, as must a claimed .sending.
+with tempfile.TemporaryDirectory() as td:
+    _mod.RESULTS_DIR = Path(td)
+    foreign = Path(td) / "proactive-morning-123.txt"
+    foreign.write_text("briefing")
+    claimed = Path(td) / "proactive-pending-q-deadbeefdeadbeef.sending"
+    claimed.write_text("mid-delivery")
+    _mod.notify_discord_dm(Q_AB)
+    _mod.notify_discord_dm(Q_B)
+    ok("another producer's proactive body is untouched", foreign.exists())
+    ok("a claimed .sending body is untouched", claimed.exists())
+
+# T7: an empty results/ is the first-run case — no predecessor to remove.
+with tempfile.TemporaryDirectory() as td:
+    _mod.RESULTS_DIR = Path(td)
+    _mod.notify_discord_dm(Q_AB)
+    ok("first reminder is written when there is nothing to supersede",
+       len(list(Path(td).glob("proactive-pending-q-*.txt"))) == 1)
 
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(0 if _failed == 0 else 1)
