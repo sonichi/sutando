@@ -16,6 +16,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+# This file reads discord-bridge.py as TEXT and never imports it, so no host
+# config is resolved — isolated anyway, so it stays true if that ever changes.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="orphan-routes-hermetic-")
+_ccd = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd.mkdir(parents=True, exist_ok=True)
+(_ccd / "access.json").write_text('{"allowFrom": [], "groups": {}}')
+
 spec = importlib.util.spec_from_file_location(
     "orphan_result_routes", REPO / "src" / "orphan_result_routes.py"
 )
