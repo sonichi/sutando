@@ -300,6 +300,17 @@ def _coarse_source(source: str) -> str:
     return s if s in _KNOWN_SOURCES else "unknown"
 
 
+def bucket_source(source: str, default: str = "unknown") -> str:
+    """Resolve a ``source:`` to a known bucket, falling back to ``default``
+    instead of the generic ``unknown``. A surface with a known home passes its
+    own bucket — e.g. the gateway is the ``remote`` surface, so a gateway task
+    whose per-task/per-deployment label isn't allowlisted counts as ``remote``,
+    not lost to ``unknown``. ``default`` is itself validated, so it can't smuggle
+    cardinality either."""
+    coarse = _coarse_source(source)
+    return coarse if coarse != "unknown" else _coarse_source(default)
+
+
 def task_processed(source: str, *, flush: bool = False) -> None:
     """One anonymous event per task the core accepts, tagged only with the
     inbound surface (``discord`` / ``slack`` / ``telegram`` / ``voice`` /

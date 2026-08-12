@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveVoiceEndpoint, defaultCandidates } from '../src/voice-connect-resolver.js';
+import { resolveVoiceEndpoint, defaultCandidates, directWsUrl } from '../src/voice-connect-resolver.js';
 
 describe('voice-connect-resolver', () => {
 	it('defaultCandidates: local first, cloud last, omits unknowns', () => {
@@ -9,6 +9,41 @@ describe('voice-connect-resolver', () => {
 		assert.ok(full[0].url.includes('localhost:9900'));
 		const minimal = defaultCandidates({});
 		assert.deepEqual(minimal.map((x) => x.tier), ['local']); // only local when nothing else known
+	});
+
+	it('tailnet slots between local and lan — mesh VPN beats same-subnet-only (upstream reconciliation)', () => {
+		const full = defaultCandidates({
+			tailnetHost: 'core.tail1234.ts.net',
+			lanHost: '192.168.1.5',
+			relayWsUrl: 'wss://r',
+			cloudUrl: 'wss://c',
+		});
+		assert.deepEqual(full.map((x) => x.tier), ['local', 'tailnet', 'lan', 'relay', 'cloud']);
+	});
+
+	it('off-localhost candidates dial the webUI /ws proxy, never the loopback-only voice port', () => {
+		const [local, tailnet, lan] = defaultCandidates({ tailnetHost: 'core.ts.net', lanHost: '192.168.1.5' });
+		assert.equal(local.url, 'ws://localhost:9900', 'local keeps the loopback voice-agent WS');
+		assert.equal(tailnet.url, 'ws://core.ts.net:8080/ws', 'tailnet goes through :proxyPort/ws');
+		assert.equal(lan.url, 'ws://192.168.1.5:8080/ws', 'lan goes through :proxyPort/ws');
+	});
+
+	it('directWsUrl: https → wss (tailscale serve fronts :443); http keeps its port; bare host gets proxyPort', () => {
+		assert.equal(directWsUrl('https://core.ts.net', 8080), 'wss://core.ts.net/ws');
+		assert.equal(directWsUrl('https://core.ts.net/', 8080), 'wss://core.ts.net/ws', 'trailing slash trimmed');
+		assert.equal(directWsUrl('http://192.168.1.5:8080', 9999), 'ws://192.168.1.5:8080/ws', 'advertised port preserved');
+		assert.equal(directWsUrl('core.ts.net', 8080), 'ws://core.ts.net:8080/ws');
+	});
+
+	it('agentEndpoint identity-routes: dial THAT agent, never generic local; relay/cloud stay as fallbacks', () => {
+		const cands = defaultCandidates({
+			agentEndpoint: 'https://agent.ts.net',
+			relayWsUrl: 'wss://r',
+			cloudUrl: 'wss://c',
+		});
+		assert.deepEqual(cands.map((x) => x.tier), ['tailnet', 'relay', 'cloud']);
+		assert.equal(cands[0].url, 'wss://agent.ts.net/ws');
+		assert.ok(!cands.some((x) => x.tier === 'local'), 'generic local would answer as the wrong agent');
 	});
 
 	it('returns the first reachable in ladder order (local down → relay up)', async () => {
