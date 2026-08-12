@@ -446,7 +446,8 @@ def _token_from_ag2space_env():
     are covered above; the bare-home guess only adds a footgun.
     """
     for path, vals in _channel_env_candidates():
-        # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
+        # Truthiness here, presence in _config_from_channel_env: a blank secret is
+        # absence and must fall through to the legacy alias; a blank room is a choice.
         tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
         if tok:
             # Name the exact file — which .env supplied the token is load-bearing
