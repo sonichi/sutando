@@ -157,8 +157,7 @@ check "code still flagged alongside skipped file"     flag  $'+++ b/docs/a.md\n@
 check "explicit --guide is honored"                   flag  $'+++ b/z.ts\n@@ -1,0 +1,1 @@\n+const p="/opt/thing";' --guide "$GUIDE"
 check "missing guide falls back, still flags /Users/" flag  $'+++ b/z.ts\n@@ -1,0 +1,1 @@\n+const p="/Users/a/b";' --guide /does/not/exist
 # --- empty input is "nothing was SCANNED", not "nothing was FOUND" -----------
-# Exit 0 here made a no-op invocation indistinguishable from a clean gate: the
-# runner is routinely called by agents/wrappers that read only the exit status.
+# Exit 0 let a no-op read as a clean gate to callers that check only the status.
 check "empty stdin fails closed (rc=2, never a pass)"  2     $''
 check "whitespace-only stdin fails closed too"         2     $' \n\t\n'
 check "--allow-empty opts an empty input back into 0"  clean $'' --allow-empty

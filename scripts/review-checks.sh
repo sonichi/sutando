@@ -16,10 +16,8 @@
 # Guide resolution: --guide wins; else <repo>/REVIEW.md. Missing
 # guide -> generic fallback patterns + a stderr note (degrades safely).
 #
-# Exit: 0 = clean; 1 = a check flagged something; 2 = usage error, an EMPTY input
-#       (nothing was scanned), or the scanner failed to launch/run — all
-#       fail-closed, and none of them print PASS. --allow-empty makes an empty
-#       input exit 0 for callers that legitimately scan a possibly-empty diff.
+# Exit: 0 = clean; 1 = a check flagged something; 2 = usage error, EMPTY input, or
+#       scanner failure — all fail-closed, no PASS. --allow-empty makes empty = 0.
 set -u
 
 DIFF_FILE=""
@@ -30,7 +28,7 @@ while [[ $# -gt 0 ]]; do
         --diff)  DIFF_FILE="${2:?--diff needs a path}"; shift 2;;
         --guide) GUIDE="${2:?--guide needs a path}";    shift 2;;
         --allow-empty) ALLOW_EMPTY=1; shift;;
-        -h|--help) sed -n '2,22p' "$0"; exit 0;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0;;
         *) echo "review-checks: unknown arg '$1'" >&2; exit 2;;
     esac
 done
