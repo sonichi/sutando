@@ -7113,30 +7113,16 @@ def check_core_model_pin() -> dict:
 
 MENUBAR_LABEL = "com.sutando.menubar"
 MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
-MENUBAR_RECENT_S = 7 * 86400
 
 
-def menubar_app_state(dev_bin, app_bin, plist, chips, is_macos: bool,
-                      now=None, recent_s: int = MENUBAR_RECENT_S) -> str:
+def menubar_app_state(dev_bin, app_bin, plist, is_macos: bool) -> str:
     """installed | expected-missing | not-applicable for the optional menu-bar app.
-
-    Only a host that asked for the app can be MISSING it — a headless install
-    has neither signal, so absence there is a configuration, not a fault.
-    """
+    The launchd plist is the only durable signal a host ASKED for the app."""
     if dev_bin.exists() or app_bin.exists():
         return "installed"
     if not is_macos:
         return "not-applicable"
-    if plist.exists():
-        return "expected-missing"
-    # The app is the sole writer of contextual-chips.json, so a RECENT one means
-    # it ran here; ageing it out stops a deliberate uninstall nagging forever.
-    try:
-        if (now or time.time()) - chips.stat().st_mtime < recent_s:
-            return "expected-missing"
-    except OSError:
-        pass
-    return "not-applicable"
+    return "expected-missing" if plist.exists() else "not-applicable"
 
 
 def run_all_checks() -> list[dict]:
@@ -7505,9 +7491,7 @@ def run_all_checks() -> list[dict]:
     dev_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     app_bin = Path("/Applications/Sutando.app/Contents/MacOS/Sutando")
     _menubar = menubar_app_state(
-        dev_bin, app_bin, MENUBAR_PLIST,
-        status_read_path("contextual-chips.json", WORKSPACE_DIR),
-        sys.platform == "darwin")
+        dev_bin, app_bin, MENUBAR_PLIST, sys.platform == "darwin")
     if _menubar == "installed":
         # Distinguish pgrep failures (exit code != 0 and != 1) from a real
         # no-match (exit code 1). Pre-fix the bare try/except swallowed

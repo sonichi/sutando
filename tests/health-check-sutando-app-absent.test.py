@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""A headless install must stay healthy; a host that asked for the app must not
-go quiet when the binary is gone.
-
-Run: python3 tests/health-check-sutando-app-absent.test.py
-"""
+"""A headless install must stay healthy; a host that asked for the app via
+launchd must not go quiet when the binary is gone."""
 from __future__ import annotations
 
 import ast
+import inspect
 import importlib.util
 import tempfile
 import unittest
@@ -50,13 +48,13 @@ class MenubarAppStateTest(unittest.TestCase):
         # Linux/cloud core: no binaries, no plist, not macOS. The OSS core is
         # deliberately headless, so this is a supported install, not a fault.
         self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=False),
+            hc.menubar_app_state(self.dev, self.app, self.plist, is_macos=False),
             "not-applicable")
 
     def test_macos_without_the_optional_app_is_not_unhealthy(self):
         # An operator who simply never installed the menu-bar app.
         self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=True),
+            hc.menubar_app_state(self.dev, self.app, self.plist, is_macos=True),
             "not-applicable")
 
     # --- but a configured host must stay visible --------------------------
@@ -66,13 +64,13 @@ class MenubarAppStateTest(unittest.TestCase):
         # bug this file exists for is that it used to emit no row at all.
         self._touch(self.plist)
         self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=True),
+            hc.menubar_app_state(self.dev, self.app, self.plist, is_macos=True),
             "expected-missing")
 
     def test_a_plist_on_a_non_macos_host_is_still_not_applicable(self):
         self._touch(self.plist)
         self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=False),
+            hc.menubar_app_state(self.dev, self.app, self.plist, is_macos=False),
             "not-applicable")
 
     # --- present in either location -> the existing probe runs -------------
@@ -80,51 +78,39 @@ class MenubarAppStateTest(unittest.TestCase):
     def test_dev_build_present_is_installed(self):
         self._touch(self.dev)
         self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=True),
+            hc.menubar_app_state(self.dev, self.app, self.plist, is_macos=True),
             "installed")
 
     def test_installed_bundle_present_is_installed(self):
         self._touch(self.app)
         self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=False),
+            hc.menubar_app_state(self.dev, self.app, self.plist, is_macos=False),
             "installed")
 
     def test_installed_wins_over_a_stale_plist(self):
         self._touch(self.plist)
         self._touch(self.dev)
         self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips, is_macos=True),
+            hc.menubar_app_state(self.dev, self.app, self.plist, is_macos=True),
             "installed")
 
 
-    # --- the OTHER install path: app run without launchd ------------------
+    # --- the control: a FRESHLY INITIALIZED workspace ---------------------
 
-    def test_a_RECENT_chips_file_means_the_app_ran_here(self):
-        # This host runs the app with no launchd plist, so plist-only would
-        # leave exactly this configuration silent.
+    def test_an_initialized_workspace_with_seeded_chips_stays_silent(self):
+        # src/init.sh seeds state/contextual-chips.json with a CURRENT
+        # timestamp, so chips recency cannot mean "the app ran here".
         self._touch(self.chips)
         self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips,
-                                 is_macos=True),
-            "expected-missing")
-
-    def test_a_STALE_chips_file_stops_nagging(self):
-        # Deliberate uninstall: the marker ages out instead of warning forever.
-        self._touch(self.chips)
-        import os
-        old = self.chips.stat().st_mtime - (30 * 86400)
-        os.utime(self.chips, (old, old))
-        self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips,
-                                 is_macos=True),
+            hc.menubar_app_state(self.dev, self.app, self.plist, is_macos=True),
             "not-applicable")
 
-    def test_chips_on_a_non_macos_host_is_still_not_applicable(self):
-        self._touch(self.chips)
-        self.assertEqual(
-            hc.menubar_app_state(self.dev, self.app, self.plist, self.chips,
-                                 is_macos=False),
-            "not-applicable")
+    def test_the_probe_never_consults_contextual_chips(self):
+        # Guards the reintroduction, not just the current return value: any
+        # chips-derived signal warns on every newly initialized macOS install.
+        body = inspect.getsource(hc.menubar_app_state)
+        self.assertNotIn("chips", body)
+        self.assertNotIn("contextual", body)
 
 
 class CallSiteTest(unittest.TestCase):
