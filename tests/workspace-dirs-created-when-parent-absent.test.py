@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""Guard: import-time workspace dir creation must tolerate an absent parent.
-
-`WORKSPACE_DIR` comes from `resolve_workspace()`; if that path does not exist yet,
-`mkdir(exist_ok=True)` raises FileNotFoundError because it will not create parents.
+"""Guard: import-time workspace dir creation must tolerate an absent resolved parent —
+workspace-relative mkdirs need parents=True, not exist_ok alone.
 """
 import subprocess
 import sys
