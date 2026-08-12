@@ -40,7 +40,7 @@ import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
-import { VoiceSession } from 'bodhi-realtime-agent';
+import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform !== 'darwin' && process.env.SUTANDO_TEST_MODE !== '1') {
@@ -262,6 +262,12 @@ if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
 const VOICE_AGENT_CONFIG = loadVoiceConfig(VOICE_AGENT_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = VOICE_AGENT_CONFIG.model;
 const VOICE_GOOGLE_SEARCH = VOICE_AGENT_CONFIG.googleSearch;
+// Shadow STT (config "shadowStt": true — default OFF): re-runs the same
+// audio through a batch model and logs disagreement — observation-only.
+const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
+// "divergenceCorrection": true additionally speaks a self-correction when
+// the shadow pass disagrees. Requires shadowStt.
+const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
@@ -887,6 +893,18 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		...(VOICE_SHADOW_STT
+			? {
+					shadowSttProvider: new GeminiBatchSTTProvider({
+						apiKey: GEMINI_VOICE_API_KEY,
+						model: 'gemini-2.5-flash',
+					}),
+					divergenceCorrection: VOICE_DIVERGENCE_CORRECTION,
+					onTranscriptionDivergence: (live: string, shadow: string, turnId?: number) => {
+						console.log(`${ts()} [ShadowSTT] model heard ≠ said (turn ${turnId ?? '?'}): live="${live}" shadow="${shadow}"`);
+					},
+				}
+			: {}),
 		// Step 11/12: when the pinned bodhi supports `?probe=1` probe
 		// interception, hand it the agent.state builder — probes get one
 		// frame + close 1000 without ever touching `this.client`. The Z3
