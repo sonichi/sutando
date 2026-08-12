@@ -2912,24 +2912,10 @@ def fix_screen_capture() -> str:
 
 
 def _checkout_is_canonical(repo_dir) -> tuple:
-    """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?
-
-    ok=True iff the repo is on `main` with a clean working tree. A dirty tree
-    or a non-main branch means an auto-restart would silently run UNINTENDED
-    code (2026-07-25: an auto-restart relaunched the bridge onto an unmerged
-    feature branch that happened to be parked in the live checkout). Best-effort
-    and fail-closed: if git state is unreadable, treat it as non-canonical.
-    """
+    """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?"""
     try:
-        # Route through git_argv, never a bare "git": a bare-string PATH lookup
-        # resolves to the /usr/bin/git SHIM on a macOS host without the Xcode
-        # command line tools, which pops the modal "install command line
-        # developer tools" dialog. This function runs from fix_down_bridges'
-        # default "restart" action on EVERY health-check pass where a bridge is
-        # down, so that dialog would repeat rather than appear once
-        # (qingyun-wu 2026-08-02, independently reproduced by bassilkhilo-ag2).
-        # git_argv raises GitUnavailable (an OSError) when the host has no git;
-        # the except below already turns that into the fail-closed verdict.
+        # Route through git_argv, never a bare "git": a bare-string PATH lookup resolves to
+        # the /usr/bin/git SHIM on a macOS host without the Xcode command line tools, which
         branch_proc = subprocess.run(
             git_argv("-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"),
             capture_output=True, text=True, timeout=10,
@@ -2940,10 +2926,8 @@ def _checkout_is_canonical(repo_dir) -> tuple:
         )
     except Exception as e:  # noqa: BLE001 — any git failure → fail closed
         return (False, f"git state unreadable ({e})")
-    # A nonzero git exit means the (possibly empty) stdout can't be trusted — an
-    # empty `status --porcelain` from a FAILED call must not read as "clean" and
-    # green-light an auto-restart (#2316, Qingyun review: the docstring promised
-    # fail-closed but the returncodes were never checked).
+    # A nonzero git exit means the (possibly empty) stdout can't be trusted — an empty
+    # `status --porcelain` from a FAILED call must not read as "clean" and green-light an
     if branch_proc.returncode != 0 or dirty_proc.returncode != 0:
         rc = branch_proc.returncode or dirty_proc.returncode
         return (False, f"git state unreadable (git exit {rc})")
@@ -2956,10 +2940,7 @@ def _checkout_is_canonical(repo_dir) -> tuple:
     return (True, "clean + on main")
 
 
-# Printed when an owner alert could not be delivered. A distinct, greppable
-# token so an operator or log monitor can distinguish "the owner was told" from
-# "we printed something locally and the send quietly failed" — the two used to
-# look identical (#2316).
+# Printed when an owner alert could not be delivered
 ALERT_UNDELIVERED_MARKER = "ALERT-UNDELIVERED"
 
 
@@ -2978,45 +2959,7 @@ def _default_local_notifier(msg: str) -> bool:
 
 def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
                      notifier=None) -> list:
-    """Restart or alert on configured-but-not-running channel bridges.
-
-    A dead bridge reports status "warn" (optional channels don't page), which
-    keeps it out of `issues` — so main()'s fix loop never reaches it, and
-    owner DMs silently queue channel-side until someone notices (2026-07-02:
-    discord-bridge died at boot with nothing logged; --fix left it down and 8
-    DMs sat undelivered). The exact-detail match excludes every other bridge
-    warn (multiple PIDs, token invalid, stale log), each of which needs
-    different handling than a plain start.
-
-    Behavior is governed by `health_check.down_bridge_action`
-    (resolve_down_bridge_action; override `action` for tests):
-      - "restart" (default): relaunch the bridge AND alert the owner — but ONLY
-        when the checkout is canonical (clean + on main). A non-canonical
-        checkout DOWNGRADES to alert, so a restart never silently runs
-        unintended code (Chi 2026-07-25: the restart itself was invisible AND
-        loaded an unmerged branch). Alerting makes crash-loops visible.
-      - "alert": never relaunch; alert the owner that the bridge is down.
-      - "off": neither — stay silent (return []).
-
-    Alerts print to stdout (captured in the health-check log) AND are sent to
-    the owner via `sender` (default `_default_slack_sender`, best-effort — a
-    missing sender never breaks the health check). Returns the list of bridge
-    names ACTUALLY (re)started (backward-compatible with the print loop in
-    main()).
-
-    Launch parity with startup.sh (per PR #1898 review): a naive
-    `sys.executable src/<bridge>.py` skips the bootstrapping startup.sh does and
-    crash-loops for two bridges:
-      - discord-bridge needs an interpreter that can `import discord`;
-        sys.executable (whatever launched health-check) frequently can't.
-      - slack-bridge needs SLACK_BOT_TOKEN/SLACK_APP_TOKEN, which startup.sh
-        sources from channels/slack/.env before launch — without them the
-        bridge exits immediately.
-    So mirror startup.sh: probe the same interpreter candidates for the
-    bridge's import, and inject the slack channel .env into the child's env.
-    Fail-safe: if no capable interpreter is found (or the required env is
-    missing), skip that bridge rather than spawn a guaranteed crash-loop.
-    """
+    """Restart or alert on configured-but-not-running channel bridges."""
     if action is None:
         action = resolve_down_bridge_action()
     if action == "off":
@@ -3078,9 +3021,8 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
             continue
         child_env = os.environ.copy()
         if name == "slack-bridge":
-            # startup.sh sources channels/slack/.env so SLACK_BOT_TOKEN /
-            # SLACK_APP_TOKEN reach the child. Mirror that here; skip the
-            # restart if the env file / tokens are missing (fail-safe).
+            # startup.sh sources channels/slack/.env so SLACK_BOT_TOKEN / SLACK_APP_TOKEN reach
+            # the child
             slack_env = _load_channel_env("slack")
             if "SLACK_BOT_TOKEN" not in {**os.environ, **slack_env}:
                 _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted "

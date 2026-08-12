@@ -346,21 +346,7 @@ class HealthCheckDegradesWithoutGit(unittest.TestCase):
         self.assertRegex(result["detail"], r"(?i)git not runnable|no runnable git")
 
     def test_checkout_is_canonical_degrades_without_git(self):
-        """`_checkout_is_canonical` must resolve git, not invoke a bare `git`.
-
-        It shipped in #2316 calling `subprocess.run(["git", "-C", ...])` twice
-        with a bare argv[0], while this module already imported `git_argv`. On a
-        Mac without the developer tools that string resolves to the /usr/bin/git
-        shim and pops the modal install dialog — and this function runs from
-        `fix_down_bridges`'s default "restart" action on EVERY health pass where
-        a bridge is down, so it repeats rather than firing once (qingyun-wu
-        2026-08-02, reproduced independently by bassilkhilo-ag2 at 8f029ebc).
-
-        Asserts the BEHAVIOUR that matters, matching the sibling test above:
-        with no runnable git the probe spawns NOTHING (a spawn is what raises
-        the modal) and fails closed. Reverting either call site to `["git", ...]`
-        makes `spawned` non-empty and this test red — that is the control.
-        """
+        """`_checkout_is_canonical` must resolve git, not invoke a bare `git`."""
         spawned = []
         real_run = subprocess.run
 

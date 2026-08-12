@@ -48,19 +48,7 @@ def check(name: str, status: str, detail: str) -> dict:
 def run_with_popen_stub(checks: list, *, action="restart",
                         guard=lambda repo: (True, "test-clean"),
                         sender=None, notifier=None) -> tuple[list, list]:
-    """Call fix_down_bridges with Popen stubbed; return (restarted, spawn argvs).
-
-    Also stubs the interpreter probe and slack-env load so the test is
-    hermetic: without these, fix_down_bridges would probe the host for
-    discord.py / slack_bolt (flaky across machines) and skip the restart when
-    absent. Here every bridge gets a known-good interpreter and slack gets a
-    token, so the restart path is exercised deterministically.
-
-    `action`/`guard`/`sender` are injected so the restart path is exercised
-    regardless of this checkout's config or branch (the real guard would refuse
-    a restart from a test worktree that isn't on `main`). Default = restart from
-    a canonical checkout with a no-op sender.
-    """
+    """Call fix_down_bridges with Popen stubbed; return (restarted, spawn argvs)."""
     spawned = []
     notified = []
 
@@ -434,9 +422,7 @@ def case_n_load_channel_env_unreadable_file() -> list[str]:
 
 
 def case_u_defaults_from_config_and_module() -> list[str]:
-    """Cover the default-resolution branches when action/sender/guard are omitted:
-    action←resolve_down_bridge_action, send←_default_slack_sender,
-    guard←_checkout_is_canonical (all module-level defaults)."""
+    """Cover the default-resolution branches when action/sender/guard are omitted:"""
     fails = []
     checks = [check("discord-bridge", "warn", "configured but not running")]
     with tempfile.TemporaryDirectory() as td:
@@ -470,11 +456,7 @@ def case_v_alert_send_failure_is_swallowed() -> list[str]:
 
 
 def case_x_failed_sender_falls_back_to_a_local_owner_surface() -> list[str]:
-    """A failed primary sender must reach an owner surface, not just a log line.
-
-    A down bridge is exactly when a bridge-borne alert cannot arrive, so the
-    fallback must not be another bridge.
-    """
+    """A failed primary sender must reach an owner surface, not just a log line."""
     import contextlib
     import io
 
@@ -542,18 +524,7 @@ def case_x_failed_sender_falls_back_to_a_local_owner_surface() -> list[str]:
 
 
 def case_w_alert_undelivered_is_observable() -> list[str]:
-    """A sender that RETURNS False (not raises) must be observable.
-
-    `_default_slack_sender` reports failure by returning False — missing owner
-    creds, or any Slack API call failing. `_alert` used to call `send(msg)` as
-    a bare statement and discard that, so on any host without a working Slack
-    bridge `action=alert` printed locally, silently failed to deliver, and left
-    NOTHING distinguishing it from a delivered alert. Found by qingyun-wu,
-    confirmed against the source by bassilkhilo-ag2 (#2316).
-
-    Asserts BOTH directions — a marker that is always printed would pass a
-    one-sided check while telling an operator nothing.
-    """
+    """A sender that RETURNS False (not raises) must be observable."""
     import io
     import contextlib
 
@@ -680,9 +651,8 @@ def case_s_checkout_is_canonical() -> list[str]:
         if ok or "uncommitted" not in why:
             fails.append(f"s) dirty tree should fail, got ({ok},{why})")
 
-    # A NONZERO git exit with empty stdout must fail closed — an errored
-    # `git status --porcelain` (empty output) must not read as "clean" and
-    # green-light an auto-restart (#2316, Qingyun review).
+    # A NONZERO git exit with empty stdout must fail closed — an errored `git status
+    # --porcelain` (empty output) must not read as "clean" and green-light an auto-restart
     def fail_status(argv, **kwargs):
         if "rev-parse" in argv:
             return subprocess.CompletedProcess(argv, 0, stdout="main\n", stderr="")

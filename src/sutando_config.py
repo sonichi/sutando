@@ -68,20 +68,7 @@ _DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
 
 
 def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
-    """How ``health-check.py --fix`` handles a configured-but-down channel bridge.
-
-    Read from merged config ``health_check.down_bridge_action``:
-      - ``"restart"`` (default): relaunch the bridge AND alert the owner — but
-        only when the code checkout is canonical (clean + on ``main``); a
-        non-canonical checkout downgrades to alert (see health-check's
-        ``fix_down_bridges``).
-      - ``"alert"``: alert the owner that the bridge is down; never relaunch.
-      - ``"off"``: neither — stay silent.
-
-    ``SUTANDO_DOWN_BRIDGE_ACTION`` is an invocation-scoped override. An unknown
-    value falls back to the default WITHOUT raising: a health-check knob typo
-    must never break the health check itself.
-    """
+    """How ``health-check.py --fix`` handles a configured-but-down channel bridge."""
     hc = load_config(repo_root).get("health_check") or {}
     configured = str(hc.get("down_bridge_action") or "restart").strip().lower()
     action = os.environ.get("SUTANDO_DOWN_BRIDGE_ACTION", "").strip().lower() or configured
