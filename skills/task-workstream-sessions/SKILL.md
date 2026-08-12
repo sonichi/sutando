@@ -1,6 +1,6 @@
 ---
 name: task-workstream-sessions
-description: Enforce Team task capabilities in the owner's selected runtime and isolate assigned owner tasks into durable provider sessions. This runtime skill is adapter-invoked; Guest keeps its established read-only Codex path and ungrouped owner tasks keep the selected core's legacy session.
+description: Guard Team tasks in the owner's selected runtime and isolate assigned owner tasks into durable provider sessions. This runtime skill is adapter-invoked; Guest keeps its established read-only Codex path and ungrouped owner tasks keep the selected core's legacy session.
 user-invocable: false
 ---
 
@@ -8,12 +8,22 @@ user-invocable: false
 
 This runtime skill first intercepts every explicit Team task before it can
 reach the unrestricted live core. It launches a fresh instance of the owner's
-configured runtime: Claude uses Claude Code's native OS sandbox and a bounded
-tool set, while Codex uses its native workspace-write sandbox. Team can edit
-and test inside the working repository but cannot access credentials or mutate
-external systems. A sandbox/runtime failure publishes a safe terminal result
-and never falls through to the owner core. Guest remains on the pre-existing
-read-only Codex delegation path carried in the task's in-band instructions.
+configured runtime with the normal configured workspace, tools, integrations,
+network, and provider settings. A Team-specific prompt identifies the sender as
+a trusted collaborator rather than the owner and requires cautious, scoped work
+without disclosing credentials or unrelated owner context. Before delivery, the
+handler scans the final response with Sutando's maintained secret scanner,
+rejects bridge delivery-control markers, and withholds any result containing a
+likely credential. Scanner/runtime failures publish a safe terminal result and
+never fall through to the owner core.
+
+This is deliberately a behavioral guardrail, not adversarial isolation. Team
+can perform ordinary development and operational work that needs the owner's
+installed toolchain and configured integrations. The owner accepts that trust
+tradeoff; outbound scanning reduces accidental response leakage but cannot undo
+side effects or guarantee that every sensitive value will be detected. Guest
+remains on the pre-existing read-only Codex delegation path carried in the
+task's in-band instructions.
 
 For owner tasks, the skill reads existing assignments from
 `<workspace>/data/task-workstreams.json`; it never classifies tasks or changes
