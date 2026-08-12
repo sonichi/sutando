@@ -57,11 +57,8 @@ check("list-sort-opt", nz.normalize_list("mice, humans, cats", sort=True), "cats
 check("list-no-sort-default", nz.normalize_list("mice, humans"), "mice, humans")
 check("list-number-items", nz.normalize_list("$5, 10%, 2 million", number_items=True), "5, 10, 2000000")
 
-# A list whose elements are themselves thousands-grouped numbers must split on
-# the element separators only, NOT on every grouping comma (bassil CR 2026-08-03:
-# naive split(",") shredded "1,000,000, 500,000, 250,000" into 7 fragments). The
-# grouping commas are preserved in the elements; auto mode leaves them as-is,
-# --number-items strips them. This is the GAIA multi-number answer shape.
+# Grouping commas inside an element are not element separators; auto mode
+# keeps them, --number-items strips them.
 check("list-grouped-numbers-preserved",
       nz.normalize_list("1,000,000, 500,000, 250,000"),
       "1,000,000, 500,000, 250,000")
@@ -78,22 +75,20 @@ check("list-grouped-decimals",
 # followed by "2000" (4 digits, not a valid 3-digit grouping) → a separator.
 check("list-nospace-plain-numbers",
       nz.normalize_list("1000,2000"), "1000, 2000")
-# Three-digit SECOND element. Grouping is a property of the whole token: no
-# grouped number has a four-digit lead group, so "1000,200" is two elements.
-# Deciding per-comma made this one element (qingyun CR on #2382).
+# No grouped number has a four-digit lead group, so "1000,200" is two
+# elements — the whole token decides, not the individual comma.
 check("list-three-digit-second-item",
       nz.normalize_list("1000,200"), "1000, 200")
 check("list-three-digit-second-item-number-items",
       nz.normalize_list("1000,200", number_items=True), "1000, 200")
-# Same token, split inconsistently before: only the last comma separated, so
-# "1000,200,30" came back as ["1000,200", "30"].
+# One token must split consistently: every comma in it gets the same answer.
 check("list-three-digit-middle-item",
       nz.normalize_list("1000,200,30"), "1000, 200, 30")
 # The lead group governs, not the element count: "1,0000" is not grouped.
 check("list-four-digit-tail-not-grouped",
       nz.normalize_list("1,0000"), "1, 0000")
-# Boundary the fix nearly broke: a grouped number may be FOLLOWED by a separator
-# comma, so the trailing guard must reject a digit only, not a comma.
+# A grouped number may be followed by a separator comma, so the trailing
+# guard rejects a digit only.
 check("list-grouped-then-grouped",
       nz.normalize_list("1,000,000, 500,000"), "1,000,000, 500,000")
 check("list-grouped-between-words",
@@ -114,8 +109,7 @@ check("auto-unknown-kind-passthru", nz.normalize_answer("whatever", kind="other"
 # --- the exact GAIA L3 miss this recovers ---
 check("gaia-100m-miss", nz.normalize_answer("100 million", kind="number"), "100000000")
 
-# --- currency symbol × thousands separator must COMPOSE (qingyun CR on #2382:
-# auto('$1,000') list-split to '$1, 000'; number('$1,000') passed through intact) ---
+# --- currency symbol x thousands separator must compose ---
 check("currency-grouped-auto", nz.normalize_answer("$1,000"), "1000")
 check("currency-grouped-number", nz.normalize_answer("$1,000", kind="number"), "1000")
 check("currency-grouped-euro-decimal", nz.normalize_answer("€1,234,567.89"), "1234567.89")
@@ -127,9 +121,7 @@ check("currency-symbol-magnitude", nz.normalize_answer("$100 million"), "1000000
 check("currency-euro-magnitude-number",
       nz.normalize_answer("€100 million", kind="number"), "100000000")
 check("currency-grouped-not-list", nz._infer_kind("$1,000"), "number")
-# Signed currency: minus BEFORE the symbol (bassil CR 2026-07-31 — previously
-# list-mangled to "-$1, 000"), plus the already-working after-symbol mirror
-# pinned so the sign-peel refactor can't regress it.
+# Signed currency: the minus may precede the symbol.
 check("currency-negative-before-symbol", nz.normalize_answer("-$1,000"), "-1000")
 check("currency-negative-before-symbol-number",
       nz.normalize_answer("-$1,000", kind="number"), "-1000")

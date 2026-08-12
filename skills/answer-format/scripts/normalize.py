@@ -38,15 +38,8 @@ _MAGNITUDE_RE = re.compile(
 _PURE_NUMBER_COMMAS = re.compile(r"^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
 _CURRENCY_PREFIX = re.compile(r"^(?:[$€£¥]|USD|EUR|GBP|JPY)\s*", re.IGNORECASE)
 _LEADING_ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
-# List elements are comma-separated, but a thousands-grouping comma inside a
-# numeric element ("1,000,000") is NOT an element boundary. Grouping is a
-# property of the WHOLE token, not of one comma: "1000,200" cannot be grouped
-# because no grouped number has a four-digit lead group, so its comma separates
-# elements. Deciding per-comma also split one token inconsistently —
-# "1000,200,30" became ["1000,200", "30"].
-# Trailing guard is (?!\d), not (?![\d,]): a grouped number may be followed by a
-# separator comma ("1,000,000, 500,000"). Greedy (?:,\d{3})+ already prevents
-# stopping mid-group, so only a digit may not follow.
+# Grouping is a property of the whole token, not of one comma: no grouped
+# number has a four-digit lead group, so "1000,200" separates elements.
 _GROUPED_NUMBER = re.compile(r"(?<![\d,])-?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?!\d)")
 
 
@@ -83,10 +76,8 @@ def _expand_magnitude(text: str) -> str | None:
 def _strip_currency_prefix(text: str) -> str:
     """Strip one supported currency wrapper only around a numeric core.
 
-    A leading minus may sit BEFORE the symbol ("-$1,000") as well as after it
-    ("$-1,000") — peel the sign, match the wrapper on the remainder, reattach
-    (bassil CR 2026-07-31: the before-symbol form fell through to list
-    classification and was re-spaced into "-$1, 000")."""
+    A leading minus may sit before the symbol ("-$1,000") or after it
+    ("$-1,000"), so peel the sign before matching the wrapper."""
     sign = ""
     body = text
     if body.startswith("-"):
@@ -115,11 +106,8 @@ def normalize_number(text: str) -> str:
     # "1,234,567" -> "1234567" (only when the whole token is a comma-grouped number)
     if _PURE_NUMBER_COMMAS.match(s):
         return s.replace(",", "")
-    # "$1234" / "$1,000" / "1,000%" -> strip a supported currency prefix and
-    # trailing percent around a numeric core. These transforms and the
-    # thousands-separator removal must COMPOSE (qingyun CR on #2382:
-    # '$1,000' previously survived number mode intact and, worse, auto mode
-    # list-split it into '$1, 000'). Order: currency, magnitude, percent, commas.
+        # Currency, magnitude, percent and comma-stripping must compose, in
+        # that order; applying any one alone leaves "$1,000" unnormalised.
     stripped = s
     if stripped[-1:] == "%" and (
             re.fullmatch(r"-?\d+(?:\.\d+)?", stripped[:-1]) or _PURE_NUMBER_COMMAS.match(stripped[:-1])):
@@ -170,15 +158,11 @@ def normalize_answer(text: str, kind: str | None = None, *,
 
 def _infer_kind(text: str) -> str:
     s = text.strip()
-    # Comma-grouped numbers must dodge list classification even when wrapped in
-    # the supported symbol forms — '$1,000' is a number, not the list ['$1','000']
-    # (qingyun CR on #2382). Strip the one leading symbol / trailing percent the
-    # number path itself supports, then test the grouped-number core.
+    # A grouped number keeps its commas even inside a supported symbol wrapper,
+    # so strip the wrapper before testing the numeric core.
     core = _strip_currency_prefix(s)
-    # An unknown ISO-shaped wrapper is not a list just because its amount has a
-    # grouping comma. Preserve it unchanged rather than manufacture "AUD 1, 000".
-    # Sign-aware for the same reason as _strip_currency_prefix: "-AUD 1,000"
-    # must stay a preserved string, not become the list ["-AUD 1", "000"].
+    # An unknown ISO-shaped wrapper stays a string even with a grouping
+    # comma, sign included: "-AUD 1,000" must not become ["-AUD 1", "000"].
     if core == s and re.match(r"^-?[A-Z]{3}\s+", s):
         return "string"
     if core[-1:] == "%":
