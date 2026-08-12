@@ -26,6 +26,31 @@ def _by_section(text: str):
         yield head, line
 
 
+_WORD_RE = re.compile(r"\w")
+
+
+def _found_at_word_boundary(needle: str, hay: str) -> bool:
+    """`needle` in `hay`, not glued to a word character on either side.
+
+    str.find beats re.search here by orders of magnitude: one saved build_log.md
+    is 14k lines against a 1.3MB live haystack, and the regex engine re-scanned
+    the whole haystack per line.
+    """
+    if not needle:
+        return True
+    pos = hay.find(needle)
+    while pos != -1:
+        # The lookarounds are unconditional in the pattern this replaces: they
+        # constrain the neighbouring character whatever the needle starts with.
+        before_ok = pos == 0 or not _WORD_RE.match(hay[pos - 1])
+        end = pos + len(needle)
+        after_ok = end >= len(hay) or not _WORD_RE.match(hay[end])
+        if before_ok and after_ok:
+            return True
+        pos = hay.find(needle, pos + 1)
+    return False
+
+
 def _new_content(saved: str, live: str) -> "list[str]":
     """Lines in the preserved copy whose TEXT is absent from live IN THE SAME SECTION.
     Blind to a renamed heading (falls back to global) and to reordering within a section."""
@@ -52,7 +77,7 @@ def _new_content(saved: str, live: str) -> "list[str]":
         hay = live_haystacks.get(head, haystack)
         # Boundary is any NON-WORD character, not a space: a live line that
         # gained trailing punctuation would otherwise read as absent.
-        if re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", hay):
+        if _found_at_word_boundary(needle, hay):
             continue  # same text, laid out differently
         out.append(line)
     return out
@@ -64,7 +89,7 @@ def _split_by_reason(extra: "list[str]", live: str) -> "tuple[list[str], list[st
     absent, resectioned = [], []
     for line in extra:
         needle = " ".join(line.split())
-        if re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack):
+        if _found_at_word_boundary(needle, haystack):
             resectioned.append(line)
         else:
             absent.append(line)
