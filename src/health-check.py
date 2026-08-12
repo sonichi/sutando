@@ -7117,8 +7117,7 @@ MENUBAR_RECENT_S = 7 * 86400
 
 
 def menubar_app_state(dev_bin, app_bin, plist, chips, is_macos: bool,
-                      now: float | None = None,
-                      recent_s: int = MENUBAR_RECENT_S) -> str:
+                      now=None, recent_s: int = MENUBAR_RECENT_S) -> str:
     """installed | expected-missing | not-applicable for the optional menu-bar app.
 
     Only a host that asked for the app can be MISSING it — a headless install
