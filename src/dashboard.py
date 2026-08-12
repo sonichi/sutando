@@ -719,6 +719,38 @@ def render_dashboard() -> str:
     return HTML.replace("__CONTENT__", "\n".join(cards))
 
 
+# ── Mutating-request gate ────────────────────────────────────────────────────
+# CORS hides a cross-origin *response*; it does not stop the request being made,
+# and a safelisted `text/plain` POST reaches the handler without a preflight.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _authority_host(value: str) -> str:
+    """Hostname from a Host/Origin authority, minus port and IPv6 brackets."""
+    v = (value or "").strip().lower()
+    if v.startswith("["):
+        return v[1:].split("]", 1)[0]
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
+def mutation_request_allowed(origin, host, content_type, *, expect_body,
+                             bind="127.0.0.1"):
+    """Fail-closed gate for state-changing dashboard requests → (ok, reason)."""
+    if _authority_host(host) not in (_LOOPBACK_HOSTS | {bind.strip().lower()}):
+        # DNS rebinding: the attacker's name resolves to loopback, so only the
+        # Host header still carries it.
+        return False, "host not allowed"
+    if not origin:
+        return False, "missing Origin"
+    if urlparse(origin).netloc.strip().lower() != (host or "").strip().lower():
+        return False, "cross-origin request refused"
+    if expect_body and (content_type or "").split(";", 1)[0].strip().lower() != "application/json":
+        # Non-safelisted type: a cross-origin sender must preflight, which this
+        # server never grants.
+        return False, "Content-Type must be application/json"
+    return True, None
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     # Drop connections that go silent (e.g. browser speculative preconnects
     # that open TCP and never send a request line). Without this, readline()
@@ -754,11 +786,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(obj).encode())
 
+    def _gate(self, *, expect_body):  # pragma: no cover — reads request headers
+        """Refuse a state-changing request that fails mutation_request_allowed."""
+        ok, why = mutation_request_allowed(
+            self.headers.get("Origin"), self.headers.get("Host", ""),
+            self.headers.get("Content-Type"), expect_body=expect_body,
+            bind=os.environ.get("DASHBOARD_BIND", "127.0.0.1"))
+        if not ok:
+            self._reply_json(403, {"error": why})
+        return ok
+
     def do_POST(self):  # pragma: no cover — thin HTTP glue over upsert_schedule()
-        """Upsert a cron job. Loopback-only (same bind as GET). Business logic
-        is the unit-tested pure upsert_schedule()."""
+        """Upsert a cron job. Business logic is the unit-tested pure
+        upsert_schedule(); the gate is mutation_request_allowed()."""
         if urlparse(self.path).path != "/api/schedules":
             self.send_response(404); self.end_headers(); return
+        if not self._gate(expect_body=True):
+            return
         code, obj = upsert_schedule(self._json_body())
         self._reply_json(code, obj)
 
@@ -888,7 +932,10 @@ load()
 
 
     def do_DELETE(self):
-        """Handle DELETE requests."""
+        """Handle DELETE requests. Every branch here mutates, so the whole
+        method is gated — /notes/ deletion was reachable the same way."""
+        if not self._gate(expect_body=False):
+            return
         path = urlparse(self.path).path
         if path.startswith("/notes/"):
             raw_slug = path.split("/notes/", 1)[1]
