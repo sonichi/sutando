@@ -28,12 +28,12 @@ DIFF_GIT = re.compile(r"^diff --git a/(?:.+) b/(.+)$")
 def violations(diff_text, globs):
     """Added files whose path is at the repo root and matches a flagged glob."""
     hits = []
-    path = None
     is_new = False
     for line in diff_text.splitlines():
-        m = DIFF_GIT.match(line)
-        if m:
-            path, is_new = m.group(1), False
+        # Resetting per file is load-bearing: without it the file after an
+        # addition inherits is_new and a modification reads as an addition.
+        if DIFF_GIT.match(line):
+            is_new = False
             continue
         if NEW_FILE.match(line):
             is_new = True
