@@ -103,8 +103,16 @@ def test_team_keeps_the_sandboxed_path_until_an_operator_opts_in() -> None:
         with mock.patch.dict(os.environ, env, clear=False):
             os.environ.pop(worker.TEAM_TRUSTED_OPT_IN_ENV, None)
             assert worker.probe("claude", workspace, team) == worker.UNHANDLED
-            # Second gate: handle() must decline even when called directly.
+            # Normal direct call declines at probe.
             assert worker.handle("claude", workspace, team, results, REPO) == worker.UNHANDLED
+            # The launch-site gate independently survives a stale/forged probe claim.
+            with (
+                mock.patch.object(worker, "probe", return_value=worker.MUST_HANDLE),
+                mock.patch.object(worker, "_run_team") as run_team,
+            ):
+                assert worker.handle(
+                    "claude", workspace, team, results, REPO) == worker.UNHANDLED
+                run_team.assert_not_called()
 
         assert not (results / team.name).exists(), \
             "a declined team task must not publish a result"
