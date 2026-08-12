@@ -4772,13 +4772,16 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             missed.append((j["name"], j["minutes_since_due"]))
     if not late and not missed:
         seen = len(jobs) - len(unknown)
-        # Lead with coverage: "N landing on schedule" alone read as healthy when the
-        # real answer was that nothing was observable.
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
         if unknown:
             detail += (f"; UNCHECKED (no dated artifact, cannot tell whether it ran): "
                        f"{', '.join(sorted(unknown))}")
+        if not seen:
+            # Verified nothing, so `ok` would be a health claim about zero jobs —
+            # dashboards read status, not detail, and green here means "checked".
+            return {"name": name, "status": "warn",
+                    "detail": detail + " — this probe has no coverage on this host"}
         return {"name": name, "status": "ok", "detail": detail}
     bits = []
     for n, m, c in late:

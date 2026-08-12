@@ -85,23 +85,25 @@ class TestMissedToday(unittest.TestCase):
 
 class TestUnverifiableIsNotClean(unittest.TestCase):
     def test_a_job_with_no_dated_artifact_is_named_not_silently_passed(self):
-        """The fail-open: no artifact means UNKNOWN, and the detail must say so."""
+        """Unknown is not a FAILURE, but it is not `ok` either — with nothing
+        observable the probe has no coverage, and green would claim it does."""
         r = hc._interpret_daily_punctuality([job("morning-briefing", 6, 57, [])])
-        self.assertEqual(r["status"], "ok", "unknown is not a failure on its own")
+        self.assertNotEqual(r["status"], "ok", "verified nothing, so green is a false claim")
         self.assertIn("no dated artifact", r["detail"])
         self.assertIn("morning-briefing", r["detail"],
                       "name the job whose punctuality cannot be checked")
 
     def test_an_all_unobservable_set_states_its_coverage_not_a_clean_bill(self):
-        """qingyun-wu's shape: only morning-briefing configured, nothing observable.
-        Status stays ok (warning forever on an unobservable job is a nag), but the
-        detail must not read as a clean bill of health."""
+        """Nothing observable: the probe must not report health it never measured.
+        Dashboards read status, so the honest detail alone was not enough."""
         r = hc._interpret_daily_punctuality(
             [job("morning-briefing", 6, 57, [], today_seen=False, since_due=300)])
         self.assertIn("0 of 1 daily job(s) observable", r["detail"])
         self.assertIn("UNCHECKED", r["detail"])
         self.assertNotIn("landing on schedule", r["detail"],
                          "nothing was observed, so nothing landed on schedule")
+        self.assertEqual(r["status"], "warn",
+                         "verified 0 jobs, so `ok` is a health claim about nothing")
 
     def test_unverifiable_is_still_named_alongside_a_real_warn(self):
         mins = [7 * 60 + 30] * 7
