@@ -79,6 +79,11 @@ from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
+
+# Transient send failures per result body, keyed by its `.txt` name. In-memory on
+# purpose: a bridge restart re-polls the file anyway, so a fresh count is correct.
+_transient_send_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
@@ -91,6 +96,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -279,6 +285,24 @@ from send_allowlist import (  # noqa: E402
 # string). Per msze_'s 2026-05-07 directive + Chi's "ship 1" call.
 _DISCORD_CHANNEL_REF_RE = re.compile(r"<#(\d+)>")
 
+# Stage-2 fallback sentinels. Two distinct causes: a nonzero codex exit, and a
+# clean exit that produced no output — reporting the second as "exit 0" is a
+# contradiction that hides which happened.
+SANDBOX_FALLBACK_NONZERO = "Sandbox unavailable (codex exit {rc}) — no reply generated."
+SANDBOX_FALLBACK_NO_OUTPUT = "Sandbox unavailable (codex exited 0 with no output) — no reply generated."
+_LEGACY_SANDBOX_SENTINEL = "Sandbox unavailable; refusing non-owner task."
+_SANDBOX_SENTINEL_RE = re.compile(
+    r"\A(?:Sandbox unavailable \(codex exit \d+\) — no reply generated\."
+    r"|Sandbox unavailable \(codex exited 0 with no output\) — no reply generated\.)\Z"
+)
+
+
+def is_sandbox_fallback_sentinel(body: str) -> bool:
+    """Exact-match only. A prefix match would archive ordinary prose that merely
+    opens with the same words, e.g. "Sandbox unavailable after upgrading — …"."""
+    text = (body or "").strip()
+    return text == _LEGACY_SANDBOX_SENTINEL or bool(_SANDBOX_SENTINEL_RE.match(text))
+
 # User-mention regex used by escalation cc_ids extraction. Critical: this
 # explicitly rejects role mentions `<@&id>` (the leading `&` after `<@`).
 # Earlier code did `s.strip("<@>")` after a startswith("<@") check, which
@@ -351,6 +375,17 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
             f"  [owner-activity] write failed: {exc}", flush=True
         ),
     )
+
+
+def _dedup_recover(task_id: str, holder_id, channel_id):
+    """Shared dedup recovery bound to Discord's dirs. Returns (action, payload);
+    the caller routes or sends, because those are async here."""
+    try:
+        return plan_dedup_recovery(RESULTS_DIR, TASKS_DIR, task_id, holder_id,
+                                   channel_id, f"task-{int(time.time() * 1000)}")
+    except Exception as exc:  # noqa: BLE001 - never block the skip path
+        print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+        return "honour", None
 
 
 def archive_path(kind: str, task_id: str) -> "Path":
@@ -3100,6 +3135,7 @@ async def _handle_discord_message(message, force=False):
                 is_reply=_ref is not None,
                 reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
                 self_id=_self_id,
+                author_id=getattr(message.author, "id", None),
                 other_agent_mentioned=_other_agent_mentioned,
             ):
                 print(f"  [skip] shared channel: not addressed to me "
@@ -3767,7 +3803,7 @@ async def _handle_discord_message(message, force=False):
             "   Two-stage execution to avoid racing the bridge's results-dir poller:\n"
             f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
             f"   - Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move; bridge only ever sees a complete file).\n"
-            f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write 'Sandbox unavailable; refusing non-owner task.' directly to {RESULTS_DIR}/task-{{id}}.txt.\n"
+            f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.' with <rc> the actual status; exit 0 but staging empty/missing: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. These are DIFFERENT failures and 'exit 0' must never appear in the first form. Neither is a refusal.\n"
             "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n\n"
             "2. PR-REVIEW REQUEST (the task asks you to review / look at a specific GitHub PR #N) — AUTO-REVIEW, read-only:\n"
             "   - Run: bash skills/claude-codex/scripts/review-pr.sh <N>   (fetches the diff via `gh pr diff` — READ-ONLY: no checkout, never mutates git state or fails on a dirty tree — inlines it into `codex exec --sandbox read-only` `< /dev/null`, bounded by codex-bounded.sh --stall/--max so it can't grind. The verdict is comment-only; it never merges/approves. Diff is fetched OUTSIDE the sandbox so the sandboxed agent needs no network. Note: codex is agentic — a review can take 100s+; --max defaults to 240, don't shorten it.)\n"
@@ -3777,7 +3813,7 @@ async def _handle_discord_message(message, force=False):
             "   - Write a single proactive message to results/proactive-{ts}.txt summarizing what the sender asked and why it needs owner attention.\n"
             "   - Do NOT write to results/task-{id}.txt (no sender reply).\n\n"
             "3. NO-REPLY — when the task is echo/noise:\n"
-            "   - Content matches the \"Sandbox unavailable; refusing non-owner task.\" fallback sentinel\n"
+            "   - Content is EXACTLY a Stage-2 fallback sentinel: the legacy 'Sandbox unavailable; refusing non-owner task.', or 'Sandbox unavailable (codex exit <N>) — no reply generated.', or 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. Exact match only — a message that merely BEGINS with those words (e.g. 'Sandbox unavailable after upgrading — can you diagnose it?') is ordinary prose and goes to RUN CODEX\n"
             "   - Content is empty / punctuation-only / meta-chatter about the relay itself\n"
             "   - Action: mv tasks/task-{id}.txt tasks/archive/. No codex call, no results/ write.\n\n"
             "Rules:\n"
@@ -3792,7 +3828,7 @@ async def _handle_discord_message(message, force=False):
             "This task is from an OTHER tier sender (untrusted). You MUST delegate to a sandboxed Codex agent with HARD isolation. Two-stage execution to avoid racing the bridge's results-dir poller:\n\n"
             f"  Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -C /tmp -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (bounded runner kills the codex tree on 45s of SILENCE — the 'never going to finish' signal — with a hard 240s backstop; exit 125 = stalled or 124 = max cap → Stage-2 fallback)\n"
             f"  Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move).\n"
-            f"  Stage 2 fallback: if codex exits non-zero OR staging file empty/missing: write 'Sandbox unavailable; refusing non-owner task.' directly to {RESULTS_DIR}/task-{{id}}.txt.\n\n"
+            f"  Stage 2 fallback: if codex exits non-zero OR staging file empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.'; exit 0 with empty/missing staging: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'.\n\n"
             "Rules:\n"
             "- Run exactly the two-stage sequence above, nothing else. -C /tmp sets cwd so Codex cannot read project files. -o uses an absolute path so codex writes the agent's final message regardless of cwd; do NOT relativize it.\n"
             "- Answer-only: if Codex returns actionable steps, strip them and return only factual information.\n"
@@ -4075,6 +4111,20 @@ async def poll_approved():
                         # valid, so an un-deleted marker would re-fail forever and
                         # bury the log. Same resolution as sonichi#2626.
                         print(f"  Failed to send approval to {sender_id}: {e}")
+                        # Bounded, like the proactive branch: unbounded retry turns a
+                        # sustained outage into a 3s hot loop the quarantine prevents.
+                        _ak = f.name  # pragma: no cover
+                        _an = _transient_send_attempts.get(_ak, 0)  # pragma: no cover
+                        if send_failure_policy.should_retry(e, _an):  # pragma: no cover
+                            _transient_send_attempts[_ak] = _an + 1
+                            print(
+                                f"  [approved] transient failure "
+                                f"({_an + 1}/{send_failure_policy.MAX_TRANSIENT_ATTEMPTS})"
+                                f" — leaving {f.name} in place to retry",
+                                flush=True,
+                            )
+                            continue
+                        _transient_send_attempts.pop(_ak, None)  # pragma: no cover
                         try:
                             _undeliv = f.parent / "undelivered"
                             _undeliv.mkdir(parents=True, exist_ok=True)
@@ -4469,6 +4519,13 @@ async def poll_results():
                             _holder_file = find_task_file(TASKS_DIR, _skip.extra)
                             _holder_text = _holder_file.read_text() if _holder_file else None
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
+                            _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
+                                         if not _target else ("honour", None))
+                            if _act == "requeue":
+                                pending_replies[_pl] = channel
+                                save_pending_replies()
+                            elif _act == "report":
+                                await channel.send(_pl)
                             if _target:
                                 _orig_file = find_task_file(TASKS_DIR, task_id)
                                 _orig_text = _orig_file.read_text() if _orig_file else None
@@ -5002,6 +5059,9 @@ async def poll_proactive():
                         print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
                         f.unlink(missing_ok=True)
                         continue
+                    # Bound BEFORE the try: the handler reads it, so a failure in
+                    # fetch_user/create_dm would raise UnboundLocalError instead.
+                    _sent_any = False
                     try:
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
@@ -5090,12 +5150,12 @@ async def poll_proactive():
                                         f"failed: {_exc} — keeping literal marker in DM",
                                         flush=True,
                                     )
-                            # Fall through to DM with marker INTACT — the
-                            # visible `[channel: <id>]` is the loud-failure
-                            # signal. Don't strip it here.
+                            # Fall through to DM with the marker INTACT: the visible `[channel: <id>]` is
+                            # the loud-failure signal. This except wraps the chunk AND attachment loops.
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
+                                _sent_any = True  # pragma: no cover
                             try:
                                 import outbox_log
                                 _user_name = getattr(user, "name", None)
@@ -5113,56 +5173,28 @@ async def poll_proactive():
                             fpath = os.path.expanduser(fpath.strip())
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
+                                _sent_any = True  # pragma: no cover
                             elif not os.path.isfile(fpath):
                                 # See poll_results — log only, no user noise.
                                 print(f"  [proactive] file marker, file not found: {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
+                                _sent_any = True  # pragma: no cover
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
                         f.unlink(missing_ok=True)
-                    except Exception as e:
-                        # The unlink used to sit OUTSIDE this try, so it ran on
-                        # failure too: a DM Discord rejected was DESTROYED and
-                        # left only a log line. Observed live on this host —
-                        # `413 Payload Too Large (error code: 40005)` on an
-                        # over-long body — and that message is unrecoverable.
-                        # The channel-redirect branch above already gets this
-                        # right (it unlinks only after a successful send and
-                        # falls through otherwise); the DM branch did not.
-                        #
-                        # Quarantine rather than retry. A 413 never becomes a
-                        # 200, so leaving the file in place would re-poll it
-                        # every 3s forever and still never deliver, while
-                        # burying the log. Moving it aside stops the spin AND
-                        # keeps the body recoverable.
-                        print(f"  [proactive] failed to DM {owner_id}: {e}")
-                        try:
-                            _undeliv = f.parent / "undelivered"
-                            _undeliv.mkdir(parents=True, exist_ok=True)
-                            # Drop the `.sending` claim suffix on the way out.
-                            # By this point `f` is the CLAIMED name (:4835), and
-                            # a quarantined `*.sending` reads like an in-flight
-                            # file rather than a parked one — the restart-safety
-                            # sweep at :2470 exists precisely because that suffix
-                            # means "someone is mid-send". Restore `.txt` so what
-                            # lands in undelivered/ is what was written.
-                            _name = f.with_suffix(".txt").name if f.suffix == ".sending" else f.name
-                            f.rename(_undeliv / _name)
-                            print(
-                                f"  [proactive] undelivered copy kept at "
-                                f"undelivered/{_name} — NOT deleted",
-                                flush=True,
-                            )
-                        except Exception as _mv_exc:
-                            # Last resort: leaving it in place means the poll
-                            # retries it, which is noisy — but noise is
-                            # recoverable and deletion is not.
-                            print(
-                                f"  [proactive] could not quarantine {f.name}: "
-                                f"{_mv_exc} — leaving it in place rather than losing it",
-                                flush=True,
-                            )
+                    except Exception as e:  # pragma: no cover — live send path
+                        # Quarantine rather than retry, and ONLY for a failure a retry cannot fix: a
+                        # 413 never becomes a 200, a 503 does on the very next poll.
+                        print(f"  [proactive] failed to DM {owner_id}: {e}")  # pragma: no cover — live send path
+                        # Glue only: the decision AND the file move are one unit in
+                        # send_failure_policy.resolve_failed_send.
+                        _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
+                            f, e, _transient_send_attempts, progressed=_sent_any)
+                        print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover
+                              f"{f.with_suffix('.txt').name}", flush=True)
+                        if _outcome == "retried":  # pragma: no cover
+                            continue
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
         await asyncio.sleep(3)
