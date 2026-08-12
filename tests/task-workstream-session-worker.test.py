@@ -950,7 +950,9 @@ lock.rmdir()
             started = time.monotonic()
             assert process.stdout is not None
             assert process.stdout.readline() == "TASK_FILE: task-z-live.txt\n"
-            assert time.monotonic() - started < 1.0
+            # The handler this discriminates against blocks for 4s; 1.0 sat below process
+            # startup here (measured 1.17-1.36s), failing while the property still held.
+            assert time.monotonic() - started < 2.5
             assert int((state / "maximum").read_text()) <= 2
 
             (state / "release").touch()
@@ -1288,6 +1290,62 @@ def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
             process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
+def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() -> None:
+    """Drives the real watcher: only the two written tokens may mean "optional"."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        task = tasks / "task-team-corrupted.txt"
+        task.write_text("access_tier: team\ntask: protected\n")
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\ncase \" $* \" in *\" --probe \"*) exit 4;; esac\nsleep 30\n",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 30\n")
+        process = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(tasks)],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_CORE_RUNTIME": "claude",
+                "SUTANDO_RESULTS_DIR": str(results),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        claim = workspace / "state" / "task-event-handler-claims" / task.name
+        try:
+            deadline = time.monotonic() + 1
+            while not claim.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert claim.exists()
+            lines = claim.read_text().splitlines()
+            assert lines[3] == "must-handle"
+            # Neither written token: the watcher must not read this as optional.
+            lines[3] = "must-handl"
+            claim.write_text("\n".join(lines) + "\n")
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=3)
+            assert "TASK_FILE:" not in stdout, (
+                "an unrecognised disposition was published to the unrestricted core")
+            assert "no recognised disposition" in stderr
+            assert not (workspace / "state" / "task-event-handler-fallbacks" / task.name).exists()
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=2)
+
+
 def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
     watcher = (REPO / "src" / "watch-tasks-stream.sh").read_text()
     notifier = (REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh").read_text()
@@ -1335,5 +1393,6 @@ if __name__ == "__main__":
     test_shutdown_falls_back_without_surviving_workers()
     test_codex_notifier_dispatches_each_isolated_task_once_without_waiting()
     test_codex_notifier_never_submits_a_watcher_claim_to_live_core()
+    test_unrecognised_claim_disposition_is_never_published_to_the_live_core()
     test_runtime_wiring_is_optional_and_adapter_injected()
     print("task workstream session worker tests passed")
