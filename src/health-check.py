@@ -3861,12 +3861,11 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
 
     quota-state.json is written by the proxy from the quota headers on
     upstream responses, so it only appears if a core actually ROUTES through
-    the proxy. `src/startup.sh` is the only thing that exports
-    ANTHROPIC_BASE_URL=http://localhost:7846 — and a core launched by the
-    desktop supervisor never runs startup.sh. Result on such a host: the
-    proxy is healthy and listening, every check is green, and quota
-    telemetry is silently absent forever. The proactive loop's per-pass
-    budget check reads "unknown" on every pass and nobody is told why.
+    the proxy. Only the core launcher (`src/agent/claude/cli/start-cli.sh`)
+    exports ANTHROPIC_BASE_URL=http://localhost:7846, and only when the proxy
+    port already has a listener at launch — so a core started outside the
+    launcher, or started before it bound, stays unrouted and every other check
+    still reads green.
 
     The existing credential-proxy check can't catch this: it is a plain
     TCP-listening probe (correctly so — a forwarding proxy has no liveness
@@ -3963,16 +3962,22 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
                 f"working ({int(agent_age / 60)}m since the last loop pass) — the proxy "
                 "is up but nothing is routing through it any more, so the file on disk "
                 "is a leftover from when it was. Quota-based budgeting is quoting stale "
-                "numbers as current. Check ANTHROPIC_BASE_URL on the running core "
-                "(exported by src/startup.sh; a supervisor-launched core never runs it)."
+                "numbers as current. Check ANTHROPIC_BASE_URL on the running core: only "
+                "the core launcher (src/agent/claude/cli/start-cli.sh) exports it, and "
+                "only when the proxy port already has a listener at launch — so a core "
+                "started outside the launcher, or started before the proxy bound, stays "
+                "unrouted for its whole session."
             )
         return check
     check["status"] = "warn"
     check["detail"] = (
-        "credential proxy is up but has never written quota-state.json — "
-        "nothing is routing through it (ANTHROPIC_BASE_URL unset; set by "
-        "src/startup.sh, which a supervisor-launched core never runs). "
-        "Quota-based budgeting is blind on this host."
+        "credential proxy is up but has never written quota-state.json — nothing "
+        "is routing through it (ANTHROPIC_BASE_URL unset on the running core). "
+        "Only the core launcher (src/agent/claude/cli/start-cli.sh) exports it, "
+        "and only when the proxy port already has a listener at launch — so a "
+        "core started outside the launcher, or started before the proxy bound, "
+        "stays unrouted for its whole session. Quota-based budgeting is blind "
+        "on this host."
     )
     return check
 
@@ -5364,6 +5369,70 @@ def _proc_argv(pid: int) -> str:
         return out.stdout.strip()
     except Exception:  # noqa: BLE001 — a probe failure must not fail the check
         return ""
+
+
+def _age_hm(age_sec: int) -> str:
+    return f"{age_sec // 3600}h{age_sec % 3600 // 60}m"
+
+
+def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
+                                  claim_threshold_age_sec: int = 7200) -> dict:
+    """A claim is a body too: `with_suffix(".sending")` REPLACES `.txt`, the one
+    shape a `*.txt` glob cannot see — and the startup sweep restores only it."""
+    name = "stale-proactive-backlog"
+    results_dir = WORKSPACE_DIR / "results"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    now = time.time()
+    try:
+        # scandir, not glob: glob swallows a directory-level EACCES/EIO and
+        # yields nothing, so an unscannable results/ would report a clean one.
+        entries = [results_dir / e.name for e in os.scandir(results_dir)
+                   if e.name.startswith("proactive-")]
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/: {exc}"}
+    stale, abandoned, unreadable = [], [], 0
+    for path in entries:
+        # Decide by suffix, and skip any shape neither side of the protocol
+        # writes rather than guessing what it meant.
+        if path.suffix == ".txt":
+            bucket, limit = stale, threshold_age_sec
+        elif path.suffix == ".sending":
+            bucket, limit = abandoned, claim_threshold_age_sec
+        else:
+            continue
+        # Per-file isolation, as in check_orphaned_results: one unreadable entry
+        # must not decide the answer for the directory.
+        try:
+            if not path.is_file():
+                continue
+            age = now - path.stat().st_mtime
+        except OSError:
+            unreadable += 1
+            continue
+        if age < limit:
+            continue
+        bucket.append((path.name, int(age)))
+    partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
+    if not stale and not abandoned:
+        status = "warn" if unreadable else "ok"
+        return {"name": name, "status": status,
+                "detail": f"no undelivered proactive bodies{partial}"}
+    parts = []
+    if stale:
+        stale.sort(key=lambda item: -item[1])
+        oldest_name, oldest_age = stale[0]
+        parts.append(f"{len(stale)} proactive body(ies) nobody has delivered; "
+                     f"oldest {oldest_name} ({_age_hm(oldest_age)}); "
+                     f"deliver or remove them — nothing clears these on its own")
+    if abandoned:
+        abandoned.sort(key=lambda item: -item[1])
+        oldest_name, oldest_age = abandoned[0]
+        parts.append(f"{len(abandoned)} claimed body(ies) abandoned mid-send; "
+                     f"oldest {oldest_name} ({_age_hm(oldest_age)}); "
+                     f"restart a consumer to run its startup .sending sweep")
+    return {"name": name, "status": "warn", "detail": "; ".join(parts) + partial}
 
 
 # The argv must BE the script invocation, not merely mention it. A substring
@@ -7479,6 +7548,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
     checks.append(check_proactive_quarantine())
+    checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())

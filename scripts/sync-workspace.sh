@@ -64,6 +64,7 @@
 #   2. sutando.config.local.json → vault.remote_url (per-clone canonical)
 #   3. sutando.config.json → vault.remote_url (tracked default)
 #   4. .env SUTANDO_MEMORY_REPO (deprecated legacy alias; warn-and-honor for one release)
+#   5. the workspace repo's own `origin` remote (recovery — see Priority 5 below)
 #
 # Note: SUTANDO_VAULT env var (introduced in PR-1 = #1445) is REMOVED in PR-2.
 # Brand new, no users to deprecate; CLI flag + config-file is the canonical surface.
@@ -168,22 +169,76 @@ fi
 # env var if set in .env — no need to re-grep the file (eliminates the
 # var=$(grep | head | ...) set-e trap class entirely; see Mini #1445 v4 Medium).
 VAULT_URL=""
+# Provenance for --status: resolution reports it on stderr as it runs, but
+# --status is read long after those lines have scrolled away.
+VAULT_URL_SOURCE=""
+VAULT_URL_DECLINED=""
+VAULT_URL_DECLINED_REASON=""
 
 # Priority 1: --vault-url CLI flag (explicit)
 if [ -n "$VAULT_URL_FLAG" ]; then
     VAULT_URL="$VAULT_URL_FLAG"
+    VAULT_URL_SOURCE="--vault-url flag"
 fi
 
 # Priority 2+3: sutando.config.{local,base}.json → vault.remote_url
 # (loader merges local + base + applies ${REPO_DIR} substitution)
 if [ -z "$VAULT_URL" ] && [ -f "$SCRIPT_PARENT/scripts/sutando-config.sh" ]; then
     VAULT_URL="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-url 2>/dev/null || true)"
+    [ -n "$VAULT_URL" ] && VAULT_URL_SOURCE="sutando.config"
 fi
 
 # Priority 4: legacy .env SUTANDO_MEMORY_REPO (warn-and-honor for one release)
 if [ -z "$VAULT_URL" ] && [ -n "${SUTANDO_MEMORY_REPO:-}" ]; then
     VAULT_URL="$SUTANDO_MEMORY_REPO"
+    VAULT_URL_SOURCE="SUTANDO_MEMORY_REPO (deprecated)"
     echo "sync-workspace: SUTANDO_MEMORY_REPO is deprecated; move vault URL to sutando.config.local.json under vault.remote_url." >&2
+fi
+
+# Priority 5: the workspace repo's own origin, adopted only when it already
+# carries THIS workspace's own `host/*/<wsId>` branch.
+if [ -z "$VAULT_URL" ] \
+   && [ "$(git -C "$WORKSPACE_DIR" rev-parse --show-toplevel 2>/dev/null || true)" \
+        = "$(cd "$WORKSPACE_DIR" && pwd -P)" ]; then
+    _origin_url="$(git -C "$WORKSPACE_DIR" remote get-url origin 2>/dev/null || true)"
+    # Read the id, never mint one: _ws_id() is defined below and persists a
+    # fresh id, which would invent an identity no vault can be carrying.
+    _wsid="$(tr -d '[:space:]' < "$WORKSPACE_DIR/.sutando-vault/ws-id" 2>/dev/null || true)"
+    # The id goes into a ref glob, so it must match what _ws_id mints: a
+    # persisted `*` asks for host/*/*, which any host branch anywhere answers.
+    case "$_wsid" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) _wsid_ok=1 ;;
+        *) _wsid_ok=0 ;;
+    esac
+    if [ -n "$_origin_url" ] && [ -z "$_wsid" ]; then
+        VAULT_URL_DECLINED="$_origin_url"
+        VAULT_URL_DECLINED_REASON="workspace has no .sutando-vault/ws-id to identify its vault branch"
+        echo "sync-workspace: no vault URL configured, and this workspace has no .sutando-vault/ws-id to identify its vault branch; refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+    elif [ -n "$_origin_url" ] && [ "$_wsid_ok" != "1" ]; then
+        VAULT_URL_DECLINED="$_origin_url"
+        VAULT_URL_DECLINED_REASON="workspace ws-id is not a valid workspace id (expected six lowercase hex characters), so it identifies no vault branch"
+        echo "sync-workspace: this workspace's .sutando-vault/ws-id is not a valid workspace id (expected six lowercase hex characters); refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+    elif [ -n "$_origin_url" ]; then
+        # Unreachable is not the same answer as not-a-vault, and an operator
+        # told the wrong one edits the wrong thing.
+        _ls_rc=0
+        _ls_out="$(GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$_origin_url" "host/*/$_wsid" 2>/dev/null)" || _ls_rc=$?
+        if [ "$_ls_rc" != "0" ]; then
+            VAULT_URL_DECLINED="$_origin_url"
+            VAULT_URL_DECLINED_REASON="unreachable this run, so it could not be confirmed either way"
+            echo "sync-workspace: could not reach the workspace repo's origin ($_origin_url) to confirm it is a vault; not recovering a URL from it this run." >&2
+        elif [ -n "$_ls_out" ]; then
+            VAULT_URL="$_origin_url"
+            VAULT_URL_SOURCE="workspace repo origin, identity-verified (carries host/*/$_wsid)"
+            echo "sync-workspace: no vault URL configured; recovered it from the workspace repo's own origin ($VAULT_URL). Restore vault.remote_url in sutando.config.local.json to silence this." >&2
+        else
+            VAULT_URL_DECLINED="$_origin_url"
+            VAULT_URL_DECLINED_REASON="carries no host/*/$_wsid branch, so this workspace has never pushed to it"
+            echo "sync-workspace: the workspace repo's origin ($_origin_url) carries no host/*/$_wsid branch, so it is not a vault this workspace has pushed to; refusing to recover a vault URL from it." >&2
+        fi
+        unset _ls_rc _ls_out
+    fi
+    unset _origin_url _wsid _wsid_ok
 fi
 
 # --------------------------------------------------------------------------- #
@@ -1502,7 +1557,17 @@ _report_unmerged_conflicts() {
 cmd_status() {
     echo "WORKSPACE_DIR: $WORKSPACE_DIR"
     echo "REPO_DIR:      $REPO_DIR"
-    echo "VAULT_URL:     ${VAULT_URL:-<unset>}"
+    # A recovered URL and a configured one print identically without the source,
+    # and a declined candidate reads as an <unset> naming nothing to go fix.
+    if [ -n "$VAULT_URL" ]; then
+        echo "VAULT_URL:     $VAULT_URL${VAULT_URL_SOURCE:+  (source: $VAULT_URL_SOURCE)}"
+    else
+        echo "VAULT_URL:     <unset>"
+        if [ -n "$VAULT_URL_DECLINED" ]; then
+            echo "               candidate NOT adopted: $VAULT_URL_DECLINED"
+            echo "               reason: $VAULT_URL_DECLINED_REASON"
+        fi
+    fi
     # Surface the wsId only if it exists — don't generate just for status.
     # Pair it with the local workspace path on the same line so the
     # wsId↔folder mapping is visually unambiguous for the operator.
@@ -1523,6 +1588,10 @@ cmd_status() {
         echo "current branch: $current_branch"
         echo "remote branches:"
         git for-each-ref --format='  %(refname:short) (last push: %(committerdate:relative))' refs/remotes/origin/host/ 2>/dev/null | head -20 || true
+    elif [ -f "$WORKSPACE_DIR/.git" ]; then
+        # A linked worktree has a .git FILE. Reporting it as "not a git repo"
+        # contradicts the VAULT_URL line printed just above it.
+        echo "git status: workspace is a linked git WORKTREE (.git is a file); --push-only refuses this layout"
     else
         echo "git status: workspace is NOT a git repo (run --init)"
     fi
