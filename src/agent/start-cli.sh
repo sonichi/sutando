@@ -59,17 +59,32 @@ if [ -n "$requested_runtime" ]; then
     claude|codex) ;;
     *) echo "start-cli: unsupported --runtime: $requested_runtime (expected claude|codex)" >&2; exit 2 ;;
   esac
+  # Same resolution as scripts/sutando-config.sh and the per-runtime launchers:
+  # this path runs from the app menu, where a bare `python3` can be Apple's
+  # Xcode-CLT stub and exits before anything is persisted.
+  if [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
+    _cfg_py="$SUTANDO_PY"
+  elif [ -x "$REPO/../runtime/python/bin/python3" ]; then
+    _cfg_py="$REPO/../runtime/python/bin/python3"
+  else
+    _cfg_py="python3"
+  fi
   # Persist core.runtime into the per-clone local config (atomic merge).
-  python3 - "$REPO" "$requested_runtime" <<'PY'
+  "$_cfg_py" - "$REPO" "$requested_runtime" <<'PY'
 import json, os, sys, tempfile
 repo, rt = sys.argv[1], sys.argv[2]
 path = os.path.join(repo, "sutando.config.local.json")
 try:
-    cfg = json.load(open(path))
-    if not isinstance(cfg, dict):
-        cfg = {}
-except (OSError, ValueError):
+    with open(path) as fh:
+        cfg = json.load(fh)
+except FileNotFoundError:
     cfg = {}
+except (OSError, ValueError) as exc:
+    # This file also holds workspace.path, vault settings and other per-clone
+    # overrides; treating an unreadable one as empty would erase them all.
+    sys.exit(f"start-cli: refusing to rewrite unreadable {path}: {exc}")
+if not isinstance(cfg, dict):
+    sys.exit(f"start-cli: refusing to rewrite {path}: top level is not an object")
 core = cfg.get("core")
 if not isinstance(core, dict):
     core = {}
