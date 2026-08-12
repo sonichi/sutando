@@ -25,7 +25,7 @@ import { VoiceSession, type MainAgent, type ToolDefinition } from 'bodhi-realtim
 import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 
@@ -130,6 +130,15 @@ export function wearableContext(device: { deviceId?: string }): string {
 			out += '\nRecent watch conversation (oldest first):\n' + lines.slice(-14).join('\n');
 		}
 	} catch { /* first session ever → skip */ }
+	try {
+		// Cross-surface memory: the desktop voice log, when present, rides along
+		// with a smaller share so the watch can follow up on desktop threads.
+		const desk = readFileSync(join(resolveWorkspace(), 'state',
+			'wearable-conversations', 'local-voice.log'), 'utf8').trim().split('\n');
+		if (desk.length && desk[0] !== '') {
+			out += '\nRecent desktop voice conversation:\n' + desk.slice(-6).join('\n');
+		}
+	} catch { /* desktop log absent → skip */ }
 	return out ? '\n\nCONTEXT FROM EARLIER (use naturally when the user refers back):' + out : '';
 }
 
@@ -445,6 +454,45 @@ function main(): void {
 	});
 	console.log(`${ts()} voice-host listening on ws://127.0.0.1:${PORT}/session + /text `
 		+ `(audio model: ${NATIVE_AUDIO_MODEL}, text model: ${TEXT_MODEL})`);
+	startContextSync();
+}
+
+// Mechanical shared-context updates (owner ask 2026-08-12): last_results must
+// track EVERY task result without anyone remembering to write it. The voice
+// host is the context CONSUMER, so it owns the sync — no new service. 15s
+// scan of results/; protocol-marker bodies and question files are skipped.
+function startContextSync(): void {
+	const resultsDir = join(resolveWorkspace(), 'results');
+	const ctxPath = join(resolveWorkspace(), 'state', 'voice-session-context.json');
+	let lastScan = Date.now();
+	setInterval(() => {
+		let fresh: { task_id: string; subject: string; ts: string }[] = [];
+		try {
+			for (const f of readdirSync(resultsDir)) {
+				if (!f.startsWith('task-') || !f.endsWith('.txt')) continue;
+				const full = join(resultsDir, f);
+				const st = statSync(full);
+				if (st.mtimeMs <= lastScan) continue;
+				const body = readFileSync(full, 'utf8').trim();
+				if (!body || body.startsWith('[deduped:') || body.startsWith('[no-send]')
+					|| body.startsWith('[REPLIED]')) continue;
+				fresh.push({ task_id: f.replace(/\.txt$/, ''),
+					subject: body.split('\n')[0].slice(0, 140),
+					ts: new Date(st.mtimeMs).toISOString() });
+			}
+		} catch { return; }
+		if (!fresh.length) { lastScan = Date.now(); return; }
+		lastScan = Date.now();
+		try {
+			let ctx: any = {};
+			try { ctx = JSON.parse(readFileSync(ctxPath, 'utf8')); } catch { /* fresh */ }
+			ctx.updated_at = new Date().toISOString();
+			ctx.last_results = [...fresh.reverse(), ...(ctx.last_results ?? [])].slice(0, 3);
+			const tmp = ctxPath + '.tmp';
+			writeFileSync(tmp, JSON.stringify(ctx, null, 1));
+			renameSync(tmp, ctxPath);
+		} catch { /* context write is best-effort */ }
+	}, 15000).unref();
 }
 
 main();
