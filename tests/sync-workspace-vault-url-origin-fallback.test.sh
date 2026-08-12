@@ -243,22 +243,85 @@ printf '%s\n' "$WSID" > "$skel/workspace/.sutando-vault/ws-id"
 git -C "$skel/workspace" remote add origin "$VAULT_REMOTE"
 if [ -f "$skel/workspace/.git" ]; then
     ok "the worktree fixture really has a .git FILE, not a directory"
+
+    out="$(run_sync "$skel" --status)"
+    if echo "$out" | grep VAULT_URL | grep -qF "$VAULT_REMOTE"; then
+        ok "a worktree workspace still adopts its own vault origin"
+    else
+        bad "a worktree workspace still adopts its own vault origin" \
+            "status said: $(echo "$out" | grep VAULT_URL)"
+    fi
+
+    # Status and push disagree on this layout, and that is the point: the URL
+    # passed the remote-identity probe, while push refuses on local layout.
+    # Asserting only status would leave the asymmetry unpinned — a later change
+    # could make push accept a worktree and nothing here would notice.
+    if echo "$out" | grep -q 'linked git WORKTREE'; then
+        ok "status names the worktree layout instead of denying the repo"
+    else
+        bad "status names the worktree layout instead of denying the repo" \
+            "status said: $(echo "$out" | grep 'git status:')"
+    fi
+    push_out="$(run_sync "$skel" --push-only)"; push_rc=$?
+    if [ "$push_rc" != "0" ]; then
+        ok "push still refuses the worktree layout the status line names"
+    else
+        bad "push still refuses the worktree layout the status line names" \
+            "push exited 0: $push_out"
+    fi
 else
     bad "the worktree fixture really has a .git FILE, not a directory" \
-        "fixture did not reproduce the layout under test"
+        "fixture did not reproduce the layout under test — dependent assertions skipped"
 fi
+
+# --- 8b: status carries the URL's provenance, not just its value -------------
+# A recovered URL and a configured one printed identically is what made the
+# earlier report unreadable: the operator could not tell which fact they held.
+skel="$(mk_skel provenance-recovered)"
+git -C "$skel/workspace" init -q
+git -C "$skel/workspace" remote add origin "$VAULT_REMOTE"
 out="$(run_sync "$skel" --status)"
-if echo "$out" | grep VAULT_URL | grep -qF "$VAULT_REMOTE"; then
-    ok "a worktree workspace still adopts its own vault origin"
+if echo "$out" | grep VAULT_URL | grep -q 'source: workspace repo origin, identity-verified'; then
+    ok "a recovered URL is labelled as recovered and identity-verified"
 else
-    bad "a worktree workspace still adopts its own vault origin" \
+    bad "a recovered URL is labelled as recovered and identity-verified" \
         "status said: $(echo "$out" | grep VAULT_URL)"
 fi
 
-# --- 9: end-to-end — a sync-INITIALIZED workspace pointed at a public remote --
-# The refusal above is a message; this asserts the consequence. ws-id satisfies
-# _assert_sync_initialized, so nothing but the vault check stands between this
-# workspace and a push to whatever origin happens to be configured.
+skel="$(mk_skel provenance-configured "$PLAIN_REMOTE")"
+out="$(run_sync "$skel" --status)"
+if echo "$out" | grep VAULT_URL | grep -q 'source: sutando.config'; then
+    ok "a configured URL is labelled as configured"
+else
+    bad "a configured URL is labelled as configured" \
+        "status said: $(echo "$out" | grep VAULT_URL)"
+fi
+
+# --- 8c: a declined candidate is named in status, with the reason ------------
+# The refusal is a stderr line during resolution; --status is read long after.
+# Printing a bare <unset> there hides the one fact that explains the state.
+skel="$(mk_skel provenance-declined)"
+git -C "$skel/workspace" init -q
+git -C "$skel/workspace" remote add origin "$PLAIN_REMOTE"
+out="$(run_sync "$skel" --status)"
+if echo "$out" | grep -qF "candidate NOT adopted: $PLAIN_REMOTE"; then
+    ok "status names the origin it declined to adopt"
+else
+    bad "status names the origin it declined to adopt" \
+        "status said: $(echo "$out" | grep -A2 VAULT_URL)"
+fi
+if echo "$out" | grep -q "reason: carries no host/\*/$WSID branch"; then
+    ok "status gives the reason the candidate was declined"
+else
+    bad "status gives the reason the candidate was declined" \
+        "status said: $(echo "$out" | grep -A2 VAULT_URL)"
+fi
+
+# --- 9: end-to-end — a push-eligible workspace pointed at a public remote -----
+# The refusal above is a message; this asserts the consequence. The fixture is
+# hand-built rather than --init'd: ws-id plus a .git directory is what
+# _assert_sync_initialized reads, so nothing but the vault check stands between
+# this workspace and a push to whatever origin happens to be configured.
 skel="$(mk_skel public-origin-no-leak)"
 git init -q --bare "$TMP/public-code.git"
 git -C "$TMP/seed-public" init -q 2>/dev/null || git init -q "$TMP/seed-public"
@@ -278,11 +341,14 @@ else
     bad "no workspace branch is pushed to a non-vault origin" \
         "pushed: $(git ls-remote --heads "$TMP/public-code.git" 'host/*')"
 fi
+# Scoped deliberately: `grep --all` searches content reachable from the remote's
+# refs. It does not prove that no unreachable object arrived, only that nothing
+# an operator can check out carries the sentinel.
 if git --git-dir="$TMP/public-code.git" grep -q 'SECRET-CREDENTIAL' --all 2>/dev/null; then
-    bad "no workspace CONTENT reaches a non-vault origin" \
+    bad "no workspace content is reachable from any ref on a non-vault origin" \
         "the secret is present in an object on the public remote"
 else
-    ok "no workspace CONTENT reaches a non-vault origin"
+    ok "no workspace content is reachable from any ref on a non-vault origin"
 fi
 
 if [ "$fail" = "0" ]; then
