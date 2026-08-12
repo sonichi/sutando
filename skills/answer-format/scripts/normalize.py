@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
-"""answer-format: deterministic final-answer normalizer.
-
-A last-step pass for any task that ends in a *precise* answer (a number, a
-short string, a list). It applies the formatting conventions that graders and
-downstream consumers expect — bare digits, no thousands separators, worded
-magnitudes expanded, list spacing normalized, prose wrappers stripped — WITHOUT
-changing the answer's meaning.
-
-Design principle: conservative. A normalizer that mangles a correct answer is
-worse than none, so every transform is either lossless or gated on a confident
-pattern. Ambiguous input passes through unchanged.
-
-CLI:
-  echo "100 million" | python3 normalize.py --kind number   -> 100000000
-  python3 normalize.py --kind list -- "b,  a , c"            -> a, b, c   (with --sort)
-"""
+"""Deterministic final-answer normalizer. Conservative by design: every transform
+is lossless or pattern-gated, and ambiguous input passes through unchanged."""
 from __future__ import annotations
 
 import argparse
@@ -74,10 +60,8 @@ def _expand_magnitude(text: str) -> str | None:
 
 
 def _strip_currency_prefix(text: str) -> str:
-    """Strip one supported currency wrapper only around a numeric core.
-
-    A leading minus may sit before the symbol ("-$1,000") or after it
-    ("$-1,000"), so peel the sign before matching the wrapper."""
+    """Strip one currency wrapper around a numeric core. The minus may sit either
+    side of the symbol ("-$1,000" / "$-1,000"), so peel the sign before matching."""
     sign = ""
     body = text
     if body.startswith("-"):
@@ -129,9 +113,8 @@ def normalize_string(text: str, drop_article: bool = False) -> str:
 
 
 def normalize_list(text: str, sort: bool = False, number_items: bool = False) -> str:
-    """Comma-separated, single space after each comma. Per-element trimming; each
-    element optionally normalized as a number. Sorting is opt-in (graders rarely
-    want it) and case-insensitive."""
+    """Comma-separated, one space after each comma, elements trimmed. Sorting is
+    opt-in (graders rarely want it) and case-insensitive."""
     parts = [p.strip() for p in _split_list_elements(text)]
     parts = [p for p in parts if p]
     if number_items:

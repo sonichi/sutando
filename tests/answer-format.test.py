@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""answer-format normalizer tests (skills/answer-format/scripts/normalize.py).
-
-Hermetic, no I/O. Run: python3 tests/answer-format.test.py
-"""
+"""Tests for skills/answer-format/scripts/normalize.py. Hermetic, no I/O."""
 import importlib.util
 import io
 from contextlib import redirect_stdout
