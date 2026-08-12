@@ -25,6 +25,12 @@ side effects or guarantee that every sensitive value will be detected. Guest
 remains on the pre-existing read-only Codex delegation path carried in the
 task's in-band instructions.
 
+Future defense in depth can add AG2 Space security monitoring around this
+trusted tier: centralized action telemetry, prompt-injection and anomalous-tool
+signals, cross-agent incident correlation, owner alerts, and rapid credential or
+agent-session revocation. Those controls would improve detection and response;
+they are not implemented here and must not be treated as current guarantees.
+
 For owner tasks, the skill reads existing assignments from
 `<workspace>/data/task-workstreams.json`; it never classifies tasks or changes
 the grouping sidecar. For each assigned owner task it resumes a headless Claude
