@@ -34,6 +34,13 @@ Config (env / .env):
   REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
+  REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
+                        $CLAUDE_CONFIG_DIR/channels/ (default "ag2space") —
+                        selects which .env fallback and access.json a bridge
+                        instance reads, so a second instance (e.g. a dev
+                        homeserver's "dev-ag2space") cannot inherit prod's
+                        credentials or tier map. Env-only by necessity: the
+                        .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
 
 Stdlib only (urllib) — no new dependencies.
@@ -47,6 +54,7 @@ import json
 import os
 import uuid
 import re
+import shlex
 import signal
 import socket
 import sys
@@ -178,6 +186,8 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .result_ready import read_ready_result
+from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -185,6 +195,10 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# Terminal resting place for proactive nudges that can never be delivered
+# (e.g. a body too large for any Matrix event). Kept separate from `archive/`
+# so "delivered" and "given up on" are never confused when auditing.
+UNDELIVERABLE_RESULTS_DIR = ARCHIVE_RESULTS_DIR / "undeliverable"
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
 # via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
@@ -271,6 +285,9 @@ INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
 TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
+# Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
+# fresh local id, but the delivery it answers is still the original one.
+DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 # sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
@@ -353,6 +370,12 @@ def _parse_onboarding_token(raw):
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
 
 
+# Which channels/<dir>/ this instance reads (.env fallback + access.json).
+# Env-only — the .env file can't name its own directory. Default preserves the
+# historical single-instance layout.
+CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+
+
 def _token_from_ag2space_env():
     """Fallback token source when the launcher didn't export it into the env.
 
@@ -386,7 +409,7 @@ def _token_from_ag2space_env():
     candidates = [os.environ.get("AG2_DEVICE_ENV")]
     _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if _cfg:
-        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
     for path in candidates:
         if not path:
             continue
@@ -487,6 +510,45 @@ def _token_from_vault_ag2space(vault_get=None):
     return tok
 
 
+_VAULT_INTERCEPT_FNS: "tuple | None" = None
+
+
+def _vault_intercept_fns():
+    """Lazily locate the monorepo `src/vault_intercept.py` helpers; memoized.
+    Returns (None, None) on failure so a caller can fall back to `_local_redact_vault_set`."""
+    global _VAULT_INTERCEPT_FNS
+    if _VAULT_INTERCEPT_FNS is not None:
+        return _VAULT_INTERCEPT_FNS
+    try:
+        cur = os.path.dirname(os.path.abspath(__file__))
+        src = ""
+        while True:
+            if os.path.isfile(os.path.join(cur, "src", "vault_intercept.py")):
+                src = os.path.join(cur, "src")
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        if not src:
+            _VAULT_INTERCEPT_FNS = (None, None)
+            return _VAULT_INTERCEPT_FNS
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from vault_intercept import intercept_vault_commands, redact_vault_commands
+        _VAULT_INTERCEPT_FNS = (intercept_vault_commands, redact_vault_commands)
+    except Exception:
+        _VAULT_INTERCEPT_FNS = (None, None)
+    return _VAULT_INTERCEPT_FNS
+
+
+def _local_redact_vault_set(text: str) -> str:
+    """Last-resort redaction when no monorepo `vault_intercept.py` is found.
+    Delegates to this package's own vendored `vault_set_grammar`, not a hand-copied regex."""
+    from .vault_set_grammar import redact_vault_commands as _grammar_redact
+    return _grammar_redact(text, placeholder="[VAULT-SET-REDACTED: interceptor unavailable]")
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 _URL_FALLBACK = ""
 _TOKEN_FILE_FALLBACK = ""
@@ -501,6 +563,18 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
+# `results/proactive-*.txt` the agent writes is delivered to that room as a
+# gateway message (POST /v1/room op:message) and archived. This is the
+# transport half of the repo's long-standing "write proactive-{ts}.txt to
+# speak to the user" contract — historically drained only by the Discord/
+# Telegram bridges, so on a gateway-only host those files were dead letters
+# (observed live: a pending-questions DM nudge sat undrained forever while
+# only its macOS notification fired). Unset → no scan, no behavior change.
+# Deliberately an EXPLICIT room id, not auto-learned from recent task
+# channel_ids: a proactive nudge is often owner-private, and auto-targeting
+# the last active room could deliver it to a shared room.
+PROACTIVE_ROOM = os.environ.get("REMOTE_PROACTIVE_ROOM") or ""
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 # rotation (_reload_rotated_token) propagates to their next request without a
@@ -556,53 +630,32 @@ _INTERACTION_TYPES = frozenset({
     "tool_initiated", "system_event", "self_reflective",
 })
 
-# Trust tier is a LOCAL decision (review 2026-06-13): the gateway is outside
-# this machine's trust boundary, so a task's SELF-CLAIMED access_tier is
-# ignored. The tier written to every task file comes from REMOTE_TASK_TIER.
-#
-# Default is "owner" for the personal-agent model (2026-07-08): a user runs
-# their OWN gateway authenticated with their OWN owner bearer, and the broker
-# OWNER-SCOPES every pull (per-agent bearer; caller-owner == target-owner), so
-# this gateway can ONLY ever receive its owner's own tasks — e.g. a voice-call
-# delegation from the user's own cloud agent. The trust therefore derives from
-# the broker's owner-scoping, NOT from trusting the gateway process or the
-# task's claim. The previous "team" default made a user's own voice
-# delegations look untrusted, so a hardened core (correctly, given the signal)
-# refused them.
-# ESCAPE HATCH: a SHARED / multi-user gateway — one that could pull tasks NOT
-# scoped to a single owner — MUST set REMOTE_TASK_TIER=team (or other).
+# Effective access is the lower of the broker-attested tier and the local cap.
+# Unset local policy defaults to owner; invalid values fail closed to guest.
 LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
-if LOCAL_TIER not in ("owner", "team", "other"):
-    # An INVALID value (e.g. a typo "owenr") fails CLOSED to "team" — NEVER
-    # silently grant owner on a misconfiguration. Only the UNSET case defaults to
-    # "owner" (the `or "owner"` above — the explicit personal-agent model).
-    LOCAL_TIER = "team"
+if LOCAL_TIER == "other":
+    LOCAL_TIER = "guest"
+if LOCAL_TIER not in ("owner", "team", "guest"):
+    LOCAL_TIER = "guest"
 
 
-# ── per-sender tier map (owner-controlled, LOCAL) ────────────────────────────
-# LOCAL_TIER above is the gateway-wide default. A SHARED room can carry messages
-# from senders who are NOT the owner (e.g. a teammate invited into a project
-# room). To tier those correctly WITHOUT trusting the task's self-claimed tier,
-# the OWNER declares a per-sender map in a LOCAL, owner-owned file:
-#   $CLAUDE_CONFIG_DIR/channels/ag2space/access.json → {"tierMap": {"@user:hs": "team"}}
-# We key the lookup on the BROKER-attested `user_id` (Matrix sender the broker
-# writes into the task, not a task-body self-claim), so this stays a LOCAL trust
-# decision — same principle as LOCAL_TIER. Only listed senders are re-tiered;
-# everyone else keeps LOCAL_TIER, so an UNLISTED sender can never escalate. A LISTED
-# sender gets exactly the tier the owner mapped them to — including one ABOVE
-# LOCAL_TIER, which is how a least-privilege node names its owner. See the CONTRACT
-# note on _tier_for for why that cannot be driven from the wire.
-# Hot: the cache keys on (st_mtime_ns, st_size, st_ino) and never serves an
-# above-LOCAL_TIER grant without a fresh read, so the owner can add teammates AND
-# revoke them without a restart.
+# A local per-sender map can only cap the broker tier; unlisted senders use LOCAL_TIER.
+# Cache identity includes mtime, size, and inode so revocations take effect promptly.
 def _ag2space_access_path():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, "channels", "ag2space", "access.json")
+    return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
 
 
-# Known tier vocabulary. Also an ordering (higher == more privileged); kept for
-# validating a mapped value. It no longer CLAMPS — see _tier_for.
-_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
+# Known tier vocabulary and privilege ordering. `_tier_for` uses this ordering
+# to choose the lower of the broker-attested tier and the local cap.
+_TIER_RANK = {"guest": 0, "team": 1, "owner": 2}
+
+
+def _normalized_tier(value):
+    tier = str(value or "").strip().lower()
+    if tier == "other":
+        tier = "guest"
+    return tier if tier in _TIER_RANK else "guest"
 
 _TIER_MAP_CACHE = {"ident": None, "map": {}}
 
@@ -614,51 +667,24 @@ def _has_above_local(cached) -> bool:
 
 
 def _stale_safe(cached):
-    """Project a STALE cached map onto the fail-closed side in BOTH directions.
-
-    The cache is deliberately preserved across a read error so a transient
-    mid-write cannot fail-OPEN a down-tiered sender back to LOCAL_TIER. That
-    reasoning holds only for entries at or below LOCAL_TIER. Once the map can
-    also grant a tier ABOVE LOCAL_TIER, replaying the cache verbatim keeps an
-    ESCALATION alive on a file the owner may have just deleted to revoke it —
-    so deleting access.json would not actually revoke anything.
-
-    Drop the above-LOCAL_TIER entries (those senders fall back to LOCAL_TIER)
-    and keep the rest. A legitimately-granted sender is briefly demoted while
-    the file is unreadable and is restored on the next successful read; an
-    unrevoked escalation is not left standing. Transient demotion is the safe
-    direction — the module already fails closed to "team" on a bad LOCAL_TIER."""
+    """Keep stale caps at or below LOCAL_TIER and drop stale privilege grants.
+    Transient demotion is safer than retaining a possibly revoked escalation."""
     local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
     return {k: v for k, v in cached.items() if _TIER_RANK.get(v, 0) <= local_rank}
 
 
 def _load_tier_map():
-    """Return the owner's {sender_mxid: tier} map, mtime-cached.
-
-    Preserves the last-known-good map on a READ error (stat/open/parse failure)
-    rather than clearing to {}. Clearing would silently up-tier every previously
-    down-tiered sender back to LOCAL_TIER the moment access.json is mid-write,
-    corrupt, or transiently unreadable — a fail-OPEN that is especially bad on a
-    LOCAL_TIER=owner node (a teammate momentarily regains owner). Only a
-    SUCCESSFUL read of a changed file replaces the cache; a fixed file (new mtime)
-    is picked up on the next call. A genuine deletion keeps the last map until the
-    owner writes an empty tierMap or the process restarts (the safe, non-surprising
-    tradeoff — the map floor never drops on a transient fault)."""
+    """Return the cached local sender caps, preserving safe caps on read errors.
+    Only a successful changed-file read replaces the cache."""
     path = _ag2space_access_path()
     try:
         st = os.stat(path)
     except OSError:
         # Absent/unstattable → keep last-known-good (initially {} before any load).
         return _stale_safe(_TIER_MAP_CACHE["map"])
-    # Cache identity is (mtime_ns, size, inode), NOT float mtime. A float mtime
-    # collides under a same-second rewrite and can be restored outright with
-    # os.utime, which would serve a REVOKED grant from cache — reproduced on
-    # #2584 (rewrite to {"tierMap":{}}, restore st_mtime_ns, still resolved owner).
+    # Size and inode supplement nanosecond mtime so same-timestamp rewrites are detected.
     ident = (st.st_mtime_ns, st.st_size, st.st_ino)
-    # Belt-and-braces: never serve an ABOVE-LOCAL grant from cache without a fresh
-    # read. Identity can still be forged deliberately; a revoked escalation must not
-    # survive that. Costs one small read per call only while an escalation is
-    # cached — discord's loader has no cache at all and re-reads every message.
+    # Re-read while an above-default grant is cached so revocation cannot be masked.
     if ident == _TIER_MAP_CACHE["ident"] and not _has_above_local(_TIER_MAP_CACHE["map"]):
         # File present and UNCHANGED — this cache is current, not stale. Return it
         # verbatim: projecting here would drop a legitimate up-tier on every call.
@@ -669,8 +695,8 @@ def _load_tier_map():
         tm = {}
         for who, tier in raw.items():
             t = str(tier).strip().lower()
-            if isinstance(who, str) and t in ("owner", "team", "other"):
-                tm[who.strip()] = t
+            if isinstance(who, str) and t in ("owner", "team", "guest", "other"):
+                tm[who.strip()] = _normalized_tier(t)
     except Exception:
         # Malformed / mid-write → keep last-known-good; don't advance mtime so a
         # later successful read of the fixed file is still picked up.
@@ -679,42 +705,17 @@ def _load_tier_map():
     return tm
 
 
-def _tier_for(user_id):
-    """Resolve the access_tier for a task's broker-attested sender.
-
-    An EXPLICITLY LISTED sender gets exactly the tier the owner mapped them to —
-    including a tier ABOVE this node's LOCAL_TIER. That is the point: it lets a
-    SHARED gateway run a least-privilege default (REMOTE_TASK_TIER=team) and name
-    the one sender who is the owner, instead of the only previously-available
-    shape — a blanket `owner` default that every unlisted sender inherits.
-
-    This mirrors the discord and slack bridges, which have always resolved
-    `access_tier = tierMap[sender_id]` with no clamp. The map is LOCAL,
-    owner-owned config with the same trust standing as REMOTE_TASK_TIER itself,
-    and the lookup key is the BROKER-ATTESTED user_id, never a task-body
-    self-claim — so the WIRE still cannot escalate anyone. Only the owner's own
-    local file can, and only for a sender they named explicitly.
-
-    Everyone else (unlisted / no user_id) gets LOCAL_TIER, unchanged: no existing
-    install is silently demoted, and an unknown sender never gains privilege.
-
-    ⚠ CONTRACT — `user_id` MUST stay broker-attested (cold-review note, #2584).
-    The removed clamp used to be a backstop: even if `user_id` had become
-    body-influenced, a mapped tier was still bounded by LOCAL_TIER. With the
-    clamp gone, "`user_id` is the broker-written Matrix sender, never a
-    task-body self-claim" is SOLELY load-bearing for the no-wire-escalation
-    property. It holds today because `user_id` is a broker-writer-side entry in
-    _TASK_FIELDS, serialized beside room_name/sender_name. Any future change
-    that lets a task body influence `user_id` reintroduces wire-controlled
-    escalation — re-add a bound here if that contract is ever weakened.
-    (Deliberately a contract note, not an assert: provenance cannot be checked
-    at runtime — the value is an ordinary string whichever path produced it.)"""
+def _tier_for(user_id, attested_tier=None):
+    """Return the lower of broker-attested access and the local sender cap.
+    Missing or invalid broker tiers resolve to guest."""
+    wire = _normalized_tier(attested_tier)
+    local = _normalized_tier(LOCAL_TIER)
     uid = (user_id or "").strip()
     if uid:
         mapped = _load_tier_map().get(uid)
-        if mapped in _TIER_RANK:
-            return mapped
-    return LOCAL_TIER
+        if mapped is not None:
+            local = _normalized_tier(mapped)
+    return wire if _TIER_RANK[wire] <= _TIER_RANK[local] else local
 
 
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
@@ -1368,39 +1369,14 @@ def _fleet_agent_ids() -> set[str]:
 
 
 def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
-    """Record that the owner was active on this transport right now — but only
-    when THIS node resolves the SENDER to owner tier. Gated on the sender's
-    resolved tier, NOT the gateway-wide LOCAL_TIER: in a shared room a
-    down-tiered teammate (tierMap[...] = "team"/"other") must not overwrite
-    `state/last-owner-activity.json`, or their message would poison owner-presence
-    routing (the proactive-loop's "owner active N min ago" signal + the core-
-    supervisor escalation target). `sender_tier` is passed in by `_write_task` so
-    the task tier and this gate share a SINGLE resolution (no divergence, no
-    double tierMap read); a direct caller can omit it and we resolve here. For an
-    Since the map may now grant a tier ABOVE LOCAL_TIER, the mirror case also
-    holds: a sender explicitly mapped to owner on a least-privilege node DOES
-    register owner presence — that is the point of naming them owner. Tests 23/24
-    pin both directions, because a refactor that regated this on LOCAL_TIER would
-    silently stop recording the real owner's activity. For an
-    unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
-    unchanged. Never trusts the gateway's own claim (it is outside the trust
-    boundary) — only the broker-attested user_id keyed against the owner's LOCAL
-    tierMap. Atomic write via per-PID tmp + os.replace (this file has four
-    concurrent writers; #2222); same schema (`ts`, `channel`, `summary`)
-    as discord-bridge.write_owner_activity so the proactive-loop reader is
-    transport-agnostic. Best-effort — never blocks task intake."""
+    """Record owner activity only for resolved owner-tier human senders.
+    Reuse the task's resolved tier so routing and presence cannot diverge."""
     if sender_tier is None:
-        # user_id is broker-attested here — see the CONTRACT note in _tier_for.
-        sender_tier = _tier_for(task.get("user_id"))
+        sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     if sender_tier != "owner":
         return
-    # A peer FLEET agent resolves to owner tier on a tierMap-less node (LOCAL_TIER
-    # fallthrough), but it is never the HUMAN owner — recording its post as
-    # owner-presence poisons the proactive-loop's engagement signal and the
-    # core-supervisor escalation target. Gate PRESENCE ONLY here; the task's
-    # access_tier (the other _tier_for consumer) stays owner so peer delegation
-    # is unaffected. Broker-attested user_id only — the /v1/agents directory is
-    # the authoritative peer set (the human owner is not in it).
+    # Agent peers may have owner task authority but must not count as human-owner presence.
+    # The broker-attested directory is authoritative for peer identity.
     _uid = (task.get("user_id") or "").strip()
     if _uid and _uid in _fleet_agent_ids():
         return
@@ -1410,8 +1386,7 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         body = (task.get("task") or "").lstrip()
         if body.startswith("[") and "]" in body:
             body = body[body.index("]") + 1:].lstrip()
-        # #2267 parity: the presence summary is persisted state too — a pasted
-        # token must not survive in last-owner-activity.json either.
+        # Presence summaries are persisted, so redact secrets before writing them.
         body = filter_chat_secrets(body).text
         payload = {
             "ts": int(time.time()),
@@ -1485,6 +1460,9 @@ def _write_task(task: dict) -> str | None:
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
     _secret_types: tuple = ()
+    # Resolved once, reused everywhere below so the tier decision can never diverge;
+    # must run before the "task" field is reached in the loop below.
+    sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -1508,17 +1486,40 @@ def _write_task(task: dict) -> str | None:
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
+            # Intercept `vault set KEY VALUE` before ordinary redaction, owner-tier only.
+            # Every path below intercepts-and-stores or falls through to a redactor — never neither.
+            _intercept_fn, _redact_fn = _vault_intercept_fns()
+            _redact_fallback = _redact_fn or _local_redact_vault_set
+            if sender_tier == "owner" and _intercept_fn is not None:
+                try:
+                    _vault_result = _intercept_fn(_fetched)
+                    _fetched = _vault_result.text
+                    if _vault_result.stored:
+                        _log(f"[vault] stored keys: {_vault_result.stored}")
+                    if _vault_result.failed:
+                        _log(f"[vault] store failed (still redacted): {_vault_result.failed}")
+                except Exception as _vault_exc:
+                    _fetched = _redact_fallback(_fetched)
+                    _log(f"[vault] intercept errored "
+                         f"({type(_vault_exc).__name__}: {_vault_exc}) — "
+                         f"redacted, NOT stored")
+            else:
+                _fetched = _redact_fallback(_fetched)
             # Redact pasted secrets BEFORE the body is persisted (#2267 parity
             # with the discord/slack/telegram bridges): a token pasted into a
             # room message must never land on disk. Runs AFTER media
-            # resolution so a signed media-proxy URL is consumed intact and
-            # only the resolved text is filtered.
+            # resolution (and after any vault interception above consumed a
+            # `vault set` line) so a signed media-proxy URL is consumed intact
+            # and only the resolved text is filtered.
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
                 _secret_types = tuple(_filtered.secret_types)
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
             lines.append(f"task: {_one_line(_filtered.text)}")
+            # Make the sanitized body authoritative everywhere, not just this task file —
+            # _write_owner_activity() re-reads task["task"] independently and isn't vault-aware.
+            task["task"] = _filtered.text
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
             # alongside the legacy [File attached:] body line (dual-write) via the
@@ -1542,36 +1543,122 @@ def _write_task(task: dict) -> str | None:
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
-    # (This used to note that a gateway-written trust signal was dropped for
-    # lack of end-to-end support. platform_card above is that signal, done
-    # properly: KNOWN_HEADER_KEYS vocabulary + guard defang + a verifying
-    # consumer in skills/agent-room-ops/verify_platform_card.py.)
-    # access_tier is a LOCAL decision and written LAST so it wins even under a
-    # last-occurrence parser; every other field is newline-stripped so none can
-    # forge an earlier one either. Resolved per broker-attested sender via the
-    # owner's tierMap (LOCAL file), falling back to LOCAL_TIER for unlisted
-    # senders — so a named teammate can be down-tiered without trusting the task.
-    # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
-    # below, so the two decisions can never diverge (a single source of truth,
-    # no double read of the tierMap).
-    # user_id is broker-attested here — see the CONTRACT note in _tier_for.
-    sender_tier = _tier_for(task.get("user_id"))
+    # sender_tier is resolved once, ahead of the field loop above (needed there
+    # for the "task" field's vault interception), and reused here unchanged.
+    # All preceding fields are newline-stripped, so none can forge a tier header.
     lines.append(f"access_tier: {sender_tier}")
-    # #2267 parity, second half: the other bridges append the in-band security
-    # notice so the core neither reproduces nor re-requests the redacted value.
-    # Appended AFTER access_tier: the notice is bridge-generated fixed text with
-    # no header-shaped lines, so the access-tier-wins-last invariant holds.
+    # The fixed prose notice follows access_tier without introducing recognized headers.
     if _secret_types:
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
+    # Guest retains the established read-only Codex path. Team is deliberately
+    # absent here: the runtime handler launches the owner's selected core in its
+    # native sandbox, so a Claude owner does not depend on Codex quota.
+    if sender_tier == "guest":
+        lines.extend([
+            "",
+            "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
+            "This AG2Space task is GUEST tier, not owner tier.",
+            "Do not execute the request directly with the owner's unrestricted core.",
+            "Delegate it to Codex using `codex exec --sandbox read-only`.",
+            "Research, inspect, explain, and draft only. Do not modify files or external systems.",
+            f"Write only the sandboxed agent's safe user-facing answer to results/{tid}.txt.",
+            "===END SUTANDO SYSTEM INSTRUCTIONS===",
+        ])
+    # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
+    # header-shaped lines, so appending after access_tier keeps it the last one.
+    if sender_tier == "owner":
+        _chan = _one_line(task.get("channel_id") or "")
+        # shlex.quote: an unescaped quote in _chan must not close the shell
+        # string early and turn the remainder into executable shell syntax.
+        _chan_q = shlex.quote(_chan)
+        _step = 1
+        _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+        if _chan:
+            _skill.append(
+                f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
+                f"message, reconstruct the room thread — `python3 "
+                f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
+                f"reports no gateway configured, load the channel env first: `set -a; . "
+                f"\"$CLAUDE_CONFIG_DIR/channels/ag2space/.env\"; set +a`) — and read it "
+                "back (everyone's messages including your own prior replies) until this "
+                "message stands on its own, then answer from the reconstructed thread, "
+                "NOT from memory. Do this every time; do NOT skip it because the message "
+                "looks self-contained or you feel you already understand it — felt "
+                "confidence is exactly the signal that fails. The only exception is a "
+                'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
+            _step += 1
+            _skill.append(
+                f"{_step}. NOTIFY FIRST (if task takes >60s): python3 "
+                f"skills/task-progress/scripts/notify.py --source ag2space "
+                f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
+            _step += 1
+        _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
+        lines.extend(_skill)
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
+    # #2274 parity: one task_processed per NEWLY queued task (idempotent early
+    # returns never reach here), bucketed to this gateway's own "remote" surface
+    # when the source label isn't an allowlisted bucket so activity isn't lost.
+    try:
+        from telemetry import bucket_source, task_processed
+        task_processed(bucket_source(_one_line(task.get("source") or PROVIDER), "remote"))
+    except Exception:
+        pass
     _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
     return tid
+
+
+def _load_dedup_aliases() -> "dict[str, str] | None":
+    """The alias map, or None when it exists but cannot be read.
+
+    None is not the same as empty: guessing "no alias" for an unreadable
+    ledger POSTs a recovered answer under the re-ask id, which the broker is
+    not waiting on.
+    """
+    if not DEDUP_ALIAS_FILE.exists():
+        return {}
+    try:
+        loaded = json.loads(DEDUP_ALIAS_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        _log(f"dedup alias ledger unreadable ({exc}) — deferring")
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _save_dedup_aliases(aliases: dict[str, str]) -> bool:
+    """Atomically persist the alias map. Returns False if it did not commit.
+
+    Unlike the neighbouring sidecars this one is delivery-critical, so the
+    caller must not retire the original delivery until it returns True.
+    """
+    try:
+        DEDUP_ALIAS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DEDUP_ALIAS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(aliases, sort_keys=True))
+        os.replace(tmp, DEDUP_ALIAS_FILE)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"dedup alias persist FAILED ({exc}) — keeping original delivery")
+        return False
+
+
+def _delivery_tid(tid: str) -> "str | None":
+    """The id to POST under, or None when the ledger cannot be read."""
+    aliases = _load_dedup_aliases()
+    return None if aliases is None else aliases.get(tid, tid)
+
+
+def _forget_dedup_alias(tid: str) -> None:
+    aliases = _load_dedup_aliases()
+    if aliases is None:
+        return
+    if aliases.pop(tid, None) is not None:
+        _save_dedup_aliases(aliases)  # cleanup: a stale entry is harmless
 
 
 def _load_task_rooms() -> dict[str, str]:
@@ -1667,6 +1754,314 @@ def _archive_result(path: Path, tid: str) -> None:
             pass  # best-effort; core may have archived it concurrently
 
 
+# A legacy bare `.sending` claim carries no owner info, so recovery for those
+# falls back to an age guard: younger than this = possibly a live worker's
+# in-flight claim, leave it alone. This guard is DELIBERATELY legacy-only —
+# new claims are pid-scoped, and pid-liveness is a stronger signal than age
+# (it recovers a dead worker's claim immediately instead of after 10 minutes),
+# so it supersedes rather than complements this threshold.
+_ORPHAN_MIN_AGE_S = 600
+
+# An empty body observed right after claiming is a writer mid-flush, so it is
+# always re-queued — and NEVER moved to a terminal resting place.
+#
+# History: this was first an mtime age cutoff, then an observation-time cutoff
+# (_EMPTY_ABANDON_S). Both are unsound for the same reason: NOTHING observable
+# from outside the writer — mtime, size, or how long WE have watched it empty —
+# proves the producer has closed its descriptor. A file held open with no write
+# keeps its creation mtime AND stays empty for as long as the writer is paused,
+# so any finite cutoff dead-letters a still-open writer; its later flush then
+# lands in the moved inode and is silently lost — the exact harm this drain
+# exists to remove (review blocker, air 2026-07-28). So there is no abandonment
+# horizon at all: an empty claim is handed back unconditionally, forever, and a
+# flush at ANY later time is delivered on a subsequent pass. A genuinely
+# orphaned 0-byte file (producer crashed before its first write) is inert — never
+# delivered, never moved by this path, which must not be the thing that decides a
+# producer is done. There is no automatic sweeper for it (checked: neither
+# disk-hygiene.sh nor results-health.sh delete results files — the latter only
+# REPORTS zero-byte counts). It is surfaced by scripts/results-health.sh for
+# deliberate cleanup, and the mtime-keyed archiver excludes it too
+# (archive-stale-results.py, sonichi/sutando#2360) so the never-moved guarantee
+# holds end-to-end. A slowly-accumulating set of 0-byte remnants is the accepted
+# benign cost of never risking a real message.
+#
+# Producers SHOULD publish atomically (write a temp, then rename into
+# proactive-*.txt) so an empty file is never observed at all — but producers are
+# heterogeneous (voice-agent.ts, morning-briefing.py, task-bridge.ts, and the
+# core agent writing ad-hoc), with no single chokepoint to enforce that, so the
+# drain stays correct for the ones that don't.
+
+# Filenames THIS process has already logged as claimed-empty, so a genuinely
+# orphaned nudge is noted once instead of on every pass. Discarded when the file
+# gains a body (so a later empty re-observation logs again).
+_EMPTY_LOGGED: "set[str]" = set()
+
+# Bodies above this never fit a Matrix event, so they are undeliverable no
+# matter how often they are retried; they are dead-lettered instead of looping.
+# Well under the 64 KiB event ceiling to leave room for envelope overhead.
+_PROACTIVE_MAX_BODY_B = 48 * 1024
+
+# Destination FORMAT validation is this bridge's own job ("the bridge
+# validates the id format for its platform when applying" — result_markers).
+# Matrix room ids only; Discord (17-20 digit) / Slack ([CDG]…) redirect
+# targets belong to their own bridges and their files are left unclaimed.
+_MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+
+
+def _proactive_route(body: str) -> "tuple[str, str | None, str]":
+    """('send', room_or_None, stripped-body) | ('foreign', None, '') |
+    ('drop', None, '').
+
+    Marker grammar comes SOLELY from parse_markers() (no private parser —
+    CLAUDE.md result-marker contract); this function only applies the actions
+    this transport supports:
+      * skip markers   → 'drop' (archive silently, deliver nothing)
+      * [dm-only]      → parse_markers already suppressed any redirect, so the
+                         body falls through to the default (owner) room
+      * [channel: !r:s]→ 'send' to that room, marker stripped
+      * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
+                         blocker: claiming it here would leak the raw body)
+      * attach markers → stripped by the parser; uploads are unsupported on
+                         the room-message op, so the actions are ignored
+    """
+    parsed = parse_markers(body)
+    if any(a.kind == "skip" for a in parsed.actions):
+        return ("drop", None, "")
+    redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
+    if redirect is not None:
+        dest = redirect.value
+        if _MATRIX_ROOM_RE.match(dest):
+            return ("send", dest, parsed.body)
+        return ("foreign", None, "")
+    return ("send", None, parsed.body)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but not signalable — treat as alive
+    return True
+
+
+def _recover_orphan_proactive() -> None:
+    """Restart-safety: recover orphan proactive claims back to `.txt` so the
+    next drain re-claims them — WITHOUT stealing a live worker's in-flight
+    claim (review blocker). Claims are pid-scoped (`.sending.<pid>`): a claim
+    whose owner pid is alive is left alone; a dead owner's claim recovers
+    immediately. Legacy bare `.sending` claims (no owner info) recover only
+    past an age threshold."""
+    if not PROACTIVE_ROOM:
+        return
+    for f in list(RESULTS_DIR.glob("proactive-*.sending.*")) \
+            + list(RESULTS_DIR.glob("proactive-*.sending")):
+        name = f.name
+        owner = name.rsplit(".sending.", 1)
+        if len(owner) == 2:  # pid-scoped claim
+            try:
+                pid = int(owner[1])
+            except ValueError:
+                continue  # not ours to interpret
+            if _pid_alive(pid):
+                continue  # live worker's in-flight claim (incl. our own
+                # process's other thread) — never steal
+        else:  # legacy bare .sending — age guard only
+            try:
+                if time.time() - f.stat().st_mtime < _ORPHAN_MIN_AGE_S:
+                    continue
+            except OSError:
+                continue
+        target = f.with_name(name.split(".sending")[0] + ".txt")
+        if target.exists():
+            continue  # collision — leave for an operator, never clobber
+        try:
+            f.rename(target)
+            _log(f"recovered orphan proactive claim {f.name}")
+        except OSError:
+            pass
+
+
+def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
+    """Retire a claimed nudge that was NOT delivered, without destroying it.
+
+    Used by the terminal non-delivery paths (settled-empty, dead-lettered).
+    Deliberately not shared with the delivered path: there the content already
+    reached the owner, so unlinking on an archive failure is harmless, whereas
+    handing the claim back would re-send a duplicate. Here nothing was
+    delivered, so the fallback is the opposite — hand it back as `.txt` rather
+    than unlink, since a duplicate on a later pass beats a lost message.
+    """
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        claim.rename(dest_dir / f"{original.stem}-{int(time.time())}.txt")
+    except OSError as e:
+        _log(f"could not retire proactive {original.name} ({e}) — re-queueing")
+        try:
+            claim.rename(original)
+        except OSError:
+            pass
+
+
+def _post_proactive() -> None:
+    """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
+
+    Claim-by-rename (`.txt` → `.sending`) so a concurrent drain (or a racing
+    legacy bridge on a multi-channel host) can't double-deliver; a delivered
+    file archives beside task results; a failed POST renames the claim back
+    to `.txt` for retry on the next loop pass. Auth errors propagate to the
+    caller (the poll loop owns auth handling); everything else is per-file
+    fail-open — one malformed nudge never blocks the rest. No-op without
+    PROACTIVE_ROOM."""
+    if not PROACTIVE_ROOM:
+        return
+    for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
+        # PEEK before claiming: a file explicitly routed to a non-Matrix
+        # destination ([channel: <discord/slack id>]) belongs to that bridge —
+        # claiming it here would leak the raw body (marker included) to the
+        # gateway room and starve the real consumer (review blocker).
+        try:
+            route, _, _ = _proactive_route(f.read_text(encoding="utf-8"))
+        except OSError:
+            continue  # racing consumer already claimed it
+        if route == "foreign":
+            continue
+        # pid-scoped claim: recovery can tell a live worker's in-flight claim
+        # from a dead one's (review blocker: bare .sending was stealable).
+        claim = f.with_suffix(f".sending.{os.getpid()}")
+        try:
+            f.rename(claim)  # atomic claim; loser of a race just misses
+        except OSError:
+            continue
+        # Re-read and re-route AFTER the claim, and act only on THIS result.
+        # The peek above can observe a writer mid-write (file created, body not
+        # yet flushed); acting on that stale empty read is what silently
+        # destroyed a nudge (review blocker). Renaming does not disturb the
+        # writer's descriptor, so the post-claim read sees the flushed body.
+        try:
+            route, room_override, routed_body = _proactive_route(
+                claim.read_text(encoding="utf-8"))
+        except OSError as exc:
+            # A TRANSIENT post-claim read failure must not strand the nudge: the
+            # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
+            # refuses to steal a LIVE pid's claim, so leaving it here loses the
+            # owner message until THIS bridge process exits (review blocker).
+            # Hand the claim back to the original `.txt` for a later pass; if even
+            # the restore fails, log loudly so the stranded inode is visible.
+            try:
+                claim.rename(f)
+            except OSError as restore_exc:
+                _log(f"CRITICAL: proactive {claim.name} post-claim read failed "
+                     f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
+                     f"owner nudge stranded under live pid until restart")
+            continue
+        if route == "foreign":
+            # A foreign destination that only became visible post-claim: hand
+            # the file back to its real consumer rather than eating it.
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        if route == "drop":
+            # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
+            # archive silently, deliver nothing. Nothing was delivered, so on
+            # an archive failure _retire_proactive hands the claim back rather
+            # than unlinking.
+            _log(f"proactive {f.name} carries a skip marker — archiving, no send")
+            _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
+            continue
+        body = routed_body.strip()
+        if not body:
+            # An empty claim means the producer has not flushed the body yet.
+            # NEVER move this inode: no observable signal proves the writer is
+            # done, so a dead-letter (rename to undeliverable/) would strand a
+            # slow/paused writer's later flush in the moved inode and silently
+            # lose an owner-facing nudge — the exact harm this drain removes.
+            # Hand the claim back UNCONDITIONALLY (no abandonment horizon) so a
+            # flush at any later time is delivered on a subsequent pass; log
+            # once per file so a genuinely orphaned 0-byte remnant (producer
+            # crashed pre-flush, reported by results-health.sh for cleanup) does
+            # not spam every pass.
+            if f.name not in _EMPTY_LOGGED:
+                _EMPTY_LOGGED.add(f.name)
+                _log(f"proactive {f.name} claimed empty — producer has not "
+                     f"flushed yet; handing back (never dead-lettered, a late "
+                     f"flush must still deliver)")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        # Non-empty now — drop any prior empty observation so a file that merely
+        # flushed late can log again if it is ever re-observed empty.
+        _EMPTY_LOGGED.discard(f.name)
+        if len(body.encode("utf-8")) > _PROACTIVE_MAX_BODY_B:
+            # Every failure branch below re-queues unconditionally, so a body
+            # that can NEVER be delivered would retry and log on every loop
+            # pass forever. An oversized body is exactly that case, and it is
+            # decidable here — dead-letter it once instead (review: retry
+            # ceiling). Undeliverable-for-other-reasons (kicked from the room,
+            # typo'd room id) still retries by design, so a misconfigured room
+            # stays loud.
+            _log(f"proactive {f.name} body is "
+                 f"{len(body.encode('utf-8'))}B (> {_PROACTIVE_MAX_BODY_B}B) "
+                 "— dead-lettering, it can never be delivered")
+            _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
+            continue
+        try:
+            resp = _req("POST", "/v1/room",
+                        {"op": "message",
+                         "room_id": room_override or PROACTIVE_ROOM,
+                         "body": body},
+                        timeout=15)
+            # A bare 200 is NOT proof of delivery: the gateway can swallow a
+            # room-send failure server-side (bad room id, kicked agent,
+            # power-level denial) and still answer 200 (review P1). Archive
+            # ONLY on the positive delivery signal — the event id of the
+            # posted message (the deployed broker returns
+            # {"ok": true, "event_id": "$..."}). Anything else is treated as
+            # a failed send: the claim is renamed back and retried next pass,
+            # loudly, so a misconfigured room is visible instead of silently
+            # eating nudges.
+            if not (isinstance(resp, dict) and resp.get("event_id")):
+                _log(f"proactive send for {f.name} got no delivery signal "
+                     f"(response {str(resp)[:120]!r}) — will retry; check "
+                     "REMOTE_PROACTIVE_ROOM and the agent's room membership")
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                try:
+                    claim.rename(f)  # un-claim before auth handling takes over
+                except OSError:
+                    pass
+                raise
+            _log(f"proactive send failed for {f.name}: HTTP {e.code} — will retry")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        except (urllib.error.URLError, TimeoutError) as e:
+            _log(f"proactive send network error for {f.name}: {e} — will retry")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
+        except OSError:
+            claim.unlink(missing_ok=True)
+        _log(f"delivered proactive {f.name}")
+
+
 def _load_inflight() -> set[str]:
     """Restore the in-flight set from disk (fail-open to empty)."""
     try:
@@ -1696,6 +2091,35 @@ def _save_inflight(inflight: set[str]) -> None:
 _uploaded_attachments: set[tuple[str, str]] = set()
 
 
+def _dedup_plan(tid: str, holder_id: str | None):
+    """Shared dedup recovery, bound to this adapter's directories.
+
+    A requeue carries the delivery forward: the re-ask keeps the room, stays
+    in flight, and aliases back to the id the broker is waiting on. Without
+    that the re-ask is written and its answer is never looked for.
+    """
+    room = _load_task_rooms().get(tid, "")
+
+    def _commit(new_id: str) -> bool:
+        """Persist routing for the re-ask before it becomes visible."""
+        delivery = _delivery_tid(tid)
+        aliases = _load_dedup_aliases()
+        if delivery is None or aliases is None:
+            return False
+        aliases[new_id] = delivery
+        if not _save_dedup_aliases(aliases):
+            return False
+        rooms = _load_task_rooms()
+        rooms[new_id] = room
+        _save_task_rooms(rooms)
+        return True
+
+    action, payload = plan_dedup_recovery(
+        RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
+        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+    return action, payload, room
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -1704,13 +2128,45 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if not rfile.exists():
+        body = read_ready_result(rfile)
+        if body is None:
             continue
-        body = rfile.read_text().strip()
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip and skip.value == "deduped":
+            action, payload, room = _dedup_plan(tid, skip.extra)
+            if action == "defer":
+                # Nothing was retired; the next pass retries the whole decision.
+                _log(f"dedup deferred for {tid} — alias not committed")
+                continue
+            if action != "honour":
+                if action == "report":
+                    # The results endpoint is keyed by delivery id; an empty
+                    # room map must not turn the report into a silent drop.
+                    _delivery = _delivery_tid(tid)
+                    if _delivery is None:
+                        _log(f"dedup report deferred for {tid} — ledger unreadable")
+                        continue
+                    try:
+                        _req("POST", "/v1/results",
+                             {"id": _broker_tid(_delivery), "body": payload})
+                    except (urllib.error.URLError, urllib.error.HTTPError,
+                            TimeoutError) as exc:
+                        # The report IS the delivery here. Archiving now would
+                        # strand the ask exactly as the unreported dedup did.
+                        _log(f"dedup report POST failed for {tid}: {exc} — will retry")
+                        continue
+                _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
+                _archive_result(rfile, tid)
+                inflight.discard(tid)
+                _forget_task_room(tid)
+                _forget_dedup_alias(tid)
+                if action == "requeue":
+                    inflight.add(payload)
+                changed = True
+                continue
         if skip:
             # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
             # archive without POSTing (match the other bridges' semantics).
@@ -1752,7 +2208,12 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": _broker_tid(tid), "body": out_body})
+            _delivery = _delivery_tid(tid)
+            if _delivery is None:
+                _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                continue
+            _req("POST", "/v1/results",
+                 {"id": _broker_tid(_delivery), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
@@ -1762,6 +2223,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         _archive_result(rfile, tid)
         inflight.discard(tid)
         _forget_task_room(tid)
+        _forget_dedup_alias(tid)
         changed = True
         _log(f"delivered result for {tid}")
     if changed:
@@ -1934,6 +2396,7 @@ def main() -> None:
     if not _acquire_singleton():
         return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
     inflight: set[str] = _load_inflight()
+    _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
@@ -1974,6 +2437,7 @@ def main() -> None:
             for tid in pending_ack:
                 _post_task_ack(tid)
             _post_ready_results(inflight)
+            _post_proactive()
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff

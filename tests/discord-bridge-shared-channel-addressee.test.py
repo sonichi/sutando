@@ -66,6 +66,32 @@ def main() -> int:
                      is_reply=False, reply_author_id=None), "fresh human message"
     print("  ok  fresh human message, no addressee (owner posting directly)")
 
+    # The self-reply case requires author_id; without it the exemption is off.
+    assert addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                     is_reply=True, reply_author_id=OWNER, author_id=OWNER), \
+        "owner replies to their OWN message"
+    print("  ok  owner replies to their OWN message (self-reply fix)")
+
+    # COMPOSITION: the self-reply exemption meets the other_agent_mentioned gate;
+    # neither side's own tests exercise the interaction.
+    assert not addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                         is_reply=True, reply_author_id=OWNER, author_id=OWNER,
+                         other_agent_mentioned=True), \
+        "owner self-reply that @-mentions ANOTHER agent is for that agent, not us"
+    print("  ok  self-reply + other-agent mention -> NOT ours (other_agent_mentioned wins)")
+
+    assert addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                     is_reply=True, reply_author_id=OWNER, author_id=OWNER,
+                     other_agent_mentioned=False), \
+        "owner self-reply with no other-agent mention is still ours"
+    print("  ok  self-reply + no other-agent mention -> still ours (exemption survives)")
+
+    assert addressed(author_is_bot=False, bot_mentioned=True, role_mentioned=False,
+                     is_reply=True, reply_author_id=OWNER, author_id=OWNER,
+                     other_agent_mentioned=True), \
+        "an explicit @-mention of US outranks the other-agent gate"
+    print("  ok  explicit mention of us outranks other_agent_mentioned")
+
     # --- addressed elsewhere → skip (False) — the bug being fixed ---
     assert not addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
                          is_reply=True, reply_author_id=PRO), "owner replies to ANOTHER agent"
@@ -78,6 +104,20 @@ def main() -> int:
     assert not addressed(author_is_bot=True, bot_mentioned=False, role_mentioned=False,
                          is_reply=True, reply_author_id=PRO), "bot replying to a third bot"
     print("  ok  another bot replying to a third bot")
+
+    # a BOT replying to its OWN post is still its own chatter → skip (the
+    # author_is_bot check runs before the self-reply exemption).
+    assert not addressed(author_is_bot=True, bot_mentioned=False, role_mentioned=False,
+                         is_reply=True, reply_author_id=MINI, author_id=MINI), \
+        "another agent replying to its OWN post"
+    print("  ok  another agent replying to its own post (still skipped)")
+
+    # legacy caller (no author_id): the self-reply exemption is OFF → a human
+    # self-reply is treated as before (skipped), so existing callers are unchanged.
+    assert not addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                         is_reply=True, reply_author_id=OWNER), \
+        "legacy caller w/o author_id: owner self-reply not exempt"
+    print("  ok  legacy caller w/o author_id keeps prior behavior")
 
     # --- structural: the bridge wires the gate in + carves out bot2bot ---
     bridge = (REPO / "src" / "discord-bridge.py").read_text()

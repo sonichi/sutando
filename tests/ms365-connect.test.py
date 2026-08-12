@@ -64,6 +64,33 @@ class TestCredentialGuard(unittest.TestCase):
         os.environ.update(MS365_CLIENT_ID="id", MS365_CLIENT_SECRET="sec", MS365_TENANT_ID="ten")
         self.assertEqual(ms365._require_credentials(), ("id", "sec", "ten"))
 
+    def test_public_flow_does_not_require_secret(self):
+        # An app registered under "Mobile and desktop applications" is a PUBLIC
+        # client: the exchange must not present a secret (AADSTS700025, live
+        # 2026-08-06) — so the guard must not demand one either.
+        os.environ.update(MS365_CLIENT_ID="id", MS365_TENANT_ID="ten",
+                          MS365_AUTH_FLOW="public")
+        try:
+            self.assertEqual(ms365._require_credentials(), ("id", None, "ten"))
+        finally:
+            os.environ.pop("MS365_AUTH_FLOW", None)
+
+    def test_default_flow_still_requires_secret(self):
+        os.environ.update(MS365_CLIENT_ID="id", MS365_TENANT_ID="ten")
+        with self.assertRaises(SystemExit) as cm:
+            ms365._require_credentials()
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_invalid_flow_exits_2(self):
+        os.environ.update(MS365_CLIENT_ID="id", MS365_TENANT_ID="ten",
+                          MS365_AUTH_FLOW="pkce")
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                ms365._auth_flow()
+            self.assertEqual(cm.exception.code, 2)
+        finally:
+            os.environ.pop("MS365_AUTH_FLOW", None)
+
 
 class TestTokenDir(unittest.TestCase):
     def test_honors_state_dir_env(self):
