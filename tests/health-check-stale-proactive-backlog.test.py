@@ -37,6 +37,12 @@ spec.loader.exec_module(hc)
 
 TWO_HOURS = 7200
 
+# The literal claim the bridges produce, not a hand-written approximation of it:
+# with_suffix REPLACES .txt, so the claimed name carries no .txt and no pid. The
+# previous fixture wrote both, which is a filename the system never emits — the
+# guard it covered was unreachable for real input.
+CLAIMED = Path("proactive-1786480017.txt").with_suffix(".sending").name
+
 
 class StaleProactiveBacklogTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -67,6 +73,33 @@ class StaleProactiveBacklogTest(unittest.TestCase):
         self.assertEqual(verdict["status"], "warn")
         self.assertIn("proactive-1786480017.txt", verdict["detail"])
 
+    def test_an_abandoned_claim_is_reported(self) -> None:
+        # The shape a *.txt glob cannot see: a consumer took it and died. It is
+        # not in results/undelivered/ (nothing refused it), and the startup
+        # sweep only restores it at the next restart — until then it is a body
+        # nobody delivered, and every other probe reads ok.
+        self._write(f"results/{CLAIMED}", TWO_HOURS * 3)
+        verdict = hc.check_stale_proactive_backlog()
+        self.assertEqual(verdict["status"], "warn")
+        self.assertIn(CLAIMED, verdict["detail"])
+        self.assertIn("abandoned mid-send", verdict["detail"])
+
+    def test_both_shapes_are_reported_together(self) -> None:
+        self._write("results/proactive-unclaimed.txt", TWO_HOURS)
+        self._write(f"results/{CLAIMED}", TWO_HOURS * 3)
+        detail = hc.check_stale_proactive_backlog()["detail"]
+        self.assertIn("proactive-unclaimed.txt", detail)
+        self.assertIn(CLAIMED, detail)
+
+    def test_detail_carries_the_remedy_not_only_the_consequence(self) -> None:
+        # Nothing auto-clears either shape, so a warn without the remedy is one
+        # the reader eventually filters out.
+        self._write("results/proactive-unclaimed.txt", TWO_HOURS)
+        self._write(f"results/{CLAIMED}", TWO_HOURS * 3)
+        detail = hc.check_stale_proactive_backlog()["detail"]
+        self.assertIn("deliver or remove them", detail)
+        self.assertIn("restart a consumer", detail)
+
     def test_detail_names_the_count_and_the_oldest(self) -> None:
         self._write("results/proactive-new.txt", TWO_HOURS)
         self._write("results/proactive-old.txt", TWO_HOURS * 12)
@@ -83,9 +116,22 @@ class StaleProactiveBacklogTest(unittest.TestCase):
         self._write("results/proactive-fresh.txt")
         self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
 
-    def test_claimed_body_is_not_reported(self) -> None:
-        # Claim-by-rename carries the claiming pid, so match the marker only.
-        self._write("results/proactive-x.sending.4242.txt", TWO_HOURS)
+    def test_a_fresh_claim_is_a_consumer_mid_send(self) -> None:
+        # Seconds old: something is delivering it right now.
+        self._write(f"results/{CLAIMED}")
+        self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
+
+    def test_a_claim_inside_its_grace_is_not_reported(self) -> None:
+        # A restart is minutes and the startup sweep restores the file, so the
+        # claim's grace is longer than an unclaimed body's — an age that warns
+        # for a *.txt must stay quiet for a claim.
+        self._write(f"results/{CLAIMED}", TWO_HOURS - 60)
+        self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
+
+    def test_an_unknown_suffix_is_not_guessed_at(self) -> None:
+        # Neither side of the protocol writes this; reporting it would invent
+        # a state, and the glob is now wide enough to see it.
+        self._write("results/proactive-notes.md", TWO_HOURS * 12)
         self.assertEqual(hc.check_stale_proactive_backlog()["status"], "ok")
 
     def test_task_results_are_left_to_their_own_probe(self) -> None:

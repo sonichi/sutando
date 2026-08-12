@@ -5361,8 +5361,13 @@ def _proc_argv(pid: int) -> str:
         return ""
 
 
-def check_stale_proactive_backlog(threshold_age_sec: int = 3600) -> dict:
-    """Report `results/proactive-*.txt` that no consumer has taken.
+def _age_hm(age_sec: int) -> str:
+    return f"{age_sec // 3600}h{age_sec % 3600 // 60}m"
+
+
+def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
+                                  claim_threshold_age_sec: int = 7200) -> dict:
+    """Report `results/proactive-*` bodies no consumer has delivered.
 
     A proactive body is the one message the owner did not ask for and therefore
     cannot miss the absence of: nothing is waiting on a reply, so an undelivered
@@ -5383,15 +5388,33 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600) -> dict:
     drain that is present but points nowhere — are indistinguishable from here
     and have the same consequence for the owner, so the probe reports the
     consequence and leaves the cause to the reader.
+
+    Two shapes, because a claim is a body too. Consumers claim by rename —
+    `f.with_suffix(".sending")` — which REPLACES `.txt`, so a claimed body is
+    `proactive-<id>.sending`. A consumer that dies mid-send leaves that name
+    behind: not in `results/undelivered/` (nothing refused it) and restored only
+    by the next startup sweep, so between the crash and that restart it is
+    exactly "a body nobody delivered" and the one shape a `*.txt` glob cannot
+    see. Its grace is longer than an unclaimed body's because the system does
+    have a recovery for this shape and none for the other; a live send is
+    seconds, so hours means abandoned either way.
     """
     name = "stale-proactive-backlog"
     results_dir = WORKSPACE_DIR / "results"
     if not results_dir.exists():
         return {"name": name, "status": "ok", "detail": "results/ not yet created"}
     now = time.time()
-    entries = list(results_dir.glob("proactive-*.txt"))
-    stale, unreadable = [], 0
+    entries = list(results_dir.glob("proactive-*"))
+    stale, abandoned, unreadable = [], [], 0
     for path in entries:
+        # Decide by suffix, and skip any shape neither side of the protocol
+        # writes rather than guessing what it meant.
+        if path.suffix == ".txt":
+            bucket, limit = stale, threshold_age_sec
+        elif path.suffix == ".sending":
+            bucket, limit = abandoned, claim_threshold_age_sec
+        else:
+            continue
         # Per-file isolation, as in check_orphaned_results: one unreadable entry
         # must not decide the answer for the directory.
         try:
@@ -5401,27 +5424,28 @@ def check_stale_proactive_backlog(threshold_age_sec: int = 3600) -> dict:
         except OSError:
             unreadable += 1
             continue
-        # A claim-by-rename is a consumer mid-delivery, not a backlog. The claim
-        # suffix carries the claiming pid, so match the marker, not a full name.
-        if ".sending" in path.name:
+        if age < limit:
             continue
-        if age < threshold_age_sec:
-            continue
-        stale.append((path.name, int(age)))
+        bucket.append((path.name, int(age)))
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
-    if not stale:
+    if not stale and not abandoned:
         status = "warn" if unreadable else "ok"
         return {"name": name, "status": status,
                 "detail": f"no undelivered proactive bodies{partial}"}
-    stale.sort(key=lambda item: -item[1])
-    oldest_name, oldest_age = stale[0]
-    return {
-        "name": name,
-        "status": "warn",
-        "detail": (f"{len(stale)} proactive body(ies) nobody has delivered; "
-                   f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
-                   f"{partial}"),
-    }
+    parts = []
+    if stale:
+        stale.sort(key=lambda item: -item[1])
+        oldest_name, oldest_age = stale[0]
+        parts.append(f"{len(stale)} proactive body(ies) nobody has delivered; "
+                     f"oldest {oldest_name} ({_age_hm(oldest_age)}); "
+                     f"deliver or remove them — nothing clears these on its own")
+    if abandoned:
+        abandoned.sort(key=lambda item: -item[1])
+        oldest_name, oldest_age = abandoned[0]
+        parts.append(f"{len(abandoned)} claimed body(ies) abandoned mid-send; "
+                     f"oldest {oldest_name} ({_age_hm(oldest_age)}); "
+                     f"restart a consumer to run its startup .sending sweep")
+    return {"name": name, "status": "warn", "detail": "; ".join(parts) + partial}
 
 
 # The argv must BE the script invocation, not merely mention it. A substring
