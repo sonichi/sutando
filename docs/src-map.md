@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-207 modules indexed.
+210 modules indexed.
 
 ## `src/`
 
@@ -63,7 +63,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
-- **`inline-tools.ts`** — Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
+- **`inline-tools.ts`** — Inline tools — lightweight platform actions that execute instantly without going through the core agent.
 - **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level Claude Code hooks (PreCompact + Stop).
 - **`install-credential-proxy-launchd.sh`** — Install / uninstall the launchd-supervised credential-proxy job.
 - **`install-cron-runner-launchd.sh`** — Install / uninstall the launchd-supervised cron-runner job.
@@ -86,6 +86,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`platform.ts`** — Cross-platform OS abstraction layer.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
@@ -109,7 +110,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
-- **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
+- **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`send_allowlist.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
@@ -125,6 +126,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
+- **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
 - **`task-bridge.ts`** — Voice → Claude Code session bridge.
 - **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
@@ -133,6 +135,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
+- **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
@@ -162,35 +165,35 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
 - **`write_calendar_cache.py`** — Producer for the morning-briefing Google-calendar cache (PR #2256).
 
-## `src/Sutando/`
+## `src\Sutando/`
 
-- **`SutandoConfig.swift`** — SutandoConfig.swift — Swift twin of src/sutando_config.{py,ts}.
 - **`main.swift`** — Sutando Drop Menu Bar App
+- **`SutandoConfig.swift`** — SutandoConfig.swift — Swift twin of src/sutando_config.{py,ts}.
 
-## `src/agent/`
+## `src\agent/`
 
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
-## `src/agent/claude/cli/`
+## `src\agent\claude\cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 
-## `src/agent/codex/cli/`
+## `src\agent\codex\cli/`
 
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
 - **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
-## `src/launchd/`
+## `src\launchd/`
 
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.
 
-## `src/observability/`
+## `src\observability/`
 
 - **`__init__.py`** — Sutando observability + metering — the local spine.
 - **`boot.ts`** — Collector daemon — the composition root for Sutando's local collector.
@@ -218,7 +221,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`usage.py`** — The usage record (Python twin of types.ts).
 - **`usage.ts`** — The usage record — the durable, billable/attributable primitive.
 
-## `src/observability/claude/`
+## `src\observability\claude/`
 
 - **`_map-util.ts`** — Shared helpers for the Claude Code mappers.
 - **`cc-hooks.ts`** — The Claude Code hook INGEST CONTRACT — the strict wire shape the core's hook (`obs-hook.sh`) POSTs to `/ingest/claude-code-hooks`, plus the decoder that turns an `unknown` body into that typed shape.
@@ -231,18 +234,18 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`otel-map.ts`** — `otelMap(rec, ctx)` — map one Claude Code OpenTelemetry record (metric, log, or span) to spine primitives.
 - **`otel-normalizer.ts`** — Claude Code OTel metrics → spine primitives, as a composable collector Normalizer.
 
-## `src/observability/claude/hooks/`
+## `src\observability\claude\hooks/`
 
 - **`build-hook-settings.mjs`** — Build the Claude Code `--settings` hooks JSON that registers the obs collector hook on every relevant lifecycle + tool event.
 - **`obs-hook.sh`** — Thin Claude Code obs hook — forwards a raw hook payload (JSON on stdin) to the Sutando collector IFF an export endpoint is configured.
 
-## `src/observability/collector/`
+## `src\observability\collector/`
 
 - **`collector.ts`** — Collector — the single, source-agnostic local ingestion point.
 - **`normalizer.ts`** — Normalizer — turns ONE source's raw payload into the universal spine vocabulary (ObsEvent / UsageRecord).
 - **`server.ts`** — HTTP shell for the Collector — the long-running local daemon.
 
-## `src/runtime-api/`
+## `src\runtime-api/`
 
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
@@ -251,6 +254,6 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
 - **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
 
-## `src/runtime-cli/`
+## `src\runtime-cli/`
 
 - **`sutando-runtime.py`** — sutando-runtime — CLI face of the local runtime API (v0).
