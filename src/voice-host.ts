@@ -25,7 +25,7 @@ import { VoiceSession, type MainAgent, type ToolDefinition } from 'bodhi-realtim
 import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 
@@ -106,6 +106,33 @@ function buildWorkTool(device: { deviceId?: string; label?: string },
 	};
 }
 
+// Cross-session context (owner ask 2026-08-12): the wearable agent used to fly
+// blind — every session started from zero. Inject at session-open: the shared
+// voice context file (maintained by the core) + the tail of this device's own
+// rolling conversation log, so "that PR thing from earlier" just resolves.
+function wearableLogPath(device: { deviceId?: string }): string {
+	const dir = join(resolveWorkspace(), 'state', 'wearable-conversations');
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	return join(dir, `${device.deviceId || 'unknown'}.log`);
+}
+
+export function wearableContext(device: { deviceId?: string }): string {
+	let out = '';
+	try {
+		const shared = JSON.parse(readFileSync(
+			join(resolveWorkspace(), 'state', 'voice-session-context.json'), 'utf8'));
+		out += `\nShared context (from the core, updated ${shared.updated_at}): `
+			+ JSON.stringify({ pending: shared.pending_action, recent: shared.last_results }).slice(0, 900);
+	} catch { /* absent/corrupt → skip */ }
+	try {
+		const lines = readFileSync(wearableLogPath(device), 'utf8').trim().split('\n');
+		if (lines.length && lines[0] !== '') {
+			out += '\nRecent watch conversation (oldest first):\n' + lines.slice(-14).join('\n');
+		}
+	} catch { /* first session ever → skip */ }
+	return out ? '\n\nCONTEXT FROM EARLIER (use naturally when the user refers back):' + out : '';
+}
+
 function buildWearableAgent(device: { deviceId?: string; label?: string },
 		route: TenantRoute = { kind: 'dir' }): MainAgent {
 	return {
@@ -116,7 +143,8 @@ function buildWearableAgent(device: { deviceId?: string; label?: string },
 			+ 'You are the same persistent Sutando that works on the user\'s computer. '
 			+ 'If the user asks for real work (research, code, checking a PR, email), call the work tool '
 			+ 'and confirm briefly; do not attempt long tasks in conversation. '
-			+ 'For questions about current status, answer from context conversationally.',
+			+ 'For questions about current status, answer from context conversationally.'
+			+ wearableContext(device),
 		// Spoken the moment a session opens: tells the wearer the session is
 		// live, and exercises the downstream path with no mic dependency.
 		greeting: 'Say only: "Hi, I\'m listening."',
@@ -249,6 +277,13 @@ async function handleSession(ws: WebSocket): Promise<void> {
 					if (msg?.type === 'transcript' && ws.readyState === WebSocket.OPEN) {
 						ws.send(JSON.stringify({ method: 'voice.transcript', params: {
 							role: msg.role, text: msg.text, partial: !!msg.partial } }));
+					}
+					// Finals feed the per-device rolling log → next session's context.
+					if (msg?.type === 'transcript' && !msg.partial && msg.text) {
+						try {
+							appendFileSync(wearableLogPath(device),
+								`${msg.role === 'user' ? 'user' : 'sutando'}: ${String(msg.text).slice(0, 300)}\n`);
+						} catch { /* log is best-effort */ }
 					}
 				};
 			}
