@@ -573,12 +573,7 @@ def _resolved_vault() -> dict:
 
 def _vault_remote_url(vault: "dict | None" = None) -> str:
     """Vault remote URL as the sync writer's CRON path resolves it: config
-    `vault.remote_url`, then the deprecated `.env` SUTANDO_MEMORY_REPO alias.
-
-    Does not see `--vault-url`, an inherited (not file-resident)
-    SUTANDO_MEMORY_REPO, or a workspace-tier `.env` the writer never sources.
-    Ignores `vault.enabled` on purpose — the writer's chain reads only the URL.
-    """
+    `vault.remote_url`, then the deprecated `.env` SUTANDO_MEMORY_REPO alias."""
     resolved = _resolved_vault() if vault is None else vault
     url = resolved.get("remote_url") or ""
     if url:
