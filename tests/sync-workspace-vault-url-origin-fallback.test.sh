@@ -213,6 +213,26 @@ else
     bad "the no-ws-id refusal names the missing identity file" "got: $out"
 fi
 
+# --- 6d: a wildcard-capable ws-id must not widen the identity probe ----------
+# The id is interpolated into `host/*/<wsId>`, so a persisted `*` asks for
+# host/*/* — which every remote carrying any host branch satisfies.
+skel="$(mk_skel wildcard-wsid)"
+printf '%s\n' '*' > "$skel/workspace/.sutando-vault/ws-id"
+git -C "$skel/workspace" init -q
+git -C "$skel/workspace" remote add origin "$FOREIGN_REMOTE"
+out="$(run_sync "$skel" --status)"
+if echo "$out" | grep VAULT_URL | grep -qF "$FOREIGN_REMOTE"; then
+    bad "a wildcard ws-id does not match a foreign remote's host branch" \
+        "adopted: $(echo "$out" | grep VAULT_URL)"
+else
+    ok "a wildcard ws-id does not match a foreign remote's host branch"
+fi
+if echo "$out" | grep -q 'ws-id is not a valid workspace id'; then
+    ok "the refusal names a malformed id, not a missing one"
+else
+    bad "the refusal names a malformed id, not a missing one" "got: $out"
+fi
+
 # --- 7: an unreachable origin is reported as unreachable, not as not-a-vault --
 skel="$(mk_skel unreachable-origin)"
 git -C "$skel/workspace" init -q
@@ -252,10 +272,8 @@ if [ -f "$skel/workspace/.git" ]; then
             "status said: $(echo "$out" | grep VAULT_URL)"
     fi
 
-    # Status and push disagree on this layout, and that is the point: the URL
-    # passed the remote-identity probe, while push refuses on local layout.
-    # Asserting only status would leave the asymmetry unpinned — a later change
-    # could make push accept a worktree and nothing here would notice.
+    # Status and push disagree here by design; asserting only status would leave
+    # that unpinned, and a later change could make push accept a worktree.
     if echo "$out" | grep -q 'linked git WORKTREE'; then
         ok "status names the worktree layout instead of denying the repo"
     else
@@ -318,10 +336,8 @@ else
 fi
 
 # --- 9: end-to-end — a push-eligible workspace pointed at a public remote -----
-# The refusal above is a message; this asserts the consequence. The fixture is
-# hand-built rather than --init'd: ws-id plus a .git directory is what
-# _assert_sync_initialized reads, so nothing but the vault check stands between
-# this workspace and a push to whatever origin happens to be configured.
+# The refusal above is a message; this asserts the consequence. Hand-built, not
+# --init'd, so nothing but the vault check stands between this and a push.
 skel="$(mk_skel public-origin-no-leak)"
 git init -q --bare "$TMP/public-code.git"
 git -C "$TMP/seed-public" init -q 2>/dev/null || git init -q "$TMP/seed-public"
@@ -341,9 +357,8 @@ else
     bad "no workspace branch is pushed to a non-vault origin" \
         "pushed: $(git ls-remote --heads "$TMP/public-code.git" 'host/*')"
 fi
-# Scoped deliberately: `grep --all` searches content reachable from the remote's
-# refs. It does not prove that no unreachable object arrived, only that nothing
-# an operator can check out carries the sentinel.
+# Scoped deliberately: `grep --all` searches only ref-reachable content, so this
+# proves nothing checkoutable carries the sentinel, not that no object arrived.
 if git --git-dir="$TMP/public-code.git" grep -q 'SECRET-CREDENTIAL' --all 2>/dev/null; then
     bad "no workspace content is reachable from any ref on a non-vault origin" \
         "the secret is present in an object on the public remote"

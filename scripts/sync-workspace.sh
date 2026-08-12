@@ -169,10 +169,8 @@ fi
 # env var if set in .env — no need to re-grep the file (eliminates the
 # var=$(grep | head | ...) set-e trap class entirely; see Mini #1445 v4 Medium).
 VAULT_URL=""
-# Where the URL came from, and — when nothing was adopted — which candidate was
-# declined and why. Resolution reports these on stderr as it runs, but --status
-# is read long afterwards, and a URL printed without its origin cannot be told
-# from a configured one.
+# Provenance for --status: resolution reports it on stderr as it runs, but
+# --status is read long after those lines have scrolled away.
 VAULT_URL_SOURCE=""
 VAULT_URL_DECLINED=""
 VAULT_URL_DECLINED_REASON=""
@@ -206,10 +204,20 @@ if [ -z "$VAULT_URL" ] \
     # Read the id, never mint one: _ws_id() is defined below and persists a
     # fresh id, which would invent an identity no vault can be carrying.
     _wsid="$(tr -d '[:space:]' < "$WORKSPACE_DIR/.sutando-vault/ws-id" 2>/dev/null || true)"
+    # The id goes into a ref glob, so it must match what _ws_id mints: a
+    # persisted `*` asks for host/*/*, which any host branch anywhere answers.
+    case "$_wsid" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) _wsid_ok=1 ;;
+        *) _wsid_ok=0 ;;
+    esac
     if [ -n "$_origin_url" ] && [ -z "$_wsid" ]; then
         VAULT_URL_DECLINED="$_origin_url"
         VAULT_URL_DECLINED_REASON="workspace has no .sutando-vault/ws-id to identify its vault branch"
         echo "sync-workspace: no vault URL configured, and this workspace has no .sutando-vault/ws-id to identify its vault branch; refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+    elif [ -n "$_origin_url" ] && [ "$_wsid_ok" != "1" ]; then
+        VAULT_URL_DECLINED="$_origin_url"
+        VAULT_URL_DECLINED_REASON="workspace ws-id is not a valid workspace id (expected six lowercase hex characters), so it identifies no vault branch"
+        echo "sync-workspace: this workspace's .sutando-vault/ws-id is not a valid workspace id (expected six lowercase hex characters); refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
     elif [ -n "$_origin_url" ]; then
         # Unreachable is not the same answer as not-a-vault, and an operator
         # told the wrong one edits the wrong thing.
@@ -230,7 +238,7 @@ if [ -z "$VAULT_URL" ] \
         fi
         unset _ls_rc _ls_out
     fi
-    unset _origin_url _wsid
+    unset _origin_url _wsid _wsid_ok
 fi
 
 # --------------------------------------------------------------------------- #
@@ -1549,9 +1557,8 @@ _report_unmerged_conflicts() {
 cmd_status() {
     echo "WORKSPACE_DIR: $WORKSPACE_DIR"
     echo "REPO_DIR:      $REPO_DIR"
-    # A value without its provenance is the reason this command gets misread:
-    # a recovered URL and a configured one printed identically, and a declined
-    # candidate vanished into an <unset> that named nothing to go fix.
+    # A recovered URL and a configured one print identically without the source,
+    # and a declined candidate reads as an <unset> naming nothing to go fix.
     if [ -n "$VAULT_URL" ]; then
         echo "VAULT_URL:     $VAULT_URL${VAULT_URL_SOURCE:+  (source: $VAULT_URL_SOURCE)}"
     else
