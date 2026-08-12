@@ -88,6 +88,39 @@ def _set_mtime(p: Path, ts: float) -> None:
     os.utime(p, (ts, ts))
 
 
+class _BinaryThatVanishes:
+    """`binary_path` whose FIRST stat succeeds and whose every later stat
+    raises, while `exists()` keeps answering truthfully — an atomic deploy
+    renaming over the target between the artifact block's own two calls.
+
+    Patching `Path.stat` cannot express this: whether `Path.exists()` bottoms
+    out through `Path.stat` is a CPython detail that changed in 3.14, so the
+    patch either raises inside `exists()` (which swallows OSError, returns
+    False, and skips the branch under test) or lands on a different call.
+    """
+
+    def __init__(self, real: Path):
+        self._real = real
+        self.stats = 0
+        self.raised = False
+
+    def exists(self) -> bool:
+        return self._real.exists()
+
+    def stat(self, *args, **kwargs):
+        self.stats += 1
+        if self.stats > 1:      # 1 = the older-than-source block's own read
+            self.raised = True
+            raise OSError(2, "No such file or directory")
+        return self._real.stat(*args, **kwargs)
+
+    def __fspath__(self) -> str:
+        return str(self._real)
+
+    def __str__(self) -> str:
+        return str(self._real)
+
+
 def _lstart(ts: float) -> str:
     """Format `ts` the way `ps -o lstart=` prints it on macOS/BSD."""
     return datetime.fromtimestamp(ts).strftime("%a %b %d %H:%M:%S %Y")
@@ -174,41 +207,30 @@ class ArtifactRebuiltUnderProcessTests(unittest.TestCase):
     # `exists()` and its `stat()` — what an atomic deploy (write tmp, rename
     # over the target) does to a concurrent reader.
     #
-    # `binary_path` is stat()ed four times per call, and only the LAST is
-    # inside the branch under test:
-    #   1. exists()  -- pre-existing "binary older than source" block
-    #   2. stat()    -- same block
-    #   3. exists()  -- the artifact-vs-process block
-    #   4. stat()    -- the artifact-vs-process block  <- the guarded call
-    # Raising earlier does not exercise the guard: a raise on 3 is caught by
-    # `Path.exists()` itself, which returns False and skips the branch whole.
-    # The exact-count assertion is deliberate — if that sequence ever changes
-    # this test fails loudly instead of silently covering nothing.
+    # The property is stateful, not ordinal: once the artifact block's OWN
+    # stat raises, the failure must stay confined to the artifact check and
+    # the source comparison must still return its verdict. Source is made
+    # NEWER than the process so that verdict is observable — the function's
+    # outer handler also catches OSError, so without the inner `except` the
+    # error unwinds past the SOURCE comparison too and the service reads
+    # "ok". "stale" vs "ok" is exactly the difference the guard makes.
     #
-    # Source is made NEWER than the process here, which is what makes the
-    # guard observable at all. The function's outer handler also catches
-    # OSError, so without the inner `except` the error unwinds past the
-    # SOURCE comparison too and the service reads "ok". The inner guard
-    # confines the failure to the artifact check and lets the source
-    # comparison still return its verdict — so "stale" vs "ok" is exactly
-    # the difference the guard makes, and deleting it fails this test.
+    # An earlier version counted `Path.stat` calls and raised on the 4th.
+    # That ordinal is a CPython implementation detail: on 3.14 the helper
+    # reaches only 2, so the count assertion failed AND — worse — the OSError
+    # never fired, leaving the guard uncovered. `.raised` below asserts the
+    # inner `except` was actually entered, which is the thing the count was
+    # standing in for.
     def test_artifact_vanishing_between_exists_and_stat_is_confined(self):
         _set_mtime(self.binary, self.proc_start + 3600)
         _set_mtime(self.src, self.proc_start + 3600)
-        real_stat = Path.stat
-        seen = {"n": 0}
+        vanishing = _BinaryThatVanishes(self.binary)
 
-        def _racing_stat(inner_self, *args, **kwargs):
-            if inner_self == self.binary:
-                seen["n"] += 1
-                if seen["n"] == 4:
-                    raise OSError(2, "No such file or directory")
-            return real_stat(inner_self, *args, **kwargs)
+        check = self._run(binary_path=vanishing)
 
-        with patch.object(Path, "stat", _racing_stat):
-            check = self._run(binary_path=self.binary)
-
-        self.assertEqual(seen["n"], 4)
+        self.assertTrue(vanishing.raised,
+                        "the artifact block's stat never raised — the inner "
+                        "except was not entered, so this case covers nothing")
         # The source comparison still ran and still decided.
         self.assertEqual(check["status"], "stale")
         self.assertIn("newer than process", check["detail"])
