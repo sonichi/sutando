@@ -20,8 +20,10 @@ never fall through to the owner core.
 This is deliberately a behavioral guardrail, not adversarial isolation. Team
 can perform ordinary development and operational work that needs the owner's
 installed toolchain and configured integrations. The owner accepts that trust
-tradeoff; outbound scanning reduces accidental response leakage but cannot undo
-side effects or guarantee that every sensitive value will be detected. Guest
+tradeoff. The outbound scanner checks only the final response: it cannot observe
+or prevent a malicious or successfully prompt-injected task from reading a
+credential, sending it over the network, mutating the host, invoking a webhook,
+or causing another side effect before returning scanner-clean text. Guest
 remains on the pre-existing read-only Codex delegation path carried in the
 task's in-band instructions.
 
