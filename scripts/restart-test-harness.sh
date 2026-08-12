@@ -12,6 +12,8 @@ restart-test-harness — real post-restart round-trip evidence for live-path PRs
     --start   "<cmd to start the service>" \
     --restart "<cmd to restart it>" \
     --probe   "<behavior check; exit 0 = healthy>" \
+    --identity "<prints a value that MUST change across a real restart,
+                 e.g. the pid or process start time>" \
     [--target local|ssh:user@host]   (default: local) \
     [--known-hosts <file>]           (ssh: pin to a disposable known_hosts and
                                       accept a new key only on first connect;
@@ -22,11 +24,13 @@ restart-test-harness — real post-restart round-trip evidence for live-path PRs
     [--ready-timeout <seconds>]      (default 60)
 
 Run the service commands against a disposable TARGET (a test VM, not the live
-core). Exit 0 only if start, restart, and BOTH probes succeeded.
+core). Exit 0 only if start, restart, and BOTH probes succeeded AND the identity
+value changed — a restart command can return 0 while the old process keeps
+answering, and then the probes pass without a restart having occurred.
 EOF
 }
 
-LABEL="" START="" RESTART="" PROBE="" READY="" TARGET="local" KNOWN_HOSTS=""
+LABEL="" START="" RESTART="" PROBE="" IDENTITY="" READY="" TARGET="local" KNOWN_HOSTS=""
 SETTLE=3 READY_TIMEOUT=60
 
 while [ $# -gt 0 ]; do
@@ -35,6 +39,7 @@ while [ $# -gt 0 ]; do
     --start)         START="$2"; shift 2 ;;
     --restart)       RESTART="$2"; shift 2 ;;
     --probe)         PROBE="$2"; shift 2 ;;
+    --identity)      IDENTITY="$2"; shift 2 ;;
     --ready)         READY="$2"; shift 2 ;;
     --target)        TARGET="$2"; shift 2 ;;
     --known-hosts)   KNOWN_HOSTS="$2"; shift 2 ;;
@@ -45,7 +50,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-for req in START RESTART PROBE; do
+for req in START RESTART PROBE IDENTITY; do
   if [ -z "${!req}" ]; then echo "missing required --$(echo "$req" | tr '[:upper:]' '[:lower:]')" >&2; exit 2; fi
 done
 
@@ -94,6 +99,11 @@ echo "## 2. BEFORE — probe pre-restart"
 BEFORE="$(run "$PROBE" 2>&1)"; BRC=$?
 echo "$BEFORE"; echo "(probe rc=$BRC)"
 if [ "$BRC" -ne 0 ]; then echo "FAIL ❌ — baseline probe failed pre-restart (rc=$BRC); no valid 'before' state to compare against" >&2; exit 1; fi
+ID_BEFORE="$(run "$IDENTITY" 2>/dev/null)"; IBRC=$?
+echo "(identity before: ${ID_BEFORE:-<empty>} rc=$IBRC)"
+if [ "$IBRC" -ne 0 ] || [ -z "$ID_BEFORE" ]; then
+  echo "FAIL ❌ — identity probe gave no pre-restart value (rc=$IBRC); a restart cannot be witnessed" >&2; exit 1
+fi
 line
 
 echo "## 3. restart service"
@@ -104,14 +114,24 @@ if ! wait_ready; then echo "FAIL ❌ — service not ready within ${READY_TIMEOU
 echo "## 4. AFTER — probe post-restart"
 AFTER="$(run "$PROBE" 2>&1)"; ARC=$?
 echo "$AFTER"; echo "(probe rc=$ARC)"
+ID_AFTER="$(run "$IDENTITY" 2>/dev/null)"; IARC=$?
+echo "(identity after: ${ID_AFTER:-<empty>} rc=$IARC)"
 line
 
 echo "## verdict"
 echo "start rc=$SRC   before-probe rc=$BRC   restart rc=$RRC   after-probe rc=$ARC   finished: $(utc)"
-if [ "$ARC" -eq 0 ]; then
-  echo "PASS ✅ — start, restart, and both probes succeeded; behavior round trip verified"
-  exit 0
-else
+echo "identity: ${ID_BEFORE} -> ${ID_AFTER:-<empty>}"
+if [ "$ARC" -ne 0 ]; then
   echo "FAIL ❌ — behavior probe did NOT pass after restart"
   exit 1
 fi
+if [ "$IARC" -ne 0 ] || [ -z "$ID_AFTER" ]; then
+  echo "FAIL ❌ — identity probe gave no post-restart value (rc=$IARC); restart unwitnessed" >&2
+  exit 1
+fi
+if [ "$ID_BEFORE" = "$ID_AFTER" ]; then
+  echo "FAIL ❌ — identity unchanged ($ID_BEFORE); the probes passed but NO restart occurred" >&2
+  exit 1
+fi
+echo "PASS ✅ — start, restart, and both probes succeeded, and identity changed; behavior round trip verified"
+exit 0
