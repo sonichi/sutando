@@ -18,8 +18,10 @@ Run: python3 tests/discord-bridge-heartbeat-offload.test.py  (exit 0/1)
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -129,6 +131,13 @@ check(
     "gateway session #" in SRC,
 )
 
+# Module-level, before ANY bridge import: the bridge resolves channel config at
+# import and falls back to the operator's real ~/.claude one when it is absent.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="sutando-hb-test-")
+_ccd = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd.mkdir(parents=True, exist_ok=True)
+(_ccd / "access.json").write_text('{"allowFrom": []}')
+
 # ── 5. Execution: on_ready runs its presence block (counter + try/except) ──────
 # The structural checks above read source text; this one actually executes
 # on_ready so the counter bump + the change_presence try/except are covered.
@@ -139,11 +148,8 @@ except ImportError:
     print("  skip on_ready exec-coverage — discord.py not importable")
 else:
     import importlib.util
-    import os
-    import tempfile
     from unittest.mock import patch, AsyncMock, MagicMock
 
-    os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="sutando-hb-test-")
     os.environ.setdefault("DISCORD_BOT_TOKEN", "faketoken-for-tests")
     _spec = importlib.util.spec_from_file_location("discordbridge_hb", REPO / "src" / "discord-bridge.py")
     _mod = importlib.util.module_from_spec(_spec)
