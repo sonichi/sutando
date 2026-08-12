@@ -5367,18 +5367,8 @@ def _age_hm(age_sec: int) -> str:
 
 def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
                                   claim_threshold_age_sec: int = 7200) -> dict:
-    """Report `results/proactive-*` bodies no consumer has delivered.
-
-    Neither adjacent probe covers this: `check_orphaned_results` excludes the
-    family by name, and `check_proactive_quarantine` reads
-    `results/undelivered/` — bodies a consumer already took.
-
-    Two shapes, because a claim is a body too. Consumers claim by rename,
-    `f.with_suffix(".sending")`, which REPLACES `.txt` — so a claimed body is
-    `proactive-<id>.sending`, the one shape a `*.txt` glob cannot see. Its
-    grace is longer because the startup sweep restores that shape and nothing
-    restores the other.
-    """
+    """A claim is a body too: `with_suffix(".sending")` REPLACES `.txt`, the one
+    shape a `*.txt` glob cannot see — and the startup sweep restores only it."""
     name = "stale-proactive-backlog"
     results_dir = WORKSPACE_DIR / "results"
     if not results_dir.exists():

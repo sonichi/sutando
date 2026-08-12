@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""Regression coverage for check_stale_proactive_backlog.
-
-Covers both directions — a detector that only ever warns carries no
-information — plus registration, since a probe never appended to `checks`
-passes every unit test here and still reports nothing on a real run.
-
-Run: python3 tests/health-check-stale-proactive-backlog.test.py
-"""
+"""A probe never appended to `checks` passes every test in this file and
+still reports nothing on a real run — hence the registration test."""
 
 from __future__ import annotations
 
