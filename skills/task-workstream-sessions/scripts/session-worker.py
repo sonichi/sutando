@@ -330,12 +330,29 @@ def _claude_stream_result(stdout: str) -> str:
 
 
 def _load_team_result_scanner(repo: Path):
-    """Load and retain the trusted scanner before Team-controlled execution."""
+    """Load and warm the full scanner graph before Team-controlled execution."""
     source_dir = str((repo / "src").resolve())
     if source_dir not in sys.path:
         sys.path.insert(0, source_dir)
     try:
+        # chat_secret_filter imports this lazily on each call. Import it into
+        # the parent now, then warm the public filter so detect-secrets loads
+        # its configured plugins too. The Team provider is a child process: it
+        # may rewrite these source files, but it cannot replace the module and
+        # plugin objects already retained in the parent's sys.modules graph.
         from chat_secret_filter import filter_chat_secrets
+        try:
+            from secret_scanner import scan_and_redact as retained_scan_and_redact
+        except Exception:
+            # This is an optional detector dependency. The maintained curated
+            # fallback in chat_secret_filter remains valid when it is absent.
+            retained_scan_and_redact = None
+        warmup = filter_chat_secrets("Sutando Team result scanner warmup")
+        if not hasattr(warmup, "detected") or (
+            retained_scan_and_redact is not None
+            and not callable(retained_scan_and_redact)
+        ):
+            raise TypeError("invalid Team result scanner contract")
     except Exception as exc:
         raise RuntimeError("Team result secret scanner is unavailable") from exc
     return filter_chat_secrets
@@ -358,8 +375,8 @@ def _run_team(runtime: str, prompt: str, repo: Path, workspace: Path) -> str:
     cwd = Path(os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo))).expanduser()
     if not cwd.is_dir():
         raise RuntimeError(f"Team working directory is unavailable: {cwd}")
-    # The provider can mutate the repository. Capture the trusted callable first,
-    # so rewriting chat_secret_filter.py cannot change this run's delivery check.
+    # The provider can mutate the repository. Capture and warm the full trusted
+    # scanner graph first, so rewriting it cannot change this run's delivery check.
     secret_filter = _load_team_result_scanner(repo)
     if runtime == "claude":
         return_code, stdout, stderr = _run_process_bounded(

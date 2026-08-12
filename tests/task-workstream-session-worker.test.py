@@ -515,6 +515,102 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('SECRET-TOKEN')
                 sys.modules["chat_secret_filter"] = previous
 
 
+def test_team_provider_cannot_rewrite_a_lazy_scanner_dependency() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        repo = root / "repo"
+        source = repo / "src"
+        source.mkdir(parents=True)
+        scanner_path = source / "secret_scanner.py"
+        scanner_path.write_text(
+            "from types import SimpleNamespace\n"
+            "def scan_and_redact(body):\n"
+            "    hits = [SimpleNamespace(secret_type='Fixture Generic Secret', "
+            "line_number=1)] if 'CUSTOM-SECRET' in body else []\n"
+            "    return hits, body\n"
+        )
+        (source / "chat_secret_filter.py").write_text(
+            "from types import SimpleNamespace\n"
+            "def filter_chat_secrets(body):\n"
+            "    from secret_scanner import scan_and_redact\n"
+            "    hits, text = scan_and_redact(body)\n"
+            "    return SimpleNamespace(detected=bool(hits), "
+            "secret_types=tuple(h.secret_type for h in hits), text=text)\n"
+        )
+        project = root / "project"
+        project.mkdir()
+        workspace = root / "workspace"
+        _executable(root / "codex", """#!/usr/bin/env python3
+import os, pathlib, sys
+pathlib.Path(os.environ['SCANNER_PATH']).write_text(
+    'def scan_and_redact(body):\\n'
+    '    return [], body\\n')
+args = sys.argv[1:]
+pathlib.Path(args[args.index('-o') + 1]).write_text('CUSTOM-SECRET')
+""")
+        previous = {name: sys.modules.pop(name, None) for name in (
+            "chat_secret_filter", "secret_scanner")}
+        try:
+            with mock.patch.dict(os.environ, {
+                "PATH": f"{root}:{os.environ['PATH']}",
+                "SCANNER_PATH": str(scanner_path),
+                "SUTANDO_ISOLATED_WORKING_DIR": str(project),
+            }, clear=False):
+                try:
+                    worker._run_team("codex", "task", repo, workspace)
+                    raise AssertionError("rewritten dependency must not release the secret")
+                except worker.TeamResultLeakError as exc:
+                    assert str(exc) == "Fixture Generic Secret"
+            assert "return [], body" in scanner_path.read_text(), \
+                "the transitive dependency mutation control did not execute"
+        finally:
+            for name in ("chat_secret_filter", "secret_scanner"):
+                sys.modules.pop(name, None)
+                if previous[name] is not None:
+                    sys.modules[name] = previous[name]
+
+
+def test_team_scanner_warmup_allows_optional_detector_and_rejects_bad_contract() -> None:
+    import builtins
+
+    fallback = types.ModuleType("chat_secret_filter")
+    fallback.filter_chat_secrets = lambda body: types.SimpleNamespace(
+        detected=False, secret_types=(), text=body)
+    original_import = builtins.__import__
+
+    def without_optional(name, *args, **kwargs):
+        if name == "secret_scanner":
+            raise ImportError("optional detector unavailable")
+        return original_import(name, *args, **kwargs)
+
+    previous = {name: sys.modules.pop(name, None) for name in (
+        "chat_secret_filter", "secret_scanner")}
+    try:
+        with (
+            mock.patch.dict(sys.modules, {"chat_secret_filter": fallback}),
+            mock.patch("builtins.__import__", side_effect=without_optional),
+        ):
+            assert worker._load_team_result_scanner(REPO) is fallback.filter_chat_secrets
+
+        invalid = types.ModuleType("chat_secret_filter")
+        invalid.filter_chat_secrets = lambda _body: object()
+        detector = types.ModuleType("secret_scanner")
+        detector.scan_and_redact = lambda body: ([], body)
+        with mock.patch.dict(sys.modules, {
+            "chat_secret_filter": invalid, "secret_scanner": detector,
+        }):
+            try:
+                worker._load_team_result_scanner(REPO)
+                raise AssertionError("invalid warmed scanner contract must fail closed")
+            except RuntimeError as exc:
+                assert str(exc) == "Team result secret scanner is unavailable"
+    finally:
+        for name in ("chat_secret_filter", "secret_scanner"):
+            sys.modules.pop(name, None)
+            if previous[name] is not None:
+                sys.modules[name] = previous[name]
+
+
 def test_team_request_injection_stays_inside_json_boundary() -> None:
     with tempfile.TemporaryDirectory() as td:
         workspace = Path(td)
@@ -1572,6 +1668,8 @@ if __name__ == "__main__":
     test_team_result_leaks_are_withheld_without_logging_secret_values()
     test_team_result_scanner_failure_fails_closed()
     test_team_provider_cannot_rewrite_the_scanner_used_for_its_result()
+    test_team_provider_cannot_rewrite_a_lazy_scanner_dependency()
+    test_team_scanner_warmup_allows_optional_detector_and_rejects_bad_contract()
     test_team_request_injection_stays_inside_json_boundary()
     test_team_result_filter_uses_runtime_fallback_patterns()
     test_team_output_injection_cannot_control_bridge_delivery()
