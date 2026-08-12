@@ -74,6 +74,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -540,6 +541,23 @@ def _set_pending_reply(task_id: str, info: dict) -> None:
         _atomic_write_pending_replies(dict(pending_replies))
 
 
+def _dedup_recover(task_id: str, holder_id, target) -> None:
+    """Route the shared dedup-recovery plan; Slack owns only the send."""
+    try:
+        action, payload = plan_dedup_recovery(
+            RESULTS_DIR, TASKS_DIR, task_id, holder_id,
+            (target or {}).get("channel", ""), f"task-{int(time.time() * 1000)}")
+        if action == "requeue":
+            _set_pending_reply(payload, dict(target or {}))
+            print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
+        elif action == "report" and target:
+            _send_reply(target["channel"], target.get("thread_ts"), payload,
+                        task_id=task_id, access_tier=target.get("access_tier", "unknown"))
+            print(f"  [dedup] unresolved for {task_id}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - never block the skip path
+        print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+
+
 def _pop_pending_reply(task_id: str):
     with pending_replies_lock:
         target = pending_replies.pop(task_id, None)
@@ -923,17 +941,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    # Owner-activity state is persisted before tier/vault handling below. Use a
-    # redacted preview so an ordinary pasted token never lands in state JSON.
+    # Redact first: a pasted token must never reach state JSON even in a preview.
     initial_secret_filter = filter_chat_secrets(text)
     detected_secret_types = set(initial_secret_filter.secret_types)
     safe_attachment = filter_chat_secrets(attachment_note)
     detected_secret_types.update(safe_attachment.secret_types)
-    write_owner_activity(
-        "slack",
-        initial_secret_filter.text or safe_attachment.text,
-        channel_id=event.get("channel"),
-    )
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for
@@ -960,6 +972,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     seeded_ok = _ensure_tier_map_seeded()
     tier_map = load_tier_map()
     access_tier = resolve_access_tier(user_id, tier_map, seeded_ok)
+
+    # Owner-only, as discord-bridge does: the proactive loop reads this file as
+    # owner PRESENCE, so a team/other sender stamping it fakes "owner is here".
+    if access_tier == "owner":
+        write_owner_activity(
+            "slack",
+            initial_secret_filter.text or safe_attachment.text,
+            channel_id=event.get("channel"),
+        )
 
     # Intercept vault commands before any disk write — must happen AFTER
     # access_tier is resolved so untrusted senders cannot write to Keychain.
@@ -1431,6 +1452,8 @@ def result_watcher():
                 _skip_parsed = parse_markers(reply_text)
                 _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
                 if _skip_action is not None:
+                    if _skip_action.value == "deduped":
+                        _dedup_recover(task_id, _skip_action.extra, target)
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     # §7 audit ledger: skip-marked results are resolved deliveries
                     # (no_send / deduped), not silent voids. One line per result.
