@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
-# Contract test for src/claude_config_dir.sh — the resolve-or-refuse policy both
-# launchers delegate to.
-#
-# Branches pinned:
-#   1. helper readable + valid config          → rc 0, resolved dir on stdout
-#   2. helper readable but NOT executable      → rc 0 (call site is `bash <file>`)
-#   3. helper readable + invalid config        → rc 1, diagnostic on stderr
-#   4. helper absent + caller-set env          → rc 2, caller's value echoed back
-#   5. helper absent + no caller env           → rc 1, diagnostic on stderr
-#   6. both launchers delegate (no second copy of the policy)
-#
-# Run:    bash tests/claude-config-dir-resolve.test.sh
-# Exit:   0 on pass, 1 on failure.
+# Contract test for src/claude_config_dir.sh — pins every rc branch of the
+# resolve-or-refuse policy, and that neither launcher keeps a second copy of it.
 
 set -uo pipefail
 

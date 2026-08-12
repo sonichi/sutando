@@ -1,16 +1,6 @@
 #!/bin/bash
-# Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
-#
-#   source "$REPO/src/claude_config_dir.sh"
-#   if _ccd="$(resolve_claude_config_dir "$REPO" start-cli)"; then ...
-#
-# Prints the resolved dir on stdout. Exit status IS the branch:
-#   0 -> resolved by the M0 helper; caller mkdir -p's, exports, and seeds it.
-#   2 -> helper absent, caller already exported CLAUDE_CONFIG_DIR; echoed back.
-#   1 -> refuse to start; a diagnostic is already on stderr.
-#
-# Refusing matters because an unset CLAUDE_CONFIG_DIR silently selects Claude
-# Code's user-level default -- a different credential store than the rest of Sutando.
+# Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh. Refusing to
+# start beats leaving it unset: unset silently selects a foreign credential store.
 
 resolve_claude_config_dir() {
   local repo="$1"
