@@ -4110,7 +4110,7 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
 
 
 def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
-    """Does the proxy inject THIS core's login, or a different account's?
+    """Does the proxy resolve THIS core's login, or a different account's?
 
     `check_quota_telemetry` above answers "is quota-state fresh, and does it
     exist" — both are questions about WHEN, and neither can see the failure
@@ -4252,7 +4252,9 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
 
     if core_service == proxy_service:
         return {"name": name, "status": "ok",
-                "detail": f"proxy injects this core's login ({core_service})"}
+                "detail": (f"proxy and core resolve the same keychain item "
+                           f"({core_service}) — name match only; this check "
+                           f"does not read tokens")}
 
     return {
         "name": name,

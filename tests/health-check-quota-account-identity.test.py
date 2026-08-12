@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check_quota_account_identity — does the proxy inject THIS core's login?
+"""check_quota_account_identity — does the proxy resolve THIS core's login?
 
 Pins the failure observed 2026-08-03: the credential proxy was up, routing, and
 writing a seconds-old quota-state.json **for a different account**. The owner's
@@ -286,6 +286,25 @@ class TestQuotaAccountIdentity(unittest.TestCase):
                         existing_services={_scoped(core), VANILLA})
         self.assertEqual(out["status"], "ok")
         self.assertIn(_scoped(core), out["detail"])
+
+    def test_ok_reports_the_name_match_not_an_injection(self):
+        """The agreeing branch has the same defect the warn branch had, and it
+        is the one that gets quoted: a reviewer cited this detail on #2843 as
+        evidence the proxy injects, which a name comparison cannot show. A
+        proxy whose stored token is unusable resolves the SAME item and passes
+        through on every request — measured on a live host, 4718 `pass-through
+        engaged` lines against a name match. Report what was compared."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=core,
+                        existing_services={_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "ok")
+        self.assertNotIn(
+            "inject", out["detail"].lower(),
+            "a name match does not establish that the token is injected; "
+            "saying so invites the reader to treat ok as proof of behaviour")
+        self.assertIn(
+            "name match", out["detail"].lower(),
+            "say what was actually compared, so the limit travels with the claim")
 
     def test_no_scoped_item_means_both_fall_back_to_vanilla(self):
         """Core is namespaced but has never logged in there, so its scoped item
