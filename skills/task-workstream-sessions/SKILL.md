@@ -6,8 +6,12 @@ user-invocable: false
 
 # Task workstream sessions
 
-This runtime skill first intercepts every explicit Team task before it can
-reach the unrestricted live core. It launches a fresh instance of the owner's
+This runtime skill intercepts explicit Team tasks before they can reach the
+unrestricted live core, but only when this install has opted in by setting
+`SUTANDO_TEAM_TRUSTED_RUNTIME=1`. Without the opt-in it declines Team tasks, so
+they keep the read-only sandboxed path they had before this runtime existed —
+existing Team mappings were granted under that contract and an upgrade alone
+must not widen them. When enabled, it launches a fresh instance of the owner's
 configured runtime with the normal configured workspace, tools, integrations,
 network, and provider settings. A Team-specific prompt identifies the sender as
 a trusted collaborator rather than the owner and requires cautious, scoped work
