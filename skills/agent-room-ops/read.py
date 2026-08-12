@@ -61,11 +61,8 @@ def _normalize(items):
             # only surface). Always a list so consumers need no None-check.
             "reactions": m.get("reactions") or [],
         }
-        # Media messages: carry the gateway's msgtype + mxc media_ref through so a
-        # reader can pass media_ref to `fetch` (op:media). Dropping them made every
-        # room attachment visible-but-unfetchable — the agent saw the filename in
-        # `body` but had no ref, so it fell back to the raw relay link (401).
-        # Additive + only when present (broker surfaces them since #85).
+        # `fetch` needs media_ref as its handle, so dropping it leaves an attachment
+        # visible but unfetchable. Set only when present, keeping the shape additive.
         ref = m.get("media_ref")
         if ref:
             norm["media_ref"] = ref
