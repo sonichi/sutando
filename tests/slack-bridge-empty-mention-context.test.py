@@ -15,12 +15,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Hermetic isolation (enforced by scripts/lint-hermetic-bridge-tests.py): the Slack
-# bridge resolves channel config at MODULE level during exec_module, so this must
-# isolate CLAUDE_CONFIG_DIR to a temp dir AND seed the canonical slack access.json
-# BEFORE the bridge is imported — otherwise `channel_access_path("slack")` falls back
-# to the operator's real per-user allowlist. Must run at module scope and before the
-# import (the lint checks both order and that the value is a real temp dir).
+# The bridge resolves channel config at import, so CLAUDE_CONFIG_DIR must be
+# isolated AND slack access.json seeded before exec_module, at module scope.
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-slack-empty-mention-")
 _cfg_slack = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
 _cfg_slack.mkdir(parents=True, exist_ok=True)
@@ -135,9 +131,8 @@ class EmptyMentionContextTest(unittest.TestCase):
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
     def test_bot_reply_is_a_boundary_not_crossed(self):
-        # CR #2230: owner "delete X" → bot "done" → bare @Sutando must NOT recover
-        # and re-run "delete X". The bot reply is a conversation boundary proving
-        # the prior owner turn was already answered → clarification, not re-run.
+        # A bot reply between the instruction and the mention is a boundary: the turn
+        # was answered, so the mention gets clarification rather than a re-run.
         BRIDGE.app.client.conversations_replies = lambda **kwargs: {
             "messages": [
                 {"ts": "1700000000.000001", "user": "UOWNER", "text": "delete the prod database"},
@@ -150,10 +145,8 @@ class EmptyMentionContextTest(unittest.TestCase):
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
     def test_split_turn_still_recovers_when_no_bot_between(self):
-        # The legitimate split turn (owner instruction immediately before the
-        # mention, no bot reply between) MUST still recover — the fix only stops
-        # at a bot boundary, it does not disable recovery. An older bot message
-        # before the instruction is never reached.
+        # The genuine split turn (no bot reply between) must still recover — the
+        # boundary stops the walk, it does not disable recovery.
         BRIDGE.app.client.conversations_replies = lambda **kwargs: {
             "messages": [
                 {"ts": "1700000000.000001", "bot_id": "B0", "text": "earlier unrelated bot msg"},
@@ -210,11 +203,8 @@ class EmptyMentionContextTest(unittest.TestCase):
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
     def test_served_bare_mention_is_a_boundary_not_walked_past(self):
-        # CR #2230 (bassilkhilo-ag2), exact repro: "delete X" → a bare @Sutando
-        # (already served) → a NEW bare @Sutando must NOT walk past the served
-        # mention and re-recover/re-run "delete X". No bot message sits between
-        # them, so ONLY the mention-only boundary can stop the walk here (the
-        # pre-existing bot-reply boundary does not apply).
+        # An already-served bare mention is itself a boundary: with no bot message
+        # between, only that stops the walk reaching the older instruction.
         BRIDGE.app.client.conversations_replies = lambda **kwargs: {
             "messages": [
                 {"ts": "1700000000.000001", "user": "UOWNER", "text": "delete the prod database"},
@@ -227,8 +217,8 @@ class EmptyMentionContextTest(unittest.TestCase):
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
     def test_recovery_ignores_a_stale_same_user_instruction(self):
-        # CR #2230: a same-user instruction older than the recovery window is not
-        # the other half of a split turn — it must not resurface "as if fresh".
+        # A same-user instruction older than the recovery window is stale, not the
+        # other half of a split turn.
         stale_ts = float(mention_event()["ts"]) - (BRIDGE._EMPTY_MENTION_RECOVERY_MAX_AGE_S + 60)
         BRIDGE.app.client.conversations_replies = lambda **kwargs: {
             "messages": [
@@ -240,9 +230,8 @@ class EmptyMentionContextTest(unittest.TestCase):
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
     def test_unparseable_timestamp_fails_closed(self):
-        # An unparseable ts means the age is UNKNOWN, and recovered text becomes a
-        # live task — so recovery must stop and ask, not proceed. Fail-open here
-        # would let the one input the recency bound cannot evaluate bypass it.
+        # Unknown age must stop and ask: recovered text becomes a live task, so
+        # failing open would bypass the bound on the one input it cannot evaluate.
         BRIDGE.app.client.conversations_replies = lambda **kwargs: {
             "messages": [
                 {"ts": "", "user": "UOWNER", "text": "Run it now"},
@@ -253,9 +242,8 @@ class EmptyMentionContextTest(unittest.TestCase):
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
     def test_unparseable_timestamp_does_not_resurface_destructive_text(self):
-        # Non-empty but non-numeric ts, and it must sort BELOW the mention's ts:
-        # the `message["ts"] >= current_ts` guard above is a STRING compare, so a
-        # malformed ts sorting high is skipped before the parse is ever reached.
+        # The ts must sort BELOW the mention's: the `>=` guard above is a string
+        # compare, so a high-sorting malformed ts is skipped before any parse.
         BRIDGE.app.client.conversations_replies = lambda **kwargs: {
             "messages": [
                 {"ts": "1700000001.bad", "user": "UOWNER", "text": "delete the prod database"},

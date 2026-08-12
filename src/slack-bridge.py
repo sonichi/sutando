@@ -1180,11 +1180,8 @@ _EMPTY_MENTION_CLARIFICATION = (
     "and ask briefly what they would like help with."
 )
 
-# The recoverable half of a split turn ("Run it now" then a bare "@Sutando") is
-# near-simultaneous. Recovering a same-user message from arbitrarily far back in
-# the 100-message page re-surfaces a stale instruction "as if fresh" (CR #2230,
-# bassilkhilo-ag2). Bound recovery to a generous window that still covers a real
-# split (seconds to a couple of minutes) while refusing an hours-old instruction.
+# A split turn is near-simultaneous; a same-user message from far back in the
+# page is a stale instruction, so bound recovery to a short window.
 _EMPTY_MENTION_RECOVERY_MAX_AGE_S = 600  # 10 minutes
 
 
@@ -1226,27 +1223,22 @@ def _resolve_mention_text(event: dict, stripped_text: str) -> tuple[str, bool]:
             for message in newest_first:
                 if message.get("ts", "") >= current_ts:
                     continue
-                # A bot reply is a conversation boundary: it means the sender's
-                # prior turn was already answered. Stop here rather than skipping
-                # past it — otherwise a bare `@Sutando` after "delete X" → bot
-                # "done" would recover and re-run "delete X" (CR #2230, qingyun-wu).
+                # A bot reply means the prior turn was already answered, so stop rather than
+                # skipping past it and re-running that instruction.
                 if message.get("bot_id"):
                     break
                 # Do not jump across another human participant and attribute an
                 # older instruction to the current sender.
                 if message.get("user") != user_id:
                     break
-                # Recency bound: a same-user message older than the window is not
-                # the other half of a split turn — it is a stale instruction that
-                # must not be resurfaced. Newest-first, so once one is too old the
-                # rest are older still → stop. (CR #2230, bassilkhilo-ag2)
+                # Newest-first: once one message is past the window the rest are older, so
+                # stop rather than continue.
                 try:
                     if float(current_ts) - float(message.get("ts", "0")) > _EMPTY_MENTION_RECOVERY_MAX_AGE_S:
                         break
                 except (TypeError, ValueError):
-                    # Unknown age must fail CLOSED. Recovered text becomes a live
-                    # task, so an unparseable ts would let the recency bound be
-                    # bypassed by the one input it cannot evaluate.
+                    # Unknown age must fail closed: recovered text becomes a live task, so an
+                    # unparseable ts would bypass the recency bound it cannot evaluate.
                     break
                 candidate = (message.get("text") or "").strip()
                 without_mentions = re.sub(
@@ -1256,13 +1248,8 @@ def _resolve_mention_text(event: dict, stripped_text: str) -> tuple[str, bool]:
                 ).strip()
                 if without_mentions:
                     return candidate, True
-                # A prior same-user message that is mention-only (empty once its
-                # mentions are stripped) is an already-served bare @mention turn,
-                # not a message to skip past. Continuing would walk to an OLDER
-                # instruction already answered in that turn — bassil CR #2230
-                # repro: "delete the prod database", bare @Sutando (served), then
-                # a new bare @Sutando re-recovered and re-ran "delete...". Treat
-                # the served mention as a boundary and stop.
+                # A mention-only prior message is an already-served turn, not one to skip:
+                # continuing would reach an older instruction that turn already answered.
                 break
         except Exception as exc:
             print(f"  [empty-mention] thread context lookup failed: {exc}", flush=True)
