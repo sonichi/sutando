@@ -215,6 +215,24 @@ async function handleSession(ws: WebSocket): Promise<void> {
 				}
 				if (!spokeThisTurn) { spokeThisTurn = true; sendState('speaking'); }
 			};
+			// LLM-transport death while the device session is live: bodhi parks the
+			// session CLOSED and waits for a client-connect that will never re-fire
+			// (the client is already attached). Without this, the watch shows
+			// "Listening" while streaming into a dead link (2026-08-12 hotel test).
+			// Tell the device the truth, then drop the stream so its own
+			// connection-lost cleanup runs and the next YELLOW opens fresh.
+			const origTransportClose = (session as any).handleTransportClose?.bind(session);
+			if (origTransportClose) {
+				(session as any).handleTransportClose = (code?: number, reason?: string) => {
+					origTransportClose(code, reason);
+					if ((session as any).sessionManager?.state === 'CLOSED'
+						&& ws.readyState === WebSocket.OPEN) {
+						console.log(`${ts()} [session ${n}] LLM died mid-session (code=${code}) — closing device stream`);
+						sendState('offline');
+						setTimeout(() => { try { ws.close(); } catch { /* gone */ } }, 300);
+					}
+				};
+			}
 			const bus = (session as any).eventBus;
 			bus?.subscribe?.('turn.start', () => { spokeThisTurn = false; sendState('thinking'); });
 			bus?.subscribe?.('turn.end', () => { spokeThisTurn = false; sendState('listening'); });
