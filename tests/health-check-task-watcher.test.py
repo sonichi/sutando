@@ -23,6 +23,9 @@ Covers:
   r) supervised watcher + absent sentinel exposes the pid --fix can re-stamp
   s) --fix re-stamps it and the RE-RUN check reports ok (no restart needed)
   t) --fix refuses to stamp a pid that is no longer the watcher (PID reuse)
+  t2) ...including a process that merely MENTIONS the script (an observer, a
+     `ps | grep`) — the fixer uses the file's exact predicate, not a substring
+  t3) ...and the same holds for the second, post-publication argv test
   u) --fix never clobbers a sentinel a watcher re-claimed meanwhile
   u2) ...nor one claimed INSIDE the write window, where only the kernel can
      arbitrate (an exists()-then-write cannot see it)
@@ -165,6 +168,59 @@ def case_t_fix_refuses_a_recycled_pid() -> list[str]:
             fails.append("t) --fix stamped a pid that is no longer the watcher")
         if "no longer the watcher" not in msg:
             fails.append(f"t) should say why it refused, got {msg!r}")
+    return fails
+
+
+def case_t2_an_impostor_that_merely_mentions_the_script_is_refused() -> list[str]:
+    """Case (t) uses an argv with no mention of the script, which a substring
+    test also rejects — so it cannot tell the two predicates apart. This argv
+    CONTAINS `watch-tasks-stream` without being the watcher: an observer, or
+    the `ps`/grep wrapper the module's own comment at `_is_watcher_argv` names.
+
+    `_is_watcher_argv` is the file's exact predicate and is what `_watcher_trees`
+    already uses; the fixer must not carry a looser private copy, because the
+    pid it stamps is the one the Stop hook later kills."""
+    fails = []
+    for argv in ("python3 observer.py watch-tasks-stream.sh",
+                 "bash -c ps aux | grep watch-tasks-stream"):
+        with supervised_watcher() as ws:
+            check = hc.check_task_watcher()
+            hc._proc_argv = lambda p, a=argv: a
+            msg = hc.fix_task_watcher_sentinel(check)
+            pid_file = ws / "state" / "watch-tasks-stream.pid"
+            if pid_file.exists():
+                fails.append(f"t2) --fix stamped an impostor ({argv!r}): "
+                             f"sentinel now {pid_file.read_text().strip()}")
+            if "no longer the watcher" not in msg:
+                fails.append(f"t2) should refuse {argv!r}, got {msg!r}")
+    return fails
+
+
+def case_t3_an_impostor_appearing_mid_write_is_withdrawn() -> list[str]:
+    """The post-publication re-validation is a SECOND argv test, and (t2) cannot
+    reach it — a pre-write refusal returns before the write. Drive the impostor
+    in on the second probe call so only the post-write check sees it."""
+    fails = []
+    with supervised_watcher() as ws:
+        check = hc.check_task_watcher()
+        calls = {"n": 0}
+
+        def _watcher_then_impostor(p):
+            calls["n"] += 1
+            return ("bash src/watch-tasks-stream.sh" if calls["n"] == 1
+                    else "python3 observer.py watch-tasks-stream.sh")
+
+        hc._proc_argv = _watcher_then_impostor
+        msg = hc.fix_task_watcher_sentinel(check)
+        pid_file = ws / "state" / "watch-tasks-stream.pid"
+        if calls["n"] < 2:
+            fails.append(f"t3) the post-write probe never ran ({calls['n']} call(s)) — "
+                         "this case covers nothing")
+        if pid_file.exists():
+            fails.append("t3) an impostor seen after publication was left stamped: "
+                         f"{pid_file.read_text().strip()}")
+        if "mid-write" not in msg:
+            fails.append(f"t3) should report the withdrawal, got {msg!r}")
     return fails
 
 
@@ -638,6 +694,8 @@ def main() -> int:
         ("r", case_r_supervised_watcher_exposes_restamp_pid),
         ("s", case_s_fix_restamps_and_recheck_is_ok),
         ("t", case_t_fix_refuses_a_recycled_pid),
+        ("t2", case_t2_an_impostor_that_merely_mentions_the_script_is_refused),
+        ("t3", case_t3_an_impostor_appearing_mid_write_is_withdrawn),
         ("u", case_u_fix_never_clobbers_a_reclaimed_sentinel),
         ("u2", case_u2_competing_claim_inside_the_write_window_survives),
         ("u3", case_u3_pid_stale_after_publication_is_withdrawn),

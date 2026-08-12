@@ -5522,10 +5522,9 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     if not pid.isdigit():
         return "no re-stampable watcher pid"
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
-    # RE-MEASURE before writing. The check ran earlier; stamping a pid that is
-    # no longer the watcher would author the exact PID-reuse lie the probe
-    # exists to catch, and this file is what the Stop hook kills.
-    if "watch-tasks-stream" not in (_proc_argv(int(pid)) or ""):
+    # Re-measure before writing: the check ran earlier, and this file is what
+    # the Stop hook kills.
+    if not _is_watcher_argv(_proc_argv(int(pid))):
         return f"pid {pid} is no longer the watcher — not re-stamped"
     try:
         # Separate try: mkdir raises FileExistsError when state/ is a plain
@@ -5534,20 +5533,17 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     except OSError as e:
         return f"could not write {pid_file}: {e}"
     try:
-        # Exclusive create, not exists()-then-write: the OS is the only thing
-        # that can arbitrate against a watcher claiming the sentinel in the
-        # same instant, and a lost race here leaves the file naming a dead pid
-        # that the live owner's content-gated cleanup will never remove.
+        # Exclusive create, not exists()-then-write: only the OS can arbitrate
+        # against a watcher claiming the sentinel in the same instant.
         with open(pid_file, "x") as fh:
             fh.write(f"{pid}\n")
     except FileExistsError:
         return "a watcher re-claimed the sentinel — left its file alone"
     except OSError as e:
         return f"could not write {pid_file}: {e}"
-    # The argv probe above was a snapshot taken BEFORE publication. Re-validate
-    # after, and retract our own stamp if it went stale mid-write — leaving it
-    # would author the PID-reuse lie this fixer exists to avoid.
-    if "watch-tasks-stream" not in (_proc_argv(int(pid)) or ""):
+    # The probe above was a snapshot taken BEFORE publication; retract our own
+    # stamp if it went stale mid-write.
+    if not _is_watcher_argv(_proc_argv(int(pid))):
         try:
             if pid_file.read_text().strip() == pid:
                 pid_file.unlink()
