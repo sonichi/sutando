@@ -110,18 +110,29 @@ with tempfile.TemporaryDirectory() as td:
     _mod.RESULTS_DIR = Path(td)
     rival = Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_ABC)}.txt"
     _real_write = Path.write_text
+    _real_fdopen = _mod.os.fdopen
 
-    def _racing_write(self, *a, **kw):
-        # Stands in for an overlapping run finishing between our look and sweep.
+    def _spawn_rival():
+        # Stands in for an overlapping run finishing while we write. Hooked on
+        # both body-write forms so it fires whichever one the writer uses.
         if not rival.exists():
             _real_write(rival, "the other run's snapshot")
+
+    def _racing_write(self, *a, **kw):
+        _spawn_rival()
         return _real_write(self, *a, **kw)
 
+    def _racing_fdopen(*a, **kw):
+        _spawn_rival()
+        return _real_fdopen(*a, **kw)
+
     Path.write_text = _racing_write
+    _mod.os.fdopen = _racing_fdopen
     try:
         _mod.notify_discord_dm(Q_AB)
     finally:
         Path.write_text = _real_write
+        _mod.os.fdopen = _real_fdopen
     ok("a body written after the enumeration survives the sweep", rival.exists())
     ok("our own reminder is still written",
        (Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_AB)}.txt").exists())
@@ -133,14 +144,15 @@ with tempfile.TemporaryDirectory() as td:
     _mod.RESULTS_DIR = Path(td)
     seen_incomplete = []
     _real_open = Path.open
+    _real_fdopen = _mod.os.fdopen
+    _real_replace = _mod.os.replace
     _looking = False
 
-    def _observing_open(self, *a, **kw):
-        # Runs the bridge's poll inside the real gap, not a simulated one.
+    def _poll():
+        # What a bridge iterating results/ would see at this instant.
         global _looking
-        fh = _real_open(self, *a, **kw)
-        if _looking or "w" not in kw.get("mode", a[0] if a else ""):
-            return fh
+        if _looking:
+            return
         _looking = True
         try:
             for p in Path(td).iterdir():
@@ -150,17 +162,79 @@ with tempfile.TemporaryDirectory() as td:
                             seen_incomplete.append(p.name)
         finally:
             _looking = False
+
+    def _observing_open(self, *a, **kw):
+        # Runs the bridge's poll inside the real gap, not a simulated one.
+        fh = _real_open(self, *a, **kw)
+        if "w" in kw.get("mode", a[0] if a else ""):
+            _poll()
         return fh
 
+    def _observing_fdopen(*a, **kw):
+        fh = _real_fdopen(*a, **kw)
+        _poll()  # body still unwritten: the deliverable name must not exist yet
+        return fh
+
+    def _observing_replace(src, dst):
+        _poll()  # last instant before the deliverable name appears
+        return _real_replace(src, dst)
+
     Path.open = _observing_open
+    _mod.os.fdopen = _observing_fdopen
+    _mod.os.replace = _observing_replace
     try:
         _mod.notify_discord_dm(Q_AB)
     finally:
         Path.open = _real_open
+        _mod.os.fdopen = _real_fdopen
+        _mod.os.replace = _real_replace
     ok("a claimable body is never observed incomplete", not seen_incomplete)
     ok("no scratch file is left behind",
        {f.name for f in Path(td).iterdir()} ==
        {f"proactive-pending-q-{_mod.questions_key(Q_AB)}.txt"})
+
+# T10: the scratch name must be unique per writer. A name derived from the
+# deliverable is the SAME for two runs of the same question set — the shape this
+# PR defends against — so one can truncate the body the other is about to publish.
+with tempfile.TemporaryDirectory() as td:
+    _mod.RESULTS_DIR = Path(td)
+    scratch = []
+    _real_replace = _mod.os.replace
+
+    def _recording_replace(src, dst):
+        scratch.append(Path(src).name)
+        return _real_replace(src, dst)
+
+    _mod.os.replace = _recording_replace
+    try:
+        _mod.notify_discord_dm(Q_AB)
+        _mod.notify_discord_dm(Q_AB)  # same set -> same deliverable name
+    finally:
+        _mod.os.replace = _real_replace
+    ok("two runs of the same set use distinct scratch names",
+       len(scratch) == 2 and len(set(scratch)) == 2)
+    ok("the scratch name cannot be claimed as a deliverable",
+       all(n.startswith(".") and not n.endswith(".txt") for n in scratch))
+
+# T10b: a unique scratch name accumulates unless the writer cleans up after a
+# failed publish. A stray .tmp per crashed run is the cost of dropping the
+# deterministic name; removing it on the failure path is what pays it.
+with tempfile.TemporaryDirectory() as td:
+    _mod.RESULTS_DIR = Path(td)
+    _real_replace = _mod.os.replace
+
+    def _failing_replace(src, dst):
+        raise OSError("publish failed")
+
+    _mod.os.replace = _failing_replace
+    try:
+        _mod.notify_discord_dm(Q_AB)
+    except OSError:
+        pass
+    finally:
+        _mod.os.replace = _real_replace
+    ok("a failed publish leaves no scratch file behind",
+       list(Path(td).iterdir()) == [])
 
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(0 if _failed == 0 else 1)
