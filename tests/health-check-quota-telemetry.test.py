@@ -4,11 +4,13 @@ producing no quota state.
 
 The gap it covers: quota-state.json is written by the credential proxy from
 upstream response headers, so it only appears if a core actually ROUTES
-through the proxy. The core launcher (src/agent/claude/cli/start-cli.sh)
-exports ANTHROPIC_BASE_URL only when the proxy port already has a listener at
-the moment the core starts, so a proxy that binds seconds AFTER the core --
-routine when both are supervised -- leaves that core unrouted for its whole
-session. On such a host the proxy is healthy and listening,
+through the proxy. Only the core launcher (src/agent/claude/cli/start-cli.sh)
+exports ANTHROPIC_BASE_URL, and only when the proxy port already has a listener
+at launch. TWO conditions leave a core unrouted, and the probe cannot tell them
+apart: the core was started outside the launcher (straight from tmux, no
+startup.sh, no start-cli.sh), or it was started by the launcher before the proxy
+bound -- routine when both are supervised. Both were observed on live hosts, one
+each. On such a host the proxy is healthy and listening,
 every check is green, and quota telemetry is silently absent forever — the
 proactive loop's budget check reads "unknown" every pass with no explanation.
 
@@ -80,6 +82,19 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         # reader has no idea why an up proxy produces nothing.
         self.assertIn("ANTHROPIC_BASE_URL", r["detail"])
 
+    def test_absent_message_names_the_condition_not_one_cause(self):
+        """The probe sees an unrouted core; it cannot see WHICH way it got there.
+        Two causes were each observed on a live host — launched outside the
+        launcher entirely, and launched by it before the proxy bound — so naming
+        either alone sends the reader on the other host to an absent bug."""
+        d = self.hc.check_quota_telemetry("ok")["detail"]
+        self.assertIn("src/agent/claude/cli/start-cli.sh", d)
+        self.assertIn("outside the launcher", d)
+        self.assertIn("before the proxy bound", d)
+        # startup.sh stopped being the exporter in #2417; pointing at it sends
+        # the reader to "the supervisor bypasses startup.sh", an absent bug.
+        self.assertNotIn("startup.sh", d)
+
     def test_proxy_down_stays_silent(self):
         """Not every host routes through the proxy, and its own check already
         reports it as down. Warning twice would be noise."""
@@ -136,6 +151,17 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         self.assertIn("ANTHROPIC_BASE_URL", r["detail"])
         self.assertIn("312h", r["detail"])
         self.assertIn("1m", r["detail"])
+
+    def test_stale_message_names_the_condition_not_one_cause(self):
+        """Same two causes as the absent branch — this message is read by the
+        same person on the same host, so it must not pick one either."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        d = self.hc.check_quota_telemetry("ok")["detail"]
+        self.assertIn("src/agent/claude/cli/start-cli.sh", d)
+        self.assertIn("outside the launcher", d)
+        self.assertIn("before the proxy bound", d)
+        self.assertNotIn("startup.sh", d)
 
     def test_idle_host_with_stale_quota_stays_silent(self):
         """The false positive the original decision was protecting against,
