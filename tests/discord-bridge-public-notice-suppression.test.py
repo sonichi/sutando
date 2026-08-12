@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
-"""Two classes of bridge-internal plumbing must never reach a public channel:
-the auto-seed access.json notice, and the Stage-2 sandbox fallback sentinel.
-
-The seed notice is owner-DM-only with no public fallback; poll_results swallows
-the sentinel for non-DM destinations (no-send archive + best-effort owner DM).
-Covered here: the suppression predicate and sentinel recogniser, both DM
-helpers, the notice formatter, and one real pass of poll_results over the
-guard's call site — the branch the extracted helpers cannot reach on their own.
-
-Run: python3 tests/discord-bridge-public-notice-suppression.test.py
-"""
+"""The auto-seed notice and the sandbox-fallback sentinel must never reach a
+public channel: DM-only with no public fallback, swallowed for non-DM."""
 
 from __future__ import annotations
 
@@ -181,9 +172,8 @@ def case_seed_notice_dm() -> list[str]:
 
 
 def case_seed_notice_dm_failure_propagates() -> list[str]:
-    # The call site wraps this in try/except and logs; the helper itself must
-    # NOT swallow — and must never fall back to a public post (nothing else
-    # is sent anywhere on failure).
+    # The helper must not swallow (its call site logs) and must never fall
+    # back to a public post.
     fails = []
     dm = _FakeDM()
     orig = bridge.client
@@ -301,11 +291,8 @@ class _GuildChan:
 
 
 def _run_one_poll_pass(body: str, chan):
-    """Drive the real poll_results once with `body` queued for `chan`.
-
-    Returns (channel, results_dir, task_id). The loop's own sleep raises, which
-    is how the repo's other poll-loop drivers bound a `while True`.
-    """
+    """Drive poll_results once with `body` queued for `chan` -> (results, id).
+    The loop's own sleep raises, which is how the repo bounds its `while True`."""
     td = tempfile.mkdtemp(prefix="dbps-poll-")
     results, tasks = Path(td) / "results", Path(td) / "tasks"
     (results / "archive").mkdir(parents=True)
