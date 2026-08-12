@@ -720,8 +720,9 @@ def render_dashboard() -> str:
 
 
 # ── Mutating-request gate ────────────────────────────────────────────────────
-# CORS hides a cross-origin *response*; it does not stop the request being made,
-# and a safelisted `text/plain` POST reaches the handler without a preflight.
+
+# CORS hides a cross-origin response but does not stop the request, and a
+# safelisted text/plain POST reaches the handler with no preflight.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # A wildcard bind names no host, so the legitimate Host set cannot be derived
 # from it; DASHBOARD_ALLOWED_HOSTS supplies it explicitly for LAN mode.

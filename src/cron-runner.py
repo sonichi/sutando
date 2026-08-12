@@ -14,10 +14,8 @@ This runner is the reliable path. It is invoked by launchd
 (``com.sutando.cron-runner``) every 60s, independent of any Claude session.
 Each tick it reads the per-host ``crons.json``, decides which entries are DUE
 since their last recorded fire, and emits a task file into ``tasks/`` for each.
-Entries with a ``shell_command`` are the mechanical lane: the command runs from
-the repository root with output logged, without waking the core or creating a
-task file. Prompt-backed entries follow the streaming watcher pipeline, which
-hands the task to the running session. Same OS-level → emit-task → process
+A ``shell_command`` entry runs directly from the repository root with output
+logged; a prompt-backed entry goes through the watcher pipeline. Same OS-level → emit-task → process
 pipeline the launchd health-check fallback already uses.
 
 Ownership / no double-fire
@@ -479,9 +477,8 @@ def run(now_epoch: Optional[int] = None) -> list:
                 print(f"cron-runner: skipping {name}: {e}", file=sys.stderr)
                 continue
             if due_epoch is not None:
-                # Direct shell jobs are the mechanical lane: they must remain
-                # runnable while the model core is stopped, and never emit a
-                # task that would wake a full agent turn.
+                # Direct shell jobs must stay claimable and idempotent like prompt jobs; only
+                # the execution differs.
                 if shell_command is not None:
                     _run_shell_command(
                         name, shell_command, _shell_timeout_for(entry))

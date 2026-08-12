@@ -205,9 +205,8 @@ ds.upsert_schedule(p4, {"name": "mech", "cron": "*/5 * * * *",
 _m = next(j for j in ds.read_crons(p4) if j["name"] == "mech")
 check("a new shell job is flagged launchd-owned", _m.get("launchd") is True, str(_m))
 
-# Converting an existing job must claim ownership too. Use a FRESH prompt job
-# with no launchd flag — reusing one that already carries it would pass whether
-# or not the code claims ownership.
+# Use a FRESH prompt job: one already carrying the launchd flag would pass
+# whether or not the code claims ownership.
 ds.upsert_schedule(p4, {"name": "conv", "cron": "0 9 * * *", "prompt": "plain"})
 _pre = next(j for j in ds.read_crons(p4) if j["name"] == "conv")
 check("fixture starts unflagged, so the next assertion can fail",
