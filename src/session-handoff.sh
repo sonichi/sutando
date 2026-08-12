@@ -94,6 +94,23 @@ WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of thi
 # after every compaction (sutando-migrate classifies it newest-mtime).
 STATE_FILE="$WORKSPACE_DIR/session-state.md"
 
+# Append-only record that a compaction happened. Nothing else on disk marks one,
+# so "did context roll over just before that failure?" was previously unanswerable.
+record_compaction_event() {
+    local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+    line="$(printf '{"ts":"%s","epoch":%s,"host":"%s","transcript":"%s","trigger":"%s"}' \
+        "$ts" "$(date +%s)" "${SUTANDO_HOST_LABEL:-$(hostname -s 2>/dev/null)}" \
+        "$(basename "${1:-}" 2>/dev/null)" "${2:-precompact}")"
+    # Bound it: keep the newest 500 so a long-lived core cannot grow this forever.
+    if [ -f "$log" ] && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -ge 500 ]; then
+        tail -n 499 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log" 2>/dev/null
+    fi
+    printf '%s\n' "$line" >> "$log" 2>/dev/null || true
+}
+record_compaction_event "${1:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact}"
+
 # Build state from available signals
 {
   echo "---"
