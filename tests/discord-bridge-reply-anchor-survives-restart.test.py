@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""A quote-reply anchor must survive a bridge restart.
-
-`pending_reply_anchors` is in-memory, so a restart between task creation and
-result delivery dropped it and the reply landed unquoted. The bridge already
-writes `source_message_id` into every task file; nothing read it back.
-"""
+"""A quote-reply anchor must survive a bridge restart: `pending_reply_anchors`
+is in-memory, so recovery reads `source_message_id` back off the task file."""
 from pathlib import Path
 import ast
 import os
