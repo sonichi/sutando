@@ -25,9 +25,9 @@
 # turn-end (after every assistant response), NOT session-end — so the
 # PID-kill block killed the live Monitor watcher every turn, triggering an
 # exit-143 + Monitor-restart cycle.  Watcher orphan-cleanup is handled by
-# the `Reap any stale watch-tasks-stream watcher` block in
-# `src/startup.sh` (defense-in-depth: PID-file + cmdline-check before
-# kill), which runs at every session start.  See the original #1061 /
+# `reap_stale_task_watcher` in `src/startup-runtime.sh` (defense-in-depth:
+# PID-file + cmdline-check before kill), which runs at every session start.
+# See the original #1061 /
 # #1063 / #1065 thread for the orphan-watcher background.
 #
 # Idempotent: re-running is safe.  Existing hook entries with the same

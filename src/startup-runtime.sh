@@ -310,9 +310,11 @@ reap_wedged_voice_agent() {
   return 0
 }
 
-# Reap a stale watch-tasks-stream watcher from a prior session. The in-session
-# Stop hook handles clean shutdown; a hard crash (SIGKILL, panic, force-quit,
-# power loss) skips it and leaves an orphan fswatch process + stale PID file.
+# Reap a stale watch-tasks-stream watcher from a prior session. The watcher's
+# own EXIT trap handles clean shutdown (the #1065 Stop hook that used to is gone
+# — see DEPRECATED_HOOKS in install-claude-hooks.sh); a hard crash (SIGKILL,
+# panic, force-quit, power loss) skips the trap and leaves an orphan fswatch
+# process + stale PID file.
 # The cmdline check is what keeps a RECYCLED pid from being killed blindly.
 #
 # The removal is compare-and-delete for the same reason watch-tasks-stream.sh's
