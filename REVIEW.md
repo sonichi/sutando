@@ -120,6 +120,22 @@ and loads whichever repo it reviews.
 
 ```yaml
 checks:
+  root-artifacts:
+    # Added files at the REPO ROOT matching these are PR-draft leftovers. Root
+    # only; omitting the key uses these defaults rather than disabling the check.
+    root_artifact_glob:
+      - 'prbody*'
+      - 'pr-body*'
+      - 'pr_body*'
+      - 'reply*.md'
+      - 'comment*.md'
+      - 'draft*.md'
+      - '*.patch'
+      - '*.diff'
+      - '*.orig'
+      - '*.rej'
+      - 'nohup.out'
+
   hardcoded-paths:
     # Added lines containing any of these substrings are flagged as errors...
     flag:

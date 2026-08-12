@@ -1109,7 +1109,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
-                             "core-status"],
+                             "core-status", "team-collaborator"],
         }
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).
@@ -1458,11 +1458,20 @@ def _write_task(task: dict) -> str | None:
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    # Promote only the exact broker boolean plus Team request; the legacy Guest
+    # wire tier keeps old nodes restricted and body text cannot opt itself in.
+    broker_tier = _normalized_tier(task.get("access_tier"))
+    requested_tier = _normalized_tier(task.get("requested_access_tier"))
+    broker_collaborator = (
+        task.get("collaborator") is True
+        and (broker_tier == "team" or requested_tier == "team")
+    )
+    attested_tier = "team" if broker_collaborator else broker_tier
+    # Resolved once and reused below so routing and owner-activity cannot diverge.
+    sender_tier = _tier_for(task.get("user_id"), attested_tier)
+    collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
     _secret_types: tuple = ()
-    # Resolved once, reused everywhere below so the tier decision can never diverge;
-    # must run before the "task" field is reached in the loop below.
-    sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -1476,6 +1485,10 @@ def _write_task(task: dict) -> str | None:
                 it = "message"
             lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
+            # Keep the established id/timestamp prefix stable, but place this
+            # trusted execution-policy header before all untrusted body text.
+            if collaborator_enabled:
+                lines.append("collaborator: true")
             # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
             # reaches the agent as body content (owner directive 2026-07-16) —
             # see _strip_room_ops_meta. Runs first so the stripped body is what
