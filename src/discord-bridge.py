@@ -401,22 +401,25 @@ def archive_file(src: "Path", kind: str, task_id: str) -> None:
 
 
 def _anchor_from_task_file(task_id: str):
-    """Recover the quote-reply anchor from the durable task file.
-
-    `pending_reply_anchors` is in-memory, so a bridge restart between task
-    creation and result delivery drops it and the reply lands unquoted. The id
-    is already written to the task file at creation and was never read back.
-    """
-    path = TASKS_DIR / f"{task_id}.txt"
+    """Recover the quote-reply anchor `pending_reply_anchors` lost to a restart.
+    By delivery time the task may be claimed or already archived, so try both."""
+    candidates = []
     try:
-        if not path.is_file():
-            return None
-        for line in path.read_text(errors="replace").splitlines():
-            if line.startswith("source_message_id:"):
-                raw = line.split(":", 1)[1].strip()
-                return int(raw) if raw.isdigit() else None
+        live = find_task_file(TASKS_DIR, task_id)
+        if live is not None:
+            candidates.append(live)
+        for pattern in (f"*/{task_id}.txt", f"*/{task_id}.claimed-core-*.txt"):
+            candidates.extend(sorted(ARCHIVE_TASKS_DIR.glob(pattern)))
     except Exception:
-        return None
+        pass
+    for path in candidates:
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                if line.startswith("source_message_id:"):
+                    raw = line.split(":", 1)[1].strip()
+                    return int(raw) if raw.isdigit() else None
+        except Exception:
+            continue
     return None
 
 

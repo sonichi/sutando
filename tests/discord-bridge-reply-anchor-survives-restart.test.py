@@ -1,24 +1,9 @@
 #!/usr/bin/env python3
-"""Behavioral test: a quote-reply anchor must survive a bridge restart.
+"""A quote-reply anchor must survive a bridge restart.
 
-Root cause (2026-08-11): the bridge threads a reply only when `reply_to_id` is
-set, and the auto-thread path took it from `pending_reply_anchors.pop(task_id)`
-— an IN-MEMORY dict. Any bridge restart between task creation and result
-delivery empties that dict, so every reply afterwards landed as a fresh message
-instead of a quote-reply, with nothing logged.
-
-The recovery data already existed and was never read: the bridge WRITES
-`source_message_id: <id>` into every task file at creation
-(`discord-bridge.py`, task-write block) and the string appeared exactly once in
-the whole module — on the write side. A durable field with no consumer.
-
-Fix: `_anchor_from_task_file(task_id)` reads that field back, and the auto-thread
-path falls back to it when the in-memory anchor is absent.
-
-This test extracts the pure function's source and exercises it against REAL temp
-files (no `import discord`, matching the other bridge tests' convention), plus a
-structural guard that the delivery path actually consults the fallback — without
-that guard the function could exist, pass every case here, and never be called.
+`pending_reply_anchors` is in-memory, so a restart between task creation and
+result delivery dropped it and the reply landed unquoted. The bridge already
+writes `source_message_id` into every task file; nothing read it back.
 """
 from pathlib import Path
 import ast
@@ -27,12 +12,7 @@ import sys
 import tempfile
 import unittest
 
-# Isolate CLAUDE_CONFIG_DIR before anything else. This test never imports the
-# bridge — it ast-extracts a single function — so no module-level channel config
-# is resolved. The isolation is kept anyway so that stays true if the test ever
-# grows an import. An empty allowFrom is the safe seed: if anything ever does
-# resolve channel config here it authorises nobody, rather than inheriting the
-# developer's real allowlist.
+# Hermetic-bridge-test lint: explicit config root, access.json seeded under it.
 _CFG = tempfile.mkdtemp(prefix="anchor-test-cfg-")
 os.environ["CLAUDE_CONFIG_DIR"] = _CFG
 _ACCESS = Path(_CFG) / "channels" / "discord" / "access.json"
@@ -40,68 +20,98 @@ _ACCESS.parent.mkdir(parents=True, exist_ok=True)
 _ACCESS.write_text('{"allowFrom": []}')
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "discord-bridge.py"
+sys.path.insert(0, str(SRC.parent))
+from task_archive import find_task_file  # noqa: E402
+
+BODY = "id: {i}\nsource_message_id: 1536878881250742322\nchannel_id: 999\ntask: hi\n"
+ANCHOR = 1536878881250742322
 
 
-def _load_fn(name, tasks_dir):
-    """Exec just the named function, with TASKS_DIR bound to a temp dir."""
+def _load_fn(name, tasks_dir, archive_dir):
+    """Exec just the named function against temp task/archive roots."""
     tree = ast.parse(SRC.read_text())
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
-            ns = {"TASKS_DIR": tasks_dir, "Path": Path}
+            ns = {"TASKS_DIR": tasks_dir, "ARCHIVE_TASKS_DIR": archive_dir,
+                  "find_task_file": find_task_file, "Path": Path}
             exec(compile(ast.Module(body=[node], type_ignores=[]), str(SRC), "exec"), ns)
             return ns[name]
     raise AssertionError(f"{name} not found in {SRC}")
 
 
-def _task(dirpath, task_id, body):
-    (dirpath / f"{task_id}.txt").write_text(body)
-
-
 class AnchorRecovery(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tasks = Path(self._td.name) / "tasks"
+        self.archive = Path(self._td.name) / "archive"
+        for d in (self.tasks, self.archive):
+            d.mkdir(parents=True)
+        self.fn = _load_fn("_anchor_from_task_file", self.tasks, self.archive)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _archived(self, month, name, task_id):
+        (self.archive / month).mkdir(exist_ok=True)
+        (self.archive / month / name).write_text(BODY.format(i=task_id))
+
     def test_recovers_the_id_the_bridge_wrote(self):
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            fn = _load_fn("_anchor_from_task_file", d)
-            _task(d, "task-1", "id: task-1\nsource_message_id: 1536878881250742322\n"
-                               "channel_id: 999\ntask: hi\n")
-            self.assertEqual(fn("task-1"), 1536878881250742322)
+        (self.tasks / "task-1.txt").write_text(BODY.format(i="task-1"))
+        self.assertEqual(self.fn("task-1"), ANCHOR)
+
+    def test_recovers_from_a_CLAIMED_task_file(self):
+        """Production renames claimed work, so a bare-name lookup misses exactly
+        the tasks that are in flight."""
+        (self.tasks / "task-2.claimed-core-3.txt").write_text(BODY.format(i="task-2"))
+        self.assertEqual(self.fn("task-2"), ANCHOR)
+
+    def test_recovers_from_the_monthly_ARCHIVE(self):
+        """The task can be archived before its result is delivered."""
+        self._archived("2026-08", "task-3.txt", "task-3")
+        self.assertEqual(self.fn("task-3"), ANCHOR)
+
+    def test_recovers_from_a_CLAIMED_file_in_the_archive(self):
+        self._archived("2026-07", "task-4.claimed-core-1.txt", "task-4")
+        self.assertEqual(self.fn("task-4"), ANCHOR)
+
+    def test_live_file_wins_over_a_stale_archived_one(self):
+        (self.tasks / "task-5.txt").write_text(
+            "id: task-5\nsource_message_id: 999000111222333444\n")
+        self._archived("2026-06", "task-5.txt", "task-5")
+        self.assertEqual(self.fn("task-5"), 999000111222333444)
 
     def test_absent_field_is_none_not_a_crash(self):
-        """A task written before the field existed must degrade, not raise."""
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            fn = _load_fn("_anchor_from_task_file", d)
-            _task(d, "task-2", "id: task-2\nchannel_id: 999\ntask: hi\n")
-            self.assertIsNone(fn("task-2"))
+        (self.tasks / "task-6.txt").write_text("id: task-6\nchannel_id: 999\n")
+        self.assertIsNone(self.fn("task-6"))
 
     def test_missing_file_is_none(self):
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            fn = _load_fn("_anchor_from_task_file", d)
-            self.assertIsNone(fn("task-nope"))
+        self.assertIsNone(self.fn("task-nope"))
 
     def test_non_numeric_id_is_none_never_a_string(self):
-        """discord.MessageReference wants an int; a str would fail at send time,
-        i.e. AFTER the result is already consumed."""
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            fn = _load_fn("_anchor_from_task_file", d)
-            _task(d, "task-3", "id: task-3\nsource_message_id: not-a-number\n")
-            self.assertIsNone(fn("task-3"))
+        """discord.MessageReference wants an int; a str fails at send time,
+        i.e. after the result has already been consumed."""
+        (self.tasks / "task-7.txt").write_text("id: task-7\nsource_message_id: nope\n")
+        self.assertIsNone(self.fn("task-7"))
 
 
 class Wiring(unittest.TestCase):
     def test_delivery_path_consults_the_fallback(self):
-        """Without this the function can exist, pass every case above, and never
-        be called — which is exactly the defect it fixes, one level up."""
+        """Without this the function can pass every case above and never run."""
         text = SRC.read_text()
-        self.assertIn("source_message_anchor = pending_reply_anchors.pop(task_id, None)", text)
-        idx = text.index("source_message_anchor = pending_reply_anchors.pop(task_id, None)")
-        window = text[idx:idx + 400]
+        anchor = "source_message_anchor = pending_reply_anchors.pop(task_id, None)"
+        self.assertIn(anchor, text)
+        window = text[text.index(anchor):text.index(anchor) + 400]
         self.assertIn("_anchor_from_task_file(task_id)", window,
                       "the pop site must fall back to the durable task file")
         self.assertIn("if source_message_anchor is None:", window,
-                      "the fallback must be conditional on the in-memory anchor being absent")
+                      "the fallback must be conditional on the in-memory anchor")
+
+    def test_the_locator_is_the_canonical_one(self):
+        """A bare TASKS_DIR / f'{task_id}.txt' cannot see a claimed file."""
+        text = SRC.read_text()
+        start = text.index("def _anchor_from_task_file(")
+        end = text.index("\ndef ", start + 1)
+        self.assertIn("find_task_file(TASKS_DIR, task_id)", text[start:end])
 
 
 if __name__ == "__main__":
