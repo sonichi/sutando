@@ -1351,7 +1351,9 @@ lock.rmdir()
             started = time.monotonic()
             assert process.stdout is not None
             assert process.stdout.readline() == "TASK_FILE: task-z-live.txt\n"
-            assert time.monotonic() - started < 1.0
+            # The handler this discriminates against blocks for 4s; 1.0 sat below process
+            # startup here (measured 1.17-1.36s), failing while the property still held.
+            assert time.monotonic() - started < 2.5
             assert int((state / "maximum").read_text()) <= 2
 
             (state / "release").touch()
