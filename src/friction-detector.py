@@ -36,6 +36,11 @@ RESULTS_DIR = WORKSPACE / "results"
 # lines, so `all_issues` is non-empty and the all-clear is withheld.
 UNCHECKED = "COULD NOT CHECK: "
 
+# pending-questions.md is enumerated in full only while the list is short.
+# Past this it collapses to a count + the oldest few; see check_pending_questions.
+_PQ_ENUMERATE_MAX = 5
+_PQ_OLDEST_SHOWN = 3
+
 
 def check_pending_questions():
     """Find questions unanswered for >24h.
@@ -61,6 +66,7 @@ def check_pending_questions():
     )
 
     issues = []
+    found: list = []
     today = datetime.now().date()
     current_title: Optional[str] = None
     current_asked: Optional[str] = None
@@ -74,6 +80,7 @@ def check_pending_questions():
         if _RESOLVED_STATUS.search(body):
             return
         age_str = ""
+        age_days_num = -1  # unknown age sorts last, never ahead of a dated item
         if current_asked:
             try:
                 asked_date = datetime.fromisoformat(current_asked).date()
@@ -81,9 +88,10 @@ def check_pending_questions():
                 if age_days < 1:
                     return  # not stale yet
                 age_str = f" ({age_days}d old)"
+                age_days_num = age_days
             except ValueError:
                 pass
-        issues.append(f"Pending question unanswered{age_str}: {current_title[:80]}")
+        found.append((age_days_num, f"Pending question unanswered{age_str}: {current_title[:80]}"))
 
     for line in content.split("\n"):
         stripped = line.strip()
@@ -101,6 +109,28 @@ def check_pending_questions():
                 except IndexError:
                     pass
     flush()
+
+    # Enumerating every open question turns the friction report into a copy of
+    # pending-questions.md — 52 of 60 lines on this host, and check-pending-
+    # questions.py already owns that list with its own rate limit. Past the
+    # threshold, collapse to a count plus the oldest few so the remaining
+    # signal (stale notes, tasks, issues) is still readable.
+    if len(found) > _PQ_ENUMERATE_MAX:
+        # Only claim "oldest" when something is actually dated. Sections carry
+        # `**Asked:**` inconsistently, and on a file with none, sorting is a
+        # no-op — calling the first three "oldest" would be a label the data
+        # does not support.
+        dated = [p for p in found if p[0] >= 0]
+        if dated:
+            dated.sort(key=lambda p: p[0], reverse=True)
+            label, sample = "oldest", dated[:_PQ_OLDEST_SHOWN]
+        else:
+            label, sample = "including", found[:_PQ_OLDEST_SHOWN]
+        issues.append(f"{len(found)} pending questions unanswered "
+                      f"(check-pending-questions.py owns the full list); {label}:")
+        issues.extend(f"  {t}" for _, t in sample)
+    else:
+        issues.extend(t for _, t in found)
 
     return issues
 
