@@ -230,10 +230,8 @@ class ReadLimitCountsMessages(unittest.TestCase):
 
 
 class NormalizeMediaRefTests(unittest.TestCase):
-    """_normalize must carry the gateway's `media_ref` + `msgtype` through — they are
-    the ONLY handle a reader has on a room attachment. Dropped, the agent sees the
-    filename in `body` but has no ref to pass to `fetch` (op:media), so it falls back
-    to the raw relay link and gets 401. The broker surfaces these since backend #85."""
+    """`media_ref` + `msgtype` are the only handle a reader has on a room attachment,
+    so dropping them leaves it visible in `body` but unfetchable."""
 
     def test_media_ref_and_msgtype_preserved(self):
         out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "doc.pdf",
