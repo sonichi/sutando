@@ -38,6 +38,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -258,31 +259,91 @@ def _shell_log_path() -> Path:
     return STATE_FILE.parent.parent / "logs" / "cron-runner.log"
 
 
-def _run_shell_command(name: str, command: str) -> int:
+# A hung or chatty job must not stall the tick that holds the state lock, nor
+# grow the log unboundedly. Per-entry override: `shell_timeout_s`.
+SHELL_COMMAND_TIMEOUT_S = 300
+SHELL_OUTPUT_LIMIT = 64 * 1024
+
+
+def _bounded_output(text: str) -> str:
+    """Cap one stream so a chatty command cannot grow the log without limit."""
+    if len(text) <= SHELL_OUTPUT_LIMIT:
+        return text
+    dropped = len(text) - SHELL_OUTPUT_LIMIT
+    return f"{text[:SHELL_OUTPUT_LIMIT]}\n[truncated {dropped} more characters]\n"
+
+
+def _shell_timeout_for(entry: dict) -> int:
+    """Per-entry `shell_timeout_s`; a non-positive or non-integer value falls back
+    to the default rather than disabling the bound."""
+    raw = entry.get("shell_timeout_s")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return SHELL_COMMAND_TIMEOUT_S
+    return raw if raw > 0 else SHELL_COMMAND_TIMEOUT_S
+
+
+def _kill_process_tree(process: "subprocess.Popen[str]") -> None:
+    """Signal the whole group: with shell=True the child is a shell, so killing
+    only its pid leaves the grandchildren that hold the pipes running."""
+    try:
+        pgid = os.getpgid(process.pid)
+    except OSError:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            return
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_TIMEOUT_S) -> int:
     """Run one mechanical cron command and persist all output.
 
     Shell jobs deliberately bypass the core heartbeat: their purpose is to
     perform work without waking a model session. The command is configuration
     owned by the user and runs from the repository root, matching the cwd a
     task-backed cron receives when the core executes it.
+
+    Bounded in time and output: the caller holds the shared state lock for the
+    whole tick, so an unbounded command would suppress every later job.
     """
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
-        completed = subprocess.run(
+        # start_new_session gives the shell its own process group, which is what
+        # makes killing the whole tree possible on timeout.
+        process = subprocess.Popen(
             command,
             shell=True,
             cwd=str(REPO_ROOT),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
+            start_new_session=True,
         )
-        returncode = completed.returncode
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_s)
+            returncode = process.returncode
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(process)
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            returncode = 124
+            stderr = (stderr or "") + (
+                f"cron-runner: {name} exceeded {timeout_s}s; process tree killed\n"
+            )
     except OSError as exc:
         returncode = 127
         stdout = ""
         stderr = f"{exc.__class__.__name__}: {exc}"
+    stdout = _bounded_output(stdout or "")
+    stderr = _bounded_output(stderr or "")
 
     log = (
         f"[{started}] shell_command job={name!r} exit_code={returncode}\n"
@@ -422,7 +483,8 @@ def run(now_epoch: Optional[int] = None) -> list:
                 # runnable while the model core is stopped, and never emit a
                 # task that would wake a full agent turn.
                 if shell_command is not None:
-                    _run_shell_command(name, shell_command)
+                    _run_shell_command(
+                        name, shell_command, _shell_timeout_for(entry))
                     emitted.append(name)
                 elif not core_alive:
                     # Preserve the previous boundary so a short outage can

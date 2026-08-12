@@ -599,5 +599,49 @@ def _run_all():
     print("ALL PASSED")
 
 
+def test_shell_command_timeout_kills_the_whole_process_tree():
+    """An unbounded command would stall the tick that holds the state lock, and
+    killing only the shell leaves grandchildren holding the pipes."""
+    import os
+    import tempfile
+    import time as _t
+    marker = Path(tempfile.mkdtemp()) / "grandchild.pid"
+    started = _t.monotonic()
+    rc = cr._run_shell_command(
+        "probe", f"sleep 120 & echo $! > {marker}; sleep 120", timeout_s=2)
+    elapsed = _t.monotonic() - started
+    check(rc == 124, "timeout returns 124")
+    check(elapsed < 20, "timeout is bounded")
+    _t.sleep(0.5)
+    gpid = int(marker.read_text().strip())
+    try:
+        os.kill(gpid, 0)
+        alive = True
+    except OSError:
+        alive = False
+    check(not alive, "grandchild is killed, not just the shell")
+
+
+def test_shell_command_output_is_bounded():
+    """A chatty command must not grow the log without limit."""
+    rc = cr._run_shell_command(
+        "chatty", "python3 -c \"print('x' * 200000)\"", timeout_s=60)
+    log = cr._shell_log_path().read_text()
+    check(rc == 0, "chatty command still succeeds")
+    check("[truncated" in log, "output is truncated with a notice")
+    check(len(log) < cr.SHELL_OUTPUT_LIMIT * 3, "log stays near the cap")
+
+
+def test_shell_timeout_override_rejects_unusable_values():
+    """A bad per-entry value must fall back to the default, never disable the bound."""
+    d = cr.SHELL_COMMAND_TIMEOUT_S
+    check(cr._shell_timeout_for({}) == d, "absent -> default")
+    check(cr._shell_timeout_for({"shell_timeout_s": 7}) == 7, "valid override honoured")
+    check(cr._shell_timeout_for({"shell_timeout_s": 0}) == d, "zero -> default")
+    check(cr._shell_timeout_for({"shell_timeout_s": -1}) == d, "negative -> default")
+    check(cr._shell_timeout_for({"shell_timeout_s": "60"}) == d, "string -> default")
+    check(cr._shell_timeout_for({"shell_timeout_s": True}) == d, "bool -> default")
+
+
 if __name__ == "__main__":
     _run_all()
