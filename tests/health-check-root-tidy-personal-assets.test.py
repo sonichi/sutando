@@ -126,10 +126,8 @@ if missing:
 else:
     ok("every root-resolved personal asset is exempt from the tidy probe")
 
-# --- the probe itself, driven end to end ------------------------------------
-# Driven from the DERIVED names, not from the exemption set: seeding the root
-# with the constant would make this pass vacuously on a tree that has no
-# constant (and therefore no exemption at all).
+# The probe end to end, seeded from the DERIVED names: seeding from the exemption
+# set would pass vacuously on a tree that has no constant, and so no exemption.
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td) / "workspace"
     (ws / "state").mkdir(parents=True)
