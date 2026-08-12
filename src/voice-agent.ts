@@ -38,7 +38,7 @@ import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { VoiceSession } from 'bodhi-realtime-agent';
+import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform !== 'darwin' && process.env.SUTANDO_TEST_MODE !== '1') {
@@ -64,11 +64,12 @@ import {
 import {
 	createAgentStateProvider,
 	createIsolatedIdleRestore,
+	publishCapabilitiesMarker,
 	publishLifecycleSnapshot,
 	type AgentStateV1,
 } from './voice-agent-state.js';
 
-import { sharedPersonalPath, claudeHomePath } from './util_paths.js';
+import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_paths.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -177,6 +178,7 @@ const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
  * (impl plan WS1 Steps 2/8). The EADDRINUSE fatal path exits 7 for the same
  * reason (see `classifyFatalExitCode`).
  */
+let voiceLockId: string | undefined;
 function acquirePidLock(): void {
 	const myPid = process.pid;
 	const guard = voiceLockGuardPath(WORKSPACE_DIR);
@@ -209,6 +211,9 @@ function acquirePidLock(): void {
 		console.error(`${ts()} [Startup] Fix the lock helper (scripts/voice-lock.py + its python3), then restart. Exiting.`);
 		process.exit(1);
 	}
+	// Capability-marker binding token: a stale marker can never match a later
+	// acquisition, even one that reuses this pid.
+	voiceLockId = res.lockId;
 	// Guarded release on clean exit — NON-BLOCKING fire-and-forget (amendment
 	// S4: a blocking release can deadlock against the helper that just TERM'd
 	// us). Skipped entirely on the fatal path (amendment R1): a stale
@@ -254,6 +259,12 @@ if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
 const VOICE_AGENT_CONFIG = loadVoiceConfig(VOICE_AGENT_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = VOICE_AGENT_CONFIG.model;
 const VOICE_GOOGLE_SEARCH = VOICE_AGENT_CONFIG.googleSearch;
+// Shadow STT (config "shadowStt": true — default OFF): re-runs the same
+// audio through a batch model and logs disagreement — observation-only.
+const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
+// "divergenceCorrection": true additionally speaks a self-correction when
+// the shadow pass disagrees. Requires shadowStt.
+const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
@@ -713,7 +724,7 @@ const mainAgent: MainAgent = {
 // ($CLAUDE_CONFIG_DIR/projects/-{slug}/memory). Failure-silent: a missing memory
 // dir should never block voice startup.
 function bootstrapMemoryDir(): void {
-	const slug = '-' + WORKSPACE_DIR.replace(/\/$/, '').split('/').filter(Boolean).join('-');
+	const slug = claudeProjectSlug(WORKSPACE_DIR.replace(/\/$/, ''));
 	const memDir = process.env.SUTANDO_MEMORY_DIR || claudeHomePath('projects', slug, 'memory');
 	try {
 		mkdirSync(memDir, { recursive: true });
@@ -869,7 +880,12 @@ async function main() {
 	// silently ignored, so the detect keeps the wiring intent explicit and
 	// lets the pin bump activate it without touching this file. Detection:
 	// the bundled VoiceSession source must mention the option.
+	// Test seam (SUTANDO_TEST_MODE only): forces the detect false so the suite
+	// can prove the marker gate's dormant branch against a spawned agent.
 	const bodhiSupportsProbeState = (() => {
+		if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_FORCE_NO_PROBE_STATE === '1') {
+			return false;
+		}
 		try { return String(VoiceSession).includes('probeState'); } catch { return false; }
 	})();
 
@@ -885,6 +901,18 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		...(VOICE_SHADOW_STT
+			? {
+					shadowSttProvider: new GeminiBatchSTTProvider({
+						apiKey: GEMINI_VOICE_API_KEY,
+						model: 'gemini-2.5-flash',
+					}),
+					divergenceCorrection: VOICE_DIVERGENCE_CORRECTION,
+					onTranscriptionDivergence: (live: string, shadow: string, turnId?: number) => {
+						console.log(`${ts()} [ShadowSTT] model heard ≠ said (turn ${turnId ?? '?'}): live="${live}" shadow="${shadow}"`);
+					},
+				}
+			: {}),
 		// Step 11/12: when the pinned bodhi supports `?probe=1` probe
 		// interception, hand it the agent.state builder — probes get one
 		// frame + close 1000 without ever touching `this.client`. The Z3
@@ -970,6 +998,18 @@ async function main() {
 	// =========================================================================
 	let lastEmittedUpstream: string | null = null;
 	let lastLifecycleKey = '';
+	// The marker must never advertise a capability the resolved bodhi lacks, and
+	// never publish unbound (no token → no marker): a marker on disk is always real and bound.
+	if (bodhiSupportsProbeState && typeof voiceLockId === 'string' && voiceLockId) {
+		publishCapabilitiesMarker(WORKSPACE_DIR, {
+			lockId: voiceLockId,
+			onError: (err) => console.error(`${ts()} [AgentState] capabilities marker write failed: ${(err as Error)?.message ?? err}`),
+		});
+	} else if (!bodhiSupportsProbeState) {
+		console.error(`${ts()} [AgentState] bodhi lacks probeState — capability marker NOT published (probes stay dormant)`);
+	} else {
+		console.error(`${ts()} [AgentState] no acquisition token from the lock helper — capability marker NOT published (probes stay dormant)`);
+	}
 	const sendAgentStateFrame = (frame: AgentStateV1): void => {
 		try {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any

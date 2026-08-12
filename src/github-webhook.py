@@ -187,7 +187,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 f"access_tier: other\n"
                 f"task: {safe_task}\n"
             )
-            TASKS_DIR.mkdir(exist_ok=True)
+            TASKS_DIR.mkdir(parents=True, exist_ok=True)
             (TASKS_DIR / f"{task_id}.txt").write_text(task_content)
             _emit_github_telemetry()
             print(f"[{time.strftime('%H:%M:%S')}] {event_type}/{payload.get('action', '')} → {task_id}")
