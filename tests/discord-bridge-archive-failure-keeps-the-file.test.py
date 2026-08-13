@@ -11,9 +11,14 @@ import unittest
 # Hermetic-bridge-test lint: explicit config root, access.json seeded under it.
 _CFG = tempfile.mkdtemp(prefix="archive-test-cfg-")
 os.environ["CLAUDE_CONFIG_DIR"] = _CFG
-_ACCESS = Path(_CFG) / "channels" / "discord" / "access.json"
-_ACCESS.parent.mkdir(parents=True, exist_ok=True)
-_ACCESS.write_text('{"allowFrom": []}')
+# Literal, not a loop: the guard reads AST constants, so a loop variable hides
+# the path from it. All three bridges are named below, so all three are seeded.
+(Path(_CFG) / "channels" / "discord").mkdir(parents=True, exist_ok=True)
+(Path(_CFG) / "channels" / "discord" / "access.json").write_text('{"allowFrom": []}')
+(Path(_CFG) / "channels" / "slack").mkdir(parents=True, exist_ok=True)
+(Path(_CFG) / "channels" / "slack" / "access.json").write_text('{"allowFrom": []}')
+(Path(_CFG) / "channels" / "telegram").mkdir(parents=True, exist_ok=True)
+(Path(_CFG) / "channels" / "telegram" / "access.json").write_text('{"allowFrom": []}')
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "discord-bridge.py"
 
