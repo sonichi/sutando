@@ -117,7 +117,7 @@ class TestLandedUnderSquash(unittest.TestCase):
         # reachability tracks landing in this repo.
         self.assertEqual(dev["landed_24h"], dev["commits_24h"] - 1, dev)
 
-    def test_a_sample_too_small_to_hold_a_merge_is_not_evidence(self):
+    def test_a_small_sample_is_measured_absence_not_a_failure_to_measure(self):
         """A young merge-commit repo also shows zero merges — that is not squashing."""
         mod = _load()
         with tempfile.TemporaryDirectory() as td:
@@ -129,10 +129,16 @@ class TestLandedUnderSquash(unittest.TestCase):
 
 
 class TestDiscriminatorFailsSafe(unittest.TestCase):
-    """The three defensive returns in `_rewrites_shas_on_merge`.
+    """The defensive returns in `_rewrites_shas_on_merge` must yield UNKNOWN.
 
-    Each says "I could not measure", and the caller treats that as "do not
-    suppress" — a git hiccup must not destroy a count that was computable."""
+    Reversed from "return False / keep the count" after review. The argument:
+    this module exists because 0 is not a valid measurement when reachability
+    cannot distinguish merged from unmerged. A probe that FAILED is in exactly
+    that state, so returning False recreates the same conflation one level down
+    — "git errored" would become indistinguishable from "measured, no squashing",
+    and the caller would present a count as fact. A broken probe must never fail
+    toward a confident value; `assertFalse` could not catch this, since None is
+    falsy too."""
 
     def setUp(self):
         self.mod = _load()
@@ -146,30 +152,30 @@ class TestDiscriminatorFailsSafe(unittest.TestCase):
         def raiser(*a, **k):
             raise OSError("git missing")
         self._with_run(raiser)
-        self.assertFalse(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
+        self.assertIsNone(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
 
     def test_subprocess_error_is_not_read_as_squash(self):
         def raiser(*a, **k):
             raise subprocess.SubprocessError("boom")
         self._with_run(raiser)
-        self.assertFalse(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
+        self.assertIsNone(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
 
     def test_nonzero_git_is_not_read_as_squash(self):
         class R:
             returncode = 128
             stdout = ""
         self._with_run(lambda *a, **k: R())
-        self.assertFalse(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
+        self.assertIsNone(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
 
     def test_unparsable_count_is_not_read_as_squash(self):
         class R:
             returncode = 0
             stdout = "not-a-number"
         self._with_run(lambda *a, **k: R())
-        self.assertFalse(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
+        self.assertIsNone(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
 
-    def test_a_failure_leaves_the_count_intact_rather_than_suppressing_it(self):
-        """End-to-end: the caller keeps its measurement when the probe cannot run."""
+    def test_a_probe_failure_yields_unknown_not_a_confident_count(self):
+        """End-to-end: a probe that cannot run must not license stating a count."""
         real = self.mod.subprocess.run
 
         def only_the_probe_fails(cmd, *a, **k):
@@ -179,8 +185,9 @@ class TestDiscriminatorFailsSafe(unittest.TestCase):
         self._with_run(only_the_probe_fails)
         with tempfile.TemporaryDirectory() as td:
             dev = self.mod.analyze_dev_activity(repo_root=_all_work_on_a_branch(td))
-        self.assertEqual(dev["landed_24h"], 0,
-                         "probe failure must not suppress an otherwise-valid count")
+        self.assertIsNone(dev["landed_24h"],
+                          "git errored, so whether reachability tracks landing here is "
+                          "unknown; 0 would assert 'none landed' on no evidence")
 
 
 if __name__ == "__main__":

@@ -472,9 +472,10 @@ def _landed_subset_count(repo_root, shas):
     if out.returncode != 0:
         return None
     unlanded = {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
-    if unlanded and _rewrites_shas_on_merge(repo_root, ref):
+    if unlanded and _rewrites_shas_on_merge(repo_root, ref) is not False:
         # Squash/rebase merging rewrites the SHA, so a landed commit is unreachable
-        # by its local SHA — "not on the branch" and "merged" are indistinguishable.
+        # by its local SHA. None means the probe could not answer, which is the same
+        # not-knowing — a failed probe must not let the caller state a count as fact.
         return None
     return sum(1 for s in shas if s not in unlanded)
 
@@ -482,9 +483,9 @@ def _landed_subset_count(repo_root, shas):
 def _rewrites_shas_on_merge(repo_root, ref, sample=200, floor=20):
     """True when `ref` shows squash/rebase merging, so a landed commit keeps no SHA.
 
-    Zero merges only means that if the sample was big enough to have held one:
-    a young merge-commit repo also shows zero. Under `floor` commits, say False
-    (unknown) rather than read an unfalsifiable sample as evidence."""
+    Three states, and the difference matters: True (measured, rewrites SHAs),
+    False (measured, does not — or the sample was too small to hold a merge, so
+    there is no evidence to act on), None (could not measure at all)."""
     def count(*extra):
         try:
             out = subprocess.run(
@@ -501,9 +502,15 @@ def _rewrites_shas_on_merge(repo_root, ref, sample=200, floor=20):
         except ValueError:
             return None
     total = count()
-    if total is None or total < floor:
+    if total is None:
+        return None
+    # Measured, just not enough of it: a young merge-commit repo also shows zero
+    # merges, so this is absence of evidence, not a failure to look.
+    if total < floor:
         return False
     merges = count("--merges")
+    if merges is None:
+        return None
     return merges == 0
 def dev_activity_insight(dev):
     """Render the dev-activity dict into one headline sentence, or None."""
