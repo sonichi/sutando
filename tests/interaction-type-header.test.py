@@ -36,7 +36,12 @@ PRODUCERS = {
 # string/heredoc/Swift multiline string. Matches `source: slack\n`,
 # "`source: chat`," and a bare `source: chat` template line.
 def write_sites(text: str, value: str):
-    pat = re.compile(rf"^.*\bsource: {re.escape(value)}(\\n|`|\n|$)", re.MULTILINE)
+    # Two write shapes: serialized header lines in string literals, and the
+    # centralized write_task_file tuple form ("source", "<value>").
+    pat = re.compile(
+        rf"^.*\bsource: {re.escape(value)}(\\n|`|\n|$)"
+        rf"|^.*\(\s*[\"']source[\"']\s*,\s*[\"']{re.escape(value)}[\"']\s*\)",
+        re.MULTILINE)
     return [text[: m.start()].count("\n") for m in pat.finditer(text)]
 
 
@@ -59,7 +64,7 @@ for rel, values in PRODUCERS.items():
         for ln in sites:
             window = "\n".join(lines[max(0, ln - 6): ln + 7])
             checked += 1
-            if "interaction_type:" not in window:
+            if "interaction_type:" not in window and '"interaction_type"' not in window:
                 failures.append(
                     f"{rel}:{ln + 1}: `source: {value}` write site has no "
                     f"interaction_type: header within 6 lines")
