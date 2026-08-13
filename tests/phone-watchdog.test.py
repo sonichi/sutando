@@ -190,5 +190,30 @@ except Exception as e:
     fail("plist parse", str(e))
 
 
+# ── Test 6: the opt-in is discoverable from README, both directions ───────────
+# Auto-remediation that restarts processes must be findable and removable by an
+# operator who has never read this PR; an installer nothing documents is unowned.
+def _readme_documents(readme, needle):
+    return any(needle in line for line in readme.splitlines())
+
+
+try:
+    with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+        _readme = f.read()
+    _install = "bash src/install-phone-watchdog-launchd.sh"
+    _uninstall = "bash src/install-phone-watchdog-launchd.sh --uninstall"
+    _missing = [
+        label
+        for label, needle in (("install", _install), ("uninstall", _uninstall))
+        if not _readme_documents(_readme, needle)
+    ]
+    if _missing:
+        fail("README documents the watchdog opt-in", f"missing: {', '.join(_missing)}")
+    else:
+        ok("README documents the watchdog install and uninstall commands")
+except Exception as e:
+    fail("README adoption-path read", str(e))
+
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
