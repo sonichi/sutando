@@ -226,6 +226,51 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertIn(head[:9], r["detail"])
         self.assertIn("dist/", r["detail"])
 
+    def test_normalisation_failure_falls_back_to_the_literal(self) -> None:
+        """`rev-parse` unrunnable must not break the comparison it feeds."""
+        self._write_manifest(sha=self.first)
+        real_run = hc.subprocess.run
+
+        def _boom_on_revparse_of_manifest(argv, *a, **kw):
+            # Let `rev-parse HEAD` through; only the normalisation call fails.
+            if "rev-parse" in argv and "HEAD" not in argv:
+                raise OSError("rev-parse unavailable")
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _boom_on_revparse_of_manifest
+        try:
+            r = self._run()
+        finally:
+            hc.subprocess.run = real_run
+        # Full sha still matches by literal comparison.
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("matches built revision", r["detail"])
+
+    def test_zero_ahead_is_the_same_commit_even_without_normalisation(self) -> None:
+        """The belt, exercised on its own.
+
+        Normalisation makes this branch unreachable in practice, which is
+        exactly why it needs a test: an unreachable guard nobody ran is a guess
+        about behaviour. Force the abbreviated value past normalisation and
+        assert the ancestor-count path still refuses to contradict itself.
+        """
+        self._write_manifest(sha=self.first[:12])
+        real_run = hc.subprocess.run
+
+        def _revparse_of_manifest_fails(argv, *a, **kw):
+            if "rev-parse" in argv and "HEAD" not in argv:
+                raise OSError("normalisation disabled for this case")
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _revparse_of_manifest_fails
+        try:
+            r = self._run()
+        finally:
+            hc.subprocess.run = real_run
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("!=", r["detail"])
+        self.assertNotIn("0 commits ahead", r["detail"])
+
     # --- wiring ----------------------------------------------------------
 
     def test_probe_is_registered(self) -> None:
