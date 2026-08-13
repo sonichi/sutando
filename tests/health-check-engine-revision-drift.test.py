@@ -72,10 +72,10 @@ class EngineRevisionDriftTest(unittest.TestCase):
         return hc.check_engine_revision_drift(
             repo_dir=self.repo, manifest_path=self.manifest)
 
-    # --- the case that matters ------------------------------------------
+    # --- drift ------------------------------------------------------------
 
     def test_warns_when_source_moved_past_the_built_revision(self) -> None:
-        """The live failure: source ahead of the artifacts, silently."""
+        """Source ahead of the artifacts, with nothing reporting it."""
         self._write_manifest(sha=self.first)
         head = self._advance(3)
 
@@ -88,7 +88,7 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertIn("dist/", r["detail"])
 
     def test_ok_when_source_is_exactly_the_built_revision(self) -> None:
-        """Control: the same probe must go quiet, or the warn proves nothing."""
+        """Control: the probe must go quiet, or the warn proves nothing."""
         self._write_manifest(sha=self.first)
         r = self._run()
         self.assertEqual(r["status"], "ok", r)
@@ -103,15 +103,7 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertIn("diverged", r["detail"])
 
     def test_abbreviated_sha_of_the_same_commit_is_not_drift(self) -> None:
-        """A probe that prints "X != X (0 commits ahead)" discredits itself.
-
-        The abbreviation satisfies `cat-file -e` and `merge-base --is-ancestor`,
-        so before the fix it reached the ahead-branch with a count of zero
-        instead of being recognised as the same commit. Reported by john-the-dev
-        on #2864 with this repro; it cannot fire against today's manifest
-        producer (it writes a full 40-char sha) but the failure mode is a
-        self-contradiction, so it is closed rather than left latent.
-        """
+        """An abbreviated sha of HEAD must not read as drift."""
         for width in (7, 12, 40):
             with self.subTest(width=width):
                 self._write_manifest(sha=self.first[:width])
@@ -128,7 +120,7 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertNotIn("!=", r["detail"])
 
-    # --- degrade cleanly where the question does not apply ---------------
+    # --- not applicable ---------------------------------------------------
 
     def test_ok_when_no_manifest(self) -> None:
         r = self._run()
@@ -155,11 +147,7 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("skipping", r["detail"])
 
-    # --- the defensive branches -----------------------------------------
-    #
-    # Written deliberately, so tested deliberately. An untested `except` is a
-    # guess about what the failure looks like, and the whole contract of this
-    # probe is that it degrades instead of taking the health run down with it.
+    # --- the degrade branches -------------------------------------------
 
     def test_ok_when_git_resolver_reports_no_runnable_git(self) -> None:
         self._write_manifest(sha=self.first)
@@ -171,10 +159,10 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("no runnable git", r["detail"])
 
-    def test_falls_back_to_plain_git_when_resolver_is_absent(self) -> None:
-        """Composes on a tree where `git_binary` does not exist yet."""
+    def test_resolver_failure_degrades_like_no_git(self) -> None:
+        # A resolver failure must not fall back to bare `git` (Xcode-CLT stub).
         self._write_manifest(sha=self.first)
-        head = self._advance(2)
+        self._advance(2)
         real_import = builtins.__import__
 
         def _no_resolver(name, *a, **kw):
@@ -184,10 +172,8 @@ class EngineRevisionDriftTest(unittest.TestCase):
 
         with mock.patch.object(builtins, "__import__", _no_resolver):
             r = self._run()
-        # Still answers, via a bare `git`.
-        self.assertEqual(r["status"], "warn", r)
-        self.assertIn("2 commits ahead", r["detail"])
-        self.assertIn(head[:9], r["detail"])
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("no runnable git", r["detail"])
 
     def test_ok_when_git_cannot_be_executed(self) -> None:
         self._write_manifest(sha=self.first)
@@ -206,7 +192,7 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertIn("git not runnable", r["detail"])
 
     def test_drift_still_reported_when_the_ahead_count_cannot_be_taken(self) -> None:
-        """The count is a nicety; the drift is the finding and must survive."""
+        """The count is a nicety; the drift must still be reported."""
         self._write_manifest(sha=self.first)
         head = self._advance(2)
         real_run = hc.subprocess.run
@@ -247,13 +233,7 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertIn("matches built revision", r["detail"])
 
     def test_zero_ahead_is_the_same_commit_even_without_normalisation(self) -> None:
-        """The belt, exercised on its own.
-
-        Normalisation makes this branch unreachable in practice, which is
-        exactly why it needs a test: an unreachable guard nobody ran is a guess
-        about behaviour. Force the abbreviated value past normalisation and
-        assert the ancestor-count path still refuses to contradict itself.
-        """
+        """Zero-ahead path, forced past normalisation so the guard is exercised."""
         self._write_manifest(sha=self.first[:12])
         real_run = hc.subprocess.run
 
@@ -274,7 +254,7 @@ class EngineRevisionDriftTest(unittest.TestCase):
     # --- wiring ----------------------------------------------------------
 
     def test_probe_is_registered(self) -> None:
-        """An unregistered probe reports nothing and looks identical to green."""
+        """An unregistered probe is indistinguishable from green."""
         src = (REPO / "src" / "health-check.py").read_text()
         self.assertIn("checks.append(check_engine_revision_drift())", src)
 

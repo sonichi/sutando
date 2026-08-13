@@ -2715,27 +2715,9 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
                                 manifest_path: "Path | None" = None) -> dict:
     """Warn when the checked-out source has moved off the BUILT engine revision.
 
-    Sibling of :func:`check_live_checkout_branch`: that one asks "am I on the
-    right branch", this one asks "is the source I am reading the source I am
-    running". They are different questions and only the second catches a mixed
-    engine — right branch, stale artifacts.
-
-    A bundled install ships ``engine/ENGINE_MANIFEST.json`` (``sha`` = the commit
-    the artifacts were built from) beside the ``engine/sutando`` checkout. The
-    compiled half lives in ``dist/``, which is **gitignored**, so a checkout can
-    never bring it along: moving the source forward silently leaves Node running
-    the older build while Python runs the newer source. Nothing else reports it.
-
-    Measured on a live install 2026-08-12: manifest ``3afc80c3`` (built 08-11),
-    checkout HEAD 27 commits ahead (newest source 08-12). The agent had spent a
-    session reading and editing source it was not running, and no probe existed
-    that could have said so — which is exactly why this one is structural rather
-    than a note telling someone to remember.
-
-    Read-only, and warn rather than fail: a developer who deliberately moved the
-    checkout forward should be told, not paged. Degrades to ok wherever the
-    question does not apply (plain dev clone with no manifest, unreadable
-    manifest, no runnable git) — a probe that cannot answer must not invent one.
+    `dist/` is gitignored, so a checkout cannot bring the compiled half with it:
+    the source can advance while the Node artifacts stay on the older build.
+    Warn, never fail; degrade to ok wherever the question does not apply.
     """
     name = "engine-revision-drift"
     repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
@@ -2755,13 +2737,16 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
                 "detail": "ENGINE_MANIFEST.json has no sha — skipping"}
     built = built.strip()
 
+    # A resolver failure must degrade like resolve_git() -> None, never to bare
+    # `git`: on a clean Mac that resolves the Xcode-CLT stub and this probe runs
+    # on every background health pass (REVIEW.md lesson 7).
     try:
         from git_binary import resolve_git  # noqa: PLC0415
         git_bin = resolve_git()
     except Exception:
-        git_bin = "git"
+        git_bin = None
     if git_bin is None:
-        return {"name": name, "status": "ok", "detail": "no runnable git (resolver) — skipping"}
+        return {"name": name, "status": "ok", "detail": "no runnable git — skipping"}
 
     def _git(*args):
         return subprocess.run([git_bin, "-C", str(repo), *args],
@@ -2774,12 +2759,8 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
     if head.returncode != 0:
         return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
     head_sha = head.stdout.strip()
-    # Resolve the manifest value to a full sha before comparing. A raw string
-    # compare calls an ABBREVIATED sha of the very commit that is checked out a
-    # mismatch, and the abbreviation still satisfies the ancestor test below, so
-    # it lands in the ahead-branch and prints "X != X (0 commits ahead)" — a
-    # probe contradicting itself, which costs more than a missed detection.
-    # Resolving also accepts a tag or any other ref-ish value.
+    # Normalise first: an abbreviated sha (or a tag) of the checked-out commit
+    # would otherwise compare unequal and print "X != X (0 commits ahead)".
     try:
         resolved = _git("rev-parse", f"{built}^{{commit}}")
         if resolved.returncode == 0 and resolved.stdout.strip():
@@ -2790,16 +2771,13 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
         return {"name": name, "status": "ok",
                 "detail": f"source matches built revision {built[:9]}"}
 
-    # Differs. Say HOW it differs when the shallow clone can answer; the drift
-    # itself is already established, so an unanswerable count must not soften it.
+    # An unanswerable count must not soften the drift, which is already established.
     detail = f"source HEAD {head_sha[:9]} != built revision {built[:9]}"
     try:
         if _git("cat-file", "-e", built).returncode == 0 and \
            _git("merge-base", "--is-ancestor", built, "HEAD").returncode == 0:
             ahead = _git("rev-list", "--count", f"{built}..HEAD").stdout.strip()
-            # Zero commits ahead of an ancestor means it IS this commit under
-            # another name. Belt to the normalisation's braces: whatever route
-            # got here, the self-contradicting warn is now unreachable.
+            # Zero ahead of an ancestor means it IS this commit under another name.
             if ahead == "0":
                 return {"name": name, "status": "ok",
                         "detail": f"source matches built revision {built[:9]}"}
