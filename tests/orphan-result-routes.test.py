@@ -264,25 +264,24 @@ class WiringTest(unittest.TestCase):
                       "poll_results never calls it, so nothing adopts an orphan route")
 
     def test_delivery_cleanup_archives_a_CLAIMED_task_not_a_rebuilt_bare_name(self):
-        # The resolver deliberately finds `<id>.claimed-core-N`, so the cleanup
-        # that follows delivery must resolve the same path or strand it forever.
-        # Anchored on the comment block: a SIBLING site also ends in
-        # _clear_delivered and already used this idiom, so a looser anchor
-        # matches that one and passes at the parent, proving nothing.
-        m = re.search(r"task_file = ([^\n]*)\n"
-                      r"\s*archive_file\(task_file, \"tasks\", task_id\)\n"
-                      r"(?:\s*#[^\n]*\n)+"
-                      r"\s*_clear_delivered\(task_id\)", self.src)
-        self.assertIsNotNone(
-            m, "the post-delivery cleanup rebuilds a bare task path; a claimed task strands")
+        # EVERY archive-then-clear site must resolve the claimed path, not just the
+        # first: anchoring on one lets a sibling site satisfy the match vacuously.
+        sites = re.findall(r"task_file = ([^\n]*)\n"
+                           r"\s*archive_file\(task_file, \"tasks\", task_id\)\n"
+                           r"(?:\s*(?:#[^\n]*|if [A-Za-z_]\w*:)\n)+"
+                           r"\s*_clear_delivered\(task_id\)", self.src)
+        self.assertGreaterEqual(
+            len(sites), 2,
+            "expected both post-delivery cleanup sites; a dropped one is an unchecked bare-name rebuild")
         with tempfile.TemporaryDirectory() as td:
             tasks = Path(td)
             claimed = tasks / "task-99.claimed-core-1.txt"
             claimed.write_text("body")
             ns = {"find_task_file": _task_archive.find_task_file,
                   "TASKS_DIR": tasks, "task_id": "task-99"}
-            self.assertEqual(eval(m.group(1), ns), claimed,
-                             "cleanup resolves the bare name, not the claimed file")
+            for expr in sites:
+                self.assertEqual(eval(expr, ns), claimed,
+                                 f"cleanup resolves the bare name, not the claimed file: {expr}")
 
     def test_the_bridge_injects_a_snowflake_validator(self):
         m = re.search(r"def _is_discord_channel_id\(value: str\) -> bool:.*?return ([^\n]+)",
