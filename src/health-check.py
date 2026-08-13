@@ -2570,12 +2570,18 @@ def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
     """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
 
-    Uses the LAST-FETCHED remote ref — deliberately does not fetch. A health
-    probe must stay fast and work offline, and a network call here would make
-    the whole run hang on a flaky link. The consequence is honest and stated in
-    the warning text: if the local ref is itself stale the count UNDERSTATES the
-    drift, so this can only under-report, never cry wolf.
+    Never fetches. Without a merge-base the count is not a distance, so returns None.
     """
+    try:
+        base = subprocess.run(
+            [git_bin, "-C", str(repo), "merge-base", "HEAD", f"origin/{branch}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if base.returncode != 0:
+        # No shared history: a count here would be a number without a meaning.
+        return None
     try:
         out = subprocess.run(
             [git_bin, "-C", str(repo), "rev-list", "--count", f"HEAD..origin/{branch}"],
@@ -2717,16 +2723,31 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # disagreed invisibly, and that is true of any content difference.
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     if stale_skills:
+        # No shared history: the tree diff is still valid, but no count and no
+        # fast-forward are, so say that rather than render "None commit(s)".
+        if behind is None:
+            distance = (f"live checkout is on {expected!r} an unknown distance behind "
+                        f"origin/{expected} (no common ancestor — shallow clone, so a commit "
+                        "count is not available)")
+            # "of them" needs a total to refer to.
+            share = f"{len(stale_skills)} commit(s) change"
+            refresh = (f"`git -C {repo} fetch --unshallow` first; `pull --ff-only` cannot "
+                       "apply without a shared history")
+        else:
+            distance = (f"live checkout is on {expected!r} and only {behind} commit(s) behind "
+                        f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
+                        "nag threshold")
+            # The count above is the TOTAL, so "of them" keeps the subset a subset.
+            share = f"{len(stale_skills)} of them change"
+            refresh = f"`git -C {repo} pull --ff-only`"
         return {"name": name, "status": "warn",
-                "detail": f"live checkout is on {expected!r} and only {behind} commit(s) behind "
-                          f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
-                          f"nag threshold — but {len(stale_skills)} of them change `skills/`, "
+                "detail": f"{distance} — but {share} `skills/`, "
                           "which the agent re-reads from this checkout on EVERY invocation. "
                           "Those merged skill fixes are not in effect here, and no "
                           "restart-staleness probe can see it: a skill has no running process "
                           f"to compare against. ({'; '.join(stale_skills[:3])}"
                           f"{'; …' if len(stale_skills) > 3 else ''}) Refresh with "
-                          f"`git -C {repo} pull --ff-only`. Measured against the last-fetched "
+                          f"{refresh}. Measured against the last-fetched "
                           "ref; this probe does not fetch, so it can only under-report."}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
