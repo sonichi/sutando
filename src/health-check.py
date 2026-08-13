@@ -2711,6 +2711,92 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                       + (f", {behind} commits behind" if behind else "")}
 
 
+def check_engine_revision_drift(repo_dir: "Path | None" = None,
+                                manifest_path: "Path | None" = None) -> dict:
+    """Warn when the checked-out source has moved off the BUILT engine revision.
+
+    Sibling of :func:`check_live_checkout_branch`: that one asks "am I on the
+    right branch", this one asks "is the source I am reading the source I am
+    running". They are different questions and only the second catches a mixed
+    engine — right branch, stale artifacts.
+
+    A bundled install ships ``engine/ENGINE_MANIFEST.json`` (``sha`` = the commit
+    the artifacts were built from) beside the ``engine/sutando`` checkout. The
+    compiled half lives in ``dist/``, which is **gitignored**, so a checkout can
+    never bring it along: moving the source forward silently leaves Node running
+    the older build while Python runs the newer source. Nothing else reports it.
+
+    Measured on a live install 2026-08-12: manifest ``3afc80c3`` (built 08-11),
+    checkout HEAD 27 commits ahead (newest source 08-12). The agent had spent a
+    session reading and editing source it was not running, and no probe existed
+    that could have said so — which is exactly why this one is structural rather
+    than a note telling someone to remember.
+
+    Read-only, and warn rather than fail: a developer who deliberately moved the
+    checkout forward should be told, not paged. Degrades to ok wherever the
+    question does not apply (plain dev clone with no manifest, unreadable
+    manifest, no runnable git) — a probe that cannot answer must not invent one.
+    """
+    name = "engine-revision-drift"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    manifest = Path(manifest_path) if manifest_path is not None else repo.parent / "ENGINE_MANIFEST.json"
+
+    if not manifest.is_file():
+        # A plain source clone has no bundle manifest — nothing to compare.
+        return {"name": name, "status": "ok",
+                "detail": "no ENGINE_MANIFEST.json — not a bundled engine, skipping"}
+    try:
+        built = (json.loads(manifest.read_text()) or {}).get("sha")
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "ok",
+                "detail": f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]}) — skipping"}
+    if not isinstance(built, str) or not built.strip():
+        return {"name": name, "status": "ok",
+                "detail": "ENGINE_MANIFEST.json has no sha — skipping"}
+    built = built.strip()
+
+    try:
+        from git_binary import resolve_git  # noqa: PLC0415
+        git_bin = resolve_git()
+    except Exception:
+        git_bin = "git"
+    if git_bin is None:
+        return {"name": name, "status": "ok", "detail": "no runnable git (resolver) — skipping"}
+
+    def _git(*args):
+        return subprocess.run([git_bin, "-C", str(repo), *args],
+                              capture_output=True, text=True, timeout=10)
+
+    try:
+        head = _git("rev-parse", "HEAD")
+    except (OSError, subprocess.TimeoutExpired):
+        return {"name": name, "status": "ok", "detail": "git not runnable — skipping"}
+    if head.returncode != 0:
+        return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
+    head_sha = head.stdout.strip()
+    if head_sha == built:
+        return {"name": name, "status": "ok",
+                "detail": f"source matches built revision {built[:9]}"}
+
+    # Differs. Say HOW it differs when the shallow clone can answer; the drift
+    # itself is already established, so an unanswerable count must not soften it.
+    detail = f"source HEAD {head_sha[:9]} != built revision {built[:9]}"
+    try:
+        if _git("cat-file", "-e", built).returncode == 0 and \
+           _git("merge-base", "--is-ancestor", built, "HEAD").returncode == 0:
+            ahead = _git("rev-list", "--count", f"{built}..HEAD").stdout.strip()
+            if ahead:
+                detail += f" ({ahead} commits ahead)"
+        else:
+            detail += " (diverged, or the built commit is outside this shallow clone)"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"name": name, "status": "warn",
+            "detail": detail + " — dist/ is gitignored so it did NOT follow the source; "
+                               "the Node half still runs the older build. Rebuild and "
+                               "reactivate the engine rather than trusting the checkout."}
+
+
 def check_migrate_reader_contract() -> dict:
     """Verify migration CLASS_RULES are compatible with reader resolution chains (issue #1543).
 
@@ -7241,6 +7327,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
+    checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
