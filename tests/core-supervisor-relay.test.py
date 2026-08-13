@@ -557,6 +557,32 @@ class TestBackendRecordContract(unittest.TestCase):
             be, "read under the process hostname instead of the host-label contract")
         self.assertEqual(be["socket"], "/tmp/sutando-tmux.sock")
 
+    def test_label_falls_back_to_platform_node_when_util_paths_is_unimportable(self):
+        """Drives the fallback rather than asserting it exists: util_paths is
+        replaced by a module with no _host_label, so the import itself raises."""
+        import platform as _pl
+        import sys
+        import types
+        os.environ["SUTANDO_HOST_LABEL"] = "Label-Not-The-Hostname"
+        prev = sys.modules.get("util_paths")
+        sys.modules["util_paths"] = types.ModuleType("util_paths")
+        try:
+            got = _mod._core_host_label()
+        finally:
+            if prev is None:
+                sys.modules.pop("util_paths", None)
+            else:
+                sys.modules["util_paths"] = prev
+        self.assertEqual(got, _pl.node().split(".")[0])
+
+    def test_control_the_two_label_branches_return_different_values(self):
+        """Without this the fallback test passes for the wrong reason: if the
+        working path also returned platform.node(), both branches look alike."""
+        import platform as _pl
+        os.environ["SUTANDO_HOST_LABEL"] = "Label-Not-The-Hostname"
+        self.assertEqual(_mod._core_host_label(), "Label-Not-The-Hostname")
+        self.assertNotEqual("Label-Not-The-Hostname", _pl.node().split(".")[0])
+
     def test_a_stale_record_is_not_a_target(self):
         """Written under BOTH labels on purpose: with only one, a reader that used
         the wrong label would return None and pass this for the wrong reason."""
