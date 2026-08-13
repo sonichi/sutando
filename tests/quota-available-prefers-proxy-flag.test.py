@@ -1,46 +1,47 @@
 #!/usr/bin/env python3
 """`read-quota.py` must not contradict the proxy's own `available` flag.
-
-Covers the extracted predicate AND the production call site, with a control
-that reverts the call site so these cannot stay green against the defect.
-
-Run: python3 tests/quota-available-prefers-proxy-flag.test.py
-"""
+Covers the predicate in-process plus the production call site and its --gate exit."""
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "quota-tracker" / "scripts" / "read-quota.py"
 
 
+_STATE = Path(tempfile.mkdtemp(prefix="quota-available-")) / "state"
+_MODULE = None
+
+
 def _load():
-    """Import is impossible: module scope sys.exit(1)s when quota-state is absent.
-    Extract from real source so a rename fails loudly instead of passing."""
-    src = SCRIPT.read_text()
-    marker = "def resolve_available("
-    if marker not in src:
+    """Unstubbed import is impossible: module scope sys.exit(1)s without quota-state.
+    Stub the resolver in sys.modules so the REAL module imports in-process."""
+    _STATE.mkdir(parents=True, exist_ok=True)
+    (_STATE / "quota-state.json").write_text(json.dumps(
+        {"available": True,
+         "headers": {"anthropic-ratelimit-unified-status": "allowed_warning"}}))
+    stub = types.ModuleType("workspace_default")
+    stub.status_read_path = lambda name: _STATE / name
+    sys.modules["workspace_default"] = stub
+    spec = importlib.util.spec_from_file_location("read_quota_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "resolve_available"):
         raise AssertionError(
             "read-quota.py no longer defines resolve_available() — the "
             "implementation moved. Update this test to match the new shape "
             "rather than leaving it green against code that is gone."
         )
-    start = src.index(marker)
-    rest = src[start:]
-    # The function ends at the next top-level `def `/`if `/`class ` line.
-    end = len(rest)
-    for i, line in enumerate(rest.split("\n")):
-        if i and line and not line[0].isspace():
-            end = sum(len(l) + 1 for l in rest.split("\n")[:i])
-            break
-    ns: dict = {}
-    exec(rest[:end], ns)  # noqa: S102 - the extracted production function
-    return ns["resolve_available"]
-
+    global _MODULE
+    _MODULE = module
+    return module.resolve_available
 
 resolve_available = _load()
 
@@ -126,6 +127,21 @@ def _run_real_script(tmp, *args, mutate=None):
         [sys.executable, str(scripts / "read-quota.py"), *args],
         capture_output=True, text=True,
     )
+
+
+def test_main_gate_exits_zero_in_process():
+    """In-process so the call site itself is measured; the subprocess variants below
+    prove the same contract but run a copy the coverage gate cannot attribute."""
+    argv = sys.argv
+    sys.argv = ["read-quota.py", "--gate"]
+    try:
+        _MODULE.main()
+    except SystemExit as exc:
+        assert exc.code == 0, f"--gate exited {exc.code} on allowed_warning + available:true"
+    else:
+        raise AssertionError("--gate returned without calling sys.exit")
+    finally:
+        sys.argv = argv
 
 
 def test_gate_exits_zero_through_the_real_call_site():
