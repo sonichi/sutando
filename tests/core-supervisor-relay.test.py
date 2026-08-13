@@ -521,7 +521,8 @@ class TestBackendRecordContract(unittest.TestCase):
     def _workspace(self):
         """Inject the workspace the helper imports, so the real resolver is not
         consulted and the test cannot silently read the live workspace."""
-        import sys, types
+        import sys
+        import types
         stub = types.ModuleType("workspace_default")
         stub.resolve_workspace = lambda: self.ws
         prev = sys.modules.get("workspace_default")
