@@ -376,6 +376,44 @@ def _parse_onboarding_token(raw):
 CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
 
 
+def _channel_env_candidates():
+    """Readable channel-.env candidates in precedence order, as [(path, vals)].
+    A candidate lacking a key must not shadow a later one that carries it."""
+    candidates = [os.environ.get("AG2_DEVICE_ENV")]
+    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _cfg:
+        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
+    out = []
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        # Every candidate is read eagerly now, so one the old early-return never
+        # opened can be undecodable — and that is not an OSError.
+        except (OSError, UnicodeDecodeError):
+            continue
+        vals = {}
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            key, _, val = ln.partition("=")
+            vals[key.strip()] = val.strip().strip('"').strip("'")
+        out.append((path, vals))
+    return out
+
+
+def _config_from_channel_env(key: str) -> str:
+    """First candidate CARRYING `key`, else "". Presence decides, not truth: an
+    explicit blank is a decision here exactly as it is in the environment."""
+    for _path, vals in _channel_env_candidates():
+        if key in vals:
+            return vals[key]
+    return ""
+
+
 def _token_from_ag2space_env():
     """Fallback token source when the launcher didn't export it into the env.
 
@@ -406,26 +444,9 @@ def _token_from_ag2space_env():
     WRONG identity (reinstall, account switch, leftover config). Both real launchers
     are covered above; the bare-home guess only adds a footgun.
     """
-    candidates = [os.environ.get("AG2_DEVICE_ENV")]
-    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
-    if _cfg:
-        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
-    for path in candidates:
-        if not path:
-            continue
-        try:
-            with open(path, encoding="utf-8") as fh:
-                lines = fh.read().splitlines()
-        except OSError:
-            continue
-        vals = {}
-        for ln in lines:
-            ln = ln.strip()
-            if not ln or ln.startswith("#") or "=" not in ln:
-                continue
-            key, _, val = ln.partition("=")
-            vals[key.strip()] = val.strip().strip('"').strip("'")
-        # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
+    for path, vals in _channel_env_candidates():
+        # Truthiness here, presence in _config_from_channel_env: a blank secret is
+        # absence and must fall through to the legacy alias; a blank room is a choice.
         tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
         if tok:
             # Name the exact file — which .env supplied the token is load-bearing
@@ -574,7 +595,14 @@ POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 # Deliberately an EXPLICIT room id, not auto-learned from recent task
 # channel_ids: a proactive nudge is often owner-private, and auto-targeting
 # the last active room could deliver it to a shared room.
-PROACTIVE_ROOM = os.environ.get("REMOTE_PROACTIVE_ROOM") or ""
+# An explicit empty export is a decision (startup.sh blanks it per named
+# instance); only an ABSENT var falls through to this deployment's .env.
+_PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
+PROACTIVE_ROOM = (
+    _PROACTIVE_ROOM_ENV
+    if _PROACTIVE_ROOM_ENV is not None
+    else _config_from_channel_env("REMOTE_PROACTIVE_ROOM")
+)
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 # rotation (_reload_rotated_token) propagates to their next request without a
