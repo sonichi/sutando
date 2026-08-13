@@ -16,7 +16,7 @@
  * realtime_input.video slot accepts single-frame images.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { readCaptureToken } from './util_paths.js';
@@ -35,12 +35,58 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 const DEFAULT_FPS = 1;
 const MAX_FPS = 2;
 const MIN_INTERVAL_MS = 250;
-// TODO(roadmap §5 Now: cost posture): A 720p JPEG q=0.6 ≈ 80–150KB. At 1 fps
-// continuous that's ~6–9MB/min into Gemini Live's video slot, plus context-
-// window growth from frame turns. Default off and tools never auto-start are
-// the cheap guard — the open work is a quota-aware throttle (drop fps on
-// rate-limit hints) and a brief doc explaining the per-minute cost
-// envelope. See vision and roadmap.md §5 Now.
+
+// Frames share one websocket with realtime audio, so an oversized frame delays
+// speech, not just vision. `screencapture` returns native resolution — on a
+// Retina display that is megabyte-class per frame, and nothing downscaled it
+// before it reached the live session.
+const FRAME_PASSTHROUGH_BYTES = 200 * 1024;
+const FRAME_MAX_EDGE_PX = 1280;
+const FRAME_JPEG_QUALITY = 60;
+
+/** Bound a frame's wire cost before it enters the live session.
+ *
+ *  Frames at or under `FRAME_PASSTHROUGH_BYTES` are returned untouched, so a
+ *  producer that already sends small frames pays nothing. Larger ones are
+ *  resampled to `FRAME_MAX_EDGE_PX` on the long edge and re-encoded as JPEG.
+ *  Downscaling failure returns the original: a big frame is worse than a small
+ *  one, but dropping the user's frame entirely is worse than both.
+ */
+export async function boundFrameCost(
+	data: Buffer,
+	mimeType: string,
+): Promise<{ data: Buffer; mimeType: string }> {
+	if (data.byteLength <= FRAME_PASSTHROUGH_BYTES) return { data, mimeType };
+	let dir: string | undefined;
+	try {
+		dir = mkdtempSync(join(tmpdir(), 'sutando-frame-'));
+		const src = join(dir, 'in');
+		const out = join(dir, 'out.jpg');
+		writeFileSync(src, data);
+		// sips is a macOS built-in; -Z preserves aspect ratio on the long edge.
+		await execFileAsync('sips', [
+			'-Z', String(FRAME_MAX_EDGE_PX),
+			'-s', 'format', 'jpeg',
+			'-s', 'formatOptions', String(FRAME_JPEG_QUALITY),
+			src, '--out', out,
+		], { timeout: 5000 });
+		const shrunk = readFileSync(out);
+		// Trust the result only if it actually got smaller.
+		if (shrunk.byteLength > 0 && shrunk.byteLength < data.byteLength) {
+			return { data: shrunk, mimeType: 'image/jpeg' };
+		}
+		return { data, mimeType };
+	} catch (err) {
+		console.warn(`${ts()} [Vision] frame downscale failed, sending original ${Math.round(data.byteLength / 1024)}KB: ${(err as Error)?.message ?? err}`);
+		return { data, mimeType };
+	} finally {
+		if (dir) {
+			try { unlinkSync(join(dir, 'in')); } catch {}
+			try { unlinkSync(join(dir, 'out.jpg')); } catch {}
+			try { rmdirSync(dir); } catch {}
+		}
+	}
+}
 
 // --- Source abstraction ---------------------------------------------------
 
@@ -532,7 +578,7 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 /** Inject a frame from an external pusher (the web-client's
  *  getDisplayMedia loop). Push-mode must be active — caller should have
  *  hit /vision/start with source='browser' first. */
-export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok: boolean; error?: string } {
+export async function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): Promise<{ ok: boolean; error?: string }> {
 	const sendFile = getSendFile();
 	if (!sendFile) {
 		console.warn(`${ts()} [Vision] frame dropped: no active voice session (sessionRef=${!!sessionRef}, transport=${!!sessionRef?.transport})`);
@@ -543,12 +589,13 @@ export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok
 		return { ok: false, error: 'not in push mode — call /vision/start with source=browser first' };
 	}
 	try {
-		sendFile(data.toString('base64'), mimeType);
+		const bounded = await boundFrameCost(data, mimeType);
+		sendFile(bounded.data.toString('base64'), bounded.mimeType);
 		frameCount++;
 		// Log first frame so the user can confirm vision is wired end-to-end,
 		// and every 10th to keep tail noise low.
 		if (frameCount === 1 || frameCount % 10 === 0) {
-			console.log(`${ts()} [Vision] sent frame #${frameCount} (${Math.round(data.byteLength / 1024)}KB ${mimeType})`);
+			console.log(`${ts()} [Vision] sent frame #${frameCount} (${Math.round(bounded.data.byteLength / 1024)}KB ${bounded.mimeType}, from ${Math.round(data.byteLength / 1024)}KB)`);
 		}
 		return { ok: true };
 	} catch (err) {
@@ -561,7 +608,8 @@ async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; erro
 	const sendFile = getSendFile();
 	if (!sendFile) return { ok: false, error: 'no active voice session' };
 	const frame = await source.capture();
-	sendFile(frame.data.toString('base64'), frame.mimeType);
+	const bounded = await boundFrameCost(frame.data, frame.mimeType);
+	sendFile(bounded.data.toString('base64'), bounded.mimeType);
 	// Fire post-send hooks (e.g. screen-companion injects selection text).
 	if (visionFrameHooks.length > 0) {
 		const transport = sessionRef?.transport;
@@ -809,8 +857,9 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 			req.on('end', () => {
 				const buf = Buffer.concat(chunks);
 				const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
-				const r = submitFrame(buf, mime);
-				respond(r.ok ? 200 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
+				void submitFrame(buf, mime).then((r) => {
+					respond(r.ok ? 200 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
+				}).catch(() => respond(500, { status: 'failed', error: 'submitFrame failed' }));
 			});
 			req.on('error', () => respond(500, { status: 'failed', error: 'request error' }));
 			return;
