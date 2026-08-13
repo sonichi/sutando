@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import os
@@ -53,6 +54,41 @@ class TestArchiveNeverOverwrites(unittest.TestCase):
         self.assertTrue(self._archive(src, "task-y"))
         self.assertEqual((self.tasks_dir / self.month / "task-y.txt").read_text(),
                          "BODY")
+
+    def test_cross_device_archive_copies_instead_of_linking(self) -> None:
+        """os.link cannot span filesystems, and the archive can be a different
+        mount. The O_EXCL copy fallback must preserve the bytes and the source."""
+        import task_archive
+        src = self.live / "task-c.txt"
+        src.write_text("PAYLOAD")
+        with mock.patch("os.link", side_effect=OSError(18, "Cross-device link")):
+            self.assertTrue(self._archive(src, "task-c"))
+        landed = self.tasks_dir / self.month / "task-c.txt"
+        self.assertEqual(landed.read_text(), "PAYLOAD")
+        self.assertFalse(src.exists(), "source must still leave the live queue")
+
+    def test_cross_device_fallback_also_refuses_to_clobber(self) -> None:
+        (self.tasks_dir / self.month).mkdir(parents=True)
+        (self.tasks_dir / self.month / "task-d.txt").write_text("OLD")
+        src = self.live / "task-d.txt"
+        src.write_text("NEW")
+        with mock.patch("os.link", side_effect=OSError(18, "Cross-device link")):
+            self.assertTrue(self._archive(src, "task-d"))
+        self.assertEqual((self.tasks_dir / self.month / "task-d.txt").read_text(), "OLD")
+        self.assertEqual((self.tasks_dir / self.month / "task-d.txt.1").read_text(), "NEW")
+
+    def test_a_failed_cross_device_copy_leaves_no_partial_and_keeps_the_source(self) -> None:
+        """A half-written archive that reads as complete is worse than no archive."""
+        src = self.live / "task-e.txt"
+        src.write_text("PAYLOAD")
+        with mock.patch("os.link", side_effect=OSError(18, "Cross-device link")), \
+             mock.patch("shutil.copyfileobj", side_effect=OSError(28, "No space left")):
+            self._archive(src, "task-e")
+        self.assertFalse((self.tasks_dir / self.month / "task-e.txt").exists(),
+                         "a partial copy must be removed, not left looking archived")
+        self.assertTrue(src.exists() or
+                        (self.live / "task-e.txt.archive-failed").exists(),
+                        "the bytes must survive somewhere in the live queue")
 
     def test_quarantine_does_not_clobber_an_earlier_quarantine(self) -> None:
         self.tasks_dir.mkdir()
