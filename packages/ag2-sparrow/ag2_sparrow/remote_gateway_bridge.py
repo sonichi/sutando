@@ -681,9 +681,39 @@ if LOCAL_TIER not in ("owner", "team", "guest"):
 
 # A local per-sender map can only cap the broker tier; unlisted senders use LOCAL_TIER.
 # Cache identity includes mtime, size, and inode so revocations take effect promptly.
+_ACCESS_PATH_LOGGED = None
+
+
 def _ag2space_access_path():
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
+    """Resolve the map only from the launcher-provided active config.
+    The desktop .env pointer wins over the config-root fallback."""
+    device_env = os.environ.get("AG2_DEVICE_ENV")
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if device_env:
+        channel_dir = os.path.dirname(
+            os.path.abspath(os.path.expanduser(device_env))
+        )
+        path = os.path.join(channel_dir, "access.json")
+    elif config_dir:
+        path = os.path.join(
+            os.path.abspath(os.path.expanduser(config_dir)),
+            "channels",
+            CHANNEL_DIR,
+            "access.json",
+        )
+    else:
+        path = ""
+
+    global _ACCESS_PATH_LOGGED
+    if path != _ACCESS_PATH_LOGGED:
+        detail = path or "disabled (no AG2_DEVICE_ENV or CLAUDE_CONFIG_DIR)"
+        print(
+            f"[remote-gateway-bridge] access tier map path: {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _ACCESS_PATH_LOGGED = path
+    return path
 
 
 # Known tier vocabulary and privilege ordering. `_tier_for` uses this ordering
@@ -697,7 +727,7 @@ def _normalized_tier(value):
         tier = "guest"
     return tier if tier in _TIER_RANK else "guest"
 
-_TIER_MAP_CACHE = {"ident": None, "map": {}}
+_TIER_MAP_CACHE = {"path": None, "ident": None, "map": {}}
 
 
 def _has_above_local(cached) -> bool:
@@ -714,18 +744,35 @@ def _stale_safe(cached):
 
 
 def _load_tier_map():
-    """Return the cached local sender caps, preserving safe caps on read errors.
-    Only a successful changed-file read replaces the cache."""
+    """Preserve safe caps on same-path faults, but never across path switches.
+    An absent launcher config explicitly clears the cache."""
     path = _ag2space_access_path()
+    if not path:
+        _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
+            path,
+            None,
+            {},
+        )
+        return {}
     try:
         st = os.stat(path)
     except OSError:
-        # Absent/unstattable → keep last-known-good (initially {} before any load).
+        # Keep last-known-good only for the same configured path. Carrying a
+        # map across a path switch would leak trust decisions between installs.
+        if path != _TIER_MAP_CACHE["path"]:
+            _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE[
+                "map"
+            ] = (path, None, {})
+            return {}
         return _stale_safe(_TIER_MAP_CACHE["map"])
     # Size and inode supplement nanosecond mtime so same-timestamp rewrites are detected.
     ident = (st.st_mtime_ns, st.st_size, st.st_ino)
     # Re-read while an above-default grant is cached so revocation cannot be masked.
-    if ident == _TIER_MAP_CACHE["ident"] and not _has_above_local(_TIER_MAP_CACHE["map"]):
+    if (
+        path == _TIER_MAP_CACHE["path"]
+        and ident == _TIER_MAP_CACHE["ident"]
+        and not _has_above_local(_TIER_MAP_CACHE["map"])
+    ):
         # File present and UNCHANGED — this cache is current, not stale. Return it
         # verbatim: projecting here would drop a legitimate up-tier on every call.
         return _TIER_MAP_CACHE["map"]
@@ -738,10 +785,19 @@ def _load_tier_map():
             if isinstance(who, str) and t in ("owner", "team", "guest", "other"):
                 tm[who.strip()] = _normalized_tier(t)
     except Exception:
-        # Malformed / mid-write → keep last-known-good; don't advance mtime so a
-        # later successful read of the fixed file is still picked up.
+        # As above, fail closed across config switches but retain the same
+        # path's safe caps for a malformed or mid-write file.
+        if path != _TIER_MAP_CACHE["path"]:
+            _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE[
+                "map"
+            ] = (path, None, {})
+            return {}
         return _stale_safe(_TIER_MAP_CACHE["map"])
-    _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = ident, tm
+    _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
+        path,
+        ident,
+        tm,
+    )
     return tm
 
 
@@ -1149,7 +1205,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
-                             "core-status"],
+                             "core-status", "team-collaborator"],
         }
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).
@@ -1498,11 +1554,20 @@ def _write_task(task: dict) -> str | None:
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    # Promote only the exact broker boolean plus Team request; the legacy Guest
+    # wire tier keeps old nodes restricted and body text cannot opt itself in.
+    broker_tier = _normalized_tier(task.get("access_tier"))
+    requested_tier = _normalized_tier(task.get("requested_access_tier"))
+    broker_collaborator = (
+        task.get("collaborator") is True
+        and (broker_tier == "team" or requested_tier == "team")
+    )
+    attested_tier = "team" if broker_collaborator else broker_tier
+    # Resolved once and reused below so routing and owner-activity cannot diverge.
+    sender_tier = _tier_for(task.get("user_id"), attested_tier)
+    collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
     _secret_types: tuple = ()
-    # Resolved once, reused everywhere below so the tier decision can never diverge;
-    # must run before the "task" field is reached in the loop below.
-    sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -1516,6 +1581,10 @@ def _write_task(task: dict) -> str | None:
                 it = "message"
             lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
+            # Keep the established id/timestamp prefix stable, but place this
+            # trusted execution-policy header before all untrusted body text.
+            if collaborator_enabled:
+                lines.append("collaborator: true")
             # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
             # reaches the agent as body content (owner directive 2026-07-16) —
             # see _strip_room_ops_meta. Runs first so the stripped body is what
