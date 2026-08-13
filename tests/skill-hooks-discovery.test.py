@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -75,6 +77,93 @@ class SkillHookDiscovery(unittest.TestCase):
     def test_hooks_as_a_non_list_is_skipped(self):
         self._skill("demo", {"name": "demo", "hooks": {"event": "PreToolUse"}})
         self.assertEqual(discover(self.repo), [])
+
+
+class ManifestLintAcceptsAndValidatesHooks(unittest.TestCase):
+    """Accepting `hooks` without validating it would be worse than rejecting it:
+    discovery silently drops what it cannot find, so a bad entry reads as armed."""
+
+    REPO = Path(__file__).resolve().parent.parent
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.skill = Path(self._td.name) / "demo"
+        (self.skill / "hooks").mkdir(parents=True)
+        (self.skill / "hooks" / "g.py").write_text("#!/usr/bin/env python3\n")
+        self.base = {
+            "name": "demo", "version": "1.0.0", "owner": "github:sonichi/sutando",
+            "stability": "experimental",
+        }
+
+    def _lint(self, hooks="__omit__"):
+        m = dict(self.base)
+        if hooks != "__omit__":
+            m["hooks"] = hooks
+        (self.skill / "manifest.json").write_text(json.dumps(m))
+        r = subprocess.run(
+            [sys.executable, str(self.REPO / "scripts" / "lint-skill.py"), str(self.skill)],
+            capture_output=True, text=True)
+        return r.returncode, r.stdout + r.stderr
+
+    def test_CONTROL_no_hooks_key_is_clean(self):
+        """Without a passing baseline the failure cases below prove nothing."""
+        rc, out = self._lint()
+        self.assertEqual(rc, 0, out)
+
+    def test_CONTROL_a_valid_hook_is_clean_and_not_an_unknown_field(self):
+        rc, out = self._lint([{"event": "PreToolUse", "command": "./hooks/g.py"}])
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("unknown manifest field", out)
+
+    def test_a_command_that_does_not_exist_is_an_error(self):
+        rc, out = self._lint([{"event": "PreToolUse", "command": "./hooks/nope.py"}])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("does not exist", out)
+
+    def test_a_command_escaping_the_skill_dir_is_an_error(self):
+        rc, out = self._lint([{"event": "PreToolUse", "command": "../../../etc/passwd"}])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("must not escape", out)
+
+    def test_a_missing_event_is_an_error(self):
+        rc, out = self._lint([{"command": "./hooks/g.py"}])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("missing 'event'", out)
+
+    def test_a_missing_command_is_an_error(self):
+        rc, out = self._lint([{"event": "PreToolUse"}])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("missing 'command'", out)
+
+    def test_hooks_must_be_a_list(self):
+        rc, out = self._lint({"event": "PreToolUse"})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("must be a list", out)
+
+    def test_an_entry_must_be_an_object(self):
+        rc, out = self._lint(["a string"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("must be an object", out)
+
+
+class HealthProbeReportsWhenDiscoveryBreaks(unittest.TestCase):
+    def test_a_raising_discovery_warns_rather_than_aborting_every_later_probe(self):
+        """The probe runs inside run_all_checks; an exception here would kill the
+        checks after it, and a silent pass would verify only the static hooks."""
+        import importlib.util
+        repo = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location("hc", repo / "src" / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(hc)
+        except SystemExit:
+            pass
+        import skill_hooks
+        with mock.patch.object(skill_hooks, "discover", side_effect=RuntimeError("boom")):
+            row = hc.check_claude_hook_registration(repo_dir=repo)
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("skill-hook discovery failed", row["detail"])
 
 
 if __name__ == "__main__":
