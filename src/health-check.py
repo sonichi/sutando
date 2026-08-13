@@ -5244,9 +5244,8 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
             # pair past the threshold is stranded rather than in flight.
             if task_age < threshold_age_sec:
                 continue
-        # A body that declares a skip was never going to be delivered, so it
-        # is not a stranded reply. `[deduped:]` stays reported: it PROMISES
-        # delivery via another task, and a broken promise is a real lost reply.
+        # A declared skip was never going to be delivered. `[deduped:]` stays
+        # reported: it PROMISES delivery elsewhere, so stranding it loses a reply.
         try:
             from result_markers import parse_markers  # noqa: PLC0415
             skips = {a.value for a in parse_markers(path.read_text()).actions
