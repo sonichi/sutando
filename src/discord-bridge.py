@@ -164,6 +164,41 @@ REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
+
+#: Consecutive polls each result file has been present-but-empty. Bridge-owned
+#: state; threshold and wording live in result_router so the bridges cannot drift.
+_empty_result_polls: "dict[str, int]" = {}
+
+
+class EmptyResultError(Exception):
+    """A result file that stayed empty past the bound — never delivered."""
+
+
+async def _note_empty_result(task_id: str, result_file) -> None:
+    """At the bound: owner DM, audit row, drain `pending_replies`, archive. Below it a
+    no-op, because that window is indistinguishable from a normal partial write."""
+    notice = result_router.note_empty_result(
+        _empty_result_polls, task_id, str(result_file))
+    if not notice:
+        return                                    # still inside the write window
+    print(f"  {notice}", flush=True)
+    # Pop every task-scoped map the normal-delivery cleanup pops, or the task
+    # reports resolved while still visible to queue-health.
+    _empty_result_polls.pop(task_id, None)
+    channel = pending_replies.pop(task_id, None)  # stop re-polling it
+    _atomic_write_pending_replies(
+        {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
+    _progress_msgs.pop(task_id, None)             # else the placeholder never clears
+    tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
+    archive_file(result_file, "results", task_id)
+    # Archive the SOURCE TASK too. Without this the task file sits in tasks/
+    # forever: discovery re-reads it and queue health counts it as pending work.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+
+
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
@@ -4592,7 +4627,9 @@ async def poll_results():
                 import re
                 reply_text = read_ready_result(result_file)
                 if reply_text is None:
+                    await _note_empty_result(task_id, result_file)
                     continue
+                _empty_result_polls.pop(task_id, None)
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving
@@ -4913,6 +4950,10 @@ async def poll_results():
                 # its purpose, remove to bound `discord-delivered/`
                 # directory growth.
                 _clear_delivered(task_id)
+            else:
+                # CONSECUTIVE means consecutive: an absent file breaks the run, or a
+                # writer that retries accumulates counts across separate appearances.
+                _empty_result_polls.pop(task_id, None)
         await asyncio.sleep(1)
 
 
