@@ -2754,6 +2754,85 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                       + (f", {behind} commits behind" if behind else "")}
 
 
+def check_engine_revision_drift(repo_dir: "Path | None" = None,
+                                manifest_path: "Path | None" = None) -> dict:
+    """Warn when the checked-out source has moved off the BUILT engine revision.
+
+    `dist/` is gitignored, so source advances while the artifacts stay behind.
+    """
+    name = "engine-revision-drift"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    manifest = Path(manifest_path) if manifest_path is not None else repo.parent / "ENGINE_MANIFEST.json"
+
+    if not manifest.is_file():
+        # A plain source clone has no bundle manifest — nothing to compare.
+        return {"name": name, "status": "ok",
+                "detail": "no ENGINE_MANIFEST.json — not a bundled engine, skipping"}
+    try:
+        built = (json.loads(manifest.read_text()) or {}).get("sha")
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "ok",
+                "detail": f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]}) — skipping"}
+    if not isinstance(built, str) or not built.strip():
+        return {"name": name, "status": "ok",
+                "detail": "ENGINE_MANIFEST.json has no sha — skipping"}
+    built = built.strip()
+
+    # A resolver failure must degrade like resolve_git() -> None, never to bare
+    # `git`, which can resolve the Xcode-CLT stub and raise the install dialog.
+    try:
+        from git_binary import resolve_git  # noqa: PLC0415
+        git_bin = resolve_git()
+    except Exception:
+        git_bin = None
+    if git_bin is None:
+        return {"name": name, "status": "ok", "detail": "no runnable git — skipping"}
+
+    def _git(*args):
+        return subprocess.run([git_bin, "-C", str(repo), *args],
+                              capture_output=True, text=True, timeout=10)
+
+    try:
+        head = _git("rev-parse", "HEAD")
+    except (OSError, subprocess.TimeoutExpired):
+        return {"name": name, "status": "ok", "detail": "git not runnable — skipping"}
+    if head.returncode != 0:
+        return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
+    head_sha = head.stdout.strip()
+    # Normalise first: an abbreviated sha (or a tag) of the checked-out commit
+    # would otherwise compare unequal and print "X != X (0 commits ahead)".
+    try:
+        resolved = _git("rev-parse", f"{built}^{{commit}}")
+        if resolved.returncode == 0 and resolved.stdout.strip():
+            built = resolved.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # keep the literal; the comparison below is still correct for it
+    if head_sha == built:
+        return {"name": name, "status": "ok",
+                "detail": f"source matches built revision {built[:9]}"}
+
+    # An unanswerable count must not soften the drift, which is already established.
+    detail = f"source HEAD {head_sha[:9]} != built revision {built[:9]}"
+    try:
+        if _git("cat-file", "-e", built).returncode == 0 and \
+           _git("merge-base", "--is-ancestor", built, "HEAD").returncode == 0:
+            ahead = _git("rev-list", "--count", f"{built}..HEAD").stdout.strip()
+            # Zero ahead of an ancestor means it IS this commit under another name.
+            if ahead == "0":
+                return {"name": name, "status": "ok",
+                        "detail": f"source matches built revision {built[:9]}"}
+            if ahead:
+                detail += f" ({ahead} commits ahead)"
+        else:
+            detail += " (diverged, or the built commit is outside this shallow clone)"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"name": name, "status": "warn",
+            "detail": detail + " — dist/ is gitignored so it did NOT follow the source; "
+                               "the Node half still runs the older build. Rebuild and "
+                               "reactivate the engine rather than trusting the checkout."}
+
+
 def check_migrate_reader_contract() -> dict:
     """Verify migration CLASS_RULES are compatible with reader resolution chains (issue #1543).
 
@@ -7292,6 +7371,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
+    checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
