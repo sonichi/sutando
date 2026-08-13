@@ -49,6 +49,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+import io
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
@@ -340,6 +342,98 @@ class NewestAppSourceTests(unittest.TestCase):
         with patch.object(hc, "REPO_DIR", Path(self.tmp.name).parent):
             got = hc.sutando_app_newest_source()
         self.assertEqual("Sutando", got.parent.name)
+
+
+class NewestSourceSurvivesAnUnreadableDirectory(unittest.TestCase):
+    """Both OSError paths fall back to main.swift. A raise here would abort the
+    whole health check over an unreadable app directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name) / "Sutando"
+        self.d.mkdir(parents=True)
+
+    def test_a_glob_that_raises_falls_back_to_main(self):
+        class _GlobRaises(type(Path())):
+            def glob(self, _pattern):
+                raise OSError("directory unreadable")
+
+        d = _GlobRaises(self.d)
+        self.assertEqual(Path(d) / "main.swift", hc.sutando_app_newest_source(d))
+
+    def test_a_stat_that_raises_falls_back_to_main(self):
+        class _StatRaises(type(Path())):
+            def is_file(self):
+                return True
+
+            def stat(self, *a, **k):
+                raise OSError("stat refused")
+
+        class _DirWithUnstattableSource(type(Path())):
+            def glob(self, _pattern):
+                return [_StatRaises(self / "RestartCoordinator.swift")]
+
+        d = _DirWithUnstattableSource(self.d)
+        self.assertEqual(Path(d) / "main.swift", hc.sutando_app_newest_source(d))
+
+
+class FixDispatchNeverAutoLaunchesAStaleBinary(unittest.TestCase):
+    """The sutando-app --fix branch launches ONLY a binary proven current.
+    An earlier auto-fix leaked duplicate instances (3 concurrent, 2026-04-19),
+    so a stale binary must be deferred to a manual rebuild, not opened."""
+
+    def _run_fix(self, checks):
+        opened = []
+        with (
+            patch.object(sys, "argv", ["health-check.py", "--fix"]),
+            patch.object(hc, "run_all_checks", return_value=checks),
+            patch.object(hc.subprocess, "run",
+                         side_effect=lambda cmd, **k: opened.append(cmd)),
+        ):
+            try:
+                with redirect_stdout(io.StringIO()):
+                    hc.main()
+            except SystemExit:
+                pass
+        return opened
+
+    def test_a_stale_app_is_not_opened(self):
+        checks = [{"name": "sutando-app", "status": "stale",
+                   "detail": "binary is 232 min older than source — rebuild needed"}]
+        opened = self._run_fix(checks)
+        self.assertEqual(
+            [c for c in opened if "/usr/bin/open" in c], [],
+            "a stale binary must never be auto-launched — that leaks duplicate instances")
+
+    def test_POSITIVE_CONTROL_the_branch_is_actually_reached(self):
+        """Without this the negative above passes vacuously. Note the status:
+        `issues` filters out "ok" and "warn", so ONLY a non-benign status such
+        as "stale" reaches the fix dispatch at all."""
+        called = []
+
+        def _spy(*a, **k):
+            called.append(1)
+            return Path("nonexistent.swift")
+
+        checks = [{"name": "sutando-app", "status": "stale",
+                   "detail": "binary is 232 min older than source — rebuild needed"}]
+        with patch.object(hc, "sutando_app_newest_source", side_effect=_spy):
+            self._run_fix(checks)
+        self.assertTrue(called, "the sutando-app fix branch never ran — "
+                                "the negative case proves nothing without this")
+
+    def test_a_warn_status_never_reaches_the_dispatch_at_all(self):
+        """`issues` excludes "warn", so the branch's own `status == "warn"`
+        auto-launch condition cannot fire from main(). Documented here because
+        a reader of that branch would reasonably assume it can."""
+        called = []
+        checks = [{"name": "sutando-app", "status": "warn",
+                   "detail": "configured but not running"}]
+        with patch.object(hc, "sutando_app_newest_source",
+                          side_effect=lambda *a, **k: called.append(1)):
+            self._run_fix(checks)
+        self.assertEqual(called, [], "a warn check must not enter the fix dispatch")
 
 
 if __name__ == "__main__":
