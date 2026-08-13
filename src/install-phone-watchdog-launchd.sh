@@ -1,13 +1,6 @@
 #!/bin/bash
-# Install / uninstall the launchd-supervised phone-stack watchdog.
-#
-# Usage:
-#   bash src/install-phone-watchdog-launchd.sh             # install (idempotent)
-#   bash src/install-phone-watchdog-launchd.sh --uninstall # remove (idempotent)
-#   bash src/install-phone-watchdog-launchd.sh --status    # print job state
-#
-# Install bootouts an existing job first, so re-running picks up a template
-# changed by `git pull`.
+# Install / uninstall the launchd phone-stack watchdog. See README.
+# Install bootouts first, so re-running picks up a pulled template.
 
 set -e
 
@@ -82,10 +75,8 @@ case "$cmd" in
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"
 
-        # Self-test: prove the watchdog script runs under this shell without
-        # touching a real stack (DRY_RUN prints the recovery action instead of
-        # running it). This does not exercise the launchd TCC path, only that the
-        # script itself is invocable.
+        # Proves the script is invocable under this shell, not that launchd's
+        # TCC path works.
         if DRY_RUN=1 bash "$REPO/src/phone-watchdog.sh" >/dev/null 2>&1; then
             echo "  Self-test: OK — phone-watchdog.sh runs (DRY_RUN)."
         else

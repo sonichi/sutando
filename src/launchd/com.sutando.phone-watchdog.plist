@@ -1,11 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Sutando — phone-stack watchdog launchd job (template).
-
-  Do NOT load directly: `bash src/install-phone-watchdog-launchd.sh` must first
-  substitute __REPO__, __WORKSPACE__ and __HOMEBREW_BIN__ with real paths.
-  KeepAlive is omitted on purpose — this is an exit-only job that launchd re-runs
-  on StartInterval, so a persistent process would defeat the interval.
+  Template — the installer substitutes __REPO__/__WORKSPACE__/__HOMEBREW_BIN__.
+  KeepAlive omitted on purpose: persistence would defeat StartInterval.
 -->
 <plist version="1.0">
 <dict>
