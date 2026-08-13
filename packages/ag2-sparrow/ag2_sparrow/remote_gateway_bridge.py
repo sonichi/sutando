@@ -607,6 +607,14 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
+# event_id: trust the bare ok as delivered (at-least-once beats never).
+_PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
+PROACTIVE_TRUST_OK = (
+    _PROACTIVE_TRUST_OK_ENV
+    if _PROACTIVE_TRUST_OK_ENV is not None
+    else _config_from_channel_env("REMOTE_PROACTIVE_TRUST_OK")
+) == "1"
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 # rotation (_reload_rotated_token) propagates to their next request without a
@@ -2064,7 +2072,11 @@ def _post_proactive() -> None:
             # a failed send: the claim is renamed back and retried next pass,
             # loudly, so a misconfigured room is visible instead of silently
             # eating nudges.
-            if not (isinstance(resp, dict) and resp.get("event_id")):
+            delivered = isinstance(resp, dict) and (
+                bool(resp.get("event_id"))
+                or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
+            )
+            if not delivered:
                 _log(f"proactive send for {f.name} got no delivery signal "
                      f"(response {str(resp)[:120]!r}) — will retry; check "
                      "REMOTE_PROACTIVE_ROOM and the agent's room membership")

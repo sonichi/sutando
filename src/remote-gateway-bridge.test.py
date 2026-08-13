@@ -36,6 +36,7 @@ def check(cond: bool, msg: str) -> None:
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
+         "force_room_ok_only": False,
          "force_heartbeat_404": False, "force_media_redirect": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
@@ -98,6 +99,10 @@ class Handler(BaseHTTPRequestHandler):
                 # Deployed-broker failure shape: room-send swallowed server-side,
                 # 200 with no event_id — must NOT count as delivered.
                 body = b"{}"
+            elif STATE["force_room_ok_only"]:
+                # Today's production broker shape: forward accepted, but the
+                # response carries no event_id (compat-flag coverage).
+                body = json.dumps({"ok": True}).encode()
             else:
                 body = json.dumps({"ok": True,
                                    "event_id": f"$evt-{len(STATE['room_posts'])}"}).encode()
@@ -841,6 +846,26 @@ def main() -> int:
     rtc.PROACTIVE_CLAIM_GATE = _prev_gate
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
+
+    # 3.7 broker-compat delivery signal (REMOTE_PROACTIVE_TRUST_OK).
+    # Default OFF: a bare {"ok": true} (no event_id) is NOT delivery — the
+    # file restores for retry, same as the empty-200 case above.
+    bare_ok = rtc.RESULTS_DIR / "proactive-t15.txt"
+    bare_ok.write_text("bare-ok nudge\n")
+    STATE["force_room_ok_only"] = True
+    rtc._post_proactive()
+    check(bare_ok.exists(),
+          "default: bare {ok:true} without event_id restores for retry")
+    # Opt-in ON: the same response is trusted as delivered-at-least-once —
+    # claimed, posted once more, archived, retries stop.
+    rtc.PROACTIVE_TRUST_OK = True
+    rtc._post_proactive()
+    STATE["force_room_ok_only"] = False
+    rtc.PROACTIVE_TRUST_OK = False
+    check(not bare_ok.exists()
+          and any(p.name.startswith("proactive-t15")
+                  for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
+          "PROACTIVE_TRUST_OK=1: bare {ok:true} archives (opt-in at-least-once)")
 
     # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
     # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen
