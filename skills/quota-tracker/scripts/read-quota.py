@@ -218,6 +218,26 @@ def _update_burn_rate(current_util_5h: float, current_util_7d=None,
     return result
 
 
+def resolve_available(status: str, proxy_available) -> bool:
+    """Whether the account can still serve requests.
+
+    The proxy writes an authoritative top-level `available` bool; prefer it over
+    deriving from the status string, whose vocabulary grows (`allowed_warning` is
+    served today and appears in no docs, so a status allowlist would break on the
+    next unlisted value). An explicit "rejected" still wins, so a stale
+    optimistic bool cannot mask exhaustion. With no bool there is no evidence, so
+    the original rule stands — which keeps `unknown` unavailable, because a gate
+    must not proceed on ambiguity. (`health-check.py` takes the opposite default
+    on `unknown`, deliberately: declining to PAGE and declining to PROCEED have
+    opposite fail-safe directions.)
+    """
+    if status == "rejected":
+        return False
+    if isinstance(proxy_available, bool):
+        return proxy_available
+    return status == "allowed"
+
+
 def main():
     data = json.loads(QUOTA_FILE.read_text())
     headers = data.get("headers", {})
@@ -235,9 +255,11 @@ def main():
     reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
     reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
 
+    available = resolve_available(status, data.get("available"))
+
     result = {
         "status": status,
-        "available": status == "allowed",
+        "available": available,
         "utilization_5h": util_5h,
         "utilization_7d": util_7d,
         "remaining_5h_pct": round((1 - util_5h) * 100),
