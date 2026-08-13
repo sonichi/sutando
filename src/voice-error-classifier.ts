@@ -188,3 +188,32 @@ export function lastTerminalClassification(): ProtocolFailure | null {
 export function clearTerminalClassification(): void {
 	_lastTerminal = null;
 }
+
+// AppleScript `display notification` cannot be withdrawn or updated, so a banner
+// must state when it fired — an undated one is indistinguishable from a live one.
+
+// Strip characters that would break the AppleScript literal. Not shell escaping:
+// the caller uses execFileSync, so no shell is involved.
+function appleScriptSafe(s: string): string {
+	return s.replace(/["\\]/g, '');
+}
+
+/** Short local date+time stamp, e.g. "Aug 8, 10:34 PM". */
+export function formatNotificationTimestamp(at: Date): string {
+	return at.toLocaleString(undefined, {
+		month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+	});
+}
+
+/** Offline banner text — always dated, because it cannot be retracted. */
+export function formatVoiceOfflineNotification(userMessage: string, at: Date): string {
+	return appleScriptSafe(`${userMessage} (detected ${formatNotificationTimestamp(at)})`);
+}
+
+/** Recovery banner text — the only counter-signal to a stale offline banner. */
+export function formatVoiceRecoveryNotification(at: Date): string {
+	return appleScriptSafe(
+		`Voice is back online (recovered ${formatNotificationTimestamp(at)}). `
+		+ 'Any earlier offline alert no longer applies.',
+	);
+}

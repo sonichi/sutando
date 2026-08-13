@@ -19,14 +19,27 @@ fail() {
   exit 3
 }
 
-# macOS has no `timeout` binary; emulate a bounded run so a step can't hang the prep.
+# macOS has no `timeout`; signals must reach the child's process GROUP, because a sync
+# that spawns a helper outlives a pid-only kill and keeps writing to the workspace.
 bounded() {
   local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return $?; fi
-  "$@" & local pid=$!
-  ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) & local killer=$!
+  local grace="${GR_KILL_GRACE_S:-3}"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --kill-after="$grace" "$secs" "$@"; return $?
+  fi
+  # `set -m` makes the job a process-group leader, so pgid == pid and `-$pid` is the
+  # group. Without it the job shares OUR group and `-$pid` would signal this shell.
+  set -m; "$@" & local pid=$!; set +m
+  ( sleep "$secs"; kill -TERM "-$pid" 2>/dev/null
+    sleep "$grace"; kill -KILL "-$pid" 2>/dev/null ) & local killer=$!
   wait "$pid"; local rc=$?
   kill -TERM "$killer" 2>/dev/null; wait "$killer" 2>/dev/null || true
+  # The group can outlive its leader; drain it before the caller reports a verdict.
+  if kill -0 "-$pid" 2>/dev/null; then
+    kill -KILL "-$pid" 2>/dev/null
+    local waited=0
+    while kill -0 "-$pid" 2>/dev/null && [ "$waited" -lt 20 ]; do sleep 0.1; waited=$((waited+1)); done
+  fi
   return $rc
 }
 
@@ -50,10 +63,10 @@ if [ "$sync_ok" = 1 ]; then
   synced=true
   rm -f "$sync_log"
 else
-  # 124 is GNU timeout; 143 is SIGTERM from bounded()'s fallback killer. A pre-kill
-  # path must not report an immediate nonzero exit as if it had hung for the full bound.
+  # 124 GNU timeout, 143 TERM, 137 KILL — a TERM-ignoring child only dies at 137. A
+  # pre-kill path must not report an immediate nonzero exit as if it hung for the bound.
   case "$sync_rc" in
-    124|143) sync_why="timed out after ${STEP_TIMEOUT}s" ;;
+    124|137|143) sync_why="timed out after ${STEP_TIMEOUT}s" ;;
     *)       sync_why="exited $sync_rc" ;;
   esac
   sync_tail="$(tail -c 400 "$sync_log" 2>/dev/null | tr '\n\t' '  ' | tr -s ' ' | sed 's/"/\\"/g')"

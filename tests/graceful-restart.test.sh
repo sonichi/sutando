@@ -184,6 +184,46 @@ out="$(GR_WS="$WS7" GR_SYNC_CMD="bash '$SPD/ok.sh'" bash "$REPO/src/agent/restar
 grep -q '"restart_id":"seam-rid"' "$WS7/state/restart-ready.json" 2>/dev/null \
   && say ok "seam ready sentinel" || say FAIL "seam ready sentinel"
 
+echo "7b. a TERM-IGNORING sync is still bounded, and reports a timeout"
+# TERM alone never reaps this child; without the KILL escalation the bound is
+# advertised only and prep reports an on-time success after the full runtime.
+WS7B="$TMP/ws7b"; mkdir -p "$WS7B/state" "$WS7B/tasks"
+t0=$(date +%s)
+GR_WS="$WS7B" GR_STEP_TIMEOUT=1 GR_KILL_GRACE_S=2 \
+  GR_SYNC_CMD='trap "" TERM; sleep 30' \
+  bash "$REPO/src/agent/restart-prep.sh" termignore-rid >/dev/null 2>&1; rc=$?
+elapsed=$(( $(date +%s) - t0 ))
+[ "$elapsed" -le 8 ] \
+  && say ok "TERM-ignoring sync bounded in ${elapsed}s (bound 1 + grace 2)" \
+  || say FAIL "TERM-ignoring sync ran ${elapsed}s — the bound is advertised, not enforced"
+[ "$rc" != 0 ] && say ok "prep reports failure (exit $rc), not an on-time success" \
+  || say FAIL "prep exited 0 after ignoring its own timeout"
+[ ! -f "$WS7B/state/restart-ready.json" ] \
+  && say ok "no ready sentinel written for a timed-out sync" \
+  || say FAIL "ready sentinel written despite the sync never completing"
+grep -q 'timed out after' "$WS7B/state/restart-prep-failed.json" 2>/dev/null \
+  && say ok "failed sentinel names the timeout" \
+  || say FAIL "failed sentinel missing or does not name the timeout"
+
+echo "7c. a timed-out sync's DESCENDANTS are reaped, not just the direct child"
+# A pid-only kill leaves the grandchild running, so prep reports "timed out" and the
+# restart proceeds while that process is still writing to the workspace.
+WS7C="$TMP/ws7c"; mkdir -p "$WS7C/state" "$WS7C/tasks"
+GR_WS="$WS7C" GR_STEP_TIMEOUT=1 GR_KILL_GRACE_S=2 \
+  GR_SYNC_CMD='trap "" TERM; sleep 41 & echo $! >"'"$WS7C"'/gchild.pid"; wait' \
+  bash "$REPO/src/agent/restart-prep.sh" pgroup-rid >/dev/null 2>&1
+gpid="$(cat "$WS7C/gchild.pid" 2>/dev/null)"
+# Fixture control: with no grandchild the survival check below passes vacuously.
+[ -n "$gpid" ] && say ok "fixture spawned a grandchild (pid $gpid)" \
+  || say FAIL "no grandchild pid recorded — fixture is unrepresentative, not passing"
+sleep 1
+if [ -n "$gpid" ] && kill -0 "$gpid" 2>/dev/null; then
+  kill -KILL "$gpid" 2>/dev/null
+  say FAIL "grandchild $gpid SURVIVED — signals went to the pid, not the process group"
+else
+  say ok "grandchild reaped with its process group"
+fi
+
 echo
 
 # --- GNU-style `stat -f` must not break alive_age() ------------------------------------
