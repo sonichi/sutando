@@ -111,15 +111,43 @@ class TestLandedUnderSquash(unittest.TestCase):
         # because a real merge commit proves reachability tracks landing here.
         self.assertEqual(dev["landed_24h"], dev["commits_24h"] - 1, dev)
 
-    def test_a_small_sample_is_measured_absence_not_a_failure_to_measure(self):
-        """A young merge-commit repo also shows zero merges — that is not squashing."""
+    def test_too_little_history_is_unknown_not_proof_of_no_rewriting(self):
+        """A depth-1 clone of a squash repo looks identical to a young one here."""
         mod = _load()
         with tempfile.TemporaryDirectory() as td:
             repo = _repo(td, merges=False, main_commits=2)
             dev = mod.analyze_dev_activity(repo_root=repo)
-        self.assertEqual(dev["landed_24h"], dev["commits_24h"] - 1,
-                         "2 commits cannot falsify 'this repo uses merge commits', "
-                         "so the count must survive rather than be suppressed")
+        self.assertIsNone(dev["landed_24h"],
+                          "insufficient history is not positive evidence that the repo "
+                          "preserves SHAs — a shallow squash clone reads the same")
+
+    def test_a_shallow_clone_of_a_squash_repo_is_not_read_as_no_rewriting(self):
+        """The reviewer's case: depth-1 hides the merge history entirely."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as td:
+            src = pathlib.Path(td) / "src"
+            src.mkdir()
+            g = _git(src)
+            g("init", "-q", "-b", "main")
+            g("config", "user.email", "t@example.com")
+            g("config", "user.name", "t")
+            for i in range(30):
+                g("commit", "-q", "--allow-empty", "-m", f"c{i}")
+            dst = pathlib.Path(td) / "shallow"
+            subprocess.run(["git", "clone", "-q", "--depth", "1",
+                            f"file://{src}", str(dst)], check=True, capture_output=True)
+            d = _git(dst)
+            d("config", "user.email", "t@example.com")
+            d("config", "user.name", "t")
+            d("checkout", "-q", "-b", "wip")
+            (dst / "w").write_text("w")
+            d("add", "-A")
+            d("commit", "-q", "-m", "wip")
+            dev = mod.analyze_dev_activity(repo_root=dst)
+        self.assertIsNone(dev["landed_24h"], dev)
+        line = mod.dev_activity_insight(dev)
+        self.assertIn("landed count unavailable", line, line)
+        self.assertNotIn("none landed", line, line)
 
 
 class TestDiscriminatorFailsSafe(unittest.TestCase):

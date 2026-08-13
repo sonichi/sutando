@@ -480,8 +480,8 @@ def _landed_subset_count(repo_root, shas):
 
 
 def _rewrites_shas_on_merge(repo_root, ref, sample=200, floor=20):
-    """Tristate: True rewrites SHAs, False does not, None could not be measured.
-    `sample` bounds the walk; `floor` is the smallest sample that could hold a merge."""
+    """Tristate: True rewrites SHAs, False does not, None is not enough evidence.
+    `sample` bounds the walk; below `floor` commits the history cannot settle it."""
     def count(*extra):
         try:
             out = subprocess.run(
@@ -500,9 +500,10 @@ def _rewrites_shas_on_merge(repo_root, ref, sample=200, floor=20):
     total = count()
     if total is None:
         return None
-    # Measured, just not enough of it — a young merge-commit repo also shows zero.
+    # Too little history to be evidence of anything: a shallow clone of a
+    # squash-only repo looks identical to a young merge-commit repo here.
     if total < floor:
-        return False
+        return None
     merges = count("--merges")
     if merges is None:
         return None
