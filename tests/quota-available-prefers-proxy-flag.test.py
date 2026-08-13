@@ -96,6 +96,8 @@ def test_non_bool_flag_is_not_trusted():
 
 # --- production call site, not just the extracted predicate ---
 
+PROXY_URL = "http://127.0.0.1:7846"
+
 LIVE_DEFECT = {
     "available": True,
     "headers": {
@@ -123,17 +125,21 @@ def _run_real_script(tmp, *args, mutate=None):
         f"    return Path({str(tmp)!r}) / 'state' / name\n"
     )
     (tmp / "state" / "quota-state.json").write_text(json.dumps(LIVE_DEFECT))
+    # Pin routed explicitly: inheriting the host's ANTHROPIC_BASE_URL makes these
+    # pass on a routed dev box and fail in CI, which is not a test of anything.
+    env = {**os.environ, "ANTHROPIC_BASE_URL": PROXY_URL}
     return subprocess.run(
         [sys.executable, str(scripts / "read-quota.py"), *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
 
 
 def test_main_gate_exits_zero_in_process():
     """In-process so the call site itself is measured; the subprocess variants below
     prove the same contract but run a copy the coverage gate cannot attribute."""
-    argv = sys.argv
+    argv, prev = sys.argv, os.environ.get("ANTHROPIC_BASE_URL")
     sys.argv = ["read-quota.py", "--gate"]
+    os.environ["ANTHROPIC_BASE_URL"] = PROXY_URL
     try:
         _MODULE.main()
     except SystemExit as exc:
@@ -142,6 +148,10 @@ def test_main_gate_exits_zero_in_process():
         raise AssertionError("--gate returned without calling sys.exit")
     finally:
         sys.argv = argv
+        if prev is None:
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+        else:
+            os.environ["ANTHROPIC_BASE_URL"] = prev
 
 
 def test_gate_exits_zero_through_the_real_call_site():
@@ -165,9 +175,10 @@ def test_control_reverted_call_site_fails_the_two_tests_above():
     """Control: with the call site back on the broken expression --gate must exit
     1, or the two call-site tests are not gating the defect at all."""
     def revert(src):
-        old = 'available = resolve_available(status, data.get("available"))'
+        old = ('available = resolve_available(status, data.get("available"))'
+               ' and routed')
         assert old in src, "call site moved; update this control, do not delete it"
-        return src.replace(old, 'available = status == "allowed"', 1)
+        return src.replace(old, 'available = status == "allowed" and routed', 1)
 
     with tempfile.TemporaryDirectory() as d:
         r = _run_real_script(Path(d), "--gate", mutate=revert)
