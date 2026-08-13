@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """A proactive Slack send that RAISES must release its claim, not destroy it.
-
-Drives the real `result_watcher` loop, so the failure path actually executes.
-"""
+Drives the real result_watcher loop so the failure path actually executes."""
 from __future__ import annotations
 
 import importlib.util

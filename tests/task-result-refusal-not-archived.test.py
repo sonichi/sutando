@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""A refused ORDINARY task reply must not be archived.
-
-The proactive drains already gate consumption on the delivery result; these
-drive the real task-result watchers, where a refusal used to archive silently.
-"""
+"""Drives the real task-result watchers, where a refusal used to archive
+silently; the proactive drains already gate consumption on the send result."""
 from __future__ import annotations
 
 import importlib.util

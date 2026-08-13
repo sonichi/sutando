@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""Telegram: a send that is REFUSED without raising must release, not consume.
-
-`send_reply()` reports refusal by returning ``ok: False``; it does not raise. A
-watcher gating cleanup on "did not raise" therefore consumes the claim on the
-ordinary failure and the message is unrecoverable.
-"""
+"""send_reply() reports refusal via ok:False without raising, so a watcher
+gating cleanup on "did not raise" consumes the claim and loses the message."""
 from __future__ import annotations
 
 import importlib.util

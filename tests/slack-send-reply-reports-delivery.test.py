@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""`_send_reply` must REPORT delivery — the real helper, not a stub.
-
-Stubs only the Slack SDK surface, so a mutation of the helper's return value
-is caught here and cannot be caught by a caller-side stub test.
-"""
+"""Stubs only the Slack SDK surface, so a mutation of _send_reply's return
+value is caught here and cannot be caught by a caller-side stub test."""
 from __future__ import annotations
 
 import importlib.util

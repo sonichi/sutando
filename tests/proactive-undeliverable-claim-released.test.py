@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""An undeliverable proactive claim is released, not deleted.
-
-Walks the AST: the defect is an `unlink` reachable from a non-delivery branch,
-which is a structural property a source regex cannot see.
-"""
+"""AST walk: the defect is an `unlink` reachable from a non-delivery branch,
+which is a structural property a source regex cannot see."""
 from __future__ import annotations
 
 import ast

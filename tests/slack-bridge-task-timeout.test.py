@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for _check_task_timeouts() in src/slack-bridge.py.
-
-Guards the silent-fail fix: when the core session wedges (e.g. loops on the
-1M-context usage-credit API error), no results/<task>.txt is ever written and
-the Slack user just sees silence. The result_watcher now posts a one-time
-"still working / may have hit a limit" reply after SLACK_TASK_TIMEOUT_SEC, and
-KEEPS the pending entry so a late real result is still delivered.
-
-Run: python3 tests/slack-bridge-task-timeout.test.py
-Exit: 0 on pass, 1 on fail.
-"""
+"""_check_task_timeouts(): a wedged core writes no result, so the user sees
+silence; the reply fires once and the pending entry is KEPT for a late result."""
 from __future__ import annotations
 import importlib.util
 import os
