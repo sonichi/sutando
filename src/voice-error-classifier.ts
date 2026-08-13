@@ -104,3 +104,116 @@ export function classifyTransportClose(
 		rawReason: text,
 	};
 }
+
+// ---------------------------------------------------------------------------
+// `agent.state` protocol mapping (design 1a′; impl plan WS1 Step 12,
+// amendment R8).
+//
+// THIS module is the single classifier seam: the `agent.state` failure
+// classification extends the transport-close classifier above with a STABLE
+// protocol mapper — classification → {upstream:'failed', reason code,
+// category} — rather than growing a second classifier elsewhere. (The
+// `/credit|quota|…/i` regex in voice-agent's startup path is a logging hint
+// only; startup failures route through `classifyTransportClose` +
+// `recordTerminalClassification` like transport closes.)
+//
+// Reason codes and the category enum are WIRE CONTRACT: supervisor-status,
+// the WS2 control consumers, and the desktop UI key on them. Change them
+// only with a protocol version bump.
+// ---------------------------------------------------------------------------
+
+/** `agent.state` frame category enum (design 1a′). */
+export type ProtocolFailureCategory = 'auth' | 'quota' | 'network' | 'other';
+
+/** Stable terminal-failure protocol mapping for `agent.state` frames. */
+export interface ProtocolFailure {
+	upstream: 'failed';
+	/** Stable protocol reason code (wire contract — not a message). */
+	reason: string;
+	category: ProtocolFailureCategory;
+}
+
+/**
+ * classification → protocol mapping. Only TERMINAL (non-retryable)
+ * classifications map to `upstream:'failed'`; retryable ones return null —
+ * they are represented in `agent.state` by the ordinary
+ * `connecting`/`backoff`/`idle` upstream states, never by `failed`.
+ */
+const PROTOCOL_MAP: Partial<Record<FailureCategory, { reason: string; category: ProtocolFailureCategory }>> = {
+	auth_invalid: { reason: 'auth-invalid', category: 'auth' },
+	quota_exceeded: { reason: 'quota-exceeded', category: 'quota' },
+	credits_depleted: { reason: 'credits-depleted', category: 'quota' },
+	model_not_found: { reason: 'model-not-found', category: 'other' },
+};
+
+/**
+ * Map a classified close to the `agent.state` failure protocol.
+ * Returns null for retryable/unrecognized closes (not terminal).
+ */
+export function protocolFailureFor(c: ClassifiedClose): ProtocolFailure | null {
+	if (c.retryable) return null;
+	const m = PROTOCOL_MAP[c.category];
+	// A non-retryable classification MUST have a mapping; fail safe to
+	// 'other' if a future category forgets to register one.
+	return { upstream: 'failed', ...(m ?? { reason: c.category, category: 'other' as const }) };
+}
+
+// Last terminal classification, persisted for buildAgentState() (R8): the
+// `agent.state` provider reads it between transport closes, so a probe that
+// arrives while the session sits in fatal backoff still sees
+// `upstream:'failed'` with the classified reason/category.
+let _lastTerminal: ProtocolFailure | null = null;
+
+/**
+ * Classify + persist in one step. Records only terminal classifications;
+ * returns the protocol mapping (null when retryable). Callers pass the same
+ * (code, reason) they hand to `classifyTransportClose` — or a startup
+ * failure message with `code` undefined.
+ */
+export function recordTerminalClassification(c: ClassifiedClose): ProtocolFailure | null {
+	const failure = protocolFailureFor(c);
+	if (failure) _lastTerminal = failure;
+	return failure;
+}
+
+/** Last persisted terminal classification (null when none / cleared). */
+export function lastTerminalClassification(): ProtocolFailure | null {
+	return _lastTerminal;
+}
+
+/**
+ * Clear the persisted terminal classification — called when the upstream
+ * recovers to ACTIVE (a live session proves the credential works again).
+ */
+export function clearTerminalClassification(): void {
+	_lastTerminal = null;
+}
+
+// AppleScript `display notification` cannot be withdrawn or updated, so a banner
+// must state when it fired — an undated one is indistinguishable from a live one.
+
+// Strip characters that would break the AppleScript literal. Not shell escaping:
+// the caller uses execFileSync, so no shell is involved.
+function appleScriptSafe(s: string): string {
+	return s.replace(/["\\]/g, '');
+}
+
+/** Short local date+time stamp, e.g. "Aug 8, 10:34 PM". */
+export function formatNotificationTimestamp(at: Date): string {
+	return at.toLocaleString(undefined, {
+		month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+	});
+}
+
+/** Offline banner text — always dated, because it cannot be retracted. */
+export function formatVoiceOfflineNotification(userMessage: string, at: Date): string {
+	return appleScriptSafe(`${userMessage} (detected ${formatNotificationTimestamp(at)})`);
+}
+
+/** Recovery banner text — the only counter-signal to a stale offline banner. */
+export function formatVoiceRecoveryNotification(at: Date): string {
+	return appleScriptSafe(
+		`Voice is back online (recovered ${formatNotificationTimestamp(at)}). `
+		+ 'Any earlier offline alert no longer applies.',
+	);
+}

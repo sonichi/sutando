@@ -833,11 +833,14 @@ else
   # don't fight over port 9900 (issue #1888 bug 2 — duplicate listeners when
   # launchd respawns while startup.sh's direct process still holds the port).
   #
-  # reap_wedged_listener runs BEFORE the launchd ownership check intentionally:
+  # The wedge reap runs BEFORE the launchd ownership check intentionally:
   # KeepAlive only triggers on process exit, not on hang. A hung process can hold
   # the port indefinitely — reaping it first frees the port so the subsequent
   # kickstart (or launchd's own respawn on exit) gets a clean bind.
-  reap_wedged_listener 9900 voice-agent
+  # NOT the generic reap_wedged_listener: voice-agent's kill path goes through
+  # the guarded voice-lock.py takeover (startup-runtime.sh, amendment T4) —
+  # identity mismatch means nothing is signaled.
+  reap_wedged_voice_agent 9900
   if launchctl print "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1; then
     if ! lsof -i :9900 > /dev/null 2>&1; then
       launchctl kickstart "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1 || true
@@ -1125,7 +1128,11 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
       # REMOTE_TASK_CHANNEL_DIR_<INST>.
       _gw_chdir_var="REMOTE_TASK_CHANNEL_DIR_${_gw_var#AG2_REMOTE_TOKEN_}"
       _gw_chdir="${!_gw_chdir_var:-${_gw_inst}-ag2space}"
+      _gw_token_file_var="REMOTE_TASK_TOKEN_FILE_${_gw_var#AG2_REMOTE_TOKEN_}"
+      _gw_token_file="${!_gw_token_file_var:-$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels "$_gw_chdir" .env)}"
+      [ -f "$_gw_token_file" ] || _gw_token_file=""
       SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+        REMOTE_TASK_URL= REMOTE_TASK_TOKEN_FILE="$_gw_token_file" \
         REMOTE_TASK_CHANNEL_DIR="$_gw_chdir" \
         REMOTE_PROACTIVE_ROOM= \
         "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
