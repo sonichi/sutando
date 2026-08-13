@@ -31,10 +31,10 @@ def _repo(td, *, merges, main_commits=30):
     g("init", "-q", "-b", "main")
     g("config", "user.email", "t@example.com")
     g("config", "user.name", "t")
+    # Empty commits: these fixtures need a COUNT and whether merge commits exist,
+    # never content — and 30 rapid write+add+commit cycles proved fragile on CI.
     for i in range(main_commits):
-        (r / f"f{i}").write_text(str(i))
-        g("add", "-A")
-        g("commit", "-q", "-m", f"c{i}")
+        g("commit", "-q", "--allow-empty", "-m", f"c{i}")
     if merges:
         # A repo that preserves SHAs on merge: at least one real merge commit.
         g("checkout", "-q", "-b", "side")
@@ -61,10 +61,13 @@ def _all_work_on_a_branch(td, main_commits=30):
     g("init", "-q", "-b", "main")
     g("config", "user.email", "t@example.com")
     g("config", "user.name", "t")
-    for i in range(main_commits):
-        (r / f"f{i}").write_text(str(i))
-        g("add", "-A")
-        g("commit", "-q", "-m", f"c{i}")
+    # One tracked file, because the orphan step below runs `git rm --cached .`
+    # and that exits 128 with an empty index; the rest are empty commits.
+    (r / "f0").write_text("0")
+    g("add", "-A")
+    g("commit", "-q", "-m", "c0")
+    for i in range(1, main_commits):
+        g("commit", "-q", "--allow-empty", "-m", f"c{i}")
     g("update-ref", "refs/remotes/origin/main", "main")
     g("checkout", "-q", "--orphan", "wip")
     g("rm", "-rq", "--cached", ".")
