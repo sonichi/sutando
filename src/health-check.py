@@ -4125,7 +4125,7 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
 
 
 def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
-    """Does the proxy inject THIS core's login, or a different account's?
+    """Does the proxy resolve THIS core's login, or a different account's?
 
     `check_quota_telemetry` above answers "is quota-state fresh, and does it
     exist" — both are questions about WHEN, and neither can see the failure
@@ -4267,17 +4267,25 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
 
     if core_service == proxy_service:
         return {"name": name, "status": "ok",
-                "detail": f"proxy injects this core's login ({core_service})"}
+                "detail": (f"proxy and core resolve the same keychain item "
+                           f"({core_service}) — name match only; this check "
+                           f"does not read tokens")}
 
     return {
         "name": name,
         "status": "warn",
         "detail": (
-            f"the credential proxy injects a DIFFERENT login than this core's: proxy "
-            f"resolves '{proxy_service}', core would resolve '{core_service}'. Quota "
-            f"numbers describe the proxy's account, not yours, and requests bill it — "
-            f"a `/login` here will not reach the proxy. Cause is almost always the "
-            f"launchd plist omitting CLAUDE_CONFIG_DIR (launchd inherits no shell env): "
+            f"the credential proxy resolves a DIFFERENT login than this core's: proxy "
+            f"resolves '{proxy_service}', core would resolve '{core_service}'. What "
+            f"follows turns on state this check does not read: if the proxy's stored "
+            f"token is usable and the request carries an authorization header, the proxy "
+            f"substitutes its own — quota numbers then describe that account, requests "
+            f"bill it, and a `/login` here will not reach the proxy; if that token is "
+            f"unusable the proxy engages pass-through, forwarding whatever credential the "
+            f"client supplied and billing that account instead, or answering 401 when the "
+            f"client supplied none. Either way "
+            f"the cause is almost always the launchd plist omitting CLAUDE_CONFIG_DIR "
+            f"(launchd inherits no shell env): "
             f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
             f"Fix: pin CLAUDE_CONFIG_DIR in "
             f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
