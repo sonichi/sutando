@@ -285,11 +285,15 @@ def main():
     reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
     reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
 
+    # Stated once: a second copy of this predicate drifts the moment either is
+    # extended, and the two fields then contradict each other in one payload.
+    available = status == "allowed" and routed
+
     result = {
         "status": status,
         # Fails closed when unrouted: --gate exits on this field, and a machine
         # consumer is the one that never sees the human NOT ROUTED banner.
-        "available": status == "allowed" and routed,
+        "available": available,
         "utilization_5h": util_5h,
         "utilization_7d": util_7d,
         "remaining_5h_pct": round((1 - util_5h) * 100),
@@ -299,7 +303,7 @@ def main():
         "routed": routed,
         # Distinguishes "not this session's data" from "quota exhausted"; both
         # are unavailable, and a caller retries only one of them.
-        "unavailable_reason": None if (status == "allowed" and routed)
+        "unavailable_reason": None if available
                               else ("not-routed" if not routed else "exhausted"),
     }
 
