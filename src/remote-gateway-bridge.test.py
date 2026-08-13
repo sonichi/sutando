@@ -576,6 +576,16 @@ def main() -> int:
     check("task-MOCK2" not in rtc._load_inflight(), "delivered task removed from persisted inflight")
 
     # 3.5 proactive drain (REMOTE_PROACTIVE_ROOM)
+    # The sutando loader wires the ag2space claim gate (proactive_routing
+    # policy). Seed owner-activity = ag2space — the normal desktop condition —
+    # so the delivery-mechanics tests below claim immediately; the gate's own
+    # routing behavior gets its dedicated section after them.
+    check(rtc.PROACTIVE_CLAIM_GATE is not None,
+          "sutando loader wires the ag2space proactive claim gate")
+    _activity = rtc.WS / "state" / "last-owner-activity.json"
+    _activity.parent.mkdir(parents=True, exist_ok=True)
+    _activity.write_text(json.dumps(
+        {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
     # Unset → no scan, files untouched (existing hosts unchanged).
     (rtc.RESULTS_DIR / "proactive-t1.txt").write_text("nudge one\n")
     rtc.PROACTIVE_ROOM = ""
@@ -772,6 +782,65 @@ def main() -> int:
           and any(p.name.startswith("proactive-t10")
                   for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
           "[no-send] proactive nudge is archived silently, never posted")
+
+    # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
+    # Owner last active on discord → a FRESH file belongs to the discord
+    # bridge; this drain defers it (stays .txt, nothing posted).
+    _activity.write_text(json.dumps(
+        {"ts": int(time.time()), "channel": "discord", "summary": "hi"}))
+    gated = rtc.RESULTS_DIR / "proactive-t11.txt"
+    gated.write_text("discord owner's nudge\n")
+    posts_b4_gate = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(gated.exists() and len(STATE["room_posts"]) == posts_b4_gate,
+          "owner-on-discord: fresh nudge deferred to the discord bridge")
+    # …but a file older than the grace window has no living claimant (e.g. the
+    # discord bridge is configured in state but not running) → fallback claim.
+    aged = time.time() - (rtc._PROACTIVE_GRACE_S + 30)
+    os.utime(gated, (aged, aged))
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_gate + 1
+          and STATE["room_posts"][-1]["body"] == "discord owner's nudge"
+          and not gated.exists(),
+          "owner-on-discord: past-grace nudge is fallback-claimed, delivered once")
+    # Missing state file (fresh install, no owner activity yet): same shape —
+    # defer while fresh, deliver after grace. A gateway-only fresh install
+    # must never strand the first proactive message.
+    _activity.unlink()
+    fresh_install = rtc.RESULTS_DIR / "proactive-t12.txt"
+    fresh_install.write_text("first ever nudge\n")
+    posts_b4_fresh = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(fresh_install.exists() and len(STATE["room_posts"]) == posts_b4_fresh,
+          "no activity state: fresh nudge deferred (discord default gets first shot)")
+    os.utime(fresh_install, (aged, aged))
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_fresh + 1
+          and not fresh_install.exists(),
+          "no activity state: past-grace nudge delivers (gateway-only host)")
+    # Owner back on ag2space → instant claim again, no grace wait.
+    _activity.write_text(json.dumps(
+        {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
+    instant = rtc.RESULTS_DIR / "proactive-t13.txt"
+    instant.write_text("app owner's nudge\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["body"] == "app owner's nudge"
+          and not instant.exists(),
+          "owner-on-ag2space: fresh nudge claims immediately")
+    # Standalone default (no loader): gate None claims everything unchanged.
+    _prev_gate = rtc.PROACTIVE_CLAIM_GATE
+    rtc.PROACTIVE_CLAIM_GATE = None
+    _activity.write_text(json.dumps(
+        {"ts": int(time.time()), "channel": "discord", "summary": "hi"}))
+    ungated = rtc.RESULTS_DIR / "proactive-t14.txt"
+    ungated.write_text("standalone nudge\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["body"] == "standalone nudge"
+          and not ungated.exists(),
+          "gate=None (standalone default): claims regardless of routing state")
+    rtc.PROACTIVE_CLAIM_GATE = _prev_gate
+    _activity.write_text(json.dumps(
+        {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
 
     # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
     # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen

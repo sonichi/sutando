@@ -64,6 +64,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 # Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
@@ -575,6 +576,9 @@ POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 # channel_ids: a proactive nudge is often owner-private, and auto-targeting
 # the last active room could deliver it to a shared room.
 PROACTIVE_ROOM = os.environ.get("REMOTE_PROACTIVE_ROOM") or ""
+# Host-injected claim gate (Path -> bool), consulted per file before the claim
+# rename; None (standalone default) claims every routable file unchanged.
+PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 # rotation (_reload_rotated_token) propagates to their next request without a
@@ -1913,7 +1917,8 @@ def _post_proactive() -> None:
     to `.txt` for retry on the next loop pass. Auth errors propagate to the
     caller (the poll loop owns auth handling); everything else is per-file
     fail-open — one malformed nudge never blocks the rest. No-op without
-    PROACTIVE_ROOM."""
+    PROACTIVE_ROOM. A host-injected PROACTIVE_CLAIM_GATE may defer a file
+    that belongs to another bridge (cross-bridge routing stays host policy)."""
     if not PROACTIVE_ROOM:
         return
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
@@ -1927,6 +1932,12 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if PROACTIVE_CLAIM_GATE is not None:
+            try:
+                if not PROACTIVE_CLAIM_GATE(f):
+                    continue  # another bridge's file right now; retry next pass
+            except Exception:
+                pass  # a broken gate must not strand owner nudges — claim
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")

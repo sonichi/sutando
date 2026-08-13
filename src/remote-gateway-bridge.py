@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent
@@ -42,6 +43,7 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from proactive_routing import should_claim_proactive  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import shared_personal_path  # noqa: E402
 
@@ -78,3 +80,25 @@ for _root in (
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
+
+# Grace before the fallback claim: long enough for the owner's routed bridge
+# (discord/telegram poll loops run in seconds) to take its file first, short
+# enough that a bridge-less host never visibly delays an owner nudge.
+_PROACTIVE_GRACE_S = 180
+
+
+def _ag2space_proactive_claim_gate(path: Path) -> bool:
+    """Claim when routing says the owner lives here; otherwise only claim
+    files old enough that no routed bridge exists to take them (grace
+    fallback keeps gateway-only hosts delivering, exactly once, late)."""
+    if should_claim_proactive(WS / "state" / "last-owner-activity.json", "ag2space"):
+        return True
+    try:
+        return (time.time() - path.stat().st_mtime) >= _PROACTIVE_GRACE_S
+    except OSError:
+        return False  # racing consumer already claimed it
+
+
+# Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
+# None` default runs inside it and would overwrite an earlier assignment.
+PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
