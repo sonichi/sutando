@@ -43,9 +43,9 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from proactive_routing import should_claim_proactive  # noqa: E402
+from proactive_routing import BRIDGE_CHANNELS, should_claim_proactive  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
-from util_paths import shared_personal_path  # noqa: E402
+from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 
 WS = resolve_workspace()
 
@@ -81,18 +81,50 @@ _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bri
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
 
-# Grace before the fallback claim: long enough for the owner's routed bridge
-# (discord/telegram poll loops run in seconds) to take its file first, short
-# enough that a bridge-less host never visibly delays an owner nudge.
+_CHANNEL = "ag2space"
+# Grace before the fallback claim on a host where the routed bridge does not
+# exist at all: long enough to lose no ordering, short enough that a
+# gateway-only host never visibly delays an owner nudge.
 _PROACTIVE_GRACE_S = 180
 
 
+def _channel_configured(channel: str) -> bool:
+    """Whether `channel`'s bridge is configured ON THIS HOST — the same
+    question health-check.py asks before probing a bridge at all: a channel
+    dir carrying `.env` or `access.json`. Deliberately NOT liveness: a
+    configured bridge that is momentarily down (restart, token reload, laptop
+    wake) still owns its owner's messages."""
+    try:
+        base = claude_home_path("channels", channel)
+    except Exception:
+        return False
+    return (base / ".env").exists() or (base / "access.json").exists()
+
+
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
-    """Claim when routing says the owner lives here; otherwise only claim
-    files old enough that no routed bridge exists to take them (grace
-    fallback keeps gateway-only hosts delivering, exactly once, late)."""
-    if should_claim_proactive(WS / "state" / "last-owner-activity.json", "ag2space"):
+    """Claim when routing says the owner lives here. Otherwise the file
+    belongs to another bridge — claim it only when that bridge cannot exist
+    on this host, never merely because it is slow or briefly down.
+
+    DOWN != ABSENT (review #2877): an age-only fallback could not tell "no
+    telegram bridge on this host" from "the telegram bridge is restarting",
+    so a 3-minute restart would have handed a telegram-destined nudge to AG2
+    Space — the cross-channel-leak class this module exists to prevent. The
+    discriminator is CONFIGURED-ness: a configured bridge keeps its file
+    (it will claim on its next poll); an unconfigured one never will, so the
+    grace fallback still keeps gateway-only hosts delivering."""
+    state = WS / "state" / "last-owner-activity.json"
+    if should_claim_proactive(state, _CHANNEL):
         return True
+    # Ask the SHARED policy which bridge routing prefers — never re-read the
+    # state file here, or this becomes a second copy of the routing rule.
+    routed = next(
+        (c for c in sorted(BRIDGE_CHANNELS)
+         if c != _CHANNEL and should_claim_proactive(state, c)),
+        None,
+    )
+    if routed and _channel_configured(routed):
+        return False
     try:
         return (time.time() - path.stat().st_mtime) >= _PROACTIVE_GRACE_S
     except OSError:

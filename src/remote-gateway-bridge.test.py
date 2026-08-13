@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -827,6 +828,13 @@ def main() -> int:
           "[no-send] proactive nudge is archived silently, never posted")
 
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
+    # Hermetic: the gate asks claude_home_path() whether the routed bridge is
+    # configured, so an ambient ~/.claude would decide these cases from the
+    # DEV MACHINE's channels. Pin an empty config dir = "no other bridge on
+    # this host" and restore at the end of the section.
+    _saved_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    _gate_cfg = Path(tempfile.mkdtemp())
+    os.environ["CLAUDE_CONFIG_DIR"] = str(_gate_cfg)
     # Owner last active on discord → a FRESH file belongs to the discord
     # bridge; this drain defers it (stays .txt, nothing posted).
     _activity.write_text(json.dumps(
@@ -837,15 +845,45 @@ def main() -> int:
     rtc._post_proactive()
     check(gated.exists() and len(STATE["room_posts"]) == posts_b4_gate,
           "owner-on-discord: fresh nudge deferred to the discord bridge")
-    # …but a file older than the grace window has no living claimant (e.g. the
-    # discord bridge is configured in state but not running) → fallback claim.
+    # …and when that bridge does not exist on this host (no channels/discord
+    # config), nothing will ever claim it → past-grace fallback delivers.
     aged = time.time() - (rtc._PROACTIVE_GRACE_S + 30)
     os.utime(gated, (aged, aged))
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == posts_b4_gate + 1
           and STATE["room_posts"][-1]["body"] == "discord owner's nudge"
           and not gated.exists(),
-          "owner-on-discord: past-grace nudge is fallback-claimed, delivered once")
+          "owner-on-discord, no discord bridge configured: past-grace fallback delivers")
+
+    # DOWN != ABSENT (review #2877, john-the-dev): a CONFIGURED routed bridge
+    # owns its owner's file even while it is momentarily down (restart, token
+    # reload, laptop wake). Age must NOT promote the gateway into its place —
+    # the pre-fix age-only rule leaked a telegram-destined nudge to AG2 Space
+    # after a 3-minute restart.
+    (_gate_cfg / "channels" / "discord").mkdir(parents=True, exist_ok=True)
+    (_gate_cfg / "channels" / "discord" / "access.json").write_text('{"allowFrom": ["1"]}')
+    configured = rtc.RESULTS_DIR / "proactive-t11b.txt"
+    configured.write_text("discord owner's nudge, bridge merely down\n")
+    os.utime(configured, (aged, aged))            # far past the grace window
+    posts_b4_down = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(configured.exists() and len(STATE["room_posts"]) == posts_b4_down,
+          "owner-on-discord with discord CONFIGURED: aged nudge is never stolen (down != absent)")
+    configured.unlink()
+    # `.env`-only configuration counts too (health-check.py's own either/or).
+    (_gate_cfg / "channels" / "telegram").mkdir(parents=True, exist_ok=True)
+    (_gate_cfg / "channels" / "telegram" / ".env").write_text("TELEGRAM_BOT_TOKEN='x'\n")
+    _activity.write_text(json.dumps(
+        {"ts": int(time.time()), "channel": "telegram", "summary": "hi"}))
+    tg = rtc.RESULTS_DIR / "proactive-t11c.txt"
+    tg.write_text("telegram owner's nudge\n")
+    os.utime(tg, (aged, aged))
+    posts_b4_tg = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(tg.exists() and len(STATE["room_posts"]) == posts_b4_tg,
+          "owner-on-telegram with a configured (.env-only) bridge: aged nudge stays put")
+    tg.unlink()
+    shutil.rmtree(_gate_cfg / "channels", ignore_errors=True)  # back to no-other-bridge
     # Missing state file (fresh install, no owner activity yet): same shape —
     # defer while fresh, deliver after grace. A gateway-only fresh install
     # must never strand the first proactive message.
@@ -890,6 +928,11 @@ def main() -> int:
           "gate: a vanished (already-claimed) file is not claimed")
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
+    # End of the gate section: hand CLAUDE_CONFIG_DIR back to the ambient value.
+    if _saved_cfg is None:
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        os.environ["CLAUDE_CONFIG_DIR"] = _saved_cfg
 
     # 3.7 broker-compat delivery signal (REMOTE_PROACTIVE_TRUST_OK).
     # Default OFF: a bare {"ok": true} (no event_id) is NOT delivery — the
