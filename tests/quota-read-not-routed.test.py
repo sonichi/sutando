@@ -229,6 +229,20 @@ class NotRoutedTest(unittest.TestCase):
         self.assertNotIn("is unset", out)
         self.assertNotIn("relaunch the proxy, then restart", out)
 
+    def test_mismatch_diagnosis_redacts_credentials(self) -> None:
+        """This line reaches shared self-diagnose bundles, not just a terminal."""
+        os.environ["ANTHROPIC_BASE_URL"] = (
+            "https://user:super-secret@example.test/v1?token=also-secret")
+        out = self._run(routed=None)
+        for secret in ("super-secret", "also-secret", "token=", "user:"):
+            self.assertNotIn(secret, out, secret)
+        self.assertIn("example.test", out)      # still diagnostic, just not raw
+
+    def test_redaction_keeps_scheme_host_port(self) -> None:
+        """Control: redaction must not flatten every URL to the same string."""
+        self.assertEqual(self.mod._redacted_endpoint("http://h.test:9/a?b=c"), "http://h.test:9")
+        self.assertEqual(self.mod._redacted_endpoint("https://x.test"), "https://x.test")
+
     def test_genuinely_unset_still_says_unset(self) -> None:
         """Control: the original diagnosis must survive for the case it describes."""
         out = self._run(routed=False)

@@ -75,6 +75,22 @@ _PROXY_SCHEME = "http"          # the proxy speaks plain HTTP; https/ftp do not 
 _PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 
+def _redacted_endpoint(base_url: str) -> str:
+    """scheme://host:port only — userinfo, path, query and fragment carry secrets.
+
+    It reaches shared self-diagnose bundles, so it must never echo the raw value.
+    """
+    try:
+        u = urlparse(base_url if "//" in base_url else "//" + base_url)
+        host = (u.hostname or "").strip()
+        port = f":{u.port}" if u.port else ""
+    except ValueError:
+        return "an unparseable endpoint"
+    if not host:
+        return "another endpoint"
+    return f"{u.scheme}://{host}{port}" if u.scheme else f"{host}{port}"
+
+
 def _points_at_credential_proxy(base_url: "str | None") -> bool:
     """True only when base_url is THIS host's credential proxy.
 
@@ -317,7 +333,8 @@ def main():
         # versus an endpoint the caller deliberately pointed somewhere else.
         _url = os.environ.get("ANTHROPIC_BASE_URL")
         if _url:
-            print(f"⛔ NOT ROUTED: ANTHROPIC_BASE_URL is {_url}, not the local credential "
+            print(f"⛔ NOT ROUTED: ANTHROPIC_BASE_URL is {_redacted_endpoint(_url)}, not the "
+                  f"local credential "
                   f"proxy ({_PROXY_SCHEME}://localhost:{_PROXY_PORT}).")
         else:
             print("⛔ NOT ROUTED: ANTHROPIC_BASE_URL is unset, so THIS session does not go "
