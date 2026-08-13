@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """Regression coverage for the engine source/artifact drift probe.
 
-The bug this guards is invisible by construction: `dist/` is gitignored, so
-moving the checkout forward leaves the compiled half on the older build and
-nothing reports it. Every case below drives the production probe against a real
-git repository rather than a stubbed one, because the discriminator IS the git
-comparison.
-
 Run: python3 tests/health-check-engine-revision-drift.test.py
 """
 

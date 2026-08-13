@@ -2715,9 +2715,7 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
                                 manifest_path: "Path | None" = None) -> dict:
     """Warn when the checked-out source has moved off the BUILT engine revision.
 
-    `dist/` is gitignored, so a checkout cannot bring the compiled half with it:
-    the source can advance while the Node artifacts stay on the older build.
-    Warn, never fail; degrade to ok wherever the question does not apply.
+    `dist/` is gitignored, so source advances while the artifacts stay behind.
     """
     name = "engine-revision-drift"
     repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
@@ -2738,8 +2736,7 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
     built = built.strip()
 
     # A resolver failure must degrade like resolve_git() -> None, never to bare
-    # `git`: on a clean Mac that resolves the Xcode-CLT stub and this probe runs
-    # on every background health pass (REVIEW.md lesson 7).
+    # `git`, which can resolve the Xcode-CLT stub and raise the install dialog.
     try:
         from git_binary import resolve_git  # noqa: PLC0415
         git_bin = resolve_git()
