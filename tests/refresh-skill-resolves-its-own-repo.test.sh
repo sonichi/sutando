@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
-# refresh-skill.sh must resolve its config helper from ITS OWN repo.
-#
-# It used to hardcode `${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}`. On a clone
-# anywhere else that path does not exist, `-x` fails, and SKILLS_DST silently
-# falls back to ~/.claude/skills — an empty directory on such a host. Every
-# skill then reads as absent, and because the guard was `[ ! -L "$link" ]`
-# (true for a MISSING path as well as a real directory) each one printed
-# "skip <name> (not a symlink — won't clobber a local/copy install)" before the
-# script announced "done". A no-op that reports success, on all 99 skills.
-#
-# Discriminator: the fake repo's helper emits a UNIQUE temp dir. Only a script
-# that resolves from its own location can find it, so this passes on a machine
-# that happens to have ~/Desktop/sutando too.
+# The fake repo's helper emits a UNIQUE temp dir, so this still discriminates on
+# a host that happens to have ~/Desktop/sutando.
 set -eu
 
 TMP="$(mktemp -d)"
