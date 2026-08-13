@@ -473,19 +473,15 @@ def _landed_subset_count(repo_root, shas):
         return None
     unlanded = {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
     if unlanded and _rewrites_shas_on_merge(repo_root, ref) is not False:
-        # Squash/rebase merging rewrites the SHA, so a landed commit is unreachable
-        # by its local SHA. None means the probe could not answer, which is the same
-        # not-knowing — a failed probe must not let the caller state a count as fact.
+        # Under SHA-rewriting merges "unreachable" and "merged" are one observation.
+        # None is the same not-knowing, so only an explicit False licenses a count.
         return None
     return sum(1 for s in shas if s not in unlanded)
 
 
 def _rewrites_shas_on_merge(repo_root, ref, sample=200, floor=20):
-    """True when `ref` shows squash/rebase merging, so a landed commit keeps no SHA.
-
-    Three states, and the difference matters: True (measured, rewrites SHAs),
-    False (measured, does not — or the sample was too small to hold a merge, so
-    there is no evidence to act on), None (could not measure at all)."""
+    """Tristate: True rewrites SHAs, False does not, None could not be measured.
+    `sample` bounds the walk; `floor` is the smallest sample that could hold a merge."""
     def count(*extra):
         try:
             out = subprocess.run(
@@ -504,8 +500,7 @@ def _rewrites_shas_on_merge(repo_root, ref, sample=200, floor=20):
     total = count()
     if total is None:
         return None
-    # Measured, just not enough of it: a young merge-commit repo also shows zero
-    # merges, so this is absence of evidence, not a failure to look.
+    # Measured, just not enough of it — a young merge-commit repo also shows zero.
     if total < floor:
         return False
     merges = count("--merges")

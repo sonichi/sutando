@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """landed_24h must be None, not 0, where merging rewrites the SHA.
-
-Under squash/rebase merging a merged commit is unreachable by its local SHA, so
-"not reachable" and "merged" are the same observation. Reporting 0 there renders
-"none landed yet — velocity is in review", which is a positive claim the data
-cannot support.
-"""
+Rationale and before/after evidence are in the PR body."""
 import importlib.util
 import pathlib
 import subprocess
@@ -82,7 +77,7 @@ def _all_work_on_a_branch(td, main_commits=30):
 
 class TestLandedUnderSquash(unittest.TestCase):
     def test_the_reported_symptom_none_landed_on_a_squash_repo(self):
-        """The line the owner saw: 'none landed yet' on a day work did land."""
+        """The reported symptom: "none landed yet" on a day work did land."""
         mod = _load()
         with tempfile.TemporaryDirectory() as td:
             dev = mod.analyze_dev_activity(repo_root=_all_work_on_a_branch(td))
@@ -129,16 +124,8 @@ class TestLandedUnderSquash(unittest.TestCase):
 
 
 class TestDiscriminatorFailsSafe(unittest.TestCase):
-    """The defensive returns in `_rewrites_shas_on_merge` must yield UNKNOWN.
-
-    Reversed from "return False / keep the count" after review. The argument:
-    this module exists because 0 is not a valid measurement when reachability
-    cannot distinguish merged from unmerged. A probe that FAILED is in exactly
-    that state, so returning False recreates the same conflation one level down
-    — "git errored" would become indistinguishable from "measured, no squashing",
-    and the caller would present a count as fact. A broken probe must never fail
-    toward a confident value; `assertFalse` could not catch this, since None is
-    falsy too."""
+    """A failed probe must yield unknown, never a value the caller can act on.
+    `assertFalse` cannot pin it — None is falsy too; argument in the PR body."""
 
     def setUp(self):
         self.mod = _load()
