@@ -12,12 +12,16 @@ Run: python3 tests/health-check-engine-revision-drift.test.py
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -124,6 +128,77 @@ class EngineRevisionDriftTest(unittest.TestCase):
                 repo_dir=Path(plain), manifest_path=self.manifest)
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("skipping", r["detail"])
+
+    # --- the defensive branches -----------------------------------------
+    #
+    # Written deliberately, so tested deliberately. An untested `except` is a
+    # guess about what the failure looks like, and the whole contract of this
+    # probe is that it degrades instead of taking the health run down with it.
+
+    def test_ok_when_git_resolver_reports_no_runnable_git(self) -> None:
+        self._write_manifest(sha=self.first)
+        self._advance()
+        mod = types.ModuleType("git_binary")
+        mod.resolve_git = lambda: None            # resolver: no usable git
+        with mock.patch.dict(sys.modules, {"git_binary": mod}):
+            r = self._run()
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("no runnable git", r["detail"])
+
+    def test_falls_back_to_plain_git_when_resolver_is_absent(self) -> None:
+        """Composes on a tree where `git_binary` does not exist yet."""
+        self._write_manifest(sha=self.first)
+        head = self._advance(2)
+        real_import = builtins.__import__
+
+        def _no_resolver(name, *a, **kw):
+            if name == "git_binary":
+                raise ImportError("no git_binary here")
+            return real_import(name, *a, **kw)
+
+        with mock.patch.object(builtins, "__import__", _no_resolver):
+            r = self._run()
+        # Still answers, via a bare `git`.
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("2 commits ahead", r["detail"])
+        self.assertIn(head[:9], r["detail"])
+
+    def test_ok_when_git_cannot_be_executed(self) -> None:
+        self._write_manifest(sha=self.first)
+        self._advance()
+        real_run = hc.subprocess.run
+
+        def _boom(argv, *a, **kw):
+            raise OSError("git is not executable here")
+
+        hc.subprocess.run = _boom
+        try:
+            r = self._run()
+        finally:
+            hc.subprocess.run = real_run
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("git not runnable", r["detail"])
+
+    def test_drift_still_reported_when_the_ahead_count_cannot_be_taken(self) -> None:
+        """The count is a nicety; the drift is the finding and must survive."""
+        self._write_manifest(sha=self.first)
+        head = self._advance(2)
+        real_run = hc.subprocess.run
+
+        def _boom_after_head(argv, *a, **kw):
+            # Let `rev-parse HEAD` through; fail everything used for counting.
+            if "rev-parse" not in argv:
+                raise OSError("cannot count from here")
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _boom_after_head
+        try:
+            r = self._run()
+        finally:
+            hc.subprocess.run = real_run
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn(head[:9], r["detail"])
+        self.assertIn("dist/", r["detail"])
 
     # --- wiring ----------------------------------------------------------
 
