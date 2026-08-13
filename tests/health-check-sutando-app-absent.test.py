@@ -9,6 +9,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "health-check.py"
 
@@ -141,6 +142,31 @@ class CallSiteTest(unittest.TestCase):
         seg = self.src.split('elif _menubar == "expected-missing":')[1][:600]
         self.assertIn('"sutando-app"', seg)
         self.assertIn('"warn"', seg)
+
+
+class RunAllChecksActuallyEmitsTheAbsentRow(unittest.TestCase):
+    """The AST guard above proves run_all_checks BRANCHES on _menubar; it cannot
+    prove the branch emits anything. This drives run_all_checks for real."""
+
+    def _rows(self, state):
+        with patch.object(hc, "menubar_app_state", return_value=state):
+            checks = hc.run_all_checks()
+        return [c for c in checks if isinstance(c, dict) and c.get("name") == "sutando-app"]
+
+    def test_expected_missing_emits_a_warn_row_naming_both_paths(self):
+        rows = self._rows("expected-missing")
+        self.assertEqual(len(rows), 1, "a host that ASKED for the app must get exactly one row")
+        self.assertEqual(rows[0]["status"], "warn")
+        detail = rows[0]["detail"]
+        self.assertIn("no binary exists", detail)
+        self.assertIn(hc.MENUBAR_LABEL, detail, "the row must name the launchd job that asked")
+        self.assertIn("UNKNOWN", detail, "silence and 'ok' are the two things this must not say")
+
+    def test_CONTROL_not_applicable_emits_NO_row(self):
+        """Without this the assertion above passes for a probe that emits a row
+        unconditionally — the headless case is the whole point of the PR."""
+        self.assertEqual(self._rows("not-applicable"), [],
+                         "a headless host must get no sutando-app row at all")
 
 
 if __name__ == "__main__":
