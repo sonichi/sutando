@@ -95,10 +95,22 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from task_archive import find_task_file  # noqa: E402
+from orphan_result_routes import orphan_result_routes  # noqa: E402
+
+
+# Round-robin position for the orphan-route scan, so a large unroutable
+# backlog cannot starve entries that sort after it.
+_orphan_route_cursor = ""
+
+
+def _is_discord_channel_id(value: str) -> bool:
+    """A snowflake, so a Telegram chat id or a Matrix room id can never be
+    mistaken for one. Shape only — resolution stays with fetch_channel."""
+    return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
-from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
+from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
@@ -2405,6 +2417,7 @@ intents.message_content = True
 if os.environ.get("DISCORD_GUILD_MEMBERS_INTENT", "").lower() in ("1", "true", "yes"):
     intents.members = True
 client = discord.Client(intents=intents)
+_ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2458,13 +2471,22 @@ _poll_loops_started = False
 
 @client.event
 async def on_ready():
-    print(f"Discord bridge ready: {client.user}", flush=True)
+    global _ready_count
+    _ready_count += 1
     # Restart-safety FIRST: if access.json was wiped/corrupted while the bridge
     # was down, auto-restore it from the durable state/auth/ backup BEFORE any
     # access read below. Without this a wipe+restart boots into pairing/TOFU with
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    # Explicit presence: after a reconnect the default presence can lag; setting
+    # it on every ready makes recovery visible immediately instead of waiting
+    # for Discord to infer it. Best-effort — presence must never break startup.
+    try:
+        await client.change_presence(status=discord.Status.online)
+    except Exception:
+        pass
     # #1147: auto-seed workspace `state/discord-config.json` from the legacy
     # access.json heuristic on first boot. Idempotent (no-op if file
     # exists). Emits a WARN to stderr if the seed had to fall back to
@@ -3129,11 +3151,14 @@ async def _handle_discord_message(message, force=False):
                 getattr(u, "bot", False) and getattr(u, "id", None) != _self_id
                 for u in (getattr(message, "mentions", None) or [])
             )
+            # A forward sets message.reference too but is NOT a reply (its payload is
+            # in message_snapshots); classing it as one makes this gate skip forwards.
+            _is_reply = reference_is_reply(_ref is not None, getattr(_ref, "type", None))
             if not is_addressed_in_shared_channel(
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 bot_mentioned=bot_mentioned,
                 role_mentioned=role_mentioned,
-                is_reply=_ref is not None,
+                is_reply=_is_reply,
                 reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
                 self_id=_self_id,
                 author_id=getattr(message.author, "id", None),
@@ -3351,7 +3376,11 @@ async def _handle_discord_message(message, force=False):
         try:
             await att.save(local_path)
             attachment_refs.append(_ref_from_attachment(att, local_path))  # pragma: no cover
-            transcript = _transcribe_via_skill(str(local_path))
+            # Off-loop: transcription shells out for up to 25s; run sync on the
+            # event loop it starves the gateway heartbeat (~41s interval) and
+            # Discord drops the socket -> presence flaps offline (owner report
+            # 2026-07-17: 49 fresh gateway sessions in one log window).
+            transcript = await asyncio.to_thread(_transcribe_via_skill, str(local_path))  # pragma: no cover
             if transcript:
                 attachment_note += f"\n[Voice transcript: {transcript}]"
             else:
@@ -3809,7 +3838,7 @@ async def _handle_discord_message(message, force=False):
             "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n\n"
             "2. PR-REVIEW REQUEST (the task asks you to review / look at a specific GitHub PR #N) — AUTO-REVIEW, read-only:\n"
             "   - Run: bash skills/claude-codex/scripts/review-pr.sh <N>   (fetches the diff via `gh pr diff` — READ-ONLY: no checkout, never mutates git state or fails on a dirty tree — inlines it into `codex exec --sandbox read-only` `< /dev/null`, bounded by codex-bounded.sh --stall/--max so it can't grind. The verdict is comment-only; it never merges/approves. Diff is fetched OUTSIDE the sandbox so the sandboxed agent needs no network. Note: codex is agentic — a review can take 100s+; --max defaults to 240, don't shorten it.)\n"
-            "   - On SUCCESS (exit 0, verdict on stdout): write the verdict to results/task-{id}.txt. This is information-only (the team-tier bound) — safe because the review ran sandboxed read-only and the output is just analysis.\n"
+            "   - On SUCCESS (exit 0): stdout line 1 is `VERDICT-MARKER: <token>`; the verdict is ONLY the text after the LAST occurrence of that exact <token>. The token is a per-run nonce, so a diff or verdict that quotes a marker literal cannot truncate the extract. Everything before it is codex's exec trace (kept there deliberately so codex-bounded.sh --stall can watch it) and contains repository source the agent inlined while working — copying the whole stream, or its tail, quotes that source as the PR's own content. Extract after the last marker and write ONLY that to results/task-{id}.txt. This is information-only (the team-tier bound) — safe because the review ran sandboxed read-only and the output is just analysis.\n"
             "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — write results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed), and do NOT write results/task-{id}.txt. Owner-ping is the FALLBACK here, not the default.\n"
             "2b. MESSAGE OWNER — when the task needs owner decision for any OTHER reason (authorization, scope question, merge direction, repeated echo):\n"
             "   - Write a single proactive message to results/proactive-{ts}.txt summarizing what the sender asked and why it needs owner attention.\n"
@@ -4465,6 +4494,19 @@ async def poll_results():
             except Exception:
                 pass
 
+        # A task written straight into tasks/ was never in pending_replies, so
+        # its result would sit forever. Adopt the route it declared, then let
+        # the existing resolution below turn it into a channel.
+        global _orphan_route_cursor
+        _adopted, _orphan_route_cursor = orphan_result_routes(
+            RESULTS_DIR, TASKS_DIR,
+            set(pending_replies) | set(_recovered_replies),
+            _is_discord_channel_id,
+            cursor=_orphan_route_cursor,
+        )
+        for task_id, channel_id_str in _adopted.items():
+            _recovered_replies.setdefault(task_id, channel_id_str)
+
         # Merge recovered replies into pending_replies (resolve channel objects)
         for task_id, channel_id_str in list(_recovered_replies.items()):
             if task_id not in pending_replies:
@@ -4794,7 +4836,9 @@ async def poll_results():
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
+                # find_task_file, not a reconstructed bare name: a claimed
+                # task is `<id>.claimed-core-N.txt` and would strand forever.
+                task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
                 # Delivery succeeded + archived — sentinel has served
                 # its purpose, remove to bound `discord-delivered/`
@@ -5525,7 +5569,10 @@ async def poll_dm_fallback():
                     # `<workspace>/src/dm-result.py` (does not exist) and the
                     # dm-fallback path errored out silently before delivering.
                     _DM_RESULT_SCRIPT = Path(__file__).resolve().parent / "dm-result.py"
-                    result = subprocess.run(
+                    # Off-loop for the same heartbeat-starvation reason as the
+                    # transcribe call in on_message (up to 15s per file here).
+                    result = await asyncio.to_thread(  # pragma: no cover
+                        subprocess.run,
                         [sys.executable, str(_DM_RESULT_SCRIPT), "--file", str(f)],
                         capture_output=True, text=True, timeout=15,
                         stdin=subprocess.DEVNULL,
