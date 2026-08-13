@@ -10,9 +10,10 @@ from pathlib import Path
 GUARD = Path(__file__).resolve().parent.parent / "skills" / "gws-gmail-voice" / "hooks" / "reply-orphan-guard.py"
 
 
-def decide(tool, cmd):
+def decide(tool, cmd, raw_tool_input=False):
+    tool_input = cmd if raw_tool_input else {"command": cmd}
     r = subprocess.run([sys.executable, str(GUARD)],
-                       input=json.dumps({"tool_name": tool, "tool_input": {"command": cmd}}),
+                       input=json.dumps({"tool_name": tool, "tool_input": tool_input}),
                        capture_output=True, text=True)
     if not r.stdout.strip():
         return "allow"
@@ -34,9 +35,23 @@ class ReplyOrphanGuard(unittest.TestCase):
         self.assertEqual(
             decide("Bash", 'gws gmail +send --to a@b.com --subject "Intro call" --body hi'), "allow")
 
-    def test_it_allows_send_that_carries_threading(self):
+    def test_message_id_does_NOT_rescue_send(self):
+        """+send has no thread flag, so --message-id there is not honoured.
+
+        Treating it as safe reopened the exact orphan the guard exists to stop.
+        """
         self.assertEqual(
-            decide("Bash", 'gws gmail +send --message-id 19f --subject "Re: EGC" --body hi'), "allow")
+            decide("Bash", 'gws gmail +send --message-id 19f --subject "Re: EGC" --body hi'), "deny")
+
+    def test_it_allows_reply_which_actually_threads(self):
+        self.assertEqual(
+            decide("Bash", 'gws gmail +reply --message-id 19f --subject "Re: EGC" --body hi'), "allow")
+
+    def test_a_non_dict_tool_input_fails_open_with_a_decision_not_a_crash(self):
+        """Real payloads have carried a str and a list here; .get() on those
+        raises and the hook then emits no decision at all."""
+        for bad in ("not an object", [1, 2], None, 7):
+            self.assertEqual(decide("Bash", bad, raw_tool_input=True), "allow")
 
     def test_it_ignores_non_Bash_tools(self):
         self.assertEqual(decide("Write", 'gws gmail +send --subject "Re: x"'), "allow")

@@ -97,6 +97,9 @@ HOOKS=(
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
+  # A manifest skill loads `tools` and nothing else, so a hook living in a skill
+  # directory has no loader — registration has to come from here to be portable.
+  "PreToolUse|reply-orphan-guard.py|python3 $(shq "$REPO_DIR/skills/gws-gmail-voice/hooks/reply-orphan-guard.py")"
 )
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
