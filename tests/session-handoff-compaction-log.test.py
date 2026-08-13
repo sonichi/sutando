@@ -334,11 +334,44 @@ class ALockThisCallDidNotTakeIsNotReleased(unittest.TestCase):
         self.lock.mkdir()
         self.log.write_text('{"ts":"x","epoch":0,"trigger":"pre-existing"}\n')
         _run(self.ws, ("/tmp/t.jsonl", "held-lock"))
-        pending = self.ws / "state" / "compactions.jsonl.pending"
-        self.assertTrue(pending.is_file(), "the event was not parked anywhere")
-        self.assertEqual(json.loads(pending.read_text().strip())["trigger"], "held-lock")
+        # The sidecar PATHNAME is per-writer now (a shared one loses records: an fd
+        # already open on it follows the inode through the holder's mv). Assert the
+        # behaviour — parked somewhere, exactly one record — not the old filename.
+        parked = sorted((self.ws / "state").glob("compactions.jsonl.pending.*"))
+        self.assertTrue(parked, "the event was not parked anywhere")
+        self.assertEqual(len(parked), 1, f"expected one sidecar, got {parked}")
+        self.assertEqual(json.loads(parked[0].read_text().strip())["trigger"], "held-lock")
+        self.assertFalse((self.ws / "state" / "compactions.jsonl.wip").exists(),
+                         "left an unpublished .wip file behind")
         self.assertEqual(self.log.read_text().count("held-lock"), 0,
                          "wrote the main log without the lock — the mv would drop it")
+
+    def test_each_give_up_writer_gets_its_own_sidecar(self):
+        """The invariant the shared pathname violated. Two give-up writers must
+        park in TWO files: a shared name is unsafe because an fd already opened on
+        it follows the inode through the holder's mv, so the record lands in a file
+        the holder has already drained and unlinked. Pre-fix this yields 1."""
+        self.lock.mkdir()
+        _run(self.ws, ("/tmp/a.jsonl", "give-up-A"))
+        _run(self.ws, ("/tmp/b.jsonl", "give-up-B"))
+        parked = sorted((self.ws / "state").glob("compactions.jsonl.pending.*"))
+        self.assertEqual(len(parked), 2,
+                         f"two give-up writers must not share a pathname; got {parked}")
+        triggers = {json.loads(f.read_text().strip())["trigger"] for f in parked}
+        self.assertEqual(triggers, {"give-up-A", "give-up-B"}, "a parked record was lost")
+
+    def test_a_locked_writer_absorbs_every_sidecar(self):
+        """Per-writer sidecars are only safe if the drain collects ALL of them."""
+        (self.ws / "state" / "compactions.jsonl.pending.aaa").write_text(
+            '{"ts":"x","epoch":0,"trigger":"parked-A"}\n')
+        (self.ws / "state" / "compactions.jsonl.pending.bbb").write_text(
+            '{"ts":"x","epoch":0,"trigger":"parked-B"}\n')
+        _run(self.ws, ("/tmp/t.jsonl", "now-locked"))
+        body = self.log.read_text()
+        for want in ("parked-A", "parked-B", "now-locked"):
+            self.assertIn(want, body, f"{want} was not absorbed")
+        self.assertFalse(sorted((self.ws / "state").glob("compactions.jsonl.pending.*")),
+                         "sidecars survived the drain and will be re-absorbed")
 
     def test_the_next_locked_writer_folds_the_sidecar_in(self):
         """Parking is only safe if something absorbs it."""
