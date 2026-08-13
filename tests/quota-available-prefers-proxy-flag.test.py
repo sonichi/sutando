@@ -1,29 +1,17 @@
 #!/usr/bin/env python3
 """`read-quota.py` must not contradict the proxy's own `available` flag.
 
-The proxy writes a top-level `available` bool alongside the raw response
-headers. `read-quota.py` ignored it and re-derived `available` as
-`status == "allowed"`, so any status outside that one literal read as
-unavailable. Observed live 2026-08-13: the proxy wrote
-
-    {"available": true, "headers": {"anthropic-ratelimit-unified-status":
-                                    "allowed_warning"}, ...}
-
-and `read-quota.py --gate` exited 1 — its documented contract is "exit 1 if
-exhausted", while 24% of the 7d pool remained and requests were being served.
-
-`allowed_warning` appears in no docs; `src/health-check.py` still describes the
-vocabulary as "allowed" or "rejected". That is why the fix is to trust the
-FLAG rather than allowlist the status: an allowlist would break on the next
-unlisted value. `test_absent_flag_allowed_warning_still_unavailable` is the
-boundary that distinguishes the two designs.
+Covers the extracted predicate AND the production call site, with a control
+that reverts the call site so these cannot stay green against the defect.
 
 Run: python3 tests/quota-available-prefers-proxy-flag.test.py
 """
 from __future__ import annotations
 
-import importlib.util
+import json
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -31,15 +19,8 @@ SCRIPT = REPO / "skills" / "quota-tracker" / "scripts" / "read-quota.py"
 
 
 def _load():
-    """Extract `resolve_available` from read-quota.py without importing it.
-
-    A plain import is not available: at module scope the script resolves a
-    quota-state path and calls `sys.exit(1)` when it is absent, which is the
-    normal condition in CI. So locate the function by name and exec just its
-    definition. Extracting from the real source (rather than restating the rule
-    here) means a rename or reshape fails loudly instead of leaving this suite
-    green against a private copy that has drifted from production.
-    """
+    """Import is impossible: module scope sys.exit(1)s when quota-state is absent.
+    Extract from real source so a rename fails loudly instead of passing."""
     src = SCRIPT.read_text()
     marker = "def resolve_available("
     if marker not in src:
@@ -101,9 +82,8 @@ def test_absent_flag_unknown_stays_unavailable():
 
 
 def test_absent_flag_allowed_warning_still_unavailable():
-    """The design boundary. Had we allowlisted the status instead of trusting
-    the flag, this would be True — and the next unlisted status would regress.
-    """
+    """Design boundary: allowlisting the status instead of trusting the flag
+    would make this True, and regress on the next unlisted status."""
     _check("allowed_warning", None, False)
 
 
@@ -111,6 +91,74 @@ def test_non_bool_flag_is_not_trusted():
     """A string/None/number is not evidence; fall back rather than coerce."""
     _check("allowed_warning", "true", False)
     _check("allowed_warning", 1, False)
+
+
+# --- production call site, not just the extracted predicate ---
+
+LIVE_DEFECT = {
+    "available": True,
+    "headers": {
+        "anthropic-ratelimit-unified-status": "allowed_warning",
+        "anthropic-ratelimit-unified-5h-utilization": "0.10",
+        "anthropic-ratelimit-unified-7d-utilization": "0.76",
+    },
+}
+
+
+def _run_real_script(tmp, *args, mutate=None):
+    """Mirror the four-parent layout read-quota.py walks and stub the resolver, so
+    the real source runs against a controlled quota-state instead of the live one."""
+    scripts = tmp / "skills" / "quota-tracker" / "scripts"
+    scripts.mkdir(parents=True)
+    (tmp / "src").mkdir()
+    (tmp / "state").mkdir()
+    src = SCRIPT.read_text()
+    if mutate is not None:
+        src = mutate(src)
+    (scripts / "read-quota.py").write_text(src)
+    (tmp / "src" / "workspace_default.py").write_text(
+        "from pathlib import Path\n"
+        "def status_read_path(name):\n"
+        f"    return Path({str(tmp)!r}) / 'state' / name\n"
+    )
+    (tmp / "state" / "quota-state.json").write_text(json.dumps(LIVE_DEFECT))
+    return subprocess.run(
+        [sys.executable, str(scripts / "read-quota.py"), *args],
+        capture_output=True, text=True,
+    )
+
+
+def test_gate_exits_zero_through_the_real_call_site():
+    with tempfile.TemporaryDirectory() as d:
+        r = _run_real_script(Path(d), "--gate")
+    assert r.returncode == 0, (
+        f"--gate exited {r.returncode} on allowed_warning + available:true; "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    )
+
+
+def test_json_reports_available_through_the_real_call_site():
+    with tempfile.TemporaryDirectory() as d:
+        r = _run_real_script(Path(d), "--json")
+    payload = json.loads(r.stdout)
+    assert payload["available"] is True, payload
+    assert payload["status"] == "allowed_warning", payload
+
+
+def test_control_reverted_call_site_fails_the_two_tests_above():
+    """Control: with the call site back on the broken expression --gate must exit
+    1, or the two call-site tests are not gating the defect at all."""
+    def revert(src):
+        old = 'available = resolve_available(status, data.get("available"))'
+        assert old in src, "call site moved; update this control, do not delete it"
+        return src.replace(old, 'available = status == "allowed"', 1)
+
+    with tempfile.TemporaryDirectory() as d:
+        r = _run_real_script(Path(d), "--gate", mutate=revert)
+    assert r.returncode == 1, (
+        f"reverted call site still exited {r.returncode} — the call-site tests "
+        "would stay green against the broken predicate"
+    )
 
 
 def main():

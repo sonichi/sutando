@@ -219,18 +219,8 @@ def _update_burn_rate(current_util_5h: float, current_util_7d=None,
 
 
 def resolve_available(status: str, proxy_available) -> bool:
-    """Whether the account can still serve requests.
-
-    The proxy writes an authoritative top-level `available` bool; prefer it over
-    deriving from the status string, whose vocabulary grows (`allowed_warning` is
-    served today and appears in no docs, so a status allowlist would break on the
-    next unlisted value). An explicit "rejected" still wins, so a stale
-    optimistic bool cannot mask exhaustion. With no bool there is no evidence, so
-    the original rule stands — which keeps `unknown` unavailable, because a gate
-    must not proceed on ambiguity. (`health-check.py` takes the opposite default
-    on `unknown`, deliberately: declining to PAGE and declining to PROCEED have
-    opposite fail-safe directions.)
-    """
+    """Trust the proxy's `available` bool over the status string, whose vocabulary
+    grows; explicit "rejected" still wins, and absent a bool require "allowed"."""
     if status == "rejected":
         return False
     if isinstance(proxy_available, bool):
