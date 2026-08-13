@@ -5,7 +5,7 @@ Read Claude Code quota state from quota-state.json.
 Usage:
   python3 read-quota.py              # human readable
   python3 read-quota.py --json       # machine readable
-  python3 read-quota.py --gate       # exit 1 if exhausted
+  python3 read-quota.py --gate       # exit 1 if exhausted OR not routed
 
 Burn-rate tracking (closes #1087):
   On each human/json read, tracks per-5min utilization delta via an EWMA
@@ -230,12 +230,8 @@ def main():
     age_s = time.time() - QUOTA_FILE.stat().st_mtime
     stale = age_s > 30 * 60
 
-    # "Proxy dead" and "this session is not routed through it" are DIFFERENT
-    # answers and the caller acts differently on them. Stale invites "old but
-    # roughly right"; not-routed means the numbers describe someone else's
-    # traffic entirely and say nothing about this session's budget. The
-    # session's own env settles it: startup.sh exports ANTHROPIC_BASE_URL, and
-    # a supervisor-launched core never runs startup.sh, so it is simply unset.
+    # Not-routed is not staleness: the numbers are another session's traffic,
+    # so they cannot authorise this session's spending at any age.
     routed = bool(os.environ.get("ANTHROPIC_BASE_URL"))
 
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
@@ -246,7 +242,9 @@ def main():
 
     result = {
         "status": status,
-        "available": status == "allowed",
+        # Fails closed when unrouted: --gate exits on this field, and a machine
+        # consumer is the one that never sees the human NOT ROUTED banner.
+        "available": status == "allowed" and routed,
         "utilization_5h": util_5h,
         "utilization_7d": util_7d,
         "remaining_5h_pct": round((1 - util_5h) * 100),
@@ -254,6 +252,10 @@ def main():
         "state_age_seconds": int(age_s),
         "stale": stale,
         "routed": routed,
+        # Distinguishes "not this session's data" from "quota exhausted"; both
+        # are unavailable, and a caller retries only one of them.
+        "unavailable_reason": None if (status == "allowed" and routed)
+                              else ("not-routed" if not routed else "exhausted"),
     }
 
     if reset_5h:

@@ -109,6 +109,43 @@ class NotRoutedTest(unittest.TestCase):
         out = self._run(routed=True, argv=("read-quota.py", "--json"))
         self.assertIs(json.loads(out)["routed"], True)
 
+    # --- the DECISION surface, which is what machine callers read ------------
+
+    def _gate_exit(self, routed: bool) -> int:
+        if routed:
+            os.environ["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+        else:
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+        old = sys.argv
+        sys.argv = ["read-quota.py", "--gate"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.mod.main()
+        except SystemExit as e:
+            return int(e.code or 0)
+        finally:
+            sys.argv = old
+        return 0
+
+    def test_unrouted_json_is_not_available(self) -> None:
+        """The banner is prose; this is the field a script branches on."""
+        out = json.loads(self._run(routed=False, argv=("read-quota.py", "--json")))
+        self.assertIs(out["available"], False)
+        self.assertEqual(out["unavailable_reason"], "not-routed")
+
+    def test_routed_json_is_available(self) -> None:
+        """Control: unavailability must come from routing, not from the fixture."""
+        out = json.loads(self._run(routed=True, argv=("read-quota.py", "--json")))
+        self.assertIs(out["available"], True)
+        self.assertIsNone(out["unavailable_reason"])
+
+    def test_unrouted_gate_exits_nonzero(self) -> None:
+        self.assertNotEqual(self._gate_exit(routed=False), 0)
+
+    def test_routed_gate_exits_zero(self) -> None:
+        """Control: the gate still passes for a session that IS routed."""
+        self.assertEqual(self._gate_exit(routed=True), 0)
+
     # --- the window the numbers still describe -------------------------------
 
     def test_unrouted_still_reports_the_raw_windows(self) -> None:
