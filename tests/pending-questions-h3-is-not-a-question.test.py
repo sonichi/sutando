@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """A `###` heading is body text, not a new question.
-
-Documented in the proactive-loop skill because writing one silently folds the
-entry into the preceding question instead of adding one.
-"""
+Why it matters is in the PR body."""
 import importlib.util
 import pathlib
 import tempfile
