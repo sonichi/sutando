@@ -133,10 +133,39 @@ try:
     rgb._maybe_warn_allowlist_divergence()
     check("same set after touch not re-warned (hash dedup)", len(proactive_files(tmp)) == 1)
 
-    # 4c. a NEW divergence (another sender) → second warning
+    # 4b-bis. BROKER-ONLY transitions, access.json untouched throughout. This is
+    # the case the mtime-only trigger could not see: the remedy the warning prints
+    # changes the broker, not the local file, so clear and re-warn must not depend
+    # on a local write. Each pass forces the poll due rather than sleeping.
+    def _due():
+        rgb._ALLOWDIV_STATE["next_poll"] = 0.0
+
+    before = len(proactive_files(tmp))
+    mtime_before = os.path.getmtime(rgb._ag2space_access_path())
+
+    # broker realigns (adds the missing sender) — warned_hash must clear
+    rgb._req = fake_req_factory([{"id": AGENT, "allowFrom": ["@rui:hs", "@mark:hs"]}])
+    _due(); rgb._maybe_warn_allowlist_divergence()
+    check("broker-only realignment writes no new warning",
+          len(proactive_files(tmp)) == before)
+    check("broker-only realignment CLEARED the warned hash",
+          rgb._ALLOWDIV_STATE["warned_hash"] is None)
+
+    # broker diverges again — must re-warn without any local change
+    rgb._req = fake_req_factory([{"id": AGENT, "allowFrom": ["@rui:hs"]}])
+    _due(); rgb._maybe_warn_allowlist_divergence()
+    check("broker-only re-divergence re-warns", len(proactive_files(tmp)) == before + 1,
+          repr(proactive_files(tmp)))
+    check("access.json was never touched across the three passes",
+          os.path.getmtime(rgb._ag2space_access_path()) == mtime_before)
+
+    # 4c. a NEW divergence (another sender) → one more warning. Counted relative
+    # to the prior state: an absolute count silently breaks when a case is inserted
+    # above, which is a stale assertion rather than a real regression.
+    n_before = len(proactive_files(tmp))
     write_access(["@rui:hs", "@mark:hs", "@sam:hs"])
     rgb._maybe_warn_allowlist_divergence()
-    check("new divergence set re-warns", len(proactive_files(tmp)) == 2,
+    check("new divergence set re-warns", len(proactive_files(tmp)) == n_before + 1,
           repr(proactive_files(tmp)))
 finally:
     rgb._req = _orig_req

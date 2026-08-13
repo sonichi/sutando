@@ -504,7 +504,10 @@ def _tier_for(user_id):
 # (qingyun CR 2026-07-30: protocol-compatibility regression + log spam).
 ALLOWDIV_UNSUPPORTED_COOLDOWN = int(
     os.environ.get("REMOTE_ALLOWDIV_RETRY_COOLDOWN") or "300")
-_ALLOWDIV_STATE = {"mtime": None, "warned_hash": None, "unsupported_until": 0.0}
+ALLOWDIV_POLL_INTERVAL = int(
+    os.environ.get("REMOTE_ALLOWDIV_POLL_INTERVAL") or "300")
+_ALLOWDIV_STATE = {"mtime": None, "warned_hash": None, "unsupported_until": 0.0,
+                   "next_poll": 0.0}
 
 
 def allowlist_divergence(local_allow, broker_allow, agent_id):
@@ -594,7 +597,7 @@ def _broker_allow_for(agent_id):
 
 
 def _maybe_warn_allowlist_divergence():
-    """Cheap per-loop hook: does work only on first run / access.json change."""
+    """Cheap per-loop hook: local-mtime change, or a bounded broker re-poll."""
     agent_id = _agent_id()
     if not agent_id:
         return
@@ -602,12 +605,16 @@ def _maybe_warn_allowlist_divergence():
         mt = os.path.getmtime(_ag2space_access_path())
     except OSError:
         return  # no local access.json → nothing to diverge
-    if mt == _ALLOWDIV_STATE["mtime"]:
+    # The remedy this warning prints changes the BROKER registry, which touches no
+    # local mtime — so an mtime-only trigger can never clear or re-arm the warning.
+    now = time.time()
+    if mt == _ALLOWDIV_STATE["mtime"] and now < _ALLOWDIV_STATE["next_poll"]:
         return
     broker = _broker_allow_for(agent_id)
     if broker is None:
-        return  # read failed — mtime unmarked, retried next loop
+        return  # read failed — mtime/next_poll unmarked, retried next loop
     _ALLOWDIV_STATE["mtime"] = mt
+    _ALLOWDIV_STATE["next_poll"] = now + ALLOWDIV_POLL_INTERVAL
     body = allowlist_divergence(_local_allow_from(), broker, agent_id)
     if body is None:
         _ALLOWDIV_STATE["warned_hash"] = None  # aligned again → future divergence re-warns
