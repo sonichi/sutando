@@ -18,10 +18,25 @@ Run: python3 tests/discord-bridge-heartbeat-offload.test.py  (exit 0/1)
 from __future__ import annotations
 
 import asyncio
+import atexit
+import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+# Isolate host config BEFORE touching the bridge. This file only reads the
+# source text today, but `channel_access_path()` falls back to the real
+# `~/.claude/channels/<ch>/access.json`, so the isolation has to be in place
+# for any future edit that imports the module rather than reading it.
+_CFG = tempfile.mkdtemp(prefix="ccd-heartbeat-offload-")
+atexit.register(lambda: shutil.rmtree(_CFG, ignore_errors=True))
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+_CHAN = Path(_CFG) / "channels" / "discord"
+_CHAN.mkdir(parents=True, exist_ok=True)
+(_CHAN / "access.json").write_text('{"allowFrom": []}')
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = (REPO / "src" / "discord-bridge.py").read_text()
