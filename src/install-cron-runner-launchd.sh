@@ -98,16 +98,17 @@ resolve_python() {
     fi
 }
 
-resolve_homebrew_bin() {
-    # Apple Silicon vs Intel — both prefixes work; pick whichever exists.
-    if [ -d /opt/homebrew/bin ]; then
-        echo /opt/homebrew/bin
-    elif [ -d /usr/local/bin ]; then
-        echo /usr/local/bin
-    else
-        echo /usr/bin
-    fi
-}
+# Same self-locating pattern as the workspace helper above.
+__BREW_HELPER="$REPO/src/homebrew_bin.sh"
+[ -f "$__BREW_HELPER" ] || __BREW_HELPER="$(cd "$(dirname "$0")" && pwd)/homebrew_bin.sh"
+if [ -f "$__BREW_HELPER" ]; then
+  # shellcheck source=homebrew_bin.sh
+  source "$__BREW_HELPER"
+else
+  echo "${0##*/}: cannot resolve Homebrew prefix — homebrew_bin.sh not found." >&2
+  exit 1
+fi
+unset __BREW_HELPER
 
 case "$cmd" in
     install)
