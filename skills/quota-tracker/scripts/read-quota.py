@@ -23,6 +23,7 @@ from __future__ import annotations
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -229,6 +230,14 @@ def main():
     age_s = time.time() - QUOTA_FILE.stat().st_mtime
     stale = age_s > 30 * 60
 
+    # "Proxy dead" and "this session is not routed through it" are DIFFERENT
+    # answers and the caller acts differently on them. Stale invites "old but
+    # roughly right"; not-routed means the numbers describe someone else's
+    # traffic entirely and say nothing about this session's budget. The
+    # session's own env settles it: startup.sh exports ANTHROPIC_BASE_URL, and
+    # a supervisor-launched core never runs startup.sh, so it is simply unset.
+    routed = bool(os.environ.get("ANTHROPIC_BASE_URL"))
+
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     util_5h = float(headers.get("anthropic-ratelimit-unified-5h-utilization", 0))
     util_7d = float(headers.get("anthropic-ratelimit-unified-7d-utilization", 0))
@@ -244,6 +253,7 @@ def main():
         "remaining_7d_pct": round((1 - util_7d) * 100),
         "state_age_seconds": int(age_s),
         "stale": stale,
+        "routed": routed,
     }
 
     if reset_5h:
@@ -268,7 +278,15 @@ def main():
         sys.exit(0 if result["available"] else 1)
 
     # Human readable
-    if stale:
+    if not routed:
+        hrs = age_s / 3600
+        print("⛔ NOT ROUTED: ANTHROPIC_BASE_URL is unset, so THIS session does not go "
+              "through the proxy.")
+        print(f"   The numbers below are another session's, {hrs:.1f}h old. They are NOT "
+              "this session's budget —")
+        print("   do not tier work off them. (startup.sh exports the var; a "
+              "supervisor-launched core never runs it.)")
+    elif stale:
         hrs = age_s / 3600
         print(f"⚠ STALE: quota state is {hrs:.1f}h old — proxy not feeding it; numbers below are historical, not current")
     print(f"Status: {status}")
@@ -278,7 +296,10 @@ def main():
     print(f"7d window: {int(util_7d * 100)}% used, {result['remaining_7d_pct']}% remaining")
     if reset_7d:
         print(f"  Resets: {datetime.fromtimestamp(int(reset_7d)).strftime('%H:%M %b %d')}")
-    if result.get("burn"):
+    if result.get("burn") and not routed:
+        print("Burn rate / passes-left: SUPPRESSED — computed from traffic that is not "
+              "this session's.")
+    elif result.get("burn"):
         b = result["burn"]
         print(f"Burn rate: {b['burn_rate_pct_per_pass']}%/pass ({b['burn_samples']} samples)")
         # An unforecast window taints BOTH outcomes, not just the empty one: a
