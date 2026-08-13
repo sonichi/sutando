@@ -30,3 +30,50 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
         return bare
     matches = sorted(tasks_dir.glob(f"{task_id}.claimed-core-*.txt"))
     return matches[0] if matches else None
+
+
+def archive_file(src: Path, kind: str, task_id: str, *,
+                 tasks_dir: Path, results_dir: Path, log=print) -> bool:
+    """Move src into the archive, NEVER deleting it if that fails.
+
+    Returns True when src has left the live queue (archived, quarantined, or
+    never existed), False only when it is still there under its live name.
+
+    Adapters inject their own resolved destinations and logger; the
+    never-delete policy lives here so the three bridges cannot drift apart on
+    it. A failed archive that unlinks the source destroys the only copy of a
+    task, which is unrecoverable; a stale file is merely noisy.
+    """
+    import shutil
+    from datetime import datetime
+    try:
+        if src.exists():
+            base = tasks_dir if kind == "tasks" else results_dir
+            dest_dir = base / datetime.now().strftime("%Y-%m")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
+        return True
+    except Exception as e:
+        log(f"  archive_file({kind}, {task_id}) failed: {e}")
+    try:
+        # Never delete, and never overwrite: rename() replaces an existing file
+        # on POSIX, so a repeated id would destroy the earlier quarantine.
+        base = src.with_suffix(src.suffix + ".archive-failed")
+        dest, n = base, 0
+        while dest.exists():
+            n += 1
+            dest = base.with_name(f"{base.name}.{n}")
+        # link() REFUSES an existing dest, so a lost race errors instead of
+        # clobbering; the suffix leaves the *.txt glob so it stops being polled.
+        import os as _os
+        _os.link(str(src), str(dest))
+    except Exception as e:
+        log(f"  archive_file({kind}, {task_id}) STILL in the live queue, expect reprocessing: {e}")
+        return False
+    try:
+        src.unlink()
+        log(f"  archive_file({kind}, {task_id}) quarantined as {dest.name}")
+        return True
+    except Exception as e:
+        log(f"  archive_file({kind}, {task_id}) STILL in the live queue, expect reprocessing: {e}")
+        return False

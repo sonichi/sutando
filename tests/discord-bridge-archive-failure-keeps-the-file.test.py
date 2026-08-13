@@ -24,33 +24,29 @@ _spec.loader.exec_module(_task_archive)
 
 
 def _load(tasks_archive, results_archive):
-    """Exec archive_path + archive_file against temp archive roots."""
-    tree = ast.parse(SRC.read_text())
-    wanted = {"archive_path", "archive_file"}
-    body = [n for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name in wanted]
-    missing = wanted - {n.name for n in body}
-    if missing:
-        raise AssertionError(f"not found in {SRC}: {sorted(missing)}")
-    ns = {"Path": Path, "os": os, "ARCHIVE_TASKS_DIR": tasks_archive,
-          "ARCHIVE_RESULTS_DIR": results_archive}
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(SRC), "exec"), ns)
-    return ns["archive_file"]
+    """Bind the SHARED policy to temp archive roots. The bridges are adapters
+    over this, so the contract is tested here once, not three times."""
+    def archive(src, kind, task_id):
+        return _task_archive.archive_file(
+            src, kind, task_id,
+            tasks_dir=tasks_archive, results_dir=results_archive,
+            log=lambda m: None)
+    return archive
 
 
 def _load_pair(tasks_archive, results_archive, tasks_dir, cleared):
     """Exec archive_path + archive_file + _archive_delivered_pair together, so
     the shared cleanup policy is exercised rather than pattern-matched."""
     tree = ast.parse(SRC.read_text())
-    wanted = {"archive_path", "archive_file", "_archive_delivered_pair"}
+    wanted = {"_archive_delivered_pair"}
     body = [n for n in tree.body
             if isinstance(n, ast.FunctionDef) and n.name in wanted]
     missing = wanted - {n.name for n in body}
     if missing:
         raise AssertionError(f"not found in {SRC}: {sorted(missing)}")
-    ns = {"Path": Path, "os": os, "ARCHIVE_TASKS_DIR": tasks_archive,
-          "ARCHIVE_RESULTS_DIR": results_archive, "TASKS_DIR": tasks_dir,
+    ns = {"Path": Path, "os": os, "TASKS_DIR": tasks_dir,
           "find_task_file": _task_archive.find_task_file,
+          "archive_file": _load(tasks_archive, results_archive),
           "_clear_delivered": lambda t: cleared.append(t)}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SRC), "exec"), ns)
     return ns["_archive_delivered_pair"]
@@ -147,10 +143,9 @@ class ArchiveFailureIsNotDeletion(unittest.TestCase):
     def test_archive_file_never_unlinks_its_source_before_a_copy_exists(self):
         """It may unlink only after the hard link is in place — an unlink that
         can run on the failure path is the deletion bug returning."""
-        text = SRC.read_text()
+        text = (SRC.parent / "task_archive.py").read_text()
         start = text.index("def archive_file(")
-        end = text.index("\ndef ", start + 1)
-        body = text[start:end]
+        body = text[start:]
         self.assertIn("os.link(", body, "quarantine must link before unlinking")
         self.assertLess(body.index("os.link("), body.index("src.unlink()"),
                         "unlink must come after the link, never before")
@@ -217,6 +212,33 @@ class CallersHonourTheReturn(unittest.TestCase):
         self.assertFalse(archive(src, "tasks", "task-4"),
                          "if the source is still under its live name, say so")
         self.assertTrue(Path(src).exists(), "never delete on the failure path")
+
+
+class EveryBridgeDelegatesTheNeverDeletePolicy(unittest.TestCase):
+    """#2819's fix was Discord-only; slack and telegram unlinked the source on a
+    failed archive, destroying the only copy of the task."""
+
+    BRIDGES = ("discord-bridge.py", "slack-bridge.py", "telegram-bridge.py")
+
+    def _fn(self, name):
+        tree = ast.parse((SRC.parent / name).read_text())
+        fns = [n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == "archive_file"]
+        self.assertEqual(len(fns), 1, f"{name}: expected exactly one archive_file")
+        return fns[0]
+
+    def test_no_bridge_unlinks_its_source_on_a_failed_archive(self):
+        for name in self.BRIDGES:
+            calls = [c for c in ast.walk(self._fn(name)) if isinstance(c, ast.Call)
+                     and getattr(c.func, "attr", "") == "unlink"]
+            self.assertEqual(calls, [], f"{name} deletes the task it failed to archive")
+
+    def test_every_bridge_routes_through_the_shared_policy(self):
+        for name in self.BRIDGES:
+            delegates = [c for c in ast.walk(self._fn(name)) if isinstance(c, ast.Call)
+                         and getattr(c.func, "id", "") == "_shared_archive_file"]
+            self.assertEqual(len(delegates), 1,
+                             f"{name} must call the shared archive policy exactly once")
 
 
 if __name__ == "__main__":

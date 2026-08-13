@@ -94,6 +94,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from orphan_result_routes import orphan_result_routes  # noqa: E402
 
 
@@ -449,41 +450,12 @@ def archive_path(kind: str, task_id: str) -> "Path":
 
 
 def archive_file(src: "Path", kind: str, task_id: str) -> bool:
-    """Move src into the archive. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving".
-
-    Returns True when src has left the live queue (archived, quarantined, or
-    never existed), False only when it is still there under its live name."""
-    try:
-        if src.exists():
-            import shutil
-            shutil.move(str(src), str(archive_path(kind, task_id)))
-        return True
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
-    try:
-        # Never delete, and never overwrite: rename() replaces an existing file
-        # on POSIX, so a repeated id would destroy the earlier quarantine.
-        base = src.with_suffix(src.suffix + ".archive-failed")
-        dest, n = base, 0
-        while dest.exists():
-            n += 1
-            dest = base.with_name(f"{base.name}.{n}")
-        # link() REFUSES an existing dest, so a lost race errors instead of
-        # clobbering; the suffix leaves the *.txt glob so it stops being polled.
-        os.link(str(src), str(dest))
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) STILL in the live queue, "
-              f"expect reprocessing: {e}", flush=True)
-        return False
-    try:
-        src.unlink()
-        print(f"  archive_file({kind}, {task_id}) quarantined as {dest.name}", flush=True)
-        return True
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) STILL in the live queue, "
-              f"expect reprocessing: {e}", flush=True)
-        return False
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy in task_archive."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(m, flush=True))
 
 
 def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
