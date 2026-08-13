@@ -486,6 +486,23 @@ def archive_file(src: "Path", kind: str, task_id: str) -> bool:
         return False
 
 
+def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
+    """Archive a delivered task's result + task file, then retire its sentinel.
+
+    One owner for a policy both delivery paths need: the sentinel may only be
+    cleared once the result has actually left the live queue, because a
+    surviving result re-enters the poll loop and the sentinel is the only thing
+    standing between it and a second send.
+    """
+    gone = archive_file(result_file, "results", task_id)
+    # find_task_file, not a reconstructed bare name: a claimed task is
+    # `<id>.claimed-core-N.txt` and would strand forever.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+    if gone:
+        _clear_delivered(task_id)
+
+
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
     """POST to agent-api /task-done so web UI flips status without waiting
     for its next /tasks/active poll. Best-effort; silent on failure (web UI
@@ -4684,13 +4701,7 @@ async def poll_results():
                 # archive_file() finishing. See DELIVERED_DIR docstring.
                 if _is_delivered(task_id):
                     print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
-                    _gone = archive_file(result_file, "results", task_id)
-                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
-                    # A result still under its live *.txt name re-enters this
-                    # loop; the sentinel is all that stops a second send.
-                    if _gone:
-                        _clear_delivered(task_id)
+                    _archive_delivered_pair(result_file, task_id)
                     continue
 
                 try:
@@ -4894,15 +4905,7 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
-                _gone = archive_file(result_file, "results", task_id)
-                # find_task_file, not a reconstructed bare name: a claimed
-                # task is `<id>.claimed-core-N.txt` and would strand forever.
-                task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                archive_file(task_file, "tasks", task_id)
-                # Clear only once the result has actually left the live queue —
-                # otherwise the sentinel is the only guard against a resend.
-                if _gone:
-                    _clear_delivered(task_id)
+                _archive_delivered_pair(result_file, task_id)
             else:
                 # CONSECUTIVE means consecutive: an absent file breaks the run, or a
                 # writer that retries accumulates counts across separate appearances.

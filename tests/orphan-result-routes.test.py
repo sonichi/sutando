@@ -264,24 +264,28 @@ class WiringTest(unittest.TestCase):
                       "poll_results never calls it, so nothing adopts an orphan route")
 
     def test_delivery_cleanup_archives_a_CLAIMED_task_not_a_rebuilt_bare_name(self):
-        # EVERY archive-then-clear site must resolve the claimed path, not just the
-        # first: anchoring on one lets a sibling site satisfy the match vacuously.
-        sites = re.findall(r"task_file = ([^\n]*)\n"
-                           r"\s*archive_file\(task_file, \"tasks\", task_id\)\n"
-                           r"(?:\s*(?:#[^\n]*|if [A-Za-z_]\w*:)\n)+"
-                           r"\s*_clear_delivered\(task_id\)", self.src)
-        self.assertGreaterEqual(
-            len(sites), 2,
-            "expected both post-delivery cleanup sites; a dropped one is an unchecked bare-name rebuild")
+        # ONE owner for the archive-then-clear policy. Asserting the resolver
+        # inside it beats matching call sites: a new site inherits it for free.
+        m = re.search(r"def _archive_delivered_pair\(.*?\n\n\n", self.src, re.S)
+        self.assertIsNotNone(m, "the shared post-delivery cleanup helper is missing")
+        helper = m.group(0)
+        expr = re.search(r"task_file = ([^\n]*)\n", helper)
+        self.assertIsNotNone(expr, "the helper must resolve a task path")
         with tempfile.TemporaryDirectory() as td:
             tasks = Path(td)
             claimed = tasks / "task-99.claimed-core-1.txt"
             claimed.write_text("body")
             ns = {"find_task_file": _task_archive.find_task_file,
                   "TASKS_DIR": tasks, "task_id": "task-99"}
-            for expr in sites:
-                self.assertEqual(eval(expr, ns), claimed,
-                                 f"cleanup resolves the bare name, not the claimed file: {expr}")
+            self.assertEqual(eval(expr.group(1), ns), claimed,
+                             "cleanup resolves the bare name, not the claimed file")
+        # and every delivery path must go THROUGH it rather than open-coding
+        self.assertGreaterEqual(
+            len(re.findall(r"^\s+_archive_delivered_pair\(result_file, task_id\)$",
+                           self.src, re.M)), 2,
+            "both delivery paths must call the shared helper")
+        self.assertNotIn("_gone = archive_file", self.src,
+                         "an open-coded cleanup site bypasses the shared policy")
 
     def test_the_bridge_injects_a_snowflake_validator(self):
         m = re.search(r"def _is_discord_channel_id\(value: str\) -> bool:.*?return ([^\n]+)",

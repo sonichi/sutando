@@ -4,6 +4,7 @@ Quarantine must not overwrite an earlier one, and callers must honour False."""
 from pathlib import Path
 import ast
 import os
+import importlib.util
 import tempfile
 import unittest
 
@@ -15,6 +16,11 @@ _ACCESS.parent.mkdir(parents=True, exist_ok=True)
 _ACCESS.write_text('{"allowFrom": []}')
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "discord-bridge.py"
+
+_spec = importlib.util.spec_from_file_location(
+    "_task_archive", Path(__file__).resolve().parent.parent / "src" / "task_archive.py")
+_task_archive = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_task_archive)
 
 
 def _load(tasks_archive, results_archive):
@@ -30,6 +36,24 @@ def _load(tasks_archive, results_archive):
           "ARCHIVE_RESULTS_DIR": results_archive}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SRC), "exec"), ns)
     return ns["archive_file"]
+
+
+def _load_pair(tasks_archive, results_archive, tasks_dir, cleared):
+    """Exec archive_path + archive_file + _archive_delivered_pair together, so
+    the shared cleanup policy is exercised rather than pattern-matched."""
+    tree = ast.parse(SRC.read_text())
+    wanted = {"archive_path", "archive_file", "_archive_delivered_pair"}
+    body = [n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name in wanted]
+    missing = wanted - {n.name for n in body}
+    if missing:
+        raise AssertionError(f"not found in {SRC}: {sorted(missing)}")
+    ns = {"Path": Path, "os": os, "ARCHIVE_TASKS_DIR": tasks_archive,
+          "ARCHIVE_RESULTS_DIR": results_archive, "TASKS_DIR": tasks_dir,
+          "find_task_file": _task_archive.find_task_file,
+          "_clear_delivered": lambda t: cleared.append(t)}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(SRC), "exec"), ns)
+    return ns["_archive_delivered_pair"]
 
 
 class ArchiveFailureIsNotDeletion(unittest.TestCase):
@@ -133,36 +157,66 @@ class ArchiveFailureIsNotDeletion(unittest.TestCase):
 
 
 class CallersHonourTheReturn(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.d = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
     """A False return that every caller discards is not a contract."""
 
-    def test_delivery_sentinel_clears_only_when_the_result_is_gone(self):
-        tree = ast.parse(SRC.read_text())
-        clears = [n for n in ast.walk(tree)
-                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                  and n.func.id == "_clear_delivered"]
-        gated = [c for n in ast.walk(tree)
-                 if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
-                 and n.test.id == "_gone"
-                 for c in ast.walk(ast.Module(body=n.body, type_ignores=[]))
-                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
-                 and c.func.id == "_clear_delivered"]
-        self.assertGreaterEqual(len(clears), 2)
-        self.assertEqual(len(gated), len(clears),
-                         "every _clear_delivered must sit behind `if _gone:` — "
-                         "clearing while the result is still live permits a resend")
+    def test_the_pair_clears_the_sentinel_when_the_result_IS_archived(self):
+        cleared = []
+        pair = _load_pair(self.d / "at", self.d / "ar", self.d / "tasks", cleared)
+        (self.d / "tasks").mkdir()
+        res = self.d / "task-1.txt"; res.write_text("r")
+        (self.d / "tasks" / "task-1.txt").write_text("t")
+        pair(res, "task-1")
+        self.assertEqual(cleared, ["task-1"], "a fully archived pair must retire its sentinel")
+        self.assertFalse(res.exists(), "the result must leave the live queue")
 
-    def test_the_gate_reads_the_RESULT_archive(self):
-        tree = ast.parse(SRC.read_text())
-        assigns = [n for n in ast.walk(tree)
-                   if isinstance(n, ast.Assign)
-                   and any(isinstance(t, ast.Name) and t.id == "_gone" for t in n.targets)
-                   and isinstance(n.value, ast.Call)
-                   and getattr(n.value.func, "id", None) == "archive_file"
-                   and n.value.args
-                   and getattr(n.value.args[0], "id", None) == "result_file"]
-        self.assertGreaterEqual(len(assigns), 2,
-                                "each gated site needs its own "
-                                "`_gone = archive_file(result_file, ...)`")
+    def test_the_pair_KEEPS_the_sentinel_when_the_result_survives(self):
+        # Both routes must fail for the result to still be live: the move (broken
+        # archive root) AND the quarantine (unlink refused). A quarantined file
+        # HAS left the live glob, so that alone is correctly treated as gone.
+        class _NoUnlink(type(Path())):
+            def unlink(self, *a, **k):
+                raise OSError("unlink refused")
+        cleared = []
+        broken = self.d / "at"; broken.write_text("not a directory")
+        tasks = self.d / "tasks"; tasks.mkdir()
+        pair = _load_pair(broken, broken, tasks, cleared)
+        res = _NoUnlink(self.d / "task-2.txt"); res.write_text("r")
+        pair(res, "task-2")
+        self.assertEqual(cleared, [], "a result still under its live name must KEEP its "
+                                      "sentinel — clearing it permits a second send")
+        self.assertTrue(Path(res).exists(), "a failed archive must never delete the result")
+
+    def test_the_pair_resolves_a_CLAIMED_task_not_a_rebuilt_bare_name(self):
+        cleared = []
+        tasks = self.d / "tasks"; tasks.mkdir()
+        pair = _load_pair(self.d / "at", self.d / "ar", tasks, cleared)
+        claimed = tasks / "task-3.claimed-core-1.txt"; claimed.write_text("t")
+        res = self.d / "task-3.txt"; res.write_text("r")
+        pair(res, "task-3")
+        self.assertFalse(claimed.exists(),
+                         "a claimed task must be archived, not stranded under its claim name")
+
+    def test_unlink_failure_after_a_successful_link_reports_still_live(self):
+        # link() succeeds, unlink() raises -> the second except, which must
+        # report False rather than claim the source is gone.
+        class _NoUnlink(type(Path())):
+            def unlink(self, *a, **k):
+                raise OSError("unlink refused")
+        # archive root clobbered by a FILE so shutil.move raises for real and
+        # the quarantine path runs; link() then succeeds beside the source.
+        broken = self.d / "at2"; broken.write_text("not a directory")
+        archive = _load(broken, broken)
+        src = _NoUnlink(self.d / "task-4.txt"); src.write_text("body")
+        self.assertFalse(archive(src, "tasks", "task-4"),
+                         "if the source is still under its live name, say so")
+        self.assertTrue(Path(src).exists(), "never delete on the failure path")
 
 
 if __name__ == "__main__":
