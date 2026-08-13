@@ -55,6 +55,7 @@ KNOWN_TOP = {
     "name", "scope", "version", "owner", "license", "description", "stability",
     "agent_compatibility", "dependencies", "permissions", "contract",
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
+    "hooks",
 }
 # Signals a skill actually touches the network (used for the permission cross-check).
 # No trailing \b: signals ending in a space/paren (`curl `, `fetch(`) are followed
@@ -163,6 +164,28 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
             tpath = skill_dir / re.sub(r"^\./", "", tools_rel)
             if not tpath.exists():
                 err(f"tools path '{tools_rel}' does not exist")
+
+    hooks = m.get("hooks")
+    if hooks is not None:
+        if not isinstance(hooks, list):
+            err(f"hooks must be a list, got {type(hooks).__name__}")
+        else:
+            for i, hook in enumerate(hooks):
+                if not isinstance(hook, dict):
+                    err(f"hooks[{i}] must be an object")
+                    continue
+                event, cmd = hook.get("event"), hook.get("command")
+                if not isinstance(event, str) or not event:
+                    err(f"hooks[{i}] missing 'event'")
+                if not isinstance(cmd, str) or not cmd:
+                    err(f"hooks[{i}] missing 'command'")
+                    continue
+                # Same escape rule as tools: a hook outside its skill dir defeats
+                # the per-skill model, and discovery silently drops what it can't find.
+                if ".." in cmd.split("/"):
+                    err(f"hooks[{i}] command '{cmd}' must not escape the skill dir (no '..')")
+                elif not (skill_dir / re.sub(r"^\./", "", cmd)).exists():
+                    err(f"hooks[{i}] command '{cmd}' does not exist")
 
     return (errors, warnings)
 
