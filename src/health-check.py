@@ -1282,6 +1282,15 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: install would have trained operators to ignore the detector.
 WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
 
+#: `personal_path()` resolves these at the workspace root and never under `state/`,
+#: so the probe's "state belongs under state/" remedy would break the reader.
+WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
+    "PERSONAL_CLAUDE.md",
+    "stand-identity.json",
+    "stand-avatar.png",
+    "voice-context-active",
+})
+
 
 def check_workspace_root_tidy() -> "dict | None":
     """Flag loose FILES at the workspace root — state that escaped `state/`.
@@ -1315,6 +1324,7 @@ def check_workspace_root_tidy() -> "dict | None":
             p.name for p in WORKSPACE_DIR.iterdir()
             if p.is_file()
             and p.name not in WORKSPACE_ROOT_ALLOWED
+            and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
             and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
         )
     except OSError:
