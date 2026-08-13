@@ -96,15 +96,44 @@ class ManifestLintAcceptsAndValidatesHooks(unittest.TestCase):
             "stability": "experimental",
         }
 
+    @staticmethod
+    def _linter():
+        """Import the module rather than shelling out to it.
+
+        A subprocess runs uninstrumented, so a CLI-only test leaves the rules it
+        exercises reading as 0% covered — which is what the gate caught.
+        """
+        import importlib.util
+        path = Path(__file__).resolve().parent.parent / "scripts" / "lint-skill.py"
+        spec = importlib.util.spec_from_file_location("lint_skill", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
     def _lint(self, hooks="__omit__"):
+        """(rc, text) with rc mirroring the CLI: non-zero when errors exist."""
         m = dict(self.base)
         if hooks != "__omit__":
             m["hooks"] = hooks
         (self.skill / "manifest.json").write_text(json.dumps(m))
-        r = subprocess.run(
+        errors, warnings = self._linter()._lint_manifest(self.skill)
+        return (1 if errors else 0), "\n".join(errors + warnings)
+
+    def test_the_CLI_exit_code_still_tracks_errors(self):
+        """One subprocess case so the in-process shortcut above cannot drift
+        from what the command actually returns."""
+        (self.skill / "manifest.json").write_text(json.dumps(
+            {**self.base, "hooks": [{"event": "PreToolUse", "command": "./hooks/nope.py"}]}))
+        bad = subprocess.run(
             [sys.executable, str(self.REPO / "scripts" / "lint-skill.py"), str(self.skill)],
             capture_output=True, text=True)
-        return r.returncode, r.stdout + r.stderr
+        (self.skill / "manifest.json").write_text(json.dumps(
+            {**self.base, "hooks": [{"event": "PreToolUse", "command": "./hooks/g.py"}]}))
+        good = subprocess.run(
+            [sys.executable, str(self.REPO / "scripts" / "lint-skill.py"), str(self.skill)],
+            capture_output=True, text=True)
+        self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
+        self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
 
     def test_CONTROL_no_hooks_key_is_clean(self):
         """Without a passing baseline the failure cases below prove nothing."""
