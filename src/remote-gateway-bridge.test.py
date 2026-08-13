@@ -882,6 +882,12 @@ def main() -> int:
           and not ungated.exists(),
           "gate=None (standalone default): claims regardless of routing state")
     rtc.PROACTIVE_CLAIM_GATE = _prev_gate
+    # A file that vanished between glob and gate (a racing consumer's claim)
+    # must not be claimed: stat() raises, the gate answers False.
+    _activity.write_text(json.dumps(
+        {"ts": int(time.time()), "channel": "discord", "summary": "hi"}))
+    check(rtc.PROACTIVE_CLAIM_GATE(rtc.RESULTS_DIR / "proactive-vanished.txt") is False,
+          "gate: a vanished (already-claimed) file is not claimed")
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
 
