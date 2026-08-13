@@ -2,24 +2,10 @@
 <!--
   Sutando — phone-stack watchdog launchd job (template).
 
-  Role: supervise the phone stack (conversation-server :3100 + reserved-domain
-  ngrok tunnel). startup.sh starts them fire-and-forget with no supervision, so a
-  host sleep/reboot/process death leaves the Twilio number answering Twilio's
-  generic "application error" until someone manually restarts. This job curls the
-  PUBLIC webhook /health every 120s and re-runs the launcher when it is down.
-
-  Installed by `bash src/install-phone-watchdog-launchd.sh` after the install
-  script substitutes __REPO__, __WORKSPACE__, and __HOMEBREW_BIN__ with the
-  user's actual paths. Do NOT load this template directly — paths must be
-  expanded first.
-
-  Behavior:
-    - Fires every 120s (StartInterval); the healthy path exits immediately.
-    - Runs `bash src/phone-watchdog.sh`.
-    - ThrottleInterval=120 prevents crash-loop thrash.
-    - Exit-only job (KeepAlive omitted) — launchd waits StartInterval, fires
-      again, no zombie process between runs.
-    - Output goes to $WORKSPACE/logs/phone-watchdog-launchd.log for postmortem.
+  Do NOT load directly: `bash src/install-phone-watchdog-launchd.sh` must first
+  substitute __REPO__, __WORKSPACE__ and __HOMEBREW_BIN__ with real paths.
+  KeepAlive is omitted on purpose — this is an exit-only job that launchd re-runs
+  on StartInterval, so a persistent process would defeat the interval.
 -->
 <plist version="1.0">
 <dict>

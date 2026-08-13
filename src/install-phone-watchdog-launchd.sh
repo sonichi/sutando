@@ -1,27 +1,13 @@
 #!/bin/bash
 # Install / uninstall the launchd-supervised phone-stack watchdog.
 #
-# Role: supervise the phone stack (conversation-server :3100 + reserved-domain
-# ngrok tunnel). startup.sh starts them fire-and-forget with no supervision, so a
-# host sleep/reboot/process death leaves the Twilio number answering Twilio's
-# generic "application error" until someone notices. This job curls the PUBLIC
-# webhook /health every 120s and re-runs the launcher when it is down.
-#
-# What this does:
-#   - Renders src/launchd/com.sutando.phone-watchdog.plist with absolute paths
-#     and writes it to ~/Library/LaunchAgents/com.sutando.phone-watchdog.plist
-#   - Loads it via `launchctl bootstrap gui/$UID` (the modern Sequoia idiom).
-#   - Result: macOS runs `bash src/phone-watchdog.sh` every 120s, independent of
-#     any Sutando session.
-#
 # Usage:
 #   bash src/install-phone-watchdog-launchd.sh             # install (idempotent)
 #   bash src/install-phone-watchdog-launchd.sh --uninstall # remove (idempotent)
 #   bash src/install-phone-watchdog-launchd.sh --status    # print job state
 #
-# Idempotent: re-running install bootouts the existing job before bootstrapping
-# the new one, so a `git pull` that updates the template is picked up by
-# re-running this script.
+# Install bootouts an existing job first, so re-running picks up a template
+# changed by `git pull`.
 
 set -e
 

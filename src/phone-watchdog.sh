@@ -1,24 +1,13 @@
 #!/usr/bin/env bash
 # Phone-stack watchdog — restart the phone stack when the PUBLIC webhook dies.
 #
-# The phone stack (skills/phone-conversation conversation-server on :3100 + the
-# reserved-domain ngrok tunnel) is started fire-and-forget by src/startup.sh with
-# no supervision. Any host sleep/reboot/process death leaves the Twilio number
-# answering Twilio's generic "application error" — its webhook still points at
-# the now-dead tunnel — until someone manually restarts. This watchdog closes
-# that gap: run every 120s by launchd (com.sutando.phone-watchdog), it curls the
-# PUBLIC webhook /health (the exact URL Twilio hits, so a wrong-domain or dead
-# tunnel is caught too) and, on failure, re-runs the canonical launcher.
+# Probes the PUBLIC url, not localhost: a wrong-domain or dead tunnel still
+# answers on :3100, and Twilio only ever hits the public one.
+# Recovery defaults to startup.sh because it is idempotent and owns bundled-mode
+# launch; RECOVER_CMD overrides it for a phone-only restart.
 #
-# Recovery reuses src/startup.sh on purpose: it is idempotent (pgrep-guards every
-# service, restarts only what is down) and owns the exact bundled-mode launch
-# (run_node_service / node-bin resolved via sutando-config.sh) that a standalone
-# restart would have to duplicate and could get wrong on a packaged install.
-# RECOVER_CMD overrides it for a host that wants a phone-only restart.
-#
-# Zero-token pure bash: the healthy path exits immediately with no work.
-# Testability: HEALTH_URL overrides the probed URL; DRY_RUN=1 prints the recovery
-# action instead of running it, so tests never touch a real stack.
+# HEALTH_URL overrides the probed URL and DRY_RUN=1 prints the recovery action
+# instead of running it, so tests never touch a real stack.
 
 set -uo pipefail
 
