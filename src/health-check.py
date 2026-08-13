@@ -2548,26 +2548,8 @@ def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
     """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
 
-    Uses the LAST-FETCHED remote ref — deliberately does not fetch. A health
-    probe must stay fast and work offline, and a network call here would make
-    the whole run hang on a flaky link. The consequence is honest and stated in
-    the warning text: if the local ref is itself stale the count UNDERSTATES the
-    drift, so this can only under-report, never cry wolf.
-
-    That "only under-reports" promise holds ONLY where the two refs share
-    history. In a SHALLOW clone whose remote ref was fetched separately the
-    graft boundaries can leave HEAD and origin/<branch> with no common ancestor
-    at all, and `rev-list --count HEAD..origin/<branch>` then degenerates to
-    "commits reachable from the remote tip", which is a small precise-looking
-    number that is not a distance. Measured on a bundled engine checkout
-    2026-08-12: count said **1** while the two refs shared no merge-base and the
-    content gap was **43 files**. The bundled checkout is always shallow, so
-    that is the primary deployment, and the false 1 also pushed the caller onto
-    its under-threshold branch and had it recommend `git pull --ff-only` — which
-    cannot succeed without a common ancestor.
-
-    So require a merge-base first: no shared history means the question is
-    unanswerable, which is what None already means here.
+    Uses the last-fetched remote ref and never fetches. Requires a merge-base:
+    without shared history the count is not a distance (shallow graft boundary).
     """
     try:
         base = subprocess.run(
@@ -2577,9 +2559,7 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     except (OSError, subprocess.TimeoutExpired):
         return None
     if base.returncode != 0:
-        # No common ancestor (typically shallow graft boundaries). A count here
-        # would be a number without a meaning — worse than no number, because
-        # callers treat a small one as "nearly current".
+        # No shared history: a count here would be a number without a meaning.
         return None
     try:
         out = subprocess.run(
@@ -2722,15 +2702,13 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # disagreed invisibly, and that is true of any content difference.
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     if stale_skills:
-        # `behind` is None when the refs share no history (shallow graft). The
-        # tree diff below is still valid — it compares trees, not ancestry — but
-        # neither a count nor a fast-forward is available, so say that instead of
-        # rendering "None commit(s)" and prescribing a pull that cannot apply.
+        # No shared history: the tree diff is still valid, but no count and no
+        # fast-forward are, so say that rather than render "None commit(s)".
         if behind is None:
             distance = (f"live checkout is on {expected!r} an unknown distance behind "
                         f"origin/{expected} (no common ancestor — shallow clone, so a commit "
                         "count is not available)")
-            # "of them" needs a total to refer to; without one it would dangle.
+            # "of them" needs a total to refer to.
             share = f"{len(stale_skills)} commit(s) change"
             refresh = (f"`git -C {repo} fetch --unshallow` first; `pull --ff-only` cannot "
                        "apply without a shared history")
@@ -2738,8 +2716,7 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
             distance = (f"live checkout is on {expected!r} and only {behind} commit(s) behind "
                         f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
                         "nag threshold")
-            # The count above is the TOTAL; "of them" keeps the skill subset
-            # visibly a subset of it rather than a second, competing number.
+            # The count above is the TOTAL, so "of them" keeps the subset a subset.
             share = f"{len(stale_skills)} of them change"
             refresh = f"`git -C {repo} pull --ff-only`"
         return {"name": name, "status": "warn",

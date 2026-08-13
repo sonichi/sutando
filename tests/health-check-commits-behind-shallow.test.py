@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """`_commits_behind` must refuse to answer when the refs share no history.
 
-The bundled engine checkout is always shallow, so this is the primary
-deployment, not an edge case. Every case drives real git repositories: the
-defect IS git's behaviour across a graft boundary, so a stub would only test
-the stub.
-
 Run: python3 tests/health-check-commits-behind-shallow.test.py
 """
 
@@ -72,7 +67,7 @@ class CommitsBehindTest(unittest.TestCase):
     # --- shared history: the count is real and must still be produced --------
 
     def test_counts_normally_when_history_is_shared(self) -> None:
-        """Control. Without this the None-return below proves nothing."""
+        """Control: without this the None-return proves nothing."""
         clone = self._clone(shallow=False)
         _commit(self.upstream, "two\n", "second")
         _commit(self.upstream, "three\n", "third")
@@ -86,16 +81,9 @@ class CommitsBehindTest(unittest.TestCase):
     # --- the bug -------------------------------------------------------------
 
     def test_returns_none_when_no_common_ancestor(self) -> None:
-        """No common ancestor: a count would be a number without a meaning.
-
-        The fixture reaches that state by rebuilding upstream history rather than
-        by depth (git ignores --depth for local clones). Disconnection is the
-        CONDITION under test; shallowness is how production reaches it.
-        """
+        """No common ancestor: the count would be a number without a meaning."""
         clone = self._clone(shallow=True)
-        # Rebuild upstream history so nothing the clone holds is reachable from
-        # it — the shape a shallow bundled checkout reaches after the upstream
-        # commits it grafted at fall outside its depth.
+        # Rebuild upstream history so nothing the clone holds is reachable.
         orphan = self.upstream / "orphan.txt"
         _git(self.upstream, "checkout", "-q", "--orphan", "rebuilt")
         orphan.write_text("rebuilt\n")
@@ -128,18 +116,13 @@ class CommitsBehindTest(unittest.TestCase):
 
         r = hc.check_live_checkout_branch(repo_dir=clone)
         detail = r["detail"]
-        # Asserted unconditionally on purpose. Guarding these behind an
-        # `if r["status"] == "warn"` would let the test pass silently on the day
-        # the fixture stops reaching this branch, which is the failure mode this
-        # file exists to catch one level down.
+        # Asserted unconditionally: a guarded assert can pass without running.
         self.assertEqual(r["status"], "warn", detail)
         self.assertIn("skills/", detail)
         self.assertNotIn("None commit", detail)
         self.assertIn("unknown distance", detail)
         self.assertIn("no common ancestor", detail)
-        # The PRESCRIPTION must become unshallow. The text may still name
-        # ff-only — it does, to say it cannot apply — so asserting the string is
-        # absent would be asserting against a true sentence.
+        # The PRESCRIPTION must become unshallow; the text may still name ff-only.
         self.assertIn("fetch --unshallow", detail)
         self.assertIn("cannot apply without a shared history", detail)
 
