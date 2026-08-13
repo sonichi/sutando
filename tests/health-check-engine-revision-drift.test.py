@@ -102,6 +102,32 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("diverged", r["detail"])
 
+    def test_abbreviated_sha_of_the_same_commit_is_not_drift(self) -> None:
+        """A probe that prints "X != X (0 commits ahead)" discredits itself.
+
+        The abbreviation satisfies `cat-file -e` and `merge-base --is-ancestor`,
+        so before the fix it reached the ahead-branch with a count of zero
+        instead of being recognised as the same commit. Reported by john-the-dev
+        on #2864 with this repro; it cannot fire against today's manifest
+        producer (it writes a full 40-char sha) but the failure mode is a
+        self-contradiction, so it is closed rather than left latent.
+        """
+        for width in (7, 12, 40):
+            with self.subTest(width=width):
+                self._write_manifest(sha=self.first[:width])
+                r = self._run()
+                self.assertEqual(r["status"], "ok", r)
+                self.assertIn("matches built revision", r["detail"])
+                self.assertNotIn("!=", r["detail"])
+
+    def test_a_tag_naming_head_is_not_drift(self) -> None:
+        """Normalising via rev-parse also accepts any other ref-ish value."""
+        _git(self.repo, "tag", "built-here")
+        self._write_manifest(sha="built-here")
+        r = self._run()
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("!=", r["detail"])
+
     # --- degrade cleanly where the question does not apply ---------------
 
     def test_ok_when_no_manifest(self) -> None:

@@ -2774,6 +2774,18 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
     if head.returncode != 0:
         return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
     head_sha = head.stdout.strip()
+    # Resolve the manifest value to a full sha before comparing. A raw string
+    # compare calls an ABBREVIATED sha of the very commit that is checked out a
+    # mismatch, and the abbreviation still satisfies the ancestor test below, so
+    # it lands in the ahead-branch and prints "X != X (0 commits ahead)" — a
+    # probe contradicting itself, which costs more than a missed detection.
+    # Resolving also accepts a tag or any other ref-ish value.
+    try:
+        resolved = _git("rev-parse", f"{built}^{{commit}}")
+        if resolved.returncode == 0 and resolved.stdout.strip():
+            built = resolved.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # keep the literal; the comparison below is still correct for it
     if head_sha == built:
         return {"name": name, "status": "ok",
                 "detail": f"source matches built revision {built[:9]}"}
@@ -2785,6 +2797,12 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
         if _git("cat-file", "-e", built).returncode == 0 and \
            _git("merge-base", "--is-ancestor", built, "HEAD").returncode == 0:
             ahead = _git("rev-list", "--count", f"{built}..HEAD").stdout.strip()
+            # Zero commits ahead of an ancestor means it IS this commit under
+            # another name. Belt to the normalisation's braces: whatever route
+            # got here, the self-contradicting warn is now unreachable.
+            if ahead == "0":
+                return {"name": name, "status": "ok",
+                        "detail": f"source matches built revision {built[:9]}"}
             if ahead:
                 detail += f" ({ahead} commits ahead)"
         else:
