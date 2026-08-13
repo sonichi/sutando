@@ -124,6 +124,27 @@ fi
 check "$(ls "$PF4".claim.* >/dev/null 2>&1 && echo 1 || echo 0)" \
       "d2) no claim file is left behind"
 
+# ------------------------------------------- portability: stat that SUCCEEDS wrongly
+# GNU `stat -f` means FILESYSTEM status and succeeds with a human-readable block,
+# so a BSD-first `||` chain never reaches the GNU form and $mtime becomes text.
+# macOS cannot reproduce that natively — BSD `stat -f %m` is correct here — so
+# the shape is forced with a stub. Without this, the bug is only findable on the
+# ubuntu runner, which is exactly where it was found.
+# Run in a SUBSHELL. Under the bug, `set -u` aborts the shell mid-arithmetic —
+# in-line that killed this suite before its summary and still exited 0, so the
+# guard would not have failed CI at all. Isolating it turns the abort into a
+# non-zero rc this suite can actually assert on.
+PF_S="$TMP/statshape.pid"; printf '%s\n' "$$" > "$PF_S"
+(
+  stat() { echo "  File: /some/path"; echo "    ID: 1234 Namelen: 255"; return 0; }
+  sentinel_pid_wrote_file "$$" "$PF_S"
+) >"$TMP/sout" 2>&1
+SRC=$?
+check "$([ "$SRC" -eq 0 ] && echo 0 || echo 1)" \
+      "non-numeric stat output fails SAFE (rc 0) instead of aborting"
+check "$(grep -qi 'unbound variable' "$TMP/sout" && echo 1 || echo 0)" \
+      "and does not blow up on arithmetic with text"
+
 # ------------------------------------------------------------ fail-safe direction
 check "$(sentinel_pid_wrote_file 999999 "$PF3" && echo 0 || echo 1)" \
       "f1) unmeasurable pid fails SAFE (treated as owner, nothing is killed)"

@@ -51,10 +51,18 @@ sentinel_pid_wrote_file() {
   local slack="${SUTANDO_SENTINEL_SLACK_SEC:-2}"
 
   elapsed="$(sentinel_pid_elapsed "$pid")" || return 0
-  [ -n "$elapsed" ] || return 0
+  case "$elapsed" in ''|*[!0-9]*) return 0 ;; esac   # non-numeric => unmeasurable => fail safe
 
-  mtime="$(stat -f %m "$pid_file" 2>/dev/null || stat -c %Y "$pid_file" 2>/dev/null)" || return 0
-  [ -n "$mtime" ] || return 0
+  # `stat -f %m` is BSD "modification time"; on GNU `-f` means FILESYSTEM status
+  # and SUCCEEDS with a human-readable block, so an `||` chain never reaches the
+  # GNU form and $mtime becomes text. Measured on the ubuntu runner: the value
+  # started with "File:" and `$(( now - mtime ))` died as `File: unbound
+  # variable`. macOS passed because BSD is correct there — the GNU path was
+  # never exercised locally. So validate the RESULT rather than trusting the
+  # exit status: a command that succeeds at a different question is the failure.
+  mtime="$(stat -c %Y "$pid_file" 2>/dev/null || true)"
+  case "$mtime" in ''|*[!0-9]*) mtime="$(stat -f %m "$pid_file" 2>/dev/null || true)" ;; esac
+  case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
 
   now="$(date +%s)"
   age=$(( now - mtime ))
