@@ -263,7 +263,9 @@ def main():
     if reset_7d:
         result["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).isoformat()
 
-    if "--gate" not in sys.argv:
+    # Unrouted: the utilization delta is another session's, and _update_burn_rate
+    # ends in _save_burn_history — a foreign sample outlives the banner flagging it.
+    if "--gate" not in sys.argv and routed:
         burn = _update_burn_rate(
             util_5h, util_7d,
             int(reset_5h) if reset_5h else None,
@@ -286,8 +288,9 @@ def main():
               "through the proxy.")
         print(f"   The numbers below are another session's, {hrs:.1f}h old. They are NOT "
               "this session's budget —")
-        print("   do not tier work off them. (startup.sh exports the var; a "
-              "supervisor-launched core never runs it.)")
+        print("   do not tier work off them. (The core launcher exports it only when the "
+              "proxy port already")
+        print("   has a listener at launch — relaunch the proxy, then restart this core.)")
     elif stale:
         hrs = age_s / 3600
         print(f"⚠ STALE: quota state is {hrs:.1f}h old — proxy not feeding it; numbers below are historical, not current")
@@ -298,7 +301,7 @@ def main():
     print(f"7d window: {int(util_7d * 100)}% used, {result['remaining_7d_pct']}% remaining")
     if reset_7d:
         print(f"  Resets: {datetime.fromtimestamp(int(reset_7d)).strftime('%H:%M %b %d')}")
-    if result.get("burn") and not routed:
+    if not routed:
         print("Burn rate / passes-left: SUPPRESSED — computed from traffic that is not "
               "this session's.")
     elif result.get("burn"):

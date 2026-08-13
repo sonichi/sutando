@@ -52,7 +52,12 @@ class NotRoutedTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="quota-routed-"))
         self._env = dict(os.environ)
         self.mod = _load_module(self.tmp)
+        self._real_update_burn_rate = self.mod._update_burn_rate
         self.mod._update_burn_rate = lambda *a, **k: dict(_BURN)
+
+    def _use_real_burn(self) -> None:
+        """History cases need the real writer; the stub never touches disk."""
+        self.mod._update_burn_rate = self._real_update_burn_rate
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -145,6 +150,42 @@ class NotRoutedTest(unittest.TestCase):
     def test_routed_gate_exits_zero(self) -> None:
         """Control: the gate still passes for a session that IS routed."""
         self.assertEqual(self._gate_exit(routed=True), 0)
+
+    # --- the DURABLE side effect: history must not record a foreign reading ---
+
+    def _hist(self):
+        f = self.tmp / "state" / "quota-burn-history.json"
+        return f.read_bytes() if f.is_file() else None
+
+    def test_unrouted_read_leaves_burn_history_untouched(self) -> None:
+        """The banner is transient; a folded EWMA sample outlives it.
+
+        An unrouted read is another session's traffic. If it lands in the
+        persisted history, the next ROUTED read prints a confident forecast
+        built from it — with no banner, because that read IS routed.
+        """
+        self._use_real_burn()
+        before = self._hist()
+        self._run(routed=False)
+        self.assertEqual(self._hist(), before)
+
+    def test_routed_read_does_advance_burn_history(self) -> None:
+        """Control: the skip must come from routing, not from history being dead."""
+        self._use_real_burn()
+        before = self._hist()
+        self._run(routed=True)
+        self.assertNotEqual(self._hist(), before)
+
+    def test_unrouted_json_also_leaves_history_untouched(self) -> None:
+        """--json is the machine path and takes the same non-gate branch."""
+        self._use_real_burn()
+        before = self._hist()
+        self._run(routed=False, argv=("read-quota.py", "--json"))
+        self.assertEqual(self._hist(), before)
+
+    def test_unrouted_still_says_the_forecast_is_suppressed(self) -> None:
+        """Skipping the computation must not silently drop the explanation."""
+        self.assertIn("SUPPRESSED", self._run(routed=False))
 
     # --- the window the numbers still describe -------------------------------
 
