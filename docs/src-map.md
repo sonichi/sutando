@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-224 modules indexed.
+225 modules indexed.
 
 ## `src/`
 
@@ -258,6 +258,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
 - **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
+- **`runtime_dispatch.py`** — S1 dispatch for act() and present() — protocol semantics, no real providers.
 - **`runtime_view.py`** — Runtime surface for THIS agent: runtime.health / runtime.details.
 - **`schedules_view.py`** — Schedule surface for the Sutando Server: schedule.list.
 - **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
