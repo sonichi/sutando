@@ -25,11 +25,11 @@ if _shared not in sys.path:
 from device_runtime_protocol import (  # noqa: E402
     ActionEnvelope,
     ActionResult,
+    ExperienceResponseEnvelope,
     PresentEnvelope,
     PresentResult,
     fault,
     resolve_capability_state,
-    validate_capability_name,
 )
 
 
@@ -89,9 +89,12 @@ def dispatch_action(raw: dict, *, providers: dict, granted: set[str],
     try:
         env = ActionEnvelope.from_dict(raw)
     except ValueError as e:
+        raw_attempt = raw.get("attempt")
+        safe_attempt = raw_attempt if isinstance(raw_attempt, int) \
+            and not isinstance(raw_attempt, bool) and raw_attempt >= 1 else 1
         return ActionResult(
             action_id=str(raw.get("action_id") or "?"),
-            attempt=int(raw.get("attempt") or 1), status="failed",
+            attempt=safe_attempt, status="failed",
             fault=fault("INVALID_ARGUMENT", str(e)),
         ).to_dict()
 
@@ -118,7 +121,8 @@ def dispatch_action(raw: dict, *, providers: dict, granted: set[str],
     if not state.granted:
         return failed(fault("PERMISSION_DENIED",
                             f"{env.capability} not granted to this subject"))
-    if env.deadline is not None and (now or time.time()) > env.deadline:
+    effective_now = now if now is not None else time.time()
+    if env.deadline is not None and effective_now > env.deadline:
         return failed(fault("DEADLINE_EXCEEDED",
                             "action expired before execution"))
     return provider.execute(env, emit_progress).to_dict()
@@ -164,18 +168,33 @@ class ExperienceRegistry:
         self._exp[env.experience_id] = rec
         return rec
 
-    def respond(self, experience_id: str, subject: str, choice: str) -> dict:
-        """Authenticated input recorded ONCE. This never authorizes anything —
-        the Policy Engine (S2) reads it; renderers/bridges hold no authority."""
-        rec = self._exp.get(experience_id)
+    def respond(self, raw: dict, *, authenticated_subject: str) -> dict:
+        """Authenticated input recorded ONCE. The payload subject is a CLAIM —
+        the transport-authenticated principal must match it, or the response
+        is refused. This never authorizes anything: the Policy Engine (S2)
+        reads it; renderers/bridges hold no authority."""
+        env = ExperienceResponseEnvelope.from_dict(raw)
+        if env.subject != authenticated_subject:
+            raise PermissionError(
+                f"payload subject {env.subject!r} != authenticated "
+                f"principal {authenticated_subject!r}")
+        rec = self._exp.get(env.experience_id)
         if rec is None:
-            raise KeyError(experience_id)
-        if rec["responses"]:
-            raise ValueError("already responded")
+            raise KeyError(env.experience_id)
         if rec["state"] != "active":
             raise ValueError(f"experience is {rec['state']}")
-        rec["responses"].append({"subject": subject, "choice": choice,
-                                 "at": time.time()})
+        if env.expected_version != rec["version"]:
+            raise ValueError(
+                f"expected_version {env.expected_version} != current "
+                f"{rec['version']}")
+        if rec["responses"]:
+            raise ValueError("already responded")
+        rec["responses"].append({
+            "response_id": env.response_id, "subject": env.subject,
+            "surface_id": env.surface_id, "choice": env.choice,
+            "nonce": env.nonce, "auth_context": env.auth_context,
+            "at": time.time(),
+        })
         return rec
 
 
@@ -242,7 +261,15 @@ def dispatch_present(raw: dict, *, registry: ExperienceRegistry,
             delivery_refs=refs,
         ).to_dict()
 
-    # resolve | dismiss
+    # resolve | dismiss — versioned like update (S1.1): a late dismiss must
+    # not silently kill an experience that changed since the caller saw it,
+    # and a terminal experience is never re-terminated.
+    if rec["state"] != "active":
+        return failed(fault("CONFLICT", f"experience is already {rec['state']}"))
+    if env.expected_version != rec["version"]:
+        return failed(fault("CONFLICT",
+                            f"expected_version {env.expected_version} "
+                            f"!= current {rec['version']}"))
     terminal = "resolved" if env.operation == "resolve" else "dismissed"
     rec["state"] = terminal
     return PresentResult(

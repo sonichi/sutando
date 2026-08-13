@@ -1,9 +1,16 @@
-"""Transport-independent error model (owner ruling: fixed at these ten).
+"""Transport-independent error model.
 
 Every fault declares whether a caller may retry AS-IS and whether it must
 re-observe first. PRECONDITION_FAILED is generic — page version, foreground
 app, window, file hash, git HEAD, target domain, approval digest — and its
 default posture is re-observe-and-replan, never blind retry.
+
+Ambiguous-execution posture (S1.1 ruling): EXECUTION_FAILED means the
+execution failed BEFORE any external effect and may be retried. When a
+provider cannot know whether the external effect happened (crash mid-flight,
+timeout after send), it MUST use OUTCOME_UNKNOWN — never retryable, always
+requires re-observation. Generic retryable=true must never be inherited by an
+uncertain external effect.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ ERROR_CODES = (
     "CONFLICT",
     "DEADLINE_EXCEEDED",
     "EXECUTION_FAILED",
+    "OUTCOME_UNKNOWN",
     "CANCELLED",
 )
 
@@ -35,6 +43,7 @@ _DEFAULTS = {
     "CONFLICT": (False, True),
     "DEADLINE_EXCEEDED": (False, False),
     "EXECUTION_FAILED": (True, False),
+    "OUTCOME_UNKNOWN": (False, True),
     "CANCELLED": (False, False),
 }
 

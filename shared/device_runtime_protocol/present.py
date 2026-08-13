@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .action import ActionEnvelope, action_digest, effects_digest
 from .errors import ProtocolFault
 
 EXPERIENCE_INTENTS = ("inform", "ask", "choose", "approve", "monitor")
@@ -50,6 +51,10 @@ class PresentEnvelope:
 
     @classmethod
     def from_dict(cls, d: dict) -> "PresentEnvelope":
+        v = d.get("protocol_version")
+        version = "1" if v is None else str(v)
+        if version != "1":
+            raise ValueError(f"unsupported protocol_version: {version!r}")
         op = d.get("operation")
         if op not in PRESENT_OPERATIONS:
             raise ValueError(f"bad present operation: {op!r}")
@@ -63,8 +68,12 @@ class PresentEnvelope:
             for k in ("presentation_id", "experience_id"):
                 if not d.get(k):
                     raise ValueError(f"present {op} missing: {k}")
-        if op == "update" and not isinstance(d.get("expected_version"), int):
-            raise ValueError("present update requires integer expected_version")
+        # S1.1: terminating an Experience is never an unconditional write —
+        # update, resolve AND dismiss all carry the version they believe in.
+        if op in ("update", "resolve", "dismiss"):
+            ev = d.get("expected_version")
+            if isinstance(ev, bool) or not isinstance(ev, int):
+                raise ValueError(f"present {op} requires integer expected_version")
         dp = d.get("delivery_policy") or {}
         disp = dp.get("disposition", "deliver")
         if disp not in DISPOSITIONS:
@@ -80,7 +89,7 @@ class PresentEnvelope:
             delivery_policy={**dp, "disposition": disp},
             expected_version=d.get("expected_version"),
             trace=d.get("trace") or {},
-            protocol_version=str(d.get("protocol_version", "1")),
+            protocol_version=version,
         )
 
     def to_dict(self) -> dict:
@@ -112,6 +121,8 @@ class PresentResult:
     fault: ProtocolFault | None = None
 
     def __post_init__(self) -> None:
+        if self.status not in ("completed", "failed"):
+            raise ValueError(f"bad present status: {self.status!r}")
         if self.status == "completed" and self.disposition not in TERMINAL_DISPOSITIONS:
             raise ValueError(
                 f"completed present needs a terminal disposition, got {self.disposition!r}")
@@ -132,14 +143,15 @@ class PresentResult:
         return d
 
 
-def build_approval_content(*, summary: str, effects: list[str],
-                           preview: dict, choices: list[str]) -> dict:
+def build_approval_content(*, action: ActionEnvelope, summary: str,
+                           effects: list[str], preview: dict,
+                           choices: list[str]) -> dict:
     """The first Experience type: an approval with structured effects and
-    preview. The rendered choices produce authenticated INPUT — the S2 Policy
-    Engine, not this content or its renderer, decides whether that input
-    yields an execution authorization."""
-    if not effects:
-        raise ValueError("approval content requires explicit effects")
+    preview, BOUND to the canonical action (S1.1 ruling): the content carries
+    approval_binding = {action_digest, effects_digest} so what was displayed
+    is provably what gets approved. The rendered choices produce authenticated
+    INPUT — the S2 Policy Engine, not this content or its renderer, decides
+    whether that input yields an execution authorization."""
     if not choices:
         raise ValueError("approval content requires choices")
     return {
@@ -148,4 +160,48 @@ def build_approval_content(*, summary: str, effects: list[str],
         "effects": effects,
         "preview": preview,
         "choices": choices,
+        "approval_binding": {
+            "action_digest": action_digest(action),
+            "effects_digest": effects_digest(effects),
+        },
     }
+
+
+_RESPONSE_REQUIRED = ("response_id", "experience_id", "expected_version",
+                      "subject", "surface_id", "choice", "nonce")
+
+
+@dataclass
+class ExperienceResponseEnvelope:
+    """A human's answer to an Experience. The payload subject is a CLAIM; the
+    transport supplies the authenticated principal and the dispatcher must
+    verify the two agree (or overwrite from the trusted context). This
+    envelope is still only input — S2 issues authorization."""
+
+    response_id: str
+    experience_id: str
+    expected_version: int
+    subject: str
+    surface_id: str
+    choice: str
+    nonce: str
+    issued_at: float | None = None
+    auth_context: dict = None  # type: ignore[assignment]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ExperienceResponseEnvelope":
+        missing = [k for k in _RESPONSE_REQUIRED if d.get(k) in (None, "")]
+        if missing:
+            raise ValueError(f"experience response missing: {', '.join(missing)}")
+        ev = d["expected_version"]
+        if isinstance(ev, bool) or not isinstance(ev, int):
+            raise ValueError("expected_version must be an integer")
+        ac = d.get("auth_context")
+        if ac is not None and not isinstance(ac, dict):
+            raise ValueError("auth_context must be an object")
+        return cls(
+            response_id=d["response_id"], experience_id=d["experience_id"],
+            expected_version=ev, subject=d["subject"],
+            surface_id=d["surface_id"], choice=d["choice"], nonce=d["nonce"],
+            issued_at=d.get("issued_at"), auth_context=ac or {},
+        )

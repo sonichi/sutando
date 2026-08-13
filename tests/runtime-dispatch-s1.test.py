@@ -78,10 +78,15 @@ def test_dispatch_gates():
                                      granted=GRANTED)
     assert unavailable["fault"]["code"] == "CAPABILITY_UNAVAILABLE"
     assert unavailable["fault"]["reason"] == "counter_hardware_missing"
-    no_provider = rd.dispatch_action(_action(provider="ghost"),
-                                     providers={"fake": provider},
-                                     granted=GRANTED)
+    no_provider = rd.dispatch_action(
+        _action(provider="ghost", capability="ghost.counter.increment"),
+        providers={"fake": provider}, granted=GRANTED)
     assert no_provider["fault"]["code"] == "CAPABILITY_UNSUPPORTED"
+    mismatched = rd.dispatch_action(_action(provider="ghost"),
+                                    providers={"fake": provider},
+                                    granted=GRANTED)
+    assert mismatched["fault"]["code"] == "INVALID_ARGUMENT", \
+        "capability not owned by provider must fail envelope validation"
     assert provider.executions == 0, "gated dispatches must never execute"
 
 
@@ -125,11 +130,20 @@ def _surfaces():
     return wrist, chat
 
 
+from device_runtime_protocol import ActionEnvelope  # noqa: E402
+
+_BOUND_ACTION = ActionEnvelope.from_dict({
+    "action_id": "act_push", "task_id": "task_1", "device_id": "dev_1",
+    "provider": "fake", "capability": "fake.counter.increment",
+    "operation": "increment", "idempotency_key": "task_1:push"})
+
+
 def _approval_create(**over):
     base = {"presentation_id": "p1", "experience_id": "exp_1",
             "task_id": "task_1", "operation": "create", "intent": "approve",
             "audience": {"subjects": ["qingyun"], "scope": "private"},
             "content": {**build_approval_content(
+                action=_BOUND_ACTION,
                 summary="push 2 commits to feat/runtime",
                 effects=["update remote branch", "trigger CI"],
                 preview={"commits": ["abc", "def"]},
@@ -137,6 +151,15 @@ def _approval_create(**over):
                 "table": {"rows": 3}},
             "interaction": {"actions": ["approve_once", "deny", "explain",
                                         "defer"]}}
+    base.update(over)
+    return base
+
+
+def _response(**over):
+    base = {"response_id": "r1", "experience_id": "exp_1",
+            "expected_version": 2, "subject": "qingyun",
+            "surface_id": "fake-watch", "choice": "approve_once",
+            "nonce": "n-1"}
     base.update(over)
     return base
 
@@ -174,21 +197,54 @@ def test_approval_experience_full_lifecycle():
     assert updated["disposition"] == "updated"
     assert updated["experience_version"] == 2
 
-    reg.respond("exp_1", "qingyun", "approve_once")
+    # the approval content itself carries the binding to the canonical action
+    assert "approval_binding" in wrist.delivered[0]["content"]
+
+    # payload subject is a CLAIM: mismatch with the authenticated principal
+    # is refused before anything is recorded
     try:
-        reg.respond("exp_1", "qingyun", "deny")
+        reg.respond(_response(), authenticated_subject="mallory")
+        raise AssertionError("subject mismatch accepted")
+    except PermissionError:
+        pass
+    # stale expected_version refused
+    try:
+        reg.respond(_response(expected_version=1),
+                    authenticated_subject="qingyun")
+        raise AssertionError("stale response version accepted")
+    except ValueError:
+        pass
+    reg.respond(_response(), authenticated_subject="qingyun")
+    try:
+        reg.respond(_response(response_id="r2", choice="deny", nonce="n-2"),
+                    authenticated_subject="qingyun")
         raise AssertionError("second response accepted")
     except ValueError:
         pass
     # the recorded response is INPUT — nothing here mints authorization
-    assert reg.get("exp_1")["responses"][0]["choice"] == "approve_once"
+    rec = reg.get("exp_1")["responses"][0]
+    assert rec["choice"] == "approve_once" and rec["surface_id"] == "fake-watch"
+    assert rec["nonce"] == "n-1"
 
+    # resolve requires the current version; a stale terminal is refused
+    stale_resolve = rd.dispatch_present(
+        {"presentation_id": "p4a", "experience_id": "exp_1",
+         "operation": "resolve", "expected_version": 1},
+        registry=reg, renderers=[wrist, chat])
+    assert stale_resolve["fault"]["code"] == "CONFLICT"
     resolved = rd.dispatch_present(
         {"presentation_id": "p4", "experience_id": "exp_1",
-         "operation": "resolve"}, registry=reg, renderers=[wrist, chat])
+         "operation": "resolve", "expected_version": 2},
+        registry=reg, renderers=[wrist, chat])
     assert resolved["disposition"] == "resolved"
-    after = rd.dispatch_present(
+    # a terminal experience is never re-terminated nor updated
+    re_terminate = rd.dispatch_present(
         {"presentation_id": "p5", "experience_id": "exp_1",
+         "operation": "dismiss", "expected_version": 2},
+        registry=reg, renderers=[wrist, chat])
+    assert re_terminate["fault"]["code"] == "CONFLICT"
+    after = rd.dispatch_present(
+        {"presentation_id": "p6", "experience_id": "exp_1",
          "operation": "update", "expected_version": 2, "content": {}},
         registry=reg, renderers=[wrist, chat])
     assert after["fault"]["code"] == "CONFLICT"

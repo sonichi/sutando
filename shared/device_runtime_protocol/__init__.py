@@ -22,15 +22,22 @@ from .capabilities import (  # noqa: F401,E402
     validate_capability_name,
 )
 from .action import (  # noqa: F401,E402
+    SUPPORTED_PROTOCOL_VERSIONS,
     ActionEnvelope,
     ActionResult,
     action_digest,
     canonical_action,
+    effects_digest,
+)
+from .canonical import (  # noqa: F401,E402
+    canonical_digest,
+    canonical_json,
 )
 from .present import (  # noqa: F401,E402
     DISPOSITIONS,
     EXPERIENCE_INTENTS,
     PRESENT_OPERATIONS,
+    ExperienceResponseEnvelope,
     PresentEnvelope,
     PresentResult,
     build_approval_content,
