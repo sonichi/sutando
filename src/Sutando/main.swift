@@ -263,7 +263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = workspace + "/assets/stand-avatar.png"
+            let avatarPath = SutandoConfig.personalAssetPath("stand-avatar.png", workspace: workspace)
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -969,7 +969,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Composited onto the top-right corner of the 18×18 avatar so the
     /// menu bar continuously signals mode without taking an extra slot.
     func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
-        let avatarPath = workspace + "/assets/stand-avatar.png"
+        let avatarPath = SutandoConfig.personalAssetPath("stand-avatar.png", workspace: workspace)
         guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
         base.size = NSSize(width: 18, height: 18)
         base.isTemplate = false
