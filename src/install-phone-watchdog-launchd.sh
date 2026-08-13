@@ -61,14 +61,18 @@ bootout_if_loaded() {
     fi
 }
 
+# Ask brew where it lives instead of naming its prefix: the Apple-Silicon and
+# Intel prefixes differ, and a literal for either is a hardcoded host path.
 resolve_homebrew_bin() {
-    if [ -d /opt/homebrew/bin ]; then
-        echo /opt/homebrew/bin
-    elif [ -d /usr/local/bin ]; then
-        echo /usr/local/bin
-    else
-        echo /usr/bin
+    local prefix
+    if prefix="$(brew --prefix 2>/dev/null)" && [ -d "$prefix/bin" ]; then
+        echo "$prefix/bin"
+        return
     fi
+    # No brew: fall back to the directory of a tool launchd will need anyway.
+    prefix="$(command -v bash 2>/dev/null)"
+    [ -n "$prefix" ] && { dirname "$prefix"; return; }
+    echo /usr/bin
 }
 
 case "$cmd" in
