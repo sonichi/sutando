@@ -9,6 +9,11 @@ function record(value) {
   if (logPath) appendFileSync(logPath, `${value}\n`, 'utf8');
 }
 
+function recordTimed(value) {
+  record(value);
+  record(`${value}.at=${Date.now()}`);
+}
+
 const browser = {
   async close() {
     record('browser.close');
@@ -16,8 +21,9 @@ const browser = {
 };
 
 const page = {
-  async goto() {
+  async goto(_url, options = {}) {
     record('page.goto');
+    record(`page.goto.timeout=${options.timeout}`);
     if (mode === 'error') throw new Error('fixture navigation failed');
     if (mode === 'hang') {
       return new Promise((resolve, reject) => {
@@ -27,13 +33,16 @@ const page = {
     }
   },
   async close() {
-    record('page.close');
+    recordTimed('page.close');
     if (mode === 'slow-close') await new Promise((resolve) => setTimeout(resolve, 2000));
     clearInterval(hangTimer);
     rejectPending?.(new Error('fixture page closed'));
   },
   async innerText() {
     return 'fixture text';
+  },
+  async waitForTimeout(ms) {
+    record(`page.wait=${ms}`);
   },
 };
 
@@ -54,7 +63,7 @@ const context = {
 
 export const chromium = {
   async launchPersistentContext() {
-    record('context.launch');
+    recordTimed('context.launch');
     if (mode === 'late-launch') {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }

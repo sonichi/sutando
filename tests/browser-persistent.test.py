@@ -40,6 +40,13 @@ class PersistentBrowserTests(unittest.TestCase):
         self.assertIn("context.close", entries)
         self.assertIn("browser.close", entries)
 
+    def _recorded_int(self, log, key):
+        prefix = f"{key}="
+        for entry in log.read_text(encoding="utf-8").splitlines():
+            if entry.startswith(prefix):
+                return int(entry.removeprefix(prefix))
+        self.fail(f"browser fixture never recorded {key!r}")
+
     def test_profile_override_is_reported_without_launching(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = dict(os.environ, SUTANDO_BROWSER_PROFILE=tmp)
@@ -87,20 +94,54 @@ class PersistentBrowserTests(unittest.TestCase):
     def test_command_deadline_includes_late_launch_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             env, log = self._fake_browser_env(tmp, "late-launch")
-            started = time.monotonic()
             result = subprocess.run(
                 ["node", str(SCRIPT), "https://example.test/", "text", "--timeout=120"],
                 cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
             )
-            elapsed = time.monotonic() - started
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("timed out after 120ms", result.stderr)
-            # The command budget starts inside Node after process/module setup;
-            # allow that fixed startup cost while still rejecting an added
-            # Playwright launch-timeout wait after the command deadline.
-            self.assertLess(elapsed, 0.5, f"command exceeded its deadline: {elapsed:.3f}s")
             self._assert_cleanup(log)
             self.assertNotIn("page.goto", log.read_text(encoding="utf-8").splitlines())
+            # Compare timestamps inside Node so slow subprocess startup or
+            # coverage instrumentation cannot masquerade as a deadline leak.
+            launch_at = self._recorded_int(log, "context.launch.at")
+            close_at = self._recorded_int(log, "page.close.at")
+            self.assertLess(close_at - launch_at, 500)
+
+    def test_timeout_override_extends_navigation_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = self._fake_browser_env(tmp, "success")
+            result = subprocess.run(
+                ["node", str(SCRIPT), "https://example.test/", "text", "--timeout=60000"],
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreater(self._recorded_int(log, "page.goto.timeout"), 30000)
+
+    def test_wait_actions_must_fit_command_budget_before_launch(self):
+        cases = (("wait:60000",), ("wait:25000", "wait:25000"))
+        for actions in cases:
+            with self.subTest(actions=actions), tempfile.TemporaryDirectory() as tmp:
+                env, log = self._fake_browser_env(tmp, "success")
+                result = subprocess.run(
+                    ["node", str(SCRIPT), "https://example.test/", *actions],
+                    cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("exceeding the 45000ms command budget", result.stderr)
+                self.assertIn("pass a larger --timeout", result.stderr)
+                self.assertFalse(log.exists(), "an impossible wait budget must not launch a browser")
+
+    def test_timeout_override_allows_declared_wait_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = self._fake_browser_env(tmp, "success")
+            result = subprocess.run(
+                ["node", str(SCRIPT), "https://example.test/", "wait:60000", "--timeout=70000"],
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Waited: 60000ms", result.stdout)
+            self.assertIn("page.wait=60000", log.read_text(encoding="utf-8").splitlines())
 
     def test_timeout_over_cap_is_rejected_instead_of_clamped(self):
         with tempfile.TemporaryDirectory() as tmp:

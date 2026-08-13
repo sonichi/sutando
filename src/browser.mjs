@@ -68,6 +68,18 @@ const cleanupBudgetMs = setupMode ? 0 : Math.min(Math.max(0, commandTimeoutMs - 
 const commandDeadline = setupMode ? Infinity : Date.now() + commandTimeoutMs;
 const operationDeadline = commandDeadline - cleanupBudgetMs;
 const actions = rawActions.filter((action) => action !== '--headed' && !action.startsWith('--timeout='));
+const waitActionMs = (action) => parseInt(action.slice(5)) || 2000;
+const declaredWaitMs = setupMode ? 0 : actions
+  .filter((action) => action.startsWith('wait:'))
+  .reduce((total, action) => total + waitActionMs(action), 0);
+const operationBudgetMs = commandTimeoutMs - cleanupBudgetMs;
+if (declaredWaitMs >= operationBudgetMs) {
+  console.error(
+    `Error: wait actions require ${declaredWaitMs}ms, exceeding the ${commandTimeoutMs}ms command budget `
+    + `(${operationBudgetMs}ms available before cleanup); pass a larger --timeout`,
+  );
+  process.exit(1);
+}
 // Per-user temp dir: a shared /tmp/sutando-screenshots is owned by whichever
 // macOS account created it first and EACCES-blocks every other account.
 const SCREENSHOT_DIR = process.env.SUTANDO_SCREENSHOT_DIR || join(tmpdir(), 'sutando-screenshots');
@@ -128,6 +140,11 @@ async function settleBefore(promise, deadline) {
   return settled;
 }
 
+function remainingOperationTimeout(defaultMs) {
+  if (!Number.isFinite(operationDeadline)) return defaultMs;
+  return Math.max(1, operationDeadline - Date.now());
+}
+
 let rejectInterruption;
 const interruption = new Promise((resolve, reject) => {
   rejectInterruption = reject;
@@ -163,7 +180,10 @@ const operation = (async () => {
     await cleanup();
     return;
   }
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: remainingOperationTimeout(30000),
+  });
 
   if (setupMode) {
     console.log(`Sutando browser profile: ${PROFILE_DIR}`);
@@ -200,7 +220,7 @@ const operation = (async () => {
         await page.fill(selector, value, { timeout: 10000 });
         console.log(`Filled: ${selector}`);
       } else if (action.startsWith('wait:')) {
-        const ms = parseInt(action.slice(5)) || 2000;
+        const ms = waitActionMs(action);
         await page.waitForTimeout(ms);
         console.log(`Waited: ${ms}ms`);
       } else if (action.startsWith('select:')) {
