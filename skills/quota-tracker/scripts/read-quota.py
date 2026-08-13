@@ -5,7 +5,7 @@ Read Claude Code quota state from quota-state.json.
 Usage:
   python3 read-quota.py              # human readable
   python3 read-quota.py --json       # machine readable
-  python3 read-quota.py --gate       # exit 1 if exhausted
+  python3 read-quota.py --gate       # exit 1 if exhausted OR not routed
 
 Burn-rate tracking (closes #1087):
   On each human/json read, tracks per-5min utilization delta via an EWMA
@@ -23,9 +23,11 @@ from __future__ import annotations
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 from pathlib import Path
 
 # Canonical (and only) home is <workspace>/state/quota-state.json, written by
@@ -64,6 +66,50 @@ _MAX_GAP_S = 7200    # 2 h — stale gap yields unreliable per-pass rate
 # A window needs this many of its OWN samples before it can be forecast.
 _MIN_SAMPLES = 2
 
+
+
+# The credential proxy writes quota-state.json; 7846 is its port everywhere else
+# in the tree (restart.sh, health-check.py, services_status.py).
+_PROXY_PORT = 7846
+_PROXY_SCHEME = "http"          # the proxy speaks plain HTTP; https/ftp do not reach it
+_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+def _redacted_endpoint(base_url: str) -> str:
+    """scheme://host:port only — userinfo, path, query and fragment carry secrets.
+
+    It reaches shared self-diagnose bundles, so it must never echo the raw value.
+    """
+    try:
+        u = urlparse(base_url if "//" in base_url else "//" + base_url)
+        host = (u.hostname or "").strip()
+        port = f":{u.port}" if u.port else ""
+    except ValueError:
+        return "an unparseable endpoint"
+    if not host:
+        return "another endpoint"
+    return f"{u.scheme}://{host}{port}" if u.scheme else f"{host}{port}"
+
+
+def _points_at_credential_proxy(base_url: "str | None") -> bool:
+    """True only when base_url is THIS host's credential proxy.
+
+    Fails closed: anything unset, unparseable or elsewhere is not routed.
+    """
+    if not base_url:
+        return False
+    try:
+        u = urlparse(base_url if "//" in base_url else "//" + base_url)
+    except ValueError:
+        return False
+    host = (u.hostname or "").strip().lower()
+    try:
+        port = u.port
+    except ValueError:      # non-numeric port in the authority
+        return False
+    scheme = (u.scheme or _PROXY_SCHEME).lower()
+    return (scheme == _PROXY_SCHEME and host in _PROXY_HOSTS
+            and port == _PROXY_PORT)
 
 def _load_burn_history() -> dict:
     if not BURN_HISTORY_FILE:
@@ -229,21 +275,36 @@ def main():
     age_s = time.time() - QUOTA_FILE.stat().st_mtime
     stale = age_s > 30 * 60
 
+    # Presence is not destination: the launcher honours a caller-set URL verbatim,
+    # so only the proxy's own host:port proves these numbers describe this session.
+    routed = _points_at_credential_proxy(os.environ.get("ANTHROPIC_BASE_URL"))
+
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     util_5h = float(headers.get("anthropic-ratelimit-unified-5h-utilization", 0))
     util_7d = float(headers.get("anthropic-ratelimit-unified-7d-utilization", 0))
     reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
     reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
 
+    # Stated once: a second copy of this predicate drifts the moment either is
+    # extended, and the two fields then contradict each other in one payload.
+    available = status == "allowed" and routed
+
     result = {
         "status": status,
-        "available": status == "allowed",
+        # Fails closed when unrouted: --gate exits on this field, and a machine
+        # consumer is the one that never sees the human NOT ROUTED banner.
+        "available": available,
         "utilization_5h": util_5h,
         "utilization_7d": util_7d,
         "remaining_5h_pct": round((1 - util_5h) * 100),
         "remaining_7d_pct": round((1 - util_7d) * 100),
         "state_age_seconds": int(age_s),
         "stale": stale,
+        "routed": routed,
+        # Distinguishes "not this session's data" from "quota exhausted"; both
+        # are unavailable, and a caller retries only one of them.
+        "unavailable_reason": None if available
+                              else ("not-routed" if not routed else "exhausted"),
     }
 
     if reset_5h:
@@ -251,7 +312,9 @@ def main():
     if reset_7d:
         result["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).isoformat()
 
-    if "--gate" not in sys.argv:
+    # Unrouted: the utilization delta is another session's, and _update_burn_rate
+    # ends in _save_burn_history — a foreign sample outlives the banner flagging it.
+    if "--gate" not in sys.argv and routed:
         burn = _update_burn_rate(
             util_5h, util_7d,
             int(reset_5h) if reset_5h else None,
@@ -268,7 +331,28 @@ def main():
         sys.exit(0 if result["available"] else 1)
 
     # Human readable
-    if stale:
+    if not routed:
+        hrs = age_s / 3600
+        # Two different causes need two different remedies: no endpoint at all
+        # versus an endpoint the caller deliberately pointed somewhere else.
+        _url = os.environ.get("ANTHROPIC_BASE_URL")
+        if _url:
+            print(f"⛔ NOT ROUTED: ANTHROPIC_BASE_URL is {_redacted_endpoint(_url)}, not the "
+                  f"local credential "
+                  f"proxy ({_PROXY_SCHEME}://localhost:{_PROXY_PORT}).")
+        else:
+            print("⛔ NOT ROUTED: ANTHROPIC_BASE_URL is unset, so THIS session does not go "
+                  "through the proxy.")
+        print(f"   The numbers below are another session's, {hrs:.1f}h old. They are NOT "
+              "this session's budget —")
+        if _url:
+            print("   do not tier work off them. (Point it at the proxy, or clear it and "
+                  "relaunch via the core launcher.)")
+        else:
+            print("   do not tier work off them. (The core launcher exports it only when the "
+                  "proxy port already")
+            print("   has a listener at launch — relaunch the proxy, then restart this core.)")
+    elif stale:
         hrs = age_s / 3600
         print(f"⚠ STALE: quota state is {hrs:.1f}h old — proxy not feeding it; numbers below are historical, not current")
     print(f"Status: {status}")
@@ -278,7 +362,10 @@ def main():
     print(f"7d window: {int(util_7d * 100)}% used, {result['remaining_7d_pct']}% remaining")
     if reset_7d:
         print(f"  Resets: {datetime.fromtimestamp(int(reset_7d)).strftime('%H:%M %b %d')}")
-    if result.get("burn"):
+    if not routed:
+        print("Burn rate / passes-left: SUPPRESSED — computed from traffic that is not "
+              "this session's.")
+    elif result.get("burn"):
         b = result["burn"]
         print(f"Burn rate: {b['burn_rate_pct_per_pass']}%/pass ({b['burn_samples']} samples)")
         # An unforecast window taints BOTH outcomes, not just the empty one: a

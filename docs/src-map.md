@@ -10,11 +10,12 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-204 modules indexed.
+209 modules indexed.
 
 ## `src/`
 
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
+- **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
@@ -80,6 +81,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
+- **`orphan_result_routes.py`** — Routes for results whose task a bridge never saw.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
@@ -137,6 +139,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
 - **`vault_intercept.py`** — Bridge-level vault secret interception.
+- **`vault_set_grammar.py`** — Pure, dependency-free `vault set KEY VALUE` grammar — regex + redact-only.
 - **`verify-gemini-31.sh`** — Sutando Gemini 3.1 rollout verification
 - **`verify-setup.sh`** — Sutando setup verification — checks everything a new user needs
 - **`vision-tools.ts`** — Vision pipeline — pipe JPEG frames from a source (screen, webcam) into the Gemini Live voice session.
@@ -168,6 +171,8 @@ and re-run `python3 scripts/gen-src-map.py`.
 
 ## `src/agent/`
 
+- **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
