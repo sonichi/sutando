@@ -128,5 +128,60 @@ class TestLandedUnderSquash(unittest.TestCase):
                          "so the count must survive rather than be suppressed")
 
 
+class TestDiscriminatorFailsSafe(unittest.TestCase):
+    """The three defensive returns in `_rewrites_shas_on_merge`.
+
+    Each says "I could not measure", and the caller treats that as "do not
+    suppress" — a git hiccup must not destroy a count that was computable."""
+
+    def setUp(self):
+        self.mod = _load()
+
+    def _with_run(self, fake):
+        real = self.mod.subprocess.run
+        self.mod.subprocess.run = fake
+        self.addCleanup(lambda: setattr(self.mod.subprocess, "run", real))
+
+    def test_oserror_is_not_read_as_squash(self):
+        def raiser(*a, **k):
+            raise OSError("git missing")
+        self._with_run(raiser)
+        self.assertFalse(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
+
+    def test_subprocess_error_is_not_read_as_squash(self):
+        def raiser(*a, **k):
+            raise subprocess.SubprocessError("boom")
+        self._with_run(raiser)
+        self.assertFalse(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
+
+    def test_nonzero_git_is_not_read_as_squash(self):
+        class R:
+            returncode = 128
+            stdout = ""
+        self._with_run(lambda *a, **k: R())
+        self.assertFalse(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
+
+    def test_unparsable_count_is_not_read_as_squash(self):
+        class R:
+            returncode = 0
+            stdout = "not-a-number"
+        self._with_run(lambda *a, **k: R())
+        self.assertFalse(self.mod._rewrites_shas_on_merge("/nope", "origin/main"))
+
+    def test_a_failure_leaves_the_count_intact_rather_than_suppressing_it(self):
+        """End-to-end: the caller keeps its measurement when the probe cannot run."""
+        real = self.mod.subprocess.run
+
+        def only_the_probe_fails(cmd, *a, **k):
+            if "--count" in cmd and "rev-list" in cmd:
+                raise OSError("probe unavailable")
+            return real(cmd, *a, **k)
+        self._with_run(only_the_probe_fails)
+        with tempfile.TemporaryDirectory() as td:
+            dev = self.mod.analyze_dev_activity(repo_root=_all_work_on_a_branch(td))
+        self.assertEqual(dev["landed_24h"], 0,
+                         "probe failure must not suppress an otherwise-valid count")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
