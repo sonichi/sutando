@@ -82,7 +82,13 @@ bash "$SKILL_DIR/scripts/review-pr.sh" 1754            # default --max 240 --sta
 bash "$SKILL_DIR/scripts/review-pr.sh" 1754 --max 300  # longer cap for a big diff
 ```
 
-Prints Codex's verdict to stdout. Exit `0` = verdict produced; `124` = hit the `--max`
+Prints `VERDICT-MARKER: <token>` as stdout line 1, then Codex's verdict preceded by that token. The token is a per-RUN nonce, never shown to Codex, so a diff or verdict quoting a marker literal cannot pose as it. **The verdict
+is only the text after the LAST such line**, which holds the mechanical checks as well as
+Codex's verdict — so a consumer taking the tail truncates the checks. The rest of the stream is Codex's exec trace,
+left unredirected on purpose so `codex-bounded.sh --stall` can watch it — it contains
+repository source the agent inlined while working, so a consumer that takes the whole
+stream (or its tail) quotes that source as the PR's own content. Extract after the last
+marker. Exit `0` = verdict produced; `124` = hit the `--max`
 cap; `125` = stalled (no output for `--stall` s); other non-zero = gh/codex error.
 
 **Timing:** `codex exec` is agentic — even with the diff inlined it may explore related
