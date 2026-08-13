@@ -97,10 +97,15 @@ HOOKS=(
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
-  # A manifest skill loads `tools` and nothing else, so a hook living in a skill
-  # directory has no loader — registration has to come from here to be portable.
-  "PreToolUse|reply-orphan-guard.py|python3 $(shq "$REPO_DIR/skills/gws-gmail-voice/hooks/reply-orphan-guard.py")"
 )
+
+# Skill-declared hooks. A skill owns its hook the way it owns its `tools`;
+# src/skill_hooks.py is the single discovery the health probe also reads.
+while IFS='|' read -r _ev _tok _cmd; do
+  [ -n "${_ev:-}" ] && HOOKS+=("$_ev|$_tok|$_cmd")
+done <<EOF
+$(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
+EOF
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
 # Matching uses `.command | contains(substring)` so we don't need to track
