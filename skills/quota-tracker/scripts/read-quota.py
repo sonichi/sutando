@@ -27,6 +27,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 from pathlib import Path
 
 # Canonical (and only) home is <workspace>/state/quota-state.json, written by
@@ -65,6 +66,31 @@ _MAX_GAP_S = 7200    # 2 h — stale gap yields unreliable per-pass rate
 # A window needs this many of its OWN samples before it can be forecast.
 _MIN_SAMPLES = 2
 
+
+
+# The credential proxy writes quota-state.json; 7846 is its port everywhere else
+# in the tree (restart.sh, health-check.py, services_status.py).
+_PROXY_PORT = 7846
+_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+def _points_at_credential_proxy(base_url: "str | None") -> bool:
+    """True only when base_url is THIS host's credential proxy.
+
+    Fails closed: anything unset, unparseable or elsewhere is not routed.
+    """
+    if not base_url:
+        return False
+    try:
+        u = urlparse(base_url if "//" in base_url else "//" + base_url)
+    except ValueError:
+        return False
+    host = (u.hostname or "").strip().lower()
+    try:
+        port = u.port
+    except ValueError:      # non-numeric port in the authority
+        return False
+    return host in _PROXY_HOSTS and port == _PROXY_PORT
 
 def _load_burn_history() -> dict:
     if not BURN_HISTORY_FILE:
@@ -230,9 +256,9 @@ def main():
     age_s = time.time() - QUOTA_FILE.stat().st_mtime
     stale = age_s > 30 * 60
 
-    # Not-routed is not staleness: the numbers are another session's traffic,
-    # so they cannot authorise this session's spending at any age.
-    routed = bool(os.environ.get("ANTHROPIC_BASE_URL"))
+    # Presence is not destination: the launcher honours a caller-set URL verbatim,
+    # so only the proxy's own host:port proves these numbers describe this session.
+    routed = _points_at_credential_proxy(os.environ.get("ANTHROPIC_BASE_URL"))
 
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     util_5h = float(headers.get("anthropic-ratelimit-unified-5h-utilization", 0))

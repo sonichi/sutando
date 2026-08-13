@@ -265,7 +265,7 @@ class TestV1HistoryWarmUp(BindingWindowBase):
         # Routed: unrouted, the forecast this case asserts on is suppressed as
         # traffic belonging to another session.
         env = dict(os.environ, SUTANDO_WORKSPACE=str(self.tmp), SUTANDO_TEST_MODE="1",
-                   ANTHROPIC_BASE_URL="http://127.0.0.1:8787")
+                   ANTHROPIC_BASE_URL="http://localhost:7846")
         out = subprocess.run([sys.executable, str(_SCRIPT)], env=env,
                              capture_output=True, text=True).stdout
         self.assertNotIn("no window runs out", out)
@@ -294,7 +294,7 @@ class TestHumanOutputBranches(BindingWindowBase):
         buf = io.StringIO()
         # Routed: the forecast is only rendered for a session that goes through
         # the proxy; unrouted it is suppressed as another session's traffic.
-        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}), \
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://localhost:7846"}), \
                 patch.object(self.mod, "_update_burn_rate", return_value=burn), \
                 patch.object(sys, "argv", ["read-quota.py"]), \
                 contextlib.redirect_stdout(buf):

@@ -64,9 +64,11 @@ class NotRoutedTest(unittest.TestCase):
         os.environ.update(self._env)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _run(self, routed: bool, argv=("read-quota.py",)) -> str:
-        if routed:
-            os.environ["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+    def _run(self, routed, argv=("read-quota.py",)) -> str:
+        if routed is None:
+            pass                      # caller set ANTHROPIC_BASE_URL itself
+        elif routed:
+            os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:7846"
         else:
             os.environ.pop("ANTHROPIC_BASE_URL", None)
         buf = io.StringIO()
@@ -118,7 +120,7 @@ class NotRoutedTest(unittest.TestCase):
 
     def _gate_exit(self, routed: bool) -> int:
         if routed:
-            os.environ["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+            os.environ["ANTHROPIC_BASE_URL"] = "http://localhost:7846"
         else:
             os.environ.pop("ANTHROPIC_BASE_URL", None)
         old = sys.argv
@@ -158,12 +160,8 @@ class NotRoutedTest(unittest.TestCase):
         return f.read_bytes() if f.is_file() else None
 
     def test_unrouted_read_leaves_burn_history_untouched(self) -> None:
-        """The banner is transient; a folded EWMA sample outlives it.
-
-        An unrouted read is another session's traffic. If it lands in the
-        persisted history, the next ROUTED read prints a confident forecast
-        built from it — with no banner, because that read IS routed.
-        """
+        """A folded EWMA sample outlives the banner that flagged it, and the
+        next routed read prints a forecast built from it with no banner."""
         self._use_real_burn()
         before = self._hist()
         self._run(routed=False)
@@ -186,6 +184,26 @@ class NotRoutedTest(unittest.TestCase):
     def test_unrouted_still_says_the_forecast_is_suppressed(self) -> None:
         """Skipping the computation must not silently drop the explanation."""
         self.assertIn("SUPPRESSED", self._run(routed=False))
+
+    # --- destination, not presence -------------------------------------------
+
+    def test_arbitrary_nonempty_base_url_is_not_routed(self) -> None:
+        """The launcher preserves a caller-set URL verbatim, so presence proves nothing."""
+        os.environ["ANTHROPIC_BASE_URL"] = "http://example.test:1"
+        out = json.loads(self._run(routed=None, argv=("read-quota.py", "--json")))
+        self.assertIs(out["available"], False)
+        self.assertEqual(out["unavailable_reason"], "not-routed")
+
+    def test_wrong_port_on_localhost_is_not_routed(self) -> None:
+        self.assertFalse(self.mod._points_at_credential_proxy("http://localhost:9999"))
+
+    def test_the_real_proxy_url_is_routed(self) -> None:
+        """Control: the destination check must still accept the launcher's own URL."""
+        for u in ("http://localhost:7846", "http://127.0.0.1:7846"):
+            self.assertTrue(self.mod._points_at_credential_proxy(u), u)
+
+    def test_unparseable_base_url_fails_closed(self) -> None:
+        self.assertFalse(self.mod._points_at_credential_proxy("garbage"))
 
     # --- the window the numbers still describe -------------------------------
 

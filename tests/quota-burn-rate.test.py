@@ -182,7 +182,7 @@ class TestStalenessGuard(unittest.TestCase):
         buf = io.StringIO()
         # Routed: these cases assert the staleness/forecast rendering, which is
         # only reached when this session's traffic goes through the proxy.
-        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}), \
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://localhost:7846"}), \
                 patch.object(sys, "argv", argv), contextlib.redirect_stdout(buf):
             try:
                 self.mod.main()
