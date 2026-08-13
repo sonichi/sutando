@@ -107,9 +107,8 @@ class TestLandedUnderSquash(unittest.TestCase):
             repo = _repo(td, merges=True)
             dev = mod.analyze_dev_activity(repo_root=repo)
         self.assertIsNotNone(dev)
-        # Only the wip commit is off origin/main, so the count is exact — and it
-        # is a measurement precisely because a merge commit exists to prove that
-        # reachability tracks landing in this repo.
+        # Exact because only the wip commit is off origin/main — and a measurement
+        # because a real merge commit proves reachability tracks landing here.
         self.assertEqual(dev["landed_24h"], dev["commits_24h"] - 1, dev)
 
     def test_a_small_sample_is_measured_absence_not_a_failure_to_measure(self):
