@@ -19,7 +19,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import socket
 import threading
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WD = os.path.join(REPO, "src", "phone-watchdog.sh")
@@ -76,10 +78,73 @@ finally:
 # ── Test 2: unreachable /health + DRY_RUN → prints recovery, exit 0 ───────────
 # Port 1 is not listening → curl fails → watchdog decides to recover.
 r = run({"HEALTH_URL": "http://127.0.0.1:1/health", "DRY_RUN": "1"})
-if r.returncode == 0 and "would run" in r.stdout and "startup.sh" in r.stdout:
+if (r.returncode == 0 and "then run:" in r.stdout and "startup.sh" in r.stdout
+        and "would stop listeners" in r.stdout):
     ok("unreachable /health → recovery decided (DRY_RUN), default = startup.sh")
 else:
     fail("unhealthy path", f"rc={r.returncode} out={r.stdout[:160]!r}")
+
+# ── Test: a WEDGED-but-resident stack is actually stopped before recovery ─────
+# The defect this covers: startup.sh starts each service only when `pgrep` finds
+# none, so a resident-but-unhealthy process made recovery a silent no-op.
+def _wedged_listener(port):
+    """A process that HOLDS the port and never answers /health — the exact state
+    `pgrep` calls 'already running' and the public probe calls dead."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(1)
+    return srv
+
+
+_wedge_port = 0
+_s = socket.socket()
+_s.bind(("127.0.0.1", 0))
+_wedge_port = _s.getsockname()[1]
+_s.close()
+
+_holder = subprocess.Popen(
+    [sys.executable, "-c",
+     "import socket,time,sys\n"
+     "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+     f"s.bind(('127.0.0.1',{_wedge_port})); s.listen(1)\n"
+     "time.sleep(120)\n"],
+)
+time.sleep(1.0)
+
+_held = subprocess.run(
+    ["lsof", "-nP", "-iTCP:%d" % _wedge_port, "-sTCP:LISTEN", "-t"],
+    capture_output=True, text=True,
+).stdout.split()
+if str(_holder.pid) in _held:
+    ok("fixture: a resident process is holding the port")
+else:
+    fail("fixture: port holder not detected", f"lsof={_held!r} pid={_holder.pid}")
+
+_r = run({
+    "HEALTH_URL": "http://127.0.0.1:1/health",   # unreachable => unhealthy
+    "PHONE_PORT": str(_wedge_port),
+    "NGROK_API_PORT": str(_wedge_port),
+    "RECOVER_CMD": "echo RECOVERED",
+})
+time.sleep(1.0)
+_still = subprocess.run(
+    ["lsof", "-nP", "-iTCP:%d" % _wedge_port, "-sTCP:LISTEN", "-t"],
+    capture_output=True, text=True,
+).stdout.split()
+if not _still:
+    ok("a wedged listener is stopped, so recovery is not a silent no-op")
+else:
+    fail("wedged listener survived recovery", f"still listening: {_still!r}")
+if "RECOVERED" in _r.stdout:
+    ok("recovery still runs after the stack is freed")
+else:
+    fail("recovery did not run", f"out={_r.stdout[:160]!r}")
+try:
+    _holder.kill()
+except OSError:
+    pass
+
 
 # ── Test 3: RECOVER_CMD override is honored ───────────────────────────────────
 r = run({
