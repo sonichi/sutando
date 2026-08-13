@@ -57,6 +57,8 @@ import {
 	recordTerminalClassification,
 	lastTerminalClassification,
 	clearTerminalClassification,
+	formatVoiceOfflineNotification,
+	formatVoiceRecoveryNotification,
 	type ClassifiedClose,
 } from './voice-error-classifier.js';
 import {
@@ -823,6 +825,24 @@ async function main() {
 	// it — Step 12's `backoff` upstream mapping.)
 	let voiceFatalBackoffUntil = 0;
 
+	// Declared outside the classifier IIFE below so the recovery hook can read it
+	// too; a banner already shown is what makes a recovery notice owed.
+	const voiceNotifiedCategories = new Set<string>();
+
+	// Announce recovery and re-arm the alert. Clearing the set is what lets a later
+	// failure of the same category notify at all; the throttle is once-per-process.
+	const notifyVoiceRecovered = (): void => {
+		if (voiceNotifiedCategories.size === 0) return;
+		const had = [...voiceNotifiedCategories].join(', ');
+		voiceNotifiedCategories.clear();
+		console.log(`${ts()} [VoiceRecovered] ACTIVE after ${had} — notifying owner + re-arming alerts`);
+		try {
+			execFileSync('osascript', ['-e',
+				`display notification "${formatVoiceRecoveryNotification(new Date())}" with title "Sutando — voice online"`,
+			], { stdio: 'ignore' });
+		} catch {}
+	};
+
 	// =========================================================================
 	// `agent.state` v1 provider (design 1a′; impl plan WS1 Step 12,
 	// amendments R8/A9/A10/S3). All getters are late-bound: `sessionRef` is
@@ -1026,7 +1046,12 @@ async function main() {
 	// works again, so it clears the persisted terminal classification (R8)
 	// before the frame is built.
 	session.eventBus.subscribe('session.stateChange', (e) => {
-		if ((e as { toState?: string })?.toState === 'ACTIVE') clearTerminalClassification();
+		if ((e as { toState?: string })?.toState === 'ACTIVE') {
+			clearTerminalClassification();
+			// One recovery site, event-driven: the same seam the classification clear
+			// uses, so a polled second copy cannot drift from it.
+			notifyVoiceRecovered();
+		}
 		emitAgentState();
 	});
 
@@ -1055,7 +1080,8 @@ async function main() {
 		const origOnClose = typeof transport.onClose === 'function'
 			? transport.onClose.bind(transport)
 			: null;
-		const notifiedCategories = new Set<string>();
+		// Shared with the recovery hook, which needs to know a banner was shown.
+		const notifiedCategories = voiceNotifiedCategories;
 		const handleClose = (c: ClassifiedClose): void => {
 			if (c.retryable) return;
 			// R8: persist the terminal classification (one classifier, one
@@ -1092,7 +1118,7 @@ async function main() {
 			// double-quote stripping below protects the AppleScript string
 			// literal itself (not the shell).
 			try {
-				const safe = c.userMessage.replace(/["\\]/g, '');
+				const safe = formatVoiceOfflineNotification(c.userMessage, new Date());
 				execFileSync('osascript', ['-e', `display notification "${safe}" with title "Sutando — voice offline"`], { stdio: 'ignore' });
 			} catch {}
 		};
