@@ -2548,8 +2548,7 @@ def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
     """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
 
-    Uses the last-fetched remote ref and never fetches. Requires a merge-base:
-    without shared history the count is not a distance (shallow graft boundary).
+    Never fetches. Without a merge-base the count is not a distance, so returns None.
     """
     try:
         base = subprocess.run(
