@@ -205,6 +205,16 @@ class NotRoutedTest(unittest.TestCase):
     def test_unparseable_base_url_fails_closed(self) -> None:
         self.assertFalse(self.mod._points_at_credential_proxy("garbage"))
 
+    def test_urlparse_raising_fails_closed(self) -> None:
+        """An unterminated IPv6 bracket makes urlparse itself raise."""
+        for u in ("http://[", "http://[::1"):
+            self.assertFalse(self.mod._points_at_credential_proxy(u), u)
+
+    def test_bad_port_fails_closed(self) -> None:
+        """`.port` raises on a non-numeric or out-of-range authority port."""
+        for u in ("http://localhost:abc", "http://localhost:99999"):
+            self.assertFalse(self.mod._points_at_credential_proxy(u), u)
+
     # --- the window the numbers still describe -------------------------------
 
     def test_unrouted_still_reports_the_raw_windows(self) -> None:
