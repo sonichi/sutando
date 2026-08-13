@@ -39,6 +39,8 @@ gws gmail +read <messageId>                     # read a message
 gws gmail users messages list --params 'q=keyword'  # search
 ```
 
+**Signatures are never auto-inserted — append one yourself.** Gmail attaches the configured signature in its *composer*, so anything that writes a message some other way (the Gmail API, an IMAP `APPEND`-created draft) produces mail with no signature, and no Gmail setting changes that. When drafting or sending on the owner's behalf, append their signature to the body yourself — plain text plus an HTML alternative, so links render in both parts.
+
 **Finding a specific email** — when the obvious query fails, invoke `/email-find <description>`. Broad-before-narrow playbook (full-inbox scan → partner-domain fanout → thread re-walk) that refuses to give up after one or two failed queries. See `skills/email-find/SKILL.md` for the workflow and rules around subject-mismatch + `get_thread` truncation. Per-user partner-domain mappings live in your own memory (the skill describes the file format).
 
 **Contacts** — look up people by name or email:
