@@ -79,6 +79,38 @@ class OrphanResultRoutesTest(unittest.TestCase):
         (self.tasks / f"{tid}.txt").write_text(task_text())
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
 
+    def test_a_quarantined_task_still_yields_its_route(self):
+        """A failed archive must not also strand the reply.
+
+        archive_file() mints <id>.txt.archive-failed when it cannot archive;
+        that file is then the task's only surviving header block, so routing
+        has to see it or the result is undeliverable forever.
+        """
+        tid = self._result()
+        (self.tasks / f"{tid}.txt.archive-failed").write_text(task_text())
+        self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_a_suffixed_quarantine_still_yields_its_route(self):
+        tid = self._result()
+        (self.tasks / f"{tid}.txt.archive-failed.1").write_text(task_text())
+        self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_a_live_task_outranks_a_quarantined_leftover(self):
+        """Precedence matters: the quarantined copy can be older, and routing
+        the stale channel_id would post the reply to the wrong place."""
+        tid = self._result()
+        (self.tasks / f"{tid}.txt").write_text(task_text())
+        (self.tasks / f"{tid}.txt.archive-failed").write_text(
+            task_text().replace(SNOWFLAKE, "9" * 19))
+        self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_a_quarantine_for_another_id_is_not_matched(self):
+        """The lookup globs, so a longer id sharing this one's prefix must not
+        satisfy it — that would route one task's reply using another's headers."""
+        tid = self._result()
+        (self.tasks / f"{tid}-extra.txt.archive-failed").write_text(task_text())
+        self.assertEqual(self.routes(), {})
+
     def test_archived_task_still_yields_its_route(self):
         # By the time a result exists the core has usually archived the task,
         # so an archive miss would make the fix work only in a race.

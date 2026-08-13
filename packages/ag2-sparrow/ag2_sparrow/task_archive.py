@@ -29,7 +29,13 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     if bare.exists():
         return bare
     matches = sorted(tasks_dir.glob(f"{task_id}.claimed-core-*.txt"))
-    return matches[0] if matches else None
+    if matches:
+        return matches[0]
+    # Quarantined last: archive_file() mints this name when it cannot archive,
+    # and it is still the task's only surviving header block. Without it a
+    # failed archive also strands the reply, since routing needs the headers.
+    quarantined = sorted(tasks_dir.glob(f"{task_id}.txt.archive-failed*"))
+    return quarantined[0] if quarantined else None
 
 
 def _move_without_clobbering(src: Path, dest: Path) -> Path:
