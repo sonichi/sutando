@@ -472,7 +472,39 @@ def _landed_subset_count(repo_root, shas):
     if out.returncode != 0:
         return None
     unlanded = {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
+    if unlanded and _rewrites_shas_on_merge(repo_root, ref):
+        # Squash/rebase merging rewrites the SHA, so a landed commit is unreachable
+        # by its local SHA — "not on the branch" and "merged" are indistinguishable.
+        return None
     return sum(1 for s in shas if s not in unlanded)
+
+
+def _rewrites_shas_on_merge(repo_root, ref, sample=200, floor=20):
+    """True when `ref` shows squash/rebase merging, so a landed commit keeps no SHA.
+
+    Zero merges only means that if the sample was big enough to have held one:
+    a young merge-commit repo also shows zero. Under `floor` commits, say False
+    (unknown) rather than read an unfalsifiable sample as evidence."""
+    def count(*extra):
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-list", "--count", *extra,
+                 f"-{sample}", ref],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        try:
+            return int(out.stdout.strip())
+        except ValueError:
+            return None
+    total = count()
+    if total is None or total < floor:
+        return False
+    merges = count("--merges")
+    return merges == 0
 def dev_activity_insight(dev):
     """Render the dev-activity dict into one headline sentence, or None."""
     if not dev or dev.get("commits_24h", 0) <= 0:
