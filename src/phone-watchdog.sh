@@ -1,21 +1,13 @@
 #!/usr/bin/env bash
-# Phone-stack watchdog — restart the phone stack when the PUBLIC webhook dies.
-#
-# Probes the PUBLIC url, not localhost: a wrong-domain or dead tunnel still
-# answers on :3100, and Twilio only ever hits the public one.
-# Recovery defaults to startup.sh because it is idempotent and owns bundled-mode
-# launch; RECOVER_CMD overrides it for a phone-only restart.
-#
-# HEALTH_URL overrides the probed URL and DRY_RUN=1 prints the recovery action
-# instead of running it, so tests never touch a real stack.
+# Phone-stack watchdog. Probes the PUBLIC url, not localhost: a dead tunnel
+# still answers on :3100, and Twilio only ever hits the public one.
 
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Resolve the PUBLIC url Twilio posts to. Default: WEBHOOK_BASE_URL from .env
-# (what startup.sh writes). No webhook configured → this host isn't a phone
-# host, nothing to supervise.
+# Default: WEBHOOK_BASE_URL from .env. Unset => not a phone host, so there is
+# nothing to supervise.
 if [ -z "${HEALTH_URL:-}" ]; then
   base="$(grep -E '^WEBHOOK_BASE_URL=' "$REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
   [ -n "$base" ] || exit 0
@@ -35,18 +27,43 @@ recover_cmd="${RECOVER_CMD:-bash "$REPO/src/startup.sh"}"
 PHONE_PORT="${PHONE_PORT:-3100}"
 NGROK_API_PORT="${NGROK_API_PORT:-4040}"
 
-# Identity by LISTENER, never by argv pattern: `pgrep -f` matches this script's
-# own command line and any editor or grep that happens to mention the name.
 port_listener_pids() {
   lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | sort -u
+}
+
+# Holding the port is not authorization to kill: a WAN/DNS/tunnel failure fails
+# the public probe while the local listener is healthy or someone else's.
+PHONE_STACK_ARGV_MATCH="${PHONE_STACK_ARGV_MATCH:-conversation-server ngrok}"
+
+# Reads the argv of ONE pid. `pgrep -f` would match this script and any grep
+# naming it; `ps -p` cannot self-match because the pid is already chosen.
+phone_stack_owns_pid() {
+  local pid="$1" cmd needle
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+  [ -n "$cmd" ] || return 1
+  for needle in $PHONE_STACK_ARGV_MATCH; do
+    case "$cmd" in *"$needle"*) return 0 ;; esac
+  done
+  return 1
+}
+
+owned_listener_pids() {
+  local pid
+  for pid in $(port_listener_pids "$1"); do
+    case "$pid" in ""|*[!0-9]*) continue ;; esac
+    [ "$pid" = "$$" ] && continue
+    if phone_stack_owns_pid "$pid"; then
+      echo "$pid"
+    else
+      echo "phone-watchdog: port $1 held by pid $pid, not the phone stack — leaving it alone" >&2
+    fi
+  done
 }
 
 stop_wedged_stack() {
   local port pid stopped=""
   for port in "$PHONE_PORT" "$NGROK_API_PORT"; do
-    for pid in $(port_listener_pids "$port"); do
-      case "$pid" in ""|*[!0-9]*) continue ;; esac
-      [ "$pid" = "$$" ] && continue
+    for pid in $(owned_listener_pids "$port"); do
       kill -TERM "$pid" 2>/dev/null && stopped="$stopped $pid"
     done
   done
@@ -56,9 +73,7 @@ stop_wedged_stack() {
   # pgrep guard sees a clean slate rather than a dying process.
   sleep 2
   for port in "$PHONE_PORT" "$NGROK_API_PORT"; do
-    for pid in $(port_listener_pids "$port"); do
-      case "$pid" in ""|*[!0-9]*) continue ;; esac
-      [ "$pid" = "$$" ] && continue
+    for pid in $(owned_listener_pids "$port"); do
       kill -KILL "$pid" 2>/dev/null || true
     done
   done

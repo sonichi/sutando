@@ -1,16 +1,5 @@
-"""
-Tests for the phone-stack watchdog:
-  - src/phone-watchdog.sh (health probe + recovery decision)
-  - src/launchd/com.sutando.phone-watchdog.plist (well-formed template)
-
-Discovered by CI's Python test runner alongside other *.test.py files.
-
-The watchdog's real recovery (re-running startup.sh) and the launchd wiring are
-NOT exercised here — they need a live phone stack + macOS launchd. These tests
-pin the decision logic hermetically via HEALTH_URL (probe target) and DRY_RUN
-(print the recovery action instead of running it), so a regression in "when does
-it recover / what does it run" is caught without any real stack.
-"""
+"""Decision logic for src/phone-watchdog.sh, pinned hermetically via HEALTH_URL
+and DRY_RUN. Real recovery and launchd wiring need a live host, not this."""
 
 import http.server
 import os
@@ -85,31 +74,30 @@ else:
     fail("unhealthy path", f"rc={r.returncode} out={r.stdout[:160]!r}")
 
 # ── Test: a WEDGED-but-resident stack is actually stopped before recovery ─────
-# The defect this covers: startup.sh starts each service only when `pgrep` finds
-# none, so a resident-but-unhealthy process made recovery a silent no-op.
-def _wedged_listener(port):
-    """A process that HOLDS the port and never answers /health — the exact state
-    `pgrep` calls 'already running' and the public probe calls dead."""
-    srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", port))
-    srv.listen(1)
-    return srv
-
-
+# startup.sh only starts what `pgrep` cannot find, so a wedged process
+# made recovery a silent no-op.
 _wedge_port = 0
 _s = socket.socket()
 _s.bind(("127.0.0.1", 0))
 _wedge_port = _s.getsockname()[1]
 _s.close()
 
-_holder = subprocess.Popen(
-    [sys.executable, "-c",
-     "import socket,time,sys\n"
-     "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
-     f"s.bind(('127.0.0.1',{_wedge_port})); s.listen(1)\n"
-     "time.sleep(120)\n"],
+# Named so the process's OWN argv identifies it as the phone stack. A bare
+# `python3 -c` holder tested the blast radius, not the recovery.
+_fixture_dir = tempfile.mkdtemp(prefix="phone-watchdog-")
+_owned_script = os.path.join(_fixture_dir, "conversation-server-fixture.py")
+_alien_script = os.path.join(_fixture_dir, "unrelated-service.py")
+_HOLDER_SRC = (
+    "import socket,sys,time\n"
+    "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+    "s.bind(('127.0.0.1',int(sys.argv[1]))); s.listen(1)\n"
+    "time.sleep(120)\n"
 )
+for _p in (_owned_script, _alien_script):
+    with open(_p, "w") as _f:
+        _f.write(_HOLDER_SRC)
+
+_holder = subprocess.Popen([sys.executable, _owned_script, str(_wedge_port)])
 time.sleep(1.0)
 
 _held = subprocess.run(
@@ -133,9 +121,49 @@ _still = subprocess.run(
     capture_output=True, text=True,
 ).stdout.split()
 if not _still:
-    ok("a wedged listener is stopped, so recovery is not a silent no-op")
+    ok("a wedged listener the phone stack OWNS is stopped, so recovery is not a no-op")
 else:
     fail("wedged listener survived recovery", f"still listening: {_still!r}")
+
+# Paired negative control. Without it the positive case above is satisfied by
+# "kill whatever holds the port", which is the defect and not the fix.
+_alien_port = 0
+_s2 = socket.socket()
+_s2.bind(("127.0.0.1", 0))
+_alien_port = _s2.getsockname()[1]
+_s2.close()
+
+_alien = subprocess.Popen([sys.executable, _alien_script, str(_alien_port)])
+time.sleep(1.0)
+_alien_held = subprocess.run(
+    ["lsof", "-nP", "-iTCP:%d" % _alien_port, "-sTCP:LISTEN", "-t"],
+    capture_output=True, text=True,
+).stdout.split()
+if str(_alien.pid) not in _alien_held:
+    fail("fixture: unrelated listener not detected", f"lsof={_alien_held!r}")
+else:
+    _r2 = run({
+        "HEALTH_URL": "http://127.0.0.1:1/health",   # same unreachable probe
+        "PHONE_PORT": str(_alien_port),
+        "NGROK_API_PORT": str(_alien_port),
+        "RECOVER_CMD": "echo RECOVERED",
+    })
+    time.sleep(1.0)
+    _alien_after = subprocess.run(
+        ["lsof", "-nP", "-iTCP:%d" % _alien_port, "-sTCP:LISTEN", "-t"],
+        capture_output=True, text=True,
+    ).stdout.split()
+    if str(_alien.pid) in _alien_after:
+        ok("an unrelated listener SURVIVES a public-health failure")
+    else:
+        fail("unrelated listener was killed",
+             "port occupancy is not authorization; a WAN/tunnel outage would "
+             "take down someone else's process")
+    if "not the phone stack" in _r2.stderr:
+        ok("the watchdog says why it declined to signal")
+    else:
+        fail("no decline diagnostic", f"stderr={_r2.stderr[:200]!r}")
+    _alien.kill()
 if "RECOVERED" in _r.stdout:
     ok("recovery still runs after the stack is freed")
 else:
@@ -191,8 +219,7 @@ except Exception as e:
 
 
 # ── Test 6: the opt-in is discoverable from README, both directions ───────────
-# Auto-remediation that restarts processes must be findable and removable by an
-# operator who has never read this PR; an installer nothing documents is unowned.
+# An installer nothing documents is unowned, and this one restarts processes.
 def _readme_documents(readme, needle):
     return any(needle in line for line in readme.splitlines())
 
