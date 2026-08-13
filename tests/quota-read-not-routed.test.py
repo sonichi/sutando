@@ -210,6 +210,31 @@ class NotRoutedTest(unittest.TestCase):
         for u in ("http://[", "http://[::1"):
             self.assertFalse(self.mod._points_at_credential_proxy(u), u)
 
+    def test_wrong_scheme_is_not_routed(self) -> None:
+        """The proxy speaks plain HTTP; https/ftp on the same host:port do not reach it."""
+        for u in ("https://localhost:7846", "ftp://localhost:7846"):
+            self.assertFalse(self.mod._points_at_credential_proxy(u), u)
+
+    def test_schemeless_authority_still_routed(self) -> None:
+        """Control: the scheme check must not reject the launcher's own forms."""
+        self.assertTrue(self.mod._points_at_credential_proxy("localhost:7846"))
+
+    # --- the human diagnosis must match the actual cause ----------------------
+
+    def test_set_but_elsewhere_names_the_url_not_unset(self) -> None:
+        """Saying "is unset" about a set variable is a false diagnosis."""
+        os.environ["ANTHROPIC_BASE_URL"] = "http://example.test:1"
+        out = self._run(routed=None)
+        self.assertIn("http://example.test:1", out)
+        self.assertNotIn("is unset", out)
+        self.assertNotIn("relaunch the proxy, then restart", out)
+
+    def test_genuinely_unset_still_says_unset(self) -> None:
+        """Control: the original diagnosis must survive for the case it describes."""
+        out = self._run(routed=False)
+        self.assertIn("is unset", out)
+        self.assertIn("has a listener at launch", out)
+
     def test_bad_port_fails_closed(self) -> None:
         """`.port` raises on a non-numeric or out-of-range authority port."""
         for u in ("http://localhost:abc", "http://localhost:99999"):

@@ -71,6 +71,7 @@ _MIN_SAMPLES = 2
 # The credential proxy writes quota-state.json; 7846 is its port everywhere else
 # in the tree (restart.sh, health-check.py, services_status.py).
 _PROXY_PORT = 7846
+_PROXY_SCHEME = "http"          # the proxy speaks plain HTTP; https/ftp do not reach it
 _PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 
@@ -90,7 +91,9 @@ def _points_at_credential_proxy(base_url: "str | None") -> bool:
         port = u.port
     except ValueError:      # non-numeric port in the authority
         return False
-    return host in _PROXY_HOSTS and port == _PROXY_PORT
+    scheme = (u.scheme or _PROXY_SCHEME).lower()
+    return (scheme == _PROXY_SCHEME and host in _PROXY_HOSTS
+            and port == _PROXY_PORT)
 
 def _load_burn_history() -> dict:
     if not BURN_HISTORY_FILE:
@@ -310,13 +313,24 @@ def main():
     # Human readable
     if not routed:
         hrs = age_s / 3600
-        print("⛔ NOT ROUTED: ANTHROPIC_BASE_URL is unset, so THIS session does not go "
-              "through the proxy.")
+        # Two different causes need two different remedies: no endpoint at all
+        # versus an endpoint the caller deliberately pointed somewhere else.
+        _url = os.environ.get("ANTHROPIC_BASE_URL")
+        if _url:
+            print(f"⛔ NOT ROUTED: ANTHROPIC_BASE_URL is {_url}, not the local credential "
+                  f"proxy ({_PROXY_SCHEME}://localhost:{_PROXY_PORT}).")
+        else:
+            print("⛔ NOT ROUTED: ANTHROPIC_BASE_URL is unset, so THIS session does not go "
+                  "through the proxy.")
         print(f"   The numbers below are another session's, {hrs:.1f}h old. They are NOT "
               "this session's budget —")
-        print("   do not tier work off them. (The core launcher exports it only when the "
-              "proxy port already")
-        print("   has a listener at launch — relaunch the proxy, then restart this core.)")
+        if _url:
+            print("   do not tier work off them. (Point it at the proxy, or clear it and "
+                  "relaunch via the core launcher.)")
+        else:
+            print("   do not tier work off them. (The core launcher exports it only when the "
+                  "proxy port already")
+            print("   has a listener at launch — relaunch the proxy, then restart this core.)")
     elif stale:
         hrs = age_s / 3600
         print(f"⚠ STALE: quota state is {hrs:.1f}h old — proxy not feeding it; numbers below are historical, not current")
