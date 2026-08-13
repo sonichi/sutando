@@ -157,10 +157,15 @@ claim_is_ours() {
   [ "$owner_id" = "$WATCHER_ID" ]
 }
 
-claim_must_handle() {
-  local filename="$1" disposition
-  disposition="$(sed -n '4p' "$CLAIMS_DIR/$filename" 2>/dev/null)"
-  [ "$disposition" = "must-handle" ]
+# 0 = must-handle, 1 = fallback, 2 = unknown.
+# Only must-handle/fallback may reach the live-core branches.
+claim_disposition() {
+  local filename="$1"
+  case "$(sed -n '4p' "$CLAIMS_DIR/$filename" 2>/dev/null)" in
+    must-handle) return 0 ;;
+    fallback) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 publish_terminal_failure() {
@@ -214,14 +219,21 @@ finish_handler_task() {
   # event during cleanup, but it cannot strand the task without either path.
   if mv "$marker" "$settled" 2>/dev/null; then
     if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
-      if claim_must_handle "$filename"; then
-        echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
-        publish_terminal_failure "$filename" "failed" || true
-      else
-        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-        echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-        printf 'TASK_FILE: %s\n' "$filename" || true
-      fi
+      claim_disposition "$filename"
+      case $? in
+        0)
+          echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
+          publish_terminal_failure "$filename" "failed" || true
+          ;;
+        1)
+          printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+          echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+          printf 'TASK_FILE: %s\n' "$filename" || true
+          ;;
+        *)
+          echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+          ;;
+      esac
       release_task_claim "$filename" || true
     elif [ "$rc" -eq 0 ]; then
       release_task_claim "$filename" || true
@@ -418,14 +430,21 @@ fallback_outstanding_handlers() {
       task_path="$(cat "$settled")"
       filename="$(basename "$task_path")"
       if claim_is_ours "$filename"; then
-        if claim_must_handle "$filename"; then
-          echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-          publish_terminal_failure "$filename" "was interrupted" || true
-        else
-          printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-          echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-          printf 'TASK_FILE: %s\n' "$filename" || true
-        fi
+        claim_disposition "$filename"
+        case $? in
+          0)
+            echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
+            publish_terminal_failure "$filename" "was interrupted" || true
+            ;;
+          1)
+            printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+            echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+            printf 'TASK_FILE: %s\n' "$filename" || true
+            ;;
+          *)
+            echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+            ;;
+        esac
         release_task_claim "$filename" || true
       fi
       rm -f "$settled"
@@ -444,14 +463,21 @@ fallback_outstanding_handlers() {
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
     [ -n "$task_path" ] || continue
     filename="$(basename "$task_path")"
-    if claim_must_handle "$filename"; then
-      echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-      publish_terminal_failure "$filename" "was interrupted" || true
-    else
-      printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-      echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-      printf 'TASK_FILE: %s\n' "$filename" || true
-    fi
+    claim_disposition "$filename"
+    case $? in
+      0)
+        echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
+        publish_terminal_failure "$filename" "was interrupted" || true
+        ;;
+      1)
+        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+        printf 'TASK_FILE: %s\n' "$filename" || true
+        ;;
+      *)
+        echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+        ;;
+    esac
     release_task_claim "$filename" || true
   done
 
