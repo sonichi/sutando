@@ -264,6 +264,16 @@ def _update_burn_rate(current_util_5h: float, current_util_7d=None,
     return result
 
 
+def resolve_available(status: str, proxy_available) -> bool:
+    """Trust the proxy's `available` bool over the status string, whose vocabulary
+    grows; explicit "rejected" still wins, and absent a bool require "allowed"."""
+    if status == "rejected":
+        return False
+    if isinstance(proxy_available, bool):
+        return proxy_available
+    return status == "allowed"
+
+
 def main():
     data = json.loads(QUOTA_FILE.read_text())
     headers = data.get("headers", {})
@@ -287,7 +297,9 @@ def main():
 
     # Stated once: a second copy of this predicate drifts the moment either is
     # extended, and the two fields then contradict each other in one payload.
-    available = status == "allowed" and routed
+    # Composition of two policies: trust the proxy's flag over the status string,
+    # AND fail closed when this session is not routed through the proxy.
+    available = resolve_available(status, data.get("available")) and routed
 
     result = {
         "status": status,
