@@ -8,6 +8,7 @@ import io
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -236,7 +237,7 @@ def test_team_runtime_skips_the_owner_session_handoff() -> None:
             "SUTANDO_TEAM_RUNTIME": "1",
         }
         result = subprocess.run(
-            ["bash", str(REPO / "src" / "session-handoff.sh")],
+            ["bash", str(_staged_handoff(root))],
             cwd=root, env=environment, capture_output=True, text=True, timeout=5,
         )
         assert result.returncode == 0
@@ -244,17 +245,28 @@ def test_team_runtime_skips_the_owner_session_handoff() -> None:
         assert not (root / "session-state.md").exists()
 
 
+def _staged_handoff(root: Path) -> Path:
+    """Copy the script somewhere whose parent is NOT a checkout. Run from the repo
+    its own parent passes _repo_ok, so the no-checkout path is unreachable."""
+    staged = root / "stage" / "src"
+    staged.mkdir(parents=True)
+    shutil.copy(REPO / "src" / "session-handoff.sh", staged / "session-handoff.sh")
+    return staged / "session-handoff.sh"
+
+
 def test_owner_session_handoff_does_not_accept_the_team_bypass_by_default() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         result = subprocess.run(
-            ["bash", str(REPO / "src" / "session-handoff.sh")],
+            ["bash", str(_staged_handoff(root))],
             cwd=root,
             env={"HOME": str(root), "PATH": os.environ["PATH"],
                  "SUTANDO_REPO_DIR": str(root / "missing-repo")},
             capture_output=True, text=True, timeout=5,
         )
-        assert result.returncode != 0
+        assert result.returncode != 0, (
+            f"expected the no-checkout hard failure; got rc=0 "
+            f"(stdout={result.stdout!r} stderr={result.stderr!r})")
         assert "could not locate a valid Sutando checkout" in result.stderr
 
 
@@ -1697,6 +1709,8 @@ if __name__ == "__main__":
     test_team_collaborator_requires_one_exact_pre_body_stamp()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan()
+    test_team_runtime_skips_the_owner_session_handoff()
+    test_owner_session_handoff_does_not_accept_the_team_bypass_by_default()
     test_team_codex_uses_normal_workspace_and_owner_configuration()
     test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end()
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
