@@ -44,6 +44,8 @@ if [ "${1:-}" = "--handler-runner" ]; then
 fi
 
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=watcher_sentinel.sh
+source "$__SCRIPT_DIR/watcher_sentinel.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -538,9 +540,7 @@ cleanup() {
   # A duplicate watcher can overwrite the sentinel before the stale watcher
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
-  if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then
-    rm -f "$PID_FILE"
-  fi
+  sentinel_release_if_owner "$PID_FILE" "$$"
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi
