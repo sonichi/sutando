@@ -359,6 +359,8 @@ dispatch_task() {
 STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
 mkdir -p "$STATE_DIR"
 PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
+# In place, never write-elsewhere-then-mv: mv preserves mtime, and
+# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier

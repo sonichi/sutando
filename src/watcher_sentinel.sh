@@ -38,6 +38,10 @@ sentinel_pid_elapsed() {
   }'
 }
 
+# PRECONDITION: the owning process creates the sentinel IN PLACE. A writer that
+# builds it elsewhere and moves it in preserves the old mtime, and this stops
+# reaping anything.
+#
 # True when <pid> could have written <pid_file>: it must have been alive when the
 # file was stamped. A process younger than the file is a REISSUED pid — a
 # different process wearing the dead owner's number.

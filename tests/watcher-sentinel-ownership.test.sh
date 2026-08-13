@@ -145,6 +145,28 @@ check "$([ "$SRC" -eq 0 ] && echo 0 || echo 1)" \
 check "$(grep -qi 'unbound variable' "$TMP/sout" && echo 1 || echo 0)" \
       "and does not blow up on arithmetic with text"
 
+# ------------------------------------- precondition: the sentinel is stamped IN PLACE
+# A move-into-place writer preserves the old mtime, so the owner looks younger
+# than its own sentinel and reaping stops entirely. Behavioural half first: show
+# what a moved-in sentinel does to the verdict.
+D5="$TMP/movedin"; mkdir -p "$D5"
+PID5="$(spawn_fake_watcher "$D5")"
+PF5="$D5/watch.pid"
+printf '%s\n' "$PID5" > "$TMP/staged.pid"
+touch -t 202601010000 "$TMP/staged.pid"     # built earlier, elsewhere
+mv "$TMP/staged.pid" "$PF5"                 # mv preserves that old mtime
+if sentinel_pid_wrote_file "$PID5" "$PF5"; then owned=0; else owned=1; fi
+check "$([ "$owned" -eq 1 ] && echo 0 || echo 1)" \
+      "p1) a moved-in sentinel reads as NOT written by its owner"
+reap_stale_task_watcher "$PF5" >"$TMP/out5" 2>&1
+check "$([ -f "$PF5" ] && echo 0 || echo 1)" \
+      "p2) so the reaper stops cleaning it — reaping degrades to never"
+
+# Shape half: only the WRITER decides how the file comes to exist, so no
+# behavioural test can catch a future refactor to write-then-mv.
+check "$(grep -qE '^echo "\$\$" > "\$PID_FILE"' "$REPO/src/watch-tasks-stream.sh" && echo 0 || echo 1)" \
+      "p3) watch-tasks-stream.sh still stamps the sentinel in place"
+
 # ------------------------------------------------------------ fail-safe direction
 check "$(sentinel_pid_wrote_file 999999 "$PF3" && echo 0 || echo 1)" \
       "f1) unmeasurable pid fails SAFE (treated as owner, nothing is killed)"
