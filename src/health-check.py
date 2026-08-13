@@ -571,6 +571,21 @@ def _resolved_vault() -> dict:
         return {"enabled": False, "remote_url": "", "_explicit_disable": False}
 
 
+def _vault_remote_url(vault: "dict | None" = None) -> str:
+    """Vault remote URL as the sync writer's CRON path resolves it: config
+    `vault.remote_url`, then the deprecated `.env` SUTANDO_MEMORY_REPO alias."""
+    resolved = _resolved_vault() if vault is None else vault
+    url = resolved.get("remote_url") or ""
+    if url:
+        return url
+    env_path = _resolve_dotenv()
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith("SUTANDO_MEMORY_REPO="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
@@ -1267,6 +1282,15 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: install would have trained operators to ignore the detector.
 WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
 
+#: `personal_path()` resolves these at the workspace root and never under `state/`,
+#: so the probe's "state belongs under state/" remedy would break the reader.
+WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
+    "PERSONAL_CLAUDE.md",
+    "stand-identity.json",
+    "stand-avatar.png",
+    "voice-context-active",
+})
+
 
 def check_workspace_root_tidy() -> "dict | None":
     """Flag loose FILES at the workspace root — state that escaped `state/`.
@@ -1300,6 +1324,7 @@ def check_workspace_root_tidy() -> "dict | None":
             p.name for p in WORKSPACE_DIR.iterdir()
             if p.is_file()
             and p.name not in WORKSPACE_ROOT_ALLOWED
+            and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
             and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
         )
     except OSError:
@@ -2223,15 +2248,7 @@ def check_memory_sync() -> dict:
     # nag (#2069).
     if vault.get("_explicit_disable"):
         return {"name": name, "status": "ok", "detail": "cross-machine sync disabled (config opt-out)"}
-    # Canonical config first (vault.remote_url), then the deprecated .env alias.
-    repo_url = vault.get("remote_url") or ""
-    if not repo_url:
-        env_path = _resolve_dotenv()
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                if line.startswith("SUTANDO_MEMORY_REPO="):
-                    repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
+    repo_url = _vault_remote_url(vault)
     if not repo_url:
         # Not configured anywhere → single-machine mode is a valid choice, not
         # a warn (#2069).
@@ -2394,6 +2411,11 @@ def check_per_host_config_backup() -> dict:
     warn on divergence; never mutates either file.
     """
     name = "per-host-config-backup"
+    # No vault URL → `_snapshot_per_host_config` is unreachable (it runs only
+    # inside sync-workspace's push path, which exits early without one).
+    if not _vault_remote_url():
+        return {"name": name, "status": "ok",
+                "detail": "no vault configured — nothing carries a backup (single-machine mode)"}
     try:
         # Resolve the live channels source from the SAME canonical resolver the
         # snapshot WRITER uses — sync-workspace's `_snapshot_per_host_config`
@@ -4194,7 +4216,7 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
 
 
 def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
-    """Does the proxy inject THIS core's login, or a different account's?
+    """Does the proxy resolve THIS core's login, or a different account's?
 
     `check_quota_telemetry` above answers "is quota-state fresh, and does it
     exist" — both are questions about WHEN, and neither can see the failure
@@ -4336,17 +4358,25 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
 
     if core_service == proxy_service:
         return {"name": name, "status": "ok",
-                "detail": f"proxy injects this core's login ({core_service})"}
+                "detail": (f"proxy and core resolve the same keychain item "
+                           f"({core_service}) — name match only; this check "
+                           f"does not read tokens")}
 
     return {
         "name": name,
         "status": "warn",
         "detail": (
-            f"the credential proxy injects a DIFFERENT login than this core's: proxy "
-            f"resolves '{proxy_service}', core would resolve '{core_service}'. Quota "
-            f"numbers describe the proxy's account, not yours, and requests bill it — "
-            f"a `/login` here will not reach the proxy. Cause is almost always the "
-            f"launchd plist omitting CLAUDE_CONFIG_DIR (launchd inherits no shell env): "
+            f"the credential proxy resolves a DIFFERENT login than this core's: proxy "
+            f"resolves '{proxy_service}', core would resolve '{core_service}'. What "
+            f"follows turns on state this check does not read: if the proxy's stored "
+            f"token is usable and the request carries an authorization header, the proxy "
+            f"substitutes its own — quota numbers then describe that account, requests "
+            f"bill it, and a `/login` here will not reach the proxy; if that token is "
+            f"unusable the proxy engages pass-through, forwarding whatever credential the "
+            f"client supplied and billing that account instead, or answering 401 when the "
+            f"client supplied none. Either way "
+            f"the cause is almost always the launchd plist omitting CLAUDE_CONFIG_DIR "
+            f"(launchd inherits no shell env): "
             f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
             f"Fix: pin CLAUDE_CONFIG_DIR in "
             f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."

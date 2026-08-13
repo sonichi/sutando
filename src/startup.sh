@@ -1128,7 +1128,11 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
       # REMOTE_TASK_CHANNEL_DIR_<INST>.
       _gw_chdir_var="REMOTE_TASK_CHANNEL_DIR_${_gw_var#AG2_REMOTE_TOKEN_}"
       _gw_chdir="${!_gw_chdir_var:-${_gw_inst}-ag2space}"
+      _gw_token_file_var="REMOTE_TASK_TOKEN_FILE_${_gw_var#AG2_REMOTE_TOKEN_}"
+      _gw_token_file="${!_gw_token_file_var:-$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels "$_gw_chdir" .env)}"
+      [ -f "$_gw_token_file" ] || _gw_token_file=""
       SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+        REMOTE_TASK_URL= REMOTE_TASK_TOKEN_FILE="$_gw_token_file" \
         REMOTE_TASK_CHANNEL_DIR="$_gw_chdir" \
         REMOTE_PROACTIVE_ROOM= \
         "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
