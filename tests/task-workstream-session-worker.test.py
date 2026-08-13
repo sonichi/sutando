@@ -183,7 +183,8 @@ def test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan() -> N
 import json, os, sys
 with open(os.environ['PROVIDER_LOG'], 'a') as f:
     f.write(json.dumps({'args': sys.argv[1:], 'cwd': os.getcwd(),
-                        'integration': os.environ.get('TEAM_INTEGRATION_TOKEN')}) + '\\n')
+                        'integration': os.environ.get('TEAM_INTEGRATION_TOKEN'),
+                        'team_runtime': os.environ.get('SUTANDO_TEAM_RUNTIME')}) + '\\n')
 open('claude-work.txt', 'w').write('normal work\\n')
 print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
 """)
@@ -208,6 +209,7 @@ print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
         team_args = call["args"]
         assert Path(call["cwd"]).resolve() == project.resolve()
         assert call["integration"] == "available-to-team-runtime"
+        assert call["team_runtime"] == "1"
         assert team_args[:2] == ["-p", "--no-session-persistence"]
         assert "--dangerously-skip-permissions" in team_args
         assert team_args[team_args.index("--add-dir") + 1] == str(Path.home())
@@ -222,6 +224,38 @@ print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
         assert (project / "claude-work.txt").read_text() == "normal work\n"
         assert (workspace / "results" / team.name).read_text() == "safe claude result"
         assert not (workspace / "results" / guest.name).exists()
+
+
+def test_team_runtime_skips_the_owner_session_handoff() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        environment = {
+            "HOME": str(root),
+            "PATH": os.environ["PATH"],
+            "SUTANDO_REPO_DIR": str(root / "missing-repo"),
+            "SUTANDO_TEAM_RUNTIME": "1",
+        }
+        result = subprocess.run(
+            ["bash", str(REPO / "src" / "session-handoff.sh")],
+            cwd=root, env=environment, capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode == 0
+        assert result.stdout == "" and result.stderr == ""
+        assert not (root / "session-state.md").exists()
+
+
+def test_owner_session_handoff_does_not_accept_the_team_bypass_by_default() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        result = subprocess.run(
+            ["bash", str(REPO / "src" / "session-handoff.sh")],
+            cwd=root,
+            env={"HOME": str(root), "PATH": os.environ["PATH"],
+                 "SUTANDO_REPO_DIR": str(root / "missing-repo")},
+            capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode != 0
+        assert "could not locate a valid Sutando checkout" in result.stderr
 
 
 def test_team_codex_uses_normal_workspace_and_owner_configuration() -> None:

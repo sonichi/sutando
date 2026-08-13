@@ -6,6 +6,9 @@
 # <workspace>/session-state.md. The incoming session reads this in CLAUDE.md
 # or as part of the proactive loop.
 
+# Ephemeral Team children do not own the live core's continuity snapshot.
+[ "${SUTANDO_TEAM_RUNTIME:-}" = "1" ] && exit 0
+
 # REPO resolves to: (1) $SUTANDO_REPO_DIR if set AND valid, (2) auto-detect
 # from the script's own resolved location (symlink-safe), (3) common layout
 # probes — each validated by _repo_ok. If nothing validates, the script exits
