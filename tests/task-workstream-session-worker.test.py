@@ -1161,7 +1161,7 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
             assert claim.exists()
             assert claim.read_text().splitlines()[3] == "must-handle"
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=3)
+            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             assert "TASK_FILE:" not in stdout
             assert "safe terminal failure" in stderr
             assert "No unrestricted fallback was used" in (results / task.name).read_text()
@@ -1170,7 +1170,7 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate(timeout=2)
+                process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_slow_handler_does_not_block_the_next_task_event() -> None:
@@ -1696,7 +1696,7 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
             lines[3] = "must-handl"
             claim.write_text("\n".join(lines) + "\n")
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=3)
+            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             assert "TASK_FILE:" not in stdout, (
                 "an unrecognised disposition was published to the unrestricted core")
             assert "no recognised disposition" in stderr
@@ -1704,7 +1704,7 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate(timeout=2)
+                process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
