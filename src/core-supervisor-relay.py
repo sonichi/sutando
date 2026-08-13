@@ -86,6 +86,8 @@ def _is_login_class(signal: dict) -> bool:
 #: A record older than this is a core that stopped beating; the socket it names
 #: may no longer exist, so pointing the owner at it is worse than generic phrasing.
 _ALIVE_STALE_SEC = 90
+# Must match the launchers' ${SUTANDO_TMUX_SESSION:-sutando-core} (src/agent/start-cli.sh).
+_DEFAULT_TMUX_SESSION = "sutando-core"
 
 
 def _core_host_label() -> str:
@@ -103,6 +105,7 @@ def _derive_backend() -> "dict | None":
     An embedded core records no tmux backend, and a stale record gets None."""
     try:
         import json
+        import os
         import sys
         import time
         from pathlib import Path
@@ -115,8 +118,13 @@ def _derive_backend() -> "dict | None":
             return None
         d = json.loads(p.read_text())
         sock = (d.get("socket") or "").strip()
+        # The socket is shared with sibling sessions (the watcher, and ${SESSION}-watcher
+        # under Codex), so an attach without -t can land anywhere but the core prompt.
+        sess = ((d.get("session") or "").strip()
+                or os.environ.get("SUTANDO_TMUX_SESSION")
+                or _DEFAULT_TMUX_SESSION)
         # A socket alone is the tmux case; anything else is not addressable as a console.
-        return {"socket": sock} if sock else None
+        return {"socket": sock, "session": sess} if sock else None
     except Exception:
         return None            # fail-open: an unknown target degrades to generic phrasing
 
@@ -149,8 +157,10 @@ def compose_message(signal: dict) -> str:
             be = _derive_backend()
         except Exception:
             be = None
-        # A bare socket path is not actionable; the attach command is.
-        where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} attach`"
+        # A bare socket path is not actionable; the attach command is — and it must
+        # name the session, or a shared socket attaches to the wrong one.
+        where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} "
+                 f"attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
                  if be else f"where the core is running on {host}")
         msg += f" — answer it {where}. A chat reply can't answer it."
     return msg

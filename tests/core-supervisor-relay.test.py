@@ -537,14 +537,51 @@ class TestBackendRecordContract(unittest.TestCase):
             else:
                 sys.modules["workspace_default"] = prev
 
-    def _write_alive(self, label, socket_path="/tmp/sutando-tmux.sock", age_sec=0):
+    def _write_alive(self, label, socket_path="/tmp/sutando-tmux.sock", age_sec=0,
+                     session=None):
         f = os.path.join(self.ws, "state", "cores", f"{label}.alive")
+        rec = {"host": label, "socket": socket_path}
+        if session is not None:
+            rec["session"] = session
         with open(f, "w") as fh:
-            json.dump({"host": label, "socket": socket_path}, fh)
+            json.dump(rec, fh)
         if age_sec:
             old = os.path.getmtime(f) - age_sec
             os.utime(f, (old, old))
         return f
+
+    def test_remedy_names_the_session_not_a_bare_attach(self):
+        """A bare `attach` on a socket shared with the watcher can land the owner
+        in the wrong session, so the remedy must carry -t."""
+        os.environ["SUTANDO_HOST_LABEL"] = "SessHost"
+        self._write_alive("SessHost")
+        with self._workspace():
+            msg = compose_message(_HUNG)
+        self.assertIn("attach -t sutando-core", msg)
+        self.assertNotRegex(msg, r"attach(?! -t)")
+
+    def test_remedy_uses_the_session_the_heartbeat_recorded(self):
+        """A sibling/custom session is exactly the case a default would send to
+        the wrong prompt, so the recorded value must win over the default."""
+        os.environ["SUTANDO_HOST_LABEL"] = "SessHost"
+        self._write_alive("SessHost", session="sutando-core-watcher")
+        with self._workspace():
+            msg = compose_message(_HUNG)
+        self.assertIn("attach -t sutando-core-watcher", msg)
+        self.assertNotIn("attach -t sutando-core`", msg)
+
+    def test_env_session_overrides_the_default_when_unrecorded(self):
+        """Same env/default contract the launchers use, so a custom-session host
+        gets an actionable command rather than the shipped default."""
+        os.environ["SUTANDO_HOST_LABEL"] = "SessHost"
+        os.environ["SUTANDO_TMUX_SESSION"] = "my-core"
+        try:
+            self._write_alive("SessHost")
+            with self._workspace():
+                msg = compose_message(_HUNG)
+        finally:
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
+        self.assertIn("attach -t my-core", msg)
 
     def test_reads_the_label_the_heartbeat_wrote_under(self):
         """The writer uses util_paths._host_label(); a reader on platform.node()
