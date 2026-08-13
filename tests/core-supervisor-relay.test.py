@@ -524,7 +524,9 @@ class TestBackendRecordContract(unittest.TestCase):
         import sys
         import types
         stub = types.ModuleType("workspace_default")
-        stub.resolve_workspace = lambda: self.ws
+        # Variadic: callers pass migrate=/repo=, and a zero-arg stub would raise
+        # TypeError into the helper's broad except, asserting fail-open by accident.
+        stub.resolve_workspace = lambda *a, **kw: self.ws
         prev = sys.modules.get("workspace_default")
         sys.modules["workspace_default"] = stub
         try:
