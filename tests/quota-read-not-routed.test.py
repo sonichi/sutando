@@ -243,6 +243,16 @@ class NotRoutedTest(unittest.TestCase):
         self.assertEqual(self.mod._redacted_endpoint("http://h.test:9/a?b=c"), "http://h.test:9")
         self.assertEqual(self.mod._redacted_endpoint("https://x.test"), "https://x.test")
 
+    def test_redaction_fails_closed_on_unparseable(self) -> None:
+        """Both raising paths: urlparse itself, and a bad `.port` inside the try."""
+        for u in ("http://[", "http://[::1", "http://localhost:abc"):
+            self.assertEqual(self.mod._redacted_endpoint(u), "an unparseable endpoint", u)
+
+    def test_redaction_fails_closed_when_no_host(self) -> None:
+        """Parses fine but carries no authority — say nothing rather than echo a path."""
+        for u in ("http:///only/path", "http://:7846", "/just/a/path"):
+            self.assertEqual(self.mod._redacted_endpoint(u), "another endpoint", u)
+
     def test_genuinely_unset_still_says_unset(self) -> None:
         """Control: the original diagnosis must survive for the case it describes."""
         out = self._run(routed=False)
