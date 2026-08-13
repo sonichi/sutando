@@ -5,9 +5,67 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import os
+from datetime import datetime
+
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from task_archive import find_task_file
+from task_archive import archive_file, find_task_file
+
+
+class TestArchiveNeverOverwrites(unittest.TestCase):
+    """The success path must not destroy an existing archived record.
+
+    Before the fix these called shutil.move, which REPLACES the destination on
+    POSIX, so a repeated task id silently overwrote the earlier archive.
+    """
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        root = Path(self._td.name)
+        self.tasks_dir = root / "archive-tasks"
+        self.results_dir = root / "archive-results"
+        self.live = root / "live"
+        self.live.mkdir()
+        self.month = datetime.now().strftime("%Y-%m")
+
+    def _archive(self, src: Path, task_id: str) -> bool:
+        return archive_file(src, "tasks", task_id, tasks_dir=self.tasks_dir,
+                            results_dir=self.results_dir, log=lambda _m: None)
+
+    def test_existing_archive_record_survives_a_repeated_id(self) -> None:
+        (self.tasks_dir / self.month).mkdir(parents=True)
+        prior = self.tasks_dir / self.month / "task-x.txt"
+        prior.write_text("OLD-RECORD")
+        src = self.live / "task-x.txt"
+        src.write_text("NEW-RECORD")
+
+        self.assertTrue(self._archive(src, "task-x"))
+        self.assertEqual(prior.read_text(), "OLD-RECORD")
+        self.assertFalse(src.exists(), "source must leave the live queue")
+        self.assertEqual((self.tasks_dir / self.month / "task-x.txt.1").read_text(),
+                         "NEW-RECORD")
+
+    def test_normal_archive_still_lands_under_the_plain_name(self) -> None:
+        src = self.live / "task-y.txt"
+        src.write_text("BODY")
+        self.assertTrue(self._archive(src, "task-y"))
+        self.assertEqual((self.tasks_dir / self.month / "task-y.txt").read_text(),
+                         "BODY")
+
+    def test_quarantine_does_not_clobber_an_earlier_quarantine(self) -> None:
+        self.tasks_dir.mkdir()
+        os.chmod(self.tasks_dir, 0o500)
+        self.addCleanup(os.chmod, self.tasks_dir, 0o700)
+        (self.live / "task-z.txt.archive-failed").write_text("FIRST")
+        src = self.live / "task-z.txt"
+        src.write_text("SECOND")
+
+        self.assertTrue(self._archive(src, "task-z"))
+        self.assertEqual((self.live / "task-z.txt.archive-failed").read_text(), "FIRST")
+        self.assertEqual((self.live / "task-z.txt.archive-failed.1").read_text(), "SECOND")
+        self.assertFalse(src.exists())
 
 
 class TestFindTaskFile(unittest.TestCase):

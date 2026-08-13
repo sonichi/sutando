@@ -7,6 +7,7 @@ import os
 import importlib.util
 import tempfile
 import unittest
+from unittest import mock
 
 # Hermetic-bridge-test lint: explicit config root, access.json seeded under it.
 _CFG = tempfile.mkdtemp(prefix="archive-test-cfg-")
@@ -146,14 +147,32 @@ class ArchiveFailureIsNotDeletion(unittest.TestCase):
         self.assertEqual((self.d / "task-7.txt.archive-failed.1").read_text(), "new")
 
     def test_archive_file_never_unlinks_its_source_before_a_copy_exists(self):
-        """It may unlink only after the hard link is in place — an unlink that
-        can run on the failure path is the deletion bug returning."""
-        text = (SRC.parent / "task_archive.py").read_text()
-        start = text.index("def archive_file(")
-        body = text[start:]
-        self.assertIn("os.link(", body, "quarantine must link before unlinking")
-        self.assertLess(body.index("os.link("), body.index("src.unlink()"),
-                        "unlink must come after the link, never before")
+        """A second copy must exist at the instant the source is unlinked.
+
+        Asserted by observing the filesystem from inside unlink, not by
+        grepping the source: the link moved into a helper once already, and a
+        source-text check reports that refactor as the deletion bug returning.
+        """
+        src = self.d / "task-8.txt"
+        src.write_text("payload")
+        observed = {}
+        real_unlink = Path.unlink
+
+        def spy(self_path, *a, **kw):
+            if self_path == src:
+                copies = [p for p in self.d.glob("task-8.txt*") if p != src]
+                observed["copies_at_unlink"] = [p.name for p in copies]
+                observed["bodies"] = [p.read_text() for p in copies]
+            return real_unlink(self_path, *a, **kw)
+
+        with mock.patch.object(Path, "unlink", spy):
+            self.assertTrue(self._broken()(src, "tasks", "task-8"))
+
+        self.assertTrue(observed, "the source was never unlinked at all")
+        self.assertTrue(observed["copies_at_unlink"],
+                        "source unlinked while it was the ONLY copy — data loss")
+        self.assertIn("payload", observed["bodies"],
+                      "the surviving copy must already hold the bytes")
 
 
 class CallersHonourTheReturn(unittest.TestCase):
