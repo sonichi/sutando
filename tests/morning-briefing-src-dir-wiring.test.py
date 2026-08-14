@@ -55,8 +55,22 @@ class SrcDirWiring(unittest.TestCase):
         self.assertIsNone(mb.get_health_issues())
 
     def test_daily_insight_path_follows_src_dir(self):
-        """Same builder, one gather down."""
-        self.assertIsNone(mb.get_daily_insight())
+        """Asserts the SUBPROCESS is never reached, not the return value.
+
+        `get_daily_insight` has two routes to None — the absent-script guard,
+        and a run whose sentinel never appears — so `assertIsNone` passes with
+        the builder reverted and proves nothing. (Verified: it did.) Reaching
+        `subprocess.run` at all means the builder found a real script, i.e. it
+        did not read the stubbed `_SRC_DIR`.
+        """
+        calls = []
+        real_run = mb.subprocess.run
+        mb.subprocess.run = lambda *a, **k: calls.append(a) or real_run(*a, **k)
+        try:
+            self.assertIsNone(mb.get_daily_insight())
+        finally:
+            mb.subprocess.run = real_run
+        self.assertEqual(calls, [], "builder resolved a real script — it ignored _SRC_DIR")
 
     def test_reminders_path_follows_src_dir(self):
         """Uses `_SRC_DIR.parent` — the one builder that walks UP, so a wrong
