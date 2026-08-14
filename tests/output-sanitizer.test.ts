@@ -1,19 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-// Exercises the PRODUCTION sanitizer from src/voice-agent.ts — not a copy of it.
-//
-// The previous version of this file declared its own FABRICATED_OUTPUT_RE and its
-// own reducer, with a comment saying the regex "MUST stay in sync". That is a test
-// that CANNOT FAIL when production drifts: change the real regex and this suite
-// still passes green. qingyun caught it on #1414 ("the added test mirrors sanitizer
-// logic instead of importing/exercising the production implementation, so it can
-// pass while the actual stream wiring regresses").
-//
-// The sanitizer was inside main()'s wiring IIFE and therefore unimportable, so it
-// is now a pure companion module (src/output_sanitizer.ts) that voice-agent.ts
-// imports. Behaviour unchanged; the streamed handler calls the same predicate
-// this suite calls, and the test no longer drags dotenv/transports into scope.
+// Imports the PRODUCTION sanitizer instead of mirroring it: a mirrored regex stays green
+// when production drifts, so the copy can never fail.
+
 import {
 	FABRICATED_OUTPUT_RE,
 	isFabricatedOutput,
@@ -21,9 +11,7 @@ import {
 	createOutputSanitizer,
 } from '../src/output_sanitizer.js';
 
-// Drives the real predicate the way the streamed handler does: accumulate per-turn
-// deltas and test the running buffer. The ACCUMULATION is the test's own (it models
-// the caller); the DETECTION is production's.
+// The ACCUMULATION models the caller and is the test's own; the DETECTION is production's.
 function turnFabricated(chunks: string[]): boolean {
 	let buffer = '';
 	for (const chunk of chunks) {
@@ -59,14 +47,8 @@ test('ordinary speech passes through untouched', () => {
 	assert.equal(turnFabricated(['']), false);
 });
 
-// Gap 3 (Pro re-review 2026-06-26): hold-output model.
-//
-// This DRIVES THE PRODUCTION STATE MACHINE. It used to declare its own FAB_PREFIXES,
-// couldStillBeFabrication and runStream — a mirror that stayed correct (and green)
-// even if the real wrapper flushed heldText early, failed to reset, or stopped
-// setting _suppressAudio. qingyun rejected exactly that twice on #1414. The machine
-// now lives in src/output_sanitizer.ts, so `runStream` is a thin harness over
-// createOutputSanitizer that records the side effects instead of reimplementing them.
+// Thin harness over the production createOutputSanitizer: it records side effects rather
+// than reimplementing them, so an early flush or a missed reset fails here.
 function runStream(chunks: string[], turnEnd = true): { forwarded: string; suppressed: boolean; audioSuppressed: boolean } {
 	let forwarded = '';
 	let blocked = false;
@@ -107,18 +89,12 @@ test('the suite is bound to the PRODUCTION regex, not a local copy', () => {
 	// must be the same object the module exports, and must be a RegExp.
 	assert.ok(FABRICATED_OUTPUT_RE instanceof RegExp);
 	assert.equal(FABRICATED_OUTPUT_RE.flags.includes('i'), true);
-	// And the predicate must agree with the exported regex on a known case —
-	// catching a future refactor that leaves the regex behind but rewires the
-	// predicate to something else.
+	// Predicate and exported regex must agree, catching a refactor that rewires one only.
 	assert.equal(isFabricatedOutput('  [System: x'), FABRICATED_OUTPUT_RE.test('[System: x'));
 });
 
-// ---------------------------------------------------------------------------
-// The behaviours a MIRRORED state machine could never have caught. Each of these
-// asserts an effect of the production wrapper itself, so a regression in
-// voice-agent.ts's contract shows up here instead of shipping green.
-// ---------------------------------------------------------------------------
-
+// Behaviours a MIRRORED state machine could not catch: each asserts an effect of the
+// production wrapper, so a contract regression fails here instead of shipping green.
 test('_suppressAudio is raised on a fabricated turn and lowered on reset', () => {
 	let audio: boolean | null = null;
 	const s = createOutputSanitizer({ forward: () => {}, setSuppressAudio: (on) => { audio = on; } });

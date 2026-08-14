@@ -1426,38 +1426,16 @@ async function main() {
 			} catch { /* test-only */ }
 		}, 250);
 	}
-	// Wire output sanitizer: intercept model-spoken transcript to detect and suppress
-	// hallucinated [System: …] / [Silence] directives (issue #1410 / #1356 class).
-	// In native-audio mode, Gemini sends audio + transcript concurrently. Suppressing
-	// _suppressAudio on detection cuts off remaining audio chunks in the same turn;
-	// earlier chunks already sent are not recalled. This is best-effort detection +
-	// partial mitigation — fix #1 from issue #1410.
+	// Native audio streams transcript and audio concurrently, so suppression reaches only
+	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
 	(() => {
 		const transport = (session as any).transport;
 		if (!transport) return;
-		// Gap 1 (review 2026-06-20): dropped the bare `Silence\.?` alternative — anchored
-		// at line start it collided with natural speech ("Silence is golden.", "Silence,
-		// please …") and silently suppressed legitimate output. The #1410/#1356 fabrication
-		// signature is the *bracketed* `[Silence]`, which is kept; dropping the bare form
-		// removes the only real false-positive surface at ~no detection cost.
+		// Only the BRACKETED `[Silence]` is a fabrication signature: a bare `Silence.` collides
+		// with natural speech ("Silence is golden") and suppressed legitimate output.
 		const origOnOutputTranscription = transport.onOutputTranscription?.bind(transport);
-		// Gap 2 (review 2026-06-20): onOutputTranscription is fed incremental per-turn
-		// deltas, not whole-turn text, so a fabricated prefix split across chunks
-		// ("[Sys" | "tem: …") matched the ^-anchor on neither fragment and the sanitizer
-		// never fired for the streamed case. Accumulate a per-turn buffer and test the
-		// running buffer (still anchored at the turn's start), resetting on the same turn
-		// boundaries that reset _suppressAudio.
-		//
-		// Gap 3 (Pro re-review 2026-06-26): the gap-2 buffer still forwarded each chunk
-		// immediately, so a split fabricated prefix leaked its first fragment before the
-		// buffer completed the match. The stream now HOLDS output until the buffer either
-		// MATCHES (suppress — nothing was forwarded) or DIVERGES from every fabricated
-		// prefix (flush + stream the rest of the turn).
-		//
-		// The hold/suppress/flush/reset machine itself lives in ./output_sanitizer.js.
-		// It was inline here, which made it unimportable, so tests could only mirror it —
-		// and a mirrored copy stays green while this wrapper drifts (qingyun, #1414).
-		// Wiring stays here; the decision logic is imported and unit-tested directly.
+		// Deltas are per-turn FRAGMENTS, so output is HELD until the running buffer either
+		// matches a fabricated prefix (suppress) or diverges (flush the rest of the turn).
 		const sanitizer = createOutputSanitizer({
 			forward: (t) => origOnOutputTranscription?.(t),
 			setSuppressAudio: (on) => { if ('_suppressAudio' in transport) transport._suppressAudio = on; },
