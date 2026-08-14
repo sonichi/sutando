@@ -25,9 +25,8 @@
 # turn-end (after every assistant response), NOT session-end — so the
 # PID-kill block killed the live Monitor watcher every turn, triggering an
 # exit-143 + Monitor-restart cycle.  Watcher orphan-cleanup is handled by
-# the `Reap any stale watch-tasks-stream watcher` block in
-# `src/startup.sh` (defense-in-depth: PID-file + cmdline-check before
-# kill), which runs at every session start.  See the original #1061 /
+# `reap_stale_task_watcher` in `src/startup-runtime.sh`, which runs at every
+# session start.  See the original #1061 /
 # #1063 / #1065 thread for the orphan-watcher background.
 #
 # Idempotent: re-running is safe.  Existing hook entries with the same
@@ -99,6 +98,14 @@ HOOKS=(
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
 )
+
+# Skill-declared hooks. A skill owns its hook the way it owns its `tools`;
+# src/skill_hooks.py is the single discovery the health probe also reads.
+while IFS='|' read -r _ev _tok _cmd; do
+  [ -n "${_ev:-}" ] && HOOKS+=("$_ev|$_tok|$_cmd")
+done <<EOF
+$(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
+EOF
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
 # Matching uses `.command | contains(substring)` so we don't need to track
