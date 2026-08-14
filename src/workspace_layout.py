@@ -36,9 +36,17 @@ def _has_workspace_override(repo_root: Path) -> bool:
     expanded = configured.replace("${REPO_DIR}", str(repo_root))
     expanded = os.path.expanduser(os.path.expandvars(expanded))
     try:
-        return Path(expanded).resolve() != (repo_root / "workspace").resolve()
+        # Resolve parents only — following the final component would let an
+        # existing symlink AT the default path launder an override into "equal".
+        return _canon_no_follow(Path(expanded)) != _canon_no_follow(repo_root / "workspace")
     except OSError:
         return True  # unresolvable custom path: treat as override, do not touch
+
+
+def _canon_no_follow(p) -> Path:
+    # str(Path) carries no trailing slash, so the dirname/basename split is stable.
+    s = str(p)
+    return Path(os.path.dirname(s)).resolve() / os.path.basename(s)
 
 
 def app_workspace_target(repo_root: Path) -> Path | None:

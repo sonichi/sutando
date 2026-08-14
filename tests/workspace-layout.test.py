@@ -228,6 +228,21 @@ class PlainCheckout(unittest.TestCase):
             self.assertEqual(report["state"], "ok")
             self.assertEqual(report["action"], "none")
 
+    def test_symlink_already_pointing_at_override_stays_untouched(self):
+        # A symlink at the default path resolving to the SAME custom dir must
+        # not launder the override into "equal" and get rewired to app default.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _app_install(Path(tmp))
+            custom = Path(tmp) / "custom-workspace"
+            custom.mkdir()
+            (repo / "sutando.config.local.json").write_text(
+                json.dumps({"workspace": {"path": str(custom)}})
+            )
+            (repo / "workspace").symlink_to(custom)
+            report = wl.ensure_workspace_layout(repo)
+            self.assertEqual(report["action"], "none")
+            self.assertEqual((repo / "workspace").resolve(), custom.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()
