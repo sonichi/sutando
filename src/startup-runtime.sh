@@ -326,10 +326,26 @@ reap_stale_task_watcher() {
   [ -f "$pid_file" ] || return 0
   stale_pid="$(cat "$pid_file" 2>/dev/null || true)"
 
-  if [ -n "$stale_pid" ] && ps -p "$stale_pid" -o args= 2>/dev/null | grep -q "watch-tasks-stream"; then
+  # `ps` failing is NOT "the pid is not a watcher". A denied or unavailable ps
+  # skipped the ownership check entirely and still fell through to the release
+  # below, deleting a live watcher's sentinel on a pid-byte match.
+  local ps_err ps_out ps_rc=0
+  ps_err="$(mktemp)"
+  ps_out="$(ps -p "$stale_pid" -o args= 2>"$ps_err")" || ps_rc=$?
+  if [ -s "$ps_err" ]; then
+    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher (ps: $(head -1 "$ps_err")); leaving the sentinel alone"
+    rm -f "$ps_err"
+    return 0
+  fi
+  rm -f "$ps_err"
+
+  if [ -n "$stale_pid" ] && printf '%s' "$ps_out" | grep -q "watch-tasks-stream"; then
     # A watcher younger than the sentinel did not write it, so it is a NEW
     # watcher on a reissued pid — signalling it would kill a live drain.
-    sentinel_pid_wrote_file "$stale_pid" "$pid_file"; local owned_rc=$?
+    # errexit-safe: a bare call here terminates startup.sh (set -e) on rc 1/2
+    # before either branch below can run.
+    local owned_rc=0
+    sentinel_pid_wrote_file "$stale_pid" "$pid_file" || owned_rc=$?
     if [ "$owned_rc" -eq 1 ]; then
       echo "  ⚠ pid $stale_pid is a watcher but started AFTER this sentinel — reissued pid, not its owner; leaving both alone"
       return 0

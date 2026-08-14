@@ -196,6 +196,46 @@ check "$(kill -0 "$U_PID" 2>/dev/null && echo 0 || echo 1)" \
 check "$([ -f "$PF_U" ] && echo 0 || echo 1)" \
       "f3) ...and does NOT unlink its sentinel"
 
+# f4 — errexit. Production startup.sh runs under `set -e`, and a BARE call to the
+# tri-state helper terminates the shell on rc 1/2 before either branch runs. Must
+# be a separate `bash -e` process invoking the reaper as a simple command: calling
+# it inside `cmd && ... || ...` disables errexit for the whole function body, which
+# is how a first attempt at this test passed while production was broken.
+for _rc in 0 1 2; do
+  cat > "$TMP/errexit.sh" <<EOF
+set -e
+. "$REPO/src/watcher_sentinel.sh"
+. "$REPO/src/startup-runtime.sh" 2>/dev/null || true
+sentinel_pid_wrote_file() { return $_rc; }
+ps() { echo "bash watch-tasks-stream.sh"; }
+sentinel_release_if_owner() { :; }
+kill() { :; }
+PF="\$(mktemp)"; echo 99999 > "\$PF"
+reap_stale_task_watcher "\$PF"
+echo REACHED
+EOF
+  _out="$(bash "$TMP/errexit.sh" 2>&1)"
+  check "$(printf '%s' "$_out" | grep -q REACHED && echo 0 || echo 1)" \
+        "f4/$_rc) helper rc=$_rc does not abort the reaper under set -e"
+done
+
+# f5 — `ps` failing is not "not a watcher". A denied ps skipped the ownership
+# check and still released the sentinel, deleting a live watcher's file.
+cat > "$TMP/psfail.sh" <<EOF
+. "$REPO/src/watcher_sentinel.sh"
+. "$REPO/src/startup-runtime.sh" 2>/dev/null || true
+ps() { echo "ps: Operation not permitted" >&2; return 1; }
+OWN=0; REL=0
+sentinel_pid_wrote_file() { OWN=1; return 2; }
+sentinel_release_if_owner() { REL=1; }
+PF="\$(mktemp)"; echo 99999 > "\$PF"
+reap_stale_task_watcher "\$PF" >/dev/null 2>&1
+echo "OWN=\$OWN REL=\$REL"
+EOF
+_ps="$(bash "$TMP/psfail.sh" 2>/dev/null)"
+check "$(printf '%s' "$_ps" | grep -q 'REL=0' && echo 0 || echo 1)" \
+      "f5) an unanswerable ps does NOT release the sentinel (got: $_ps)"
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
