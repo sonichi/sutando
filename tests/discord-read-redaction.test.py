@@ -121,5 +121,59 @@ class ReaderRedaction(unittest.TestCase):
         self.assertIn("from vault_intercept import redact_vault_commands", src)
 
 
+class SiblingReaderRedaction(unittest.TestCase):
+    """`src/read_discord_channel.py` had the SAME bypass — and it is the reader
+    CLAUDE.md tells the agent to PREFER (the graceful contextNotFrom path).
+
+    Fixing only `discord-read.py` would have left the documented-preferred path
+    leaking, which is the instance-vs-class mistake: the policy already lives in
+    `chat_secret_filter` / `vault_intercept`, and the defect is a consumer not
+    wired to it. Two consumers were unwired; both are now wired.
+
+    Note what this does NOT overlap with: the contextNotFrom gate decides WHICH
+    channel may be read. It says nothing about what the text contains, so a
+    permitted channel can still carry a credential. Gate and redaction are
+    orthogonal, and having one is not having the other.
+    """
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "read_discord_channel", REPO / "src" / "read_discord_channel.py")
+        self.rdc = importlib.util.module_from_spec(spec)
+        sys.modules["read_discord_channel"] = self.rdc
+        try:
+            spec.loader.exec_module(self.rdc)
+        except SystemExit:
+            pass
+
+    def _fetch(self, contents):
+        msgs = [{"author": {"username": "sonichi"}, "content": c} for c in contents]
+        self.rdc._api_get = lambda *a, **k: msgs
+        return self.rdc.fetch_messages("123", len(msgs), "token")
+
+    def test_vault_set_is_not_printed(self):
+        """Fails on parent, which prints `m.get("content", "")` untouched."""
+        out = self._fetch([f"vault set TELEGRAM_BOT_TOKEN {FAKE_TOKEN}"])
+        self.assertNotIn(FAKE_TOKEN, out)
+        self.assertIn("vault set TELEGRAM_BOT_TOKEN", out)
+
+    def test_ordinary_messages_and_authors_survive(self):
+        """Additive — the reader's shape (`[author] content`, oldest-first) is
+        unchanged for text with no secret in it."""
+        out = self._fetch(["ordinary message"])
+        self.assertEqual(out, "[sonichi] ordinary message")
+
+    def test_empty_content_does_not_raise(self):
+        self.assertEqual(self._fetch([""]), "[sonichi] ")
+
+    def test_uses_the_same_two_helpers_as_the_bridge(self):
+        """Both readers and the bridge must resolve the SAME policy, from the
+        same modules — `vault_set_grammar` exports a same-named function with a
+        different placeholder, so the import source is load-bearing."""
+        src = (REPO / "src" / "read_discord_channel.py").read_text()
+        self.assertIn("from chat_secret_filter import filter_chat_secrets", src)
+        self.assertIn("from vault_intercept import redact_vault_commands", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
