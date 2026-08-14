@@ -208,6 +208,33 @@ class CollisionRecordsStayReachable(unittest.TestCase):
         self.assertIn("channel_id: REAL", got.read_text())
 
 
+class ArchiveLookupNeverScansTheDirectory(unittest.TestCase):
+    """find_archived_task runs in agent-api's per-poll loop over an archive that
+    reached 5,716 entries; a glob there measured 442x an exists()."""
+
+    def test_newest_archived_probes_exact_names_and_never_globs(self) -> None:
+        import task_archive
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "task-x.txt").write_text("a")
+            (d / "task-x.txt.1").write_text("b")
+            def boom(self, *a, **kw):
+                raise AssertionError("newest_archived scanned the directory")
+            with mock.patch.object(Path, "glob", boom), \
+                 mock.patch.object(Path, "iterdir", boom), \
+                 mock.patch("os.scandir", boom):
+                got = task_archive.newest_archived(d, "task-x")
+            self.assertEqual(got.name, "task-x.txt.1")
+
+    def test_an_absent_id_costs_one_probe_and_returns_none(self) -> None:
+        import task_archive
+        with tempfile.TemporaryDirectory() as td:
+            def boom(self, *a, **kw):
+                raise AssertionError("scanned the directory for an absent id")
+            with mock.patch.object(Path, "glob", boom):
+                self.assertIsNone(task_archive.newest_archived(Path(td), "task-nope"))
+
+
 class CrashDuringCrossDeviceCopy(unittest.TestCase):
     """A mocked exception exercises cleanup; only a real kill proves the
     authoritative name is never published half-written."""

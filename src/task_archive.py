@@ -40,21 +40,17 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
 def newest_archived(directory: Path, task_id: str) -> Path | None:
     """Newest record for task_id in one directory — collision suffix included.
     A repeat lands as `<id>.txt.1`, so plain `<id>.txt` is the OLDEST, not current."""
-    prefix = f"{task_id}.txt"
-    best: Path | None = None
-    best_n = -1
-    for p in directory.glob(prefix + "*"):
-        rest = p.name[len(prefix):]
-        if rest:
-            # Numeric compare: string order puts `.txt.10` before `.txt.2`.
-            if not (rest.startswith(".") and rest[1:].isdigit()):
-                continue
-            n = int(rest[1:])
-        else:
-            n = 0
-        if n > best_n:
-            best, best_n = p, n
-    return best
+    base = directory / f"{task_id}.txt"
+    if not base.exists():
+        return None          # `.N` is only minted once `.txt` is taken
+    # Probe exact names, never glob: this runs in agent-api's per-poll loop over an
+    # archive dir that reached 5,716 entries, where a glob measured 442x an exists().
+    best, n = base, 1
+    while True:
+        nxt = base.with_name(f"{base.name}.{n}")
+        if not nxt.exists():
+            return best
+        best, n = nxt, n + 1
 
 
 def _move_without_clobbering(src: Path, dest: Path) -> Path:
