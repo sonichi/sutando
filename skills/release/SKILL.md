@@ -49,7 +49,9 @@ an approved release PR.
    upgrade guidance, and `CHANGELOG.md`. Do not copy canonical text into a
    second document.
 7. Prepare one release PR containing only release artifacts and documentation.
-   Do not mix product fixes into it; list unresolved fixes as blockers.
+   Do not mix product fixes into it; list unresolved fixes as blockers. It
+   records the entry **after** the tag (see Publish step 2) and is not a
+   precondition for publishing.
 8. Run every applicable hard gate from `docs/release-process.md`, including the
    fresh-clone health check, headline-feature smoke, migration idempotency, and
    prior-release-to-candidate upgrade smoke. Record exact commands, candidate
@@ -73,9 +75,15 @@ Proceed only when the owner explicitly confirms the exact version and candidate
 SHA in the current conversation.
 
 1. Re-read the proposal and `docs/release-process.md`.
-2. Verify the candidate SHA is still the intended commit, the release PR is
-   merged, required checks are green, the worktree is clean, the tag does not
-   exist, and every blocker is resolved.
+2. Verify the candidate SHA is still the intended commit, required checks are
+   green, the worktree is clean, the tag does not exist, and every blocker is
+   resolved.
+
+   **Do not gate the tag on the release PR being merged.** This repo tags the
+   candidate commit and records the CHANGELOG entry afterwards — v0.7.0 through
+   v0.10.0 were each tagged on a tree containing no entry for themselves, and
+   v0.10.0's entry landed two days later in #2826. Holding the tag for the
+   changelog PR blocks the release on review latency for no benefit.
 3. If any evidence is stale or the SHA changed, return to **Prepare**.
 4. Create the annotated tag. Use a signed tag only when the owner is performing
    the signing with their configured key; never impersonate an owner signature.
