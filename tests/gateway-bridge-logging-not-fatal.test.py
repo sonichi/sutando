@@ -14,7 +14,8 @@ guard for the standalone ag2-sparrow package.
 
 `test_a_write_to_a_dead_pipe_does_not_raise` fails on the parent commit.
 """
-import importlib.util
+import importlib
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -38,19 +39,29 @@ class _DeadPipe:
 
 
 def _never_fatal():
-    """Return the module's guard class without importing the whole bridge.
+    """Return the module's guard class, importing the module the way the repo's
+    other gateway tests do (`tests/gateway-owner-presence-peer-gate.test.py`).
 
-    Executing the module would start real network/config work, so the class is
-    extracted from source. Returns None when the guard is absent (parent commit).
+    Importing rather than exec-ing a source slice matters twice over: it is the
+    established harness, and it is what makes the guard's lines register as
+    covered — `compile()` on a slice renumbers from 1, so diff-cover would credit
+    the wrong lines of this file entirely.
+
+    Returns None when the guard is absent (parent commit), so the control arms
+    fail on an assertion rather than an ImportError.
     """
-    src = MOD.read_text()
-    if "class _NeverFatalStream" not in src:
-        return None
-    start = src.index("class _NeverFatalStream")
-    end = src.index("sys.stdout = _NeverFatalStream", start)
-    ns: dict = {}
-    exec(compile(src[start:end], str(MOD), "exec"), ns)  # noqa: S102 — pinned slice
-    return ns["_NeverFatalStream"]
+    os.environ.setdefault("REMOTE_TASK_URL", "https://gw.example/relay")
+    os.environ.setdefault("REMOTE_TASK_TOKEN", "dummy-secret")
+    sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+    # The module installs the guard on the REAL sys.stdout/sys.stderr at import.
+    # Restore them, or every later test in the process writes through the wrapper.
+    saved_out, saved_err = sys.stdout, sys.stderr
+    try:
+        m = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+        m = importlib.reload(m)
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+    return getattr(m, "_NeverFatalStream", None)
 
 
 class GatewayLoggingNotFatalTest(unittest.TestCase):
