@@ -55,9 +55,29 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
+
+
+_NEWEST_ARCHIVED = None
+
+
+def _newest_archived(directory: Path, task_id: str) -> Path | None:
+    """Delegate to task_archive: one collision-naming owner, never a copy.
+    Lazy — this module is loaded by path in contexts with no src/ on sys.path."""
+    global _NEWEST_ARCHIVED
+    if _NEWEST_ARCHIVED is None:
+        try:
+            from .task_archive import newest_archived
+        except ImportError:  # pragma: no cover - flat / by-path import
+            here = str(Path(__file__).resolve().parent)
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            from task_archive import newest_archived
+        _NEWEST_ARCHIVED = newest_archived
+    return _NEWEST_ARCHIVED(directory, task_id)
 
 # ── Schema constants ─────────────────────────────────────────────────────────
 
@@ -550,9 +570,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """
     if not valid_archive_lookup_id(task_id):
         return None
-    fname = f"{task_id}.txt"
-    candidates = [tasks_dir / fname, tasks_dir / "processed" / fname,
-                  tasks_dir / "archive" / fname]
+    dirs = [tasks_dir, tasks_dir / "processed", tasks_dir / "archive"]
     archive_root = tasks_dir / "archive"
     try:
         with os.scandir(archive_root) as entries:
@@ -560,10 +578,13 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
                             if _MONTH_DIR_RE.match(e.name) and e.is_dir())
     except (OSError, ValueError):
         months = []          # missing/unreadable archive is "no months", not an error
-    candidates.extend(archive_root / m / fname for m in months)
-    for p in candidates:
-        if p.exists():
-            return p
+    dirs.extend(archive_root / m for m in months)
+    for d in dirs:
+        # Shared owner picks among collision suffixes: `<id>.txt` is the OLDEST
+        # record once `<id>.txt.1` exists, so `.exists()` here returned stale.
+        hit = _newest_archived(d, task_id)
+        if hit is not None:
+            return hit
     return None
 
 

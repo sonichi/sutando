@@ -31,19 +31,35 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     matches = sorted(tasks_dir.glob(f"{task_id}.claimed-core-*.txt"))
     if matches:
         return matches[0]
-    # Quarantined last: archive_file() mints this name when it cannot archive,
-    # and it is still the task's only surviving header block. Without it a
-    # failed archive also strands the reply, since routing needs the headers.
+    # Quarantined last: it is the task's only surviving header block, and
+    # routing needs those headers or a failed archive also strands the reply.
     quarantined = sorted(tasks_dir.glob(f"{task_id}.txt.archive-failed*"))
     return quarantined[0] if quarantined else None
 
 
+def newest_archived(directory: Path, task_id: str) -> Path | None:
+    """Newest record for task_id in one directory — collision suffix included.
+    A repeat lands as `<id>.txt.1`, so plain `<id>.txt` is the OLDEST, not current."""
+    prefix = f"{task_id}.txt"
+    best: Path | None = None
+    best_n = -1
+    for p in directory.glob(prefix + "*"):
+        rest = p.name[len(prefix):]
+        if rest:
+            # Numeric compare: string order puts `.txt.10` before `.txt.2`.
+            if not (rest.startswith(".") and rest[1:].isdigit()):
+                continue
+            n = int(rest[1:])
+        else:
+            n = 0
+        if n > best_n:
+            best, best_n = p, n
+    return best
+
+
 def _move_without_clobbering(src: Path, dest: Path) -> Path:
     """Move src to dest, or to dest.N if taken. Returns where it landed.
-
-    link()+unlink() rather than rename()/move(): those REPLACE an existing
-    destination on POSIX, which is data loss on a repeated task id.
-    """
+    link()+unlink(): rename()/move() REPLACE on POSIX — data loss on a repeat."""
     import os
     import shutil
     base, candidate, n = dest, dest, 0
@@ -55,23 +71,26 @@ def _move_without_clobbering(src: Path, dest: Path) -> Path:
             n += 1
             candidate = base.with_name(f"{base.name}.{n}")
         except OSError:
-            # Cross-device: link() can't span filesystems. O_EXCL still refuses
-            # an existing destination, so the no-clobber guarantee survives.
-            while True:
-                try:
-                    fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                except FileExistsError:
-                    n += 1
-                    candidate = base.with_name(f"{base.name}.{n}")
-                    continue
-                try:
-                    with open(fd, "wb") as out, open(src, "rb") as inp:
-                        shutil.copyfileobj(inp, out)
-                    shutil.copystat(str(src), str(candidate))
-                except BaseException:
-                    os.unlink(str(candidate))
-                    raise
-                break
+            # Cross-device: link() can't span filesystems. Fill a private temp
+            # first — the authoritative name created early publishes a stub on a kill.
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=str(base.parent),
+                                       prefix=f".{base.name}.", suffix=".part")
+            try:
+                with open(fd, "wb") as out, open(src, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+                    out.flush()
+                    os.fsync(out.fileno())
+                shutil.copystat(str(src), tmp)
+                while True:
+                    try:
+                        os.link(tmp, str(candidate))   # atomic, refuses existing
+                        break
+                    except FileExistsError:
+                        n += 1
+                        candidate = base.with_name(f"{base.name}.{n}")
+            finally:
+                os.unlink(tmp)
             break
     src.unlink()
     return candidate
