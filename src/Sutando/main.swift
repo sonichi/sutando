@@ -263,7 +263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = workspace + "/assets/stand-avatar.png"
+            let avatarPath = SutandoConfig.personalAssetPath("stand-avatar.png", workspace: workspace)
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -969,7 +969,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Composited onto the top-right corner of the 18×18 avatar so the
     /// menu bar continuously signals mode without taking an extra slot.
     func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
-        let avatarPath = workspace + "/assets/stand-avatar.png"
+        let avatarPath = SutandoConfig.personalAssetPath("stand-avatar.png", workspace: workspace)
         guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
         base.size = NSSize(width: 18, height: 18)
         base.isTemplate = false
@@ -2054,12 +2054,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let logPath = workspace + "/logs/health-check.log"
         let scriptPath = repoRoot + "/src/health-check.py"
-        // Match the (retired) launchd plist's interpreter so behavior is
-        // identical. Falls back to /usr/bin/env python3 if homebrew python
-        // is missing on this host.
-        let homebrewPython = "/opt/homebrew/opt/python@3.11/libexec/bin/python3"
-        let pythonPath = FileManager.default.fileExists(atPath: homebrewPython)
-            ? homebrewPython : "/usr/bin/env"
+        // $SUTANDO_PY -> bundled runtime -> system python3 only when the
+        // developer tools are present; skip rather than raise a modal dialog.
+        guard let pythonPath = SutandoConfig.resolvePython(repoRoot: repoRoot) else {
+            logToFile("runHealthCheck: no runnable python3 "
+                + "(no $SUTANDO_PY, no bundled runtime, no developer tools) — skipping")
+            return
+        }
         // `--emit-task` writes tasks/task-health-{ts}.txt on failure (with
         // built-in dedup: 1h cooldown per failure-set hash). The agent picks
         // it up via the bridge as a regular owner task — gives the trio's
@@ -2067,9 +2068,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // health failures the trio's coverage scanner suppresses by cooldown
         // (or the LLM step archives by judgment) still reach the agent. Per
         // Chi 2026-05-07 PT.
-        let arguments: [String] = (pythonPath == "/usr/bin/env")
-            ? ["python3", scriptPath, "--fix", "--emit-task"]
-            : [scriptPath, "--fix", "--emit-task"]
+        // resolvePython returns a real interpreter path, so argv no longer
+        // needs the "python3" prepend the `/usr/bin/env` form required.
+        let arguments: [String] = [scriptPath, "--fix", "--emit-task"]
 
         DispatchQueue.global(qos: .background).async { [weak self] in
             guard let self = self else { return }

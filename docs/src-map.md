@@ -10,11 +10,12 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-202 modules indexed.
+211 modules indexed.
 
 ## `src/`
 
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
+- **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
@@ -46,6 +47,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
+- **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
@@ -79,6 +81,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
+- **`orphan_result_routes.py`** — Routes for results whose task a bridge never saw.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
@@ -97,6 +100,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`recording-tools.ts`** — Recording, video playback, and scroll-and-describe tools.
 - **`remote-gateway-bridge.py`** — remote-gateway-bridge.py — sutando loader for the canonical ag2-sparrow client.
 - **`remote-relay-bridge.py`** — remote-relay-bridge.py — DEPRECATED name; renamed to remote-gateway-bridge.py.
+- **`render_plist_template.py`** — Render a launchd plist: literal __TOKEN__ substitution, XML escaping, parse check.
 - **`reply_chain.py`** — Reply-context formatting (pure) — companion to ``discord-bridge.py``.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
@@ -112,6 +116,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`send_allowlist.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
+- **`send_failure_policy.py`** — Classify an outbound-send failure as transient (retry) or permanent (park).
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
@@ -135,6 +140,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
 - **`vault_intercept.py`** — Bridge-level vault secret interception.
+- **`vault_set_grammar.py`** — Pure, dependency-free `vault set KEY VALUE` grammar — regex + redact-only.
 - **`verify-gemini-31.sh`** — Sutando Gemini 3.1 rollout verification
 - **`verify-setup.sh`** — Sutando setup verification — checks everything a new user needs
 - **`vision-tools.ts`** — Vision pipeline — pipe JPEG frames from a source (screen, webcam) into the Gemini Live voice session.
@@ -151,6 +157,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
+- **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
@@ -166,6 +173,8 @@ and re-run `python3 scripts/gen-src-map.py`.
 
 ## `src/agent/`
 
+- **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
