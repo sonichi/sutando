@@ -132,6 +132,44 @@ class AppendOnlyShrinkTest(unittest.TestCase):
         (self.ws / "state" / "file-watermarks.json").write_text('["not", "a", "dict"]')
         self.assertEqual(self._check()["status"], "ok")
 
+    # ---- optional: per-host files a host may never create --------------------
+
+    def _opt(self, path, name="pq"):
+        """Call with `optional`, degrading to the parent's signature so the control
+        arm FAILS the assertion instead of erroring. A TypeError proves the kwarg
+        is new; only a status comparison shows the behaviour differs."""
+        fn = getattr(hc, "check_append_only_file", None)
+        if fn is None:
+            return hc.check_file(path, name)
+        try:
+            return fn(path, name, optional=True)
+        except TypeError:
+            return fn(path, name)
+
+    def test_optional_absent_is_ok_not_missing(self):
+        """A host that has filed no question has no pending-questions.md. That is
+        not a fault, and reporting it as one trains the reader to ignore the row."""
+        out = self._opt(self.ws / "hosts" / "h" / "pending-questions.md")
+        self.assertEqual(out["status"], "ok", out)
+        self.assertIn("not present", out["detail"])
+
+    def test_optional_does_not_weaken_the_shrink_warning_once_it_exists(self):
+        """`optional` must only excuse ABSENCE — a file that exists is watched
+        exactly as strictly, or the flag becomes a way to opt out of the probe."""
+        p = self.ws / "hosts" / "h" / "pending-questions.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x" * 74_845)
+        self._opt(p)
+        p.write_text("x" * 900)
+        self.assertEqual(self._opt(p)["status"], "warn")
+
+    def test_optional_still_reports_an_empty_file(self):
+        """Absent and empty are different: empty means something truncated it."""
+        p = self.ws / "hosts" / "h" / "pending-questions.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("")
+        self.assertEqual(self._opt(p)["status"], "empty")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1200,7 +1200,9 @@ def check_file(path: Path, name: str) -> dict:
     return {"name": name, "status": "ok", "detail": f"{size} bytes"}
 
 
-def check_append_only_file(path: Path, name: str, shrink_ratio: float = 0.5) -> dict:
+def check_append_only_file(
+    path: Path, name: str, shrink_ratio: float = 0.5, optional: bool = False
+) -> dict:
     """`check_file`, plus: warn when an append-only log SHRINKS against its own
     high-water mark. Size alone cannot see a truncation that leaves one line.
 
@@ -1211,8 +1213,14 @@ def check_append_only_file(path: Path, name: str, shrink_ratio: float = 0.5) -> 
 
     Re-baselines to the smaller size after warning, so an intentional rotation
     is one loud signal rather than a permanent warn nobody reads.
+
+    `optional` is for per-host files that a host may legitimately never create
+    (a host that has filed no question has no `pending-questions.md`). Absence
+    is reported ok; once the file exists it is watched exactly like any other.
     """
     base = check_file(path, name)
+    if base["status"] == "missing" and optional:
+        return {"name": name, "status": "ok", "detail": f"not present on this host ({path})"}
     if base["status"] != "ok":
         return base
     size = path.stat().st_size
@@ -7396,6 +7404,13 @@ def run_all_checks() -> list[dict]:
     ]:
         checks.append(check_file(path, name))
     checks.append(check_append_only_file(WORKSPACE_DIR / "build_log.md", "build_log.md"))
+    # Resolved questions move BELOW the file's divider rather than out of it, and no
+    # archiver exists — so this file only grows, and it is the owner's decision surface.
+    checks.append(check_append_only_file(
+        WORKSPACE_DIR / "hosts" / _host_label() / "pending-questions.md",
+        "pending-questions.md",
+        optional=True,
+    ))
 
     # Memory system (check if dir exists — specific files are optional)
     if MEMORY_DIR.exists():
