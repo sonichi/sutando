@@ -163,7 +163,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
-- **`workspace_layout.py`** — Spawn-time guard for the repo→workspace wiring (the `workspace` entry).
+- **`workspace_layout.py`** — Spawn-time guard for the `<repo>/workspace` wiring (symlink in app installs).
 - **`workspace_lock.py`** — Atomic per-workspace role lock for sutando singleton enforcement (MC1).
 - **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
 - **`write_calendar_cache.py`** — Producer for the morning-briefing Google-calendar cache (PR #2256).
