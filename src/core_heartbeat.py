@@ -114,8 +114,25 @@ def _socket_path() -> str:
 
 
 def core_session() -> str:
-    """The tmux session the core runs in. Mirrors both launchers' default."""
+    """The tmux session the core runs in, per the env/default contract.
+    NOT authoritative: the Claude launcher hardcodes SESSION="sutando-core"
+    (claude/cli/start-cli.sh:52) and never forwards SUTANDO_TMUX_SESSION, so an
+    exported value can name a session that does not exist. Prefer
+    _observed_session() for anything recorded."""
     return os.environ.get("SUTANDO_TMUX_SESSION", "sutando-core")
+
+
+def _observed_session(sock: str) -> str:
+    """The session this process is actually IN, per tmux, else the contract.
+    Only trusted when $TMUX proves we are inside tmux — a bare display-message
+    from outside resolves some arbitrary session on a shared socket."""
+    if os.environ.get("TMUX"):
+        r = _tmux(sock, "display-message", "-p", "#{session_name}")
+        if r is not None and r.returncode == 0:
+            name = (r.stdout or "").strip()
+            if name:
+                return name
+    return core_session()
 
 
 def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess | None:
@@ -353,9 +370,10 @@ def write_beat(status: str = "running") -> None:
         # app, whose ambient SUTANDO_TMUX_SOCKET points at a *different* bundled
         # socket). Mirrors start-cli.sh's resolution exactly.
         "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
-        # Same runtime-authored argument as `socket`: the session lives in the
-        # core's env, and a shared socket makes `attach` without -t ambiguous.
-        "session": core_session(),
+        # Same runtime-authored argument as `socket`, but the env cannot be
+        # trusted here: the Claude launcher hardcodes the session, so ask tmux.
+        "session": _observed_session(
+            os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")),
         # Self-reported locality (Track 10): {kind: local|cloud, host}. Additive
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.

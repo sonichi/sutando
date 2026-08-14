@@ -84,9 +84,10 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertEqual(data["schema_version"], 3)
         # locality (Track 10): {kind, host}, self-reported. Default kind=local.
         self.assertEqual(data["locality"], {"kind": "local", "host": _short_host()})
-        # session: the tmux session the core runs in. Recorded for the same reason
-        # as `socket` — a shared socket makes `attach` without -t ambiguous.
-        self.assertEqual(data["session"], core_heartbeat.core_session())
+        # session: what tmux says this core is IN, not what the env claims.
+        self.assertEqual(data["session"], core_heartbeat._observed_session(
+            os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")))
+
         # socket: the runtime-authored tmux socket the core runs on. Consumed by
         # `sutando-config.sh runtime` so the AgentRuntime descriptor reports the
         # real socket (incl. custom sockets) independent of a caller's env.
@@ -98,6 +99,43 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertIsInstance(data["last_beat_at"], float)
         # last_beat_at advances after a sleep; just sanity-check it's recent.
         self.assertLess(abs(time.time() - data["last_beat_at"]), 5)
+
+    def test_observed_session_prefers_tmux_over_a_lying_env(self):
+        """The Claude launcher hardcodes SESSION and never forwards
+        SUTANDO_TMUX_SESSION, so an exported value can name a session that does
+        not exist. Recording it would send the owner to a dead target."""
+        import core_heartbeat
+        import subprocess as _sp
+        _orig = core_heartbeat._tmux
+        core_heartbeat._tmux = lambda sock, *a: _sp.CompletedProcess(
+            a, 0, stdout="sutando-core\n", stderr="")
+        os.environ["TMUX"] = "/tmp/sutando-tmux.sock,1,0"
+        os.environ["SUTANDO_TMUX_SESSION"] = "custom-core-does-not-exist"
+        try:
+            self.assertEqual(core_heartbeat.core_session(),
+                             "custom-core-does-not-exist")   # the env still lies
+            self.assertEqual(core_heartbeat._observed_session("/tmp/s.sock"),
+                             "sutando-core")                 # tmux wins
+        finally:
+            core_heartbeat._tmux = _orig
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
+            os.environ.pop("TMUX", None)
+
+    def test_observed_session_falls_back_when_not_inside_tmux(self):
+        """Outside tmux a bare display-message resolves an arbitrary session on a
+        shared socket, so the contract value is the safer answer."""
+        import core_heartbeat
+        _orig = core_heartbeat._tmux
+        core_heartbeat._tmux = lambda sock, *a: (_ for _ in ()).throw(
+            AssertionError("must not ask tmux when $TMUX is unset"))
+        os.environ.pop("TMUX", None)
+        os.environ["SUTANDO_TMUX_SESSION"] = "from-contract"
+        try:
+            self.assertEqual(core_heartbeat._observed_session("/tmp/s.sock"),
+                             "from-contract")
+        finally:
+            core_heartbeat._tmux = _orig
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
 
     def test_locality_kind_from_env(self):
         """Track 10: `kind` self-reports from $SUTANDO_CORE_LOCALITY — `cloud`
