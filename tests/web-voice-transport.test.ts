@@ -320,7 +320,7 @@ class FakeAudioContext {
 		return { duration: len / rate, getChannelData: () => new Float32Array(len) };
 	}
 	createBufferSource(): any {
-		return {
+		const src = {
 			buffer: null,
 			playbackRate: { value: 1 },
 			connect() {},
@@ -328,8 +328,19 @@ class FakeAudioContext {
 				this.bufferSourcesStarted++;
 			},
 			stop() {},
-			onended: null,
+			onended: null as (() => void) | null,
 		};
+		this.bufferSources.push(src);
+		return src;
+	}
+	/** Every source created, in order — P7 ended/cancelled split tests fire
+	 *  their onended by hand. */
+	bufferSources: Array<{ onended: (() => void) | null; stop: () => void }> = [];
+	/** P7 D7.5: the transport assigns onstatechange; tests flip `state` and
+	 *  call this to simulate a browser lifecycle transition. */
+	onstatechange: (() => void) | null = null;
+	fireStateChange(): void {
+		this.onstatechange?.();
 	}
 }
 
@@ -340,6 +351,8 @@ class FakeSocket {
 	readyState = 0; // CONNECTING
 	sent: Array<ArrayBuffer | string> = [];
 	closeCalls = 0;
+	/** P7: settable for bufferedAmount-skip tests (real sockets expose this). */
+	bufferedAmount = 0;
 	onopen: (() => void) | null = null;
 	onmessage: ((ev: { data: unknown }) => void) | null = null;
 	onerror: (() => void) | null = null;
@@ -379,13 +392,32 @@ class FakeSocket {
 // Browser globals the class touches. Each test FILE runs in its own process
 // under the node:test runner, so this stubbing cannot leak into other suites.
 let gumImpl: () => Promise<FakeMediaStream>;
+/** P7 D7.5 input-device fingerprinting seam: tests swap the device list to
+ *  drive the devicechange input-filter. */
+let enumImpl: () => Promise<Array<{ kind: string; deviceId: string }>>;
+const mediaDevicesListeners: Array<{ type: string; h: () => void }> = [];
+function fireDeviceChange(): void {
+	for (const l of [...mediaDevicesListeners]) if (l.type === 'devicechange') l.h();
+}
 Object.defineProperty(globalThis, 'AudioContext', {
 	value: FakeAudioContext,
 	configurable: true,
 	writable: true,
 });
 Object.defineProperty(globalThis, 'navigator', {
-	value: { mediaDevices: { getUserMedia: () => gumImpl() } },
+	value: {
+		mediaDevices: {
+			getUserMedia: () => gumImpl(),
+			enumerateDevices: () => enumImpl(),
+			addEventListener: (type: string, h: () => void) => {
+				mediaDevicesListeners.push({ type, h });
+			},
+			removeEventListener: (type: string, h: () => void) => {
+				const i = mediaDevicesListeners.findIndex((l) => l.type === type && l.h === h);
+				if (i >= 0) mediaDevicesListeners.splice(i, 1);
+			},
+		},
+	},
 	configurable: true,
 	writable: true,
 });
@@ -434,6 +466,8 @@ beforeEach(() => {
 	FakeAudioContext.nextState = 'running';
 	FakeAudioContext.resumeHook = null;
 	gumImpl = async () => new FakeMediaStream();
+	enumImpl = async () => [];
+	mediaDevicesListeners.length = 0;
 });
 
 describe('classifyMicErrorCode (Step 15 — machine-readable class)', () => {
@@ -713,7 +747,11 @@ describe('attempt conclusion invalidates the generation (fix round — server-cl
 		FakeAudioContext.resumeHook = () => new Promise((res) => (release = res));
 		await delay(5); // getUserMedia resolved → stream captured → parked in resume()
 		assert.equal(streams.length, 1);
-		assert.equal((h.t as any).micStream, streams[0], 'precondition: captured before the resume await');
+		// P7 (wireCaptureGraph): the captured stream is not published to
+		// micStream until AFTER the resume fence passes — while parked, the
+		// grant is held only by the continuation, so a stale one can't leave
+		// even a transient publication behind.
+		assert.equal((h.t as any).micStream, null, 'precondition: parked in resume, not yet published');
 
 		h.t.disconnect(); // while parked in resume()
 		assert.equal(h.statuses[h.statuses.length - 1].status, 'closed');
@@ -1279,5 +1317,561 @@ describe('transport public API additions (Steps 15/16/18)', () => {
 				k + ' has a remediation hint',
 			);
 		}
+	});
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// P7 step 1 — audio-progress ledger client hop (D7.1): counters, latched
+// episodes, watchdog, audio_health heartbeat; capture recovery FSM (D7.5);
+// §D7.0b frame-path budget guard.
+// ═════════════════════════════════════════════════════════════════════════════
+
+type FrameEvent = { inputBuffer: { getChannelData: () => Float32Array } };
+function frame(samples: Float32Array): FrameEvent {
+	return { inputBuffer: { getChannelData: () => samples } };
+}
+const LOUD = new Float32Array(2048).fill(0.1); // rms 0.1 ≥ 0.02 floor
+const QUIET = new Float32Array(2048); // zeros
+
+function proc(h: ReturnType<typeof harness>): (e: FrameEvent) => void {
+	const p = (h.t as any).processor;
+	assert.ok(p?.onaudioprocess, 'capture processor must be wired');
+	return p.onaudioprocess;
+}
+
+/** Kill the real 500 ms interval so ticks are driven deterministically. */
+function stopRealStats(h: ReturnType<typeof harness>): void {
+	const timer = (h.t as any).statsTimer;
+	if (timer) clearInterval(timer);
+	(h.t as any).statsTimer = null;
+}
+function tick(h: ReturnType<typeof harness>): void {
+	(h.t as any).runStatsTick();
+}
+function healthFrames(s: FakeSocket): any[] {
+	return s.sent
+		.filter((x): x is string => typeof x === 'string')
+		.map((x) => {
+			try {
+				return JSON.parse(x);
+			} catch {
+				return null;
+			}
+		})
+		.filter((m) => m?.t === 'audio_health');
+}
+
+describe('P7 D7.1 ledger counters', () => {
+	it('scheduled/ended/cancelled split: barge-in cancellations never count as completion', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const ctx = FakeAudioContext.created[0];
+		s.binary(new Int16Array([1000, -1000, 500, -500]).buffer);
+		s.binary(new Int16Array([1000, -1000]).buffer);
+		s.binary(new Int16Array([500]).buffer);
+		assert.equal((h.t as any).chunksScheduled, 3);
+		assert.equal((h.t as any).activeSources.length, 3);
+		ctx.bufferSources[0].onended?.(); // natural completion of the first
+		assert.equal((h.t as any).chunksEnded, 1);
+		assert.ok((h.t as any).lastEndedAt != null);
+		feed(h.t, { type: 'turn.interrupted' }); // flush cancels the remaining two
+		assert.equal((h.t as any).chunksCancelled, 2);
+		assert.equal((h.t as any).activeSources.length, 0);
+		// The browser fires onended for stop()ped sources too — a cancelled
+		// chunk must not later masquerade as a completion.
+		ctx.bufferSources[1].onended?.();
+		assert.equal((h.t as any).chunksEnded, 1, 'cancelled chunk never counts as ended');
+		h.t.disconnect();
+	});
+
+	it('bufferedAmount watermark: skip + sendSkipped + high-water, resumes when drained', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const p = proc(h);
+		const bin = () => s.sent.filter((x) => typeof x !== 'string').length;
+		const before = bin();
+		s.bufferedAmount = 300 * 1024;
+		p(frame(LOUD));
+		assert.equal((h.t as any).sendSkipped, 1);
+		assert.equal((h.t as any).bufferedHighWater, 300 * 1024);
+		assert.equal(bin(), before, 'no PCM past the watermark');
+		s.bufferedAmount = 0;
+		p(frame(LOUD));
+		assert.equal(bin(), before + 1, 'send resumes when drained');
+		assert.equal((h.t as any).sendSkipped, 1);
+		h.t.disconnect();
+	});
+
+	it('send try/catch: a throwing socket increments sendFailed, never throws off the graph', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		const p = proc(h);
+		s.send = () => {
+			throw new Error('boom');
+		};
+		assert.doesNotThrow(() => p(frame(LOUD)));
+		assert.equal((h.t as any).sendFailed, 1);
+		assert.equal((h.t as any).capCallbacks, 1, 'callback still accounted');
+		assert.equal((h.t as any).bytesSent, 0, 'failed send not counted as sent');
+		h.t.disconnect();
+	});
+});
+
+describe('P7 D7.1 latched episodes + watchdog', () => {
+	it('RMS floor latches a speech interval {onsetSeq, offsetSeq, maxRms, aboveFloorMs}', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now });
+		await goLive(h);
+		const p = proc(h);
+		p(frame(LOUD)); // onset at seq 1
+		now += 43;
+		p(frame(LOUD));
+		now += 700; // past the 600 ms hangover
+		p(frame(QUIET)); // offset
+		const ep = ((h.t as any).episodeRing as any[]).find((sl) => sl.id === 1);
+		assert.ok(ep, 'episode latched');
+		assert.equal(ep.kind, 'speech');
+		assert.equal(ep.onsetSeq, 1);
+		assert.equal(ep.offsetSeq, 3);
+		assert.equal(ep.maxRmsPm, 100); // rms 0.1 → 100‰
+		assert.equal(ep.aboveFloorMs, 86); // 2 loud frames × 43 ms
+		assert.equal((h.t as any).speechActive, false);
+		h.t.disconnect();
+	});
+
+	it('capture stall opens a gap (capStalled + og on the wire); return latches the episode; the latch survives fast resume and re-sends idempotently', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now });
+		const s = await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		p(frame(QUIET)); // lastCapAt = 10000
+		now += 1100; // > max(3×43, 1000)
+		tick(h); // tick 0: gap opens + first heartbeat
+		assert.equal((h.t as any).capStalled, true);
+		let hb = healthFrames(s);
+		assert.equal(hb.length, 1);
+		assert.deepEqual(hb[0].og, [0, 1100], 'open gap travels — a permanent stall never closes an episode');
+		// Fast resume (S2 shape): capture returns before the next tick — the
+		// interval must LATCH, not vanish with the overwritten lastCapAt.
+		p(frame(QUIET));
+		assert.equal((h.t as any).capStalled, false);
+		const ep = ((h.t as any).episodeRing as any[]).find((sl) => sl.id === 1);
+		assert.equal(ep.kind, 'gap');
+		assert.equal(ep.durationMs, 1100);
+		for (let i = 0; i < 4; i++) tick(h); // ticks 1-4 → heartbeat at 4
+		for (let i = 0; i < 4; i++) tick(h); // ticks 5-8 → heartbeat at 8
+		hb = healthFrames(s);
+		assert.equal(hb.length, 3);
+		assert.deepEqual(hb[1].ep.map((e: any[]) => e[0]), [1]);
+		assert.deepEqual(hb[2].ep.map((e: any[]) => e[0]), [1], 'idempotent window re-sends by id');
+		assert.equal(hb[1].og, undefined, 'gap closed — og gone');
+		h.t.disconnect();
+	});
+
+	it('watchdog is gated: no gap while muted', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now });
+		await goLive(h);
+		stopRealStats(h);
+		proc(h)(frame(QUIET));
+		h.t.setMicMuted(true);
+		now += 5000;
+		tick(h);
+		assert.equal((h.t as any).capStalled, false);
+		assert.equal((h.t as any).gapOpenedAt, 0);
+		h.t.disconnect();
+	});
+});
+
+describe('P7 D7.1 audio_health heartbeat', () => {
+	it('cadence (first tick, then every 4th), stable 8-char nonce, absolute counters, seq', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now });
+		const s = await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		p(frame(LOUD));
+		p(frame(LOUD));
+		for (let i = 0; i < 9; i++) {
+			now += 500;
+			tick(h);
+		}
+		const hb = healthFrames(s);
+		assert.equal(hb.length, 3, 'heartbeats at ticks 0/4/8 — 2 s cadence on the 500 ms timer');
+		assert.equal(hb[0].n.length, 8);
+		assert.equal(hb[0].n, hb[2].n, 'nonce stable within the epoch');
+		assert.equal(hb[2].c[0], 2, 'capCallbacks absolute (idempotent across skipped beats)');
+		assert.deepEqual([hb[0].q, hb[1].q, hb[2].q], [0, 1, 2]);
+		const enc = new TextEncoder();
+		for (const x of s.sent.filter((v): v is string => typeof v === 'string')) {
+			assert.ok(enc.encode(x).byteLength <= 300, 'every frame ≤ 300 B (≤150 B/s at 2 s cadence)');
+		}
+		h.t.disconnect();
+	});
+
+	it('episode window: last 4 by id; unsent episodes aging out surface as eo', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now, speechOffsetHangMs: 100 });
+		const s = await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		for (let k = 0; k < 6; k++) {
+			p(frame(LOUD));
+			now += 43;
+			p(frame(LOUD));
+			now += 200; // past the 100 ms hangover
+			p(frame(QUIET));
+			now += 10;
+		}
+		assert.equal((h.t as any).episodeSeq, 6);
+		tick(h);
+		const hb = healthFrames(s);
+		assert.deepEqual(hb[0].ep.map((e: any[]) => e[0]), [3, 4, 5, 6], 'window = newest 4, oldest first');
+		assert.equal(hb[0].eo, 2, 'episodes 1-2 can never be sent — evidence loss is visible');
+		tick(h);
+		tick(h);
+		tick(h);
+		tick(h); // next heartbeat
+		const hb2 = healthFrames(s);
+		assert.deepEqual(hb2[1].ep.map((e: any[]) => e[0]), [3, 4, 5, 6], 'idempotent re-send');
+		assert.equal(hb2[1].eo, 2, 'overflow counted exactly once');
+		h.t.disconnect();
+	});
+
+	it('worst-case serialization: hard ≤300 B by construction — window trims, flags survive', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now, speechOffsetHangMs: 100 });
+		const s = await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		for (let k = 0; k < 6; k++) {
+			p(frame(LOUD));
+			now += 43;
+			p(frame(LOUD));
+			now += 200;
+			p(frame(QUIET));
+			now += 10;
+		}
+		const t: any = h.t;
+		t.capCallbacks = 9_999_999;
+		t.bytesSent = 9_999_999_999;
+		t.sendSkipped = 99_999;
+		t.sendFailed = 99_999;
+		t.audioChunksRecv = 9_999_999;
+		t.chunksScheduled = 9_999_999;
+		t.chunksEnded = 9_999_999;
+		t.chunksCancelled = 9_999_999;
+		t.ctxSuspendCount = 999;
+		t.bufferedHighWater = 99_999_999;
+		t.lastEndedAt = 1;
+		t.gapOpenedAt = 1; // ancient open gap (worst-width og values)
+		s.bufferedAmount = 99_999_999;
+		h.t.setMicMuted(true);
+		// Model episodes from hour 3 of a call: every numeric field at its
+		// realistic maximum width, so the serialized window genuinely overflows.
+		for (const slot of t.episodeRing as any[]) {
+			if (slot.id === 0) continue;
+			slot.startMs = 9_999_999;
+			slot.endMs = 9_999_999;
+			slot.durationMs = 9_999_999;
+			slot.onsetSeq = 9_999_999;
+			slot.offsetSeq = 9_999_999;
+			slot.maxRmsPm = 1000;
+			slot.aboveFloorMs = 9_999_999;
+		}
+		tick(h);
+		const raw = s.sent
+			.filter((v): v is string => typeof v === 'string')
+			.find((x) => {
+				try {
+					return JSON.parse(x)?.t === 'audio_health';
+				} catch {
+					return false;
+				}
+			})!;
+		assert.ok(new TextEncoder().encode(raw).byteLength <= 300, 'hard cap holds under worst case');
+		const hb = JSON.parse(raw);
+		assert.ok((hb.ep?.length ?? 0) < 4, 'window trimmed to fit');
+		assert.equal(hb.mu, 1);
+		assert.ok(hb.og, 'open gap still travels');
+		assert.deepEqual(hb.ba, [99_999_999, 99_999_999]);
+		h.t.disconnect();
+	});
+
+	it('skipped silently when the socket is not open', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		stopRealStats(h);
+		s.serverClose(4000, 'bye');
+		assert.doesNotThrow(() => tick(h));
+		assert.equal(healthFrames(s).length, 0);
+	});
+
+	it('epoch scoping: reconnect resets counters/episodes and rotates the nonce', async () => {
+		const h = harness();
+		const s1 = await goLive(h);
+		stopRealStats(h);
+		proc(h)(frame(LOUD));
+		tick(h);
+		const n1 = healthFrames(s1)[0].n;
+		assert.equal((h.t as any).capCallbacks, 1);
+		await h.t.connect('ws://fake:9900/');
+		const s2 = h.sock();
+		s2.open();
+		await delay(5);
+		stopRealStats(h);
+		assert.equal((h.t as any).capCallbacks, 0, 'counters reset per epoch');
+		assert.equal((h.t as any).episodeSeq, 0, 'episodes reset per epoch');
+		tick(h);
+		const n2 = healthFrames(s2)[0].n;
+		assert.notEqual(n1, n2, 'fresh nonce per connection epoch');
+		h.t.disconnect();
+	});
+
+	it('demux: heartbeat text rides between binary PCM frames without disturbing egress', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		p(frame(LOUD));
+		tick(h);
+		p(frame(LOUD));
+		const kinds = s.sent.map((x) => (typeof x === 'string' ? 's' : 'b')).join('');
+		assert.ok(kinds.includes('bsb'), 'text heartbeat between binary PCM frames');
+		assert.equal((h.t as any).bytesSent, 2 * 682 * 2, 'PCM byte accounting unaffected');
+		h.t.disconnect();
+	});
+
+	it('onStats: extended payload is additive alongside the byte totals', async () => {
+		const statsSeen: any[] = [];
+		const h = harness({ onStats: (st: any) => statsSeen.push(st) });
+		await goLive(h);
+		stopRealStats(h);
+		proc(h)(frame(LOUD));
+		tick(h);
+		const st = statsSeen[statsSeen.length - 1];
+		assert.equal(typeof st.bytesSent, 'number');
+		assert.equal(typeof st.bytesRecv, 'number');
+		assert.equal(st.capCallbacks, 1);
+		assert.equal(st.captureState, 'observing');
+		assert.equal(st.speechActive, true);
+		assert.equal(st.ctxState, 'running');
+		assert.equal(st.epochNonce.length, 8);
+		h.t.disconnect();
+	});
+});
+
+describe('P7 D7.5 capture recovery FSM', () => {
+	it('suspension → resume recovery succeeds; ctxSuspendCount + transitions recorded', async () => {
+		const events: Array<{ state: string; kind: string }> = [];
+		const h = harness({
+			recoveryBackoffMs: [0, 0, 0],
+			recoveryResumeTimeoutMs: 100,
+			onCaptureHealth: (state: any, kind: any) => events.push({ state, kind }),
+		});
+		await goLive(h);
+		const ctx = FakeAudioContext.created[0];
+		ctx.state = 'suspended';
+		ctx.fireStateChange();
+		await delay(10);
+		assert.deepEqual(events, [
+			{ state: 'recovering', kind: 'resume' },
+			{ state: 'recovered', kind: 'resume' },
+		]);
+		assert.equal((h.t as any).captureState, 'observing');
+		assert.equal((h.t as any).ctxSuspendCount, 1);
+		assert.equal(ctx.state, 'running');
+		h.t.disconnect();
+	});
+
+	it('exhausted recovery → degraded, NOT terminal; single-flight; retryCapture recovers', async () => {
+		const events: Array<{ s: string; k: string }> = [];
+		const h = harness({
+			recoveryBackoffMs: [0, 0, 0],
+			recoveryResumeTimeoutMs: 30,
+			onCaptureHealth: (s: any, k: any) => events.push({ s, k }),
+		});
+		const s = await goLive(h);
+		const ctx = FakeAudioContext.created[0];
+		let resumeCalls = 0;
+		ctx.resume = async () => {
+			resumeCalls++; // resolves but stays suspended — resume ineffective
+		};
+		ctx.state = 'suspended';
+		ctx.fireStateChange();
+		ctx.fireStateChange(); // second signal mid-recovery: no second loop
+		await delay(30);
+		assert.equal((h.t as any).captureState, 'degraded');
+		assert.equal(resumeCalls, 3, 'bounded attempts, single-flight');
+		assert.equal(events.filter((e) => e.s === 'recovering').length, 1, 'one recovering emission');
+		assert.equal(events[events.length - 1].s, 'degraded');
+		assert.equal(h.failures.length, 0, 'degraded is NOT onConnectFailure');
+		assert.equal(s.closeCalls, 0, 'socket stays live — voice lease retained');
+		assert.ok(
+			h.statuses.every((x) => x.status !== 'error' && x.status !== 'closed'),
+			'no terminal status',
+		);
+		// The UI retry affordance: fix the ctx, reacquire from degraded.
+		ctx.resume = async () => {
+			ctx.state = 'running';
+		};
+		let gumCalls = 0;
+		gumImpl = async () => {
+			gumCalls++;
+			return new FakeMediaStream();
+		};
+		h.t.retryCapture();
+		await delay(10);
+		assert.equal(gumCalls, 1, 'retry reacquires');
+		assert.equal((h.t as any).captureState, 'observing');
+		assert.equal(events[events.length - 1].s, 'recovered');
+		h.t.disconnect();
+	});
+
+	it('devicechange filter: output-only change ignored; input-set change reacquires', async () => {
+		let devices = [
+			{ kind: 'audioinput', deviceId: 'a' },
+			{ kind: 'audiooutput', deviceId: 'x' },
+		];
+		enumImpl = async () => devices;
+		let gumCalls = 0;
+		gumImpl = async () => {
+			gumCalls++;
+			return new FakeMediaStream();
+		};
+		const h = harness({ recoveryBackoffMs: [0, 0, 0], recoveryResumeTimeoutMs: 50 });
+		await goLive(h);
+		await delay(5); // initial input-device snapshot settles
+		assert.equal(gumCalls, 1);
+		assert.equal((h.t as any).inputDeviceSig, 'a');
+		devices = [
+			{ kind: 'audioinput', deviceId: 'a' },
+			{ kind: 'audiooutput', deviceId: 'y' },
+		];
+		fireDeviceChange();
+		await delay(10);
+		assert.equal(gumCalls, 1, 'output-only change: no reacquire');
+		devices = [
+			{ kind: 'audioinput', deviceId: 'b' },
+			{ kind: 'audiooutput', deviceId: 'y' },
+		];
+		fireDeviceChange();
+		await delay(10);
+		assert.equal(gumCalls, 2, 'input-set change: reacquire');
+		assert.equal((h.t as any).inputDeviceSig, 'b');
+		h.t.disconnect();
+	});
+
+	it('track ended → reacquire replaces the capture stream', async () => {
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		const h = harness({ recoveryBackoffMs: [0, 0, 0], recoveryResumeTimeoutMs: 50 });
+		await goLive(h);
+		(streams[0].tracks[0] as any).onended?.();
+		await delay(10);
+		assert.equal(streams.length, 2, 'reacquired');
+		assert.equal((h.t as any).micStream, streams[1]);
+		assert.equal(streams[0].tracks[0].stopped, true, 'old track stopped');
+		h.t.disconnect();
+	});
+
+	it('fencing: disconnect during a parked reacquire — the late grant leaks nothing', async () => {
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		const h = harness({ recoveryBackoffMs: [0, 0, 0], recoveryResumeTimeoutMs: 5000 });
+		await goLive(h);
+		let releaseGum!: (s: FakeMediaStream) => void;
+		gumImpl = () =>
+			new Promise<FakeMediaStream>((res) => {
+				releaseGum = (st) => {
+					streams.push(st);
+					res(st);
+				};
+			});
+		(streams[0].tracks[0] as any).onended?.(); // recovery parks in getUserMedia
+		await delay(5);
+		assert.equal((h.t as any).captureState, 'recovering');
+		await h.t.disconnect(); // teardown bumps captureGen
+		const late = new FakeMediaStream();
+		releaseGum(late);
+		await delay(5);
+		assert.equal(late.tracks[0].stopped, true, 'late grant stopped, not leaked');
+		assert.equal((h.t as any).micStream, null);
+		assert.equal((h.t as any).processor, null);
+	});
+
+	it('listener teardown: disconnect removes devicechange + statechange listeners', async () => {
+		const h = harness();
+		await goLive(h);
+		assert.equal(mediaDevicesListeners.length, 1, 'devicechange listener installed');
+		const ctx = FakeAudioContext.created[0];
+		assert.ok(ctx.onstatechange, 'statechange adopted');
+		await h.t.disconnect();
+		assert.equal(mediaDevicesListeners.length, 0, 'devicechange removed');
+		assert.equal(ctx.onstatechange, null, 'statechange cleared before close');
+	});
+});
+
+describe('P7 §D7.0b frame-path budget', () => {
+	it('instrumented frame handler adds ≤50 µs p99 over the pinned-replica baseline', async () => {
+		const h = harness();
+		await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		const s = h.sock();
+		const buf = new Float32Array(2048);
+		for (let i = 0; i < buf.length; i++) buf[i] = Math.sin(i / 10) * 0.05;
+		const ev = frame(buf);
+		// Pinned-replica baseline: the pre-P7 handler body with a same-shape sink.
+		const baseSink: ArrayBuffer[] = [];
+		let baseBytes = 0;
+		const baseline = (e: FrameEvent): void => {
+			const raw = e.inputBuffer.getChannelData(0);
+			const down = downsample(raw, 48000, 16000);
+			const pcm = float32ToInt16(down);
+			baseSink.push(pcm.buffer as ArrayBuffer);
+			baseBytes += pcm.buffer.byteLength;
+		};
+		const N = 2000;
+		const WARM = 300;
+		const tInst = new Float64Array(N);
+		const tBase = new Float64Array(N);
+		for (let i = 0; i < WARM; i++) {
+			p(ev);
+			baseline(ev);
+		}
+		s.sent.length = 0;
+		baseSink.length = 0;
+		for (let i = 0; i < N; i++) {
+			let t0 = process.hrtime.bigint();
+			baseline(ev);
+			let t1 = process.hrtime.bigint();
+			tBase[i] = Number(t1 - t0);
+			t0 = process.hrtime.bigint();
+			p(ev);
+			t1 = process.hrtime.bigint();
+			tInst[i] = Number(t1 - t0);
+			if (i % 250 === 0) {
+				s.sent.length = 0; // keep sink growth from skewing either side
+				baseSink.length = 0;
+			}
+		}
+		const p99 = (a: Float64Array): number => {
+			const c = Array.from(a).sort((x, y) => x - y);
+			return c[Math.floor(c.length * 0.99)];
+		};
+		const addedUs = (p99(tInst) - p99(tBase)) / 1000;
+		assert.ok(addedUs <= 50, `added p99 ${addedUs.toFixed(1)} µs exceeds the 50 µs budget`);
+		assert.ok(baseBytes > 0);
+		h.t.disconnect();
 	});
 });
