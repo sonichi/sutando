@@ -123,6 +123,27 @@ and loads whichever repo it reviews.
    The tell is that a broken instrument and a clean result are *byte-identical*, so the
    author's confidence carries no information.
 
+10. **A fix that changes a decision rule is itself a decision rule — enumerate the
+    adjacent inputs before pushing.** When a patch changes *how something is judged*
+    (a readiness test, a routing check, a marker classification), the next reviewer will
+    find the input one step to the side of the one you tested. Before pushing, list the
+    other values that reach the same decision and exercise each; and when the repo already
+    owns that judgement, ask the owner rather than restating its knowledge — the shared
+    copy is where the edge cases have already been paid for.
+    *Grounded by:* two PRs on 2026-08-13, five and six rounds each, every round a real
+    finding and every one adjacent to the last. (a) #2867 — the reap's "does a result
+    exist?" rule was rebuilt four times: a hand-rolled archive glob (a prefix collision
+    satisfied the wrong task), then `-s` (accepted whitespace-only, which the shared
+    `result_ready` contract rejects), then an overwrite that destroyed a late answer, then
+    a check-then-`mv` that relocated one out of the delivery path. `local_task_protocol`
+    and `result_ready` already answered the first two correctly. (b) #2868 — "is this
+    session routed?" went display-suppression → durable burn history → any non-empty
+    `ANTHROPIC_BASE_URL` → any scheme on the right host:port → a diagnosis line asserting
+    a cause it had not checked → that same line echoing URL credentials into a shared
+    self-diagnose bundle. Each fix was correct for the case its test named.
+    The tell that you are in this pattern: your test suite grows by exactly one case per
+    round, and each new case is the previous one with a single field changed.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
