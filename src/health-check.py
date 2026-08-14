@@ -4777,11 +4777,12 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         if unknown:
             detail += (f"; UNCHECKED (no dated artifact, cannot tell whether it ran): "
                        f"{', '.join(sorted(unknown))}")
-        if not seen:
-            # Verified nothing, so `ok` would be a health claim about zero jobs —
-            # dashboards read status, not detail, and green here means "checked".
-            return {"name": name, "status": "warn",
-                    "detail": detail + " — this probe has no coverage on this host"}
+        if unknown:
+            # `ok` would certify jobs nobody measured: on a 1-of-5 host the four
+            # UNCHECKED ones miss forever behind green. Coverage gates the verdict.
+            scope = "no coverage on this host" if not seen else \
+                    f"{len(unknown)} of {len(jobs)} unverifiable — status cannot be ok"
+            return {"name": name, "status": "warn", "detail": f"{detail} — {scope}"}
         return {"name": name, "status": "ok", "detail": detail}
     bits = []
     for n, m, c in late:

@@ -37,6 +37,22 @@ class TestLatenessIsTheSignal(unittest.TestCase):
         r = hc._interpret_daily_punctuality([job("daily-insight", 6, 50, arts)])
         self.assertEqual(r["status"], "ok", r)
 
+    def test_partial_coverage_is_not_ok_even_when_every_observed_job_is_punctual(self):
+        """The reviewer's 1-of-5 host: four UNCHECKED jobs can miss forever
+        behind a green status, which is the class this probe exists to catch."""
+        good = [(f"2026-08-{d:02d}", 361) for d in range(6, 13)]
+        jobs = [job("seen", 6, 0, good)] + [job(f"blind{i}", 6, 0, []) for i in range(4)]
+        r = hc._interpret_daily_punctuality(jobs)
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("1 of 5", r["detail"])
+        self.assertIn("cannot be ok", r["detail"])
+
+    def test_full_coverage_all_punctual_is_still_ok(self):
+        """Coverage gates the verdict; it must not make the probe permanently warn."""
+        good = [(f"2026-08-{d:02d}", 361) for d in range(6, 13)]
+        r = hc._interpret_daily_punctuality([job(f"j{i}", 6, 0, good) for i in range(3)])
+        self.assertEqual(r["status"], "ok", r["detail"])
+
     def test_the_real_host_shape_warns(self):
         """Verbatim from this host: 07:12 08:37 07:53 07:20 07:32 07:38 07:27."""
         mins = [7 * 60 + 12, 8 * 60 + 37, 7 * 60 + 53, 7 * 60 + 20,
