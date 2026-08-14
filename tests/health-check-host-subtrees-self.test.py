@@ -130,6 +130,16 @@ class HostSubtreeSelfTest(unittest.TestCase):
         self.assertEqual(out["status"], "ok")
         self.assertNotIn("Empty-Host", out["detail"])
 
+    def test_only_empty_peer_subtrees_says_so_rather_than_naming_a_host(self):
+        """`fresh`, `stale` and `own` all empty. Reachable on a fresh clone that
+        has a hosts/ dir before any host has written into it, so the sentence
+        must not claim a subtree that is not there."""
+        (self.ws / "hosts" / "Nobody-Yet").mkdir()
+        out = self._run()
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("no datable subtree", out["detail"])
+        self.assertNotIn("local writes", out["detail"])
+
     def test_no_hosts_dir_is_unchanged(self):
         with mock.patch.object(hc, "WORKSPACE_DIR", self.ws / "nope"):
             self.assertEqual(hc.check_host_subtrees()["status"], "ok")
