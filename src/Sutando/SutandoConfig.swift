@@ -262,6 +262,44 @@ enum SutandoConfig {
         return resolved
     }
 
+    /// Precedence: $SUTANDO_HOST_LABEL / $SUTANDO_HOST_OVERRIDE -> scutil LocalHostName
+    /// -> short hostname. scutil outranks hostname: a DHCP lease can drift the hostname.
+    static func hostLabel() -> String {
+        let env = ProcessInfo.processInfo.environment
+        for key in ["SUTANDO_HOST_LABEL", "SUTANDO_HOST_OVERRIDE"] {
+            if let v = env[key]?.trimmingCharacters(in: .whitespaces), !v.isEmpty {
+                return v
+            }
+        }
+        let scutil = Process()
+        scutil.executableURL = URL(fileURLWithPath: "/usr/sbin/scutil")
+        scutil.arguments = ["--get", "LocalHostName"]
+        let pipe = Pipe()
+        scutil.standardOutput = pipe
+        scutil.standardError = FileHandle.nullDevice
+        if (try? scutil.run()) != nil {
+            scutil.waitUntilExit()
+            if scutil.terminationStatus == 0,
+               let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                                encoding: .utf8) {
+                let name = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty { return name }
+            }
+        }
+        let short = ProcessInfo.processInfo.hostName
+        return short.split(separator: ".").first.map(String.init) ?? short
+    }
+
+    /// Probes the per-host home before the legacy `assets/` location. When neither
+    /// exists it returns the per-host path, so the caller's existence check still fails.
+    static func personalAssetPath(_ name: String, workspace: String) -> String {
+        let candidates = [
+            (workspace as NSString).appendingPathComponent("hosts/\(hostLabel())/\(name)"),
+            (workspace as NSString).appendingPathComponent("assets/\(name)"),
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? candidates[0]
+    }
+
     /// Scan the repo's `.env` for SUTANDO_WORKSPACE=. Best-effort.
     static func detectEnvWorkspaceInDotenv(repoRoot explicitRoot: String? = nil) -> String? {
         let root: String?
