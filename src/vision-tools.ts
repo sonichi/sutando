@@ -16,10 +16,11 @@
  * realtime_input.video slot accepts single-frame images.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, mkdirSync, openSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { readCaptureToken } from './util_paths.js';
+import { findRepoRoot } from './sutando_config.js';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, type Server } from 'node:http';
@@ -30,7 +31,11 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 
 const execFileAsync = promisify(execFile);
-const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+// UTC, matching voice-agent's ts() — these logs interleave in the same file,
+// and a local-time subsystem next to UTC subsystems made incident timelines
+// off-by-timezone (field report 2026-08-14: 09:48:04 [Vision] and 16:48:04
+// [VoiceSession] were the same instant).
+const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
 const MAX_FPS = 2;
@@ -81,15 +86,43 @@ function _portListening(port: number): Promise<boolean> {
 	});
 }
 
+/**
+ * Where screen-capture-server.py actually lives, as candidate paths in
+ * probe order. The old single answer — "next to this module" — was only true
+ * in dev (`tsx src/voice-agent.ts`): the bundled app runs
+ * `dist/voice-agent.js`, and build-bundle.mjs ships no .py files, so the
+ * module-relative path resolved to a nonexistent dist/screen-capture-server.py
+ * and every Watch attempt died as a silent 8s port timeout (field report
+ * 2026-08-14). The bundle DOES ship src/*.py as a sibling of dist/, so the
+ * canonical answer is `<sutando root>/src/…` via findRepoRoot (the same
+ * helper python-binary.ts uses), with the module-sibling kept as the dev/
+ * exotic-layout fallback. Exported for tests.
+ */
+export function _captureServerScriptCandidates(moduleDir: string): string[] {
+	const candidates: string[] = [];
+	const root = findRepoRoot(moduleDir);
+	if (root) candidates.push(join(root, 'src', 'screen-capture-server.py'));
+	const sibling = join(moduleDir, 'screen-capture-server.py');
+	if (!candidates.includes(sibling)) candidates.push(sibling);
+	return candidates;
+}
+
 /** Ensure the screen-capture-server is up on :7845, spawning it if absent.
- *  Reuses a running server (startup.sh's, or a prior lazy spawn); memoizes the
- *  in-flight spawn so concurrent captures don't double-start it. */
+ *  Reuses a running server (startup.sh's, the supervisor's, or a prior lazy
+ *  spawn); memoizes the in-flight spawn so concurrent captures don't
+ *  double-start it. */
 export async function ensureScreenCaptureServer(): Promise<void> {
 	if (await _portListening(SCREEN_CAPTURE_PORT)) return; // reuse a running server
 	if (_screenCaptureStarting) return _screenCaptureStarting; // join an in-flight spawn
 	const start = (async () => {
-		// screen-capture-server.py sits next to this module in src/.
-		const script = join(dirname(fileURLToPath(import.meta.url)), 'screen-capture-server.py');
+		const moduleDir = dirname(fileURLToPath(import.meta.url));
+		const candidates = _captureServerScriptCandidates(moduleDir);
+		const script = candidates.find((c) => existsSync(c));
+		if (!script) {
+			// Fail FAST and say why — the old path burned 8s per attempt on a
+			// port that could never open, with the real cause discarded.
+			throw new Error(`screen-capture-server.py not found (tried: ${candidates.join(', ')})`);
+		}
 		// The bundled .app's voice-agent runs under a MINIMAL launchd PATH (no
 		// /opt/homebrew/bin etc. — same class as the claude-on-PATH gotcha, desktop
 		// PR #50). A bare `python3` would ENOENT there — Watch would still silently
@@ -100,17 +133,55 @@ export async function ensureScreenCaptureServer(): Promise<void> {
 		const augmentedPath = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/usr/sbin', '/bin', process.env.PATH]
 			.filter(Boolean)
 			.join(':');
+		// Observability + process shape (field report 2026-08-14): the old
+		// spawn was detached with stdio 'ignore' and no handlers, so a child
+		// that died instantly (missing script, python error, bind failure) was
+		// indistinguishable from a slow boot. Now: NOT detached — the server
+		// stays a non-disclaimed child of the voice agent, the same shape the
+		// supervisor deliberately uses for screen-capture so TCC attributes the
+		// Screen Recording grant to the app lineage — stderr/stdout go to a log
+		// file, the pid is logged, and an early exit fails the wait immediately
+		// with the code + log path instead of a ghost timeout. unref() still
+		// keeps the child from holding the event loop open.
+		let logPath = '/dev/null';
+		let logfd: number | undefined;
+		try {
+			const logDir = join(resolveWorkspace(), 'logs');
+			mkdirSync(logDir, { recursive: true });
+			logPath = join(logDir, 'screen-capture-server.lazy.log');
+			logfd = openSync(logPath, 'a');
+		} catch {
+			logfd = undefined; // fall back to ignore — logging must not block the spawn
+		}
+		let exited: { code: number | null; signal: string | null } | null = null;
+		let spawnError: Error | null = null;
 		const child = spawn('python3', [script], {
-			detached: true,
-			stdio: 'ignore',
+			detached: false,
+			stdio: logfd !== undefined ? ['ignore', logfd, logfd] : 'ignore',
 			env: { ...process.env, PATH: augmentedPath },
 		});
 		child.unref();
+		child.on('error', (err) => {
+			spawnError = err;
+		});
+		child.on('exit', (code, signal) => {
+			exited = { code, signal };
+		});
+		console.log(`${ts()} [Vision] spawned screen-capture-server pid=${child.pid} script=${script} log=${logPath}`);
 		for (let i = 0; i < 40; i++) {
 			if (await _portListening(SCREEN_CAPTURE_PORT)) return;
+			if (spawnError) {
+				throw new Error(`screen-capture-server spawn failed: ${(spawnError as Error).message}`);
+			}
+			if (exited) {
+				const e = exited as { code: number | null; signal: string | null };
+				throw new Error(
+					`screen-capture-server exited before listening (code=${e.code} signal=${e.signal}) — see ${logPath}`,
+				);
+			}
 			await new Promise((r) => setTimeout(r, 200));
 		}
-		throw new Error('screen-capture-server did not come up on :7845 within 8s');
+		throw new Error(`screen-capture-server did not come up on :7845 within 8s — see ${logPath}`);
 	})();
 	_screenCaptureStarting = start;
 	try {
