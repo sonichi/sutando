@@ -2331,11 +2331,17 @@ def check_host_subtrees() -> dict:
     """Surface per-host subtrees (hosts/<host>/) that have stopped syncing.
 
     Under the hosts/<hostname>/ convention each host writes only its own
-    subtree, so the newest file mtime in a subtree is that host's last sync. A
-    subtree not updated in SUTANDO_STALE_HOST_DAYS days means that host went
-    quiet (crashed, decommissioned, or sync broke) — surface it rather than
-    letting it silently rot (a gap in both the old machine-<host>/ model and the
-    new one until now). Read-only.
+    subtree, so the newest file mtime in a PEER's subtree is when sync last
+    carried that host's writes here. A peer not updated in
+    SUTANDO_STALE_HOST_DAYS days went quiet (crashed, decommissioned, or sync
+    broke) — surface it rather than letting it silently rot. Read-only.
+
+    THIS host's own subtree is excluded, because its mtime measures local
+    writes, not sync: the core rewrites `hosts/<self>/current-track.md`,
+    `pending-questions.md` and `crons.json` continuously, so it is fresh even
+    where sync has never run once. Counting it made the verdict read
+    "all synced <7d" on a single-machine install with `vault.enabled=false` —
+    an assurance about the one thing the mtime cannot witness.
     """
     name = "host-subtrees"
     hosts_dir = WORKSPACE_DIR / "hosts"
@@ -2349,7 +2355,15 @@ def check_host_subtrees() -> dict:
     if not subtrees:
         return {"name": name, "status": "ok", "detail": "hosts/ present, no host subtrees"}
     now = time.time()
-    stale, fresh = [], 0
+    # Union of every label a launcher here could have written, and on failure the
+    # empty set — which restores the old behaviour rather than excluding a peer we
+    # could not identify. Under-claiming sync evidence beats asserting it.
+    try:
+        local = _local_host_labels()
+        label_known = True
+    except Exception:                     # noqa: BLE001 — a probe must not raise
+        local, label_known = set(), False
+    stale, fresh, own = [], 0, []
     for d in subtrees:
         newest = 0.0
         for f in d.rglob("*"):
@@ -2360,16 +2374,28 @@ def check_host_subtrees() -> dict:
                 continue
         if newest == 0.0:
             continue  # empty subtree — nothing to age
+        if d.name in local:
+            own.append(d.name)
+            continue
         age_d = (now - newest) / 86400
         if age_d > stale_days:
             stale.append(f"{d.name} ({age_d:.0f}d)")
         else:
             fresh += 1
+    suffix = "" if label_known else " (could not identify this host's own label)"
     if stale:
         return {"name": name, "status": "warn",
-                "detail": f"{len(stale)} host subtree(s) stale (>{stale_days:.0f}d): "
-                          f"{', '.join(stale)} — host stopped syncing?"}
-    return {"name": name, "status": "ok", "detail": f"{fresh} host subtree(s), all synced <{stale_days:.0f}d"}
+                "detail": f"{len(stale)} peer subtree(s) stale (>{stale_days:.0f}d): "
+                          f"{', '.join(stale)} — host stopped syncing?{suffix}"}
+    if fresh:
+        return {"name": name, "status": "ok",
+                "detail": f"{fresh} peer subtree(s), all synced <{stale_days:.0f}d"
+                          f"{f'; own subtree {own[0]} not aged (local writes)' if own else ''}{suffix}"}
+    return {"name": name, "status": "ok",
+            "detail": ("no peer subtree(s) to age — "
+                       + (f"only this host's own ({', '.join(own)}), whose mtime is local writes, "
+                          "not sync" if own else "hosts/ holds no datable subtree")
+                       + suffix)}
 
 
 def _durable_access_bytes(raw: bytes) -> "bytes | None":
