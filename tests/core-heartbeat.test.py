@@ -84,6 +84,9 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertEqual(data["schema_version"], 3)
         # locality (Track 10): {kind, host}, self-reported. Default kind=local.
         self.assertEqual(data["locality"], {"kind": "local", "host": _short_host()})
+        # session: the tmux session the core runs in. Recorded for the same reason
+        # as `socket` — a shared socket makes `attach` without -t ambiguous.
+        self.assertEqual(data["session"], core_heartbeat.core_session())
         # socket: the runtime-authored tmux socket the core runs on. Consumed by
         # `sutando-config.sh runtime` so the AgentRuntime descriptor reports the
         # real socket (incl. custom sockets) independent of a caller's env.

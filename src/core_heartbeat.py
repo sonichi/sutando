@@ -353,6 +353,9 @@ def write_beat(status: str = "running") -> None:
         # app, whose ambient SUTANDO_TMUX_SOCKET points at a *different* bundled
         # socket). Mirrors start-cli.sh's resolution exactly.
         "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+        # Same runtime-authored argument as `socket`: the session lives in the
+        # core's env, and a shared socket makes `attach` without -t ambiguous.
+        "session": core_session(),
         # Self-reported locality (Track 10): {kind: local|cloud, host}. Additive
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.
