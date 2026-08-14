@@ -42,7 +42,10 @@ _DATA_IGNORABLE = {".gitkeep", ".DS_Store"}
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    # Repo root only — this guard runs BEFORE workspace resolution (its whole
+    # job is repairing the wiring the resolver depends on), so it cannot go
+    # through sutando_config; the workspace path itself is never derived here.
+    return Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 
 
 def _has_workspace_override(repo_root: Path) -> bool:
