@@ -1,6 +1,12 @@
 #!/bin/bash
 # Runtime/credential decisions shared by startup and behavior-level tests.
 
+# reap_stale_task_watcher() resolves sentinel ownership through this helper, so
+# the dependency is declared here rather than left to each caller's source order
+# — a consumer that sourced only this file got `command not found` at reap time.
+# shellcheck source=watcher_sentinel.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watcher_sentinel.sh"
+
 # Resolve the selected core before startup touches runtime-specific credentials.
 # The normal .env load happens later in configure_startup_runtime(); use a
 # subshell here so an invocation-scoped SUTANDO_CORE_RUNTIME stored there still
@@ -306,6 +312,56 @@ reap_wedged_voice_agent() {
     sleep 1
   else
     echo "  ⚠ guarded takeover blocked/failed — leaving the listener untouched (a live lock is never removed): $out"
+  fi
+  return 0
+}
+
+# A pid alone cannot say WHICH watcher it names: the OS reissues the numbers of
+# exited processes, so a live watcher can wear a dead predecessor's pid and match
+# both the value in the sentinel and the `ps` argv check. Ownership is resolved by
+# src/watcher_sentinel.sh, which asks the OS whether the process is old enough to
+# have written the file. Nothing here decides ownership locally.
+reap_stale_task_watcher() {
+  local pid_file="$1" stale_pid
+  [ -f "$pid_file" ] || return 0
+  stale_pid="$(cat "$pid_file" 2>/dev/null || true)"
+
+  # `ps` failing is NOT "the pid is not a watcher". A denied or unavailable ps
+  # skipped the ownership check entirely and still fell through to the release
+  # below, deleting a live watcher's sentinel on a pid-byte match.
+  local ps_err ps_out ps_rc=0
+  ps_err="$(mktemp)"
+  ps_out="$(ps -p "$stale_pid" -o args= 2>"$ps_err")" || ps_rc=$?
+  if [ -s "$ps_err" ]; then
+    echo "  ⚠ cannot determine whether pid $stale_pid is a watcher (ps: $(head -1 "$ps_err")); leaving the sentinel alone"
+    rm -f "$ps_err"
+    return 0
+  fi
+  rm -f "$ps_err"
+
+  if [ -n "$stale_pid" ] && printf '%s' "$ps_out" | grep -q "watch-tasks-stream"; then
+    # A watcher younger than the sentinel did not write it, so it is a NEW
+    # watcher on a reissued pid — signalling it would kill a live drain.
+    # errexit-safe: a bare call here terminates startup.sh (set -e) on rc 1/2
+    # before either branch below can run.
+    local owned_rc=0
+    sentinel_pid_wrote_file "$stale_pid" "$pid_file" || owned_rc=$?
+    if [ "$owned_rc" -eq 1 ]; then
+      echo "  ⚠ pid $stale_pid is a watcher but started AFTER this sentinel — reissued pid, not its owner; leaving both alone"
+      return 0
+    fi
+    if [ "$owned_rc" -ne 0 ]; then
+      # Unmeasurable ownership is not permission. Killing here reaped a live drain.
+      echo "  ⚠ pid $stale_pid is a watcher but its ownership of the sentinel is UNMEASURABLE; leaving both alone"
+      return 0
+    fi
+    kill "$stale_pid" 2>/dev/null || true
+    echo "  ✓ reaped stale watch-tasks-stream watcher (pid $stale_pid)"
+  fi
+
+  sentinel_release_if_owner "$pid_file" "$stale_pid"
+  if [ -f "$pid_file" ]; then
+    echo "  ⚠ watch-tasks-stream sentinel changed under the reap — a live watcher owns it, leaving it in place"
   fi
   return 0
 }
