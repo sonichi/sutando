@@ -136,6 +136,11 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # workspace_layout guards the repo->workspace WIRING before resolution
+    # runs (it cannot import the resolver it exists to repair); its flagged
+    # tokens are JSON report field names ("state": the wiring classifier's
+    # verdict), not runtime-state paths.
+    "src/workspace_layout.py",
     # The canonical resolver itself — names the strings literally and
     # IS the place where the fallback shapes legitimately live.
     "src/workspace_default.py",
