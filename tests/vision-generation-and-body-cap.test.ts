@@ -105,7 +105,7 @@ test('readBodyCapped refuses an oversized body instead of buffering it', async (
 	// 1 MB against a 64 KB cap. fetch may see the socket destroyed mid-send, so
 	// a transport error here is also a pass — what matters is that the handler
 	// refused rather than buffering the whole body.
-	let status = 0;
+	let status: number;
 	try {
 		status = (await fetch(`http://127.0.0.1:${port}/`, { method: 'POST', body: new Uint8Array(1024 * 1024) })).status;
 	} catch {
