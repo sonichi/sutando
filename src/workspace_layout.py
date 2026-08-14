@@ -1,33 +1,9 @@
-"""Spawn-time guard for the repo→workspace wiring (the `workspace` entry).
+"""Spawn-time guard for the `<repo>/workspace` wiring (symlink in app installs).
 
-In an app-managed install the checkout lives at `<app-root>/engine/sutando`
-and `<repo>/workspace` is a SYMLINK to the durable `<app-root>/workspace`.
-That entry is untracked, so a `git clean -fdx` (or any tooling that prunes
-untracked paths) deletes the symlink — the arrow, not the data. The next
-service to run `mkdir -p <repo>/workspace/...` then materializes a real,
-empty directory and tasks/results silently split from the durable workspace.
-
-This module makes the wiring self-healing instead of relying on operational
-discipline: `ensure_workspace_layout()` runs before workspace resolution at
-core spawn (src/startup.sh) and classifies `<repo>/workspace`:
-
-  ok               healthy (valid symlink in an app layout, or a real dir in
-                   a plain checkout — the M0 default)
-  healed-missing   app layout, entry absent/dangling → symlink recreated
-  healed-target    app layout, symlink pointed somewhere else → relinked
-  healed-empty-dir app layout, a materialized dir with no user data (empty or
-                   only .gitkeep) → replaced with the symlink
-  broken           app layout, a materialized dir that HOLDS data → left
-                   untouched (healing would orphan the files); reported so
-                   health-check can flag it for a human decision
-
-App layout is detected structurally — parent dir named `engine` with a real
-`workspace/` dir beside it (the target `attach-engine-git.sh` wires) — and a
-per-clone override in `sutando.config.local.json` disables the guard entirely:
-an explicit `workspace.path` means resolution never goes through the symlink.
-
-CLI: `--ensure` (heal + report, exit 0 unless broken), `--check` (report only,
-exit 2 on broken). Stdlib-only; safe to run before anything else boots.
+Classifies the entry (see the state strings in `inspect_layout`) and heals what
+is safe to heal; a real directory HOLDING data is never touched — healing would
+orphan the files. CLI: `--ensure` heals + reports, `--check` reports only;
+both exit 2 when the layout is broken.
 """
 
 from __future__ import annotations
@@ -42,20 +18,13 @@ _DATA_IGNORABLE = {".gitkeep", ".DS_Store"}
 
 
 def _repo_root() -> Path:
-    # Repo root only — this guard runs BEFORE workspace resolution (its whole
-    # job is repairing the wiring the resolver depends on), so it cannot go
-    # through sutando_config; the workspace path itself is never derived here.
+    # Runs BEFORE workspace resolution, so it cannot go through sutando_config.
     return Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 
 
 def _has_workspace_override(repo_root: Path) -> bool:
-    """True only when config points workspace.path AWAY from `<repo>/workspace`.
-
-    The tracked `sutando.config.json` ships the DEFAULT as an explicit value
-    (`"${REPO_DIR}/workspace"`), so "a path is configured" is not the test —
-    that is true on every install and would disable the guard everywhere.
-    Local config wins over tracked, same as the resolver.
-    """
+    """True only when config points workspace.path AWAY from `<repo>/workspace` —
+    the tracked config ships the default as an explicit value on every install."""
     configured = None
     for name in ("sutando.config.local.json", "sutando.config.json"):
         try:
@@ -173,11 +142,8 @@ def ensure_workspace_layout(repo_root: Path | None = None) -> dict:
             if ws.is_symlink() or ws.is_file():
                 ws.unlink()
             elif ws.is_dir():
-                # materialized-empty only — but re-verify AT DELETE TIME, entry
-                # by entry: a file can land between classification and here, and
-                # the never-destroy contract must hold across that window. Only
-                # known-ignorable names are ever unlinked; anything else aborts
-                # untouched, and rmdir itself fails closed on a late arrival.
+                # Re-verify at DELETE time, entry by entry: a file landing
+                # after classification must abort the heal, never be unlinked.
                 for entry in ws.iterdir():
                     if entry.name not in _DATA_IGNORABLE:
                         report["state"] = "materialized-with-data"

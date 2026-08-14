@@ -47,14 +47,8 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 
-# Repo->workspace wiring guard — after the PY-validity abort (that check
-# touches no workspace path and its no-python diagnostic must stay reachable),
-# but ABOVE every workspace-derived operation (the CLAUDE_CONFIG_DIR mkdir,
-# init.sh, the WORKSPACE mkdir): nothing below may touch $WORKSPACE until this
-# has run, or a deleted symlink is materialized into an unhealable real dir
-# (review finding, 2894). Unhealable split -> ABORT, not warn-and-continue:
-# booting services onto a stranded dir silently loses owner tasks. A performed
-# heal is echoed so the repair is visible in the startup log.
+# Must run after the PY-validity abort but before ANY workspace-derived write:
+# a write below on a broken link materializes an unhealable real dir.
 _wl_out="$("$PY" "$REPO/src/workspace_layout.py" --ensure)" || {
   echo "✗ workspace wiring broken and not auto-healable — refusing to start services onto a stranded workspace. Diagnose: $PY $REPO/src/workspace_layout.py --check" >&2
   exit 1
