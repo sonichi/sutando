@@ -69,8 +69,8 @@ describe('P7 D7.1 parseHeartbeat', () => {
 		assert.deepEqual(hb.openGap, { startMs: 10, ageMs: 1500 });
 		assert.equal(hb.episodeOverflow, 3);
 		assert.deepEqual(hb.episodes, [
-			{ id: 1, kind: 'gap' },
-			{ id: 2, kind: 'speech' },
+			{ id: 1, kind: 'gap', startMs: 0, durationMs: 1200 },
+			{ id: 2, kind: 'speech', onsetSeq: 5, offsetSeq: 9, maxRmsPm: 300, aboveFloorMs: 172 },
 		]);
 		assert.equal(hb.receivedAt, 5000);
 	});

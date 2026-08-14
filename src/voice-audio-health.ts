@@ -65,8 +65,22 @@ export interface ClientHeartbeat {
   muted: boolean;
   openGap: { startMs: number; ageMs: number } | null;
   episodeOverflow: number;
-  episodes: Array<{ id: number; kind: string }>;
+  episodes: ClientEpisode[];
   receivedAt: number;
+}
+
+/** One episode interval from the wire window. Gap entries carry
+ *  {startMs, durationMs} (client-epoch-relative); speech entries carry
+ *  {onsetSeq, offsetSeq, maxRmsPm, aboveFloorMs}. */
+export interface ClientEpisode {
+  id: number;
+  kind: 'gap' | 'speech';
+  startMs?: number;
+  durationMs?: number;
+  onsetSeq?: number;
+  offsetSeq?: number;
+  maxRmsPm?: number;
+  aboveFloorMs?: number;
 }
 
 /** One persistence row (the injected mailbox writes it to sqlite). */
@@ -108,6 +122,12 @@ export interface AudioHealthSnapshot {
   samplesSkipped: number;
   lastTurnLatencyMs: number | null;
   inputHealth: 'ok' | 'stalled' | 'no-client' | 'unknown';
+  /** Receipt-time approximation of the client epoch's start on the engine
+   *  clock (null before the first heartbeat). */
+  epochStartApproxMs: number | null;
+  /** Last D7.2 matrix verdict noted via noteMatrixVerdict (persisted with
+   *  every row). */
+  lastMatrixVerdict: string | null;
 }
 
 export interface AudioHealthLedger {
@@ -133,6 +153,8 @@ export interface AudioHealthLedger {
   /** Try-enqueue one row into the persistence mailbox; a busy mailbox skips
    *  the sample (samplesSkipped), never queues (§D7.0b). */
   persistTick(reason: 'timer' | 'anomaly' | 'final', clientConnected: boolean): void;
+  /** D7.2: record the latest matrix verdict so every persisted row carries it. */
+  noteMatrixVerdict(verdict: string): void;
   /** Exposed for tests (the wrap routes here). */
   ingestHeartbeat(msg: unknown): void;
 }
@@ -159,11 +181,22 @@ export function parseHeartbeat(msg: unknown, receivedAt: number): ClientHeartbea
   const x = Array.isArray(m.x) ? (m.x as unknown[]) : [];
   const ba = Array.isArray(m.ba) ? (m.ba as unknown[]) : null;
   const og = Array.isArray(m.og) && m.og.length >= 2 ? (m.og as unknown[]) : null;
-  const episodes: Array<{ id: number; kind: string }> = [];
+  const episodes: ClientEpisode[] = [];
   if (Array.isArray(m.ep)) {
     for (const e of m.ep as unknown[]) {
       if (Array.isArray(e) && typeof e[0] === 'number' && typeof e[1] === 'string') {
-        episodes.push({ id: e[0], kind: e[1] === 'g' ? 'gap' : 'speech' });
+        if (e[1] === 'g') {
+          episodes.push({ id: e[0], kind: 'gap', startMs: num(e[2]), durationMs: num(e[3]) });
+        } else {
+          episodes.push({
+            id: e[0],
+            kind: 'speech',
+            onsetSeq: num(e[2]),
+            offsetSeq: num(e[3]),
+            maxRmsPm: num(e[4]),
+            aboveFloorMs: num(e[5]),
+          });
+        }
       }
     }
   }
@@ -205,6 +238,12 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
   let nonce: string | null = null;
   let lastMintedEpoch = 0;
   const nonceToEpoch = new Map<string, number>();
+  /** Receipt-time approximation of the client's epoch start (first heartbeat
+   *  fires on the client's first 500 ms stats tick) — lets the matrix place
+   *  client-epoch-relative episode intervals on the engine clock, labeled
+   *  approximate. */
+  let epochStartApproxMs: number | null = null;
+  let lastMatrixVerdict: string | null = null;
 
   // ── frame-path counters (session-layer coverage only) ──
   let deliveredFrames = 0;
@@ -254,6 +293,8 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
   function resetEpochState(): void {
     epoch = null;
     nonce = null;
+    epochStartApproxMs = null;
+    lastMatrixVerdict = null;
     deliveredFrames = 0;
     deliveredBytes = 0;
     lastDeliveredAt = null;
@@ -339,6 +380,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       seenEpisodeIds = new Set();
       newEpisodeIds = [];
       clientTotals = zeroTotals();
+      epochStartApproxMs = hb.receivedAt - 500;
     } else {
       prevHb = lastHb;
     }
@@ -458,7 +500,13 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
         samplesSkipped,
         lastTurnLatencyMs,
         inputHealth: inputHealth(clientConnected),
+        epochStartApproxMs,
+        lastMatrixVerdict,
       };
+    },
+
+    noteMatrixVerdict(verdict: string): void {
+      lastMatrixVerdict = verdict;
     },
 
     healthSegments(clientConnected: boolean): string {

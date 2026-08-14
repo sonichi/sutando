@@ -49,6 +49,7 @@ function assertMacOS() {
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
 import { createHealthPersistence } from './voice-audio-health-persist.js';
+import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
 import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper } from './voice-continuity.js';
 import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
@@ -1558,6 +1559,8 @@ async function main() {
 	// throttle prevents a tight retry loop.
 	let lastReconnectAt = 0;
 	let lastLoggedStatus = '';
+	let matrixBaseline: MatrixBaseline | null = null;
+	let lastMatrixVerdict = '';
 	setInterval(() => {
 		const state = session.sessionManager.state ?? 'unknown';
 		const clientConnected = session.clientConnected;
@@ -1568,6 +1571,26 @@ async function main() {
 		// rule was hiding exactly the dead zones we need to see).
 		const status = `state=${state} client=${clientConnected}`;
 		const anomaly = audioHealth.anomalySinceLastTick(clientConnected);
+		// P7 D7.2: evaluate the localization matrix per tick. lastEgressAt is
+		// the Tranche-A model-event proxy (model audio out = the model spoke);
+		// the native model hop lands with the bodhi pin.
+		const snapshot = audioHealth.getSnapshot(clientConnected);
+		const matrix = evaluateMatrix({
+			sessionState: state,
+			clientConnected,
+			snapshot,
+			prev: matrixBaseline,
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			serverBufferedAmount: (session as any).clientTransport?.client?.bufferedAmount ?? null,
+			lastModelEventAt: snapshot.lastEgressAt,
+			now: Date.now(),
+		});
+		matrixBaseline = matrix.baseline;
+		audioHealth.noteMatrixVerdict(matrix.verdict);
+		if (matrix.verdict !== lastMatrixVerdict && (matrix.verdict !== 'healthy-idle' || lastMatrixVerdict)) {
+			console.log(`${ts()} [Matrix] ${matrix.verdict}${matrix.reasons.length ? ' (' + matrix.reasons.join('; ') + ')' : ''}`);
+		}
+		lastMatrixVerdict = matrix.verdict;
 		if (state !== 'ACTIVE' || status !== lastLoggedStatus || anomaly.anomalous) {
 			const seg = clientConnected ? ' ' + audioHealth.healthSegments(clientConnected) : '';
 			const why = anomaly.anomalous ? ` anomaly=${anomaly.reasons.join(',')}` : '';
