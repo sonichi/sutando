@@ -3163,7 +3163,8 @@ def _load_channel_env(channel: str) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800, binary_path: Optional[Path] = None) -> None:
+def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800,
+                          binary_path: Optional[Path] = None, artifact_threshold_sec: int = 120) -> None:
     """Mark `check` as 'stale' in place if a process matching `pgrep_pattern`
     started more than `threshold_sec` before `src_file`'s mtime.
 
@@ -3241,6 +3242,23 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         # Pick the OLDEST start time — the tsx wrapper spawns a child node
         # process; we want the parent's launch time, not the child's.
         proc_start = min(starts)
+        # A compiled service executes the ARTIFACT, so src-vs-process cannot see
+        # a deploy that refreshes the artifact without touching source.
+        if binary_path is not None and binary_path.exists():
+            try:
+                bin_mtime = binary_path.stat().st_mtime
+                # Smaller than the source threshold, which exists to absorb
+                # `git checkout` mtime bumps -- those never touch an artifact.
+                if bin_mtime - proc_start > artifact_threshold_sec:
+                    age_min = int((bin_mtime - proc_start) / 60)
+                    check["status"] = "stale"
+                    check["detail"] = (
+                        f"running, but the artifact it executes was rebuilt "
+                        f"{age_min} min after the process started -- restart needed"
+                    )
+                    return
+            except OSError:
+                pass
         src_mtime = src_file.stat().st_mtime
         if src_mtime - proc_start > threshold_sec:
             # Before flagging stale, cross-check with git: mtime gets bumped by
@@ -4027,7 +4045,9 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     # result depends on ambient host state is worse than the bug it guards -- and CI,
     # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
-    if proxy_status != "ok":
+    # "stale" means listening but executing pre-deploy code -- still routing,
+    # so gating it out here would mute this check exactly during a redeploy.
+    if proxy_status not in ("ok", "stale"):
         check["detail"] = "credential proxy not running — quota telemetry not expected"
         return check
     path = status_read_path("quota-state.json", WORKSPACE_DIR)
@@ -4262,7 +4282,9 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     material of any kind, is read or logged.
     """
     name = "quota-account-identity"
-    if proxy_status != "ok":
+    # "stale" means listening but executing pre-deploy code -- still routing,
+    # so gating it out here would mute this check exactly during a redeploy.
+    if proxy_status not in ("ok", "stale"):
         return {"name": name, "status": "ok",
                 "detail": "credential proxy not up — nothing to compare"}
 
@@ -7332,6 +7354,38 @@ def check_core_model_pin() -> dict:
     return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 
+def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
+    """True when a live process matching `pgrep_pattern` has `artifact` in argv.
+    A dev host can hold a build it never executes, so gate on the process."""
+    if not artifact.exists():
+        return False
+    try:
+        out = subprocess.run(["/usr/bin/pgrep", "-f", pgrep_pattern],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return any(str(artifact) in _proc_argv(int(pid))
+               for pid in out.split() if pid.isdigit())
+
+
+def check_credential_proxy() -> dict:
+    """Credential proxy (port 7846). probe=False: a forwarding proxy has no
+    liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
+    check = check_port(7846, "credential-proxy", probe=False)
+    if check["status"] == "down":
+        check["status"] = "warn"
+        check["detail"] = "not running (optional)"
+    elif check["status"] == "ok":
+        artifact = REPO_DIR / "dist" / "credential-proxy.js"
+        mark_stale_if_outdated(
+            check,
+            REPO_DIR / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts",
+            "credential-proxy",
+            binary_path=(artifact
+                         if _process_executes_artifact(artifact, "credential-proxy")
+                         else None),
+        )
+    return check
 MENUBAR_LABEL = "com.sutando.menubar"
 MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
 
@@ -7375,17 +7429,9 @@ def run_all_checks() -> list[dict]:
         # startup.sh's lsof guard sees the port as occupied and won't restart it.
         checks.append(c)
 
-    # Credential proxy (port 7846) — the OAuth-injection + quota-header path
-    # (skills/quota-tracker/scripts/credential-proxy.ts). It was previously
-    # unmonitored, so a dead proxy (= broken auth/quota for proxy-routed cores)
-    # never surfaced on the dashboard. Plain TCP-listening check (probe=False):
-    # it's a forwarding proxy with no liveness endpoint, so an HTTP probe would
-    # be forwarded upstream and misread as "wedged". Optional (not every node
-    # routes through it) → down is a warning, not a failure.
-    proxy_check = check_port(7846, "credential-proxy", probe=False)
-    if proxy_check["status"] == "down":
-        proxy_check["status"] = "warn"
-        proxy_check["detail"] = "not running (optional)"
+    # Previously unmonitored, so a dead proxy (= broken auth/quota for
+    # proxy-routed cores) never surfaced on the dashboard.
+    proxy_check = check_credential_proxy()
     checks.append(proxy_check)
 
     # Quota telemetry — only meaningful when the proxy is actually up.
