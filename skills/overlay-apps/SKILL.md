@@ -20,6 +20,18 @@ The framework gives you, for free:
   back.
 - A simple `OVERLAYS` registry — add a new overlay by registering it.
 
+## When to use
+Building or running a **Sutando desktop overlay** — an always-on-top, frameless
+floating window controllable from the web UI `/overlays` manager. Use this
+framework (register in the `OVERLAYS` registry) rather than hand-rolling an
+Electron window. Not for normal app windows or the menu-bar app.
+
+## Done & failure modes
+- **Done =** the overlay appears always-on-top and the `/overlays` manager can
+  open/close/show/hide/opacity it; placement persists across restarts.
+- Control server port already in use → another overlay-apps instance is running; stop it first.
+- Overlay invisible → check it was registered in `app/main.js` `OVERLAYS` and that `scripts/launch.sh` synced source → workspace + installed deps.
+
 ## Ships with
 
 One example overlay: **System Resources** — live CPU / memory / disk / network

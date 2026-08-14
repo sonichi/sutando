@@ -219,19 +219,28 @@ case "$cmd" in
         fi
         PYTHON_BIN="$(resolve_python_verified)"
         BREW_BIN="$(resolve_homebrew_bin)"
+        # Canonical config dir, baked into the plist so the minimal launchd env
+        # resolves channels/ag2space/.env the same way startup does (#2487 P1).
+        CLAUDE_CFG="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
+        # The helper owns every supported fallback. If it cannot resolve one,
+        # do not install a launchd job with an empty/legacy config path and
+        # silently lose the core-independent gateway alert.
+        [ -n "$CLAUDE_CFG" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; exit 1; }
         echo "Installing $LABEL"
         echo "  repo:    $REPO"
         echo "  python:  $PYTHON_BIN"
         echo "  brew:    $BREW_BIN"
+        echo "  config:  $CLAUDE_CFG"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
-        # Render the template. Use a delimiter unlikely to appear in paths.
-        sed \
-            -e "s|__REPO__|$REPO|g" \
-            -e "s|__WORKSPACE__|$WORKSPACE|g" \
-            -e "s|__PYTHON__|$PYTHON_BIN|g" \
-            -e "s|__HOMEBREW_BIN__|$BREW_BIN|g" \
-            "$TEMPLATE" > "$DEST"
+        # Shared renderer: literal substitution + XML escaping + a parse
+        # check, so a path with & < > | cannot install a silently-broken job.
+        "$PYTHON_BIN" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$DEST" \
+            "REPO=$REPO" \
+            "WORKSPACE=$WORKSPACE" \
+            "PYTHON=$PYTHON_BIN" \
+            "HOMEBREW_BIN=$BREW_BIN" \
+            "CLAUDE_CONFIG_DIR=$CLAUDE_CFG" || exit 1
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"

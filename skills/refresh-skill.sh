@@ -25,11 +25,19 @@ set -uo pipefail   # NOT -e: one skill's hiccup must not strand a half-swapped s
 # Precedence: SKILLS_DST env > sutando-config helper (if reachable) > ~/.claude/skills.
 SKILLS_DST="${SKILLS_DST:-}"
 if [ -z "$SKILLS_DST" ]; then
-  _cfg="${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}/scripts/sutando-config.sh"
-  [ -x "$_cfg" ] && SKILLS_DST="$(bash "$_cfg" claude-home-path skills 2>/dev/null || true)"
+  # The helper lives in THIS script's own repo — a hardcoded path resolves to an
+  # empty dir on any clone elsewhere, and every skill then reads as absent.
+  _repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  _cfg="${SUTANDO_REPO_DIR:-$_repo}/scripts/sutando-config.sh"
+  # -f, not -x: it is invoked via `bash`, so a missing exec bit must not
+  # silently disable resolution and fall through to the wrong directory.
+  [ -f "$_cfg" ] && SKILLS_DST="$(bash "$_cfg" claude-home-path skills 2>/dev/null || true)"
   SKILLS_DST="${SKILLS_DST:-$HOME/.claude/skills}"
 fi
 SETTLE_S="${REFRESH_SKILL_SETTLE_S:-1}"
+# --all concurrency. The settle is a fixed per-skill wait, so serialising it made
+# --all cost SETTLE_S x skill-count — 97s at 97 skills, past a 120s cron budget.
+JOBS="${REFRESH_SKILL_JOBS:-8}"
 EXCLUDES=(--exclude='workspace' --exclude='node_modules' --exclude='generated'
           --exclude='__pycache__' --exclude='.git' --exclude='*.mp4' --exclude='*.png'
           --exclude='*.wav' --exclude='.venv')
@@ -37,6 +45,9 @@ EXCLUDES=(--exclude='workspace' --exclude='node_modules' --exclude='generated'
 refresh_one() {
   local name="$1"
   local link="$SKILLS_DST/$name"
+  if [ ! -e "$link" ] && [ ! -L "$link" ]; then
+    echo "  skip $name (NOT INSTALLED at $SKILLS_DST — nothing to refresh)"; return 0
+  fi
   if [ ! -L "$link" ]; then
     echo "  skip $name (not a symlink — won't clobber a local/copy install)"; return 0
   fi
@@ -57,11 +68,17 @@ main() {
   mkdir -p "$SKILLS_DST"
   [ "$#" -ge 1 ] || { echo "usage: refresh-skill.sh <name> [<name> ...] | --all" >&2; exit 2; }
   if [ "$1" = "--all" ]; then
-    local any=0
+    # Each skill's settle is WAITING, not work, so --all runs them concurrently.
+    # Chunked, not unbounded: a crash strands at most $REFRESH_SKILL_JOBS as copies,
+    # which refresh_one then refuses to touch ("not a symlink").
+    local any=0 running=0
     for link in "$SKILLS_DST"/*; do
       [ -L "$link" ] || continue
-      refresh_one "$(basename "$link")"; any=1
+      refresh_one "$(basename "$link")" &
+      any=1; running=$((running + 1))
+      if [ "$running" -ge "$JOBS" ]; then wait; running=0; fi
     done
+    wait
     [ "$any" = 1 ] || echo "  (no symlinked skills under $SKILLS_DST)"
   else
     for name in "$@"; do refresh_one "$name"; done
