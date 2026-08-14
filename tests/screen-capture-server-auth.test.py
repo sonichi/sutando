@@ -227,6 +227,9 @@ def test_downscale_failure_only_allows_small_original() -> None:
         with unittest.mock.patch.object(sc.subprocess, "run", side_effect=RuntimeError("sips failed")):
             ok("downscale failure permits a small original", sc._downscale_frame(small.name, 1280, 60))
             ok("downscale failure rejects an over-budget original", not sc._downscale_frame(large.name, 1280, 60))
+    with unittest.mock.patch.object(sc.subprocess, "run", side_effect=RuntimeError("sips failed")), \
+         unittest.mock.patch.object(sc.os.path, "getsize", side_effect=OSError("stat failed")):
+        ok("downscale failure rejects an unreadable original", not sc._downscale_frame("missing.jpg", 1280, 60))
 
 
 def test_capture_downscale_options_and_failure_are_visible() -> None:
@@ -252,6 +255,11 @@ def test_capture_downscale_options_and_failure_are_visible() -> None:
     ok("downscale budget failure has a stable error", json.loads(failed._buf.getvalue()) == {
         "status": "error", "error": "downscale failed and frame exceeds budget"
     }, f"got body={failed._buf.getvalue()!r}")
+
+
+test_downscale_invokes_sips_with_bounds()
+test_downscale_failure_only_allows_small_original()
+test_capture_downscale_options_and_failure_are_visible()
 
 # ---------------------------------------------------------------------------
 # Summary
