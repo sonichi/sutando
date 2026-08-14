@@ -855,24 +855,52 @@ def main() -> int:
           and not gated.exists(),
           "owner-on-discord, no discord bridge configured: past-grace fallback delivers")
 
-    # DOWN != ABSENT (review #2877, john-the-dev): a CONFIGURED routed bridge
-    # owns its owner's file even while it is momentarily down (restart, token
-    # reload, laptop wake). Age must NOT promote the gateway into its place —
-    # the pre-fix age-only rule leaked a telegram-destined nudge to AG2 Space
-    # after a 3-minute restart.
+    # DOWN != ABSENT: a CONFIGURED routed bridge that is merely between polls
+    # (restart, token reload, laptop wake) owns its owner's file. Age must NOT
+    # promote the gateway into its place — an age-only rule hands a
+    # telegram-destined nudge to AG2 Space after a 3-minute restart.
     (_gate_cfg / "channels" / "discord").mkdir(parents=True, exist_ok=True)
     (_gate_cfg / "channels" / "discord" / "access.json").write_text('{"allowFrom": ["1"]}')
+    (rtc.WS / "logs").mkdir(parents=True, exist_ok=True)
+    _dlog = rtc.WS / "logs" / "discord-bridge.log"
+    _dlog.write_text("alive\n")                    # a recent liveness trace
     configured = rtc.RESULTS_DIR / "proactive-t11b.txt"
     configured.write_text("discord owner's nudge, bridge merely down\n")
     os.utime(configured, (aged, aged))            # far past the grace window
     posts_b4_down = len(STATE["room_posts"])
     rtc._post_proactive()
     check(configured.exists() and len(STATE["room_posts"]) == posts_b4_down,
-          "owner-on-discord with discord CONFIGURED: aged nudge is never stolen (down != absent)")
-    configured.unlink()
+          "owner-on-discord, bridge configured + recently alive: aged nudge is never stolen")
+
+    # …but the hold is BOUNDED. A configured bridge silent past the
+    # abandonment window is treated as gone, so its files cannot wait forever
+    # (the pre-bound rule refused the fallback purely on configured-ness).
+    _gone = time.time() - (rtc._PROACTIVE_ABANDONED_S + 3600)
+    os.utime(_dlog, (_gone, _gone))
+    posts_b4_gone = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_gone + 1 and not configured.exists(),
+          "configured bridge silent past the abandonment window: file is released, not stranded")
+
+    # A configured bridge that has NEVER left a trace: the wait is bounded on
+    # the file's own age instead — young file held, old file released.
+    _dlog.unlink()
+    young = rtc.RESULTS_DIR / "proactive-t11d.txt"
+    young.write_text("no-trace bridge, young file\n")
+    os.utime(young, (aged, aged))                  # past grace, far short of abandonment
+    posts_b4_young = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(young.exists() and len(STATE["room_posts"]) == posts_b4_young,
+          "configured bridge with no trace yet: a young file is held")
+    os.utime(young, (_gone, _gone))
+    rtc._post_proactive()
+    check(not young.exists() and len(STATE["room_posts"]) == posts_b4_young + 1,
+          "configured bridge with no trace yet: a file past the abandonment window is released")
+
     # `.env`-only configuration counts too (health-check.py's own either/or).
     (_gate_cfg / "channels" / "telegram").mkdir(parents=True, exist_ok=True)
     (_gate_cfg / "channels" / "telegram" / ".env").write_text("TELEGRAM_BOT_TOKEN='x'\n")
+    (rtc.WS / "state" / "telegram-bridge.heartbeat").write_text("")   # fresh heartbeat
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "telegram", "summary": "hi"}))
     tg = rtc.RESULTS_DIR / "proactive-t11c.txt"
@@ -881,8 +909,9 @@ def main() -> int:
     posts_b4_tg = len(STATE["room_posts"])
     rtc._post_proactive()
     check(tg.exists() and len(STATE["room_posts"]) == posts_b4_tg,
-          "owner-on-telegram with a configured (.env-only) bridge: aged nudge stays put")
+          "owner-on-telegram, configured (.env-only) + heartbeat fresh: aged nudge stays put")
     tg.unlink()
+    (rtc.WS / "state" / "telegram-bridge.heartbeat").unlink()
     shutil.rmtree(_gate_cfg / "channels", ignore_errors=True)  # back to no-other-bridge
     # Missing state file (fresh install, no owner activity yet): same shape —
     # defer while fresh, deliver after grace. A gateway-only fresh install

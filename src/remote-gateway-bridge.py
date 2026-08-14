@@ -82,18 +82,20 @@ __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports reso
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
 
 _CHANNEL = "ag2space"
-# Grace before the fallback claim on a host where the routed bridge does not
-# exist at all: long enough to lose no ordering, short enough that a
-# gateway-only host never visibly delays an owner nudge.
+# Fallback delay when no bridge for the routed channel exists on this host.
+# Longer than a peer bridge's own poll grace so an installed bridge always
+# gets first refusal; short enough that a gateway-only host stays responsive.
 _PROACTIVE_GRACE_S = 180
+# How long a configured bridge may show no sign of life before it is treated
+# as gone. Hours, not minutes: it must survive a restart, a token reload and a
+# laptop sleep, while still bounding the wait for a bridge that never returns.
+_PROACTIVE_ABANDONED_S = 6 * 3600
 
 
 def _channel_configured(channel: str) -> bool:
-    """Whether `channel`'s bridge is configured ON THIS HOST — the same
-    question health-check.py asks before probing a bridge at all: a channel
-    dir carrying `.env` or `access.json`. Deliberately NOT liveness: a
-    configured bridge that is momentarily down (restart, token reload, laptop
-    wake) still owns its owner's messages."""
+    """Whether `channel`'s bridge is installed on this host: a channel dir
+    carrying `.env` or `access.json` — the same evidence health-check.py
+    requires before it probes a bridge at all."""
     try:
         base = claude_home_path("channels", channel)
     except Exception:
@@ -101,32 +103,62 @@ def _channel_configured(channel: str) -> bool:
     return (base / ".env").exists() or (base / "access.json").exists()
 
 
-def _ag2space_proactive_claim_gate(path: Path) -> bool:
-    """Claim when routing says the owner lives here. Otherwise the file
-    belongs to another bridge — claim it only when that bridge cannot exist
-    on this host, never merely because it is slow or briefly down.
+def _channel_last_alive(channel: str) -> float | None:
+    """Newest of the bridge's own liveness traces, or None if it has never
+    left one. Same traces (heartbeat, then log) health-check.py reads."""
+    newest = None
+    for p in (WS / "state" / f"{channel}-bridge.heartbeat",
+              WS / "logs" / f"{channel}-bridge.log"):
+        try:
+            m = p.stat().st_mtime
+        except OSError:
+            continue
+        newest = m if newest is None else max(newest, m)
+    return newest
 
-    DOWN != ABSENT (review #2877): an age-only fallback could not tell "no
-    telegram bridge on this host" from "the telegram bridge is restarting",
-    so a 3-minute restart would have handed a telegram-destined nudge to AG2
-    Space — the cross-channel-leak class this module exists to prevent. The
-    discriminator is CONFIGURED-ness: a configured bridge keeps its file
-    (it will claim on its next poll); an unconfigured one never will, so the
-    grace fallback still keeps gateway-only hosts delivering."""
+
+def _routed_bridge_still_owns(routed: str, path: Path, now: float) -> bool:
+    """Whether `routed`'s bridge should keep this file rather than the gateway.
+
+    DOWN is not ABSENT: age alone cannot tell "no telegram bridge here" from
+    "the telegram bridge is restarting", and treating the second as the first
+    hands a telegram-destined nudge to AG2 Space — the cross-channel
+    mis-delivery this module exists to prevent. So configured-ness is asked
+    FIRST and liveness only as a late tiebreaker: an installed bridge keeps
+    its owner's file across any ordinary outage, but one silent for hours is
+    treated as gone so the file cannot wait forever."""
+    if not _channel_configured(routed):
+        return False
+    last = _channel_last_alive(routed)
+    if last is None:
+        # Installed but never seen running: bound the wait on the file itself
+        # rather than assuming the bridge is either coming or gone.
+        try:
+            return (now - path.stat().st_mtime) < _PROACTIVE_ABANDONED_S
+        except OSError:
+            return True  # unreadable → leave it alone
+    return (now - last) < _PROACTIVE_ABANDONED_S
+
+
+def _ag2space_proactive_claim_gate(path: Path) -> bool:
+    """Claim when routing says the owner lives here; otherwise claim only what
+    no other bridge will ever take (see _routed_bridge_still_owns)."""
     state = WS / "state" / "last-owner-activity.json"
     if should_claim_proactive(state, _CHANNEL):
         return True
+    now = time.time()
     # Ask the SHARED policy which bridge routing prefers — never re-read the
     # state file here, or this becomes a second copy of the routing rule.
+    # sorted() only makes the pick deterministic; it is not a priority order.
     routed = next(
         (c for c in sorted(BRIDGE_CHANNELS)
          if c != _CHANNEL and should_claim_proactive(state, c)),
         None,
     )
-    if routed and _channel_configured(routed):
+    if routed and _routed_bridge_still_owns(routed, path, now):
         return False
     try:
-        return (time.time() - path.stat().st_mtime) >= _PROACTIVE_GRACE_S
+        return (now - path.stat().st_mtime) >= _PROACTIVE_GRACE_S
     except OSError:
         return False  # racing consumer already claimed it
 
