@@ -21,9 +21,16 @@ bad()  { FAIL=$((FAIL+1)); echo "  FAIL $1"; }
 check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2"; fi; }
 
 TMP="$(mktemp -d)"
+PIDFILE="$TMP/spawned.pids"
 KILL_LIST=()
 cleanup_all() {
   for p in "${KILL_LIST[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+  # KILL_LIST cannot see a pid appended inside $( ): spawn_fake_watcher is always
+  # called as PID="$(spawn_fake_watcher ...)", so the += lands in the subshell's
+  # copy and the parent array stays empty. The fakes the reaper is SUPPOSED to
+  # leave alive therefore survived the suite as ppid=1 orphans for their full
+  # sleep, and health-check's task-watcher probe counts them as live watchers.
+  [ -f "$PIDFILE" ] && while read -r p; do [ -n "$p" ] && kill "$p" 2>/dev/null; done < "$PIDFILE"
   rm -rf "$TMP"
 }
 trap cleanup_all EXIT
@@ -38,6 +45,7 @@ spawn_fake_watcher() {
   # until the child exits — a 120s hang rather than a test.
   "$script" >/dev/null 2>&1 & local pid=$!
   KILL_LIST+=("$pid")
+  echo "$pid" >> "$PIDFILE"   # survives the $( ) the caller wraps this in
   # Wait until ps can actually see it, so the test never races the fixture.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     ps -p "$pid" -o args= 2>/dev/null | grep -q "watch-tasks-stream" && break
