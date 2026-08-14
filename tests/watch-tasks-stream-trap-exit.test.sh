@@ -42,6 +42,12 @@ HARNESS="$TMPDIR_T/harness.sh"
   echo '#!/usr/bin/env bash'
   echo "PID_FILE=\"$PID_FILE\""
   echo 'echo "$$" > "$PID_FILE"'
+  # cleanup() delegates sentinel removal to the shared ownership helper, which
+  # the real script sources at its top. The harness re-creates the script's
+  # CONTEXT, so it must source it too — otherwise the extracted lines run with
+  # the function undefined and the file is never removed, which reads as the
+  # trap being broken rather than the harness being incomplete.
+  echo "source \"$REPO/src/watcher_sentinel.sh\""
   # Pull the exact cleanup()/trap lines out of the real script so this test
   # breaks if the fix is ever reverted or edited incompatibly.
   sed -n '/^cleanup()/,/^trap .*HUP INT TERM$/p' "$WATCHER"

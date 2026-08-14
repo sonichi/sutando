@@ -44,7 +44,8 @@ except Exception:  # pragma: no cover — bridge must keep running
         return False
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
+                                release_claim)
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
@@ -1025,31 +1026,10 @@ def main():  # pragma: no cover
                         if peek.startswith("[channel:") and \
                                 re.match(r'\[channel:\s*\d{17,20}\]', peek):
                             continue
-                        # Claim-by-rename: atomic move to a `.sending`
-                        # suffix before reading, so a concurrent poll
-                        # (same bridge, or a race with discord-bridge)
-                        # can't pick it up and resend. See
-                        # discord-bridge.py for the same fix + the
-                        # 2026-04-20 bug-scenario that motivated it.
-                        claim = f.with_suffix(".sending")
-                        try:
-                            f.rename(claim)
-                        except FileNotFoundError:
-                            continue
-                        f = claim
-                        text = read_ready_result(f)
-                        if text is None:
-                            release_claim(f)
-                            continue
-                        # Pre-fix used `next(iter(load_allowed()))`,
-                        # which iterates a `set` — hash-slot order, not
-                        # list order. With multiple users in allowFrom
-                        # (e.g. admin adds a second sender via
-                        # `/telegram:access allow`), proactive
-                        # owner-notifications could route to the wrong
-                        # user. Mirrors the same fix shape used by
-                        # discord-bridge's poll_proactive; full priority
-                        # chain documented on _resolve_proactive_owner_id.
+                        # Resolve the recipient BEFORE claiming: the claim renames the
+                        # file out of the `*.txt` glob every peer bridge polls.
+                        # `_resolve_proactive_owner_id` orders allowFrom explicitly; a
+                        # bare `next(iter(set))` picked a hash-slot, not the first user.
                         env_override = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip()
                         try:
                             access_data = json.loads(ACCESS_FILE.read_text())
@@ -1057,8 +1037,16 @@ def main():  # pragma: no cover
                             access_data = {}
                         owner_id = _resolve_proactive_owner_id(env_override, access_data)
                         if owner_id is None:
-                            print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
-                            f.unlink(missing_ok=True)
+                            continue
+                        # The shared helper owns "no recipient -> do not claim"; this
+                        # adapter contributes only the owner it resolved.
+                        claim = claim_for_delivery(f, owner_id)
+                        if claim is None:
+                            continue
+                        f = claim
+                        text = read_ready_result(f)
+                        if text is None:
+                            release_claim(f)
                             continue
                         try:
                             _s = send_reply(int(owner_id), text)
@@ -1071,10 +1059,19 @@ def main():  # pragma: no cover
                                     outcome="ok" if _s["ok"] else "error",
                                     data={"text_chunks": _s["text_chunks"], "file_count": _s["files_sent"]},
                                 )
-                            print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                            if _s.get("ok"):
+                                print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                                f.unlink(missing_ok=True)
+                            else:
+                                # send_reply reports refusal by returning ok=False
+                                # without raising; the except below never sees it.
+                                print(f"  [proactive] send refused, releasing {f.name}")
+                                release_claim(f)
                         except Exception as e:
-                            print(f"  [proactive] failed: {e}")
-                        f.unlink(missing_ok=True)
+                            # Release, never delete: pollers scan `.txt`, so a deleted
+                            # claim is a message no bridge can ever retry.
+                            print(f"  [proactive] failed, releasing {f.name}: {e}")
+                            release_claim(f)
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
 
@@ -1112,6 +1109,9 @@ def main():  # pragma: no cover
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
+                # Bound before the try: a raise below must not leave the archive
+                # gate reading an unassigned name.
+                delivered_ok = False
                 try:
                     # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
                     # File attachments are in parsed.actions; send_reply() won't re-find them,
@@ -1149,9 +1149,15 @@ def main():  # pragma: no cover
                             outcome="ok" if delivered_ok else "error",
                             data={"task_id": task_id, "text_chunks": _s["text_chunks"], "file_count": sent_files},
                         )
-                    print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
+                    if delivered_ok:
+                        print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)
+                if not delivered_ok:
+                    # Restore the route popped above, or a retry has no chat_id.
+                    pending_replies[task_id] = chat_id
+                    print(f"[Telegram] reply refused, keeping {task_id} for retry", flush=True)
+                    continue
                 _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)

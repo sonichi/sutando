@@ -101,6 +101,12 @@ def legacy_dotted_workspace() -> Path:
     return Path.home() / ".sutando" / "workspace"
 
 
+def legacy_dotted_workspace_path(*subpath: str) -> Path:
+    """Subpath under `legacy_dotted_workspace()`, which owns the literal.
+    Reaches unmigrated pre-v0.8 content; never resolves the live workspace."""
+    return legacy_dotted_workspace().joinpath(*subpath)
+
+
 def _host_label() -> str:
     r"""Per-host directory label. Precedence:
       1. `$SUTANDO_HOST_LABEL` (or legacy `$SUTANDO_HOST_OVERRIDE`)

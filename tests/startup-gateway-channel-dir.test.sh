@@ -10,7 +10,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Stub interpreter: dump the env we care about, exit (no real bridge).
 cat > "$TMP/py-stub" <<'STUB'
 #!/usr/bin/env bash
-env | grep -E '^(REMOTE_TASK_CHANNEL_DIR|GATEWAY_INSTANCE|REMOTE_TASK_TOKEN)=' \
+env | grep -E '^(REMOTE_TASK_CHANNEL_DIR|REMOTE_TASK_TOKEN_FILE|REMOTE_TASK_URL|GATEWAY_INSTANCE|REMOTE_TASK_TOKEN)=' \
   >> "$ENV_DUMP"
 STUB
 chmod +x "$TMP/py-stub"
@@ -45,4 +45,13 @@ echo "  ok  per-instance override honored"
 echo "$OUT" | grep -q '^REMOTE_TASK_CHANNEL_DIR=ag2space$' \
   && { echo "FAIL: instance leaked prod channel dir"; exit 1; }
 echo "  ok  prod channel dir never inherited"
+
+# Case 4: named gateways must not inherit the primary gateway URL or token file.
+: > "$TMP/dev.env"
+OUT="$(run_loop 'export AG2_REMOTE_TOKEN_DEV=https://dev.example/relay\|tok-dev REMOTE_TASK_URL=https://prod.example/relay REMOTE_TASK_TOKEN_FILE=/tmp/prod.env REMOTE_TASK_TOKEN_FILE_DEV="$TMP/dev.env"')"
+echo "$OUT" | grep -q '^REMOTE_TASK_URL=$' \
+  || { echo "FAIL: dev instance inherited primary REMOTE_TASK_URL"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -q "^REMOTE_TASK_TOKEN_FILE=$TMP/dev.env$" \
+  || { echo "FAIL: dev instance did not get its own token file"; echo "$OUT"; exit 1; }
+echo "  ok  primary URL and token file never inherited"
 echo "PASS — launcher threads REMOTE_TASK_CHANNEL_DIR per instance"
