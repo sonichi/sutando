@@ -33,7 +33,7 @@ import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
-import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
+import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
@@ -597,8 +597,17 @@ const itemsClear = createConversationClearHelper(
 	() => (voiceSessionRef as any)?.conversationContext?.items,
 	(m) => console.log(`${ts()} ${m}`),
 );
-// P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side).
+// P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side). The guard
+// compares against userTurnCount, which resets per logical session — every
+// reset MUST rebase the guard too, or a legitimate goodbye in the next
+// session (count restarted below the old watermark) would be suppressed.
 let goodbyeGuard = initialGoodbyeGuard();
+function resetSessionGateState(): void {
+	userTurnCount = 0;
+	userHasInterrupted = false;
+	sessionEnding = false;
+	goodbyeGuard = initialGoodbyeGuard();
+}
 
 // Unified base-mode resolver: see src/voice-mode-resolver.ts for the
 // rationale + canonical mode descriptors. Local wrapper threads the in-memory
@@ -618,7 +627,7 @@ const _configCtx: VoiceConfigContext = {
 	resolveCurrentMode,
 	isMeetingActive: () => meetingActive,
 	googleSearch: VOICE_GOOGLE_SEARCH,
-	resetSessionGates: () => { userTurnCount = 0; userHasInterrupted = false; sessionEnding = false; },
+	resetSessionGates: () => { resetSessionGateState(); },
 	resetNoteViewingDebounce,
 	getRecentConversation,
 	getSecondsSinceLastTurn,
@@ -954,7 +963,7 @@ async function main() {
 			: {}),
 		hooks: {
 			onSessionStart: (e) => {
-				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
+				resetSessionGateState();
 				recorder.reset();
 				recorder.events.push({ event: 'session_started', timestamp: new Date().toISOString() });
 				recorder.startTicker(VOICE_NATIVE_AUDIO_MODEL);
@@ -1021,6 +1030,9 @@ async function main() {
 	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
 	// count). Coverage is honestly session-only until the bodhi pin.
 	audioHealth.wrapSession(session);
+	// P7 D7.4: vision defers frames while the canonical speech evidence is
+	// active (pause-during-speech rides the same tracker as the matrix).
+	setVisionSpeechEvidence(() => audioHealth.getSpeechEvidence());
 
 	// =========================================================================
 	// `agent.state` emission + lifecycle snapshot (Step 12 + amendment A9).
@@ -1064,13 +1076,18 @@ async function main() {
 		lastEmittedUpstream = upstreamKey;
 		if (opts.immediate || upstreamChanged) sendAgentStateFrame(frame);
 		// A9: publish the lifecycle snapshot when any relevant field flipped
-		// (attach/detach, initialized, upstream) — atomic temp+rename with
-		// unique temp names inside publishLifecycleSnapshot; NOT the
-		// writeVoiceState plain-writeFileSync pattern.
-		const lifecycleKey = `${frame.clientAttached}|${frame.initialized}|${upstreamKey}`;
+		// (attach/detach, initialized, upstream, and — P7 D7.1 — the additive
+		// inputHealth verdict P4's evidence ladder consumes) — atomic
+		// temp+rename inside publishLifecycleSnapshot.
+		const ledgerHealth = audioHealth.getInputHealth(session.clientConnected);
+		// The lifecycle schema's four values: no-client folds into 'unknown'
+		// (a detached client is absence of evidence for THIS field).
+		const inputHealth = ledgerHealth === 'no-client' ? 'unknown' : ledgerHealth;
+		const lifecycleKey = `${frame.clientAttached}|${frame.initialized}|${upstreamKey}|${inputHealth}`;
 		if (lifecycleKey !== lastLifecycleKey) {
 			lastLifecycleKey = lifecycleKey;
 			publishLifecycleSnapshot(WORKSPACE_DIR, frame, {
+				inputHealth,
 				onError: (err) => console.error(`${ts()} [AgentState] lifecycle snapshot write failed: ${(err as Error)?.message ?? err}`),
 			});
 		}
@@ -1455,7 +1472,7 @@ async function main() {
 			// upstream down under this client.
 			probeIdleRestore.fence();
 			if (recorder.wasFlushed) {
-				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
+				resetSessionGateState();
 				recorder.reset();
 				recorder.events.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
 				// bodhi's onSessionStart won't re-fire (#1372 above), so start the
@@ -1561,16 +1578,24 @@ async function main() {
 	let lastLoggedStatus = '';
 	let matrixBaseline: MatrixBaseline | null = null;
 	let lastMatrixVerdict = '';
+	let lastFailedWrites = 0;
 	setInterval(() => {
 		const state = session.sessionManager.state ?? 'unknown';
 		const clientConnected = session.clientConnected;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const serverBufferedAmount = (session as any).clientTransport?.client?.bufferedAmount ?? null;
 		// Log only on state changes or non-ACTIVE states — avoid 2,880 lines/day of
 		// "state=ACTIVE client=true" during healthy operation. P7 D7.1 inverts
 		// the suppression for anomalies: any tick where the ledger latched an
 		// anomaly logs the FULL line even mid-ACTIVE-streak (the suppression
 		// rule was hiding exactly the dead zones we need to see).
 		const status = `state=${state} client=${clientConnected}`;
-		const anomaly = audioHealth.anomalySinceLastTick(clientConnected);
+		// PEEK anomalies; the latches clear only AFTER the anomaly row has
+		// been persisted (clearing first would serialize a snapshot with the
+		// evidence already gone).
+		const anomaly = audioHealth.anomalies(clientConnected);
+		const persistFailed = healthPersistence.failedWrites > lastFailedWrites;
+		lastFailedWrites = healthPersistence.failedWrites;
 		// P7 D7.2: evaluate the localization matrix per tick. lastEgressAt is
 		// the Tranche-A model-event proxy (model audio out = the model spoke);
 		// the native model hop lands with the bodhi pin.
@@ -1580,8 +1605,7 @@ async function main() {
 			clientConnected,
 			snapshot,
 			prev: matrixBaseline,
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			serverBufferedAmount: (session as any).clientTransport?.client?.bufferedAmount ?? null,
+			serverBufferedAmount,
 			lastModelEventAt: snapshot.lastEgressAt,
 			now: Date.now(),
 		});
@@ -1591,13 +1615,20 @@ async function main() {
 			console.log(`${ts()} [Matrix] ${matrix.verdict}${matrix.reasons.length ? ' (' + matrix.reasons.join('; ') + ')' : ''}`);
 		}
 		lastMatrixVerdict = matrix.verdict;
+		if (anomaly.anomalous) audioHealth.persistTick('anomaly', clientConnected);
+		// Rate windows advance EVERY tick (a suppressed streak must not turn
+		// the next logged line into a long-window average).
+		const seg = audioHealth.healthSegments(clientConnected, serverBufferedAmount);
 		if (state !== 'ACTIVE' || status !== lastLoggedStatus || anomaly.anomalous) {
-			const seg = clientConnected ? ' ' + audioHealth.healthSegments(clientConnected) : '';
 			const why = anomaly.anomalous ? ` anomaly=${anomaly.reasons.join(',')}` : '';
-			console.log(`${ts()} [Health] ${status}${seg}${why}`);
+			const pf = persistFailed ? ` persistFail=${healthPersistence.failedWrites}` : '';
+			console.log(`${ts()} [Health] ${status}${clientConnected ? ' ' + seg : ''}${why}${pf}`);
 			lastLoggedStatus = status;
 		}
-		if (anomaly.anomalous) audioHealth.persistTick('anomaly', clientConnected);
+		audioHealth.clearTickLatches();
+		// P7 D7.1: an inputHealth flip republishes the lifecycle snapshot
+		// (emitAgentState publishes only when its key changed — cheap).
+		emitAgentState();
 		// Clear any stale fatal-backoff once we observe a healthy session —
 		// otherwise a brief outage that triggered a backoff would suppress
 		// recovery from a later transient close even after the upstream
@@ -1622,9 +1653,11 @@ async function main() {
 
 	// P7 D7.1: periodic ledger persistence — a try-enqueue into the worker's
 	// one-slot mailbox (a busy slot skips the sample; §D7.0b). Anomaly rows
-	// ride the 30 s tick above; this is the once-a-minute baseline.
+	// ride the 30 s tick above; this is the once-a-minute baseline. Gated on
+	// an attached client: idle no-client rows would slowly evict the real
+	// evidence through the per-session row cap.
 	setInterval(() => {
-		audioHealth.persistTick('timer', session.clientConnected);
+		if (session.clientConnected) audioHealth.persistTick('timer', true);
 	}, 60_000);
 
 	// The server bound successfully (EADDRINUSE would have exited via main().catch

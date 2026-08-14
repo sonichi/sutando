@@ -121,7 +121,10 @@ export interface AudioHealthSnapshot {
   newEpisodeIds: number[];
   samplesSkipped: number;
   lastTurnLatencyMs: number | null;
-  inputHealth: 'ok' | 'stalled' | 'no-client' | 'unknown';
+  /** Server-clock ingress-onset → first model audio (receipt-time
+   *  approximation — D7.3's user-speech→first-model-event metric). */
+  lastSpeechToModelMs: number | null;
+  inputHealth: 'ok' | 'degraded' | 'stalled' | 'no-client' | 'unknown';
   /** Receipt-time approximation of the client epoch's start on the engine
    *  clock (null before the first heartbeat). */
   epochStartApproxMs: number | null;
@@ -142,14 +145,18 @@ export interface AudioHealthLedger {
   /** Canonical speech evidence — the vision gate and the matrix consume
    *  THIS (precedence: ingress tracker > client RMS intervals). */
   getSpeechEvidence(): SpeechEvidence;
-  getInputHealth(clientConnected: boolean): 'ok' | 'stalled' | 'no-client' | 'unknown';
+  getInputHealth(clientConnected: boolean): 'ok' | 'degraded' | 'stalled' | 'no-client' | 'unknown';
   getSnapshot(clientConnected: boolean): AudioHealthSnapshot;
-  /** Upgraded [Health] segments (30 s tick). Also advances the per-tick
-   *  rate windows. */
-  healthSegments(clientConnected: boolean): string;
+  /** Upgraded [Health] segments (30 s tick). Also advances the per-tick rate
+   *  windows — call EVERY tick, even when the line is suppressed, or a later
+   *  line reports a long-window average instead of the last 30 s. */
+  healthSegments(clientConnected: boolean, serverBufferedAmount?: number | null): string;
   /** Anomaly-overrides-suppression (D7.1): true forces a [Health] line even
-   *  during an unchanged-ACTIVE streak. Clears the per-tick latches. */
-  anomalySinceLastTick(clientConnected: boolean): { anomalous: boolean; reasons: string[] };
+   *  during an unchanged-ACTIVE streak. PEEK ONLY — call clearTickLatches()
+   *  after the anomaly row has been logged AND persisted, so the evidence
+   *  cannot be cleared before it is serialized. */
+  anomalies(clientConnected: boolean): { anomalous: boolean; reasons: string[] };
+  clearTickLatches(): void;
   /** Try-enqueue one row into the persistence mailbox; a busy mailbox skips
    *  the sample (samplesSkipped), never queues (§D7.0b). */
   persistTick(reason: 'timer' | 'anomaly' | 'final', clientConnected: boolean): void;
@@ -183,11 +190,13 @@ export function parseHeartbeat(msg: unknown, receivedAt: number): ClientHeartbea
   const og = Array.isArray(m.og) && m.og.length >= 2 ? (m.og as unknown[]) : null;
   const episodes: ClientEpisode[] = [];
   if (Array.isArray(m.ep)) {
-    for (const e of m.ep as unknown[]) {
+    // Cap at 2× the client window: telemetry is bounded by contract, and an
+    // oversized array must not become unbounded ingest work.
+    for (const e of (m.ep as unknown[]).slice(0, 8)) {
       if (Array.isArray(e) && typeof e[0] === 'number' && typeof e[1] === 'string') {
         if (e[1] === 'g') {
           episodes.push({ id: e[0], kind: 'gap', startMs: num(e[2]), durationMs: num(e[3]) });
-        } else {
+        } else if (e[1] === 's') {
           episodes.push({
             id: e[0],
             kind: 'speech',
@@ -197,6 +206,8 @@ export function parseHeartbeat(msg: unknown, receivedAt: number): ClientHeartbea
             aboveFloorMs: num(e[5]),
           });
         }
+        // Unknown kinds are dropped, not misclassified — a future client's
+        // new episode type must not masquerade as speech evidence.
       }
     }
   }
@@ -234,10 +245,13 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
   const hangMs = opts.speechHangMs ?? ENGINE_SPEECH_HANG_MS;
 
   // ── epoch (engine-minted, Tranche A — round-4 #7) ──
+  // Minted in onClientConnected (per the design — a connection that dies
+  // before its first heartbeat still persists a real epoch); the client's
+  // nonce binds to it on first heartbeat sight. A nonce change WITHOUT a
+  // connect event (should not happen at the pin) re-mints defensively.
   let epoch: number | null = null;
   let nonce: string | null = null;
   let lastMintedEpoch = 0;
-  const nonceToEpoch = new Map<string, number>();
   /** Receipt-time approximation of the client's epoch start (first heartbeat
    *  fires on the client's first 500 ms stats tick) — lets the matrix place
    *  client-epoch-relative episode intervals on the engine clock, labeled
@@ -258,12 +272,17 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
   let speechEager = false;
   let onsetAt: number | null = null;
   let lastAboveFloorAt: number | null = null;
+  /** Armed at speech onset, consumed by the next egress frame (D7.3 latency). */
+  let pendingSpeechOnsetAt: number | null = null;
+  let lastSpeechToModelMs: number | null = null;
 
   // ── client heartbeat mirror ──
   let lastHb: ClientHeartbeat | null = null;
   let prevHb: ClientHeartbeat | null = null;
   let heartbeatCount = 0;
   let seenEpisodeIds = new Set<number>();
+  /** Gap episodes only — the [Health] `gaps` field must not count speech. */
+  let gapEpisodeCount = 0;
   let newEpisodeIds: number[] = [];
   let sendSkippedGrew = false;
   const zeroTotals = () => ({
@@ -309,16 +328,26 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     prevHb = null;
     heartbeatCount = 0;
     seenEpisodeIds = new Set();
+    gapEpisodeCount = 0;
     newEpisodeIds = [];
     sendSkippedGrew = false;
     clientTotals = zeroTotals();
     prevDeliveredFrames = 0;
     prevEgressFrames = 0;
+    prevTickAt = now();
+    samplesSkipped = 0;
+    prevSamplesSkipped = 0;
+    lastTurnLatencyMs = null;
+    pendingSpeechOnsetAt = null;
+    lastSpeechToModelMs = null;
   }
 
   function noteIngress(data: unknown): void {
-    // §D7.0b FRAME PATH: O(1) writes + one subsampled pass. `data` is the
-    // int16le PCM Buffer bodhi hands to handleAudioFromClient.
+    // §D7.0b FRAME PATH: O(1) writes + one BOUNDED subsampled pass. `data`
+    // is the int16le PCM Buffer bodhi hands to handleAudioFromClient — but
+    // its length is client-controlled, so the pass caps at 8 KiB (≥ the
+    // nominal 1364 B frame; a jumbo frame's tail adds nothing to a level
+    // estimate).
     const t = now();
     deliveredFrames++;
     const buf = data as { length?: number; readInt16LE?: (o: number) => number };
@@ -326,24 +355,32 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     deliveredBytes += len;
     lastDeliveredAt = t;
     if (len >= 2 && typeof buf.readInt16LE === 'function') {
+      const scanLen = Math.min(len, 8192);
       // Every 4th sample (= every 8 bytes), allocation-free.
       let sum = 0;
       let n = 0;
-      for (let o = 0; o + 1 < len; o += 8) {
+      for (let o = 0; o + 1 < scanLen; o += 8) {
         const v = buf.readInt16LE(o) / 32768;
         sum += v * v;
         n++;
       }
       const rms = n > 0 ? Math.sqrt(sum / n) : 0;
       ingressRms = rms;
+      // Decay FIRST: after a silent stall longer than the hangover, the next
+      // above-floor frame is a NEW onset — without this, onsetAt would stay
+      // latched to the first utterance forever (codex round-2 #3).
+      if (speechEager && lastAboveFloorAt !== null && t - lastAboveFloorAt > hangMs) {
+        speechEager = false;
+      }
       if (rms >= floor) {
         if (!speechEager) {
           speechEager = true;
           onsetAt = t;
+          // Arm the speech→first-model-event latency sample (D7.3: the half
+          // FE-1 actually inflated), consumed by the next egress frame.
+          pendingSpeechOnsetAt = t;
         }
         lastAboveFloorAt = t;
-      } else if (speechEager && lastAboveFloorAt !== null && t - lastAboveFloorAt > hangMs) {
-        speechEager = false;
       }
     }
   }
@@ -354,30 +391,38 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     const s = base64 as { length?: number };
     if (typeof s?.length === 'number') egressBytes += Math.floor((s.length * 3) / 4);
     lastEgressAt = now();
+    if (pendingSpeechOnsetAt !== null) {
+      // Server-clock ingress-onset → first model audio (receipt-time
+      // approximation, labeled — model audio out is the Tranche-A model
+      // event).
+      lastSpeechToModelMs = lastEgressAt - pendingSpeechOnsetAt;
+      pendingSpeechOnsetAt = null;
+    }
+  }
+
+  function mintEpoch(): number {
+    lastMintedEpoch = Math.max(now(), lastMintedEpoch + 1);
+    return lastMintedEpoch;
   }
 
   function ingestHeartbeat(msg: unknown): void {
     const hb = parseHeartbeat(msg, now());
     if (!hb) return;
     if (hb.nonce !== nonce) {
-      // First sight of a new client connection: mint the engine-owned epoch
-      // (monotonic, collision-free) and key everything to it.
-      const existing = nonceToEpoch.get(hb.nonce);
-      if (existing !== undefined) {
-        epoch = existing;
+      if (nonce === null && epoch !== null) {
+        // First heartbeat of the connection: bind the client nonce to the
+        // epoch minted at connect.
+        log(`[AudioHealth] client nonce ${hb.nonce} bound to epoch ${epoch}`);
       } else {
-        lastMintedEpoch = Math.max(now(), lastMintedEpoch + 1);
-        epoch = lastMintedEpoch;
-        nonceToEpoch.set(hb.nonce, epoch);
-        if (nonceToEpoch.size > 4) {
-          const oldest = nonceToEpoch.keys().next().value;
-          if (oldest !== undefined) nonceToEpoch.delete(oldest);
-        }
-        log(`[AudioHealth] epoch ${epoch} minted for client nonce ${hb.nonce}`);
+        // Nonce changed without a connect event (or a heartbeat arrived
+        // before any connect) — defensively treat it as a new epoch.
+        epoch = mintEpoch();
+        log(`[AudioHealth] epoch ${epoch} minted for unexpected client nonce ${hb.nonce}`);
       }
       nonce = hb.nonce;
       prevHb = null;
       seenEpisodeIds = new Set();
+      gapEpisodeCount = 0;
       newEpisodeIds = [];
       clientTotals = zeroTotals();
       epochStartApproxMs = hb.receivedAt - 500;
@@ -388,6 +433,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       if (!seenEpisodeIds.has(e.id)) {
         seenEpisodeIds.add(e.id);
         newEpisodeIds.push(e.id);
+        if (e.kind === 'gap') gapEpisodeCount++;
         if (seenEpisodeIds.size > 128) seenEpisodeIds.clear(); // bounded (ids re-add harmlessly)
       }
     }
@@ -414,13 +460,31 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     return { active, onsetAt: active ? onsetAt : null, lastAboveFloorAt };
   }
 
-  function inputHealth(clientConnected: boolean): 'ok' | 'stalled' | 'no-client' | 'unknown' {
+  function inputHealth(
+    clientConnected: boolean,
+  ): 'ok' | 'degraded' | 'stalled' | 'no-client' | 'unknown' {
     if (!clientConnected) return 'no-client';
     const t = now();
-    if (lastHb?.openGap) return 'stalled';
+    const hbFresh = lastHb !== null && t - lastHb.receivedAt <= HEARTBEAT_STALE_MS;
     const muted = lastHb?.muted ?? false;
-    if (!muted && lastDeliveredAt !== null && t - lastDeliveredAt > INGRESS_STALL_MS) return 'stalled';
-    if (lastDeliveredAt === null && heartbeatCount === 0) return 'unknown';
+    // A degraded capture (client recovery exhausted) is worth surfacing even
+    // muted — the input will still be dead on unmute.
+    if (hbFresh && lastHb?.captureState === 'd') return 'degraded';
+    // Mute is a user choice, not an input failure — nothing below can
+    // conclude 'stalled' while muted.
+    if (muted && hbFresh) return 'ok';
+    // Client-reported evidence counts only while its heartbeat is FRESH — a
+    // detached client's retained open gap must not report stalled forever.
+    if (hbFresh && lastHb) {
+      if (lastHb.openGap) return 'stalled';
+      if (lastHb.ctxState === 's' || lastHb.ctxState === 'c') return 'stalled';
+    }
+    if (lastDeliveredAt !== null && t - lastDeliveredAt > INGRESS_STALL_MS) return 'stalled';
+    if (lastDeliveredAt === null) {
+      // Heartbeats crossing while NO PCM has ever reached the session is a
+      // stall, not health (codex round-2 #4).
+      return heartbeatCount > 0 ? 'stalled' : 'unknown';
+    }
     return 'ok';
   }
 
@@ -464,6 +528,11 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
 
     onClientConnected(): void {
       resetEpochState();
+      // The design mints the epoch HERE: a connection that dies before its
+      // first heartbeat still persists rows under a real epoch. The client's
+      // nonce binds on first heartbeat sight.
+      epoch = mintEpoch();
+      log(`[AudioHealth] epoch ${epoch} minted (client connected; nonce pending)`);
     },
 
     onClientDisconnected(): void {
@@ -499,6 +568,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
         newEpisodeIds: [...newEpisodeIds],
         samplesSkipped,
         lastTurnLatencyMs,
+        lastSpeechToModelMs,
         inputHealth: inputHealth(clientConnected),
         epochStartApproxMs,
         lastMatrixVerdict,
@@ -509,7 +579,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       lastMatrixVerdict = verdict;
     },
 
-    healthSegments(clientConnected: boolean): string {
+    healthSegments(clientConnected: boolean, serverBufferedAmount?: number | null): string {
       const t = now();
       const dt = Math.max(0.001, (t - prevTickAt) / 1000);
       const inFps = (deliveredFrames - prevDeliveredFrames) / dt;
@@ -524,7 +594,9 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       const up = 'up=n/a';
       const endedLag =
         lastHb?.lastEndedAgoMs != null ? (lastHb.lastEndedAgoMs / 1000).toFixed(1) + 's' : 'n/a';
-      const out = `out={fps:${outFps.toFixed(1)},buffered:${lastHb?.bufferedAmount ?? 'n/a'},endedLag:${endedLag}}`;
+      // out.buffered is the SERVER's egress socket toward the client; the
+      // client's own uplink bufferedAmount lives under clientHealth.upBuf.
+      const out = `out={fps:${outFps.toFixed(1)},buffered:${serverBufferedAmount ?? 'n/a'},endedLag:${endedLag}}`;
       let client = 'clientHealth=n/a';
       if (lastHb) {
         const hbAge = ((t - lastHb.receivedAt) / 1000).toFixed(1) + 's';
@@ -537,26 +609,31 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
         // client's own rms travels only as latched episode intervals.
         client =
           `clientHealth={age:${hbAge},capCb/s:${capRate},rms:${ingressRms.toFixed(3)},` +
-          `ctx:${lastHb.ctxState ?? '?'},cap:${lastHb.captureState ?? '?'},gaps:${seenEpisodeIds.size},` +
-          `skip:${clientTotals.sendSkipped}${lastHb.muted ? ',muted' : ''}${lastHb.openGap ? ',STALLED' : ''}}`;
+          `ctx:${lastHb.ctxState ?? '?'},cap:${lastHb.captureState ?? '?'},gaps:${gapEpisodeCount},` +
+          `upBuf:${lastHb.bufferedAmount ?? 'n/a'},skip:${clientTotals.sendSkipped}` +
+          `${lastHb.muted ? ',muted' : ''}${lastHb.openGap ? ',STALLED' : ''}}`;
       }
       const lat = lastTurnLatencyMs != null ? ` latency=${lastTurnLatencyMs}ms` : '';
+      const s2m = lastSpeechToModelMs != null ? ` speech2model=${lastSpeechToModelMs}ms` : '';
       const ep = epoch != null ? ` epoch=${epoch}` : '';
       const health = clientConnected ? inputHealth(true) : 'no-client';
-      return `${audioIn} ${up} ${out} ${client}${ep}${lat} inputHealth=${health}`;
+      return `${audioIn} ${up} ${out} ${client}${ep}${lat}${s2m} inputHealth=${health}`;
     },
 
-    anomalySinceLastTick(clientConnected: boolean): { anomalous: boolean; reasons: string[] } {
+    anomalies(clientConnected: boolean): { anomalous: boolean; reasons: string[] } {
       const t = now();
       const reasons: string[] = [];
-      if (lastHb?.openGap) reasons.push('capStalled');
+      const hbFresh = lastHb !== null && t - lastHb.receivedAt <= HEARTBEAT_STALE_MS;
+      const muted = lastHb?.muted ?? false;
+      // Client-reported stall evidence only counts while attached, unmuted,
+      // and FRESH — a detached client's retained open gap is not a live
+      // anomaly (codex round-2 #4).
+      if (clientConnected && !muted && hbFresh && lastHb?.openGap) reasons.push('capStalled');
       if (newEpisodeIds.length > 0) reasons.push(`episodes:${newEpisodeIds.length}`);
-      if (clientConnected && lastHb && t - lastHb.receivedAt > HEARTBEAT_STALE_MS) {
-        reasons.push('heartbeat-stale');
-      }
+      if (clientConnected && lastHb && !hbFresh) reasons.push('heartbeat-stale');
       if (
         clientConnected &&
-        !(lastHb?.muted ?? false) &&
+        !muted &&
         lastDeliveredAt !== null &&
         t - lastDeliveredAt > INGRESS_STALL_MS
       ) {
@@ -564,18 +641,34 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       }
       if (sendSkippedGrew) reasons.push('sendSkipped');
       if (samplesSkipped > prevSamplesSkipped) reasons.push('persistSkipped');
-      // Clear the per-tick latches (counters themselves stay monotonic).
+      return { anomalous: reasons.length > 0, reasons };
+    },
+
+    clearTickLatches(): void {
       newEpisodeIds = [];
       sendSkippedGrew = false;
       prevSamplesSkipped = samplesSkipped;
-      return { anomalous: reasons.length > 0, reasons };
     },
 
     persistTick(reason: 'timer' | 'anomaly' | 'final', clientConnected: boolean): void {
       if (!opts.persist) return;
       const snapshot = this.getSnapshot(clientConnected);
       let payload = JSON.stringify(snapshot);
-      if (payload.length > PERSIST_PAYLOAD_MAX_BYTES) payload = payload.slice(0, PERSIST_PAYLOAD_MAX_BYTES);
+      if (Buffer.byteLength(payload) > PERSIST_PAYLOAD_MAX_BYTES) {
+        // Never slice a JSON document mid-string: over budget, persist a
+        // reduced-but-VALID snapshot with the truncation named.
+        payload = JSON.stringify({
+          truncated: true,
+          coverage: snapshot.coverage,
+          epoch: snapshot.epoch,
+          nonce: snapshot.nonce,
+          inputHealth: snapshot.inputHealth,
+          deliveredFrames: snapshot.deliveredFrames,
+          egressFrames: snapshot.egressFrames,
+          samplesSkipped: snapshot.samplesSkipped,
+          lastMatrixVerdict: snapshot.lastMatrixVerdict,
+        });
+      }
       const row: HealthRow = {
         tsUnix: Math.floor(now() / 1000),
         sessionId: opts.sessionId,

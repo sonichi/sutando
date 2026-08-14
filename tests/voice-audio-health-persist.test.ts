@@ -37,14 +37,14 @@ describe('P7 D7.1 voice_audio_health persistence (worker_threads)', () => {
 		await p.close(); // terminate(): the worker-thread SIGKILL analog — no flush
 		const db = new DatabaseSync(dbPath);
 		const rows = db
-			.prepare('SELECT session_id, epoch, nonce, reason, payload FROM voice_audio_health')
+			.prepare('SELECT session_id, epoch, nonce, reason, payload_json FROM voice_audio_health')
 			.all() as Array<Record<string, unknown>>;
 		db.close();
 		assert.equal(rows.length, 1);
 		assert.equal(rows[0].session_id, 'session_test');
 		assert.equal(rows[0].epoch, 123);
 		assert.equal(rows[0].reason, 'anomaly');
-		assert.equal(rows[0].payload, '{"coverage":"session-only"}');
+		assert.equal(rows[0].payload_json, '{"coverage":"session-only"}');
 	});
 
 	it('one-slot mailbox: a second enqueue while the slot is in flight is refused', async () => {
@@ -59,20 +59,61 @@ describe('P7 D7.1 voice_audio_health persistence (worker_threads)', () => {
 		await p.close();
 	});
 
-	it('row cap retention: only the newest maxRows survive', async () => {
+	it('row cap retention is PER SESSION: one busy session cannot evict another\'s evidence', async () => {
 		const dbPath = join(dir, 'cap.sqlite');
-		const p = createHealthPersistence({ dbPath, maxRows: 3 });
-		for (let i = 0; i < 5; i++) {
-			assert.equal(p.tryEnqueue(row({ epoch: i })), true);
+		const p = createHealthPersistence({ dbPath, maxRows: 2 });
+		for (const [sid, epoch] of [
+			['A', 1],
+			['A', 2],
+			['B', 3],
+			['B', 4],
+			['B', 5],
+		] as Array<[string, number]>) {
+			assert.equal(p.tryEnqueue(row({ sessionId: sid, epoch })), true);
 			await p.drain();
 		}
+		await p.close();
+		const db = new DatabaseSync(dbPath);
+		const rows = (db
+			.prepare('SELECT session_id, epoch FROM voice_audio_health ORDER BY id')
+			.all() as Array<{ session_id: string; epoch: number }>).map((r) => `${r.session_id}:${r.epoch}`);
+		db.close();
+		assert.deepEqual(rows, ['A:1', 'A:2', 'B:4', 'B:5'], 'B capped to 2 without touching A');
+	});
+
+	it('30-day retention sweep prunes ancient rows on the next write', async () => {
+		const dbPath = join(dir, 'age.sqlite');
+		const p = createHealthPersistence({ dbPath });
+		assert.equal(p.tryEnqueue(row({ tsUnix: Math.floor(Date.now() / 1000) - 40 * 24 * 3600, epoch: 1 })), true);
+		await p.drain();
+		assert.equal(p.tryEnqueue(row({ epoch: 2 })), true);
+		await p.drain();
 		await p.close();
 		const db = new DatabaseSync(dbPath);
 		const epochs = (db.prepare('SELECT epoch FROM voice_audio_health ORDER BY id').all() as Array<{ epoch: number }>).map(
 			(r) => r.epoch,
 		);
 		db.close();
-		assert.deepEqual(epochs, [2, 3, 4], 'oldest rows pruned at the cap');
+		assert.deepEqual(epochs, [2], 'the 40-day-old row was swept');
+	});
+
+	it('a busy/locked health DB never blocks the caller: tryEnqueue refuses instead of waiting', async () => {
+		const dbPath = join(dir, 'locked.sqlite');
+		const p = createHealthPersistence({ dbPath });
+		assert.equal(p.tryEnqueue(row({ epoch: 1 })), true);
+		await p.drain();
+		// Hold an exclusive transaction from THIS thread — the worker's next
+		// write will sit in its busy_timeout inside the worker.
+		const locker = new DatabaseSync(dbPath);
+		locker.exec('BEGIN EXCLUSIVE');
+		const t0 = Date.now();
+		assert.equal(p.tryEnqueue(row({ epoch: 2 })), true, 'slot accepts — the WORKER blocks, not us');
+		assert.equal(p.tryEnqueue(row({ epoch: 3 })), false, 'slot busy → skip, zero waiting');
+		assert.ok(Date.now() - t0 < 100, 'the voice loop side never blocked');
+		locker.exec('ROLLBACK');
+		locker.close();
+		await p.drain();
+		await p.close();
 	});
 
 	it('a failing write acks ok:false — visible in failedWrites, worker stays up', async () => {

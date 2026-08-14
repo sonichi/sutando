@@ -142,16 +142,21 @@ describe('P7 D7.1 engine ledger — wraps', () => {
 });
 
 describe('P7 D7.1 engine ledger — epoch minting (Tranche A nonce scheme)', () => {
-	it('mints on first sight, stays stable per nonce, advances per new nonce, resets baselines', () => {
+	it('mints AT CONNECT; the nonce binds on first heartbeat; a connection dying pre-heartbeat still has a real epoch', () => {
 		const now = { t: 50_000 };
 		const led = makeLedger(now);
-		led.ingestHeartbeat(wireHb('nonceAAA'));
+		led.onClientConnected();
 		const e1 = led.getSnapshot(true).epoch;
-		assert.ok(e1 && e1 >= 50_000, 'engine-minted epoch');
+		assert.ok(e1 && e1 >= 50_000, 'epoch minted at connect, before any heartbeat');
+		assert.equal(led.getSnapshot(true).nonce, null, 'nonce pending until first heartbeat');
+		led.ingestHeartbeat(wireHb('nonceAAA'));
+		assert.equal(led.getSnapshot(true).epoch, e1, 'first heartbeat BINDS, does not re-mint');
+		assert.equal(led.getSnapshot(true).nonce, 'nonceAAA');
 		led.ingestHeartbeat(wireHb('nonceAAA', { q: 1 }));
-		assert.equal(led.getSnapshot(true).epoch, e1, 'stable for the same connection');
 		assert.equal(led.getSnapshot(true).clientTotals.capCallbacks, 94, 'deltas accumulate');
+		// Reconnect: connect mints a strictly newer epoch and resets baselines.
 		now.t += 10;
+		led.onClientConnected();
 		led.ingestHeartbeat(wireHb('nonceBBB'));
 		const snap = led.getSnapshot(true);
 		assert.ok(snap.epoch && snap.epoch > e1!, 'new connection = strictly newer epoch');
@@ -159,18 +164,38 @@ describe('P7 D7.1 engine ledger — epoch minting (Tranche A nonce scheme)', () 
 		assert.equal(snap.clientTotals.capCallbacks, 47, 'totals reset at the epoch boundary');
 	});
 
-	it('onClientConnected clears the pending epoch and per-epoch counters', () => {
+	it('a mid-connection nonce change (no connect event) defensively re-mints', () => {
 		const now = { t: 50_000 };
 		const led = makeLedger(now);
+		led.onClientConnected();
+		led.ingestHeartbeat(wireHb('nonceAAA'));
+		const e1 = led.getSnapshot(true).epoch!;
+		now.t += 10;
+		led.ingestHeartbeat(wireHb('nonceZZZ'));
+		assert.ok(led.getSnapshot(true).epoch! > e1, 'unexpected nonce never reuses the old epoch');
+	});
+
+	it('onClientConnected resets per-epoch counters, latency samples, and skip counters', () => {
+		const now = { t: 50_000 };
+		const rows: HealthRow[] = [];
+		let accept = false;
+		const led = makeLedger(now, () => accept);
 		const s = fakeSession();
 		led.wrapSession(s);
 		s.handleAudioFromClient(pcm(0.1));
 		led.ingestHeartbeat(wireHb('nonceAAA'));
+		led.noteTurnLatency(1234);
+		led.persistTick('timer', true); // rejected → samplesSkipped 1
+		assert.equal(led.getSnapshot(true).samplesSkipped, 1);
 		led.onClientConnected();
+		accept = true;
 		const snap = led.getSnapshot(true);
-		assert.equal(snap.epoch, null);
+		assert.ok(snap.epoch, 'fresh epoch minted');
 		assert.equal(snap.deliveredFrames, 0);
 		assert.equal(snap.heartbeatCount, 0);
+		assert.equal(snap.samplesSkipped, 0, 'skip counter is per-epoch');
+		assert.equal(snap.lastTurnLatencyMs, null, 'latency sample is per-epoch');
+		assert.equal(rows.length, 0);
 	});
 });
 
@@ -199,6 +224,46 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		s.handleAudioFromClient(pcm(0.005));
 		assert.equal(led.getSpeechEvidence().active, false);
 	});
+
+	it('speech after a silent stall is a NEW onset (eager decay on the frame path)', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		const s = fakeSession();
+		led.wrapSession(s);
+		s.handleAudioFromClient(pcm(0.3)); // onset #1 at 10000
+		now.t = 10_700; // hangover elapsed with NO frames (stall)
+		s.handleAudioFromClient(pcm(0.3)); // must re-latch, not extend
+		const ev = led.getSpeechEvidence();
+		assert.equal(ev.active, true);
+		assert.equal(ev.onsetAt, 10_700, 'stale onset would corrupt speech→model latency');
+	});
+
+	it('speech onset → first model audio yields the latency sample (server clock)', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		const s = fakeSession();
+		led.wrapSession(s);
+		s.handleAudioFromClient(pcm(0.3)); // onset armed at 10000
+		now.t = 11_840;
+		s.handleAudioOutput(Buffer.from('audio').toString('base64'));
+		assert.equal(led.getSnapshot(true).lastSpeechToModelMs, 1840);
+		// consumed: a second egress frame does not overwrite the sample
+		now.t = 12_000;
+		s.handleAudioOutput(Buffer.from('audio').toString('base64'));
+		assert.equal(led.getSnapshot(true).lastSpeechToModelMs, 1840);
+	});
+
+	it('ingress RMS work is bounded: a jumbo frame scans at most 8 KiB', () => {
+		const led = makeLedger({ t: 10_000 });
+		const s = fakeSession();
+		led.wrapSession(s);
+		const jumbo = Buffer.alloc(4 * 1024 * 1024); // 4 MiB of silence
+		const t0 = process.hrtime.bigint();
+		s.handleAudioFromClient(jumbo);
+		const us = Number(process.hrtime.bigint() - t0) / 1000;
+		assert.ok(us < 5000, `jumbo frame took ${us.toFixed(0)}µs — scan not bounded`);
+		assert.equal(led.getSnapshot(true).deliveredBytes, jumbo.length, 'bytes still fully accounted');
+	});
 });
 
 describe('P7 D7.1 engine ledger — inputHealth + anomaly latching', () => {
@@ -219,31 +284,86 @@ describe('P7 D7.1 engine ledger — inputHealth + anomaly latching', () => {
 		assert.equal(led.getInputHealth(true), 'stalled');
 	});
 
-	it('anomalies latch per tick and clear on read; muted suppresses the ingress-stall reason', () => {
+	it('heartbeats crossing while NO PCM ever reached the session is a stall, not health', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		led.onClientConnected();
+		led.ingestHeartbeat(wireHb('nnnnnnnn'));
+		assert.equal(led.getInputHealth(true), 'stalled');
+	});
+
+	it('a muted client is never stalled; a degraded capture surfaces even muted', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		const s = fakeSession();
+		led.wrapSession(s);
+		s.handleAudioFromClient(pcm(0.1));
+		now.t += 6000; // would be an ingress stall if unmuted
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { mu: 1 }));
+		assert.equal(led.getInputHealth(true), 'ok', 'mute is a user choice');
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { q: 1, mu: 1, cap: 'd' }));
+		assert.equal(led.getInputHealth(true), 'degraded', 'exhausted recovery surfaces regardless');
+	});
+
+	it('suspended/closed context reports stalled; STALE heartbeat evidence stops counting', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		const s = fakeSession();
+		led.wrapSession(s);
+		s.handleAudioFromClient(pcm(0.1));
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { cs: 's' }));
+		assert.equal(led.getInputHealth(true), 'stalled', 'suspended ctx = no input');
+		// The same heartbeat 20 s later is stale — a detached client's
+		// retained evidence must not report stalled forever…
+		now.t += 20_000;
+		s.handleAudioFromClient(pcm(0.1)); // …and live PCM proves input works
+		assert.equal(led.getInputHealth(true), 'ok');
+	});
+
+	it('anomalies PEEK until clearTickLatches; muted/stale gates apply', () => {
 		const now = { t: 10_000 };
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
 		s.handleAudioFromClient(pcm(0.1));
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { ep: [[1, 'g', 0, 1200]], og: [0, 1500] }));
-		const a1 = led.anomalySinceLastTick(true);
+		const a1 = led.anomalies(true);
 		assert.equal(a1.anomalous, true);
 		assert.ok(a1.reasons.includes('capStalled'));
 		assert.ok(a1.reasons.some((r) => r.startsWith('episodes:')));
+		const a1again = led.anomalies(true);
+		assert.ok(a1again.reasons.some((r) => r.startsWith('episodes:')), 'peek does not clear');
+		led.clearTickLatches();
 		// same episode re-sent (idempotent window) → no NEW episode anomaly
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { q: 1, ep: [[1, 'g', 0, 1200]], og: [0, 3500] }));
-		const a2 = led.anomalySinceLastTick(true);
+		const a2 = led.anomalies(true);
 		assert.ok(!a2.reasons.some((r) => r.startsWith('episodes:')), 'dedup by episode id');
+		led.clearTickLatches();
 		now.t += 6000;
-		led.ingestHeartbeat(wireHb('nnnnnnnn', { q: 2, mu: 1 }));
-		const a3 = led.anomalySinceLastTick(true);
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { q: 2, mu: 1, og: [0, 9000] }));
+		const a3 = led.anomalies(true);
 		assert.ok(!a3.reasons.includes('ingress-stalled'), 'muted client is not an ingress stall');
+		assert.ok(!a3.reasons.includes('capStalled'), 'muted open gap is not a stall');
+		assert.ok(!led.anomalies(false).reasons.includes('capStalled'), 'detached gap is not live');
 	});
 
 	it('sendSkipped delta in any heartbeat is an anomaly', () => {
 		const led = makeLedger({ t: 10_000 });
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { c: [47, 64000, 5, 0, 0, 0, 0, 0] }));
-		assert.ok(led.anomalySinceLastTick(true).reasons.includes('sendSkipped'));
+		assert.ok(led.anomalies(true).reasons.includes('sendSkipped'));
+	});
+
+	it('unknown episode kinds are dropped, never misclassified as speech', () => {
+		const led = makeLedger({ t: 10_000 });
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { ep: [[1, 'z', 0, 1200]] }));
+		assert.equal(led.getSnapshot(true).lastHeartbeat?.episodes.length, 0);
+	});
+
+	it('the ep array ingest is capped at 8 entries', () => {
+		const led = makeLedger({ t: 10_000 });
+		const ep = Array.from({ length: 100 }, (_, i) => [i + 1, 'g', 0, 100]);
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { ep }));
+		assert.equal(led.getSnapshot(true).lastHeartbeat?.episodes.length, 8);
 	});
 });
 
@@ -267,7 +387,32 @@ describe('P7 D7.1 engine ledger — persistence tick + [Health] segments', () =>
 		accept = false;
 		led.persistTick('anomaly', true);
 		assert.equal(led.getSnapshot(true).samplesSkipped, 1, 'busy mailbox → skipped, never queued');
-		assert.ok(led.anomalySinceLastTick(true).reasons.includes('persistSkipped'));
+		assert.ok(led.anomalies(true).reasons.includes('persistSkipped'));
+	});
+
+	it('an oversized snapshot persists as reduced-but-VALID JSON, never a sliced document', () => {
+		const now = { t: 10_000 };
+		const rows: HealthRow[] = [];
+		const led = makeLedger(now, (row) => {
+			rows.push(row);
+			return true;
+		});
+		led.onClientConnected();
+		// Inflate the snapshot past the payload budget: hundreds of un-cleared
+		// new episode ids (a tick that never cleared its latches).
+		for (let k = 0; k < 80; k++) {
+			// 8-digit ids keep every entry wide so the accumulated ids alone
+			// push the snapshot past the payload budget.
+			const ep = Array.from({ length: 8 }, (_, i) => [10_000_000 + k * 8 + i, 'g', 9_999_999, 9_999_999]);
+			led.ingestHeartbeat(wireHb('nnnnnnnn', { q: k, ep }));
+		}
+		led.persistTick('timer', true);
+		assert.equal(rows.length, 1);
+		const parsed = JSON.parse(rows[0].payload); // must not throw — VALID JSON
+		assert.ok(Buffer.byteLength(rows[0].payload) <= 4096);
+		assert.equal(parsed.truncated, true, 'over-budget snapshot takes the reduced form');
+		assert.equal(parsed.coverage, 'session-only');
+		assert.ok(parsed.epoch, 'core evidence survives truncation');
 	});
 
 	it('healthSegments renders the upgraded line fields', () => {

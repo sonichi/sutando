@@ -41,18 +41,22 @@ function open() {
     'epoch INTEGER,' +
     'nonce TEXT,' +
     'reason TEXT NOT NULL,' +
-    'payload TEXT NOT NULL)');
+    'payload_json TEXT NOT NULL)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_vah_ts ON voice_audio_health(ts_unix)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_vah_session ON voice_audio_health(session_id)');
   return db;
 }
 parentPort.on('message', (row) => {
   let ok = true;
   try {
     const d = open();
-    d.prepare('INSERT INTO voice_audio_health (ts_unix, session_id, epoch, nonce, reason, payload) VALUES (?, ?, ?, ?, ?, ?)')
+    d.prepare('INSERT INTO voice_audio_health (ts_unix, session_id, epoch, nonce, reason, payload_json) VALUES (?, ?, ?, ?, ?, ?)')
       .run(row.tsUnix, row.sessionId, row.epoch ?? null, row.nonce ?? null, row.reason, row.payload);
-    d.prepare('DELETE FROM voice_audio_health WHERE id NOT IN (SELECT id FROM voice_audio_health ORDER BY id DESC LIMIT ?)')
-      .run(row.maxRows);
+    // Row cap is PER SESSION (a busy new session must not evict another
+    // session's evidence); the 30-day sweep is global.
+    d.prepare('DELETE FROM voice_audio_health WHERE session_id = ? AND id NOT IN ' +
+      '(SELECT id FROM voice_audio_health WHERE session_id = ? ORDER BY id DESC LIMIT ?)')
+      .run(row.sessionId, row.sessionId, row.maxRows);
     d.prepare('DELETE FROM voice_audio_health WHERE ts_unix < ?')
       .run(Math.floor(Date.now() / 1000) - 30 * 24 * 3600);
   } catch (e) {

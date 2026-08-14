@@ -32,6 +32,16 @@ describe('P7 D7.3 stale-repeat goodbye guard', () => {
 		const other = shouldFireGoodbye(first.next, 'Bye for now!', 3);
 		assert.equal(other.fire, true);
 	});
+
+	it('a rebased (fresh) guard fires at ANY count — the per-session reset contract', () => {
+		// voice-agent's resetSessionGateState() replaces the guard whenever
+		// userTurnCount resets; without the rebase, the next session's count
+		// (restarted below the old watermark) would suppress a real goodbye.
+		const first = shouldFireGoodbye(initialGoodbyeGuard(), 'Goodbye!', 3);
+		assert.equal(first.fire, true);
+		const nextSession = shouldFireGoodbye(initialGoodbyeGuard(), 'Goodbye!', 1);
+		assert.equal(nextSession.fire, true);
+	});
 });
 
 describe('P7 D7.3 centralized conversation clear (G-P7-8)', () => {
