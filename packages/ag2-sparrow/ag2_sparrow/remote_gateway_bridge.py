@@ -64,6 +64,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 # Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
@@ -603,6 +604,17 @@ PROACTIVE_ROOM = (
     if _PROACTIVE_ROOM_ENV is not None
     else _config_from_channel_env("REMOTE_PROACTIVE_ROOM")
 )
+# Host-injected claim gate (Path -> bool), consulted per file before the claim
+# rename; None (standalone default) claims every routable file unchanged.
+PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
+# event_id: trust the bare ok as delivered (at-least-once beats never).
+_PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
+PROACTIVE_TRUST_OK = (
+    _PROACTIVE_TRUST_OK_ENV
+    if _PROACTIVE_TRUST_OK_ENV is not None
+    else _config_from_channel_env("REMOTE_PROACTIVE_TRUST_OK")
+) == "1"
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 # rotation (_reload_rotated_token) propagates to their next request without a
@@ -912,6 +924,48 @@ def _redact_url(value: str) -> str:
         return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
     except Exception:  # noqa: BLE001 — redaction must never break status I/O
         return str(value)
+
+
+class _NeverFatalStream:
+    """Logging must never take the poll loop down.
+
+    Mirrors the merged `src/discord-bridge.py` fix (#2856). This package is
+    standalone (`dependencies = []`, imports nothing from sutando's `src/`), so
+    the guard is local by necessity rather than duplicated policy.
+
+    The loop's own `except Exception  # keep the loop alive` cannot help here:
+    every handler calls `_log()` first, so a `BrokenPipeError` from that print
+    is raised *inside* the handler and escapes it. Stdout is a pipe whenever the
+    launcher pipes to `tee`, which is how this bridge runs today.
+
+    Swallow ONLY OSError (the EPIPE/EBADF class); anything else still propagates
+    so real bugs are not masked.
+    """
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except OSError:
+            # Report the write as accepted: callers must not branch on it.
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _NeverFatalStream(sys.stdout)
+sys.stderr = _NeverFatalStream(sys.stderr)
 
 
 def _log(msg: str) -> None:
@@ -2010,7 +2064,8 @@ def _post_proactive() -> None:
     to `.txt` for retry on the next loop pass. Auth errors propagate to the
     caller (the poll loop owns auth handling); everything else is per-file
     fail-open — one malformed nudge never blocks the rest. No-op without
-    PROACTIVE_ROOM."""
+    PROACTIVE_ROOM. A host-injected PROACTIVE_CLAIM_GATE may defer a file
+    that belongs to another bridge (cross-bridge routing stays host policy)."""
     if not PROACTIVE_ROOM:
         return
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
@@ -2024,6 +2079,12 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if PROACTIVE_CLAIM_GATE is not None:
+            try:
+                if not PROACTIVE_CLAIM_GATE(f):
+                    continue  # another bridge's file right now; retry next pass
+            except Exception:
+                pass  # a broken gate must not strand owner nudges — claim
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -2122,7 +2183,11 @@ def _post_proactive() -> None:
             # a failed send: the claim is renamed back and retried next pass,
             # loudly, so a misconfigured room is visible instead of silently
             # eating nudges.
-            if not (isinstance(resp, dict) and resp.get("event_id")):
+            delivered = isinstance(resp, dict) and (
+                bool(resp.get("event_id"))
+                or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
+            )
+            if not delivered:
                 _log(f"proactive send for {f.name} got no delivery signal "
                      f"(response {str(resp)[:120]!r}) — will retry; check "
                      "REMOTE_PROACTIVE_ROOM and the agent's room membership")
@@ -2423,6 +2488,18 @@ def _acquire_singleton() -> bool:
     return True
 
 
+def _react_sender(timeout: int = 10):
+    """The 👀 receipt's room-verb call. Lives here because the room-verb
+    endpoint surface is frozen to this adapter edge, not to sparrow modules."""
+    def _react(room_id, message_id, key) -> None:
+        # safe="" — the default safe="/" would split a room id containing "/"
+        # across path segments and misroute the react.
+        safe_room = urllib.parse.quote(str(room_id), safe="")
+        _req("POST", f"/v1/rooms/{safe_room}/react",
+             {"event_id": message_id, "key": key}, timeout=timeout)
+    return _react
+
+
 def _maybe_start_event_channel() -> None:
     """AWP P0: start the persistent Workspace-Event channel in its OWN daemon
     thread, ISOLATED from task delivery. Opt-in (SPARROW_EVENTS truthy) and
@@ -2460,6 +2537,17 @@ def _maybe_start_event_channel() -> None:
                                     ha_room, log=_log,
                                     include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
                                     .strip().lower() in ("1", "true", "yes", "on"))
+        # 👀 receipt: OPT-IN because it scopes by room_id alone, so default-on
+        # would react in shared rooms. Wrapped OUTERMOST, chain-transparent.
+        if (str(os.environ.get("SPARROW_OBSERVE_REACT", "")).strip().lower()
+                in ("1", "true", "yes", "on")):
+            mxid = os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID")
+            if mxid:
+                from .default_observer import ReactObserverHandler
+                handler = ReactObserverHandler(handler, _react_sender(), mxid,
+                                               log=_log)
+            else:
+                _log("react-observer: AGENT_MXID/AGENT_ID unset — observed-receipt off")
         consumer = EventConsumer(inbox, handler)
 
         def _drain_loop():
