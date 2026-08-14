@@ -50,6 +50,12 @@ from ag2_sparrow.event_consumer import TaskifyHandler  # noqa: E402
 # Deterministic local trust default regardless of the host's REMOTE_LOCAL_TIER.
 rgb.LOCAL_TIER = "owner"
 
+# The REAL bucket_source (pure) so fake-telemetry cases exercise the SAME
+# source-bucketing the production caller uses, not a divergent passthrough.
+_REAL_TEL_SPEC = importlib.util.spec_from_file_location("telemetry", REPO / "src" / "telemetry.py")
+_REAL_TEL = importlib.util.module_from_spec(_REAL_TEL_SPEC)
+_REAL_TEL_SPEC.loader.exec_module(_REAL_TEL)
+
 failures = []
 
 
@@ -77,6 +83,7 @@ def _fresh_dirs():
     # Reset the tierMap to the seeded EMPTY config and drop the mtime cache so
     # no case inherits another case's (or the host's) tier state.
     _ACCESS.write_text('{"allowFrom": [], "tierMap": {}}')
+    rgb._TIER_MAP_CACHE["ident"] = None
     rgb._TIER_MAP_CACHE["mtime"] = None
     rgb._TIER_MAP_CACHE["map"] = {}
     return tmp
@@ -94,6 +101,7 @@ class _FakeTelemetry:
                 raise RuntimeError("telemetry backend down")
 
         self.mod.task_processed = task_processed
+        self.mod.bucket_source = _REAL_TEL.bucket_source
 
     def __enter__(self):
         self._prev = sys.modules.get("telemetry")
@@ -111,21 +119,25 @@ class _FakeTelemetry:
 _fresh_dirs()
 with _FakeTelemetry() as t:
     tid = rgb._write_task({"id": "task-telem1", "task": "hello", "source": "ag2space",
-                           "user_id": "@rui:ag2.space", "channel_id": "!room:ag2.space"})
+                           "user_id": "@rui:ag2.space", "access_tier": "owner",
+                           "channel_id": "!room:ag2.space"})
 check("write returns the task id", tid == "task-telem1")
 check("one task_processed event", t.calls == ["ag2space"], repr(t.calls))
 
 # 2. no source on the task → falls back to PROVIDER (matches the file header)
 _fresh_dirs()
 with _FakeTelemetry() as t:
-    rgb._write_task({"id": "task-telem2", "task": "hi", "user_id": "@rui:ag2.space"})
+    rgb._write_task({"id": "task-telem2", "task": "hi", "user_id": "@rui:ag2.space",
+                     "access_tier": "owner"})
 check("sourceless task tags PROVIDER", t.calls == [rgb.PROVIDER], repr(t.calls))
 
 # 3. idempotent re-write (file already queued) → no second event
 _fresh_dirs()
 with _FakeTelemetry() as t:
-    rgb._write_task({"id": "task-telem3", "task": "x", "source": "ag2space"})
-    rgb._write_task({"id": "task-telem3", "task": "x", "source": "ag2space"})
+    rgb._write_task({"id": "task-telem3", "task": "x", "source": "ag2space",
+                     "access_tier": "owner"})
+    rgb._write_task({"id": "task-telem3", "task": "x", "source": "ag2space",
+                     "access_tier": "owner"})
 check("idempotent re-write counted once", t.calls == ["ag2space"], repr(t.calls))
 
 # 4. gateway redelivery of an archived task → no event (and no task file)
@@ -134,7 +146,8 @@ archive = rgb.TASKS_DIR / "archive"
 archive.mkdir(parents=True, exist_ok=True)
 (archive / "task-telem4.txt").write_text("done long ago\n")
 with _FakeTelemetry() as t:
-    rgb._write_task({"id": "task-telem4", "task": "replay", "source": "ag2space"})
+    rgb._write_task({"id": "task-telem4", "task": "replay", "source": "ag2space",
+                     "access_tier": "owner"})
 check("archived redelivery not counted", t.calls == [], repr(t.calls))
 check("archived redelivery writes no task file",
       not (rgb.TASKS_DIR / "task-telem4.txt").exists())
@@ -143,7 +156,8 @@ check("archived redelivery writes no task file",
 _fresh_dirs()
 _prev = sys.modules.pop("telemetry", None)
 try:
-    tid = rgb._write_task({"id": "task-telem5", "task": "standalone", "source": "ag2space"})
+    tid = rgb._write_task({"id": "task-telem5", "task": "standalone", "source": "ag2space",
+                           "access_tier": "owner"})
 finally:
     if _prev is not None:
         sys.modules["telemetry"] = _prev
@@ -153,7 +167,8 @@ check("missing telemetry module → task still queued",
 # 6. telemetry raising mid-call → write still succeeds (fire-and-forget)
 _fresh_dirs()
 with _FakeTelemetry(raise_on_call=True) as t:
-    tid = rgb._write_task({"id": "task-telem6", "task": "boom", "source": "ag2space"})
+    tid = rgb._write_task({"id": "task-telem6", "task": "boom", "source": "ag2space",
+                           "access_tier": "owner"})
 check("raising telemetry never breaks the write",
       tid == "task-telem6" and (rgb.TASKS_DIR / "task-telem6.txt").exists())
 check("raising telemetry was attempted", t.calls == ["ag2space"], repr(t.calls))
@@ -189,6 +204,7 @@ def _write_with_real_telemetry(task: dict):
     its network sink stubbed to a capture list. Joins sender threads so the
     captured payloads are complete before asserting."""
     tmp = _fresh_dirs()
+    task = {"access_tier": "owner", **task}
     real = _load_real_telemetry(tmp / "telem-state")
     payloads = []
     real._post = lambda payload: payloads.append(payload)  # network boundary stub
@@ -211,7 +227,8 @@ def _write_with_real_telemetry(task: dict):
 #    exact metric the owner reported missing), not "unknown".
 tmp7, payloads = _write_with_real_telemetry(
     {"id": "task-telem7", "task": "hello", "source": "ag2space",
-     "user_id": "@rui:ag2.space", "channel_id": "!room:ag2.space"})
+     "user_id": "@rui:ag2.space", "access_tier": "owner",
+     "channel_id": "!room:ag2.space"})
 tp = [p for p in payloads if p.get("event") == "task_processed"]
 check("real pipeline emits one task_processed", len(tp) == 1, repr(payloads))
 check("real pipeline keeps source=ag2space",
@@ -300,14 +317,19 @@ check("taskify emit tagged events-promotion",
       bool(tp) and tp[0]["properties"].get("source") == "events-promotion",
       repr(tp and tp[0]["properties"]))
 
-# 7c. the allowlist still collapses junk — adding gateway sources must not
-#     open the cardinality/leak gate the allowlist exists for.
+# 7c. leak/cardinality guard preserved under the fix: a secret-ish source is
+#     never emitted as-is. It now collapses to this gateway's "remote" surface
+#     bucket (not "unknown"), and the raw identifier appears NOWHERE in the
+#     payload — the cardinality/leak posture the allowlist exists for is intact.
 _t, payloads = _write_with_real_telemetry(
     {"id": "task-telem7c", "task": "x", "source": "secret-user-identifier-123"})
 tp = [p for p in payloads if p.get("event") == "task_processed"]
-check("unknown source still collapses to unknown",
-      bool(tp) and tp[0]["properties"].get("source") == "unknown",
+check("secret-ish gateway source buckets to remote (surface, not unknown)",
+      bool(tp) and tp[0]["properties"].get("source") == "remote",
       repr(tp and tp[0]["properties"]))
+check("raw secret value never reaches the payload",
+      bool(tp) and "secret-user-identifier-123" not in repr(tp[0]),
+      repr(tp and tp[0]))
 
 # 7d. hostile-tier control (P1-2 regression pin): with the CONTROLLED temp
 #     access.json down-tiering the fixture sender to "team", production must
@@ -315,6 +337,7 @@ check("unknown source still collapses to unknown",
 #     proving no assertion secretly depends on the host's ambient tierMap.
 tmp7d = _fresh_dirs()
 _ACCESS.write_text('{"allowFrom": [], "tierMap": {"@rui:ag2.space": "team"}}')
+rgb._TIER_MAP_CACHE["ident"] = None
 rgb._TIER_MAP_CACHE["mtime"] = None  # force re-read of the hostile map
 real = _load_real_telemetry(tmp7d / "telem-state")
 payloads = []
@@ -324,7 +347,8 @@ sys.modules["telemetry"] = real
 try:
     before = set(threading.enumerate())
     rgb._write_task({"id": "task-telem7d", "task": "hi", "source": "ag2space",
-                     "user_id": "@rui:ag2.space", "channel_id": "!room:ag2.space"})
+                     "user_id": "@rui:ag2.space", "access_tier": "owner",
+                     "channel_id": "!room:ag2.space"})
     for th in set(threading.enumerate()) - before:
         th.join(timeout=2)
 finally:
@@ -339,6 +363,29 @@ check("hostile tier: task written with access_tier team",
       "access_tier: team" in (tmp7d / "tasks" / "task-telem7d.txt").read_text())
 check("hostile tier: owner-activity stamp suppressed for non-owner",
       not (tmp7d / "state" / "last-owner-activity.json").exists())
+
+# 7e. REGRESSION (#2432 aftermath): a gateway task whose source is neither
+#     `ag2space` nor `events-promotion` (e.g. a custom REMOTE_TASK_PROVIDER, or
+#     any label the core allowlist doesn't recognize) was recorded as
+#     source="unknown" — burying real gateway activity as the single largest
+#     bucket fleet-wide. It must now count as this gateway's own surface,
+#     "remote", not "unknown".
+_t, payloads = _write_with_real_telemetry(
+    {"id": "task-telem7e", "task": "x", "source": "acme-cloud-deployment"})
+tp = [p for p in payloads if p.get("event") == "task_processed"]
+check("non-allowlisted gateway source buckets to remote, not unknown",
+      bool(tp) and tp[0]["properties"].get("source") == "remote",
+      repr(tp and tp[0]["properties"]))
+
+# 7f. bucket_source unit: known source kept; unknown falls to the given default;
+#     a non-allowlisted default can't itself smuggle cardinality (→ unknown).
+import telemetry as _tel  # the REAL module (src/ on sys.path from the header)
+check("bucket_source keeps a known source",
+      _tel.bucket_source("slack", "remote") == "slack")
+check("bucket_source falls back to a known default",
+      _tel.bucket_source("acme-cloud", "remote") == "remote")
+check("bucket_source rejects a bad default (no cardinality via default)",
+      _tel.bucket_source("acme-cloud", "acme-default") == "unknown")
 
 print()
 if failures:

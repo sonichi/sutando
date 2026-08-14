@@ -44,6 +44,8 @@ if [ "${1:-}" = "--handler-runner" ]; then
 fi
 
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=watcher_sentinel.sh
+source "$__SCRIPT_DIR/watcher_sentinel.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -116,10 +118,10 @@ retire_stale_claim() {
 }
 
 acquire_task_claim() {
-  local filename="$1" task_path="$2" claim temporary attempts=0
+  local filename="$1" task_path="$2" disposition="${3:-fallback}" claim temporary attempts=0
   claim="$CLAIMS_DIR/$filename"
   temporary="$CLAIMS_DIR/.claim-$WATCHER_ID-$filename"
-  printf '%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" > "$temporary"
+  printf '%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "$disposition" > "$temporary"
   while [ "$attempts" -lt 3 ]; do
     # A hard link publishes the fully written claim atomically and fails if
     # another watcher already owns the destination; it never clobbers.
@@ -155,6 +157,31 @@ claim_is_ours() {
   local filename="$1" owner_id
   owner_id="$(sed -n '2p' "$CLAIMS_DIR/$filename" 2>/dev/null)"
   [ "$owner_id" = "$WATCHER_ID" ]
+}
+
+# 0 = must-handle, 1 = fallback, 2 = unknown.
+# Only must-handle/fallback may reach the live-core branches.
+claim_disposition() {
+  local filename="$1"
+  case "$(sed -n '4p' "$CLAIMS_DIR/$filename" 2>/dev/null)" in
+    must-handle) return 0 ;;
+    fallback) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+publish_terminal_failure() {
+  local filename="$1" reason="$2" result temporary rc
+  result="$RESULTS_DIR/$filename"
+  [ -f "$result" ] && return 0
+  mkdir -p "$RESULTS_DIR"
+  temporary="$(mktemp "$RESULTS_DIR/.$filename.XXXXXX.tmp")" || return 1
+  chmod 600 "$temporary" 2>/dev/null || true
+  printf '%s\n' "I could not safely process this Team-tier task because the restricted runtime $reason. No unrestricted fallback was used." > "$temporary"
+  ln "$temporary" "$result" 2>/dev/null || [ -f "$result" ]
+  rc=$?
+  rm -f "$temporary"
+  return "$rc"
 }
 
 if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
@@ -194,9 +221,21 @@ finish_handler_task() {
   # event during cleanup, but it cannot strand the task without either path.
   if mv "$marker" "$settled" 2>/dev/null; then
     if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
-      printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-      echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-      printf 'TASK_FILE: %s\n' "$filename" || true
+      claim_disposition "$filename"
+      case $? in
+        0)
+          echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
+          publish_terminal_failure "$filename" "failed" || true
+          ;;
+        1)
+          printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+          echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+          printf 'TASK_FILE: %s\n' "$filename" || true
+          ;;
+        *)
+          echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+          ;;
+      esac
       release_task_claim "$filename" || true
     elif [ "$rc" -eq 0 ]; then
       release_task_claim "$filename" || true
@@ -252,7 +291,7 @@ drain_dispatch_queue() {
 }
 
 queue_handler_task() {
-  local task_path="$1" filename marker
+  local task_path="$1" disposition="${2:-fallback}" filename marker
   filename="$(basename "$task_path")"
   acquire_dispatch_lock || return 1
   if [ -e "$DISPATCH_DIR/shutting-down" ]; then
@@ -261,7 +300,7 @@ queue_handler_task() {
   fi
   marker="$DISPATCH_DIR/pending/$filename"
   if [ ! -e "$marker" ] && [ ! -e "$DISPATCH_DIR/running/$filename" ]; then
-    if ! acquire_task_claim "$filename" "$task_path"; then
+    if ! acquire_task_claim "$filename" "$task_path" "$disposition"; then
       release_dispatch_lock
       return 0
     fi
@@ -278,10 +317,6 @@ dispatch_task() {
     printf 'TASK_FILE: %s\n' "$filename" || exit 0
     return
   fi
-  if [ -f "$FALLBACKS_DIR/$filename" ]; then
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
-    return
-  fi
   "$SUTANDO_TASK_EVENT_HANDLER" \
     --runtime "${SUTANDO_CORE_RUNTIME:-}" \
     --workspace "$WORKSPACE_DIR" \
@@ -291,7 +326,18 @@ dispatch_task() {
     --probe >/dev/null
   rc=$?
   if [ "$rc" -eq 0 ]; then
-    queue_handler_task "$task_path" || printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    if [ -f "$FALLBACKS_DIR/$filename" ]; then
+      printf 'TASK_FILE: %s\n' "$filename" || exit 0
+      return
+    fi
+    queue_handler_task "$task_path" "fallback" || printf 'TASK_FILE: %s\n' "$filename" || exit 0
+  elif [ "$rc" -eq 4 ]; then
+    # A required handler is a security boundary. Remove any legacy fallback
+    # receipt and never make this task visible to the unrestricted live core.
+    rm -f "$FALLBACKS_DIR/$filename"
+    if ! queue_handler_task "$task_path" "must-handle"; then
+      publish_terminal_failure "$filename" "could not be queued" || true
+    fi
   elif [ "$rc" -eq 3 ]; then
     printf 'TASK_FILE: %s\n' "$filename" || exit 0
   else
@@ -313,6 +359,8 @@ dispatch_task() {
 STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
 mkdir -p "$STATE_DIR"
 PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
+# In place, never write-elsewhere-then-mv: mv preserves mtime, and
+# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
@@ -386,9 +434,21 @@ fallback_outstanding_handlers() {
       task_path="$(cat "$settled")"
       filename="$(basename "$task_path")"
       if claim_is_ours "$filename"; then
-        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        printf 'TASK_FILE: %s\n' "$filename" || true
+        claim_disposition "$filename"
+        case $? in
+          0)
+            echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
+            publish_terminal_failure "$filename" "was interrupted" || true
+            ;;
+          1)
+            printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+            echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+            printf 'TASK_FILE: %s\n' "$filename" || true
+            ;;
+          *)
+            echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+            ;;
+        esac
         release_task_claim "$filename" || true
       fi
       rm -f "$settled"
@@ -407,9 +467,21 @@ fallback_outstanding_handlers() {
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
     [ -n "$task_path" ] || continue
     filename="$(basename "$task_path")"
-    printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-    echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-    printf 'TASK_FILE: %s\n' "$filename" || true
+    claim_disposition "$filename"
+    case $? in
+      0)
+        echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
+        publish_terminal_failure "$filename" "was interrupted" || true
+        ;;
+      1)
+        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+        printf 'TASK_FILE: %s\n' "$filename" || true
+        ;;
+      *)
+        echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+        ;;
+    esac
     release_task_claim "$filename" || true
   done
 
@@ -470,9 +542,7 @@ cleanup() {
   # A duplicate watcher can overwrite the sentinel before the stale watcher
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
-  if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then
-    rm -f "$PID_FILE"
-  fi
+  sentinel_release_if_owner "$PID_FILE" "$$"
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi
