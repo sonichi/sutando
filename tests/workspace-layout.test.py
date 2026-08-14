@@ -134,6 +134,76 @@ class AppLayout(unittest.TestCase):
             wl._repo_root = orig
 
 
+class EdgeBranches(unittest.TestCase):
+    """The diff-coverage gate flagged these exact branches (2894 CI)."""
+
+    def test_repo_root_is_the_checkout_root(self):
+        self.assertEqual(wl._repo_root(), _SRC.parent.parent)
+
+    def test_unresolvable_override_counts_as_override(self):
+        # Non-strict resolve() rarely raises, so force the OSError to pin the
+        # fail-safe direction: an override we cannot resolve means DO NOT touch.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _app_install(Path(tmp))
+            (repo / "sutando.config.local.json").write_text(
+                json.dumps({"workspace": {"path": "/somewhere/custom"}})
+            )
+            real_path = wl.Path
+
+            class _Unresolvable:
+                def __init__(self, *a): pass
+                def resolve(self, *a, **k):
+                    raise OSError("unresolvable custom path")
+
+            wl.Path = _Unresolvable
+            try:
+                self.assertTrue(wl._has_workspace_override(repo))
+            finally:
+                wl.Path = real_path
+            report = wl.ensure_workspace_layout(repo)
+            self.assertEqual(report["action"], "none")  # override → guard off
+
+    def test_symlinked_app_target_is_not_a_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            repo = tmp / "engine" / "sutando"
+            repo.mkdir(parents=True)
+            (tmp / "real-ws").mkdir()
+            (tmp / "workspace").symlink_to(tmp / "real-ws")  # target is itself a link
+            self.assertIsNone(wl.app_workspace_target(repo))
+
+    def test_unreadable_dir_counts_as_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "locked"
+            d.mkdir()
+            os.chmod(d, 0o000)
+            try:
+                self.assertTrue(wl._dir_holds_data(d))
+            finally:
+                os.chmod(d, 0o700)
+
+    def test_heal_failure_is_reported_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _app_install(Path(tmp))  # app layout, ws entry missing
+            os.chmod(repo, 0o555)  # read-only checkout: symlink_to must fail
+            try:
+                report = wl.ensure_workspace_layout(repo)
+            finally:
+                os.chmod(repo, 0o755)
+            self.assertEqual(report["action"], "heal-failed")
+            self.assertIn("heal failed", report["detail"])
+            self.assertFalse((repo / "workspace").exists())
+
+    def test_regular_file_at_workspace_is_left_broken(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _app_install(Path(tmp))
+            (repo / "workspace").write_text("not a dir")
+            report = wl.ensure_workspace_layout(repo)
+            self.assertEqual(report["state"], "not-a-directory")
+            self.assertEqual(report["action"], "left-broken")
+            self.assertEqual((repo / "workspace").read_text(), "not a dir")
+
+
 class PlainCheckout(unittest.TestCase):
     def test_real_dir_without_app_layout_is_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
