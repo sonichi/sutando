@@ -22,8 +22,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from skill_hooks import resolve_hook_command  # noqa: E402
+
+def resolve_hook_command(skill_dir: Path, command: str) -> Path | None:
+    """Delegate to src/skill_hooks: one containment rule, not a second copy.
+    Lazy via _repo_root() — a __file__ parent-walk trips the resolution gate."""
+    global _RESOLVE_HOOK
+    if _RESOLVE_HOOK is None:
+        sys.path.insert(0, str(_repo_root() / "src"))
+        from skill_hooks import resolve_hook_command as _impl
+        _RESOLVE_HOOK = _impl
+    return _RESOLVE_HOOK(skill_dir, command)
+
+
+_RESOLVE_HOOK = None
 
 
 def _repo_root() -> Path:
