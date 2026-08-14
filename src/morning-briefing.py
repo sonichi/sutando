@@ -19,8 +19,8 @@ from pathlib import Path
 from urllib.request import urlopen
 from urllib.error import URLError
 
-# Resolved once: sibling scripts are launched with cwd=WORKSPACE, and a relative
-# __file__ (python3 src/morning-briefing.py) makes that path unfindable there.
+# Sibling scripts are launched with cwd=WORKSPACE, so their paths must not depend
+# on it. Defensive only: Python >=3.11 already absolutises __file__ (bpo-20443).
 _SRC_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
