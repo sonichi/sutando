@@ -50,7 +50,7 @@ import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary
 import { createAudioHealthLedger } from './voice-audio-health.js';
 import { createHealthPersistence } from './voice-audio-health-persist.js';
 import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
-import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper } from './voice-continuity.js';
+import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper, clearStaleResumptionHandle } from './voice-continuity.js';
 import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
@@ -1468,6 +1468,12 @@ async function main() {
 	if (origConnect) {
 		(session as any).handleClientConnected = () => {
 			cancelIdleTeardown();
+			// A dead session's resumption handle must not poison the fresh
+			// connect (1008 "Requested entity was not found" staircase — see
+			// clearStaleResumptionHandle). Only the CLOSED path reconnects.
+			if (session.sessionManager.state === 'CLOSED' && clearStaleResumptionHandle(session)) {
+				console.log(`${ts()} [Resume] cleared stale resumption handle from dead session before fresh connect`);
+			}
 			// P7 D7.1: new client connection = new (pending) ledger epoch; the
 			// epoch value is minted on first heartbeat sight (nonce mapping).
 			audioHealth.onClientConnected();

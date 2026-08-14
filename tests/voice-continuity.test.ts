@@ -4,6 +4,7 @@ import {
 	initialGoodbyeGuard,
 	shouldFireGoodbye,
 	createConversationClearHelper,
+	clearStaleResumptionHandle,
 } from '../src/voice-continuity.js';
 
 describe('P7 D7.3 stale-repeat goodbye guard', () => {
@@ -74,5 +75,34 @@ describe('P7 D7.3 centralized conversation clear (G-P7-8)', () => {
 		h.cursor.index = 2;
 		assert.equal(h.clear('none'), 0);
 		assert.equal(h.cursor.index, 0);
+	});
+});
+
+describe('stale resumption-handle clearing (1008 \'Requested entity was not found\' staircase)', () => {
+	it('clears BOTH handle copies before a fresh reconnect and reports it', () => {
+		let smCleared = 0;
+		const session = {
+			transport: { config: { resumptionHandle: 'dead-handle-123' } },
+			sessionManager: { clearResumptionHandle: () => { smCleared += 1; } },
+		};
+		assert.equal(clearStaleResumptionHandle(session), true);
+		assert.equal(session.transport.config.resumptionHandle, undefined, 'transport copy cleared');
+		assert.equal(smCleared, 1, 'sessionManager copy cleared');
+	});
+
+	it('no stale handle → false, still syncs the sessionManager copy', () => {
+		let smCleared = 0;
+		const session = {
+			transport: { config: {} },
+			sessionManager: { clearResumptionHandle: () => { smCleared += 1; } },
+		};
+		assert.equal(clearStaleResumptionHandle(session), false);
+		assert.equal(smCleared, 1);
+	});
+
+	it('missing seams never throw (a broken shape must not break reconnect)', () => {
+		assert.equal(clearStaleResumptionHandle(null), false);
+		assert.equal(clearStaleResumptionHandle({}), false);
+		assert.equal(clearStaleResumptionHandle({ transport: {} }), false);
 	});
 });

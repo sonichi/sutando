@@ -33,6 +33,37 @@ export function shouldFireGoodbye(
   return { fire: true, next: { lastText, userTurnsAtFire: userTurnCount } };
 }
 
+/**
+ * Clear a dead session's Gemini resumption handle before a fresh reconnect
+ * (field incident 2026-08-14): when Gemini invalidates a session it closes
+ * 1008 "Requested entity was not found", bodhi transitions ACTIVE→CLOSED —
+ * but nothing clears `transport.config.resumptionHandle`, and the CLOSED→
+ * fresh-connect path replays it in `sessionResumption: { handle }`. Gemini
+ * completes setup, then kills each new connection the same way (observed
+ * survival staircase: 9 min → 18 s → 0.9 s). Clearing costs nothing here:
+ * this path already rebuilds context via text injection, never via resume;
+ * mid-session GoAway resume (the legitimate handle use) does not run
+ * through it. Returns true when a stale handle was actually cleared.
+ * Pin-workaround: belongs in bodhi's handleTransportClose (Tranche B).
+ */
+export function clearStaleResumptionHandle(session: unknown): boolean {
+  let cleared = false;
+  try {
+    const s = session as {
+      transport?: { config?: { resumptionHandle?: string } };
+      sessionManager?: { clearResumptionHandle?: () => void };
+    };
+    if (s?.transport?.config?.resumptionHandle) {
+      s.transport.config.resumptionHandle = undefined;
+      cleared = true;
+    }
+    s?.sessionManager?.clearResumptionHandle?.();
+  } catch {
+    /* a missing seam must never break the reconnect path */
+  }
+  return cleared;
+}
+
 export interface ConversationClearHelper {
   /** The turn.end logger's cursor into conversationContext.items. */
   cursor: { index: number };
