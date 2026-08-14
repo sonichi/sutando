@@ -50,12 +50,15 @@ sentinel_pid_elapsed() {
 # so an unanswerable question never authorises killing or unlinking; the cost is
 # leaving a stale sentinel one more boot, which is recoverable. The reverse
 # would signal a live watcher.
+# Tri-state, because "unmeasurable" is not "yes": rc 0 = this pid wrote the file,
+# rc 1 = it demonstrably did not (reissued pid), rc 2 = UNKNOWN. Returning 0 for
+# unknown made the reaper read it as confirmed ownership and kill a live watcher.
 sentinel_pid_wrote_file() {
   local pid="$1" pid_file="$2" elapsed mtime now age
   local slack="${SUTANDO_SENTINEL_SLACK_SEC:-2}"
 
-  elapsed="$(sentinel_pid_elapsed "$pid")" || return 0
-  case "$elapsed" in ''|*[!0-9]*) return 0 ;; esac   # non-numeric => unmeasurable => fail safe
+  elapsed="$(sentinel_pid_elapsed "$pid")" || return 2
+  case "$elapsed" in ''|*[!0-9]*) return 2 ;; esac   # non-numeric => UNKNOWN, never "owner"
 
   # `stat -f %m` is BSD "modification time"; on GNU `-f` means FILESYSTEM status
   # and SUCCEEDS with a human-readable block, so an `||` chain never reaches the
@@ -66,7 +69,7 @@ sentinel_pid_wrote_file() {
   # exit status: a command that succeeds at a different question is the failure.
   mtime="$(stat -c %Y "$pid_file" 2>/dev/null || true)"
   case "$mtime" in ''|*[!0-9]*) mtime="$(stat -f %m "$pid_file" 2>/dev/null || true)" ;; esac
-  case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
+  case "$mtime" in ''|*[!0-9]*) return 2 ;; esac   # mtime unreadable => UNKNOWN
 
   now="$(date +%s)"
   age=$(( now - mtime ))

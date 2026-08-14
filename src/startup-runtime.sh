@@ -329,8 +329,14 @@ reap_stale_task_watcher() {
   if [ -n "$stale_pid" ] && ps -p "$stale_pid" -o args= 2>/dev/null | grep -q "watch-tasks-stream"; then
     # A watcher younger than the sentinel did not write it, so it is a NEW
     # watcher on a reissued pid — signalling it would kill a live drain.
-    if ! sentinel_pid_wrote_file "$stale_pid" "$pid_file"; then
+    sentinel_pid_wrote_file "$stale_pid" "$pid_file"; local owned_rc=$?
+    if [ "$owned_rc" -eq 1 ]; then
       echo "  ⚠ pid $stale_pid is a watcher but started AFTER this sentinel — reissued pid, not its owner; leaving both alone"
+      return 0
+    fi
+    if [ "$owned_rc" -ne 0 ]; then
+      # Unmeasurable ownership is not permission. Killing here reaped a live drain.
+      echo "  ⚠ pid $stale_pid is a watcher but its ownership of the sentinel is UNMEASURABLE; leaving both alone"
       return 0
     fi
     kill "$stale_pid" 2>/dev/null || true

@@ -140,8 +140,13 @@ PF_S="$TMP/statshape.pid"; printf '%s\n' "$$" > "$PF_S"
   sentinel_pid_wrote_file "$$" "$PF_S"
 ) >"$TMP/sout" 2>&1
 SRC=$?
-check "$([ "$SRC" -eq 0 ] && echo 0 || echo 1)" \
-      "non-numeric stat output fails SAFE (rc 0) instead of aborting"
+# rc alone no longer separates graceful from aborted: since the tri-state change,
+# a graceful "cannot measure" is rc 2, and a `set -u` abort is also non-zero. So
+# assert BOTH the exact UNKNOWN code and the absence of the abort's own message.
+check "$([ "$SRC" -eq 2 ] && echo 0 || echo 1)" \
+      "non-numeric stat output reports UNKNOWN (rc 2) instead of aborting (got $SRC)"
+check "$(grep -qi "unbound variable" "$TMP/sout" && echo 1 || echo 0)" \
+      "...and did not abort mid-arithmetic under set -u"
 check "$(grep -qi 'unbound variable' "$TMP/sout" && echo 1 || echo 0)" \
       "and does not blow up on arithmetic with text"
 
@@ -167,9 +172,29 @@ check "$([ -f "$PF5" ] && echo 0 || echo 1)" \
 check "$(grep -qE '^echo "\$\$" > "\$PID_FILE"' "$REPO/src/watch-tasks-stream.sh" && echo 0 || echo 1)" \
       "p3) watch-tasks-stream.sh still stamps the sentinel in place"
 
-# ------------------------------------------------------------ fail-safe direction
-check "$(sentinel_pid_wrote_file 999999 "$PF3" && echo 0 || echo 1)" \
-      "f1) unmeasurable pid fails SAFE (treated as owner, nothing is killed)"
+# ------------------------------------------------------------ unmeasurable ownership
+# rc 0 = wrote it, rc 1 = demonstrably did not, rc 2 = UNKNOWN. The old assertion
+# here accepted rc 0 for an unmeasurable pid and called that "nothing is killed" —
+# a claim about the REAPER that it never exercised. rc 0 is what makes the reaper
+# kill, so f2 below drives the production reaper instead of the helper alone.
+sentinel_pid_wrote_file 999999 "$PF3"; f1_rc=$?
+check "$([ "$f1_rc" -eq 2 ] && echo 0 || echo 1)" \
+      "f1) unmeasurable pid reports UNKNOWN (rc 2), not owner (got rc $f1_rc)"
+
+# f2/f3 — the production reaper, forced through the unknown branch. Uses
+# spawn_fake_watcher so the child's pipe handling matches every other case here.
+DIR_U="$TMP/unknown"; mkdir -p "$DIR_U"
+U_PID="$(spawn_fake_watcher "$DIR_U")"
+PF_U="$DIR_U/watch-tasks-stream.pid"
+echo "$U_PID" > "$PF_U"
+_real_elapsed="$(declare -f sentinel_pid_elapsed)"
+sentinel_pid_elapsed() { return 1; }          # ownership becomes unmeasurable
+reap_stale_task_watcher "$PF_U" >"$TMP/outU" 2>&1
+eval "$_real_elapsed"                          # restore for any later case
+check "$(kill -0 "$U_PID" 2>/dev/null && echo 0 || echo 1)" \
+      "f2) unmeasurable ownership does NOT kill the live watcher"
+check "$([ -f "$PF_U" ] && echo 0 || echo 1)" \
+      "f3) ...and does NOT unlink its sentinel"
 
 echo
 echo "passed $PASS, failed $FAIL"
