@@ -132,6 +132,25 @@ def _notify_capture_blocking():
         pass  # Best-effort; notification absence is never critical.
 
 
+def _downscale_frame(path: str, maxdim: int | None, quality: int | None) -> None:
+    """P7 D7.4: resize/recompress a captured frame IN THIS PROCESS via sips.
+
+    Runs before the path is returned to the caller, so the voice event loop
+    only ever touches the already-shrunk file. Best-effort: any failure
+    leaves the original in place (the caller's token bucket still bounds
+    egress)."""
+    cmd = ["sips"]
+    if maxdim:
+        cmd += ["--resampleHeightWidthMax", str(maxdim)]
+    if quality:
+        cmd += ["-s", "format", "jpeg", "-s", "formatOptions", str(quality)]
+    cmd.append(path)
+    try:
+        subprocess.run(cmd, timeout=10, capture_output=True, check=True)
+    except Exception:
+        pass
+
+
 def _notify_capture():
     """Debounced fire-and-forget macOS notification."""
     global _last_notify_ts
@@ -206,6 +225,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fmt = "png"
         ext = "jpg" if fmt in ("jpg", "jpeg") else "png"
         type_flag = "jpg" if ext == "jpg" else "png"
+        # P7 D7.4: optional downscale/recompress executed HERE, in the capture
+        # server's process (sips subprocess) — vision compression must never
+        # compete with the voice event loop. maxdim bounds the longest edge;
+        # quality is JPEG percent (jpg only). Bounded to sane ranges.
+        maxdim_raw = query.get("maxdim", [None])[0]
+        maxdim = int(maxdim_raw) if maxdim_raw and maxdim_raw.isdigit() and 320 <= int(maxdim_raw) <= 3840 else None
+        quality_raw = query.get("quality", [None])[0]
+        quality = int(quality_raw) if quality_raw and quality_raw.isdigit() and 10 <= int(quality_raw) <= 100 else None
         try:
             if capture_all:
                 # Capture all displays separately
@@ -229,6 +256,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     cmd.append(f"-D{display}")
                 cmd.append(path)
                 subprocess.run(cmd, timeout=5, check=True)
+            if maxdim or (quality and ext == "jpg"):
+                for p in paths:
+                    _downscale_frame(p, maxdim, quality if ext == "jpg" else None)
             resp = {"status": "ok", "path": paths[0] if paths else path}
             if len(paths) > 1:
                 resp["all_paths"] = paths
