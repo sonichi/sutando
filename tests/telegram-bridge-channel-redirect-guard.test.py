@@ -21,6 +21,14 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = (REPO / "src" / "telegram-bridge.py").read_text()
 
 
+def _claim_pos(src: str, start: int) -> int:
+    """First claim site after `start` — inline `.rename(claim)` or the delegated
+    `claim_for_delivery(`. Both are the moment the file leaves the `*.txt` glob."""
+    hits = [p for p in (src.find(".rename(claim)", start),
+                        src.find("claim_for_delivery(", start)) if p > 0]
+    return min(hits) if hits else -1
+
+
 class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
 
     def test_re_imported_at_module_level(self):
@@ -69,7 +77,7 @@ class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
         peek_pos = SRC.find("peek", proactive_block_start)
         self.assertGreater(peek_pos, 0, "peek variable not found after PROACTIVE_PREFIXES block")
 
-        rename_pos = SRC.find(".rename(claim)", proactive_block_start)
+        rename_pos = _claim_pos(SRC, proactive_block_start)
         self.assertGreater(rename_pos, 0, "rename(claim) not found after PROACTIVE_PREFIXES block")
 
         self.assertLess(
@@ -84,7 +92,7 @@ class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
 
         # The guard should appear before rename(claim) in source order
         guard_continue_pos = SRC.find("continue", SRC.find("[channel:", proactive_block_start))
-        rename_pos = SRC.find(".rename(claim)", proactive_block_start)
+        rename_pos = _claim_pos(SRC, proactive_block_start)
         self.assertGreater(guard_continue_pos, 0, "continue not found in guard block")
         self.assertLess(
             guard_continue_pos, rename_pos,
