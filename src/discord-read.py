@@ -18,6 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path  # noqa: E402
 from discord_http import request_json  # noqa: E402
+from chat_secret_filter import filter_chat_secrets  # noqa: E402
+from vault_intercept import redact_vault_commands  # noqa: E402
 
 # Runaway backstop only (not a depth target — depth is governed by --until):
 # 200 pages * 100 = 20k messages before we refuse to loop forever.
@@ -48,6 +50,23 @@ def _fetch(extra, channel_id, page, headers):
     # request_json honors 429 Retry-After + retries transient 5xx, so a rate
     # limit mid-pagination no longer aborts the read (2026-07-24 truncation fix).
     return request_json(req, timeout=10)
+
+
+def _redact(text):
+    """The same two filters `discord-bridge.py` applies, in the same order.
+
+    The bridge redacts what it writes into a task file, but this reader — which
+    `context-reconstruct` runs on every pass — read the channel raw, so a secret
+    the bridge had just stripped came straight back through the other door. Both
+    helpers already live in dependency-light modules; the reader was simply never
+    wired to them.
+
+    Order matches the bridge (`filter_chat_secrets` then `redact_vault_commands`)
+    so the two consumers cannot disagree about what a message says.
+    """
+    if not text:
+        return text
+    return redact_vault_commands(filter_chat_secrets(text).text)
 
 
 def _reply_context(msg, clip=REPLY_CLIP):
@@ -96,12 +115,15 @@ def _render(msg, clip=CLIP):
     from the 200-char clip — the clip exists to keep ordinary chatter scannable,
     and a forward is usually carrying the substance someone moved deliberately.
     """
-    body = (msg.get("content") or "").strip()
+    # Redact BEFORE clipping, never after: the 200-char clip can land in the
+    # middle of a token, and half a secret still printed is still a leak — the
+    # pattern would no longer match to catch it.
+    body = _redact((msg.get("content") or "").strip())
     snaps = msg.get("message_snapshots") or []
     if not snaps:
         return body[:clip] if clip is not None else body
     fwd = (snaps[0].get("message") or {})
-    fwd_body = (fwd.get("content") or "").strip()
+    fwd_body = _redact((fwd.get("content") or "").strip())
     extra = []
     for a in fwd.get("attachments") or []:
         extra.append(f"<attachment: {a.get('filename', '?')}>")
