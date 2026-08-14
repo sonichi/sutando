@@ -997,6 +997,10 @@ if __name__ == "__main__":
     # `DASHBOARD_BIND=0.0.0.0` to opt back into LAN exposure when you
     # know you want it. Same env-override shape as `AGENT_API_BIND` in
     # agent-api.py.
+    #
+    # A wildcard bind ALSO requires `DASHBOARD_ALLOWED_HOSTS` (comma-separated
+    # host[:port] the UI is reached by) or every mutation 403s: with 0.0.0.0
+    # there is no host to infer, so the DNS-rebinding gate cannot fail open.
     bind = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client held a connection without completing a request — every later
