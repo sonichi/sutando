@@ -4228,6 +4228,69 @@ def _keychain_service_exists(service: str) -> bool:
         return False
 
 
+# Distinct from None and from "": the proxy's environment could not be read at
+# all. "" means "read it, there is no CLAUDE_CONFIG_DIR" (the proxy then resolves
+# the vanilla item), which is a comparable answer; unreadable is not.
+_PROXY_ENV_UNREADABLE = object()
+
+
+def _proxy_config_dir_from_process(pid_finder=None, ps_runner=None):
+    """CLAUDE_CONFIG_DIR of the RUNNING proxy, read from its process environment.
+
+    The launchd plist answers this only for a launchd-managed proxy. One started
+    any other way (startup.sh, the desktop supervisor, a hand-run node) inherits
+    its env from whatever spawned it, and that env can name a different
+    CLAUDE_CONFIG_DIR than the core's just as easily — the plist is one source of
+    the mismatch, not the definition of it.
+
+    Returns the value, "" when the proxy has no such variable, or
+    _PROXY_ENV_UNREADABLE when the environment cannot be read.
+    """
+    finder = pid_finder or _proxy_pids
+    runner = ps_runner or (lambda pid: subprocess.run(
+        ["ps", "eww", "-p", pid], capture_output=True, text=True, timeout=5))
+    try:
+        pids = finder()
+    except Exception:                     # noqa: BLE001 — a probe failure is "unknown"
+        return _PROXY_ENV_UNREADABLE
+    # Zero: nothing to read. More than one: ambiguous, and an ambiguous proxy is
+    # not evidence about which account any single request billed.
+    if len(pids) != 1:
+        return _PROXY_ENV_UNREADABLE
+    try:
+        proc = runner(pids[0])
+    except Exception:                     # noqa: BLE001
+        return _PROXY_ENV_UNREADABLE
+    if proc is None or getattr(proc, "returncode", 1) != 0:
+        return _PROXY_ENV_UNREADABLE
+    out = proc.stdout or ""
+    # `ps eww` prints argv THEN the environment, space-separated, and prints argv
+    # ALONE for a process whose env we may not read. Requiring one KEY=VALUE pair
+    # is what keeps that case UNREADABLE instead of "no CLAUDE_CONFIG_DIR".
+    if not re.search(r"(?:^| )[A-Za-z_][A-Za-z0-9_]*=", out):
+        return _PROXY_ENV_UNREADABLE
+    # Capture to the next ` KEY=` rather than the next space: this value is a path
+    # under "~/Library/Application Support", so a whitespace split truncates it at
+    # "…/Library/Application" and silently hashes the wrong directory.
+    m = re.search(
+        r"(?:^| )CLAUDE_CONFIG_DIR=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)", out, re.S)
+    return m.group(1) if m else ""
+
+
+def _proxy_pids() -> "list[str]":
+    """PIDs LISTENING on the credential proxy's port (7846).
+
+    `-sTCP:LISTEN` is load-bearing: bare `-ti:7846` also matches every client with
+    an open connection to the port, and the routed core is always one of them. That
+    returns two pids on a healthy host, which an "exactly one" guard reads as
+    ambiguous — disabling the check precisely where it applies.
+    """
+    out = subprocess.run(
+        ["/usr/sbin/lsof", "-ti:7846", "-sTCP:LISTEN"],
+        capture_output=True, text=True, timeout=5)
+    return [p for p in (out.stdout or "").split() if p.isdigit()]
+
+
 def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
     """First EXISTING item of [scoped(config_dir), vanilla] — the proxy's order."""
     for service in (_scoped_keychain_service(config_dir), "Claude Code-credentials"):
@@ -4313,9 +4376,20 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
                 "detail": "core has no CLAUDE_CONFIG_DIR — both sides resolve the vanilla item"}
 
     plist = Path.home() / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
+    cfg_source = "plist"
     if not plist.is_file():
-        return {"name": name, "status": "ok",
-                "detail": "credential proxy is not launchd-managed on this host"}
+        # Not launchd-managed. This used to return ok here, which reads as "the
+        # accounts agree" but only means "the file this check knows how to read is
+        # absent" — the probe going silent on every host whose proxy is started by
+        # startup.sh or the desktop supervisor. Those proxies still carry a
+        # CLAUDE_CONFIG_DIR; read it from the process instead of giving up.
+        from_proc = _proxy_config_dir_from_process()
+        if from_proc is _PROXY_ENV_UNREADABLE:
+            return {"name": name, "status": "ok",
+                    "detail": ("credential proxy is not launchd-managed and its "
+                               "environment could not be read — identity comparison "
+                               "inactive here (not evidence either way)")}
+        return _quota_identity_verdict(name, core_cfg, from_proc, "process")
     # Imported HERE, not at module scope, and this placement is the whole point.
     # `plistlib` pulls in `xml.parsers.expat` -> the `pyexpat` C extension, which
     # is the single most fragile import in the stdlib: it dlopens libexpat, so a
@@ -4368,6 +4442,17 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
                 "detail": (f"credential-proxy plist has CLAUDE_CONFIG_DIR as "
                            f"{type(proxy_cfg).__name__}, not a string — cannot resolve its keychain item")}
 
+    return _quota_identity_verdict(name, core_cfg, proxy_cfg, cfg_source)
+
+
+def _quota_identity_verdict(name: str, core_cfg: Optional[str],
+                            proxy_cfg: Optional[str], source: str) -> dict:
+    """Compare the two resolved keychain ITEM NAMES and report.
+
+    `source` names where the proxy's CLAUDE_CONFIG_DIR came from ("plist" or
+    "process") and selects the remediation — telling someone to edit a plist that
+    does not exist on their host is worse than saying nothing.
+    """
     core_service = _resolved_credential_service(core_cfg)
     proxy_service = _resolved_credential_service(proxy_cfg)
 
@@ -4396,11 +4481,20 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
             f"unusable the proxy engages pass-through, forwarding whatever credential the "
             f"client supplied and billing that account instead, or answering 401 when the "
             f"client supplied none. Either way "
-            f"the cause is almost always the launchd plist omitting CLAUDE_CONFIG_DIR "
-            f"(launchd inherits no shell env): "
-            f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
-            f"Fix: pin CLAUDE_CONFIG_DIR in "
-            f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
+            + (
+                f"the cause is almost always the launchd plist omitting CLAUDE_CONFIG_DIR "
+                f"(launchd inherits no shell env): "
+                f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
+                f"Fix: pin CLAUDE_CONFIG_DIR in "
+                f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
+                if source == "plist" else
+                f"this proxy is NOT launchd-managed — it inherited "
+                f"{'no CLAUDE_CONFIG_DIR' if not proxy_cfg else repr(proxy_cfg)} from whatever "
+                f"started it, so there is no plist to correct. Fix: restart the proxy with "
+                f"CLAUDE_CONFIG_DIR set to this core's ({core_cfg!r}). Restarting it changes "
+                f"which account subsequent requests bill, so confirm that is the intended "
+                f"login first."
+            )
         ),
     }
 
