@@ -914,6 +914,48 @@ def _redact_url(value: str) -> str:
         return str(value)
 
 
+class _NeverFatalStream:
+    """Logging must never take the poll loop down.
+
+    Mirrors the merged `src/discord-bridge.py` fix (#2856). This package is
+    standalone (`dependencies = []`, imports nothing from sutando's `src/`), so
+    the guard is local by necessity rather than duplicated policy.
+
+    The loop's own `except Exception  # keep the loop alive` cannot help here:
+    every handler calls `_log()` first, so a `BrokenPipeError` from that print
+    is raised *inside* the handler and escapes it. Stdout is a pipe whenever the
+    launcher pipes to `tee`, which is how this bridge runs today.
+
+    Swallow ONLY OSError (the EPIPE/EBADF class); anything else still propagates
+    so real bugs are not masked.
+    """
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except OSError:
+            # Report the write as accepted: callers must not branch on it.
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _NeverFatalStream(sys.stdout)
+sys.stderr = _NeverFatalStream(sys.stderr)
+
+
 def _log(msg: str) -> None:
     line = f"[remote-gateway-bridge] {msg}"
     print(line, flush=True)
