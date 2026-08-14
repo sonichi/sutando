@@ -208,6 +208,24 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
 
    **Give it a minute or two before concluding it failed.** The status is posted asynchronously: on one PR it was still `total=0` immediately after reopening and `license/cla=success` on the next check. Re-running the command above is the way to tell; an immediate zero means nothing yet.
 
+   **If the status is PRESENT and `pending`, that is a third case with its own cause.** `state=pending` with the description *"Contributor License Agreement is not signed yet."* means CLA-Assistant ran and is waiting on a signature — so close+reopen does nothing, and the `--reset-author` fix above only applies if the identity is your own. Ask GitHub which commit identities it cannot vouch for:
+
+   ```bash
+   gh api repos/<owner>/<repo>/pulls/<N>/commits \
+     --jq '.[] | "\(.sha[0:8]) \(.commit.author.email) -> \(.author.login // "NULL — maps to no account")"'
+   ```
+
+   Two shapes turn up. An email mapping to **no account** (`author: null`) is yours to fix by re-authoring. An email mapping to a **real account that has not signed** needs that account to sign — and you find it by differencing against the rest of the queue, because one PR alone cannot tell you which of its contributors is the unsigned one:
+
+   ```bash
+   # the login that appears on CLA-pending PRs and on no green one
+   gh api repos/<owner>/<repo>/pulls/<N>/commits --jq '[.[].author.login // "NULL"] | unique | join(",")'
+   ```
+
+   **Do not guess from the shape of the email.** One contributor here commits under two addresses that map to two different accounts, and it is the personal-looking one that is unsigned while the institutional one is signed — the opposite of the natural assumption. A suspect that also appears on a CLA-**green** PR is disproved, which is the cheap check to run before naming anyone.
+
+   **Only offer "re-author the commits" for commits that belong to the person you are telling.** Rewriting the author of someone else's commit misattributes their work; where the unsigned identity is a third party, the only correct remedy is that account signing.
+
    Note the corollary of the status being SHA-bound: **pushing to the branch after this drops the status again.** If you reopen to fix the CLA and then push a review fix, expect to be back where you started.
 
    **When to expect it.** `license/cla` is a *commit status*, so it binds to one SHA. **Every push gives the PR a new head SHA that carries no CLA status**, which is what [`.github/workflows/cla-recheck-on-push.yml`](.github/workflows/cla-recheck-on-push.yml) exists to repair — it comments the `@cla-assistant check` trigger on each `synchronize`. That repair is not reliable, so a PR you have pushed to can end up permanently short of a required check.
