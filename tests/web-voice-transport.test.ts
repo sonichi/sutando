@@ -1501,7 +1501,8 @@ describe('P7 D7.1 audio_health heartbeat', () => {
 		assert.equal(hb.length, 3, 'heartbeats at ticks 0/4/8 — 2 s cadence on the 500 ms timer');
 		assert.equal(hb[0].n.length, 8);
 		assert.equal(hb[0].n, hb[2].n, 'nonce stable within the epoch');
-		assert.equal(hb[2].c[0], 2, 'capCallbacks absolute (idempotent across skipped beats)');
+		assert.equal(hb[0].c[0], 2, 'first beat carries the delta since epoch start');
+		assert.equal(hb[1].c[0] + hb[2].c[0], 0, 'quiet beats carry zero deltas');
 		assert.deepEqual([hb[0].q, hb[1].q, hb[2].q], [0, 1, 2]);
 		const enc = new TextEncoder();
 		for (const x of s.sent.filter((v): v is string => typeof v === 'string')) {
@@ -1593,9 +1594,12 @@ describe('P7 D7.1 audio_health heartbeat', () => {
 		assert.ok(new TextEncoder().encode(raw).byteLength <= 300, 'hard cap holds under worst case');
 		const hb = JSON.parse(raw);
 		assert.ok((hb.ep?.length ?? 0) < 4, 'window trimmed to fit');
+		// Core evidence survives trimming/dropping; only diagnostics (x/ba/sc)
+		// may be sacrificed for the cap.
 		assert.equal(hb.mu, 1);
 		assert.ok(hb.og, 'open gap still travels');
-		assert.deepEqual(hb.ba, [99_999_999, 99_999_999]);
+		assert.equal(hb.c.length, 8, 'delta counters intact');
+		assert.equal(hb.n.length, 8, 'nonce intact');
 		h.t.disconnect();
 	});
 
@@ -1872,6 +1876,348 @@ describe('P7 §D7.0b frame-path budget', () => {
 		const addedUs = (p99(tInst) - p99(tBase)) / 1000;
 		assert.ok(addedUs <= 50, `added p99 ${addedUs.toFixed(1)} µs exceeds the 50 µs budget`);
 		assert.ok(baseBytes > 0);
+		h.t.disconnect();
+	});
+
+	it('PCM displacement: heartbeat bytes are <1% of egress while frames flow', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now });
+		const s = await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		for (let i = 0; i < 47; i++) {
+			now += 43;
+			p(frame(LOUD));
+		}
+		tick(h); // one heartbeat within the ~2 s of PCM
+		let stringBytes = 0;
+		let binBytes = 0;
+		for (const x of s.sent) {
+			if (typeof x === 'string') stringBytes += new TextEncoder().encode(x).byteLength;
+			else binBytes += (x as ArrayBuffer).byteLength;
+		}
+		assert.ok(binBytes > 0);
+		assert.ok(
+			stringBytes / (stringBytes + binBytes) < 0.01,
+			`displacement ${((stringBytes / (stringBytes + binBytes)) * 100).toFixed(2)}% ≥ 1%`,
+		);
+		h.t.disconnect();
+	});
+
+	it('zero added frame-path allocation (GC A/B soak — needs --expose-gc, else skips)', async (t) => {
+		const gc = (globalThis as { gc?: () => void }).gc;
+		if (typeof gc !== 'function') {
+			t.skip('run with node --expose-gc to enable');
+			return;
+		}
+		const h = harness();
+		await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		const s = h.sock();
+		const buf = new Float32Array(2048).fill(0.05);
+		const ev = frame(buf);
+		const baseSink: ArrayBuffer[] = [];
+		const baseline = (e: FrameEvent): void => {
+			const raw = e.inputBuffer.getChannelData(0);
+			baseSink.push(float32ToInt16(downsample(raw, 48000, 16000)).buffer as ArrayBuffer);
+		};
+		const measure = (fn: (e: FrameEvent) => void, sink: () => void): number => {
+			for (let i = 0; i < 500; i++) fn(ev); // warm
+			sink();
+			gc();
+			const before = process.memoryUsage().heapUsed;
+			for (let i = 0; i < 3000; i++) {
+				fn(ev);
+				if (i % 250 === 0) sink();
+			}
+			sink();
+			gc();
+			return process.memoryUsage().heapUsed - before;
+		};
+		const baseDelta = measure(baseline, () => {
+			baseSink.length = 0;
+		});
+		const instDelta = measure(p, () => {
+			s.sent.length = 0;
+		});
+		assert.ok(
+			instDelta <= baseDelta + 512 * 1024,
+			`instrumented retained ${instDelta - baseDelta} B more than baseline`,
+		);
+		h.t.disconnect();
+	});
+});
+
+describe('P7 codex round-1 fixes', () => {
+	it('gap that starts AND ends between watchdog ticks still latches (frozen-timer self-latch)', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now });
+		await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		p(frame(QUIET)); // lastCapAt = 10000
+		now += 1200; // whole-thread freeze: no tick ever observed it
+		p(frame(QUIET)); // resumed callback must latch before overwriting
+		const ep = ((h.t as any).episodeRing as any[]).find((sl) => sl.id === 1);
+		assert.ok(ep, 'episode latched without any watchdog tick');
+		assert.equal(ep.kind, 'gap');
+		assert.equal(ep.durationMs, 1200);
+		assert.equal((h.t as any).episodeSeq, 1);
+		h.t.disconnect();
+	});
+
+	it('capture that never fires its first callback still produces a stall (wire-time baseline)', async () => {
+		let now = 10_000;
+		const h = harness({ nowFn: () => now });
+		const s = await goLive(h);
+		stopRealStats(h);
+		// no frames at all
+		now += 1500;
+		tick(h);
+		assert.equal((h.t as any).capStalled, true, 'baseline armed at graph wire');
+		const hb = healthFrames(s);
+		assert.ok(hb[0].og, 'open gap travels');
+		h.t.disconnect();
+	});
+
+	it('watchdog stays armed during a reacquire outage (processor torn down)', async () => {
+		let now = 10_000;
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		const h = harness({ nowFn: () => now, recoveryBackoffMs: [0, 0, 0], recoveryResumeTimeoutMs: 5000 });
+		await goLive(h);
+		stopRealStats(h);
+		proc(h)(frame(QUIET));
+		gumImpl = () => new Promise<FakeMediaStream>(() => {}); // park the reacquire
+		(streams[0].tracks[0] as any).onended?.();
+		await delay(5);
+		assert.equal((h.t as any).captureState, 'recovering');
+		assert.equal((h.t as any).processor, null, 'precondition: capture torn down');
+		now += 2000;
+		tick(h);
+		assert.equal((h.t as any).capStalled, true, 'reacquire outage is a gap');
+		h.t.disconnect();
+	});
+
+	it('reacquire requested during an in-flight resume is honored after the resume succeeds', async () => {
+		const events: Array<{ s: string; k: string }> = [];
+		const streams: FakeMediaStream[] = [];
+		let gumCalls = 0;
+		gumImpl = async () => {
+			gumCalls++;
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		const h = harness({
+			recoveryBackoffMs: [0, 0, 0],
+			recoveryResumeTimeoutMs: 500,
+			onCaptureHealth: (s: any, k: any) => events.push({ s, k }),
+		});
+		await goLive(h);
+		const ctx = FakeAudioContext.created[0];
+		let releaseResume!: () => void;
+		ctx.resume = () =>
+			new Promise<void>((res) => {
+				releaseResume = () => {
+					ctx.state = 'running';
+					res();
+				};
+			});
+		ctx.state = 'suspended';
+		ctx.fireStateChange(); // resume-recovery parks inside resume()
+		await delay(5);
+		(streams[0].tracks[0] as any).onended?.(); // dead track during the resume
+		releaseResume(); // resume SUCCEEDS — but the track is still dead
+		await delay(10);
+		assert.equal(gumCalls, 2, 'escalated reacquire ran after the successful resume');
+		assert.equal((h.t as any).micStream, streams[1], 'fresh stream wired');
+		const last = events[events.length - 1];
+		assert.deepEqual(last, { s: 'recovered', k: 'reacquire' });
+		h.t.disconnect();
+	});
+
+	it('reacquire with the context stuck suspended reports failure, not recovery', async () => {
+		const events: Array<{ s: string; k: string }> = [];
+		const streams: FakeMediaStream[] = [];
+		let gumCalls = 0;
+		gumImpl = async () => {
+			gumCalls++;
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		const h = harness({
+			recoveryBackoffMs: [0, 0, 0],
+			recoveryResumeTimeoutMs: 30,
+			onCaptureHealth: (s: any, k: any) => events.push({ s, k }),
+		});
+		await goLive(h);
+		const ctx = FakeAudioContext.created[0];
+		ctx.resume = async () => {
+			/* resolves but the context never runs again */
+		};
+		ctx.state = 'suspended';
+		(streams[0].tracks[0] as any).onended?.();
+		await delay(30);
+		assert.equal((h.t as any).captureState, 'degraded', 'suspended ctx is NOT a recovery');
+		assert.equal(gumCalls, 4, 'initial + 3 bounded attempts');
+		for (const st of streams.slice(1)) {
+			assert.equal(st.tracks[0].stopped, true, 'unused acquisition stopped');
+		}
+		assert.equal(events[events.length - 1].s, 'degraded');
+		h.t.disconnect();
+	});
+
+	it('a stale attempt\'s in-flight recovery cannot swallow the new attempt\'s trigger', async () => {
+		const events: Array<{ s: string; k: string }> = [];
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		const h = harness({
+			recoveryBackoffMs: [0, 0, 0],
+			recoveryResumeTimeoutMs: 5000,
+			onCaptureHealth: (s: any, k: any) => events.push({ s, k }),
+		});
+		await goLive(h);
+		// Park attempt 1's recovery inside getUserMedia.
+		gumImpl = () => new Promise<FakeMediaStream>(() => {});
+		(streams[0].tracks[0] as any).onended?.();
+		await delay(5);
+		assert.equal(events.filter((e) => e.s === 'recovering').length, 1);
+		// New attempt over the same transport.
+		gumImpl = async () => {
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		await h.t.connect('ws://fake:9900/');
+		h.sock().open();
+		await delay(5);
+		const ctx = FakeAudioContext.created[0]; // reused (never closed)
+		ctx.resume = async () => {
+			ctx.state = 'running';
+		};
+		ctx.state = 'suspended';
+		ctx.fireStateChange();
+		await delay(10);
+		assert.equal(
+			events.filter((e) => e.s === 'recovering').length,
+			2,
+			'the live attempt took recovery ownership from the fenced-dead loop',
+		);
+		assert.equal(events[events.length - 1].s, 'recovered');
+		h.t.disconnect();
+	});
+
+	it('a stale device enumeration cannot reacquire over a fresh recovery (captureGen fence)', async () => {
+		const streams: FakeMediaStream[] = [];
+		let gumCalls = 0;
+		gumImpl = async () => {
+			gumCalls++;
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		const enumResolvers: Array<(v: Array<{ kind: string; deviceId: string }>) => void> = [];
+		enumImpl = () => new Promise((res) => enumResolvers.push(res));
+		const h = harness({ recoveryBackoffMs: [0, 0, 0], recoveryResumeTimeoutMs: 100 });
+		await goLive(h);
+		// r0: wireCaptureGraph's initial snapshot — settle it as 'a'.
+		enumResolvers.shift()?.([{ kind: 'audioinput', deviceId: 'a' }]);
+		await delay(5);
+		fireDeviceChange(); // r1 parks (captures captureGen)
+		await delay(2);
+		(streams[0].tracks[0] as any).onended?.(); // recovery replaces the graph (bumps captureGen)
+		await delay(10);
+		assert.equal(gumCalls, 2, 'precondition: track-ended reacquired');
+		// r2: the NEW graph's snapshot; r1 is still the parked devicechange.
+		const afterRecovery = gumCalls;
+		enumResolvers.pop()?.([{ kind: 'audioinput', deviceId: 'b' }]); // settle r2 (fresh graph)
+		enumResolvers.shift()?.([{ kind: 'audioinput', deviceId: 'zzz' }]); // stale r1: changed set!
+		await delay(10);
+		assert.equal(gumCalls, afterRecovery, 'stale enumeration fenced — no spurious reacquire');
+		h.t.disconnect();
+	});
+
+	it('delta heartbeats: a failed send folds its interval into the next beat (lossless)', async () => {
+		const now = 10_000;
+		const h = harness({ nowFn: () => now });
+		const s = await goLive(h);
+		stopRealStats(h);
+		const p = proc(h);
+		p(frame(LOUD));
+		p(frame(LOUD));
+		tick(h); // tick 0 → hb0: delta 2
+		for (let i = 0; i < 3; i++) p(frame(LOUD));
+		let failNext = true;
+		const origSend = s.send.bind(s);
+		s.send = (d: ArrayBuffer | string) => {
+			if (typeof d === 'string' && failNext) {
+				failNext = false;
+				throw new Error('socket hiccup');
+			}
+			origSend(d);
+		};
+		tick(h);
+		tick(h);
+		tick(h);
+		tick(h); // tick 4 → hb send FAILS (baseline not advanced)
+		p(frame(LOUD));
+		tick(h);
+		tick(h);
+		tick(h);
+		tick(h); // tick 8 → next successful hb
+		const hb = healthFrames(s);
+		assert.equal(hb.length, 2, 'failed beat never landed');
+		assert.equal(hb[0].c[0], 2);
+		assert.equal(hb[1].c[0], 4, 'lost interval (3) + new (1) folded into one delta');
+		assert.deepEqual([hb[0].q, hb[1].q], [0, 1], 'q counts SENT beats — contiguous');
+		h.t.disconnect();
+	});
+
+	it('lifecycle evidence rides onStats: ctx transition, device + recovery events, drop counters', async () => {
+		const statsSeen: any[] = [];
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const st = new FakeMediaStream();
+			streams.push(st);
+			return st;
+		};
+		const h = harness({
+			recoveryBackoffMs: [0, 0, 0],
+			recoveryResumeTimeoutMs: 100,
+			onStats: (st: any) => statsSeen.push(st),
+		});
+		await goLive(h);
+		stopRealStats(h);
+		const ctx = FakeAudioContext.created[0];
+		ctx.state = 'suspended';
+		ctx.fireStateChange(); // resume recovery (fake resume → running)
+		await delay(10);
+		(streams[0].tracks[0] as any).onended?.(); // reacquire
+		await delay(10);
+		tick(h);
+		const st = statsSeen[statsSeen.length - 1];
+		assert.equal(st.ctxLastTransition?.to, 'suspended');
+		assert.ok(
+			st.deviceEvents.some((e: any) => e.kind === 'track-ended'),
+			'device events exposed',
+		);
+		assert.ok(
+			st.recoveryEvents.some((e: any) => e.result === 'recovered'),
+			'recovery events exposed',
+		);
+		assert.equal(st.deviceEventsDropped, 0);
+		assert.equal(st.recoveryEventsDropped, 0);
 		h.t.disconnect();
 	});
 });
