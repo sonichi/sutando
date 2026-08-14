@@ -61,23 +61,22 @@ from pathlib import Path
 from typing import Iterable
 
 
-_NEWEST_ARCHIVED = None
 
+def newest_archived(directory: Path, task_id: str) -> Path | None:
+    """Newest record for task_id in one directory — collision suffix included.
+    A repeat lands as `<id>.txt.1`, so plain `<id>.txt` is the OLDEST, not current."""
+    base = directory / f"{task_id}.txt"
+    if not base.exists():
+        return None          # `.N` is only minted once `.txt` is taken
+    # Probe exact names, never glob: this runs in agent-api's per-poll loop over an
+    # archive dir that reached 5,716 entries, where a glob measured 442x an exists().
+    best, n = base, 1
+    while True:
+        nxt = base.with_name(f"{base.name}.{n}")
+        if not nxt.exists():
+            return best
+        best, n = nxt, n + 1
 
-def _newest_archived(directory: Path, task_id: str) -> Path | None:
-    """Delegate to task_archive: one collision-naming owner, never a copy.
-    Lazy — this module is loaded by path in contexts with no src/ on sys.path."""
-    global _NEWEST_ARCHIVED
-    if _NEWEST_ARCHIVED is None:
-        try:
-            from .task_archive import newest_archived
-        except ImportError:  # pragma: no cover - flat / by-path import
-            here = str(Path(__file__).resolve().parent)
-            if here not in sys.path:
-                sys.path.insert(0, here)
-            from task_archive import newest_archived
-        _NEWEST_ARCHIVED = newest_archived
-    return _NEWEST_ARCHIVED(directory, task_id)
 
 # ── Schema constants ─────────────────────────────────────────────────────────
 
@@ -582,7 +581,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     for d in dirs:
         # Shared owner picks among collision suffixes: `<id>.txt` is the OLDEST
         # record once `<id>.txt.1` exists, so `.exists()` here returned stale.
-        hit = _newest_archived(d, task_id)
+        hit = newest_archived(d, task_id)
         if hit is not None:
             return hit
     return None

@@ -213,7 +213,7 @@ class ArchiveLookupNeverScansTheDirectory(unittest.TestCase):
     reached 5,716 entries; a glob there measured 442x an exists()."""
 
     def test_newest_archived_probes_exact_names_and_never_globs(self) -> None:
-        import task_archive
+        import local_task_protocol
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "task-x.txt").write_text("a")
@@ -223,16 +223,16 @@ class ArchiveLookupNeverScansTheDirectory(unittest.TestCase):
             with mock.patch.object(Path, "glob", boom), \
                  mock.patch.object(Path, "iterdir", boom), \
                  mock.patch("os.scandir", boom):
-                got = task_archive.newest_archived(d, "task-x")
+                got = local_task_protocol.newest_archived(d, "task-x")
             self.assertEqual(got.name, "task-x.txt.1")
 
     def test_an_absent_id_costs_one_probe_and_returns_none(self) -> None:
-        import task_archive
+        import local_task_protocol
         with tempfile.TemporaryDirectory() as td:
             def boom(self, *a, **kw):
                 raise AssertionError("scanned the directory for an absent id")
             with mock.patch.object(Path, "glob", boom):
-                self.assertIsNone(task_archive.newest_archived(Path(td), "task-nope"))
+                self.assertIsNone(local_task_protocol.newest_archived(Path(td), "task-nope"))
 
 
 class CrashDuringCrossDeviceCopy(unittest.TestCase):

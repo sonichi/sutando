@@ -37,20 +37,10 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     return quarantined[0] if quarantined else None
 
 
-def newest_archived(directory: Path, task_id: str) -> Path | None:
-    """Newest record for task_id in one directory — collision suffix included.
-    A repeat lands as `<id>.txt.1`, so plain `<id>.txt` is the OLDEST, not current."""
-    base = directory / f"{task_id}.txt"
-    if not base.exists():
-        return None          # `.N` is only minted once `.txt` is taken
-    # Probe exact names, never glob: this runs in agent-api's per-poll loop over an
-    # archive dir that reached 5,716 entries, where a glob measured 442x an exists().
-    best, n = base, 1
-    while True:
-        nxt = base.with_name(f"{base.name}.{n}")
-        if not nxt.exists():
-            return best
-        best, n = nxt, n + 1
+# Collision NAMING lives here (_move_without_clobbering mints `.N`); collision
+# SELECTION lives with the reader in local_task_protocol. No cross-import: both
+# modules are loaded by PATH with src/ off sys.path, where any import of the
+# other raises ModuleNotFoundError and takes its caller down with it.
 
 
 def _move_without_clobbering(src: Path, dest: Path) -> Path:
