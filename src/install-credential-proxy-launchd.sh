@@ -114,23 +114,17 @@ case "$cmd" in
         echo "  config:    $CLAUDE_CFG"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
-        # SUTANDO_NODE is caller-controlled and lands inside plist XML via sed
-        # (external review on #2182): XML-encode &<> then escape sed's \ & and
-        # the | delimiter so hostile-looking paths can't corrupt the plist.
-        _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
-            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
-        _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
-        _cfg_xml="$(printf '%s' "$CLAUDE_CFG" \
-            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
-        _cfg_sed="$(printf '%s' "$_cfg_xml" | sed -e 's/[\\&|]/\\&/g')"
-        sed \
-            -e "s|__REPO__|$REPO|g" \
-            -e "s|__WORKSPACE__|$WORKSPACE|g" \
-            -e "s|__BREW_BIN__|$BREW_BIN|g" \
-            -e "s|__SUTANDO_NODE__|${_node_sed}|g" \
-            -e "s|__CLAUDE_CONFIG_DIR__|${_cfg_sed}|g" \
-            -e "s|__HOME__|$HOME|g" \
-            "$TEMPLATE" > "$DEST"
+        # Escaping renderer + resolved interpreter: a bare python3 can be the
+        # Xcode-CLT stub, which passes an existence check and raises the dialog.
+        . "$REPO/scripts/python-binary.sh"
+        _PY="$(require_python "$REPO" "install the credential-proxy launchd job")" || exit 1
+        "$_PY" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$DEST" \
+            "REPO=$REPO" \
+            "WORKSPACE=$WORKSPACE" \
+            "BREW_BIN=$BREW_BIN" \
+            "SUTANDO_NODE=${SUTANDO_NODE:-}" \
+            "CLAUDE_CONFIG_DIR=$CLAUDE_CFG" \
+            "HOME=$HOME" || exit 1
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"

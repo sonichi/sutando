@@ -94,6 +94,71 @@ WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of thi
 # after every compaction (sutando-migrate classifies it newest-mtime).
 STATE_FILE="$WORKSPACE_DIR/session-state.md"
 
+# JSON-escape one value. host/transcript/trigger are external input, and any
+# raw control char or quote makes the whole line unparseable to every reader.
+_ch_json_escape() {
+    local s=${1//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "${s//[[:cntrl:]]/ }"
+}
+
+record_compaction_event() {
+    local log="$WORKSPACE_DIR/state/compactions.jsonl" ts line lock tmp pend wip i=0 acquired=0
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+    line="$(printf '{"ts":"%s","epoch":%s,"host":"%s","transcript":"%s","trigger":"%s"}' \
+        "$ts" "$(date +%s)" \
+        "$(_ch_json_escape "${SUTANDO_HOST_LABEL:-$(hostname -s 2>/dev/null)}")" \
+        "$(_ch_json_escape "$(basename "${1:-}" 2>/dev/null)")" \
+        "$(_ch_json_escape "${2:-precompact}")")"
+    # Trim-then-append is read-modify-write on one shared file, so overlapping
+    # hooks drop events with no malformed line to show for it. One writer at a time.
+    lock="$log.lock"
+    while [ "$i" -lt 100 ]; do
+        # Never block a PreCompact hook forever: a dead holder must not wedge it.
+        if mkdir "$lock" 2>/dev/null; then acquired=1; break; fi
+        i=$((i + 1))
+        sleep 0.05
+    done
+    # The trim REPLACES the pathname, so an unlocked append lands in the old
+    # inode and the mv discards it. Nothing may touch "$log" without the lock.
+    if [ "$acquired" != 1 ]; then
+        # Each give-up caller owns its OWN sidecar, published by rename. A shared
+        # pathname loses records: an fd already opened on it follows the inode
+        # through the holder's mv, so the write lands in a file already drained.
+        wip="$(mktemp "${log}.wip.XXXXXX" 2>/dev/null)" || return 0
+        if printf '%s\n' "$line" > "$wip" 2>/dev/null; then
+            mv "$wip" "${log}.pending.${wip##*.}" 2>/dev/null || rm -f "$wip" 2>/dev/null
+        else
+            rm -f "$wip" 2>/dev/null
+        fi
+        return 0
+    fi
+    # A pre-fix writer, or one mid-upgrade, may have parked at the legacy shared
+    # pathname. Absorb it too or an upgrade loses the very records this protects.
+    if [ -f "$log.pending" ]; then
+        pend="$(mktemp "${log}.pending.XXXXXX" 2>/dev/null)" || pend="${log}.pending.$$"
+        mv "$log.pending" "$pend" 2>/dev/null || rm -f "$pend" 2>/dev/null
+    fi
+    # Absorb anything earlier give-up callers parked. Only completed sidecars are
+    # named .pending.* — a writer builds in .wip.* and renames, so we never read a
+    # partial line and never hold a pathname another writer still has open.
+    for pend in "${log}".pending.*; do
+        [ -e "$pend" ] || continue
+        cat "$pend" >> "$log" 2>/dev/null || true
+        rm -f "$pend" 2>/dev/null
+    done
+    if [ -f "$log" ] && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -ge 500 ]; then
+        tmp="$(mktemp "${log}.tmp.XXXXXX" 2>/dev/null)" || tmp="${log}.tmp.$$"
+        tail -n 499 "$log" > "$tmp" 2>/dev/null && mv "$tmp" "$log" 2>/dev/null
+        rm -f "$tmp" 2>/dev/null
+    fi
+    printf '%s\n' "$line" >> "$log" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null
+    return 0
+}
+record_compaction_event "${TRANSCRIPT:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact}"
+
 # Build state from available signals
 {
   echo "---"

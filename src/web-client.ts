@@ -920,6 +920,9 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Restore the chat transcript saved before the last reload, then watch for
+  // new entries to persist.
+  try { initTranscriptPersistence(); } catch {}
 });
 
 // ─── Remote toggle via SSE ────────────────────────────────
@@ -1240,6 +1243,83 @@ function persistTaskMap() {
 function persistExpanded() {
   try { localStorage.setItem(PERSIST_KEY_EXPAND, JSON.stringify(Array.from(expandedTasks))); } catch {}
 }
+
+// ─── Transcript persistence ──────────────────────────────
+// A MutationObserver is used so every append path is captured without editing
+// each call site.
+const PERSIST_KEY_TRANSCRIPT = 'sutando-transcript-v1';
+const TRANSCRIPT_MAX_ENTRIES = 50;
+const TRANSCRIPT_MAX_ENTRY_LEN = 20000; // skip oversized entries (e.g. data-URL images) to stay under localStorage quota
+let _transcriptRestoring = false;
+let _snapshotTimer = null;
+function snapshotTranscript() {
+  try {
+    const t = $('transcript');
+    if (!t) return;
+    const kids = Array.from(t.children).slice(-TRANSCRIPT_MAX_ENTRIES);
+    const entries = kids.map(el => {
+      // Drop the injected copy button (its onclick can't survive an innerHTML
+      // round-trip) — a live one is re-added on restore.
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('.copy-btn').forEach(b => b.remove());
+      return { cls: el.className, html: clone.innerHTML };
+    }).map(e => {
+      if (!e.html) return null;
+      // Oversized entries get a static placeholder, not a silent drop: omitting
+      // the bubble would make the restored transcript lie. Never user content.
+      if (e.html.length >= TRANSCRIPT_MAX_ENTRY_LEN) {
+        return { cls: e.cls, html: '<em class="t-not-persisted">[image/attachment not kept across reloads — too large for local storage]</em>' };
+      }
+      return e;
+    }).filter(Boolean);
+    try {
+      localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries));
+    } catch {
+      // Quota exceeded — keep only the most recent half and retry once.
+      try { localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries.slice(-Math.ceil(entries.length / 2)))); } catch {}
+    }
+  } catch {}
+}
+function scheduleSnapshot() {
+  if (_transcriptRestoring) return;
+  if (_snapshotTimer) clearTimeout(_snapshotTimer);
+  _snapshotTimer = setTimeout(snapshotTranscript, 400);
+}
+function restoreTranscript() {
+  let entries;
+  try { entries = JSON.parse(localStorage.getItem(PERSIST_KEY_TRANSCRIPT) || '[]'); } catch { return; }
+  if (!Array.isArray(entries) || !entries.length) return;
+  _transcriptRestoring = true;
+  const t = $('transcript');
+  // Clear the freshly-rendered default seed so it isn't duplicated by the
+  // seed entry captured in the snapshot.
+  t.innerHTML = '';
+  entries.forEach(e => {
+    const el = document.createElement('div');
+    el.className = e.cls || 't-entry';
+    // Sanitize on restore — stored html may include agent-origin markdown.
+    if (window.DOMPurify) {
+      try { el.innerHTML = window.DOMPurify.sanitize(e.html); } catch { el.textContent = e.html; }
+    } else {
+      el.textContent = e.html;
+    }
+    t.appendChild(el);
+    // Re-attach a live copy button on user/assistant bubbles.
+    if (el.classList.contains('t-assistant') || el.classList.contains('t-user')) addCopyBtn(el);
+  });
+  _transcriptRestoring = false;
+  scrollTranscript(true);
+}
+function initTranscriptPersistence() {
+  restoreTranscript();
+  try {
+    const t = $('transcript');
+    if (t && window.MutationObserver) {
+      new MutationObserver(scheduleSnapshot).observe(t, { childList: true, subtree: true, characterData: true });
+    }
+  } catch {}
+}
+
 const taskMap = window.taskMap = loadPersistedTaskMap();
 let taskWorkstreamNames = Object.create(null);
 
