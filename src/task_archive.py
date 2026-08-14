@@ -1,4 +1,4 @@
-"""Task-file locator for archive calls (#933).
+"""Task/result archive policy and claimed-task locator (#933).
 
 claim_task.py (#884) renames task-{id}.txt → task-{id}.claimed-core-N.txt
 when a core claims work. Bridge archive calls that hard-code the bare
@@ -14,7 +14,10 @@ Usage:
 """
 from __future__ import annotations
 
+import shutil
+from datetime import datetime
 from pathlib import Path
+from typing import Callable, Optional
 
 
 def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
@@ -30,3 +33,45 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
         return bare
     matches = sorted(tasks_dir.glob(f"{task_id}.claimed-core-*.txt"))
     return matches[0] if matches else None
+
+
+def archive_file(
+    src: Path,
+    kind: str,
+    task_id: str,
+    archive_tasks_dir: Path,
+    archive_results_dir: Path,
+    *,
+    now: Optional[datetime] = None,
+    on_error: Optional[Callable[[Exception], None]] = None,
+) -> bool:
+    """Move a live task/result into its monthly archive.
+
+    Archival is cleanup, not a delivery gate. A failed move therefore removes
+    the stale live source, matching the adapters' established fail-open policy.
+    ``False`` means the source was absent or the move failed.
+    """
+    # Outside the try on purpose: the fail-open handler below catches Exception,
+    # so a guard inside it would be swallowed and would also unlink the source.
+    if kind not in ("tasks", "results"):
+        raise ValueError(f"archive_file: kind must be 'tasks' or 'results', got {kind!r}")
+    if not src.exists():
+        return False
+    try:
+        month = (now or datetime.now()).strftime("%Y-%m")
+        base = archive_tasks_dir if kind == "tasks" else archive_results_dir
+        destination_dir = base / month
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(destination_dir / f"{task_id}.txt"))
+        return True
+    except Exception as exc:
+        if on_error is not None:
+            try:
+                on_error(exc)
+            except Exception:
+                pass
+        try:
+            src.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False

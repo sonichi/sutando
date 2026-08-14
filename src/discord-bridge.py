@@ -132,7 +132,7 @@ try:
 except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
-from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _archive_file_shared, find_task_file  # noqa: E402
 from orphan_result_routes import orphan_result_routes  # noqa: E402
 
 
@@ -474,34 +474,18 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
         return "honour", None
 
 
-def archive_path(kind: str, task_id: str) -> "Path":
-    """Return archive destination for a task or result file, partitioned by
-    year-month so the archive stays browsable.
-
-    kind: "tasks" or "results". task_id: e.g. "task-1776538911450"."""
-    from datetime import datetime
-    ym = datetime.now().strftime("%Y-%m")
-    base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-    month_dir = base / ym
-    month_dir.mkdir(parents=True, exist_ok=True)
-    return month_dir / f"{task_id}.txt"
-
-
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into the archive. Silent on failure — archive is for later
-    analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving"."""
-    try:
-        if src.exists():
-            import shutil
-            shutil.move(str(src), str(archive_path(kind, task_id)))
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        # Fall back to unlink so we don't leave stale files.
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+    """Archive through the shared task/result filesystem policy."""
+    _archive_file_shared(
+        src,
+        kind,
+        task_id,
+        ARCHIVE_TASKS_DIR,
+        ARCHIVE_RESULTS_DIR,
+        on_error=lambda exc: print(
+            f"  archive_file({kind}, {task_id}) failed: {exc}", flush=True
+        ),
+    )
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
