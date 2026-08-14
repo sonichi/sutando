@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Allowlist-divergence warning in the ag2-sparrow gateway bridge.
 
-TWO layers gate an AG2 Space sender: the broker registry decides whose room
-messages become tasks at all; the local access.json only re-tiers arrived
-tasks. Adding a teammate locally therefore silently drops their messages at
-the broker (live incident 2026-07-30: @mark's @-mentions never became tasks).
-Agents can't edit their own broker record, so the bridge now DETECTS the
-divergence and warns the owner with the exact fleet-sibling command.
+The broker registry decides whose room messages become tasks; local access.json
+only re-tiers ones that arrived. A local-only add therefore drops silently at
+the broker, and the bridge detects that divergence and warns the owner.
 
 Hermetic — no network: _req is monkeypatched; config/state under temp roots
 (CLAUDE_CONFIG_DIR seeded BEFORE import per the #2429 isolation rule).
@@ -18,6 +15,7 @@ Covers:
   4. dedup: unchanged divergence never warns twice; a NEW divergence re-warns
   5. broker read failure → no warning, no mtime consumption (retries next loop)
   6. realignment clears the warned-hash (future divergence warns again)
+  7. a persistently failing broker keeps retrying but logs once per cooldown
 
 Run: python3 tests/gateway-allowlist-divergence.test.py   (exit 0 / 1)
 """
@@ -133,10 +131,8 @@ try:
     rgb._maybe_warn_allowlist_divergence()
     check("same set after touch not re-warned (hash dedup)", len(proactive_files(tmp)) == 1)
 
-    # 4b-bis. BROKER-ONLY transitions, access.json untouched throughout. This is
-    # the case the mtime-only trigger could not see: the remedy the warning prints
-    # changes the broker, not the local file, so clear and re-warn must not depend
-    # on a local write. Each pass forces the poll due rather than sleeping.
+    # 4b-bis. BROKER-ONLY transitions with access.json untouched — the case an
+    # mtime-only trigger cannot see. Each pass forces the poll due, not sleeps.
     def _due():
         rgb._ALLOWDIV_STATE["next_poll"] = 0.0
 
@@ -265,13 +261,21 @@ def fake_500(method, path, payload=None, timeout=35):
 
 
 rgb._req = fake_500
-rgb._log = lambda msg: None
+_500_logs = []
+rgb._log = _500_logs.append
 try:
-    rgb._maybe_warn_allowlist_divergence()
-    rgb._maybe_warn_allowlist_divergence()
-    check("500: stays transient — both loops retry, no cooldown",
-          _500_calls["n"] == 2 and rgb._ALLOWDIV_STATE["unsupported_until"] == 0.0,
+    for _ in range(5):
+        rgb._maybe_warn_allowlist_divergence()
+    check("500: stays transient — every loop retries, no cooldown",
+          _500_calls["n"] == 5 and rgb._ALLOWDIV_STATE["unsupported_until"] == 0.0,
           f"calls={_500_calls['n']} state={rgb._ALLOWDIV_STATE}")
+    # Retries are every-loop by design, so the log is what has to be bounded.
+    check("500: five failures log ONCE, not five times",
+          len(_500_logs) == 1, f"logs={_500_logs}")
+    rgb._ALLOWDIV_STATE["fail_log_until"] = 0.0
+    rgb._maybe_warn_allowlist_divergence()
+    check("500: a failure after the window logs again",
+          len(_500_logs) == 2, f"logs={_500_logs}")
 finally:
     rgb._req = _orig_req
     rgb._log = _orig_log

@@ -486,28 +486,17 @@ def _tier_for(user_id):
 
 
 # ── allowlist divergence warning (local access.json vs broker registry) ──────
-# TWO layers gate a sender: the BROKER's agent registry decides whose room
-# messages become tasks AT ALL; the local access.json above only re-tiers tasks
-# that already arrived. An owner who adds a teammate locally (the natural place
-# to look) gets silent message-drop at the broker — live incident 2026-07-30:
-# @mark added to local allowFrom, his @-mentions never generated tasks. Agents
-# cannot edit their OWN broker record (relay's anti-self-escalation rule), so
-# the best the bridge can do is DETECT the divergence and hand the owner the
-# exact fleet-sibling command. Checked on startup and whenever access.json
-# changes (mtime); warned once per distinct divergence set.
+# The BROKER registry decides whose messages become tasks; local access.json only
+# re-tiers ones that arrived, so a local-only add drops silently at the broker.
 
-# /v1/agents is a registry endpoint newer than the core bridge protocol
-# (tasks/ack/results/heartbeat) — an older gateway answers 404/405. Mirror the
-# /ack pattern: time-gated cooldown rather than a permanent latch, so a broker
-# that GAINS the endpoint (deploy) is picked up without a worker restart, and a
-# broker that lacks it is asked once per cooldown, not once per poll loop
-# (qingyun CR 2026-07-30: protocol-compatibility regression + log spam).
+# 404/405 means a gateway older than /v1/agents. Time-gated, not latched, so a
+# broker that gains the endpoint is picked up without restarting the worker.
 ALLOWDIV_UNSUPPORTED_COOLDOWN = int(
     os.environ.get("REMOTE_ALLOWDIV_RETRY_COOLDOWN") or "300")
 ALLOWDIV_POLL_INTERVAL = int(
     os.environ.get("REMOTE_ALLOWDIV_POLL_INTERVAL") or "300")
 _ALLOWDIV_STATE = {"mtime": None, "warned_hash": None, "unsupported_until": 0.0,
-                   "next_poll": 0.0}
+                   "next_poll": 0.0, "fail_log_until": 0.0}
 
 
 def allowlist_divergence(local_allow, broker_allow, agent_id):
@@ -564,21 +553,25 @@ def _local_allow_from():
         return []
 
 
-def _broker_allow_for(agent_id):
-    """GET /v1/agents (own bearer → the owner's fleet, safe metadata only) →
-    this agent's allowFrom, or None when unreadable. None is fail-OPEN for the
-    warning (no divergence spam off a flaky read) — the mtime is left unmarked
-    so the next loop retries.
+def _log_transient_failure(exc):
+    """One line per cooldown, not per loop: retries stay every-loop, so an
+    unbounded log would be the only cost of a gateway that is down for hours."""
+    now = time.time()
+    if now < _ALLOWDIV_STATE["fail_log_until"]:
+        return
+    _ALLOWDIV_STATE["fail_log_until"] = now + ALLOWDIV_UNSUPPORTED_COOLDOWN
+    _log(f"allowlist-divergence: broker read failed ({exc}) — retrying every loop; "
+         f"further failures silent for {ALLOWDIV_UNSUPPORTED_COOLDOWN}s")
 
-    Unsupported endpoint (404/405 = pre-registry gateway) is NOT transient:
-    it enters a time-gated cooldown with ONE log line, so existing onboarded
-    clients see one request + one line per cooldown window instead of a
-    failing call after every long-poll. Any other failure stays transient
-    (silent retry next loop, mtime unmarked)."""
+
+def _broker_allow_for(agent_id):
+    """This agent's broker allowFrom, or None when unreadable. None fails OPEN and
+    leaves the mtime unmarked, so a flaky read retries instead of warning."""
     if time.time() < _ALLOWDIV_STATE["unsupported_until"]:
         return None
     try:
         resp = _req("GET", "/v1/agents", timeout=15)
+        _ALLOWDIV_STATE["fail_log_until"] = 0.0  # recovered: the next outage logs at once
         for rec in (resp or {}).get("agents", []):
             if str(rec.get("id", "")).strip().lower() == str(agent_id).strip().lower():
                 return [str(x) for x in rec.get("allowFrom") or []]
@@ -590,9 +583,9 @@ def _broker_allow_for(agent_id):
             _log(f"allowlist-divergence: /v1/agents unsupported by this gateway "
                  f"({e.code}) — cooling down {ALLOWDIV_UNSUPPORTED_COOLDOWN}s")
         else:
-            _log(f"allowlist-divergence: broker read failed ({e}) — will retry")
+            _log_transient_failure(e)
     except Exception as e:  # noqa: BLE001 — diagnostics only; never disturb the task loop
-        _log(f"allowlist-divergence: broker read failed ({e}) — will retry")
+        _log_transient_failure(e)
     return None
 
 
