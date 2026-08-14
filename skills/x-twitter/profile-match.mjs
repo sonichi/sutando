@@ -45,7 +45,9 @@ export function lineHoldsProfile(line, profileDir) {
 		if (value.startsWith(profileDir + ' ')) {
 			// A following FLAG proves the path ended at that space. A bare token does
 			// not: "/tmp/x-profile copy" is equally a path containing a space.
-			if (value.slice(profileDir.length + 1).startsWith('-')) return true;
+			// `--`, not `-`: `-copy` is a bare token, and matching it hands an
+			// unrelated browser's pid to releaseProfileLock() for SIGTERM/SIGKILL.
+			if (value.slice(profileDir.length + 1).startsWith('--')) return true;
 		}
 		i += FLAG.length;
 	}

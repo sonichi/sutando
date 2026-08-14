@@ -81,6 +81,20 @@ for (const [name, l, d] of [
 	check(`degenerate: ${name} does not match`, lineHoldsProfile(l, d) === false);
 }
 
+// --- a space then a BARE token is NOT an argument boundary -------------------
+// `-copy` is a bare token, not a flag: "/tmp/x-profile -copy" is one path that
+// happens to contain a space. Matching it sends SIGKILL to an unrelated browser.
+for (const [name, l] of [
+	['space then -copy', line(DIR).replace(DIR, `${DIR} -copy`)],
+	['space then -copy/Default/x', line(DIR).replace(DIR, `${DIR} -copy/Default/x`)],
+]) {
+	check(`bare token after space does not match: ${name}`, lineHoldsProfile(l, DIR) === false);
+}
+check('a real flag after a space still matches (feature preserved)',
+	lineHoldsProfile(line(DIR).replace(DIR, `${DIR} --foo`), DIR) === true);
+check('no pid is offered for the disputed line',
+	JSON.stringify(pidsHoldingProfile(line(DIR).replace(DIR, `${DIR} -copy`), DIR)) === '[]');
+
 // --- pid extraction ---------------------------------------------------------
 const out = [
 	line(DIR),                                   // ours            -> 4242
