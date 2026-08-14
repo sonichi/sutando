@@ -22,6 +22,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from skill_hooks import resolve_hook_command  # noqa: E402
+
 
 def _repo_root() -> Path:
     """Repo root — NOT the workspace. Resolves via git (the sanctioned method,
@@ -180,10 +183,10 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
                 if not isinstance(cmd, str) or not cmd:
                     err(f"hooks[{i}] missing 'command'")
                     continue
-                # Same escape rule as tools: a hook outside its skill dir defeats
-                # the per-skill model, and discovery silently drops what it can't find.
-                if ".." in cmd.split("/"):
-                    err(f"hooks[{i}] command '{cmd}' must not escape the skill dir (no '..')")
+                # One containment rule, shared with discovery: lint that accepts
+                # what discovery registers is the only version that gates anything.
+                if resolve_hook_command(skill_dir, cmd) is None:
+                    err(f"hooks[{i}] command '{cmd}' must resolve inside the skill dir")
                 elif not (skill_dir / re.sub(r"^\./", "", cmd)).exists():
                     err(f"hooks[{i}] command '{cmd}' does not exist")
 

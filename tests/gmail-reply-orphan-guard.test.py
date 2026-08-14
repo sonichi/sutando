@@ -43,6 +43,28 @@ class ReplyOrphanGuard(unittest.TestCase):
         self.assertEqual(
             decide("Bash", 'gws gmail +send --message-id 19f --subject "Re: EGC" --body hi'), "deny")
 
+    def test_reply_text_in_the_BODY_does_not_make_a_send_safe(self):
+        """The reviewer's repro: a whole-command regex read body prose as proof
+        of threading, so the plainest orphan there is was allowed."""
+        for body in ("please use +reply next time", "set in-reply-to yourself"):
+            self.assertEqual(
+                decide("Bash", f'gws gmail +send --to a@b.com --subject "Re: EGC" --body "{body}"'),
+                "deny", f"body text {body!r} must not mark a +send safe")
+
+    def test_a_re_subject_only_in_the_body_is_not_a_reply(self):
+        self.assertEqual(
+            decide("Bash", 'gws gmail +send --to a@b.com --subject "Notes" --body "he wrote Re: X"'),
+            "allow")
+
+    def test_a_chained_orphan_after_a_safe_reply_is_still_denied(self):
+        self.assertEqual(
+            decide("Bash", 'gws gmail +reply --message-id a --body hi'
+                           ' && gws gmail +send --subject "Re: Y" --body z'), "deny")
+
+    def test_unparseable_quoting_fails_closed(self):
+        self.assertEqual(
+            decide("Bash", 'gws gmail +send --subject "Re: X --body hi'), "deny")
+
     def test_it_allows_reply_which_actually_threads(self):
         self.assertEqual(
             decide("Bash", 'gws gmail +reply --message-id 19f --subject "Re: EGC" --body hi'), "allow")

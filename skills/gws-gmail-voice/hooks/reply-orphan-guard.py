@@ -5,20 +5,43 @@
 """
 import json
 import re
+import shlex
 import sys
 
 REPLY_SUBJECT = re.compile(r'(?i)(?:^|["\'\s:])(?:re|fwd|fw)\s*:', re.M)
 SEND_CALL = re.compile(r'gws\s+gmail\s+\+send\b')
-# +reply is the only gws form that threads. --message-id does NOT rescue +send:
-# the flag is not wired to a header there, so honouring it reopens the orphan.
-SAFE_FORM = re.compile(r'\+reply\b|in-?reply-?to', re.I)
+
+
+def _gmail_calls(tokens: list[str]) -> list[tuple[str, list[str]]]:
+    """(subcommand, following tokens) per `gws gmail …` call in the command."""
+    return [(tokens[i + 2], tokens[i + 3:]) for i, tok in enumerate(tokens)
+            if tok == "gws" and tokens[i + 1:i + 2] == ["gmail"] and len(tokens) > i + 2]
+
+
+def _flag(tokens: list[str], name: str) -> str | None:
+    for i, tok in enumerate(tokens):
+        if tok == name:
+            return tokens[i + 1] if i + 1 < len(tokens) else ""
+        if tok.startswith(name + "="):
+            return tok.split("=", 1)[1]
+    return None
 
 
 def decide(cmd: str) -> bool:
     """True when this command must be denied."""
-    return bool(SEND_CALL.search(cmd)
-                and not SAFE_FORM.search(cmd)
-                and REPLY_SUBJECT.search(cmd))
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        # Unparseable quoting fails CLOSED — never let untokenizable text
+        # be read as evidence that the call is a safe one.
+        return bool(SEND_CALL.search(cmd) and REPLY_SUBJECT.search(cmd))
+    for sub, rest in _gmail_calls(tokens):
+        if sub != "+send":
+            continue  # +reply is the only threading form; nothing else sends.
+        subject = _flag(rest, "--subject")
+        if REPLY_SUBJECT.search(subject if subject is not None else cmd):
+            return True
+    return False
 
 
 def main() -> int:

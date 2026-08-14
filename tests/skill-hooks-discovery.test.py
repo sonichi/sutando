@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,14 @@ class SkillHookDiscovery(unittest.TestCase):
         self.assertEqual(token, "g.py")
         self.assertTrue(cmd.startswith("python3 "), cmd)
         self.assertIn("skills/demo/hooks/g.py", cmd)
+
+    def test_discovery_refuses_a_command_outside_the_declaring_skill(self):
+        """A manifest must not be able to point core at a host executable."""
+        for cmd in ("/bin/sh", "../../../bin/sh"):
+            self._skill("demo", {"name": "demo", "hooks": [
+                {"event": "PreToolUse", "command": cmd}]})
+            self.assertEqual(discover(self.repo), [], f"registered {cmd!r}")
+            shutil.rmtree(self.repo / "skills" / "demo")
 
     def test_the_command_is_absolute_so_it_is_portable(self):
         """The whole point: no host-specific path is written by hand."""
@@ -98,11 +107,8 @@ class ManifestLintAcceptsAndValidatesHooks(unittest.TestCase):
 
     @staticmethod
     def _linter():
-        """Import the module rather than shelling out to it.
-
-        A subprocess runs uninstrumented, so a CLI-only test leaves the rules it
-        exercises reading as 0% covered — which is what the gate caught.
-        """
+        """In-process import: a subprocess runs uninstrumented, so a CLI-only
+        test leaves the rules it exercises reading as 0% covered."""
         import importlib.util
         path = Path(__file__).resolve().parent.parent / "scripts" / "lint-skill.py"
         spec = importlib.util.spec_from_file_location("lint_skill", path)
@@ -119,9 +125,15 @@ class ManifestLintAcceptsAndValidatesHooks(unittest.TestCase):
         errors, warnings = self._linter()._lint_manifest(self.skill)
         return (1 if errors else 0), "\n".join(errors + warnings)
 
+    def test_lint_rejects_a_command_that_resolves_outside_the_skill(self):
+        """`skill_dir / "/bin/sh"` is `/bin/sh` — escaping needs no `..`."""
+        for cmd in ("/bin/sh", "../../../bin/sh"):
+            rc, text = self._lint([{"event": "PreToolUse", "command": cmd}])
+            self.assertEqual(rc, 1, f"lint accepted {cmd!r}")
+            self.assertIn("inside the skill dir", text)
+
     def test_the_CLI_exit_code_still_tracks_errors(self):
-        """One subprocess case so the in-process shortcut above cannot drift
-        from what the command actually returns."""
+        """One subprocess case so the in-process shortcut cannot drift."""
         (self.skill / "manifest.json").write_text(json.dumps(
             {**self.base, "hooks": [{"event": "PreToolUse", "command": "./hooks/nope.py"}]}))
         bad = subprocess.run(
@@ -153,7 +165,7 @@ class ManifestLintAcceptsAndValidatesHooks(unittest.TestCase):
     def test_a_command_escaping_the_skill_dir_is_an_error(self):
         rc, out = self._lint([{"event": "PreToolUse", "command": "../../../etc/passwd"}])
         self.assertNotEqual(rc, 0)
-        self.assertIn("must not escape", out)
+        self.assertIn("must resolve inside the skill dir", out)
 
     def test_a_missing_event_is_an_error(self):
         rc, out = self._lint([{"command": "./hooks/g.py"}])
