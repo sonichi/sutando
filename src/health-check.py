@@ -4377,19 +4377,16 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
 
     plist = Path.home() / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
     cfg_source = "plist"
-    if not plist.is_file():
-        # Not launchd-managed. This used to return ok here, which reads as "the
-        # accounts agree" but only means "the file this check knows how to read is
-        # absent" — the probe going silent on every host whose proxy is started by
-        # startup.sh or the desktop supervisor. Those proxies still carry a
-        # CLAUDE_CONFIG_DIR; read it from the process instead of giving up.
-        from_proc = _proxy_config_dir_from_process()
-        if from_proc is _PROXY_ENV_UNREADABLE:
-            return {"name": name, "status": "ok",
-                    "detail": ("credential proxy is not launchd-managed and its "
-                               "environment could not be read — identity comparison "
-                               "inactive here (not evidence either way)")}
+    # Ask the RUNNING listener before the plist: a plist that outlives its job
+    # describes a proxy that is not the one holding :7846, in someone else's name.
+    from_proc = _proxy_config_dir_from_process()
+    if from_proc is not _PROXY_ENV_UNREADABLE:
         return _quota_identity_verdict(name, core_cfg, from_proc, "process")
+    if not plist.is_file():
+        return {"name": name, "status": "ok",
+                "detail": ("credential proxy is not launchd-managed and its "
+                           "environment could not be read — identity comparison "
+                           "inactive here (not evidence either way)")}
     # Imported HERE, not at module scope, and this placement is the whole point.
     # `plistlib` pulls in `xml.parsers.expat` -> the `pyexpat` C extension, which
     # is the single most fragile import in the stdlib: it dlopens libexpat, so a
