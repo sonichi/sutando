@@ -46,7 +46,11 @@ from pathlib import Path
 # `github-commits`, anything else) returned False for BOTH bridges,
 # silently stranding the proactive file in `results/` until the
 # next discord/telegram message restored a known activity channel.
-BRIDGE_CHANNELS = frozenset({"discord", "telegram"})
+#
+# `ag2space` is the desktop gateway bridge (remote-gateway-bridge's
+# owner-DM drain); its owner-activity writer stamps that channel on
+# every owner message from the AG2 Space app.
+BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space"})
 
 
 def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
@@ -62,7 +66,7 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
         messages right now. The decision rule:
 
           1. State file says ``data["channel"]`` is a known BRIDGE
-             channel (discord / telegram) → claim only when
+             channel (discord / telegram / ag2space) → claim only when
              ``last_channel == this_channel``. This is the message-
              routing match — owner was last reading there, follow-up
              goes there.
