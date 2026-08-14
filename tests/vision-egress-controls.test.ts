@@ -7,6 +7,7 @@ import {
 	submitFrame,
 	startStreaming,
 	stopStreaming,
+	registerSource,
 	getVisionEgressStats,
 	getVisionState,
 	resetVisionEgressForTests,
@@ -115,6 +116,37 @@ describe('P7 D7.4 vision egress controls', () => {
 		stopStreaming();
 		assert.equal(getVisionEgressStats().slotOccupied, false);
 		assert.equal(sent.length, 0);
+	});
+
+	it('wire-byte accounting: the bucket charges base64 size (4/3 of raw)', () => {
+		const { session, sent } = fakeSession();
+		setVisionSession(session);
+		startStreaming('browser', undefined, 'push');
+		// 500 KB raw fits the 600 KB burst raw-wise, but its 667 KB wire size
+		// must NOT pass (round-3 #10: raw accounting under-charged by 25%).
+		const r = submitFrame(frameBuf(1, 500 * 1024));
+		assert.equal(r.deferred, true, 'over the encoded-bytes burst → deferred');
+		assert.equal(sent.length, 0);
+		stopStreaming();
+	});
+
+	it('stopStreaming fences an in-flight pull capture — the stale frame never sends', async () => {
+		const { session, sent } = fakeSession();
+		setVisionSession(session);
+		let releaseCapture!: () => void;
+		registerSource({
+			name: 'slowsrc',
+			capture: () =>
+				new Promise((res) => {
+					releaseCapture = () => res({ data: frameBuf(7), mimeType: 'image/jpeg' });
+				}),
+		});
+		startStreaming('slowsrc', 1, 'pull'); // startStream fires an immediate tick
+		await delay(10); // the tick is parked inside capture()
+		stopStreaming();
+		releaseCapture(); // slow source finally returns — AFTER the stop
+		await delay(10);
+		assert.equal(sent.length, 0, 'stop semantics beat a slow source');
 	});
 
 	it('getVisionState exposes the egress diagnostics', () => {

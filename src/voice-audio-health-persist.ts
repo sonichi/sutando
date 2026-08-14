@@ -42,6 +42,12 @@ function open() {
     'nonce TEXT,' +
     'reason TEXT NOT NULL,' +
     'payload_json TEXT NOT NULL)');
+  // Pre-rename databases carry a "payload" column; CREATE IF NOT EXISTS
+  // would leave them as-is and every insert would then fail forever.
+  const cols = db.prepare('PRAGMA table_info(voice_audio_health)').all().map((c) => c.name);
+  if (!cols.includes('payload_json') && cols.includes('payload')) {
+    db.exec('ALTER TABLE voice_audio_health RENAME COLUMN payload TO payload_json');
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_vah_ts ON voice_audio_health(ts_unix)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_vah_session ON voice_audio_health(session_id)');
   return db;

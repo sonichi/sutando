@@ -1868,6 +1868,10 @@ export class VoiceTransport {
    *   t   'audio_health'
    *   n   epoch nonce (engine maps nonce→server epoch on first sight)
    *   q   heartbeat seq within the epoch
+   *   ea  epoch age: ms since connect() on the CLIENT clock at assembly —
+   *       lets the engine place epoch-relative episode intervals on its own
+   *       clock as receivedAt − ea (accurate to network latency), instead of
+   *       guessing the epoch start from first-heartbeat timing
    *   c   DELTAS since the last successfully-sent heartbeat (lossless: a
    *       failed/skipped frame's interval folds into the next delta):
    *       [capCallbacks, bytesSent, sendSkipped, sendFailed, chunksRecv,
@@ -1895,6 +1899,7 @@ export class VoiceTransport {
       t: 'audio_health',
       n: this.epochNonce,
       q: this.heartbeatsSent,
+      ea: Math.max(0, Math.round(now - this.connectAtMs)),
       c: [
         this.capCallbacks - this.hbPrev.capCallbacks,
         this.bytesSent - this.hbPrev.bytesSent,

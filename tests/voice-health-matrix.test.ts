@@ -13,6 +13,7 @@ function hb(over: Partial<ClientHeartbeat> = {}): ClientHeartbeat {
 	return {
 		nonce: 'n0n0n0n0',
 		seq: 10,
+		epochAgeMs: 60_000,
 		capCallbacks: 47,
 		bytesSent: 64000,
 		sendSkipped: 0,
@@ -66,6 +67,8 @@ function snap(over: Partial<AudioHealthSnapshot> = {}): AudioHealthSnapshot {
 		newEpisodeIds: [],
 		samplesSkipped: 0,
 		lastTurnLatencyMs: null,
+		lastSpeechToModelMs: null,
+		lastModelEventAt: null,
 		inputHealth: 'ok',
 		epochStartApproxMs: NOW - 60_000,
 		lastMatrixVerdict: null,
@@ -77,6 +80,7 @@ function snap(over: Partial<AudioHealthSnapshot> = {}): AudioHealthSnapshot {
 function baselineBefore(s: AudioHealthSnapshot, deltas: Partial<MatrixBaseline> = {}): MatrixBaseline {
 	return {
 		at: NOW - 30_000,
+		epoch: s.epoch,
 		deliveredFrames: s.deliveredFrames,
 		capCallbacks: s.clientTotals.capCallbacks,
 		bytesSent: s.clientTotals.bytesSent,
@@ -84,6 +88,7 @@ function baselineBefore(s: AudioHealthSnapshot, deltas: Partial<MatrixBaseline> 
 		chunksRecv: s.clientTotals.chunksRecv,
 		chunksScheduled: s.clientTotals.chunksScheduled,
 		chunksEnded: s.clientTotals.chunksEnded,
+		chunksCancelled: s.clientTotals.chunksCancelled,
 		ctxTimeMs: s.lastHeartbeat?.ctxTimeMs ?? null,
 		bufferedAmount: s.lastHeartbeat?.bufferedAmount ?? null,
 		serverBufferedAmount: null,
@@ -229,7 +234,11 @@ describe('P7 D7.2 matrix — rows 6/7a/7b', () => {
 
 	it('row 7a needs the server buffered input — absent ⇒ no verdict from that pattern', () => {
 		const s = snap();
-		const r = evalWith(s, baselineBefore(s), { serverBufferedAmount: null });
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 700,
+			capCallbacks: s.clientTotals.capCallbacks - 700,
+		});
+		const r = evalWith(s, prev, { serverBufferedAmount: null });
 		assert.equal(r.verdict, 'healthy-idle');
 	});
 
@@ -277,6 +286,87 @@ describe('P7 D7.2 matrix — row 5′ healthy-idle', () => {
 		});
 		const r = evalWith(s, prev);
 		assert.equal(r.verdict, 'healthy-idle');
+	});
+});
+
+describe('P7 D7.2 matrix — round-3 honesty + ordering fixes', () => {
+	it('an epoch boundary between ticks is never diffed — insufficient-evidence', () => {
+		const s = snap();
+		const prev = baselineBefore(s, { epoch: 99, deliveredFrames: s.deliveredFrames + 5000 });
+		const r = evalWith(s, prev);
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.includes('epoch-boundary'));
+		assert.equal(r.baseline.epoch, s.epoch, 'fresh baseline adopts the new epoch');
+	});
+
+	it('episode overflow means the quiet window cannot be proven quiet', () => {
+		const s = snap({ lastHeartbeat: hb({ episodeOverflow: 2 }) });
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 700,
+			capCallbacks: s.clientTotals.capCallbacks - 700,
+		});
+		const r = evalWith(s, prev);
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.some((x) => x.startsWith('episodeOverflow')));
+	});
+
+	it('a stale heartbeat cannot support healthy-idle', () => {
+		const s = snap({ lastHeartbeat: hb({ receivedAt: NOW - 20_000 }) });
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 700,
+			capCallbacks: s.clientTotals.capCallbacks - 700,
+		});
+		const r = evalWith(s, prev);
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.includes('heartbeat-stale'));
+	});
+
+	it('zero progress while unmuted is missing telemetry, not health', () => {
+		const s = snap({ lastDeliveredAt: NOW - 1000 });
+		const r = evalWith(s, baselineBefore(s));
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.includes('no-progress-in-window'));
+	});
+
+	it('row 5 outranks row 6: speech with no model event wins over backpressure (D7.2 order)', () => {
+		const s = snap({
+			coverage: 'full' as never,
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			lastHeartbeat: hb({ bufferedAmount: 500_000 }),
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			bufferedAmount: 50_000,
+		});
+		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
+		assert.equal(r.verdict, 'model-silent');
+	});
+
+	it('a stale client speech EPISODE alone is not current speech evidence (canonical tracker only)', () => {
+		const s = snap({
+			speech: { active: false, onsetAt: null, lastAboveFloorAt: null },
+			lastHeartbeat: hb({ episodes: [{ id: 7, kind: 'speech', onsetSeq: 5, offsetSeq: 9, maxRmsPm: 300, aboveFloorMs: 900 }] }),
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 700,
+			capCallbacks: s.clientTotals.capCallbacks - 700,
+		});
+		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
+		assert.notEqual(r.verdict, 'model-silent');
+		assert.ok(!r.reasons.includes('speech-without-model-event'));
+	});
+
+	it('row 7b: an all-cancelled window (barge-in flush) proves nothing about playback', () => {
+		const s = snap({ lastHeartbeat: hb({ ctxTimeMs: 30_000 }) });
+		const prev = baselineBefore(s, {
+			chunksScheduled: s.clientTotals.chunksScheduled - 20,
+			chunksCancelled: s.clientTotals.chunksCancelled - 20,
+			deliveredFrames: s.deliveredFrames - 700,
+			capCallbacks: s.clientTotals.capCallbacks - 700,
+			ctxTimeMs: 30_000,
+		});
+		const r = evalWith(s, prev);
+		assert.notEqual(r.verdict, 'client-playback-failure');
 	});
 });
 

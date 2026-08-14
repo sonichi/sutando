@@ -116,6 +116,32 @@ describe('P7 D7.1 voice_audio_health persistence (worker_threads)', () => {
 		await p.close();
 	});
 
+	it('a legacy database (pre-rename payload column) is migrated, not bricked', async () => {
+		const dbPath = join(dir, 'legacy.sqlite');
+		const legacy = new DatabaseSync(dbPath);
+		legacy.exec('CREATE TABLE voice_audio_health (' +
+			'id INTEGER PRIMARY KEY AUTOINCREMENT,' +
+			'ts_unix INTEGER NOT NULL,' +
+			'session_id TEXT NOT NULL,' +
+			'epoch INTEGER,' +
+			'nonce TEXT,' +
+			'reason TEXT NOT NULL,' +
+			'payload TEXT NOT NULL)');
+		legacy
+			.prepare('INSERT INTO voice_audio_health (ts_unix, session_id, epoch, nonce, reason, payload) VALUES (?, ?, ?, ?, ?, ?)')
+			.run(Math.floor(Date.now() / 1000), 'session_old', 1, 'aaaa', 'timer', '{"old":true}');
+		legacy.close();
+		const p = createHealthPersistence({ dbPath });
+		assert.equal(p.tryEnqueue(row({ epoch: 2 })), true);
+		await p.drain();
+		await p.close();
+		assert.equal(p.failedWrites, 0, 'insert succeeded against the migrated schema');
+		const db = new DatabaseSync(dbPath);
+		const rows = (db.prepare('SELECT payload_json FROM voice_audio_health ORDER BY id').all() as Array<{ payload_json: string }>).map((r) => r.payload_json);
+		db.close();
+		assert.deepEqual(rows, ['{"old":true}', '{"coverage":"session-only"}'], 'old rows preserved under the new column');
+	});
+
 	it('a failing write acks ok:false — visible in failedWrites, worker stays up', async () => {
 		// A file path whose parent is a FILE cannot be opened as a database.
 		const bad = join(dir, 'not-a-dir.sqlite');

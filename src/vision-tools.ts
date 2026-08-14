@@ -353,6 +353,10 @@ function getSendFile(): ((b64: string, mime: string) => void) | null {
 // --- Streaming controller -------------------------------------------------
 
 let ticker: NodeJS.Timeout | null = null;
+/** Bumped on every stream start/stop: an in-flight pull capture from a
+ *  stopped stream must not send its stale frame after stopStream() (P7
+ *  round-3 #8 — stop semantics beat a slow source.capture()). */
+let streamGen = 0;
 let activeSource: VisionSource | null = null;
 let inFlight = false;
 let frameCount = 0;
@@ -534,7 +538,10 @@ function sendFrameGated(
 		parkFrame(data, mimeType, fireHooks, 'gate', fromDrain);
 		return { ok: true, deferred: true, reason: gate.reason };
 	}
-	if (now - lastFrameSentAt < VISION_MIN_SEND_INTERVAL_MS || data.byteLength > bucketBytes) {
+	// The wire carries base64 — 4/3 of the raw frame — so the bucket charges
+	// encoded bytes, not raw (round-3 #10: raw accounting under-charged 25%).
+	const wireBytes = Math.ceil((data.byteLength * 4) / 3);
+	if (now - lastFrameSentAt < VISION_MIN_SEND_INTERVAL_MS || wireBytes > bucketBytes) {
 		parkFrame(data, mimeType, fireHooks, 'budget', fromDrain);
 		return { ok: true, deferred: true, reason: 'budget' };
 	}
@@ -546,7 +553,7 @@ function sendFrameGated(
 	} catch (err) {
 		return { ok: false, error: (err as Error)?.message ?? 'sendFile threw' };
 	}
-	bucketBytes = Math.max(0, bucketBytes - data.byteLength);
+	bucketBytes = Math.max(0, bucketBytes - wireBytes);
 	lastFrameSentAt = now;
 	egressStats.sent++;
 	frameCount++;
@@ -704,6 +711,7 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 	if (wasRunning) {
 		console.log(`${ts()} [Vision] stopped ${sourceName}${wasPush ? ' (push)' : ''} — ${frames} frame(s) in ${(durationMs / 1000).toFixed(1)}s`);
 	}
+	streamGen++; // fence any in-flight pull capture (see captureAndSend)
 	activeSource = null;
 	frameCount = 0;
 	startedAt = 0;
@@ -760,9 +768,17 @@ export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok
 	return r;
 }
 
-async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; deferred?: boolean; error?: string }> {
+async function captureAndSend(
+	source: VisionSource,
+	fenceGen?: number,
+): Promise<{ ok: boolean; deferred?: boolean; error?: string }> {
 	if (!getSendFile()) return { ok: false, error: 'no active voice session' };
 	const frame = await source.capture();
+	if (fenceGen !== undefined && fenceGen !== streamGen) {
+		// The stream this capture belonged to was stopped (or replaced) while
+		// the source was capturing — the stale frame is dropped, not sent.
+		return { ok: true, deferred: false };
+	}
 	// P7 D7.4: the central gate + bucket own the egress decision; post-send
 	// hooks (screen-companion selection text) fire only when the frame
 	// actually sends — including a later drain of the deferred slot.
@@ -787,7 +803,7 @@ async function tick(): Promise<void> {
 	if (inFlight || !activeSource) return; // skip overlap — slow camera or slow disk
 	inFlight = true;
 	try {
-		const r = await captureAndSend(activeSource);
+		const r = await captureAndSend(activeSource, streamGen);
 		if (r.ok) {
 			// Deferred counts as healthy: the gate/bucket parked the frame
 			// deliberately (frameCount advances only on real sends, inside
@@ -840,6 +856,7 @@ function startStream(source: VisionSource, fps: number): { fps: number; interval
 	const clamped = Math.max(0.5, Math.min(MAX_FPS, fps));
 	const intervalMs = Math.max(MIN_INTERVAL_MS, Math.round(1000 / clamped));
 	if (ticker) clearInterval(ticker);
+	streamGen++;
 	activeSource = source;
 	frameCount = 0;
 	startedAt = Date.now();

@@ -2427,17 +2427,59 @@ function updateVisionPreviewStats() {
   if (stats) stats.textContent = _visionFrameCount + ' frame' + (_visionFrameCount === 1 ? '' : 's');
 }
 
+// P7 D7.4: this page's main thread also runs the voice capture
+// (ScriptProcessor in the vendored transport) — drawImage + JPEG encode
+// there competes with audio. A tiny Blob-URL worker does the draw + encode
+// in an OffscreenCanvas; the main thread only grabs a cheap ImageBitmap.
+// One frame in flight at a time (latest-frame discipline, no backlog).
+var _visionWorker = null;
+var _visionWorkerBusy = false;
+function ensureVisionWorker() {
+  if (_visionWorker !== null) return _visionWorker;
+  if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined' || typeof Worker === 'undefined') {
+    _visionWorker = false; // feature-detected once; falsy → main-thread fallback
+    return _visionWorker;
+  }
+  var src = 'onmessage=async function(e){var d=e.data;try{' +
+    'var c=new OffscreenCanvas(d.w,d.h);var x=c.getContext("2d");' +
+    'x.drawImage(d.bmp,0,0,d.w,d.h);d.bmp.close();' +
+    'var b=await c.convertToBlob({type:"image/jpeg",quality:d.q});' +
+    'postMessage({ok:true,blob:b});}catch(err){postMessage({ok:false});}}';
+  try {
+    _visionWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    _visionWorker.onmessage = function(e) {
+      _visionWorkerBusy = false;
+      if (e.data && e.data.ok && e.data.blob) _postVisionBlob(e.data.blob);
+    };
+    _visionWorker.onerror = function() { _visionWorkerBusy = false; };
+  } catch (e) { _visionWorker = false; }
+  return _visionWorker;
+}
+
 function captureAndSendFrame() {
   var preview = document.getElementById('vision-preview');
   if (!preview || !_visionStream) return;
   // Wait for the video to actually have pixels — readyState >= HAVE_CURRENT_DATA (2)
   if (preview.readyState < 2 || !preview.videoWidth || !preview.videoHeight) return;
+  var worker = ensureVisionWorker();
+  if (worker) {
+    if (_visionWorkerBusy) return; // latest-frame: skip, never queue
+    _visionWorkerBusy = true;
+    createImageBitmap(preview).then(function(bmp) {
+      worker.postMessage({ bmp: bmp, w: VISION_FRAME_WIDTH, h: VISION_FRAME_HEIGHT, q: VISION_FRAME_QUALITY }, [bmp]);
+    }).catch(function() { _visionWorkerBusy = false; });
+    return;
+  }
+  // Fallback (no OffscreenCanvas): the original main-thread canvas path.
   if (!_visionCanvas) _visionCanvas = document.createElement('canvas');
   _visionCanvas.width = VISION_FRAME_WIDTH;
   _visionCanvas.height = VISION_FRAME_HEIGHT;
   var ctx = _visionCanvas.getContext('2d');
   ctx.drawImage(preview, 0, 0, VISION_FRAME_WIDTH, VISION_FRAME_HEIGHT);
-  _visionCanvas.toBlob(function(blob) {
+  _visionCanvas.toBlob(function(blob) { _postVisionBlob(blob); }, 'image/jpeg', VISION_FRAME_QUALITY);
+}
+
+function _postVisionBlob(blob) {
     if (!blob) return;
     // Skip blank frames — getDisplayMedia sometimes paints a black frame
     // for the first tick when the user switches surfaces; uploading a
@@ -2467,11 +2509,11 @@ function captureAndSendFrame() {
         }
       }
     }).catch(function() { /* network blip — next tick will retry */ });
-  }, 'image/jpeg', VISION_FRAME_QUALITY);
 }
 
 function teardownPushSession() {
   _visionPushActive = false;
+  _visionWorkerBusy = false; // an in-flight encode must not block the next session's first frame
   if (_visionFrameTimer) { clearInterval(_visionFrameTimer); _visionFrameTimer = null; }
   if (_visionStream) {
     try { _visionStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}

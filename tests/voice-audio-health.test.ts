@@ -20,6 +20,7 @@ function wireHb(nonce: string, over: Record<string, unknown> = {}): Record<strin
 		t: 'audio_health',
 		n: nonce,
 		q: 0,
+		ea: 60_000,
 		c: [47, 64000, 0, 0, 100, 100, 98, 2],
 		x: [2000, 3, 120],
 		cs: 'r',
@@ -274,6 +275,7 @@ describe('P7 D7.1 engine ledger — inputHealth + anomaly latching', () => {
 		led.wrapSession(s);
 		assert.equal(led.getInputHealth(false), 'no-client');
 		assert.equal(led.getInputHealth(true), 'unknown', 'no evidence yet');
+		led.onClientConnected();
 		s.handleAudioFromClient(pcm(0.1));
 		assert.equal(led.getInputHealth(true), 'ok');
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { og: [0, 1500] }));
@@ -420,6 +422,7 @@ describe('P7 D7.1 engine ledger — persistence tick + [Health] segments', () =>
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
+		led.onClientConnected();
 		s.handleAudioFromClient(pcm(0.3));
 		led.ingestHeartbeat(wireHb('nnnnnnnn'));
 		now.t += 2000;
@@ -432,5 +435,70 @@ describe('P7 D7.1 engine ledger — persistence tick + [Health] segments', () =>
 		assert.match(line, /clientHealth=\{age:[\d.]+s,capCb\/s:23\.5,rms:/);
 		assert.match(line, /latency=1840ms/);
 		assert.match(line, /inputHealth=ok/);
+	});
+});
+
+describe('P7 round-3 ledger fixes', () => {
+	it('epoch placement uses the client-stamped epoch age (receivedAt − ea), refreshed per beat', () => {
+		const now = { t: 100_000 };
+		const led = makeLedger(now);
+		led.onClientConnected();
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { ea: 7_500 }));
+		assert.equal(led.getSnapshot(true).epochStartApproxMs, 100_000 - 7_500);
+		now.t = 102_000;
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { q: 1, ea: 9_500 }));
+		assert.equal(led.getSnapshot(true).epochStartApproxMs, 102_000 - 9_500);
+	});
+
+	it('a frame without ea falls back to the coarse first-beat guess', () => {
+		const now = { t: 100_000 };
+		const led = makeLedger(now);
+		led.onClientConnected();
+		const frame = wireHb('nnnnnnnn');
+		delete (frame as Record<string, unknown>).ea;
+		led.ingestHeartbeat(frame);
+		assert.equal(led.getSnapshot(true).epochStartApproxMs, 100_000 - 500);
+	});
+
+	it('an unexpected nonce is a FULL epoch boundary: server counters and latency reset too', () => {
+		const now = { t: 100_000 };
+		const led = makeLedger(now);
+		const s = fakeSession();
+		led.wrapSession(s);
+		led.onClientConnected();
+		led.ingestHeartbeat(wireHb('nonceAAA'));
+		s.handleAudioFromClient(pcm(0.1));
+		led.noteTurnLatency(1234);
+		now.t += 10;
+		led.ingestHeartbeat(wireHb('nonceZZZ'));
+		const snap = led.getSnapshot(true);
+		assert.equal(snap.deliveredFrames, 0, 'server-side counters reset at the boundary');
+		assert.equal(snap.lastTurnLatencyMs, null);
+		assert.equal(snap.nonce, 'nonceZZZ');
+	});
+
+	it('noteModelEvent records model activity and consumes the speech→model latency sample', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		const s = fakeSession();
+		led.wrapSession(s);
+		s.handleAudioFromClient(pcm(0.3)); // speech onset armed at 10000
+		now.t = 10_900;
+		led.noteModelEvent(); // e.g. turn.start — text/tool-first turn
+		const snap = led.getSnapshot(true);
+		assert.equal(snap.lastModelEventAt, 10_900);
+		assert.equal(snap.lastSpeechToModelMs, 900, 'first EVENT, not first audio');
+		now.t = 11_500;
+		s.handleAudioOutput(Buffer.from('audio').toString('base64'));
+		assert.equal(led.getSnapshot(true).lastSpeechToModelMs, 900, 'already consumed');
+		assert.equal(led.getSnapshot(true).lastModelEventAt, 11_500, 'audio still advances the event clock');
+	});
+
+	it('episode anomalies require an attached client (a detached window re-send is not live)', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		led.ingestHeartbeat(wireHb('nnnnnnnn', { ep: [[1, 'g', 0, 1200]] }));
+		assert.ok(!led.anomalies(false).reasons.some((r) => r.startsWith('episodes:')));
+		assert.ok(led.anomalies(true).reasons.some((r) => r.startsWith('episodes:')));
 	});
 });

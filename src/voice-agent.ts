@@ -983,6 +983,7 @@ async function main() {
 				console.log(`${ts()} [Latency] ${e?.turnId ?? '?'} e2e=${e?.segments?.totalE2EMs ?? '?'}ms`);
 			},
 			onToolCall: (e) => {
+				audioHealth.noteModelEvent(); // P7 D7.1: a tool call is model activity
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				// tool_call event push removed per #1052 — canonical record
 				// is the surface-table row written in onToolResult via
@@ -1294,6 +1295,9 @@ async function main() {
 		try { fetch(`http://localhost:7877/speaking/${mode}`, { method: 'POST' }).catch(() => {}); } catch {}
 	};
 	session.eventBus.subscribe('turn.start', () => _duck('on'));
+	// P7 D7.1: the model hop is EVENTS — a text/tool-first turn must count
+	// as model activity even before any audio frame lands.
+	session.eventBus.subscribe('turn.start', () => audioHealth.noteModelEvent());
 	session.eventBus.subscribe('turn.end', () => _duck('off'));
 	session.eventBus.subscribe('turn.interrupted', () => _duck('off'));
 
@@ -1606,7 +1610,7 @@ async function main() {
 			snapshot,
 			prev: matrixBaseline,
 			serverBufferedAmount,
-			lastModelEventAt: snapshot.lastEgressAt,
+			lastModelEventAt: snapshot.lastModelEventAt,
 			now: Date.now(),
 		});
 		matrixBaseline = matrix.baseline;
@@ -1614,12 +1618,17 @@ async function main() {
 		if (matrix.verdict !== lastMatrixVerdict && (matrix.verdict !== 'healthy-idle' || lastMatrixVerdict)) {
 			console.log(`${ts()} [Matrix] ${matrix.verdict}${matrix.reasons.length ? ' (' + matrix.reasons.join('; ') + ')' : ''}`);
 		}
+		const verdictChanged = matrix.verdict !== lastMatrixVerdict;
 		lastMatrixVerdict = matrix.verdict;
-		if (anomaly.anomalous) audioHealth.persistTick('anomaly', clientConnected);
+		// A verdict TRANSITION is itself evidence worth a row — without this a
+		// transient verdict can vanish before the 1-min baseline write.
+		if (anomaly.anomalous || (verdictChanged && matrix.verdict !== 'healthy-idle')) {
+			audioHealth.persistTick('anomaly', clientConnected);
+		}
 		// Rate windows advance EVERY tick (a suppressed streak must not turn
 		// the next logged line into a long-window average).
 		const seg = audioHealth.healthSegments(clientConnected, serverBufferedAmount);
-		if (state !== 'ACTIVE' || status !== lastLoggedStatus || anomaly.anomalous) {
+		if (state !== 'ACTIVE' || status !== lastLoggedStatus || anomaly.anomalous || persistFailed) {
 			const why = anomaly.anomalous ? ` anomaly=${anomaly.reasons.join(',')}` : '';
 			const pf = persistFailed ? ` persistFail=${healthPersistence.failedWrites}` : '';
 			console.log(`${ts()} [Health] ${status}${clientConnected ? ' ' + seg : ''}${why}${pf}`);

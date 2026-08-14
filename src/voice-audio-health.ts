@@ -46,6 +46,9 @@ export interface SpeechEvidence {
 export interface ClientHeartbeat {
   nonce: string;
   seq: number;
+  /** ms since connect() on the CLIENT clock at assembly (null on frames from
+   *  clients predating the field). epochStartApprox = receivedAt − ea. */
+  epochAgeMs: number | null;
   capCallbacks: number;
   bytesSent: number;
   sendSkipped: number;
@@ -121,9 +124,11 @@ export interface AudioHealthSnapshot {
   newEpisodeIds: number[];
   samplesSkipped: number;
   lastTurnLatencyMs: number | null;
-  /** Server-clock ingress-onset → first model audio (receipt-time
+  /** Server-clock ingress-onset → first model EVENT (receipt-time
    *  approximation — D7.3's user-speech→first-model-event metric). */
   lastSpeechToModelMs: number | null;
+  /** Latest observed model activity (audio out, turn start, tool call). */
+  lastModelEventAt: number | null;
   inputHealth: 'ok' | 'degraded' | 'stalled' | 'no-client' | 'unknown';
   /** Receipt-time approximation of the client epoch's start on the engine
    *  clock (null before the first heartbeat). */
@@ -142,6 +147,9 @@ export interface AudioHealthLedger {
   onClientConnected(): void;
   onClientDisconnected(): void;
   noteTurnLatency(totalE2EMs: number | undefined): void;
+  /** Any observed model activity beyond audio (turn start, tool call) — the
+   *  D7.1 model hop is EVENTS, and audio alone misses text/tool-first turns. */
+  noteModelEvent(): void;
   /** Canonical speech evidence — the vision gate and the matrix consume
    *  THIS (precedence: ingress tracker > client RMS intervals). */
   getSpeechEvidence(): SpeechEvidence;
@@ -214,6 +222,7 @@ export function parseHeartbeat(msg: unknown, receivedAt: number): ClientHeartbea
   return {
     nonce: m.n,
     seq: num(m.q),
+    epochAgeMs: numOrNull(m.ea),
     capCallbacks: num(c[0]),
     bytesSent: num(c[1]),
     sendSkipped: num(c[2]),
@@ -272,9 +281,12 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
   let speechEager = false;
   let onsetAt: number | null = null;
   let lastAboveFloorAt: number | null = null;
-  /** Armed at speech onset, consumed by the next egress frame (D7.3 latency). */
+  /** Armed at speech onset, consumed by the next MODEL EVENT (D7.3 latency). */
   let pendingSpeechOnsetAt: number | null = null;
   let lastSpeechToModelMs: number | null = null;
+  /** Any model activity: first audio out, turn start, tool call — whichever
+   *  the engine observes first (D7.1: model EVENT, not model audio). */
+  let lastModelEventAt: number | null = null;
 
   // ── client heartbeat mirror ──
   let lastHb: ClientHeartbeat | null = null;
@@ -340,6 +352,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     lastTurnLatencyMs = null;
     pendingSpeechOnsetAt = null;
     lastSpeechToModelMs = null;
+    lastModelEventAt = null;
   }
 
   function noteIngress(data: unknown): void {
@@ -385,19 +398,23 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     }
   }
 
+  function noteModelEventAt(t: number): void {
+    lastModelEventAt = t;
+    if (pendingSpeechOnsetAt !== null) {
+      // Server-clock ingress-onset → FIRST model event (audio, turn start,
+      // or tool call — whichever lands first; receipt-time approximation).
+      lastSpeechToModelMs = t - pendingSpeechOnsetAt;
+      pendingSpeechOnsetAt = null;
+    }
+  }
+
   function noteEgress(base64: unknown): void {
     // §D7.0b FRAME PATH: O(1). `base64` is the outbound audio string.
     egressFrames++;
     const s = base64 as { length?: number };
     if (typeof s?.length === 'number') egressBytes += Math.floor((s.length * 3) / 4);
     lastEgressAt = now();
-    if (pendingSpeechOnsetAt !== null) {
-      // Server-clock ingress-onset → first model audio (receipt-time
-      // approximation, labeled — model audio out is the Tranche-A model
-      // event).
-      lastSpeechToModelMs = lastEgressAt - pendingSpeechOnsetAt;
-      pendingSpeechOnsetAt = null;
-    }
+    noteModelEventAt(lastEgressAt);
   }
 
   function mintEpoch(): number {
@@ -413,22 +430,28 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
         // First heartbeat of the connection: bind the client nonce to the
         // epoch minted at connect.
         log(`[AudioHealth] client nonce ${hb.nonce} bound to epoch ${epoch}`);
+        nonce = hb.nonce;
       } else {
         // Nonce changed without a connect event (or a heartbeat arrived
-        // before any connect) — defensively treat it as a new epoch.
+        // before any connect) — a FULL epoch boundary, not just a client
+        // baseline reset: server counters, heartbeats, latency samples, and
+        // tick windows from the old epoch must not bleed into the new one.
+        resetEpochState();
         epoch = mintEpoch();
+        nonce = hb.nonce;
         log(`[AudioHealth] epoch ${epoch} minted for unexpected client nonce ${hb.nonce}`);
       }
-      nonce = hb.nonce;
-      prevHb = null;
-      seenEpisodeIds = new Set();
-      gapEpisodeCount = 0;
-      newEpisodeIds = [];
-      clientTotals = zeroTotals();
-      epochStartApproxMs = hb.receivedAt - 500;
     } else {
       prevHb = lastHb;
     }
+    // Epoch placement: the client stamps its own epoch age into every beat —
+    // receivedAt − ea places the client's epoch-relative intervals on the
+    // engine clock (accurate to network latency). Refreshed per beat; the
+    // pre-`ea` fallback stays a coarse first-beat guess.
+    epochStartApproxMs =
+      hb.epochAgeMs !== null
+        ? hb.receivedAt - hb.epochAgeMs
+        : (epochStartApproxMs ?? hb.receivedAt - 500);
     for (const e of hb.episodes) {
       if (!seenEpisodeIds.has(e.id)) {
         seenEpisodeIds.add(e.id);
@@ -546,6 +569,10 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       }
     },
 
+    noteModelEvent(): void {
+      noteModelEventAt(now());
+    },
+
     getSpeechEvidence: speechEvidence,
     getInputHealth: inputHealth,
 
@@ -569,6 +596,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
         samplesSkipped,
         lastTurnLatencyMs,
         lastSpeechToModelMs,
+        lastModelEventAt,
         inputHealth: inputHealth(clientConnected),
         epochStartApproxMs,
         lastMatrixVerdict,
@@ -629,7 +657,9 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       // and FRESH — a detached client's retained open gap is not a live
       // anomaly (codex round-2 #4).
       if (clientConnected && !muted && hbFresh && lastHb?.openGap) reasons.push('capStalled');
-      if (newEpisodeIds.length > 0) reasons.push(`episodes:${newEpisodeIds.length}`);
+      // Episode evidence still latches into the snapshot regardless, but a
+      // detached client re-sending its window is not a LIVE anomaly.
+      if (clientConnected && newEpisodeIds.length > 0) reasons.push(`episodes:${newEpisodeIds.length}`);
       if (clientConnected && lastHb && !hbFresh) reasons.push('heartbeat-stale');
       if (
         clientConnected &&
