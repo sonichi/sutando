@@ -215,16 +215,27 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
      --jq '.[] | "\(.sha[0:8]) \(.commit.author.email) -> \(.author.login // "NULL — maps to no account")"'
    ```
 
-   Two shapes turn up. An email mapping to **no account** (`author: null`) is yours to fix by re-authoring. An email mapping to a **real account that has not signed** needs that account to sign — and you find it by differencing against the rest of the queue, because one PR alone cannot tell you which of its contributors is the unsigned one:
+   Two shapes turn up: an email mapping to **no account** (`author: null`), and an email mapping to a **real account that has not signed**.
+
+   Neither is identifiable from a single PR — every login on it looks equally plausible. The unsigned one is the login that appears on CLA-**pending** PRs and on **no green** one, which takes a comparison across the open queue:
 
    ```bash
-   # the login that appears on CLA-pending PRs and on no green one
-   gh api repos/<owner>/<repo>/pulls/<N>/commits --jq '[.[].author.login // "NULL"] | unique | join(",")'
+   for n in $(gh pr list --state open --limit 100 --json number --jq '.[].number'); do
+     h=$(gh pr view "$n" --json headRefOid --jq .headRefOid)
+     state=$(gh api "repos/<owner>/<repo>/commits/$h/status" \
+               --jq '[.statuses[]|select(.context=="license/cla")]
+                     | if length==0 then "absent" else (sort_by(.updated_at)|last|.state) end')
+     logins=$(gh api "repos/<owner>/<repo>/pulls/$n/commits" --jq '[.[].author.login // "NULL"]|unique|join(" ")')
+     echo "$state $logins"
+   done | awk '$1=="pending"{for(i=2;i<=NF;i++) p[$i]=1} $1=="success"{for(i=2;i<=NF;i++) g[$i]=1}
+                END{for(k in p) if(!(k in g)) print "unsigned candidate:", k}'
    ```
+
+   Treat the output as a **candidate list, not a verdict**: confirm against the PR's CLA-Assistant page before attributing the pending status to a person.
 
    **Do not guess from the shape of the email.** One contributor here commits under two addresses that map to two different accounts, and it is the personal-looking one that is unsigned while the institutional one is signed — the opposite of the natural assumption. A suspect that also appears on a CLA-**green** PR is disproved, which is the cheap check to run before naming anyone.
 
-   **Only offer "re-author the commits" for commits that belong to the person you are telling.** Rewriting the author of someone else's commit misattributes their work; where the unsigned identity is a third party, the only correct remedy is that account signing.
+   **`author: null` does not mean the commit is yours.** It proves only that GitHub could not map that email to an account. Before recommending `git commit --amend --reset-author` — or running it — establish that the commit is the current contributor's own work: the author NAME, the branch it arrived on, and where there is any doubt, their confirmation. Rewriting the author of someone else's commit misattributes it, and where the unsigned identity is a third party the only correct remedy is that account signing.
 
    Note the corollary of the status being SHA-bound: **pushing to the branch after this drops the status again.** If you reopen to fix the CLA and then push a review fix, expect to be back where you started.
 
