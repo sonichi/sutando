@@ -64,7 +64,7 @@ owner_task_queued() {
     [ -n "$f" ] || continue
     tier="$(sed -n 's/^access_tier:[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '[:space:]')"
     case "$tier" in
-      team|other|ambient) continue ;;   # explicitly not the owner -> ignore
+      team|other|guest|ambient) continue ;;   # explicitly not the owner -> ignore
       *) return 0 ;;                    # owner, or unstated -> yield
     esac
   done <<EOF
