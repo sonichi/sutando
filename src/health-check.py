@@ -1200,6 +1200,47 @@ def check_file(path: Path, name: str) -> dict:
     return {"name": name, "status": "ok", "detail": f"{size} bytes"}
 
 
+def check_append_only_file(path: Path, name: str, shrink_ratio: float = 0.5) -> dict:
+    """`check_file`, plus: warn when an append-only log SHRINKS against its own
+    high-water mark. Size alone cannot see a truncation that leaves one line.
+
+    `check_file` answers "is it empty". On 2026-08-14 `build_log.md` went from
+    ~314 KB to 1673 bytes — one surviving entry — and reported `ok 1673 bytes`
+    for 13 hours, because a truncation that leaves anything is not emptiness.
+    The high-water mark is what makes the drop visible.
+
+    Re-baselines to the smaller size after warning, so an intentional rotation
+    is one loud signal rather than a permanent warn nobody reads.
+    """
+    base = check_file(path, name)
+    if base["status"] != "ok":
+        return base
+    size = path.stat().st_size
+    marks_file = WORKSPACE_DIR / "state" / "file-watermarks.json"
+    try:
+        marks = json.loads(marks_file.read_text()) if marks_file.is_file() else {}
+        if not isinstance(marks, dict):
+            marks = {}
+    except (OSError, ValueError):
+        return base          # unreadable state is not evidence of a shrink
+    previous = marks.get(name)
+    shrank = isinstance(previous, int) and size < previous * shrink_ratio
+    if previous is None or size >= previous or shrank:
+        # Record on first sight, on growth, and AFTER a warn (re-baseline).
+        marks[name] = size
+        try:
+            marks_file.parent.mkdir(parents=True, exist_ok=True)
+            marks_file.write_text(json.dumps(marks, indent=2, sort_keys=True))
+        except OSError:
+            pass             # advisory only — never fail the run over telemetry
+    if shrank:
+        return {"name": name, "status": "warn",
+                "detail": (f"{size} bytes — was {previous}, a {100 - size * 100 // previous}% drop. "
+                           f"An append-only log does not shrink; check for a truncating write "
+                           f"before the next backup. Re-baselined, so this warns once.")}
+    return base
+
+
 def check_directory(path: Path, name: str) -> dict:
     """Check if a directory exists and has files."""
     if not path.exists():
@@ -7350,10 +7391,11 @@ def run_all_checks() -> list[dict]:
     # Critical files
     for name, path in [
         ("CLAUDE.md", REPO_DIR / "CLAUDE.md"),
-        ("build_log.md", WORKSPACE_DIR / "build_log.md"),
+        # build_log.md is append-only: routed to the shrink-aware probe below.
         (".env", _resolve_dotenv()),
     ]:
         checks.append(check_file(path, name))
+    checks.append(check_append_only_file(WORKSPACE_DIR / "build_log.md", "build_log.md"))
 
     # Memory system (check if dir exists — specific files are optional)
     if MEMORY_DIR.exists():
