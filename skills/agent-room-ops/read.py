@@ -66,7 +66,10 @@ def _normalize(items):
         ref = m.get("media_ref")
         if ref:
             norm["media_ref"] = ref
-            norm["msgtype"] = m.get("msgtype")
+            # Also conditional: the gateway is an external producer, so a media event
+            # arriving without msgtype must not grow an explicit null either.
+            if (mt := m.get("msgtype")):
+                norm["msgtype"] = mt
         out.append(norm)
     return out
 

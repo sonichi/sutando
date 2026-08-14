@@ -239,6 +239,14 @@ class NormalizeMediaRefTests(unittest.TestCase):
         self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
         self.assertEqual(out[0]["msgtype"], "m.file")
 
+    def test_media_without_msgtype_grows_no_null(self):
+        # Third case: media present, msgtype absent. The gateway is external, so this
+        # cannot be ruled out from here — keep the same additive shape as plain text.
+        out = rd._normalize([{"event_id": "$e", "sender": "@a:h", "body": "f.pdf",
+                              "media_ref": "mxc://hs/abc123"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
+        self.assertNotIn("msgtype", out[0])
+
     def test_no_media_ref_key_for_plain_message(self):
         # A text message must not grow a null media_ref — keep the shape additive.
         out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "hi"}])
