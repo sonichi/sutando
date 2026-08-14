@@ -418,6 +418,11 @@ let startedAt = 0;
 // each JPEG frame to /vision/frame. The controller doesn't tick — it just
 // forwards frames to the live session.
 let pushMode = false;
+// Identity of the current stream session. Bumped on every start and every stop,
+// so work that awaited across either transition can tell it is stale. A plain
+// `pushMode` re-check after the await is not enough: stop followed by a new
+// start leaves the flag true again and would re-admit the old frame.
+let visionGeneration = 0;
 let pushSourceName: string | null = null;
 
 export function isStreaming(): boolean {
@@ -479,6 +484,7 @@ export function startStreaming(
 			// Push mode — caller (web-client, Mentra bridge, glasses webhook,
 			// etc.) captures frames and POSTs them to /vision/frame. No ticker.
 			stopStream();
+			visionGeneration++;
 			pushMode = true;
 			pushSourceName = lower;
 			frameCount = 0;
@@ -540,6 +546,7 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 	}
 	pushMode = false;
 	pushSourceName = null;
+	visionGeneration++;
 	const frames = frameCount;
 	const durationMs = startedAt ? Date.now() - startedAt : 0;
 	if (wasRunning) {
@@ -589,7 +596,16 @@ export async function submitFrame(data: Buffer, mimeType: string = 'image/jpeg')
 		return { ok: false, error: 'not in push mode — call /vision/start with source=browser first' };
 	}
 	try {
+		// Bind this submission to the session that admitted it. Bounding awaits,
+		// and a stop during that await must not land a frame after the user
+		// stopped sharing — it would contradict the stale-frames note and
+		// contaminate the next turn.
+		const gen = visionGeneration;
 		const bounded = await boundFrameCost(data, mimeType);
+		if (!pushMode || visionGeneration !== gen) {
+			console.warn(`${ts()} [Vision] frame dropped: stream stopped or restarted while the frame was being bounded`);
+			return { ok: false, error: 'stream stopped while frame was in flight' };
+		}
 		sendFile(bounded.data.toString('base64'), bounded.mimeType);
 		frameCount++;
 		// Log first frame so the user can confirm vision is wired end-to-end,
@@ -607,8 +623,15 @@ export async function submitFrame(data: Buffer, mimeType: string = 'image/jpeg')
 async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; error?: string }> {
 	const sendFile = getSendFile();
 	if (!sendFile) return { ok: false, error: 'no active voice session' };
+	// Same staleness rule as the push path — capture and bounding both await, so
+	// a stop in between must not deliver the frame.
+	const gen = visionGeneration;
 	const frame = await source.capture();
 	const bounded = await boundFrameCost(frame.data, frame.mimeType);
+	if (visionGeneration !== gen) {
+		console.warn(`${ts()} [Vision] frame dropped: stream stopped or restarted while the frame was in flight`);
+		return { ok: false, error: 'stream stopped while frame was in flight' };
+	}
 	sendFile(bounded.data.toString('base64'), bounded.mimeType);
 	// Fire post-send hooks (e.g. screen-companion injects selection text).
 	if (visionFrameHooks.length > 0) {
