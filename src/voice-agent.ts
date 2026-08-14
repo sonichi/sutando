@@ -47,6 +47,9 @@ function assertMacOS() {
 	}
 }
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { createAudioHealthLedger } from './voice-audio-health.js';
+import { createHealthPersistence } from './voice-audio-health-persist.js';
+import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper } from './voice-continuity.js';
 import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
@@ -554,22 +557,10 @@ const endSession: ToolDefinition = {
 		// Death spiral observed live 2026-04-09 at 22:57 — 3 self-initiated
 		// end_session calls in 36 seconds. sessionManager.reset() only
 		// clears the state machine; conversationContext persists separately.
-		try {
-			const vs = voiceSessionRef as any;
-			const items = vs?.conversationContext?.items;
-			// `items` is a GETTER returning bodhi's underlying _items array
-			// by reference. We can't reassign to it (TypeError: only has a
-			// getter, hit live at 23:01:09 on 2026-04-09) but we CAN mutate
-			// in place via `length = 0`. Verified against bodhi dist
-			// ConversationContext class around line 945 of index.js.
-			if (Array.isArray(items)) {
-				const count = items.length;
-				items.length = 0;
-				console.log(`${ts()} [end_session] Cleared ${count} conversationContext items`);
-			}
-		} catch (e) {
-			console.log(`${ts()} [end_session] Could not clear conversationContext: ${e}`);
-		}
+		// (`items` is a GETTER returning bodhi's underlying _items array by
+		// reference — mutate in place via length = 0, never reassign. The
+		// helper also rebases the turn.end transcript cursor: P7 D7.3.)
+		itemsClear.clear('end_session');
 		// Also force-close client WS after 4s as fallback
 		setTimeout(() => {
 			console.log(`${ts()} [end_session] Force-closing client WS`);
@@ -594,6 +585,19 @@ const endSession: ToolDefinition = {
 // =============================================================================
 
 let voiceSessionRef: VoiceSession | null = null;
+
+// P7 D7.3: the ONE clear path for bodhi's conversationContext — items and the
+// turn.end transcript cursor move together (G-P7-8: a clear that leaves the
+// cursor pointing past the emptied array makes the logger skip everything
+// that accumulates after it). Used by end_session, the goodbye detector, and
+// the sessionEnding turn.end sweep.
+const itemsClear = createConversationClearHelper(
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	() => (voiceSessionRef as any)?.conversationContext?.items,
+	(m) => console.log(`${ts()} ${m}`),
+);
+// P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side).
+let goodbyeGuard = initialGoodbyeGuard();
 
 // Unified base-mode resolver: see src/voice-mode-resolver.ts for the
 // rationale + canonical mode descriptors. Local wrapper threads the in-memory
@@ -696,13 +700,21 @@ const mainAgent: MainAgent = {
 			if (lastText.length === 0 || lastText.length >= 80) return;
 			const FAREWELL_START = /^(goodbye|bye\b|farewell|good\s*bye|see you)/i;
 			if (!FAREWELL_START.test(lastText)) return;
+			// P7 D7.3 stale-repeat guard: a reconnect replay can make the model
+			// repeat the SAME short farewell with no new real user turn — that
+			// repeat must not re-fire session_end.
+			const verdict = shouldFireGoodbye(goodbyeGuard, lastText, userTurnCount);
+			if (!verdict.fire) {
+				console.log(`${ts()} [Agent] Stale-repeat goodbye suppressed (same farewell, no new user turn)`);
+				return;
+			}
+			goodbyeGuard = verdict.next;
 			console.log(`${ts()} [Agent] Strict goodbye detected — closing client in 3s`);
 			logSessionBoundary('voice_goodbye');
 			(ctx as any).sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 			setTimeout(() => {
 				try {
-					const vsItems = (voiceSessionRef as any)?.conversationContext?.items;
-					if (Array.isArray(vsItems)) vsItems.length = 0;
+					itemsClear.clear('voice_goodbye');
 					const ct = (voiceSessionRef as any)?.clientTransport;
 					ct?.client?.close(4000, 'goodbye');
 				} catch {}
@@ -889,6 +901,16 @@ async function main() {
 		try { return String(VoiceSession).includes('probeState'); } catch { return false; }
 	})();
 
+	// P7 D7.1: engine-side audio-progress ledger (Tranche A interim, coverage
+	// session-only) + worker-thread persistence. Created before the session so
+	// the hooks below can reference it; the wraps install after construction.
+	const healthPersistence = createHealthPersistence();
+	const audioHealth = createAudioHealthLedger({
+		sessionId: SESSION_ID,
+		persist: (row) => healthPersistence.tryEnqueue(row),
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
+
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -943,6 +965,13 @@ async function main() {
 				clearActiveArtifact();
 				recorder.flush();
 			},
+			// P7 D7.3: bodhi's turn-latency hook was half-blind AND unconsumed
+			// (G-P7-12) — the ledger keeps the last value for [Health] and the
+			// persisted snapshot.
+			onTurnLatency: (e: { turnId?: string; segments?: { totalE2EMs?: number } }) => {
+				audioHealth.noteTurnLatency(e?.segments?.totalE2EMs);
+				console.log(`${ts()} [Latency] ${e?.turnId ?? '?'} e2e=${e?.segments?.totalE2EMs ?? '?'}ms`);
+			},
 			onToolCall: (e) => {
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				// tool_call event push removed per #1052 — canonical record
@@ -986,6 +1015,11 @@ async function main() {
 	});
 
 	sessionRef = session;
+
+	// P7 D7.1: install the session-layer ledger wraps (audio ingress count +
+	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
+	// count). Coverage is honestly session-only until the bodhi pin.
+	audioHealth.wrapSession(session);
 
 	// =========================================================================
 	// `agent.state` emission + lifecycle snapshot (Step 12 + amendment A9).
@@ -1184,7 +1218,8 @@ async function main() {
 	// The Cartesia stuck-session fallback is adapter-provided via opts.
 	wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech });
 
-	let lastLoggedIndex = 0;
+	// P7 D7.3: the transcript cursor lives in the clear helper so every clear
+	// path rebases it with the items array (G-P7-8).
 	const liveTranscriptPath = '/tmp/sutando-live-transcript-voice.txt';
 	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
 	session.eventBus.subscribe('turn.end', () => {
@@ -1194,12 +1229,10 @@ async function main() {
 		// to inject on the next reconnect. Items re-accumulate during
 		// the post-goodbye "Farewell. Talk to you next time." turns.
 		if (sessionEnding && Array.isArray(items) && items.length > 0) {
-			console.log(`${ts()} [turn.end] Clearing ${items.length} items (sessionEnding=true)`);
-			items.length = 0;
-			lastLoggedIndex = 0;
+			itemsClear.clear('session-ending-turn-end');
 			return;
 		}
-		for (const item of items.slice(lastLoggedIndex)) {
+		for (const item of items.slice(itemsClear.cursor.index)) {
 			if (item.role === 'user' || item.role === 'assistant') {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
 				logConversation(item.role, item.content, SESSION_ID);
@@ -1221,7 +1254,7 @@ async function main() {
 				}
 			}
 		}
-		lastLoggedIndex = items.length;
+		itemsClear.cursor.index = items.length;
 	});
 
 	// Track user interruption events as a secondary signal for the
@@ -1384,6 +1417,10 @@ async function main() {
 			origDisconnect();
 			recorder.flush();
 			writeVoiceState(false);
+			// P7 D7.1: final ledger row for the departing epoch — written NOW
+			// (the crash-evidence rule: end-of-session-only flushes lose it).
+			audioHealth.onClientDisconnected();
+			audioHealth.persistTick('final', false);
 			scheduleIdleTeardown();
 			// Step 12/A9: client detach is a lifecycle transition (and may
 			// flip upstream backoff→idle now that no client is attached).
@@ -1409,6 +1446,9 @@ async function main() {
 	if (origConnect) {
 		(session as any).handleClientConnected = () => {
 			cancelIdleTeardown();
+			// P7 D7.1: new client connection = new (pending) ledger epoch; the
+			// epoch value is minted on first heartbeat sight (nonce mapping).
+			audioHealth.onClientConnected();
 			// Z3 fence: a REAL connection invalidates any pending
 			// probe/verifier idle-restore — the restore must never tear the
 			// upstream down under this client.
@@ -1522,12 +1562,19 @@ async function main() {
 		const state = session.sessionManager.state ?? 'unknown';
 		const clientConnected = session.clientConnected;
 		// Log only on state changes or non-ACTIVE states — avoid 2,880 lines/day of
-		// "state=ACTIVE client=true" during healthy operation.
+		// "state=ACTIVE client=true" during healthy operation. P7 D7.1 inverts
+		// the suppression for anomalies: any tick where the ledger latched an
+		// anomaly logs the FULL line even mid-ACTIVE-streak (the suppression
+		// rule was hiding exactly the dead zones we need to see).
 		const status = `state=${state} client=${clientConnected}`;
-		if (state !== 'ACTIVE' || status !== lastLoggedStatus) {
-			console.log(`${ts()} [Health] ${status}`);
+		const anomaly = audioHealth.anomalySinceLastTick(clientConnected);
+		if (state !== 'ACTIVE' || status !== lastLoggedStatus || anomaly.anomalous) {
+			const seg = clientConnected ? ' ' + audioHealth.healthSegments(clientConnected) : '';
+			const why = anomaly.anomalous ? ` anomaly=${anomaly.reasons.join(',')}` : '';
+			console.log(`${ts()} [Health] ${status}${seg}${why}`);
 			lastLoggedStatus = status;
 		}
+		if (anomaly.anomalous) audioHealth.persistTick('anomaly', clientConnected);
 		// Clear any stale fatal-backoff once we observe a healthy session —
 		// otherwise a brief outage that triggered a backoff would suppress
 		// recovery from a later transient close even after the upstream
@@ -1549,6 +1596,13 @@ async function main() {
 			}
 		}
 	}, 30_000);
+
+	// P7 D7.1: periodic ledger persistence — a try-enqueue into the worker's
+	// one-slot mailbox (a busy slot skips the sample; §D7.0b). Anomaly rows
+	// ride the 30 s tick above; this is the once-a-minute baseline.
+	setInterval(() => {
+		audioHealth.persistTick('timer', session.clientConnected);
+	}, 60_000);
 
 	// The server bound successfully (EADDRINUSE would have exited via main().catch
 	// before here) — record the actual bound endpoint for the runtime descriptor.
