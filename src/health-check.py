@@ -572,6 +572,21 @@ def _resolved_vault() -> dict:
         return {"enabled": False, "remote_url": "", "_explicit_disable": False}
 
 
+def _vault_remote_url(vault: "dict | None" = None) -> str:
+    """Vault remote URL as the sync writer's CRON path resolves it: config
+    `vault.remote_url`, then the deprecated `.env` SUTANDO_MEMORY_REPO alias."""
+    resolved = _resolved_vault() if vault is None else vault
+    url = resolved.get("remote_url") or ""
+    if url:
+        return url
+    env_path = _resolve_dotenv()
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith("SUTANDO_MEMORY_REPO="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
@@ -1268,6 +1283,15 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: install would have trained operators to ignore the detector.
 WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
 
+#: `personal_path()` resolves these at the workspace root and never under `state/`,
+#: so the probe's "state belongs under state/" remedy would break the reader.
+WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
+    "PERSONAL_CLAUDE.md",
+    "stand-identity.json",
+    "stand-avatar.png",
+    "voice-context-active",
+})
+
 
 def check_workspace_root_tidy() -> "dict | None":
     """Flag loose FILES at the workspace root — state that escaped `state/`.
@@ -1301,6 +1325,7 @@ def check_workspace_root_tidy() -> "dict | None":
             p.name for p in WORKSPACE_DIR.iterdir()
             if p.is_file()
             and p.name not in WORKSPACE_ROOT_ALLOWED
+            and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
             and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
         )
     except OSError:
@@ -2224,15 +2249,7 @@ def check_memory_sync() -> dict:
     # nag (#2069).
     if vault.get("_explicit_disable"):
         return {"name": name, "status": "ok", "detail": "cross-machine sync disabled (config opt-out)"}
-    # Canonical config first (vault.remote_url), then the deprecated .env alias.
-    repo_url = vault.get("remote_url") or ""
-    if not repo_url:
-        env_path = _resolve_dotenv()
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                if line.startswith("SUTANDO_MEMORY_REPO="):
-                    repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
+    repo_url = _vault_remote_url(vault)
     if not repo_url:
         # Not configured anywhere → single-machine mode is a valid choice, not
         # a warn (#2069).
@@ -2395,6 +2412,11 @@ def check_per_host_config_backup() -> dict:
     warn on divergence; never mutates either file.
     """
     name = "per-host-config-backup"
+    # No vault URL → `_snapshot_per_host_config` is unreachable (it runs only
+    # inside sync-workspace's push path, which exits early without one).
+    if not _vault_remote_url():
+        return {"name": name, "status": "ok",
+                "detail": "no vault configured — nothing carries a backup (single-machine mode)"}
     try:
         # Resolve the live channels source from the SAME canonical resolver the
         # snapshot WRITER uses — sync-workspace's `_snapshot_per_host_config`
@@ -2549,12 +2571,18 @@ def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
     """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
 
-    Uses the LAST-FETCHED remote ref — deliberately does not fetch. A health
-    probe must stay fast and work offline, and a network call here would make
-    the whole run hang on a flaky link. The consequence is honest and stated in
-    the warning text: if the local ref is itself stale the count UNDERSTATES the
-    drift, so this can only under-report, never cry wolf.
+    Never fetches. Without a merge-base the count is not a distance, so returns None.
     """
+    try:
+        base = subprocess.run(
+            [git_bin, "-C", str(repo), "merge-base", "HEAD", f"origin/{branch}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if base.returncode != 0:
+        # No shared history: a count here would be a number without a meaning.
+        return None
     try:
         out = subprocess.run(
             [git_bin, "-C", str(repo), "rev-list", "--count", f"HEAD..origin/{branch}"],
@@ -2696,20 +2724,114 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # disagreed invisibly, and that is true of any content difference.
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     if stale_skills:
+        # No shared history: the tree diff is still valid, but no count and no
+        # fast-forward are, so say that rather than render "None commit(s)".
+        if behind is None:
+            distance = (f"live checkout is on {expected!r} an unknown distance behind "
+                        f"origin/{expected} (no common ancestor — shallow clone, so a commit "
+                        "count is not available)")
+            # "of them" needs a total to refer to.
+            share = f"{len(stale_skills)} commit(s) change"
+            refresh = (f"`git -C {repo} fetch --unshallow` first; `pull --ff-only` cannot "
+                       "apply without a shared history")
+        else:
+            distance = (f"live checkout is on {expected!r} and only {behind} commit(s) behind "
+                        f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
+                        "nag threshold")
+            # The count above is the TOTAL, so "of them" keeps the subset a subset.
+            share = f"{len(stale_skills)} of them change"
+            refresh = f"`git -C {repo} pull --ff-only`"
         return {"name": name, "status": "warn",
-                "detail": f"live checkout is on {expected!r} and only {behind} commit(s) behind "
-                          f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
-                          f"nag threshold — but {len(stale_skills)} of them change `skills/`, "
+                "detail": f"{distance} — but {share} `skills/`, "
                           "which the agent re-reads from this checkout on EVERY invocation. "
                           "Those merged skill fixes are not in effect here, and no "
                           "restart-staleness probe can see it: a skill has no running process "
                           f"to compare against. ({'; '.join(stale_skills[:3])}"
                           f"{'; …' if len(stale_skills) > 3 else ''}) Refresh with "
-                          f"`git -C {repo} pull --ff-only`. Measured against the last-fetched "
+                          f"{refresh}. Measured against the last-fetched "
                           "ref; this probe does not fetch, so it can only under-report."}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
                       + (f", {behind} commits behind" if behind else "")}
+
+
+def check_engine_revision_drift(repo_dir: "Path | None" = None,
+                                manifest_path: "Path | None" = None) -> dict:
+    """Warn when the checked-out source has moved off the BUILT engine revision.
+
+    `dist/` is gitignored, so source advances while the artifacts stay behind.
+    """
+    name = "engine-revision-drift"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    manifest = Path(manifest_path) if manifest_path is not None else repo.parent / "ENGINE_MANIFEST.json"
+
+    if not manifest.is_file():
+        # A plain source clone has no bundle manifest — nothing to compare.
+        return {"name": name, "status": "ok",
+                "detail": "no ENGINE_MANIFEST.json — not a bundled engine, skipping"}
+    try:
+        built = (json.loads(manifest.read_text()) or {}).get("sha")
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "ok",
+                "detail": f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]}) — skipping"}
+    if not isinstance(built, str) or not built.strip():
+        return {"name": name, "status": "ok",
+                "detail": "ENGINE_MANIFEST.json has no sha — skipping"}
+    built = built.strip()
+
+    # A resolver failure must degrade like resolve_git() -> None, never to bare
+    # `git`, which can resolve the Xcode-CLT stub and raise the install dialog.
+    try:
+        from git_binary import resolve_git  # noqa: PLC0415
+        git_bin = resolve_git()
+    except Exception:
+        git_bin = None
+    if git_bin is None:
+        return {"name": name, "status": "ok", "detail": "no runnable git — skipping"}
+
+    def _git(*args):
+        return subprocess.run([git_bin, "-C", str(repo), *args],
+                              capture_output=True, text=True, timeout=10)
+
+    try:
+        head = _git("rev-parse", "HEAD")
+    except (OSError, subprocess.TimeoutExpired):
+        return {"name": name, "status": "ok", "detail": "git not runnable — skipping"}
+    if head.returncode != 0:
+        return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
+    head_sha = head.stdout.strip()
+    # Normalise first: an abbreviated sha (or a tag) of the checked-out commit
+    # would otherwise compare unequal and print "X != X (0 commits ahead)".
+    try:
+        resolved = _git("rev-parse", f"{built}^{{commit}}")
+        if resolved.returncode == 0 and resolved.stdout.strip():
+            built = resolved.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # keep the literal; the comparison below is still correct for it
+    if head_sha == built:
+        return {"name": name, "status": "ok",
+                "detail": f"source matches built revision {built[:9]}"}
+
+    # An unanswerable count must not soften the drift, which is already established.
+    detail = f"source HEAD {head_sha[:9]} != built revision {built[:9]}"
+    try:
+        if _git("cat-file", "-e", built).returncode == 0 and \
+           _git("merge-base", "--is-ancestor", built, "HEAD").returncode == 0:
+            ahead = _git("rev-list", "--count", f"{built}..HEAD").stdout.strip()
+            # Zero ahead of an ancestor means it IS this commit under another name.
+            if ahead == "0":
+                return {"name": name, "status": "ok",
+                        "detail": f"source matches built revision {built[:9]}"}
+            if ahead:
+                detail += f" ({ahead} commits ahead)"
+        else:
+            detail += " (diverged, or the built commit is outside this shallow clone)"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"name": name, "status": "warn",
+            "detail": detail + " — dist/ is gitignored so it did NOT follow the source; "
+                               "the Node half still runs the older build. Rebuild and "
+                               "reactivate the engine rather than trusting the checkout."}
 
 
 def check_migrate_reader_contract() -> dict:
@@ -4116,7 +4238,7 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
 
 
 def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
-    """Does the proxy inject THIS core's login, or a different account's?
+    """Does the proxy resolve THIS core's login, or a different account's?
 
     `check_quota_telemetry` above answers "is quota-state fresh, and does it
     exist" — both are questions about WHEN, and neither can see the failure
@@ -4258,17 +4380,25 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
 
     if core_service == proxy_service:
         return {"name": name, "status": "ok",
-                "detail": f"proxy injects this core's login ({core_service})"}
+                "detail": (f"proxy and core resolve the same keychain item "
+                           f"({core_service}) — name match only; this check "
+                           f"does not read tokens")}
 
     return {
         "name": name,
         "status": "warn",
         "detail": (
-            f"the credential proxy injects a DIFFERENT login than this core's: proxy "
-            f"resolves '{proxy_service}', core would resolve '{core_service}'. Quota "
-            f"numbers describe the proxy's account, not yours, and requests bill it — "
-            f"a `/login` here will not reach the proxy. Cause is almost always the "
-            f"launchd plist omitting CLAUDE_CONFIG_DIR (launchd inherits no shell env): "
+            f"the credential proxy resolves a DIFFERENT login than this core's: proxy "
+            f"resolves '{proxy_service}', core would resolve '{core_service}'. What "
+            f"follows turns on state this check does not read: if the proxy's stored "
+            f"token is usable and the request carries an authorization header, the proxy "
+            f"substitutes its own — quota numbers then describe that account, requests "
+            f"bill it, and a `/login` here will not reach the proxy; if that token is "
+            f"unusable the proxy engages pass-through, forwarding whatever credential the "
+            f"client supplied and billing that account instead, or answering 401 when the "
+            f"client supplied none. Either way "
+            f"the cause is almost always the launchd plist omitting CLAUDE_CONFIG_DIR "
+            f"(launchd inherits no shell env): "
             f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
             f"Fix: pin CLAUDE_CONFIG_DIR in "
             f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
@@ -7113,6 +7243,20 @@ def check_core_model_pin() -> dict:
     return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 
+MENUBAR_LABEL = "com.sutando.menubar"
+MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
+
+
+def menubar_app_state(dev_bin, app_bin, plist, is_macos: bool) -> str:
+    """installed | expected-missing | not-applicable for the optional menu-bar app.
+    The launchd plist is the only durable signal a host ASKED for the app."""
+    if dev_bin.exists() or app_bin.exists():
+        return "installed"
+    if not is_macos:
+        return "not-applicable"
+    return "expected-missing" if plist.exists() else "not-applicable"
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -7243,6 +7387,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
     checks.append(check_live_checkout_branch())
+    checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
@@ -7484,7 +7629,9 @@ def run_all_checks() -> list[dict]:
     # the menu bar check to run so dashboard reports accurate status.
     dev_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     app_bin = Path("/Applications/Sutando.app/Contents/MacOS/Sutando")
-    if dev_bin.exists() or app_bin.exists():
+    _menubar = menubar_app_state(
+        dev_bin, app_bin, MENUBAR_PLIST, sys.platform == "darwin")
+    if _menubar == "installed":
         # Distinguish pgrep failures (exit code != 0 and != 1) from a real
         # no-match (exit code 1). Pre-fix the bare try/except swallowed
         # subprocess errors AND empty results into a single "no pids" path,
@@ -7540,6 +7687,12 @@ def run_all_checks() -> list[dict]:
             # actually couldn't determine state. Surface as a transient warn
             # with the cause so it's debuggable, not a routine "app is down."
             checks.append({"name": "sutando-app", "status": "warn", "detail": f"detection failed (pgrep: {pgrep_err or 'unknown error'}) — actual app state unknown"})
+    elif _menubar == "expected-missing":
+        # Only a host that ASKED for the app can be missing it; a headless
+        # install has no plist and gets no row, like check_gateway_bridge().
+        checks.append({"name": "sutando-app", "status": "warn", "detail": (
+            f"launchd job {MENUBAR_LABEL} is installed but no binary exists at "
+            f"{dev_bin} or {app_bin} — app state UNKNOWN, not ok")})
 
     # Battery and memory health checks
 

@@ -31,6 +31,45 @@ from pathlib import Path
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
+
+class _NeverFatalStream:
+    """Logging must never take delivery down.
+
+    Because the streams above are LINE-buffered, every `print()` flushes at the
+    newline — so if the far end of stdout goes away (supervisor exits, pipe
+    closed, launcher reaped), that flush raises `BrokenPipeError` *inside
+    whatever code was logging*, not at some later flush point.
+
+    Swallow ONLY OSError (the EPIPE/EBADF class). A logging failure is not a
+    reason to stop delivering; anything else still propagates so real bugs are
+    not masked.
+    """
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except OSError:
+            # Report the write as accepted: callers must not branch on it.
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _NeverFatalStream(sys.stdout)
+sys.stderr = _NeverFatalStream(sys.stderr)
+
 # Self-rescue: this bridge HAS to keep running — Discord is the primary channel
 # the owner uses to reach Sutando. If `python3` on $PATH happens to resolve to
 # an interpreter that lacks `discord.py` (e.g. miniconda's python on a Mac that
@@ -126,6 +165,41 @@ REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
+
+#: Consecutive polls each result file has been present-but-empty. Bridge-owned
+#: state; threshold and wording live in result_router so the bridges cannot drift.
+_empty_result_polls: "dict[str, int]" = {}
+
+
+class EmptyResultError(Exception):
+    """A result file that stayed empty past the bound — never delivered."""
+
+
+async def _note_empty_result(task_id: str, result_file) -> None:
+    """At the bound: owner DM, audit row, drain `pending_replies`, archive. Below it a
+    no-op, because that window is indistinguishable from a normal partial write."""
+    notice = result_router.note_empty_result(
+        _empty_result_polls, task_id, str(result_file))
+    if not notice:
+        return                                    # still inside the write window
+    print(f"  {notice}", flush=True)
+    # Pop every task-scoped map the normal-delivery cleanup pops, or the task
+    # reports resolved while still visible to queue-health.
+    _empty_result_polls.pop(task_id, None)
+    channel = pending_replies.pop(task_id, None)  # stop re-polling it
+    _atomic_write_pending_replies(
+        {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
+    _progress_msgs.pop(task_id, None)             # else the placeholder never clears
+    tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
+    archive_file(result_file, "results", task_id)
+    # Archive the SOURCE TASK too. Without this the task file sits in tasks/
+    # forever: discovery re-reads it and queue health counts it as pending work.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+
+
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
@@ -2468,6 +2542,38 @@ def _recover_orphan_sending_files() -> int:
 # re-fires on every gateway reconnect, so without this the loops accumulate.
 _poll_loops_started = False
 
+# Restart delay after a poll loop crashes. Long enough that a persistently
+# failing loop can't spin, short enough that delivery resumes on its own.
+POLL_LOOP_RESTART_SEC = 5
+
+
+async def _supervise_loop(coro_fn, name):
+    """Keep a poll loop alive across crashes.
+
+    Each `poll_*` coroutine is an unbounded `while True`, so an exception that
+    escapes its body ends that loop *permanently* while the process stays up —
+    the bridge keeps receiving and silently stops delivering, with nothing in
+    the logs (the escape can itself be a logging failure; see
+    `_NeverFatalStream`). `poll_results` in particular has no loop-level
+    try/except at all, so one raise past its inner handler is terminal.
+
+    Restart instead of dying. Re-entry is safe for these loops: they rebuild
+    their state from `pending_replies` / `results/` on each pass, and re-send is
+    gated by the `_mark_delivered` sentinel, so a restarted loop cannot
+    duplicate a delivery that already happened. `CancelledError` is re-raised —
+    shutdown must stay prompt.
+    """
+    while True:
+        try:
+            await coro_fn()
+            # A poll loop returning is itself unexpected (they never exit).
+            print(f"  [{name}] loop returned unexpectedly — restarting in {POLL_LOOP_RESTART_SEC}s", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"  [{name}] loop crashed: {type(exc).__name__}: {exc} — restarting in {POLL_LOOP_RESTART_SEC}s", flush=True)
+        await asyncio.sleep(POLL_LOOP_RESTART_SEC)
+
 
 @client.event
 async def on_ready():
@@ -2534,13 +2640,13 @@ async def on_ready():
     global _poll_loops_started
     if not _poll_loops_started:
         _poll_loops_started = True
-        client.loop.create_task(poll_results())
-        client.loop.create_task(poll_progress())
-        client.loop.create_task(poll_approved())
-        client.loop.create_task(poll_proactive())
-        client.loop.create_task(poll_dm_fallback())
+        client.loop.create_task(_supervise_loop(poll_results, "poll_results"))
+        client.loop.create_task(_supervise_loop(poll_progress, "poll_progress"))
+        client.loop.create_task(_supervise_loop(poll_approved, "poll_approved"))
+        client.loop.create_task(_supervise_loop(poll_proactive, "poll_proactive"))
+        client.loop.create_task(_supervise_loop(poll_dm_fallback, "poll_dm_fallback"))
         # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
-        client.loop.create_task(_mod_flush_timer_loop())
+        client.loop.create_task(_supervise_loop(_mod_flush_timer_loop, "_mod_flush_timer_loop"))
 
 
 def _message_mentions_bot(message):
@@ -4523,7 +4629,9 @@ async def poll_results():
                 import re
                 reply_text = read_ready_result(result_file)
                 if reply_text is None:
+                    await _note_empty_result(task_id, result_file)
                     continue
+                _empty_result_polls.pop(task_id, None)
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving
@@ -4844,6 +4952,10 @@ async def poll_results():
                 # its purpose, remove to bound `discord-delivered/`
                 # directory growth.
                 _clear_delivered(task_id)
+            else:
+                # CONSECUTIVE means consecutive: an absent file breaks the run, or a
+                # writer that retries accumulates counts across separate appearances.
+                _empty_result_polls.pop(task_id, None)
         await asyncio.sleep(1)
 
 
