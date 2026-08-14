@@ -67,6 +67,8 @@ jobs:
         # (auth/rate-limit/network) sent an empty diff to the scanner, which
         # printed "empty diff — nothing to check" and exited 0 → the gate passed
         # WITHOUT scanning the PR. `set -euo pipefail` + `--diff` closes that.
+        # The runner now also exits 2 on an empty diff, so both ends fail closed;
+        # a PR whose diff is genuinely empty fails here rather than passing unscanned.
         run: |
           set -euo pipefail
           gh pr diff ${{ github.event.pull_request.number }} > /tmp/review-pr.diff

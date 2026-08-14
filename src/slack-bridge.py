@@ -1058,9 +1058,20 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
     _claude_config_dir = claude_home_path()
     skill_hints = ""
-    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+    # CONTEXT-FIRST is a correctness step, not a skill hint: it must not be
+    # gated on optional skills. The steps that need them stay conditional inside.
+    if access_tier == "owner":
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
+        hints_lines.append(
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained '
+            f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
+            f'stated here), reconstruct context BEFORE interpreting. Slack has no '
+            f'channel-history fetch in this bridge, so use the embedded thread/reply '
+            f'context above (if present) plus the session transcript, and answer from '
+            f'that, not from memory.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_thread_arg = (
                 f" --thread-ts {shlex.quote(str(reply_thread_ts))}"
