@@ -4310,8 +4310,8 @@ def _record_skip_audit(task_id: str, skip_value: str) -> None:
 
 
 def _is_sandbox_fallback_result(body, is_dm):
-    """True iff this body is the Stage-2 sandbox sentinel bound for a non-DM
-    destination. startswith, so an appended wrapper line cannot reopen the leak."""
+    """True iff this body is EXACTLY the Stage-2 sandbox sentinel and is bound for a
+    non-DM destination. Exact match: prose merely opening with it is real content."""
     if is_dm:
         return False
     return is_sandbox_fallback_sentinel(body)
