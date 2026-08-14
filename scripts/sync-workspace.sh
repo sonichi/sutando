@@ -38,8 +38,11 @@
 # un-ignores exactly the include list. So setting vault.sync.include to add one
 # path silently DROPS every default path — notes/, hosts/*/ and the whole
 # .claude-sutando/projects/*/memory/ corpus — out of the backup, while this
-# script goes on printing "pushed to <branch>" on every run. To add a path you
-# must restate the full carrier set.
+# script goes on printing "pushed to <branch>" on every run. To add an INCLUDE
+# path you must restate the full carrier set.
+#
+# `vault.sync.exclude_extra` appends instead of replacing — use it rather than
+# restating `exclude`. No `include_extra`: unioning a whitelist widens the vault.
 #
 # `exclude` subtracts, carving subpaths out of an included parent (emitted after
 # the includes so gitignore's last-match-wins applies).
@@ -61,6 +64,7 @@
 #   2. sutando.config.local.json → vault.remote_url (per-clone canonical)
 #   3. sutando.config.json → vault.remote_url (tracked default)
 #   4. .env SUTANDO_MEMORY_REPO (deprecated legacy alias; warn-and-honor for one release)
+#   5. the workspace repo's own `origin` remote (recovery — see Priority 5 below)
 #
 # Note: SUTANDO_VAULT env var (introduced in PR-1 = #1445) is REMOVED in PR-2.
 # Brand new, no users to deprecate; CLI flag + config-file is the canonical surface.
@@ -165,22 +169,76 @@ fi
 # env var if set in .env — no need to re-grep the file (eliminates the
 # var=$(grep | head | ...) set-e trap class entirely; see Mini #1445 v4 Medium).
 VAULT_URL=""
+# Provenance for --status: resolution reports it on stderr as it runs, but
+# --status is read long after those lines have scrolled away.
+VAULT_URL_SOURCE=""
+VAULT_URL_DECLINED=""
+VAULT_URL_DECLINED_REASON=""
 
 # Priority 1: --vault-url CLI flag (explicit)
 if [ -n "$VAULT_URL_FLAG" ]; then
     VAULT_URL="$VAULT_URL_FLAG"
+    VAULT_URL_SOURCE="--vault-url flag"
 fi
 
 # Priority 2+3: sutando.config.{local,base}.json → vault.remote_url
 # (loader merges local + base + applies ${REPO_DIR} substitution)
 if [ -z "$VAULT_URL" ] && [ -f "$SCRIPT_PARENT/scripts/sutando-config.sh" ]; then
     VAULT_URL="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-url 2>/dev/null || true)"
+    [ -n "$VAULT_URL" ] && VAULT_URL_SOURCE="sutando.config"
 fi
 
 # Priority 4: legacy .env SUTANDO_MEMORY_REPO (warn-and-honor for one release)
 if [ -z "$VAULT_URL" ] && [ -n "${SUTANDO_MEMORY_REPO:-}" ]; then
     VAULT_URL="$SUTANDO_MEMORY_REPO"
+    VAULT_URL_SOURCE="SUTANDO_MEMORY_REPO (deprecated)"
     echo "sync-workspace: SUTANDO_MEMORY_REPO is deprecated; move vault URL to sutando.config.local.json under vault.remote_url." >&2
+fi
+
+# Priority 5: the workspace repo's own origin, adopted only when it already
+# carries THIS workspace's own `host/*/<wsId>` branch.
+if [ -z "$VAULT_URL" ] \
+   && [ "$(git -C "$WORKSPACE_DIR" rev-parse --show-toplevel 2>/dev/null || true)" \
+        = "$(cd "$WORKSPACE_DIR" && pwd -P)" ]; then
+    _origin_url="$(git -C "$WORKSPACE_DIR" remote get-url origin 2>/dev/null || true)"
+    # Read the id, never mint one: _ws_id() is defined below and persists a
+    # fresh id, which would invent an identity no vault can be carrying.
+    _wsid="$(tr -d '[:space:]' < "$WORKSPACE_DIR/.sutando-vault/ws-id" 2>/dev/null || true)"
+    # The id goes into a ref glob, so it must match what _ws_id mints: a
+    # persisted `*` asks for host/*/*, which any host branch anywhere answers.
+    case "$_wsid" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) _wsid_ok=1 ;;
+        *) _wsid_ok=0 ;;
+    esac
+    if [ -n "$_origin_url" ] && [ -z "$_wsid" ]; then
+        VAULT_URL_DECLINED="$_origin_url"
+        VAULT_URL_DECLINED_REASON="workspace has no .sutando-vault/ws-id to identify its vault branch"
+        echo "sync-workspace: no vault URL configured, and this workspace has no .sutando-vault/ws-id to identify its vault branch; refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+    elif [ -n "$_origin_url" ] && [ "$_wsid_ok" != "1" ]; then
+        VAULT_URL_DECLINED="$_origin_url"
+        VAULT_URL_DECLINED_REASON="workspace ws-id is not a valid workspace id (expected six lowercase hex characters), so it identifies no vault branch"
+        echo "sync-workspace: this workspace's .sutando-vault/ws-id is not a valid workspace id (expected six lowercase hex characters); refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+    elif [ -n "$_origin_url" ]; then
+        # Unreachable is not the same answer as not-a-vault, and an operator
+        # told the wrong one edits the wrong thing.
+        _ls_rc=0
+        _ls_out="$(GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$_origin_url" "host/*/$_wsid" 2>/dev/null)" || _ls_rc=$?
+        if [ "$_ls_rc" != "0" ]; then
+            VAULT_URL_DECLINED="$_origin_url"
+            VAULT_URL_DECLINED_REASON="unreachable this run, so it could not be confirmed either way"
+            echo "sync-workspace: could not reach the workspace repo's origin ($_origin_url) to confirm it is a vault; not recovering a URL from it this run." >&2
+        elif [ -n "$_ls_out" ]; then
+            VAULT_URL="$_origin_url"
+            VAULT_URL_SOURCE="workspace repo origin, identity-verified (carries host/*/$_wsid)"
+            echo "sync-workspace: no vault URL configured; recovered it from the workspace repo's own origin ($VAULT_URL). Restore vault.remote_url in sutando.config.local.json to silence this." >&2
+        else
+            VAULT_URL_DECLINED="$_origin_url"
+            VAULT_URL_DECLINED_REASON="carries no host/*/$_wsid branch, so this workspace has never pushed to it"
+            echo "sync-workspace: the workspace repo's origin ($_origin_url) carries no host/*/$_wsid branch, so it is not a vault this workspace has pushed to; refusing to recover a vault URL from it." >&2
+        fi
+        unset _ls_rc _ls_out
+    fi
+    unset _origin_url _wsid _wsid_ok
 fi
 
 # --------------------------------------------------------------------------- #
@@ -483,6 +541,28 @@ _compose_exclude_content() {
     echo "*.jks"
 }
 
+# Print `existing` with a legacy per-host carrier scope rewritten to the shared
+# `hosts/*/` form. Unchanged when the host label is not a literal path segment.
+_widen_legacy_host_scope() {
+    local existing="$1" own_host
+    own_host="$(_host)"
+    if ! _is_literal_host_label "$own_host"; then
+        cat "$existing"
+        return 0
+    fi
+    awk -v host="$own_host" '
+        $0 == "!hosts/" host "/" {
+            print "!hosts/*/"
+            next
+        }
+        $0 == "!hosts/" host "/**" {
+            print "!hosts/*/**"
+            next
+        }
+        { print }
+    ' "$existing"
+}
+
 # Return success only when an existing generated rule set differs from the
 # desired one solely because one or more legacy `!hosts/<label>/` entries need
 # widening to `!hosts/*/`. This narrow comparison preserves the existing
@@ -492,19 +572,47 @@ _is_safe_legacy_host_scope_widening() {
     local existing="$1" desired="$2" own_host
     own_host="$(_host)"
     _is_literal_host_label "$own_host" || return 1
-    cmp -s <(
-        awk -v host="$own_host" '
-            $0 == "!hosts/" host "/" {
-                print "!hosts/*/"
-                next
-            }
-            $0 == "!hosts/" host "/**" {
-                print "!hosts/*/**"
-                next
-            }
-            { print }
-        ' "$existing"
-    ) "$desired"
+    cmp -s <(_widen_legacy_host_scope "$existing") "$desired"
+}
+
+# Comments and blanks are inert in gitignore, so header drift between generated
+# versions must not decide whether a refresh is safe.
+_exclude_rules_only() {
+    grep -vE '^[[:space:]]*(#|$)' "$1" | sort
+}
+
+# A previously-generated exclude whose ONLY difference is carve-outs the shipped
+# config now adds is safe to refresh: no operator-authored rule is lost.
+_is_safe_carveout_addition() {
+    local existing="$1" desired="$2" shipped shipped_rules line path widened rc
+    # Compare against the HOST-WIDENED existing content: the two safe migrations are
+    # independent, so a file needing both was refused by each recognizer alone.
+    widened="$(mktemp -t sync-workspace-widened.XXXXXX)" || return 1
+    _widen_legacy_host_scope "$existing" > "$widened"
+    existing="$widened"
+    shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
+    [ -n "$shipped" ] || { rm -f "$widened"; return 1; }
+    # Compare against what the composer EMITS, not the raw config value: a
+    # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
+    shipped_rules=""
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
+    done <<<"$shipped"
+    shipped="$shipped_rules"
+    rc=0
+    # Refuse if the refresh would DROP any rule the existing file carries.
+    if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ]; then
+        rc=1
+    else
+        # Every added rule must be a shipped carve-out, never an operator's line.
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            grep -qxF -- "$line" <<< "$shipped" || { rc=1; break; }
+        done < <(comm -13 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))
+    fi
+    rm -f "$widened"
+    return "$rc"
 }
 
 # Write `<workspace>/.git/info/exclude` from the composed content. Also
@@ -570,6 +678,9 @@ generate_exclude() {
         elif _is_safe_legacy_host_scope_widening "$exclude_path" "$tmp_path"; then
             log "generate_exclude: safely widened legacy hosts/<label>/ carrier rules to hosts/*/"
             color_warn "sync-workspace: widened legacy hosts/<label>/ carrier rules to hosts/*/ so peer host state remains durable"
+        elif _is_safe_carveout_addition "$exclude_path" "$tmp_path"; then
+            log "generate_exclude: refreshed a previously-generated exclude with shipped carve-outs only"
+            color_warn "sync-workspace: added shipped carve-out(s) to the existing exclude file; no operator rule was removed"
         elif [ "$FORCE_GITIGNORE" != "1" ]; then
             color_warn "sync-workspace: $exclude_path EXISTS and DIFFERS from the generated content."
             color_warn "Refusing to overwrite (operator-authored content may block carrier-set paths)."
@@ -1353,10 +1464,24 @@ _push_only_impl() {
     fi
 
     # Mass-deletion tripwire (carried over from sync-memory.sh)
-    local deleted max_delete
+    local deleted staged_d untracked_by_policy max_delete _p
     # `-M` for rename detection: legitimate moves (refactor) don't count as
     # deletions. Mirrors pull-side tripwire fix. Mini #1445 v4 Low.
-    deleted=$(git diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
+    staged_d=$(git diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
+    # A policy untrack leaves the file on disk; a real deletion does not. Both
+    # stage a D under an excluded path, so disk presence is the discriminator.
+    untracked_by_policy=0
+    while IFS= read -r -d '' _p; do
+        if [ -e "$_p" ] || [ -L "$_p" ]; then
+            untracked_by_policy=$(( untracked_by_policy + 1 ))
+        fi
+    done < <(git diff -M --cached --name-only --diff-filter=D -z \
+        | git check-ignore -z --stdin --no-index 2>/dev/null || true)
+    deleted=$(( staged_d - untracked_by_policy ))
+    [ "$deleted" -ge 0 ] || deleted=0
+    if [ "$untracked_by_policy" -gt 0 ]; then
+        log "_push_only_impl: tripwire counts $deleted real deletion(s); $untracked_by_policy staged D(s) are policy untracks still on disk"
+    fi
     max_delete="${SUTANDO_SYNC_MAX_DELETE:-50}"
     if [ "$deleted" -gt "$max_delete" ] && [ "${SUTANDO_FORCE_SYNC:-0}" != "1" ]; then
         log "_push_only_impl: ABORT — would delete $deleted files (>$max_delete tripwire)"
@@ -1401,13 +1526,48 @@ cmd_default_bidirectional() {
     fi
     acquire_lock
     _pull_only_impl || true   # pull failures shouldn't block push
-    _push_only_impl
+    # `|| _rc=$?`, NOT a bare call then `$?`: under `set -e` a non-zero
+    # `_push_only_impl` would exit before the reporter below ever runs.
+    local _rc=0
+    _push_only_impl || _rc=$?
+    # Report rather than auto-merge: a union merge loses no line but resurrects
+    # an in-place retraction beneath its own correction, where it reads as current.
+    _report_unmerged_conflicts || true   # fail-open: never change sync's outcome
+    return "$_rc"
+}
+
+# Print preserved-but-unmerged peer content. Deliberately does NOT gate on the
+# reporter's exit status: a broken diagnostic must not fail a good sync.
+_report_unmerged_conflicts() {
+    local script="$REPO_DIR/scripts/sync-conflicts-report.py"
+    [ -f "$script" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local out
+    out="$(python3 "$script" "$WORKSPACE_DIR" 2>&1)" || true
+    # Only speak up when there is something to merge back; the clean case is
+    # silent so a 30-minute cron does not grow a nag nobody reads.
+    case "$out" in
+        *"no unmerged peer content"*) log "_report_unmerged_conflicts: clean" ;;
+        "") : ;;
+        *) log "_report_unmerged_conflicts: $out"; printf '%s\n' "$out" ;;
+    esac
+    return 0
 }
 
 cmd_status() {
     echo "WORKSPACE_DIR: $WORKSPACE_DIR"
     echo "REPO_DIR:      $REPO_DIR"
-    echo "VAULT_URL:     ${VAULT_URL:-<unset>}"
+    # A recovered URL and a configured one print identically without the source,
+    # and a declined candidate reads as an <unset> naming nothing to go fix.
+    if [ -n "$VAULT_URL" ]; then
+        echo "VAULT_URL:     $VAULT_URL${VAULT_URL_SOURCE:+  (source: $VAULT_URL_SOURCE)}"
+    else
+        echo "VAULT_URL:     <unset>"
+        if [ -n "$VAULT_URL_DECLINED" ]; then
+            echo "               candidate NOT adopted: $VAULT_URL_DECLINED"
+            echo "               reason: $VAULT_URL_DECLINED_REASON"
+        fi
+    fi
     # Surface the wsId only if it exists — don't generate just for status.
     # Pair it with the local workspace path on the same line so the
     # wsId↔folder mapping is visually unambiguous for the operator.
@@ -1428,6 +1588,10 @@ cmd_status() {
         echo "current branch: $current_branch"
         echo "remote branches:"
         git for-each-ref --format='  %(refname:short) (last push: %(committerdate:relative))' refs/remotes/origin/host/ 2>/dev/null | head -20 || true
+    elif [ -f "$WORKSPACE_DIR/.git" ]; then
+        # A linked worktree has a .git FILE. Reporting it as "not a git repo"
+        # contradicts the VAULT_URL line printed just above it.
+        echo "git status: workspace is a linked git WORKTREE (.git is a file); --push-only refuses this layout"
     else
         echo "git status: workspace is NOT a git repo (run --init)"
     fi
@@ -1480,10 +1644,10 @@ _migrate_from_legacy_impl() {
         echo "sync-workspace migrate: copying from $legacy_dir into $WORKSPACE_DIR" >&2
     fi
 
-    # Local slug derivation: matches Claude Code's auto-derived slug
-    # (REPO_DIR with / replaced by -).
+    # Claude Code dashes EVERY non-alphanumeric char, not just `/`; a path with a
+    # space or dot would otherwise resolve to a slug it never creates.
     local local_slug
-    local_slug="$(printf '%s' "$REPO_DIR" | sed 's|/|-|g')"
+    local_slug="$(printf '%s' "$REPO_DIR" | tr -c 'A-Za-z0-9' '-')"
 
     # Per-host segment for hostname-qualified destinations (build_log,
     # pending-questions). Computed once; matches `_host()` + the reader probe.

@@ -285,6 +285,10 @@ _KNOWN_SOURCES = frozenset({
     "twilio_voice", "twilio_sms", "twilio_voicemail",
     "cron", "health-check", "sync-memory", "sync-workspace",
     "github", "web", "push", "remote",
+    # Gateway (AG2 Space) surfaces — emitted by ag2_sparrow's _write_task:
+    # "ag2space" for direct room messages, "events-promotion" for taskify
+    # promotions, "remote" (above) as the REMOTE_TASK_PROVIDER default.
+    "ag2space", "events-promotion",
 })
 
 
@@ -294,6 +298,17 @@ def _coarse_source(source: str) -> str:
     cardinality and accidental identifier/secret leakage (CR #2274)."""
     s = (source or "").strip().lower()
     return s if s in _KNOWN_SOURCES else "unknown"
+
+
+def bucket_source(source: str, default: str = "unknown") -> str:
+    """Resolve a ``source:`` to a known bucket, falling back to ``default``
+    instead of the generic ``unknown``. A surface with a known home passes its
+    own bucket — e.g. the gateway is the ``remote`` surface, so a gateway task
+    whose per-task/per-deployment label isn't allowlisted counts as ``remote``,
+    not lost to ``unknown``. ``default`` is itself validated, so it can't smuggle
+    cardinality either."""
+    coarse = _coarse_source(source)
+    return coarse if coarse != "unknown" else _coarse_source(default)
 
 
 def task_processed(source: str, *, flush: bool = False) -> None:

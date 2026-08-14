@@ -16,8 +16,6 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 <!-- fix() PRs go here -->
 
-- Pending questions listed in the web UI can be answered again. `POST /answer` skipped every free-form section, so answering any question returned "not found or already answered"; question ids are now derived from each section's own content (stable across rewrites of the file, and distinct + non-renumbering when two open questions share a title) instead of the section's position, and archived entries below the `# Resolved` divider are no longer offered as open. ([#2103])
-
 ## Changed
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->

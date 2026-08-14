@@ -11,21 +11,24 @@
 #   git diff | bash scripts/review-checks.sh                 # scan a diff on stdin
 #   bash scripts/review-checks.sh --diff pr.diff             # scan a diff file
 #   bash scripts/review-checks.sh --guide path/to/REVIEW.md --diff pr.diff
+#   bash scripts/review-checks.sh --allow-empty --diff pr.diff  # empty input OK
 #
 # Guide resolution: --guide wins; else <repo>/REVIEW.md. Missing
 # guide -> generic fallback patterns + a stderr note (degrades safely).
 #
-# Exit: 0 = clean; 1 = a check flagged something; 2 = usage error OR the scanner
-#       failed to launch/run (fail-closed — NEVER print PASS in that case).
+# Exit: 0 = clean; 1 = a check flagged something; 2 = usage error, EMPTY input, or
+#       scanner failure — all fail-closed, no PASS. --allow-empty makes empty = 0.
 set -u
 
 DIFF_FILE=""
 GUIDE=""
+ALLOW_EMPTY=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --diff)  DIFF_FILE="${2:?--diff needs a path}"; shift 2;;
         --guide) GUIDE="${2:?--guide needs a path}";    shift 2;;
-        -h|--help) sed -n '2,16p' "$0"; exit 0;;
+        --allow-empty) ALLOW_EMPTY=1; shift;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0;;
         *) echo "review-checks: unknown arg '$1'" >&2; exit 2;;
     esac
 done
@@ -41,7 +44,17 @@ else
 fi
 # Non-empty test via regex (NOT ${DIFF//…/} — that global substitution is
 # O(pathological) on a large string under macOS bash 3.2 and effectively hangs).
-[[ "$DIFF" =~ [^[:space:]] ]] || { echo "review-checks: empty diff — nothing to check." >&2; exit 0; }
+if [[ ! "$DIFF" =~ [^[:space:]] ]]; then
+    # "Nothing was scanned" is not "nothing was found": exiting 0 here let every
+    # wrapper (and every agent) read a no-op invocation as a clean gate.
+    if [[ -n "$ALLOW_EMPTY" ]]; then
+        echo "review-checks: empty diff — nothing to check (--allow-empty)." >&2
+        exit 0
+    fi
+    echo "review-checks: ERROR — empty diff; nothing was scanned, so this is NOT a pass." >&2
+    echo "  Pipe a diff, or pass --diff <file>; use --allow-empty to accept an empty input." >&2
+    exit 2
+fi
 
 [[ -n "$GUIDE" ]] || GUIDE="$REPO/REVIEW.md"
 
@@ -73,7 +86,15 @@ FLAGS="$(parse_list flag)"
 FLAGS_EXACT="$(parse_list flag_exact)"
 ALLOWS="$(parse_list allow)"
 ALLOW_PAIRED="$(parse_list allow_paired)"
+ROOT_GLOBS="$(parse_list root_artifact_glob)"
 NOTE=""
+ROOT_NOTE=""
+# Defaulted independently of the FLAGS fallback: the two go empty for different
+# reasons, and sharing a condition left this one silently unscanned.
+if [[ -z "${ROOT_GLOBS//[$' \t\r\n']/}" ]]; then
+    ROOT_GLOBS=$'prbody*\npr-body*\npr_body*\nreply*.md\ncomment*.md\ndraft*.md\n*.patch\n*.diff\n*.orig\n*.rej\nnohup.out'
+    ROOT_NOTE="no root_artifact_glob in ${GUIDE#$REPO/}; used generic root-artifact defaults"
+fi
 if [[ -z "${FLAGS//[$' \t\r\n']/}" ]]; then
     FLAGS=$'/Users/\n/home/'
     ALLOWS=$'/nonexistent\n/usr/fake\n/tmp/\nexample.com'
@@ -98,12 +119,31 @@ if [[ $SCAN_RC -ne 0 ]]; then
 fi
 
 [[ -n "$NOTE" ]] && echo "review-checks: $NOTE" >&2
+[[ -n "$ROOT_NOTE" ]] && echo "review-checks: $ROOT_NOTE" >&2
 
+# --- scan ADDED FILE PATHS for PR-draft artifacts at the repo root -----------
+# Separate scanner: a stray root file is a diff HEADER, so the content scan
+# above cannot see it whatever its patterns.
+ROOT_HITS="$(printf '%s' "$DIFF" | RC_ROOT_ARTIFACT_GLOBS="$ROOT_GLOBS" python3 "$HERE/review-checks-root-artifacts.py")"
+ROOT_RC=$?
+if [[ $ROOT_RC -ne 0 ]]; then
+    echo "review-checks: ERROR — root-artifacts scanner failed to run (exit $ROOT_RC); failing closed (NOT a pass)." >&2
+    exit 2
+fi
+
+FAILED=0
 if [[ "$HITS" =~ [^[:space:]] ]]; then
     echo "review-checks: FAIL — hardcoded-paths:" >&2
     printf '%s\n' "$HITS" >&2
     echo "review-checks: $(printf '%s\n' "$HITS" | grep -c '') violation(s). Resolve via workspace/config helpers, or add a scoped allow to REVIEW.md if it's a genuine fixture." >&2
-    exit 1
+    FAILED=1
 fi
-echo "review-checks: PASS (hardcoded-paths clean)"
+if [[ "$ROOT_HITS" =~ [^[:space:]] ]]; then
+    echo "review-checks: FAIL — root-artifacts:" >&2
+    printf '%s\n' "$ROOT_HITS" >&2
+    echo "review-checks: $(printf '%s\n' "$ROOT_HITS" | grep -c '') artifact(s) at the repo root. Delete them from the branch, or add the name to root-artifacts in REVIEW.md if it is genuinely source." >&2
+    FAILED=1
+fi
+[[ $FAILED -eq 1 ]] && exit 1
+echo "review-checks: PASS (hardcoded-paths + root-artifacts clean)"
 exit 0
