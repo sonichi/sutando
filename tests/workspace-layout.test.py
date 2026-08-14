@@ -1,12 +1,5 @@
-"""Contract tests for src/workspace_layout.py — the spawn-time wiring guard.
-
-The load-bearing assertions:
-  * every recoverable break (missing / dangling / wrong-target / materialized
-    empty dir) is healed to a symlink at the durable workspace;
-  * a materialized dir HOLDING DATA is never touched (healing would orphan
-    the very files the guard exists to protect);
-  * plain checkouts and overridden configs are strict no-ops.
-"""
+"""Contract tests for src/workspace_layout.py: recoverable breaks heal to the
+durable symlink; a data-holding dir is NEVER touched; overrides are no-ops."""
 
 import importlib.util
 import json
@@ -81,10 +74,8 @@ class AppLayout(unittest.TestCase):
         self._assert_healthy_link()
 
     def test_data_arriving_between_classify_and_delete_is_preserved(self):
-        # TOCTOU guard (001 review): a file landing after classification but
-        # before the unlink loop must abort the heal, not be deleted. Simulate
-        # the race by feeding ensure a stale "empty" classification while the
-        # dir actually holds data.
+        # A file landing between classification and the unlink loop must abort
+        # the heal — simulated via a stale "empty" classification.
         ws = self.repo / "workspace"
         ws.mkdir()
         (ws / ".gitkeep").touch()
@@ -135,7 +126,7 @@ class AppLayout(unittest.TestCase):
 
 
 class EdgeBranches(unittest.TestCase):
-    """The diff-coverage gate flagged these exact branches (2894 CI)."""
+    """Fail-safe direction of the rarely-taken branches."""
 
     def test_repo_root_is_the_checkout_root(self):
         self.assertEqual(wl._repo_root(), _SRC.parent.parent)
@@ -215,9 +206,8 @@ class PlainCheckout(unittest.TestCase):
             self.assertFalse((repo / "workspace").is_symlink())
 
     def test_tracked_default_path_does_not_disable_guard(self):
-        # sutando.config.json ships the DEFAULT as an explicit value on every
-        # install; treating it as an override would make the guard a global
-        # no-op. Caught live on first run against a real checkout.
+        # The shipped config states the default explicitly; treating that as an
+        # override would make the guard a global no-op.
         with tempfile.TemporaryDirectory() as tmp:
             repo = _app_install(Path(tmp))
             (repo / "sutando.config.json").write_text(

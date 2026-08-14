@@ -1294,18 +1294,8 @@ WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
 
 
 def check_workspace_wiring() -> "dict | None":
-    """Report-only mirror of the spawn-time guard (src/workspace_layout.py).
-
-    startup.sh heals the recoverable states before services boot; anything this
-    probe still sees either post-dates boot (a mid-session `git clean -fdx`) or
-    was unhealable. `materialized-with-data` is a FAIL: tasks/results are being
-    written into a stray real directory instead of the durable workspace — the
-    exact stranded-owner-DM class the guard exists to prevent — and healing it
-    automatically would orphan those files, so a human (or the owner's agent)
-    must merge them. Every other broken state warns: recoverable at next boot.
-
-    Returns None on healthy layouts so plain checkouts gain no line.
-    """
+    """Report-only mirror of the spawn-time guard: `materialized-with-data` FAILS
+    (auto-heal would orphan its files — needs a merge); other broken states warn."""
     report = inspect_layout(REPO_DIR)
     state = report["state"]
     if state == "ok":

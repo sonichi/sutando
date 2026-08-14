@@ -1,10 +1,5 @@
-"""Spawn-time guard for the `<repo>/workspace` wiring (symlink in app installs).
-
-Classifies the entry (see the state strings in `inspect_layout`) and heals what
-is safe to heal; a real directory HOLDING data is never touched — healing would
-orphan the files. CLI: `--ensure` heals + reports, `--check` reports only;
-both exit 2 when the layout is broken.
-"""
+"""Spawn-time guard for the `<repo>/workspace` wiring: heals recoverable breaks
+to the durable symlink; a real directory HOLDING data is never touched."""
 
 from __future__ import annotations
 
