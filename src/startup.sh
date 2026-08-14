@@ -31,16 +31,6 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 . "$REPO/scripts/python-binary.sh"
 PY="$(resolve_python "$REPO")"
 
-# Repo->workspace wiring guard. MUST stay ABOVE every workspace-derived path
-# operation (the CLAUDE_CONFIG_DIR mkdir, init.sh, the WORKSPACE mkdir):
-# nothing below may touch $WORKSPACE until this has run — with the symlink
-# deleted, the first mkdir through <repo>/workspace materializes a real dir
-# the guard can no longer heal (review finding, 2894). Unhealable split ->
-# ABORT: booting services onto a stranded dir silently loses owner tasks.
-if ! "$PY" "$REPO/src/workspace_layout.py" --ensure >/dev/null; then
-  echo "✗ workspace wiring broken and not auto-healable — refusing to start services onto a stranded workspace. Diagnose: $PY $REPO/src/workspace_layout.py --check" >&2
-  exit 1
-fi
 if [ -z "$PY" ]; then
   {
     echo "✗ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
@@ -56,6 +46,20 @@ if [ -z "$PY" ]; then
   } >&2
   exit 1
 fi
+
+# Repo->workspace wiring guard — after the PY-validity abort (that check
+# touches no workspace path and its no-python diagnostic must stay reachable),
+# but ABOVE every workspace-derived operation (the CLAUDE_CONFIG_DIR mkdir,
+# init.sh, the WORKSPACE mkdir): nothing below may touch $WORKSPACE until this
+# has run, or a deleted symlink is materialized into an unhealable real dir
+# (review finding, 2894). Unhealable split -> ABORT, not warn-and-continue:
+# booting services onto a stranded dir silently loses owner tasks. A performed
+# heal is echoed so the repair is visible in the startup log.
+_wl_out="$("$PY" "$REPO/src/workspace_layout.py" --ensure)" || {
+  echo "✗ workspace wiring broken and not auto-healable — refusing to start services onto a stranded workspace. Diagnose: $PY $REPO/src/workspace_layout.py --check" >&2
+  exit 1
+}
+case "$_wl_out" in *'"action": "healed-'*) echo "🔧 workspace wiring healed: $_wl_out" >&2 ;; esac
 cd "$REPO"
 
 # Belt-and-suspenders startup log → always recoverable from /tmp (Lucy's Bug #5
