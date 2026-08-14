@@ -89,6 +89,54 @@ class SiblingScriptPathTest(unittest.TestCase):
                 p = self.paths[name]
                 self.assertTrue(p.is_absolute(), f"{name} path is relative: {p}")
 
+    def test_the_argv_handed_to_the_child_is_absolute(self):
+        """Executes the two functions that actually launch a child and inspects
+        the argv they pass — a relative argv plus cwd=WORKSPACE is the defect.
+
+        This case does NOT discriminate: it loads the module by an absolute path,
+        so it passes on the parent commit too. It is here to execute the changed
+        lines and to pin the contract (the argv handed to a child is absolute),
+        not as evidence of the fix. The discriminating cases are the ones above,
+        which load by a RELATIVE path."""
+        import importlib.util
+        import subprocess as sp
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location(
+            "mb_argv", REPO / "src" / "morning-briefing.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["mb_argv"] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except SystemExit:
+            pass
+
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append((list(argv), kwargs.get("cwd")))
+            return sp.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        # STATE_DIR must point somewhere empty: get_daily_insight returns the
+        # cached sentinel without launching anything when today's already exists,
+        # so on a host that has run the briefing this case would silently assert
+        # over one child instead of two.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(mod, "STATE_DIR", Path(td)), \
+             mock.patch.object(mod.subprocess, "run", side_effect=fake_run):
+            mod.get_health_issues()
+            mod.get_daily_insight()
+
+        self.assertEqual(len(seen), 2, f"expected two child launches, got {seen}")
+        for argv, cwd in seen:
+            script = Path(argv[-1])
+            with self.subTest(script=script.name):
+                self.assertTrue(
+                    script.is_absolute(),
+                    f"argv path is relative ({script}) while cwd={cwd} — the child "
+                    f"resolves it against the wrong directory")
+
     def test_resolving_survives_a_cwd_that_is_not_the_repo(self):
         """The bug only shows when the child's cwd differs from the parent's.
         Resolve the paths from a foreign cwd and require they still point at
