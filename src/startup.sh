@@ -600,6 +600,17 @@ echo ""
 # Install Claude Code skills (runs every startup, idempotent)
 bash "$REPO/skills/install.sh" 2>/dev/null || true
 
+# Guard the repo->workspace wiring BEFORE resolving or creating anything.
+# In an app-managed install `workspace` is an untracked symlink; a
+# `git clean -fdx` deletes it, and the `mkdir -p` below would then
+# materialize a real dir and silently strand tasks/results outside the
+# durable workspace. The guard relinks every recoverable state and refuses
+# (loudly) when a materialized dir already holds data — see
+# src/workspace_layout.py and the health-check `workspace-wiring` probe.
+if ! python3 "$REPO/src/workspace_layout.py" --ensure >/dev/null; then
+  echo "⚠️  workspace wiring broken and not auto-healable — run: python3 src/workspace_layout.py --check" >&2
+fi
+
 # Resolve the runtime workspace via the canonical loader (M0 cutover).
 # The loader (v0.8 — env override removed) implements:
 #   1. sutando.config.local.json -> workspace.path (per-clone override)

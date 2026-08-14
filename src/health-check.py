@@ -53,6 +53,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from workspace_layout import inspect_layout  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -1290,6 +1291,37 @@ WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "stand-avatar.png",
     "voice-context-active",
 })
+
+
+def check_workspace_wiring() -> "dict | None":
+    """Report-only mirror of the spawn-time guard (src/workspace_layout.py).
+
+    startup.sh heals the recoverable states before services boot; anything this
+    probe still sees either post-dates boot (a mid-session `git clean -fdx`) or
+    was unhealable. `materialized-with-data` is a FAIL: tasks/results are being
+    written into a stray real directory instead of the durable workspace — the
+    exact stranded-owner-DM class the guard exists to prevent — and healing it
+    automatically would orphan those files, so a human (or the owner's agent)
+    must merge them. Every other broken state warns: recoverable at next boot.
+
+    Returns None on healthy layouts so plain checkouts gain no line.
+    """
+    report = inspect_layout(REPO_DIR)
+    state = report["state"]
+    if state == "ok":
+        return None
+    status = "fail" if state == "materialized-with-data" else "warn"
+    fix = (
+        "merge stray files into the durable workspace, then rerun "
+        "`python3 src/workspace_layout.py --ensure`"
+        if status == "fail"
+        else "`python3 src/workspace_layout.py --ensure` (or restart the core)"
+    )
+    return {
+        "name": "workspace-wiring",
+        "status": status,
+        "detail": f"{state}: {report['detail']} — {fix}",
+    }
 
 
 def check_workspace_root_tidy() -> "dict | None":
@@ -7350,6 +7382,10 @@ def run_all_checks() -> list[dict]:
     _root_tidy = check_workspace_root_tidy()
     if _root_tidy:
         checks.append(_root_tidy)
+
+    _wiring = check_workspace_wiring()
+    if _wiring:
+        checks.append(_wiring)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:
