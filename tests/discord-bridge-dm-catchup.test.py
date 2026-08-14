@@ -204,10 +204,16 @@ def test_source_wires_periodic_reconciliation_once():
     assert on_ready_block, "could not locate on_ready in discord-bridge.py"
     body = on_ready_block.group(1)
     guard_pos = body.index("if not _poll_loops_started:")
-    loop_pos = body.index("create_task(_dm_reconciliation_loop())")
+    # main wrapped every long-lived loop in _supervise_loop; this one is not an
+    # exception, so pin BOTH the guard placement and the supervision.
+    loop_pos = body.index('_supervise_loop(_dm_reconciliation_loop, "_dm_reconciliation_loop")')
     assert loop_pos > guard_pos, (
         "periodic DM reconciliation must start inside the once-only poll-loop "
         "guard, or reconnects will accumulate duplicate loops"
+    )
+    assert "create_task(_dm_reconciliation_loop())" not in body, (
+        "unsupervised: an exception escaping the loop would end reconciliation "
+        "permanently while the bridge stays up"
     )
 
 
