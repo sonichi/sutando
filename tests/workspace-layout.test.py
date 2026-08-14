@@ -80,6 +80,30 @@ class AppLayout(unittest.TestCase):
         self.assertEqual(report["action"], "healed-materialized-empty")
         self._assert_healthy_link()
 
+    def test_data_arriving_between_classify_and_delete_is_preserved(self):
+        # TOCTOU guard (001 review): a file landing after classification but
+        # before the unlink loop must abort the heal, not be deleted. Simulate
+        # the race by feeding ensure a stale "empty" classification while the
+        # dir actually holds data.
+        ws = self.repo / "workspace"
+        ws.mkdir()
+        (ws / ".gitkeep").touch()
+        late = ws / "task-late.txt"
+        late.write_text("landed mid-heal")
+        orig = wl.inspect_layout
+        wl.inspect_layout = lambda root=None: {
+            "path": str(ws), "app_target": str(self.durable),
+            "state": "materialized-empty", "detail": "stale classification",
+        }
+        try:
+            report = wl.ensure_workspace_layout(self.repo)
+        finally:
+            wl.inspect_layout = orig
+        self.assertEqual(report["action"], "left-broken")
+        self.assertEqual(report["state"], "materialized-with-data")
+        self.assertFalse(ws.is_symlink())
+        self.assertEqual(late.read_text(), "landed mid-heal")
+
     def test_materialized_dir_with_data_is_never_touched(self):
         ws = self.repo / "workspace"
         (ws / "tasks").mkdir(parents=True)

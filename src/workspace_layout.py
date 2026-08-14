@@ -173,8 +173,17 @@ def ensure_workspace_layout(repo_root: Path | None = None) -> dict:
             if ws.is_symlink() or ws.is_file():
                 ws.unlink()
             elif ws.is_dir():
-                # materialized-empty only: remove the ignorable entries, then the dir
+                # materialized-empty only — but re-verify AT DELETE TIME, entry
+                # by entry: a file can land between classification and here, and
+                # the never-destroy contract must hold across that window. Only
+                # known-ignorable names are ever unlinked; anything else aborts
+                # untouched, and rmdir itself fails closed on a late arrival.
                 for entry in ws.iterdir():
+                    if entry.name not in _DATA_IGNORABLE:
+                        report["state"] = "materialized-with-data"
+                        report["action"] = "left-broken"
+                        report["detail"] += "; data appeared before heal — left untouched"
+                        return report
                     entry.unlink()
                 ws.rmdir()
             ws.symlink_to(link_value)
