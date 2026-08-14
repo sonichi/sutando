@@ -2,6 +2,39 @@
 
 All notable changes are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [v0.11.0] — 2026-08-14
+
+54 commits since v0.10.0: 10 features, 39 fixes. Headline: **collaborator tier with AG2 Space** —
+a Team room reaches the trusted runtime only on an explicit, broker-attested opt-in.
+
+### Added
+
+- **AG2 Space collaborator tier.** A Team room now reaches the owner-capability runtime only when the broker attests `collaborator: true` alongside Team; missing or invalid controls, older gateways, and local owner→Team downgrades all keep the restricted path. This is a trust boundary, not a convenience flag — read the AG2 Space section of `CLAUDE.md` before granting it. ([#2824])
+- Durable Work Model named as a protocol: lifecycle, invariants, and the ambient tier, plus the durable-lane write side and the first resolver consumer. ([#2719], [#2721])
+- `sutando://` endpoint resolver seed — `resolve(endpoint, mode)` over the runtime descriptor. ([#2720])
+- Sparrow observed-receipt (👀), opt-in with the event plane. ([#2319])
+- Health-check learns two new probes: the source has moved off the BUILT engine revision ([#2864]), and proactive bodies no consumer ever claimed ([#2842]).
+- `restart-test-harness` — real post-restart round-trip evidence for live-path PRs, with an identity gate so a restart that never happened cannot pass. ([#2724])
+- Session-handoff records that a compaction happened. ([#2821])
+- `review-checks` gates PR-draft artifacts committed to the repo root. ([#2841])
+
+### Fixed
+
+39 fixes, concentrated in delivery and the task/result protocol. Notable:
+
+- A Discord logging failure could kill delivery **and silently destroy inbound messages**. ([#2856])
+- The Slack bridge claimed a proactive file before resolving the owner, destroying results it could not deliver. ([#2628])
+- Headless provider workers hung without `stdin=DEVNULL` — the collaborator-tier path could stall instead of running. ([#2859])
+- An empty result file silently stalled a reply until the 7-day age-out. ([#2631])
+- Named gateway auth endpoints were not isolated. ([#2861])
+- A guest-tier task deferred every owner-facing cron. ([#2880])
+- Rendered episodes were silently refused as attachments. ([#2746])
+- The watcher reaper deleted a sentinel it never inspected, stranding a live watcher. ([#2837])
+
+### Changed
+
+- No breaking changes and no new workspace migrations. Upgrading from v0.10.0 requires no action; rollback is `git checkout v0.10.0`.
+
 ## [v0.10.0] — 2026-08-12
 
 316 PRs since v0.9.0: 60 features, 202 fixes. Full curated notes live on the
