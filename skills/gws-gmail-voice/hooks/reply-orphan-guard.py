@@ -3,6 +3,8 @@
 
 +send cannot set In-Reply-To/References, so the reply starts a new thread.
 """
+from __future__ import annotations
+
 import json
 import re
 import shlex
