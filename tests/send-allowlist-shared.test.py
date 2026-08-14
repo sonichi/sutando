@@ -138,6 +138,54 @@ def test_send_allowlist_module_has_documented_set():
     )
 
 
+def test_rendered_episode_root_is_allowed():
+    """Renders land under the legacy workspace's notes tree, outside every
+    other root, so without this root every rendered mp4 is refused."""
+    sys.path.insert(0, str(SRC))
+    import send_allowlist as sa
+    from util_paths import legacy_dotted_workspace_path
+
+    wanted = str(legacy_dotted_workspace_path("notes", "generated"))
+    assert wanted in sa.SEND_ALLOWED_ROOTS, (
+        f"{wanted} is not in SEND_ALLOWED_ROOTS — rendered episodes are "
+        f"unsendable. Got: {sa.SEND_ALLOWED_ROOTS}"
+    )
+
+
+def test_symlinked_root_resolves_and_stays_scoped():
+    """Pins two properties: `is_path_sendable` realpaths the ROOT, and scoping
+    at `generated/` keeps the rest of notes/ refused."""
+    import tempfile
+
+    sys.path.insert(0, str(SRC))
+    import send_allowlist as sa
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        real_notes = tmp / "sync-root" / "notes"
+        (real_notes / "generated" / "ep-bundle").mkdir(parents=True)
+        episode = real_notes / "generated" / "ep-bundle" / "ep.mp4"
+        episode.write_bytes(b"\x00")
+        private = real_notes / "private-note.md"
+        private.write_text("owner-only")
+
+        (tmp / "workspace").mkdir()
+        link = tmp / "workspace" / "notes"
+        link.symlink_to(real_notes)
+
+        root = (str(link / "generated"),)
+        assert sa.is_path_sendable(str(link / "generated" / "ep-bundle" / "ep.mp4"),
+                                  extra_roots=root), (
+            "a file under a SYMLINKED allowed root was refused — the root "
+            "itself must be realpath'd, not only the candidate path"
+        )
+        assert not sa.is_path_sendable(str(link / "private-note.md"),
+                                       extra_roots=root), (
+            "a private note OUTSIDE generated/ was deliverable — scoping the "
+            "root at generated/ is what keeps notes/ private"
+        )
+
+
 def main():
     failures = []
     for fn in (
@@ -147,6 +195,8 @@ def main():
         test_no_inline_send_allowed_roots_definitions,
         test_no_inline_is_path_sendable_function,
         test_send_allowlist_module_has_documented_set,
+        test_rendered_episode_root_is_allowed,
+        test_symlinked_root_resolves_and_stays_scoped,
     ):
         try:
             fn()

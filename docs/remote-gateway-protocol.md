@@ -13,8 +13,15 @@ channel `.env` supplies a token, and is silent otherwise.
 
 ## Configuration
 
-The bridge reads these from the environment (typically sourced from
-`channels/<provider>/.env`):
+The bridge reads these from the environment. `channels/<provider>/.env` is not
+sourced by every launcher, so the bridge also reads that file directly for the
+keys marked *(.env too)* below — an exported value always wins.
+
+Those file reads happen **at import**, so a `.env` edit needs a bridge restart
+to take effect (unlike `REMOTE_TASK_TOKEN`, which is re-read on rotation). In
+the file as in the environment, **presence decides, not truthiness**: a key
+written with an empty value is an explicit "off" and does not fall through to a
+lower-precedence candidate.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
@@ -23,7 +30,7 @@ The bridge reads these from the environment (typically sourced from
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`other` for a shared gateway (see Security). |
-| `REMOTE_PROACTIVE_ROOM` | no | — | Default room id to deliver `results/proactive-*.txt` nudges to (`POST /v1/room` op:message, claim-by-rename, archive on success). Unset → proactive files are not scanned. Deliberately explicit — never auto-learned from task channel_ids, since a nudge may be owner-private. Result-body markers are honored via the shared parser (`result_markers.parse_markers`): a `[channel: !room:server]` first line redirects that one nudge, `[dm-only]` suppresses any redirect (nudge stays here), skip markers archive silently, and a foreign `[channel:]` destination (Discord/Slack id) leaves the file to its own bridge. |
+| `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | Default room id to deliver `results/proactive-*.txt` nudges to (`POST /v1/room` op:message, claim-by-rename, archive on success). Unset → read from this instance's `channels/<dir>/.env`; still unset → proactive files are not scanned. Exported as empty → stays empty, which is how a named secondary gateway keeps nudges on the primary. Deliberately explicit — never auto-learned from task channel_ids, since a nudge may be owner-private. Result-body markers are honored via the shared parser (`result_markers.parse_markers`): a `[channel: !room:server]` first line redirects that one nudge, `[dm-only]` suppresses any redirect (nudge stays here), skip markers archive silently, and a foreign `[channel:]` destination (Discord/Slack id) leaves the file to its own bridge. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
