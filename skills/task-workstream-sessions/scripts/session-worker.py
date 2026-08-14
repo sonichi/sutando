@@ -265,7 +265,7 @@ def _run_process_bounded(
     # returns whatever is available immediately, so the loop always makes it back
     # to the deadline checks and can fail closed.
     process = subprocess.Popen(
-        command, cwd=cwd, env=environment, stdout=subprocess.PIPE,
+        command, cwd=cwd, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, start_new_session=True,
     )
     assert process.stdout is not None and process.stderr is not None
@@ -522,7 +522,7 @@ def _run_claude(workspace: Path, workstream_id: str, prompt: str, repo: Path) ->
     result = subprocess.run(
         _claude_command(session_id, not created, prompt, repo),
         cwd=os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo)),
-        text=True,
+        text=True, stdin=subprocess.DEVNULL,
         capture_output=True,
         check=False,
     )
@@ -548,7 +548,7 @@ def _run_codex(workspace: Path, workstream_id: str, prompt: str, repo: Path) -> 
             process = subprocess.Popen(
                 _codex_command(session_id or None, prompt, repo, output_file),
                 cwd=os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo)),
-                text=True,
+                text=True, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
             )
