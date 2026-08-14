@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
+import { readBodyCapped } from './http-body-limit.js';
 
 const execFileAsync = promisify(execFile);
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -43,6 +44,10 @@ const MIN_INTERVAL_MS = 250;
 const FRAME_PASSTHROUGH_BYTES = 200 * 1024;
 const FRAME_MAX_EDGE_PX = 1280;
 const FRAME_JPEG_QUALITY = 60;
+// Each oversized frame costs one `sips`, so an unbounded producer would be an
+// unbounded process spawner on a surface the web-client exposes to the LAN.
+const FRAME_BOUND_MAX_CONCURRENT = 2;
+let framesBounding = 0;
 
 /** Bound a frame's wire cost before it enters the live session.
  *
@@ -57,6 +62,11 @@ export async function boundFrameCost(
 	mimeType: string,
 ): Promise<{ data: Buffer; mimeType: string }> {
 	if (data.byteLength <= FRAME_PASSTHROUGH_BYTES) return { data, mimeType };
+	if (framesBounding >= FRAME_BOUND_MAX_CONCURRENT) {
+		console.warn(`${ts()} [Vision] ${FRAME_BOUND_MAX_CONCURRENT} downscales already in flight — passing ${Math.round(data.byteLength / 1024)}KB through unbounded`);
+		return { data, mimeType };
+	}
+	framesBounding++;
 	let dir: string | undefined;
 	try {
 		dir = mkdtempSync(join(tmpdir(), 'sutando-frame-'));
@@ -80,6 +90,7 @@ export async function boundFrameCost(
 		console.warn(`${ts()} [Vision] frame downscale failed, sending original ${Math.round(data.byteLength / 1024)}KB: ${(err as Error)?.message ?? err}`);
 		return { data, mimeType };
 	} finally {
+		framesBounding--;
 		if (dir) {
 			try { unlinkSync(join(dir, 'in')); } catch {}
 			try { unlinkSync(join(dir, 'out.jpg')); } catch {}
@@ -337,7 +348,11 @@ export function _getVisionFrameHookCount(): number {
 // swap-and-restore. Once DeviceSession exists, frames should carry a target
 // device ID and fan out only to that session.
 export function setVisionSession(session: unknown): void {
-	sessionRef = session as MinimalSession | null;
+	const next = session as MinimalSession | null;
+	// Both send paths capture `sendFile` before their await, so a swap that
+	// lands mid-bound would deliver the frame to the session routing just left.
+	if (next !== sessionRef) visionGeneration++;
+	sessionRef = next;
 	if (!session) stopStream();
 }
 
@@ -719,6 +734,9 @@ function startStream(source: VisionSource, fps: number): { fps: number; interval
 	const clamped = Math.max(0.5, Math.min(MAX_FPS, fps));
 	const intervalMs = Math.max(MIN_INTERVAL_MS, Math.round(1000 / clamped));
 	if (ticker) clearInterval(ticker);
+	// A restart goes straight through here without stopStream(), so nothing else
+	// invalidates a frame still bounding for the source we just replaced.
+	visionGeneration++;
 	activeSource = source;
 	frameCount = 0;
 	startedAt = Date.now();
@@ -875,17 +893,15 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 			return respond(200, stopStreaming());
 		}
 		if (url.pathname === '/vision/frame' && req.method === 'POST') {
-			const chunks: Buffer[] = [];
-			req.on('data', (c: Buffer) => chunks.push(c));
-			req.on('end', () => {
-				const buf = Buffer.concat(chunks);
-				const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
-				void submitFrame(buf, mime).then((r) => {
-					respond(r.ok ? 200 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
-				}).catch(() => respond(500, { status: 'failed', error: 'submitFrame failed' }));
-			});
-			req.on('error', () => respond(500, { status: 'failed', error: 'request error' }));
-			return;
+			const buf = await readBodyCapped(req);
+			if (!buf) return respond(413, { status: 'failed', error: 'frame body too large' });
+			const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
+			try {
+				const r = await submitFrame(buf, mime);
+				return respond(r.ok ? 200 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
+			} catch {
+				return respond(500, { status: 'failed', error: 'submitFrame failed' });
+			}
 		}
 		respond(404, { error: 'not found' });
 	});
