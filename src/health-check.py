@@ -6821,6 +6821,18 @@ def check_claude_hook_registration(
                 "detail": "could not parse HOOKS=(...) from install-claude-hooks.sh — "
                           "cannot verify registration (reporting rather than assuming clean)"}
 
+    # Skill-declared hooks are appended to HOOKS at run time, so the static parse
+    # above cannot see them. Same discovery the installer uses — a second copy here
+    # would drift and quietly stop verifying whatever the installer registered.
+    try:
+        sys.path.insert(0, str(repo / "src"))
+        from skill_hooks import discover as _discover_skill_hooks
+        owned.extend(_discover_skill_hooks(repo))
+    except Exception as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"skill-hook discovery failed ({exc}) — "
+                          f"cannot verify skill-declared hooks"}
+
     sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
     settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
     if not settings.is_file():
@@ -7241,6 +7253,20 @@ def check_core_model_pin() -> dict:
     return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 
+MENUBAR_LABEL = "com.sutando.menubar"
+MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
+
+
+def menubar_app_state(dev_bin, app_bin, plist, is_macos: bool) -> str:
+    """installed | expected-missing | not-applicable for the optional menu-bar app.
+    The launchd plist is the only durable signal a host ASKED for the app."""
+    if dev_bin.exists() or app_bin.exists():
+        return "installed"
+    if not is_macos:
+        return "not-applicable"
+    return "expected-missing" if plist.exists() else "not-applicable"
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -7607,7 +7633,9 @@ def run_all_checks() -> list[dict]:
     # the menu bar check to run so dashboard reports accurate status.
     dev_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     app_bin = Path("/Applications/Sutando.app/Contents/MacOS/Sutando")
-    if dev_bin.exists() or app_bin.exists():
+    _menubar = menubar_app_state(
+        dev_bin, app_bin, MENUBAR_PLIST, sys.platform == "darwin")
+    if _menubar == "installed":
         # Distinguish pgrep failures (exit code != 0 and != 1) from a real
         # no-match (exit code 1). Pre-fix the bare try/except swallowed
         # subprocess errors AND empty results into a single "no pids" path,
@@ -7663,6 +7691,12 @@ def run_all_checks() -> list[dict]:
             # actually couldn't determine state. Surface as a transient warn
             # with the cause so it's debuggable, not a routine "app is down."
             checks.append({"name": "sutando-app", "status": "warn", "detail": f"detection failed (pgrep: {pgrep_err or 'unknown error'}) — actual app state unknown"})
+    elif _menubar == "expected-missing":
+        # Only a host that ASKED for the app can be missing it; a headless
+        # install has no plist and gets no row, like check_gateway_bridge().
+        checks.append({"name": "sutando-app", "status": "warn", "detail": (
+            f"launchd job {MENUBAR_LABEL} is installed but no binary exists at "
+            f"{dev_bin} or {app_bin} — app state UNKNOWN, not ok")})
 
     # Battery and memory health checks
 
