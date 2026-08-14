@@ -1767,6 +1767,29 @@ describe('P7 D7.5 capture recovery FSM', () => {
 		h.t.disconnect();
 	});
 
+	it('devicechange before the initial input snapshot settles does not reacquire blindly', async () => {
+		const resolvers: Array<(v: Array<{ kind: string; deviceId: string }>) => void> = [];
+		enumImpl = () => new Promise((resolve) => resolvers.push(resolve));
+		let gumCalls = 0;
+		gumImpl = async () => {
+			gumCalls++;
+			return new FakeMediaStream();
+		};
+		const h = harness({ recoveryBackoffMs: [0, 0, 0], recoveryResumeTimeoutMs: 50 });
+		await goLive(h);
+		assert.equal(resolvers.length, 1, 'initial snapshot is pending');
+		fireDeviceChange();
+		await delay(2);
+		assert.equal(resolvers.length, 2, 'change snapshot is pending');
+		resolvers[1]([{ kind: 'audioinput', deviceId: 'a' }]);
+		await delay(5);
+		assert.equal(gumCalls, 1, 'no baseline means no blind reacquire');
+		resolvers[0]([{ kind: 'audioinput', deviceId: 'a' }]);
+		await delay(5);
+		assert.equal((h.t as any).inputDeviceSig, 'a', 'initial snapshot still establishes the baseline');
+		h.t.disconnect();
+	});
+
 	it('track ended → reacquire replaces the capture stream', async () => {
 		const streams: FakeMediaStream[] = [];
 		gumImpl = async () => {

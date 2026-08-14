@@ -118,15 +118,32 @@ describe('P7 D7.4 vision egress controls', () => {
 		assert.equal(sent.length, 0);
 	});
 
-	it('wire-byte accounting: the bucket charges base64 size (4/3 of raw)', () => {
+	it('wire-byte accounting: an over-burst base64 frame is rejected rather than deferred forever', () => {
 		const { session, sent } = fakeSession();
 		setVisionSession(session);
 		startStreaming('browser', undefined, 'push');
 		// 500 KB raw fits the 600 KB burst raw-wise, but its 667 KB wire size
-		// must NOT pass (round-3 #10: raw accounting under-charged by 25%).
+		// cannot ever fit the encoded-byte burst budget.
 		const r = submitFrame(frameBuf(1, 500 * 1024));
-		assert.equal(r.deferred, true, 'over the encoded-bytes burst → deferred');
+		assert.equal(r.ok, false);
+		assert.equal(r.reason, 'frame-too-large');
+		assert.match(r.error ?? '', /vision egress budget/);
 		assert.equal(sent.length, 0);
+		assert.equal(getVisionEgressStats().droppedOversize, 1);
+		assert.equal(getVisionEgressStats().slotOccupied, false);
+		stopStreaming();
+	});
+
+	it('pull cadence is capped by the egress send interval', () => {
+		const { session } = fakeSession();
+		setVisionSession(session);
+		registerSource({ name: 'fps-cap-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
+		const r = startStreaming('fps-cap-source', 2, 'pull');
+		assert.equal(r.status, 'streaming');
+		if (r.status === 'streaming') {
+			assert.equal(r.intervalMs, VISION_MIN_SEND_INTERVAL_MS);
+			assert.equal(r.fps, 1000 / VISION_MIN_SEND_INTERVAL_MS);
+		}
 		stopStreaming();
 	});
 
@@ -155,6 +172,7 @@ describe('P7 D7.4 vision egress controls', () => {
 		assert.equal(typeof st.egress.deferredGate, 'number');
 		assert.equal(typeof st.egress.deferredBudget, 'number');
 		assert.equal(typeof st.egress.displaced, 'number');
+		assert.equal(typeof st.egress.droppedOversize, 'number');
 		assert.equal(typeof st.egress.slotOccupied, 'boolean');
 	});
 

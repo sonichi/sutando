@@ -38,7 +38,8 @@ const execFileAsync = promisify(execFile);
 const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
-const MAX_FPS = 2;
+export const VISION_MIN_SEND_INTERVAL_MS = 900;
+const MAX_FPS = 1000 / VISION_MIN_SEND_INTERVAL_MS;
 const MIN_INTERVAL_MS = 250;
 // TODO(roadmap §5 Now: cost posture): A 720p JPEG q=0.6 ≈ 80–150KB. At 1 fps
 // continuous that's ~6–9MB/min into Gemini Live's video slot, plus context-
@@ -468,8 +469,6 @@ export function isStreaming(): boolean {
  *  ceiling is 2 s of budget; a 720p/q0.6 frame is ~80–150 KB. */
 export const VISION_BUCKET_BYTES_PER_SEC = 300 * 1024;
 export const VISION_BUCKET_MAX_BYTES = 600 * 1024;
-/** ≈1 fps egress cap regardless of the capture cadence. */
-export const VISION_MIN_SEND_INTERVAL_MS = 900;
 const VISION_DRAIN_INTERVAL_MS = 250;
 /** Downscale budget requested from the capture server (which resizes in ITS
  *  process — compression never competes with this event loop). ~720p-class. */
@@ -488,7 +487,7 @@ let bucketRefillAt = Date.now();
 let lastFrameSentAt = 0;
 let deferredSlot: { data: Buffer; mimeType: string; fireHooks: boolean } | null = null;
 let drainTimer: NodeJS.Timeout | null = null;
-const egressStats = { sent: 0, deferredGate: 0, deferredBudget: 0, displaced: 0 };
+const egressStats = { sent: 0, deferredGate: 0, deferredBudget: 0, displaced: 0, droppedOversize: 0 };
 
 /** Read-only egress diagnostics (drop counters are cumulative per process). */
 export function getVisionEgressStats(): {
@@ -496,6 +495,7 @@ export function getVisionEgressStats(): {
 	deferredGate: number;
 	deferredBudget: number;
 	displaced: number;
+	droppedOversize: number;
 	slotOccupied: boolean;
 } {
 	return { ...egressStats, slotOccupied: deferredSlot !== null };
@@ -513,6 +513,7 @@ export function resetVisionEgressForTests(): void {
 	egressStats.deferredGate = 0;
 	egressStats.deferredBudget = 0;
 	egressStats.displaced = 0;
+	egressStats.droppedOversize = 0;
 }
 
 function refillBucket(now: number): void {
@@ -604,14 +605,22 @@ function sendFrameGated(
 	if (!sendFile) return { ok: false, error: 'no active voice session' };
 	const now = Date.now();
 	refillBucket(now);
+	// A frame larger than the bucket burst can never drain; reject it instead.
+	const wireBytes = Math.ceil((data.byteLength * 4) / 3);
+	if (wireBytes > VISION_BUCKET_MAX_BYTES) {
+		egressStats.droppedOversize++;
+		return {
+			ok: false,
+			reason: 'frame-too-large',
+			error: `frame exceeds the ${VISION_BUCKET_MAX_BYTES}-byte vision egress budget`,
+		};
+	}
 	const gate = visionGate();
 	if (!gate.open) {
 		parkFrame(data, mimeType, fireHooks, 'gate', fromDrain);
 		return { ok: true, deferred: true, reason: gate.reason };
 	}
-	// The wire carries base64 — 4/3 of the raw frame — so the bucket charges
-	// encoded bytes, not raw (round-3 #10: raw accounting under-charged 25%).
-	const wireBytes = Math.ceil((data.byteLength * 4) / 3);
+	// The wire carries base64, so the bucket charges encoded bytes rather than raw.
 	if (now - lastFrameSentAt < VISION_MIN_SEND_INTERVAL_MS || wireBytes > bucketBytes) {
 		parkFrame(data, mimeType, fireHooks, 'budget', fromDrain);
 		return { ok: true, deferred: true, reason: 'budget' };
@@ -820,7 +829,7 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 /** Inject a frame from an external pusher (the web-client's
  *  getDisplayMedia loop). Push-mode must be active — caller should have
  *  hit /vision/start with source='browser' first. */
-export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok: boolean; deferred?: boolean; error?: string } {
+export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok: boolean; deferred?: boolean; reason?: string; error?: string } {
 	if (!getSendFile()) {
 		console.warn(`${ts()} [Vision] frame dropped: no active voice session (sessionRef=${!!sessionRef}, transport=${!!sessionRef?.transport})`);
 		return { ok: false, error: 'no active voice session' };
@@ -834,7 +843,7 @@ export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok
 	const r = sendFrameGated(data, mimeType, false);
 	if (!r.ok) {
 		console.error(`${ts()} [Vision] sendFile failed: ${r.error}`);
-		return { ok: false, error: 'submitFrame failed' };
+		return { ok: false, reason: r.reason, error: r.error ?? 'submitFrame failed' };
 	}
 	return r;
 }
@@ -1090,7 +1099,7 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 				const buf = Buffer.concat(chunks);
 				const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
 				const r = submitFrame(buf, mime);
-				respond(r.ok ? 200 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
+				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
 			});
 			req.on('error', () => respond(500, { status: 'failed', error: 'request error' }));
 			return;

@@ -714,10 +714,10 @@ export class VoiceTransport {
    *  teardownAudio; every async capture continuation validates BOTH gens. */
   private captureGen = 0;
   private captureState: CaptureState = 'observing';
-  /** attemptGen that owns the in-flight recovery loop (0 = none). Ownership
+  /** attemptGen that owns the in-flight recovery loop (-1 = none). Ownership
    *  is attempt-scoped: a stale loop (owner ≠ current attempt) is fenced-dead
    *  and must not swallow the live attempt's triggers. */
-  private recoveryOwner = 0;
+  private recoveryOwner = -1;
   /** A reacquire trigger arrived while a resume-recovery was in flight. */
   private recoveryEscalate = false;
   /** Sorted input-device fingerprint (null = cannot enumerate). */
@@ -2100,7 +2100,7 @@ export class VoiceTransport {
         'Microphone input could not be recovered',
       );
     } finally {
-      if (this.recoveryOwner === gen) this.recoveryOwner = 0;
+      if (this.recoveryOwner === gen) this.recoveryOwner = -1;
     }
   }
 
@@ -2261,8 +2261,8 @@ export class VoiceTransport {
     // this enumeration was pending bumped captureGen — acting on the stale
     // result would tear the fresh capture down again.
     if (gen !== this.attemptGen || capGen !== this.captureGen) return;
-    if (sig === null) return;
-    if (this.inputDeviceSig !== null && sig === this.inputDeviceSig) return; // output-only change
+    if (sig === null || this.inputDeviceSig === null) return;
+    if (sig === this.inputDeviceSig) return; // output-only change
     this.inputDeviceSig = sig;
     this.recordDeviceEvent('input-devices-changed');
     void this.startRecovery('reacquire');
