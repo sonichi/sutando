@@ -83,8 +83,8 @@ def app_workspace_target(repo_root: Path) -> Path | None:
     if parent.name != APP_ENGINE_DIRNAME:
         return None
     target = parent.parent / "workspace"
-    # lexists-not-resolved on purpose: the target must be a REAL directory,
-    # not itself a link into the checkout (which would make a loop).
+    # The target must be a REAL directory — a symlink target could loop back
+    # into the checkout.
     if target.is_dir() and not target.is_symlink():
         return target
     return None

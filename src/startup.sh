@@ -30,6 +30,17 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # suppress. An actionable message beats that dialog.
 . "$REPO/scripts/python-binary.sh"
 PY="$(resolve_python "$REPO")"
+
+# Repo->workspace wiring guard. MUST stay ABOVE every workspace-derived path
+# operation (the CLAUDE_CONFIG_DIR mkdir, init.sh, the WORKSPACE mkdir):
+# nothing below may touch $WORKSPACE until this has run — with the symlink
+# deleted, the first mkdir through <repo>/workspace materializes a real dir
+# the guard can no longer heal (review finding, 2894). Unhealable split ->
+# ABORT: booting services onto a stranded dir silently loses owner tasks.
+if ! "$PY" "$REPO/src/workspace_layout.py" --ensure >/dev/null; then
+  echo "✗ workspace wiring broken and not auto-healable — refusing to start services onto a stranded workspace. Diagnose: $PY $REPO/src/workspace_layout.py --check" >&2
+  exit 1
+fi
 if [ -z "$PY" ]; then
   {
     echo "✗ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
@@ -599,17 +610,6 @@ echo ""
 
 # Install Claude Code skills (runs every startup, idempotent)
 bash "$REPO/skills/install.sh" 2>/dev/null || true
-
-# Guard the repo->workspace wiring BEFORE resolving or creating anything.
-# In an app-managed install `workspace` is an untracked symlink; a
-# `git clean -fdx` deletes it, and the `mkdir -p` below would then
-# materialize a real dir and silently strand tasks/results outside the
-# durable workspace. The guard relinks every recoverable state and refuses
-# (loudly) when a materialized dir already holds data — see
-# src/workspace_layout.py and the health-check `workspace-wiring` probe.
-if ! python3 "$REPO/src/workspace_layout.py" --ensure >/dev/null; then
-  echo "⚠️  workspace wiring broken and not auto-healable — run: python3 src/workspace_layout.py --check" >&2
-fi
 
 # Resolve the runtime workspace via the canonical loader (M0 cutover).
 # The loader (v0.8 — env override removed) implements:
