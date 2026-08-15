@@ -63,10 +63,15 @@ os.environ["HOME"] = _CFG
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
 os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
-for _ch in ("discord", "slack"):
-    _p = Path(_CFG) / "channels" / _ch
-    _p.mkdir(parents=True, exist_ok=True)
-    (_p / "access.json").write_text(json.dumps({"allowFrom": []}))
+# Seeded with literal channel names, not a loop variable: the hermetic-bridge lint
+# traces the path-segment chain statically and cannot prove a computed segment.
+_cfg_discord = Path(_CFG) / "channels" / "discord"
+_cfg_discord.mkdir(parents=True, exist_ok=True)
+(_cfg_discord / "access.json").write_text(json.dumps({"allowFrom": []}))
+
+_cfg_slack = Path(_CFG) / "channels" / "slack"
+_cfg_slack.mkdir(parents=True, exist_ok=True)
+(_cfg_slack / "access.json").write_text(json.dumps({"allowFrom": []}))
 
 # The defect only reproduces with the feature OFF, which is the shipped default.
 os.environ["SUTANDO_PROGRESS_STREAM"] = "0"
