@@ -148,6 +148,12 @@ and loads whichever repo it reviews.
 
 ```yaml
 checks:
+  prose-cap:
+    # Added comment runs and docstrings may not exceed this many PHYSICAL lines.
+    # Both forms are scanned: a checker covering one reports clean on the other.
+    prose_cap: 2
+    prose_exts: ['.py']
+
   root-artifacts:
     # Added files at the REPO ROOT matching these are PR-draft leftovers. Root
     # only; omitting the key uses these defaults rather than disabling the check.

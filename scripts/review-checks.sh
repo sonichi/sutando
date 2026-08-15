@@ -124,10 +124,23 @@ fi
 # --- scan ADDED FILE PATHS for PR-draft artifacts at the repo root -----------
 # Separate scanner: a stray root file is a diff HEADER, so the content scan
 # above cannot see it whatever its patterns.
+PROSE_CAP="$(sed -n 's/^ *prose_cap: *//p' "$GUIDE" | head -1)"
+PROSE_CAP="${PROSE_CAP:-2}"
+PROSE_EXTS=".py"
 ROOT_HITS="$(printf '%s' "$DIFF" | RC_ROOT_ARTIFACT_GLOBS="$ROOT_GLOBS" python3 "$HERE/review-checks-root-artifacts.py")"
 ROOT_RC=$?
 if [[ $ROOT_RC -ne 0 ]]; then
     echo "review-checks: ERROR — root-artifacts scanner failed to run (exit $ROOT_RC); failing closed (NOT a pass)." >&2
+    exit 2
+fi
+
+# --- scan ADDED lines for prose blocks over the physical-line cap -----------
+# Separate scanner: comment runs AND docstrings. A checker covering only one
+# reports clean on the other's violation, which is worse than no gate.
+PROSE_HITS="$(printf '%s' "$DIFF" | RC_PROSE_CAP="$PROSE_CAP" RC_PROSE_EXTS="$PROSE_EXTS" python3 "$HERE/review-checks-prose-cap.py")"
+PROSE_RC=$?
+if [[ $PROSE_RC -ne 0 ]]; then
+    echo "review-checks: ERROR — prose-cap scanner failed to run (exit $PROSE_RC); failing closed (NOT a pass)." >&2
     exit 2
 fi
 
@@ -144,6 +157,12 @@ if [[ "$ROOT_HITS" =~ [^[:space:]] ]]; then
     echo "review-checks: $(printf '%s\n' "$ROOT_HITS" | grep -c '') artifact(s) at the repo root. Delete them from the branch, or add the name to root-artifacts in REVIEW.md if it is genuinely source." >&2
     FAILED=1
 fi
+if [[ "$PROSE_HITS" =~ [^[:space:]] ]]; then
+    echo "review-checks: FAIL — prose-cap:" >&2
+    printf '%s\n' "$PROSE_HITS" >&2
+    echo "review-checks: $(printf '%s\n' "$PROSE_HITS" | grep -c '') block(s) over the cap. Keep the constraint in the code and move the narrative to the PR body." >&2
+    FAILED=1
+fi
 [[ $FAILED -eq 1 ]] && exit 1
-echo "review-checks: PASS (hardcoded-paths + root-artifacts clean)"
+echo "review-checks: PASS (hardcoded-paths + root-artifacts + prose-cap clean)"
 exit 0
