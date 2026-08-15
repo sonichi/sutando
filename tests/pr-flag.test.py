@@ -100,12 +100,14 @@ def _mergeable_churn_does_not_refire():
              "mergeable": "MERGEABLE", "review": "APPROVED", "approvals": 2,
              "approvals_standing": 2}]
     prior = pf.mergeable_map(base)
-    assert prior == {"1": "MERGEABLE"}, f"map should carry the known value, got {prior}"
+    key = pf._mergeable_key(base[0])
+    assert prior == {key: "MERGEABLE"}, f"map should carry the known value, got {prior}"
+    assert key != "1", "the key must be revision-scoped, not the bare PR number"
 
     # GitHub parks the field at UNKNOWN mid-recompute: carried forward, no refire.
     churn = pf.carry_unknown_mergeable([dict(base[0], mergeable="UNKNOWN")], prior)
     assert pf.state_hash(base) == pf.state_hash(churn), "UNKNOWN churn must NOT move the hash"
-    assert pf.mergeable_map(churn) == {"1": "MERGEABLE"}, "carried value must persist for the next fire"
+    assert pf.mergeable_map(churn) == {key: "MERGEABLE"}, "carried value must persist for the next fire"
 
     # The control the reviewer asked for: a real transition MUST wake the cron.
     # The target branch advancing changes nothing else -- not head, base name, ci,
@@ -615,9 +617,81 @@ def main() -> int:
     _failed_fetch_is_never_an_empty_population()
     _each_stage_certifies_its_own_ceiling()
     _prior_read_fails_open_on_any_shape()
+    _uncertified_run_is_never_silent()
+    _mergeable_carry_is_revision_scoped()
     print("  ok  #2643 peer-scope + mergeable-churn cases")
     print("\nAll pr-flag core cases pass.")
     return 0
+
+
+def _uncertified_run_is_never_silent():
+    """P1: a failed fetch whose survivors hash to the LAST HEALTHY state."""
+    src = (REPO / "scripts" / "pr_flag.py").read_text()
+    assert "if h == prev and certified and not args.force:" in src, \
+        "the NO_CHANGE fast path must be gated on `certified`"
+
+    import io
+    import json
+    import contextlib
+    import tempfile
+    import pathlib
+    real_prs, real_disc = pf._fetch_prs, pf._fetch_discovered
+    try:
+        # Owner fetch survives and yields the same (empty) population as last
+        # run; discovery FAILS. The hash is therefore unchanged while the
+        # population is incomplete -- precisely the silent-outage case.
+        pf._fetch_prs = lambda *a, **k: (True, [])
+        pf._fetch_discovered = lambda *a, **k: (False, [])
+        h = pf.state_hash([])
+        with tempfile.TemporaryDirectory() as td:
+            sf = pathlib.Path(td) / "state.json"
+            sf.write_text(json.dumps({"hash": h}))
+            argv = ["pr_flag.py", "--emit", "--repo", "o/r", "--owner", "o",
+                    "--state-file", str(sf)]
+            out = io.StringIO()
+            real_argv = sys.argv
+            try:
+                sys.argv = argv
+                with contextlib.redirect_stdout(out):
+                    pf.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = real_argv
+            printed = out.getvalue().strip()
+            assert printed != "NO_CHANGE", \
+                "an uncertified run exited NO_CHANGE -- the outage is invisible " \
+                "to the monitor and the population was never declared incomplete"
+    finally:
+        pf._fetch_prs, pf._fetch_discovered = real_prs, real_disc
+    print("  ok  an uncertified run never collapses to NO_CHANGE")
+
+
+def _mergeable_carry_is_revision_scoped():
+    """P1: UNKNOWN must not inherit a DIFFERENT revision's mergeability."""
+    prev = pf.mergeable_map(
+        [{"number": 7, "head": "aaa", "base": "main", "mergeable": "MERGEABLE"}])
+
+    same = pf.carry_unknown_mergeable(
+        [{"number": 7, "head": "aaa", "base": "main", "mergeable": "UNKNOWN"}], prev)
+    assert same[0]["mergeable"] == "MERGEABLE", same
+
+    forced = pf.carry_unknown_mergeable(
+        [{"number": 7, "head": "bbb", "base": "main", "mergeable": "UNKNOWN"}], prev)
+    assert forced[0]["mergeable"] == "UNKNOWN", \
+        "a force-pushed head inherited the old revision's MERGEABLE"
+
+    retargeted = pf.carry_unknown_mergeable(
+        [{"number": 7, "head": "aaa", "base": "release", "mergeable": "UNKNOWN"}], prev)
+    assert retargeted[0]["mergeable"] == "UNKNOWN", \
+        "a retargeted base inherited the old revision's MERGEABLE"
+
+    legacy = pf.carry_unknown_mergeable(
+        [{"number": 7, "head": "aaa", "base": "main", "mergeable": "UNKNOWN"}],
+        {"7": "MERGEABLE"})
+    assert legacy[0]["mergeable"] == "UNKNOWN", \
+        "a pre-scoping number-keyed state file must fail open, not carry"
+    print("  ok  carried mergeable is scoped to (number, head, base)")
 
 
 if __name__ == "__main__":

@@ -202,8 +202,18 @@ def raw_state(prs: list, owner_login: str, stand: str = None) -> list:
     return out
 
 
+def _mergeable_key(row: dict) -> str:
+    """Cache key for a carried mergeable value.
+
+    Scoped to the REVISION, not the PR: a force-push or retarget parks the field
+    at UNKNOWN, and a number-only key would attach the old revision's MERGEABLE
+    to the new one -- suppressing exactly the wake-up that re-evaluation needs.
+    """
+    return f"{row.get('number')}@{row.get('head') or ''}#{row.get('base') or ''}"
+
+
 def carry_unknown_mergeable(state: list, previous: dict) -> list:
-    """Replace UNKNOWN mergeable with the last value seen for that PR.
+    """Replace UNKNOWN mergeable with the last value seen for THIS revision.
 
     GitHub's lazy recomputation parks the field at UNKNOWN; carrying the previous
     value keeps that churn out of the hash while leaving a real
@@ -213,7 +223,9 @@ def carry_unknown_mergeable(state: list, previous: dict) -> list:
     for s in state:
         row = dict(s)
         if row.get("mergeable") == "UNKNOWN":
-            prior = (previous or {}).get(str(row.get("number")))
+            # A miss (new revision, or a pre-scoping number-keyed state file)
+            # leaves UNKNOWN in place -- the conservative direction.
+            prior = (previous or {}).get(_mergeable_key(row))
             if prior:
                 row["mergeable"] = prior
         out.append(row)
@@ -221,8 +233,8 @@ def carry_unknown_mergeable(state: list, previous: dict) -> list:
 
 
 def mergeable_map(state: list) -> dict:
-    """Per-PR mergeable, for the next run to carry forward."""
-    return {str(s.get("number")): s.get("mergeable") for s in state
+    """Per-REVISION mergeable, for the next run to carry forward."""
+    return {_mergeable_key(s): s.get("mergeable") for s in state
             if s.get("mergeable") and s.get("mergeable") != "UNKNOWN"}
 
 
@@ -624,7 +636,9 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     except Exception:
         prev = ""
 
-    if h == prev and not args.force:
+    # `certified` gates the fast path: an uncertified run whose surviving rows
+    # happen to hash to the last healthy state would otherwise exit silently.
+    if h == prev and certified and not args.force:
         print("NO_CHANGE")
         return 0
 
