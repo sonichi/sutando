@@ -240,13 +240,16 @@ class _Status(unittest.TestCase):
         # Review P1: a NEW rejection after a recovered episode must not
         # keep advertising the stale recovered:true terminal.
         saved = {n: getattr(gw, n) for n in
-                 ("TOKEN_FILE", "_reload_rotated_token", "_reenroll_claim",
-                  "_log", "GATEWAY_STATUS_FILE")}
+                 ("TOKEN_FILE", "TOKEN", "_reload_rotated_token",
+                  "_reenroll_claim", "_log", "GATEWAY_STATUS_FILE")}
         tmp = Path(tempfile.mkdtemp()) / "gateway-status.json"
         try:
             _reset(recovered_at=1786767544)   # episode A ended recovered
             gw.GATEWAY_STATUS_FILE = tmp
             gw.TOKEN_FILE = ""
+            # A host-resolved TOKEN would (correctly) enter the loop under the
+            # narrowed guard — stub it so the FATAL branch is actually taken.
+            gw.TOKEN = ""
             gw._log = lambda m: None
             gw._reload_rotated_token = lambda: False
             gw._reenroll_claim = lambda: None   # claim fails to park (409/net)
