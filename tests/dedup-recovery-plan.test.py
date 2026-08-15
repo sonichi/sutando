@@ -80,12 +80,8 @@ class PlanTest(unittest.TestCase):
             self.assertIn("dedup_requeue_count: 1", body, "loop guard missing")
 
     def test_live_unarchived_holder_is_found(self):
-        """A holder that answered moments ago is still in results/, not archive/.
-
-        Archival trails delivery, so a same-pass dedup is decided while the
-        holder's result is live. Reading only archive/ calls that "never
-        delivered" and re-asks a question that was already answered.
-        """
+        """Archival trails delivery, so a same-pass dedup is decided while the
+        holder's result is still live in results/ rather than archive/."""
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.orig()
             (sp.results / f"{HOLDER}.txt").write_text("the full answer")
@@ -236,11 +232,8 @@ class DelegationTest(unittest.TestCase):
                 )
 
     def test_result_lookup_is_not_reimplemented(self):
-        """Live-then-archive is one policy with one owner.
-
-        An archive-only copy reads a delivered-but-not-yet-archived result as
-        "never delivered", which re-asks a question that was already answered.
-        """
+        """Live-then-archive is one policy: an archive-only copy reads a
+        delivered-but-unarchived result as never delivered."""
         for name, path in LOOKUP_CONSUMERS.items():
             with self.subTest(consumer=name):
                 src = path.read_text()

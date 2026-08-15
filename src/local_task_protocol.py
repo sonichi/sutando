@@ -521,11 +521,8 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
 
 
 def find_result(results_dir: Path, task_id: str) -> Path | None:
-    """Locate a task's result wherever it currently is: live dir, then archive.
-
-    Archival trails delivery, so a result can be delivered and not yet moved;
-    an archive-only lookup reads that window as "never delivered".
-    """
+    """Locate a task's result: live dir first, then archive. Archival trails
+    delivery, so an archive-only lookup reads a fresh result as never delivered."""
     if not valid_archive_lookup_id(task_id):
         return None
     live = Path(results_dir) / f"{task_id}.txt"
