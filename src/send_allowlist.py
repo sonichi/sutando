@@ -46,7 +46,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
-from util_paths import shared_personal_path  # noqa: E402
+from util_paths import (  # noqa: E402
+    legacy_dotted_workspace_path,
+    shared_personal_path,
+)
 
 _REPO = resolve_workspace()
 
@@ -60,6 +63,9 @@ SEND_ALLOWED_ROOTS: tuple[str, ...] = (
     # allowed during the transition; resolver picks whichever exists.
     str(shared_personal_path("notes", _REPO)),
     str(_REPO / "docs"),
+    # Rendered episode bundles. This tree can be a symlink out to the sync
+    # root; roots are realpath'd below, and `generated` keeps notes/ private.
+    str(legacy_dotted_workspace_path("notes", "generated")),
     str(Path.home() / "Desktop" / "iclr-backups"),
     str(Path.home() / "Documents" / "sutando-launch-assets"),
 )
