@@ -103,6 +103,9 @@ class _Claim(unittest.TestCase):
             _reset()
             gw.os.environ.pop("AGENT_MXID", None)
             gw.os.environ.pop("AGENT_ID", None)
+            saved_cfg = gw._config_from_channel_env
+            gw._config_from_channel_env = lambda k: ""
+            self.addCleanup(setattr, gw, "_config_from_channel_env", saved_cfg)
             gw._reenroll_claim()  # runs, but refuses without identity
             self.assertIsNone(gw._reenroll_state["code"])
         finally:
@@ -148,9 +151,32 @@ class _Claim(unittest.TestCase):
         finally:
             gw.urllib.request.urlopen = real
 
+
+    def test_identity_falls_back_to_the_channel_env_file(self):
+        # G3 (live-confirmed on a real install): desktop launchers export
+        # NEITHER AGENT_MXID nor AGENT_ID — the channel .env is the source.
+        gw.os.environ.pop("AGENT_MXID", None)
+        gw.os.environ.pop("AGENT_ID", None)
+        saved = gw._config_from_channel_env
+        gw._config_from_channel_env = (
+            lambda k: "@file.agent:ag2.space" if k == "AG2SPACE_USER_ID" else "")
+        real = gw.urllib.request.urlopen
+        gw.urllib.request.urlopen = self._serve(
+            {"ok": True, "pending": True, "approval_code": "beef1234"})
+        try:
+            gw._reenroll_claim()
+        finally:
+            gw.urllib.request.urlopen = real
+            gw._config_from_channel_env = saved
+        self.assertEqual(self.posted[-1][1]["agent_id"], "@file.agent:ag2.space")
+        self.assertEqual(gw._reenroll_state["code"], "beef1234")
+
     def test_missing_identity_does_not_consume_the_cadence(self):
         gw.os.environ.pop("AGENT_MXID", None)
         gw.os.environ.pop("AGENT_ID", None)
+        saved_cfg = gw._config_from_channel_env
+        gw._config_from_channel_env = lambda k: ""   # no .env identity either
+        self.addCleanup(setattr, gw, "_config_from_channel_env", saved_cfg)
         gw._reenroll_claim()   # no POST issued
         self.assertEqual(gw._reenroll_state["last_attempt_at"], 0.0)
         gw.os.environ["AGENT_MXID"] = "@probe.agent:ag2.space"

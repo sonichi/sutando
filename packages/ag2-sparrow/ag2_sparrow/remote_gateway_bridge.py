@@ -653,6 +653,20 @@ def _provision_base() -> str:
     return URL.split("/relay")[0].rstrip("/") + "/api"
 
 
+def _reenroll_identity() -> str:
+    """Agent mxid: process env first, then the channel .env file — the same
+    fallback the token uses (desktop launchers don't export either)."""
+    for key in ("AGENT_MXID", "AGENT_ID"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v
+    for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
+        v = _config_from_channel_env(key).strip()
+        if v:
+            return v
+    return ""
+
+
 def _reenroll_claim() -> None:
     """Best-effort claim: one live code per episode; failed POSTs retry no
     sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
@@ -660,7 +674,7 @@ def _reenroll_claim() -> None:
         return
     if time.time() - _reenroll_state["last_attempt_at"] < REENROLL_CLAIM_RETRY_S:
         return
-    agent_id = (os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID") or "").strip()
+    agent_id = _reenroll_identity()
     if not agent_id or not TOKEN:
         # No POST issued -> no cadence stamp; identity may appear later.
         _log("reenroll: AGENT_MXID/AGENT_ID or token unavailable — not claiming")
