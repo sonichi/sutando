@@ -132,10 +132,8 @@ class TestTaskClaimAge(unittest.TestCase):
         source = (REPO / "src" / "health-check.py").read_text()
         self.assertIn("checks.append(check_task_claim_age())", source)
 
-    # --- thresholds track the HANDLER's configured bound, not a constant -----
-    # Claims wrap session-worker.py, whose hard limit is SUTANDO_TIER_HARD_TIMEOUT
-    # (default 900s, explicitly configurable). A fixed threshold pages on live work
-    # the moment a deployment raises that timeout.
+    # Thresholds track SUTANDO_TIER_HARD_TIMEOUT (configurable), not a constant:
+    # a fixed threshold pages on live work as soon as a deployment raises it.
 
     def test_raised_hard_timeout_does_not_page_on_an_in_flight_handler(self):
         """The reviewer's control on #2906: hard timeout 7200s, a 1900s live claim.

@@ -5746,11 +5746,8 @@ def check_task_watcher() -> dict:
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 
-#: A claim covers ONE handler run, so the thresholds must track the handler's OWN
-#: configured bound. `session-worker.py` reads `SUTANDO_TIER_HARD_TIMEOUT`
-#: (default 900s) and is explicitly configurable, so a deployment that raises it
-#: has legitimately longer in-flight claims. Anchoring on a constant instead
-#: pages on live work the moment the timeout is raised.
+#: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
+#: configurable): a constant pages on live work the moment a deploy raises it.
 _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S = 900.0
 _TASK_CLAIM_WARN_MULTIPLE = 2
 _TASK_CLAIM_DOWN_MULTIPLE = 8
@@ -5911,9 +5908,8 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     warn_s, down_s = _task_claim_thresholds()
     bounded, leaked, in_flight, held = [], [], 0, 0
     entries = list(base.glob("task-*.txt"))
-    # Ages come from a LOCAL first-sighting, not mtime: mtime is sync-mutable.
-    # An untrusted ledger degrades only the AGE-DEPENDENT decisions. A dead owner
-    # is knowable without any age, so keep scanning rather than returning here.
+    # Ages come from a LOCAL first-sighting; mtime is sync-mutable. An untrusted
+    # ledger degrades only the AGE-DEPENDENT decisions, so keep scanning.
     ages, age_trusted = _claim_ages(entries, Path(workspace_dir or WORKSPACE_DIR), now)
     age_unknown = 0
     for entry in entries:
@@ -5922,19 +5918,16 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
             continue          # raced with a release; the next run sees the truth
         held += 1
         pid, disposition, task_path = _claim_owner(entry)
-        # The task file is the progress signal. While it exists the work is
-        # queued or running -- with 2 handler workers a burst legitimately holds
-        # several claims -- so neither count nor age can condemn it.
+        # The task file is the progress signal: while it exists the work is queued
+        # or running, and 2 workers legitimately hold several claims in a burst.
         task_live = bool(task_path) and Path(task_path).exists()
         # Age-INDEPENDENT and definitive, so it is checked FIRST: nothing can
         # release a claim whose owner is gone, whatever the ledger says.
         if pid is not None and not _pid_alive(pid):
             leaked.append((age or 0.0, entry.name, "owner process gone"))
         elif not task_live:
-            # Archival and claim release are ASYNCHRONOUS: the handler can
-            # publish, the bridge archive the task, and finish_handler_task
-            # still be processing HANDLER_DONE. Only past that window is an
-            # absent task evidence that nothing will release the claim.
+            # Archival and claim release are ASYNCHRONOUS; only past that window
+            # is an absent task evidence that nothing will release the claim.
             if age is None:
                 age_unknown += 1          # grace needs an age we do not have
             elif age >= _TASK_CLAIM_ARCHIVE_GRACE_S:
