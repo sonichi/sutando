@@ -189,9 +189,24 @@ class TestTaskClaimAge(unittest.TestCase):
 
     def test_all_claims_unreadable_reads_as_empty_not_broken(self):
         """Every entry racing at once is indistinguishable from an empty dir, and
-        an empty dir is the honest report — the next run sees the truth."""
+        an empty dir is the honest report — the next run sees the truth.
+
+        Raises only for claim FILES, never blanket-on-Path.stat: CPython 3.12's
+        `Path.is_dir()` calls stat(), so a global raise breaks the probe's own
+        directory check and the test exercises the wrong failure. It passed on
+        3.14 locally and errored on 3.12 in CI for exactly that reason. The
+        suffix matters too — the claims DIRECTORY is `task-event-handler-claims`,
+        which also starts with `task-`.
+        """
         self._claim("task-gone.txt", 10)
-        with mock.patch.object(Path, "stat", lambda *a, **kw: (_ for _ in ()).throw(OSError())):
+        real_stat = Path.stat
+
+        def flaky(self_path, *a, **kw):
+            if self_path.name.startswith("task-") and self_path.name.endswith(".txt"):
+                raise OSError(2, "No such file or directory")
+            return real_stat(self_path, *a, **kw)
+
+        with mock.patch.object(Path, "stat", flaky):
             out = self.hc.check_task_claim_age(workspace_dir=self.ws)
         self.assertEqual(out["status"], "ok")
 
