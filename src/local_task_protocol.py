@@ -520,6 +520,20 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     return flat[-1] if flat else None
 
 
+def find_result(results_dir: Path, task_id: str) -> Path | None:
+    """Locate a task's result wherever it currently is: live dir, then archive.
+
+    Archival trails delivery, so a result can be delivered and not yet moved;
+    an archive-only lookup reads that window as "never delivered".
+    """
+    if not valid_archive_lookup_id(task_id):
+        return None
+    live = Path(results_dir) / f"{task_id}.txt"
+    if live.is_file():
+        return live
+    return find_archived_result(results_dir, task_id)
+
+
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
