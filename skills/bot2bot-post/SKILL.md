@@ -20,6 +20,11 @@ the shell eats the remainder — the message arrives truncated and the send stil
 reports success. Write the body to a file and pass the path; nothing crosses a
 quoting boundary.
 
+`--body-file` reads whatever path it is given and posts the contents, and neither
+form redacts. That is not new capability — the positional form already accepts
+`"$(cat <path>)"` — but the content is no longer visible in the caller's command,
+so **write the file yourself; never point it at a path you have not read.**
+
 Kinds:
 - `claim` — "I'm taking this work, ETA X"
 - `blocked` — "I'm stuck on X, need eyes"
