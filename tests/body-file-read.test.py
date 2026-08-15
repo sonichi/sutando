@@ -8,6 +8,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -77,17 +78,69 @@ class ReaderContract(unittest.TestCase):
             body_file.read_body_file(p)
         self.assertIn("over the", str(cm.exception))
 
-    def test_growth_after_stat_is_still_refused(self):
-        # The stat says small, the bytes say large. Without the post-read
-        # re-check a file that grows between the two calls slips the bound.
+    def test_growth_after_fstat_is_still_refused(self):
+        # fstat says small, the bytes say large. Without the post-read re-check a
+        # file that grows after validation slips the bound.
         p = self._p("grows.txt")
         pathlib.Path(p).write_bytes(b"x" * (body_file.MAX_BODY_BYTES + 1))
         real = os.stat(p)
         lying = os.stat_result((real.st_mode, 0, 0, 1, 0, 0, 10) + tuple(real)[7:])
-        with mock.patch.object(body_file.os, "stat", return_value=lying):
+        with mock.patch.object(body_file.os, "fstat", return_value=lying):
             with self.assertRaises(SystemExit) as cm:
                 body_file.read_body_file(p)
         self.assertIn("exceeds", str(cm.exception))
+
+    def test_a_regular_file_swapped_for_a_fifo_before_open_is_refused(self):
+        # The TOCTOU control. Validating the PATHNAME and then opening it is two
+        # syscalls; swap the entry between them and the open blocks forever.
+        p = self._p("swapped.txt")
+        pathlib.Path(p).write_text("body that never gets read\n", encoding="utf-8")
+        real_open = os.open
+
+        def swapping_open(target, *a, **kw):
+            if target == p:                  # replace exactly at the open boundary
+                os.unlink(p)
+                os.mkfifo(p)
+            return real_open(target, *a, **kw)
+
+        started = time.monotonic()
+        with mock.patch.object(body_file.os, "open", swapping_open):
+            with self.assertRaises(SystemExit) as cm:
+                body_file.read_body_file(p)
+        elapsed = time.monotonic() - started
+        self.assertIn("not a regular file", str(cm.exception))
+        self.assertLess(elapsed, 1.0, "reader blocked on the swapped FIFO")
+
+    def test_the_pathname_is_never_stat_ed(self):
+        # Structural guarantee behind the swap test: validation reads the open
+        # descriptor, so no pathname-based stat may occur at all.
+        p = self._p("plain.txt")
+        pathlib.Path(p).write_text("hello\n", encoding="utf-8")
+
+        def forbidden(*a, **kw):
+            raise AssertionError("read_body_file validated a PATHNAME, not a descriptor")
+
+        with mock.patch.object(body_file.os, "stat", forbidden):
+            self.assertEqual(body_file.read_body_file(p), "hello")
+
+    def test_a_fifo_returns_promptly_rather_than_hanging(self):
+        p = self._p("slow-pipe")
+        os.mkfifo(p)
+        started = time.monotonic()
+        with self.assertRaises(SystemExit):
+            body_file.read_body_file(p)
+        self.assertLess(time.monotonic() - started, 1.0, "reader blocked on a FIFO")
+
+    def test_the_descriptor_is_closed_on_the_refusal_path(self):
+        p = self._p("toobig.txt")
+        pathlib.Path(p).write_bytes(b"x" * (body_file.MAX_BODY_BYTES + 1))
+        before = len(os.listdir("/dev/fd")) if os.path.isdir("/dev/fd") else None
+        for _ in range(20):
+            with self.assertRaises(SystemExit):
+                body_file.read_body_file(p)
+        if before is not None:
+            after = len(os.listdir("/dev/fd"))
+            self.assertLess(after - before, 5, "descriptors leaked on the refusal path")
 
     def test_exactly_at_the_limit_is_accepted(self):
         p = self._p("edge.txt")
