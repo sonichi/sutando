@@ -238,6 +238,20 @@ class TestClaimExecutionContract(unittest.TestCase):
         t = time.time() - age_h * 3600
         os.utime(f, (t, t))
 
+    def _claim_in(self, ws, name, pid, disposition, age_h, task_exists):
+        cd = ws / "state" / "task-event-handler-claims"
+        cd.mkdir(parents=True, exist_ok=True)
+        td = ws / "tasks"
+        td.mkdir(parents=True, exist_ok=True)
+        tp = td / name
+        if task_exists:
+            tp.write_text("task\n")
+        f = cd / name
+        f.write_text("%s\nWID\n%s\n%s\n" % (pid, tp, disposition))
+        t = time.time() - age_h * 3600
+        os.utime(f, (t, t))
+        return f
+
     def _run(self, spec):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
@@ -261,6 +275,35 @@ class TestClaimExecutionContract(unittest.TestCase):
         r = self._run([(os.getpid(), "fallback", 31.0 - i * 0.5, False) for i in range(34)])
         self.assertEqual(r["status"], "down", r["detail"])
         self.assertIn("task already archived", r["detail"])
+
+    def test_a_sync_refreshed_mtime_cannot_hide_a_stale_bounded_claim(self):
+        # A sync replay rewrites claim mtime; the execution lifetime is
+        # unchanged and must still alarm.
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            subprocess.run(["git", "init", "-q", str(ws)], check=False)
+            self._claim_in(ws, "task-1.txt", os.getpid(), "must-handle", 40.0, True)
+            first = self.hc.check_task_claim_age(ws)
+            self.assertEqual(first["status"], "down", first["detail"])
+            f = ws / "state" / "task-event-handler-claims" / "task-1.txt"
+            now = time.time()
+            os.utime(f, (now, now))          # the sync replay
+            after = self.hc.check_task_claim_age(ws)
+            self.assertEqual(after["status"], "down",
+                             "a refreshed mtime pushed a stale bounded claim "
+                             "back under its threshold: " + after["detail"])
+            self.assertIn("40.0h", after["detail"])
+
+    def test_the_observation_registry_is_outside_the_synced_tree(self):
+        # state/ is carryable by a vault.sync include; the git dir never is.
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            subprocess.run(["git", "init", "-q", str(ws)], check=False)
+            p = self.hc._claim_observations_path(ws)
+            self.assertIn(".git", str(p),
+                          "observations must live under the git dir: " + str(p))
 
     def test_archive_before_claim_release_is_not_an_outage(self):
         # The reviewer's case: handler published, bridge archived the task,

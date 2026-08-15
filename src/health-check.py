@@ -5810,6 +5810,54 @@ def _claim_owner(path: Path):
 _TASK_CLAIM_ARCHIVE_GRACE_S = 300
 
 
+def _claim_observations_path(workspace_dir: Path) -> Path:
+    """Under the git dir on purpose: `state/` is carryable by a supported
+    vault.sync include, but nothing under the git dir is ever tracked (#2476)."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=str(workspace_dir),
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            git_dir = (workspace_dir / out.stdout.strip()).resolve()
+            return git_dir / "sutando-claim-observations.json"
+    except Exception:
+        pass
+    # No git dir (a bare workspace): fall back beside the claims, and say so by
+    # name so a reader knows this copy is only as durable as state/ itself.
+    return workspace_dir / "state" / ".claim-observations-local.json"
+
+
+def _claim_ages(entries: list, workspace_dir: Path, now: float) -> dict:
+    """{name: seconds since THIS host first observed the claim}. mtime is
+    sync-mutable, so a refresh must not push a stale claim under its threshold."""
+    path = _claim_observations_path(workspace_dir)
+    try:
+        seen = json.loads(path.read_text())
+        if not isinstance(seen, dict):
+            seen = {}
+    except Exception:
+        seen = {}          # unreadable/corrupt -> re-observe, never crash the probe
+    live = {e.name for e in entries}
+    seen = {k: v for k, v in seen.items() if k in live and isinstance(v, (int, float))}
+    ages = {}
+    for e in entries:
+        first = seen.get(e.name)
+        if first is None:
+            # First sighting: seed from mtime, the only evidence there is, but
+            # record it so a later sync refresh cannot move it.
+            try:
+                first = e.stat().st_mtime
+            except OSError:
+                continue      # raced with a release; no age, caller skips it
+            seen[e.name] = first
+        ages[e.name] = max(0.0, now - first)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(seen))
+    except Exception:
+        pass               # read-only fs: degrade to per-run observation
+    return ages
+
+
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     """Held-but-unsettled task-handler claims — a leak no other probe can see.
 
@@ -5826,10 +5874,12 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     now = time.time()
     warn_s, down_s = _task_claim_thresholds()
     bounded, leaked, in_flight, held = [], [], 0, 0
-    for entry in base.glob("task-*.txt"):
-        try:
-            age = now - entry.stat().st_mtime
-        except OSError:
+    entries = list(base.glob("task-*.txt"))
+    # Ages come from a LOCAL first-sighting, not mtime: mtime is sync-mutable.
+    ages = _claim_ages(entries, Path(workspace_dir or WORKSPACE_DIR), now)
+    for entry in entries:
+        age = ages.get(entry.name)
+        if age is None:
             continue          # raced with a release; the next run sees the truth
         held += 1
         pid, disposition, task_path = _claim_owner(entry)
