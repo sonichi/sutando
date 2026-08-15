@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 """Bridge self-claim on auth rejection (registry-loss recovery, backend #595).
-
-Pins the client half of the claim -> owner-approval flow:
-  - ONE claim per auth-rejection episode; the approval code is surfaced on
-    device-visible channels only (log + gateway-status.json reenroll block).
-  - The recovery loop probes the gateway with the CURRENT token once a claim
-    is pending — re-enrollment revalidates the SAME bearer, so waiting for a
-    token-file rotation alone would wait forever.
-  - _auth_probe treats only a definite 401/403 as "still rejected"; network
-    errors keep waiting (no false recovery on a flaky link).
-  - Kill switch REMOTE_REENROLL=0 and missing-identity guard never claim.
-
-Run: python3 tests/gateway-auto-reenroll.test.py
-"""
+Run: python3 tests/gateway-auto-reenroll.test.py"""
 from __future__ import annotations
 
 import io
@@ -33,7 +21,7 @@ from ag2_sparrow import remote_gateway_bridge as gw  # noqa: E402
 
 def _reset(**over):
     gw._reenroll_state.clear()
-    gw._reenroll_state.update({"last_attempt_at": 0.0, "code": None,
+    gw._reenroll_state.update({"last_attempt_at": None, "code": None,
                                "claimed_at": None})
     gw._reenroll_state.update(over)
 
@@ -142,10 +130,10 @@ class _Claim(unittest.TestCase):
             self.assertIsNone(gw._reenroll_state["code"])
             gw._reenroll_claim()                       # inside cadence: no POST
             self.assertEqual(calls["n"], 1)
-            gw._reenroll_state["last_attempt_at"] = 0.0  # cadence elapsed
+            gw._reenroll_state["last_attempt_at"] = None  # never attempted
             gw._reenroll_claim()                       # retried -> parks
             self.assertEqual(gw._reenroll_state["code"], "beef1234")
-            gw._reenroll_state["last_attempt_at"] = 0.0
+            gw._reenroll_state["last_attempt_at"] = None
             gw._reenroll_claim()                       # parked: one-claim invariant
             self.assertEqual(calls["n"], 2)
         finally:
@@ -178,7 +166,7 @@ class _Claim(unittest.TestCase):
         gw._config_from_channel_env = lambda k: ""   # no .env identity either
         self.addCleanup(setattr, gw, "_config_from_channel_env", saved_cfg)
         gw._reenroll_claim()   # no POST issued
-        self.assertEqual(gw._reenroll_state["last_attempt_at"], 0.0)
+        self.assertIsNone(gw._reenroll_state["last_attempt_at"])
         gw.os.environ["AGENT_MXID"] = "@probe.agent:ag2.space"
         real = gw.urllib.request.urlopen
         gw.urllib.request.urlopen = self._serve(
@@ -202,9 +190,8 @@ class _Probe(unittest.TestCase):
         self.assertTrue(gw._auth_probe())
 
     def test_only_success_is_recovery(self):
-        # Review P1: a 5xx proves nothing about auth — resuming into a
-        # failing gateway just re-enters the error path. Every non-success
-        # keeps waiting.
+        # Review P1: an error proves nothing about auth — every non-success
+        # keeps waiting rather than resuming into a failing gateway.
         for exc in (urllib.error.HTTPError("u", 401, "no", {}, io.BytesIO(b"{}")),
                     urllib.error.HTTPError("u", 403, "no", {}, io.BytesIO(b"{}")),
                     urllib.error.HTTPError("u", 500, "err", {}, io.BytesIO(b"{}")),
@@ -250,9 +237,8 @@ class _Status(unittest.TestCase):
         self.assertNotIn("recovered_at", gw._reenroll_state)
 
     def test_second_episode_never_republishes_the_old_recovered_terminal(self):
-        # Review P1 (both reviewers; sonichi executed it): recovered episode A,
-        # then a NEW rejection whose claim fails to park -> status must not
-        # advertise the stale recovered:true.
+        # Review P1: a NEW rejection after a recovered episode must not
+        # keep advertising the stale recovered:true terminal.
         saved = {n: getattr(gw, n) for n in
                  ("TOKEN_FILE", "_reload_rotated_token", "_reenroll_claim",
                   "_log", "GATEWAY_STATUS_FILE")}
@@ -271,6 +257,37 @@ class _Status(unittest.TestCase):
         finally:
             for n, v in saved.items():
                 setattr(gw, n, v)
+            _reset()
+
+
+class _ClaimClock(unittest.TestCase):
+    def test_wall_clock_regression_does_not_suppress_retry(self):
+        # Review P2: the cadence must ride time.monotonic() — a backward
+        # wall-clock step must never suppress claims.
+        import unittest.mock as mock
+        saved_enabled = gw.REENROLL_ENABLED
+
+        def run_claim(last_offset, wall):
+            # Identity refusal sits after the cadence gate, so reaching it
+            # proves the gate passed; gate() counts those arrivals.
+            gates = {"n": 0}
+            with mock.patch.object(gw.time, "monotonic", return_value=100000.0), \
+                 mock.patch.object(gw.time, "time", return_value=wall), \
+                 mock.patch.object(gw, "_reenroll_identity",
+                                   side_effect=lambda: gates.__setitem__("n", gates["n"] + 1) or ""), \
+                 mock.patch.object(gw, "_log", lambda m: None):
+                gw._reenroll_state["last_attempt_at"] = 100000.0 - last_offset
+                gw._reenroll_claim()
+            return gates["n"]
+        try:
+            gw.REENROLL_ENABLED = True
+            _reset()
+            # Cadence elapsed on monotonic + wall clock stepped far BACK: fires.
+            self.assertEqual(run_claim(gw.REENROLL_CLAIM_RETRY_S + 1, 100.0), 1)
+            # Not elapsed on monotonic + wall clock far AHEAD: suppressed.
+            self.assertEqual(run_claim(1, 9e9), 0)
+        finally:
+            gw.REENROLL_ENABLED = saved_enabled
             _reset()
 
 
@@ -306,10 +323,8 @@ class _RecoverLoop(unittest.TestCase):
             _reset()
 
     def test_transiently_failed_claim_retries_and_parks_later(self):
-        # Reviewer blocker: `attempted` latched before the POST, so a claim
-        # that failed transiently never retried — on the standard install
-        # (TOKEN_FILE set) the bridge then waited forever with no reenroll
-        # block and no popup. Retrying while nothing is parked is safe.
+        # Review blocker: a transiently-failed claim must retry — retrying
+        # while nothing is parked is safe (no code to supersede).
         saved = {n: getattr(gw, n) for n in
                  ("TOKEN_FILE", "AUTH_RECHECK_INTERVAL", "_reload_rotated_token",
                   "_heartbeat_singleton", "_auth_probe", "_reenroll_claim",

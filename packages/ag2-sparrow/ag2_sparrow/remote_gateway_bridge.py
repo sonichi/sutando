@@ -645,7 +645,7 @@ REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
     not in ("0", "false", "no", "off")
 REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
 REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
-_reenroll_state: dict = {"last_attempt_at": 0.0, "code": None, "claimed_at": None}
+_reenroll_state: dict = {"last_attempt_at": None, "code": None, "claimed_at": None}
 
 
 def _provision_base() -> str:
@@ -672,14 +672,17 @@ def _reenroll_claim() -> None:
     sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
     if not REENROLL_ENABLED or _reenroll_state["code"]:
         return
-    if time.time() - _reenroll_state["last_attempt_at"] < REENROLL_CLAIM_RETRY_S:
+    last = _reenroll_state["last_attempt_at"]
+    # Monotonic: a wall-clock step backward must not suppress claims (review
+    # P2); None = never attempted, so a fresh boot claims immediately.
+    if last is not None and time.monotonic() - last < REENROLL_CLAIM_RETRY_S:
         return
     agent_id = _reenroll_identity()
     if not agent_id or not TOKEN:
         # No POST issued -> no cadence stamp; identity may appear later.
         _log("reenroll: AGENT_MXID/AGENT_ID or token unavailable — not claiming")
         return
-    _reenroll_state["last_attempt_at"] = time.time()
+    _reenroll_state["last_attempt_at"] = time.monotonic()
     try:
         req = urllib.request.Request(
             _provision_base() + "/connect/reenroll",
@@ -708,7 +711,7 @@ def _reenroll_clear(recovered: bool = False) -> None:
     """End the episode; recovered=True (probe-success path only) leaves the
     explicit terminal — disappearance alone must never read as success."""
     was_pending = bool(_reenroll_state.get("code"))
-    _reenroll_state.update({"last_attempt_at": 0.0, "code": None, "claimed_at": None})
+    _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
     if recovered and was_pending:
         _reenroll_state["recovered_at"] = int(time.time())
     else:
