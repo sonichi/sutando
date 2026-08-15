@@ -395,6 +395,25 @@ class TestClaimExecutionContract(unittest.TestCase):
                 r = self.hc.check_task_claim_age(ws)
             self.assertEqual(r["status"], "warn", r["detail"])
 
+    def test_untrusted_age_still_reports_a_DEAD_OWNER_as_down(self):
+        # The reviewer's P1: a dead owner is knowable without any age, so an
+        # unusable ledger must not downgrade it to warn.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._claim_in(ws, "task-1.txt", 999999, "fallback", 0.1, True)
+            with mock.patch.object(self.hc, "_claim_ages", return_value=({}, False)):
+                r = self.hc.check_task_claim_age(ws)
+            self.assertEqual(r["status"], "down", r["detail"])
+            self.assertIn("owner process gone", r["detail"])
+
+    def test_the_probe_resolves_git_through_git_argv_not_a_bare_binary(self):
+        # A bare `git` can raise the Xcode CLT dialog on a clean macOS box.
+        src = (REPO / "src" / "health-check.py").read_text()
+        i = src.index("def _claim_observations_path")
+        body = src[i:src.index("def _claim_ages")]
+        self.assertIn("git_argv(", body)
+        self.assertNotIn('["git"', body)
+
     def test_archive_before_claim_release_is_not_an_outage(self):
         # The reviewer's case: handler published, bridge archived the task,
         # and finish_handler_task has not processed HANDLER_DONE yet.

@@ -5821,7 +5821,7 @@ def _claim_observations_path(workspace_dir: Path) -> Optional[Path]:
     engine = REPO_DIR.resolve()          # the module already resolves its own repo
     try:
         # rev-parse, not `engine/".git"`: in a WORKTREE .git is a file.
-        out = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=str(engine),
+        out = subprocess.run(git_argv("rev-parse", "--git-dir"), cwd=str(engine),
                              capture_output=True, text=True, timeout=5)
         if out.returncode != 0 or not out.stdout.strip():
             return None
@@ -5912,17 +5912,13 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     bounded, leaked, in_flight, held = [], [], 0, 0
     entries = list(base.glob("task-*.txt"))
     # Ages come from a LOCAL first-sighting, not mtime: mtime is sync-mutable.
+    # An untrusted ledger degrades only the AGE-DEPENDENT decisions. A dead owner
+    # is knowable without any age, so keep scanning rather than returning here.
     ages, age_trusted = _claim_ages(entries, Path(workspace_dir or WORKSPACE_DIR), now)
-    if entries and not age_trusted:
-        # No structurally-unsynced store: mtime is the only signal and it is
-        # refreshable, so report the gap rather than a number we cannot trust.
-        return {"name": name, "status": "warn",
-                "detail": f"{len(entries)} held claim(s); claim AGE is unavailable "
-                          "(no unsynced observation store), so a stale claim cannot "
-                          "be distinguished from a fresh one"}
+    age_unknown = 0
     for entry in entries:
         age = ages.get(entry.name)
-        if age is None:
+        if age is None and age_trusted:
             continue          # raced with a release; the next run sees the truth
         held += 1
         pid, disposition, task_path = _claim_owner(entry)
@@ -5930,19 +5926,26 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         # queued or running -- with 2 handler workers a burst legitimately holds
         # several claims -- so neither count nor age can condemn it.
         task_live = bool(task_path) and Path(task_path).exists()
-        if not task_live:
+        # Age-INDEPENDENT and definitive, so it is checked FIRST: nothing can
+        # release a claim whose owner is gone, whatever the ledger says.
+        if pid is not None and not _pid_alive(pid):
+            leaked.append((age or 0.0, entry.name, "owner process gone"))
+        elif not task_live:
             # Archival and claim release are ASYNCHRONOUS: the handler can
             # publish, the bridge archive the task, and finish_handler_task
             # still be processing HANDLER_DONE. Only past that window is an
             # absent task evidence that nothing will release the claim.
-            if age >= _TASK_CLAIM_ARCHIVE_GRACE_S:
+            if age is None:
+                age_unknown += 1          # grace needs an age we do not have
+            elif age >= _TASK_CLAIM_ARCHIVE_GRACE_S:
                 leaked.append((age, entry.name, "task already archived"))
             else:
                 in_flight += 1
-        elif pid is not None and not _pid_alive(pid):
-            leaked.append((age, entry.name, "owner process gone"))
         elif disposition == "must-handle":
-            bounded.append((age, entry.name))
+            if age is None:
+                age_unknown += 1          # the bound is an age comparison
+            else:
+                bounded.append((age, entry.name))
         else:
             in_flight += 1
 
@@ -5968,6 +5971,12 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         if age > warn_s:
             return {"name": name, "status": "warn",
                     "detail": f"{detail} — past {_TASK_CLAIM_WARN_MULTIPLE}x the handler's own bound"}
+    if age_unknown:
+        return {"name": name, "status": "warn",
+                "detail": f"{held} held claim(s); no leak or dead owner found, but "
+                          f"claim AGE is unavailable for {age_unknown} of them (no "
+                          "trusted observation store), so stale cannot be told from "
+                          "fresh for those"}
     return {"name": name, "status": "ok",
             "detail": f"{held} held claim(s), {in_flight} still queued or running; "
                       "none leaked and none past its own execution contract"}
