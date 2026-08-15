@@ -11,7 +11,14 @@ Post a coordination message from this Sutando node to the shared `#bot2bot` Disc
 
 ```bash
 python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> <text>
+python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> --body-file <path>
 ```
+
+**Use `--body-file` for any prose containing backticks or apostrophes.** An
+apostrophe closes a single-quoted shell argument and re-arms the backticks, so
+the shell eats the remainder — the message arrives truncated and the send still
+reports success. Write the body to a file and pass the path; nothing crosses a
+quoting boundary.
 
 Kinds:
 - `claim` — "I'm taking this work, ETA X"

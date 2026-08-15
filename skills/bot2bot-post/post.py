@@ -3,12 +3,17 @@
 
 Usage:
     python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> <text>
+    python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> --body-file <path>
     python3 skills/bot2bot-post/post.py claim "refactor X, ETA 20m"
     python3 skills/bot2bot-post/post.py --to pro ping "your take on the WIRE topic?"
     python3 skills/bot2bot-post/post.py --to lucy opinion "disagreement axis below"
     python3 skills/bot2bot-post/post.py done "shipped PR #472"
 
 Kinds: claim | blocked | done | ping | nack | opinion
+--body-file <path>: read the body from a FILE instead of argv. Use it for any
+prose containing backticks or apostrophes — an apostrophe closes a
+single-quoted shell argument and re-arms the backticks, truncating the message
+at that point while the send still reports success.
 Peers (for --to): a name from ~/.claude/channels/discord/peers.json, or a raw numeric id
 
 The target channel ID is read from `$CLAUDE_CONFIG_DIR/channels/discord/access.json`:
@@ -41,6 +46,7 @@ Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env.
 """
 import json
 import os
+import pathlib
 import sys
 import urllib.request
 import urllib.error
@@ -289,11 +295,34 @@ def main():
         to_target = argv[i + 1]
         del argv[i : i + 2]
 
-    if len(argv) < 2:
-        print(__doc__, file=sys.stderr)
-        sys.exit(1)
-    kind = argv[0]
-    text = " ".join(argv[1:])
+    # Body from a FILE so prose never crosses a shell quoting boundary: an
+    # apostrophe re-arms backticks and truncates, while the send still succeeds.
+    body_file = None
+    if "--body-file" in argv:
+        i = argv.index("--body-file")
+        if i + 1 >= len(argv):
+            sys.exit("ERROR: --body-file requires a path")
+        body_file = argv[i + 1]
+        del argv[i : i + 2]
+
+    if body_file is not None:
+        if len(argv) != 1:
+            sys.exit("ERROR: --body-file takes the body; pass only <kind> "
+                     f"positionally, got {argv[1:]!r}")
+        try:
+            text = pathlib.Path(body_file).read_text(encoding="utf-8").rstrip("\n")
+        except OSError as exc:
+            sys.exit(f"ERROR: cannot read --body-file {body_file!r}: {exc}")
+        if not text.strip():
+            sys.exit(f"ERROR: --body-file {body_file!r} is empty — refusing to "
+                     "post a blank message")
+        kind = argv[0]
+    else:
+        if len(argv) < 2:
+            print(__doc__, file=sys.stderr)
+            sys.exit(1)
+        kind = argv[0]
+        text = " ".join(argv[1:])
     if kind not in VALID_KINDS:
         sys.exit(f"ERROR: kind must be one of {sorted(VALID_KINDS)}, got {kind!r}")
 
