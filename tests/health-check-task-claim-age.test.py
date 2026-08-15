@@ -211,5 +211,55 @@ class TestTaskClaimAge(unittest.TestCase):
         self.assertEqual(out["status"], "ok")
 
 
+
+
+class TestClaimExecutionContract(unittest.TestCase):
+    """Age alone condemned every claim, including ones with no deadline."""
+
+    def setUp(self):
+        self.hc = _load_health_check()
+
+    def _claim(self, ws, name, pid, disposition, age_h):
+        d = ws / "state" / "task-event-handler-claims"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / name
+        f.write_text("%s\nWID\n/tmp/t.txt\n%s\n" % (pid, disposition))
+        t = time.time() - age_h * 3600
+        os.utime(f, (t, t))
+        return f
+
+    def _run(self, spec):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            for i, (pid, disp, age) in enumerate(spec):
+                self._claim(ws, "task-%d.txt" % i, pid, disp, age)
+            return self.hc.check_task_claim_age(ws)
+
+    def test_a_live_unbounded_claim_is_not_leaked_however_old(self):
+        # The reviewer's case: a fallback claim runs on the live core, which has
+        # no hard deadline, so a long owner session must not read as a leak.
+        r = self._run([(os.getpid(), "fallback", 31.2)])
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_the_founding_leak_is_still_caught(self):
+        # 34 concurrent fallback claims under a HEALTHY watcher — the incident
+        # this probe exists for. Age cannot see it; concurrency can.
+        r = self._run([(os.getpid(), "fallback", 31.2 - i * 0.5) for i in range(34)])
+        self.assertEqual(r["status"], "down", r["detail"])
+        self.assertIn("held at once", r["detail"])
+
+    def test_an_orphaned_claim_is_down_at_any_age(self):
+        r = self._run([(999999, "fallback", 0.2)])
+        self.assertEqual(r["status"], "down", r["detail"])
+        self.assertIn("orphaned", r["detail"])
+
+    def test_a_bounded_claim_past_its_hard_timeout_is_down(self):
+        r = self._run([(os.getpid(), "must-handle", 31.2)])
+        self.assertEqual(r["status"], "down", r["detail"])
+
+    def test_a_young_bounded_claim_is_ok(self):
+        self.assertEqual(self._run([(os.getpid(), "must-handle", 0.05)])["status"], "ok")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

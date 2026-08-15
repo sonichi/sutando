@@ -5754,6 +5754,10 @@ def check_task_watcher() -> dict:
 _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S = 900.0
 _TASK_CLAIM_WARN_MULTIPLE = 2
 _TASK_CLAIM_DOWN_MULTIPLE = 8
+# The live core drains tasks serially: >1 concurrent unbounded holder is
+# already odd, and a handful is the shape of the 34-claim leak.
+_TASK_CLAIM_CONCURRENT_WARN = 3
+_TASK_CLAIM_CONCURRENT_DOWN = 6
 
 
 def _task_claim_thresholds() -> tuple[float, float]:
@@ -5775,34 +5779,42 @@ def _task_claim_thresholds() -> tuple[float, float]:
     return hard * _TASK_CLAIM_WARN_MULTIPLE, hard * _TASK_CLAIM_DOWN_MULTIPLE
 
 
+def _pid_alive(pid: int) -> bool:
+    """Signal 0 probes existence without delivering anything."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True           # exists, owned by someone else
+    except (OverflowError, ValueError, OSError):
+        return False
+    return True
+
+
+def _claim_owner(path: Path):
+    """(owner_pid, disposition) from a claim file, either may be None.
+
+    Format is the shell writer's: pid, watcher id, task path, disposition.
+    """
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None, None
+    pid = None
+    if lines and lines[0].strip().isdigit():
+        pid = int(lines[0].strip())
+    disposition = lines[3].strip() if len(lines) > 3 else None
+    return pid, disposition
+
+
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
-    """Held-but-unsettled task-handler claims — the leak nothing else can see.
+    """Held-but-unsettled task-handler claims — a leak no other probe can see.
 
-    `watch-tasks-stream.sh` takes a claim in `state/task-event-handler-claims/`
-    before dispatching a task to `$SUTANDO_TASK_EVENT_HANDLER`, and releases it
-    on completion. A claim that is never released is invisible: no error path
-    runs, so nothing is logged, and every other probe here reads healthy. The
-    task queue drains, the watcher is alive, results are delivered.
-
-    It stays invisible until the watcher EXITS, because `fallback_outstanding_
-    handlers()` settles each still-held claim by publishing a terminal failure —
-    one user-visible message per claim. So the first and only symptom of a slow
-    leak is a flood at restart, sized by however long the leak ran.
-
-    Measured 2026-08-14: 34 claims accumulated over 21h of task arrivals, oldest
-    31.2h, and drained as 34 Discord messages in two seconds when the watcher was
-    restarted. The retired watcher's whole captured stderr was 228 lines — 194
-    task events plus those 34 shutdown lines, and NOTHING else. Zero handler
-    failures. Nothing in the system could have reported the leak while it grew.
-
-    Age comes from mtime, not a payload: the claim file's format is owned by the
-    shell writer, and a probe that parsed it would break when that changed. mtime
-    is safe here for the reason it is NOT safe for `state/cores/*.alive` — claims
-    are local-only and never synced, so no remote write can refresh one.
-
-    Deliberately NOT a `--fix`: deleting a held claim would drop a task that may
-    still be running, and publishing its failure early is the watcher's call, not
-    a health probe's.
+    Classified by the claim's own execution contract, not by age alone:
+    `must-handle` is bounded by SUTANDO_TIER_HARD_TIMEOUT; `fallback` runs on
+    the live core and has no deadline, so only a dead owner or many concurrent
+    holders condemn it. Not a --fix: releasing a claim may drop a running task.
     """
     name = "task-claims"
     base = Path(workspace_dir or WORKSPACE_DIR) / "state" / "task-event-handler-claims"
@@ -5811,26 +5823,64 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
                 "detail": "no claims directory — task-event handler never dispatched on this host"}
     now = time.time()
     warn_s, down_s = _task_claim_thresholds()
-    held = []
+    bounded, unbounded, live_unbounded, held = [], [], [], 0
     for entry in base.glob("task-*.txt"):
         try:
-            held.append((now - entry.stat().st_mtime, entry.name))
+            age = now - entry.stat().st_mtime
         except OSError:
             continue          # raced with a release; the next run sees the truth
+        held += 1
+        pid, disposition = _claim_owner(entry)
+        if disposition == "must-handle":
+            bounded.append((age, entry.name))
+        else:
+            # No deadline to exceed, so age is not evidence; only an owner
+            # that can no longer release it is.
+            if pid is not None and not _pid_alive(pid):
+                unbounded.append((age, entry.name))
+            else:
+                live_unbounded.append((age, entry.name))
     if not held:
         return {"name": name, "status": "ok", "detail": "no held task-handler claims"}
-    held.sort(reverse=True)
-    oldest_age, oldest_name = held[0]
-    detail = (f"{len(held)} held claim(s), oldest {oldest_age / 3600:.1f}h ({oldest_name}); "
-              f"handler bound {warn_s / _TASK_CLAIM_WARN_MULTIPLE / 60:.0f}m")
-    if oldest_age > down_s:
+
+    if unbounded:
+        unbounded.sort(reverse=True)
+        age, who = unbounded[0]
         return {"name": name, "status": "down",
-                "detail": f"{detail} — leaked; each will publish a user-visible "
-                          "failure when the watcher next exits"}
-    if oldest_age > warn_s:
+                "detail": f"{len(unbounded)} of {held} held claim(s) are orphaned — "
+                          f"owner process gone, oldest {age / 3600:.1f}h ({who}); "
+                          "nothing will release them, and each publishes a "
+                          "user-visible failure when the watcher next exits"}
+    # Age cannot condemn a live unbounded claim, but concurrency can: the core
+    # drains serially, and the founding leak was 34 held at once under a healthy watcher.
+    if len(live_unbounded) >= _TASK_CLAIM_CONCURRENT_DOWN:
+        live_unbounded.sort(reverse=True)
+        age, who = live_unbounded[0]
+        return {"name": name, "status": "down",
+                "detail": f"{len(live_unbounded)} unbounded claim(s) held at once "
+                          f"(oldest {age / 3600:.1f}h, {who}) — the live core drains "
+                          "serially, so this many concurrent holders is a leak, not "
+                          "a long session"}
+    if len(live_unbounded) >= _TASK_CLAIM_CONCURRENT_WARN:
+        live_unbounded.sort(reverse=True)
+        age, who = live_unbounded[0]
         return {"name": name, "status": "warn",
-                "detail": f"{detail} — past {_TASK_CLAIM_WARN_MULTIPLE}x the handler's own bound"}
-    return {"name": name, "status": "ok", "detail": detail}
+                "detail": f"{len(live_unbounded)} unbounded claim(s) held at once "
+                          f"(oldest {age / 3600:.1f}h, {who}) — more than one live "
+                          "session should hold"}
+    if bounded:
+        bounded.sort(reverse=True)
+        age, who = bounded[0]
+        detail = (f"{held} held claim(s); oldest bounded {age / 3600:.1f}h ({who}); "
+                  f"handler bound {warn_s / _TASK_CLAIM_WARN_MULTIPLE / 60:.0f}m")
+        if age > down_s:
+            return {"name": name, "status": "down",
+                    "detail": f"{detail} — past its own hard timeout; leaked"}
+        if age > warn_s:
+            return {"name": name, "status": "warn",
+                    "detail": f"{detail} — past {_TASK_CLAIM_WARN_MULTIPLE}x the handler's own bound"}
+    return {"name": name, "status": "ok",
+            "detail": f"{held} held claim(s), none past its own execution contract"}
 
 
 def fix_task_watcher_sentinel(check: dict) -> str:
