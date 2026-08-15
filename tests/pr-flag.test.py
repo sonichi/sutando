@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for the pure core of scripts/pr_flag.py.
+Unit tests for the pure core of scripts/pf.py.
 
 After the 2026-07-27 refactor (Chi: "are you using a script to do judgement that
 should be done by an agent?"), the script does ONLY mechanical state-gathering +
@@ -48,6 +48,61 @@ def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=Fals
             *extra_reviews,
         ],
     }
+
+
+# --- #2643: the peer half the owner-scoped fetch structurally cannot contain ---
+
+def _peer_cases():
+    disc = [
+        {"number": 1, "author": {"login": "sonichi"}, "isDraft": False, "reviewDecision": "APPROVED"},
+        {"number": 2, "author": {"login": "peer"}, "isDraft": False, "reviewDecision": "APPROVED"},
+        {"number": 3, "author": {"login": "peer"}, "isDraft": False, "reviewDecision": "CHANGES_REQUESTED"},
+        {"number": 4, "author": {"login": "peer"}, "isDraft": True, "reviewDecision": "APPROVED"},
+        {"number": 5, "author": {"login": "peer2"}, "isDraft": False, "reviewDecision": None},
+        {"number": 6, "author": {"login": "peer2"}, "isDraft": False, "reviewDecision": "REVIEW_REQUIRED"},
+    ]
+    got = pf.peer_candidates(disc, "sonichi")
+    # own PR excluded (stage 2 already has it); CR pruned; draft pruned;
+    # APPROVED kept -- that is the one an owner action may unblock.
+    assert got == [2, 5, 6], f"peer candidates should be [2,5,6], got {got}"
+    assert pf.peer_candidates([], "sonichi") == [], "no discovery -> no candidates, not a crash"
+    # An APPROVED-based filter is the scope that once reported 32 owner-needing
+    # PRs as 1. Assert we did not reintroduce it.
+    assert 2 in got, "an APPROVED peer PR must survive pruning"
+
+
+def _discovery_is_light():
+    """Stage 1 must omit the two fields that 504 repo-wide, or it IS stage 2."""
+    argv = pf.discovery_argv("o/r")
+    fields = argv[argv.index("--json") + 1]
+    assert "statusCheckRollup" not in fields, "discovery must not request statusCheckRollup"
+    assert "reviews" not in fields, "discovery must not request reviews"
+    assert "--author" not in argv, "discovery must NOT be author-scoped -- that is the point"
+
+
+def _descriptor_tracks_the_widened_population():
+    """Metadata must not claim peers are excluded once they are fetched."""
+    narrow = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3)
+    assert any("not authored by" in e for e in narrow["excludes"]), "author exclusion must still be declared without a peer stage"
+    stage = {"discovered": 70, "candidates": 13, "fetched": 13, "failed": 0}
+    wide = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=stage)
+    assert not any("not authored by" in e for e in wide["excludes"]), "must not still claim peers are excluded once fetched"
+    assert any("CHANGES_REQUESTED" in e for e in wide["excludes"]), "the CR prune is a real exclusion and must be declared"
+    assert "peer" in wide["population"], "population string must name the peer half"
+    bad = {"discovered": 70, "candidates": 13, "fetched": 11, "failed": 2}
+    failed = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=bad)
+    assert any("FAILED" in e for e in failed["excludes"]), "a failed peer fetch must be declared, not read as 'no peers'"
+
+
+def _mergeable_churn_does_not_refire():
+    """GitHub parks mergeable at UNKNOWN while recomputing; that is not a change."""
+    base = [{"number": 1, "principal": "p", "base": "main", "head": "abc", "ci": "green",
+             "mergeable": "MERGEABLE", "review": "APPROVED", "approvals": 2,
+             "approvals_standing": 2}]
+    churn = [dict(base[0], mergeable="UNKNOWN")]
+    assert pf.state_hash(base) == pf.state_hash(churn), "a mergeable-only flip must NOT move the hash"
+    assert pf.state_hash(base) != pf.state_hash([dict(base[0], head="def")]), "a new head MUST still move the hash"
+    assert pf.state_hash(base) != pf.state_hash([dict(base[0], approvals=1)]), "an approval change MUST still move the hash"
 
 
 def main() -> int:
@@ -472,9 +527,16 @@ def main() -> int:
     assert "--author" in argv and argv[argv.index("--author") + 1] == "someowner", argv
     print("  ok  fetch_argv is the real gh command the descriptor reads")
 
+    _peer_cases()
+    _discovery_is_light()
+    _descriptor_tracks_the_widened_population()
+    _mergeable_churn_does_not_refire()
+    print("  ok  #2643 peer-scope + mergeable-churn cases")
     print("\nAll pr-flag core cases pass.")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

@@ -204,15 +204,28 @@ def raw_state(prs: list, owner_login: str, stand: str = None) -> list:
 
 def state_hash(state: list) -> str:
     """Stable hash of the objective set. Changes when a PR appears/disappears or
-    any actionable field (base/head/ci/mergeable/review/approvals/
+    any actionable field (base/head/ci/review/approvals/
     approvals_standing) flips; a title edit does not refire.
 
     `approvals_standing` is in the key for a reason the head-anchored count
     cannot cover: a reviewer converting CHANGES_REQUESTED to APPROVED at an
     OLDER commit moves the enforced gate without moving `approvals`, so before
     this it did not refire and the agent was never woken for a PR that had just
-    become mergeable."""
-    key = [[s["number"], s["principal"], s["base"], s["head"], s["ci"], s["mergeable"],
+    become mergeable.
+
+    `mergeable` is DELIBERATELY EXCLUDED. GitHub computes it lazily and parks it
+    at `UNKNOWN` while recomputing, so it churns without any PR changing. Measured
+    2026-08-14 19:21Z: all 13 rows flipped to UNKNOWN simultaneously, the hash
+    moved, and the cron emitted a digest whose composition was identical to the
+    previous fire — waking the owner for GitHub's cache, not for his repo. Twelve
+    PRs do not change state in the same second; that signature IS the tell.
+
+    Dropping it loses nothing a digest acts on: a real merge-state change is
+    already carried by `head` (a push), `base` (a retarget), `ci`, `review`, or
+    the approval fields. `mergeable` stays in the emitted payload for the agent
+    to read — it is only untrustworthy as a CHANGE signal.
+    """
+    key = [[s["number"], s["principal"], s["base"], s["head"], s["ci"],
             s["review"], s["approvals"], s["approvals_standing"]]
            for s in state]
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
@@ -226,12 +239,18 @@ def fetch_argv(repo: str, owner_login: str) -> list:
     the thing it is describing plus a chance to be wrong: widen the fetch, forget
     the string, and the payload now asserts a filter the code no longer applies.
     """
-    # SCOPE NOTE: `--author owner_login` means this only ever sees the owner's OWN
-    # PRs (24 of 116 open on 2026-08-02). Peer PRs where the owner's approval is
-    # the thing unblocking a merge are not fetched at all, so they cannot appear
-    # in any digest built from this state. Left alone deliberately -- widening the
-    # fetch is a scope decision, not a field-completeness fix, and belongs in its
-    # own change (issue #2643).
+    # This is STAGE 2 of a two-stage fetch (#2643). It stays `--author`-scoped on
+    # purpose: the heavy fields below cannot be fetched repo-wide. Measured
+    # 2026-08-14 on sonichi/sutando, 70 open non-draft PRs:
+    #
+    #   --author sonichi + statusCheckRollup + reviews  ->  16 rows, 3.6s, rc=0
+    #   same fields, --author dropped                   ->  HTTP 504 after 11.2s
+    #
+    # GitHub times out computing those fields across the full open set, so simply
+    # removing the flag does not widen the digest -- it EMPTIES it, and a fetch
+    # that fails every fire is worse than one that under-answers because the
+    # failure is silent at the consumer. `peer_candidates()` + `_fetch_peer_pr()`
+    # cover the rest of the population; `scope_descriptor()` reads both.
     return [
         "gh", "pr", "list", "--repo", repo, "--state", "open",
         "--author", owner_login, "--limit", "1000",
@@ -239,8 +258,51 @@ def fetch_argv(repo: str, owner_login: str) -> list:
     ]
 
 
+def discovery_argv(repo: str) -> list:
+    """STAGE 1: every open PR, light fields only, NO author filter.
+
+    Cheap enough to run repo-wide because it omits `statusCheckRollup` and
+    `reviews` -- the two fields that 504 at that scale. Measured: 78 rows, 20 KB,
+    1.44s. Its job is only to reveal which PRs exist and who owns them, so the
+    expensive stage can be pointed at the ones that matter.
+    """
+    return [
+        "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
+        "--json", "number,author,isDraft,mergeable,reviewDecision,baseRefName,headRefOid",
+    ]
+
+
+def peer_candidates(discovered: list, owner_login: str) -> list:
+    """Peer PRs where the owner's review could still matter — the category the
+    cron prompt names and the `--author` fetch structurally cannot contain.
+
+    Prunes two ways, and both are about not paying for the expensive stage:
+
+    - drafts: never actionable.
+    - peer PRs already carrying CHANGES_REQUESTED: the author has to clear the
+      review before anyone's approval can matter, so it is their problem, not the
+      owner's. Measured 2026-08-14: this drops 43 of 70, leaving 27 heavy calls.
+
+    Deliberately does NOT prune on `reviewDecision == APPROVED`. An approved peer
+    PR is precisely the one whose merge may be one owner action away, and an
+    APPROVED-based filter is the exact scope that once reported 32 owner-needing
+    PRs as 1.
+    """
+    out = []
+    for pr in discovered:
+        if pr.get("isDraft"):
+            continue
+        author = ((pr.get("author") or {}).get("login") or "")
+        if author == owner_login:
+            continue                       # stage 2's own fetch already has these
+        if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+            continue
+        out.append(pr["number"])
+    return out
+
+
 def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
-                     fetched_count: int = None) -> dict:
+                     fetched_count: int = None, peer_stage: dict = None) -> dict:
     """Name the emitted population precisely, from the WHOLE pipeline.
 
     Why this exists: the payload carries counts, per-PR CI, approvals and merge
@@ -278,11 +340,26 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
         limit = None
 
     excludes = ["draft PRs (dropped by raw_state, always)"]
-    if author:
+    if author and not peer_stage:
         excludes.append(
             f"PRs not authored by {author!r} -- including peer PRs where the "
             "owner's approval is the only thing blocking a merge"
         )
+    elif author and peer_stage:
+        # The author filter still binds STAGE 2, but stage 1 + the peer fetch put
+        # the peer half back. Naming what the widened population still drops is
+        # the whole job of this descriptor: peers with an open CHANGES_REQUESTED
+        # are pruned before the expensive call, and that is a real exclusion even
+        # though it is a defensible one.
+        excludes.append(
+            "peer PRs already carrying CHANGES_REQUESTED (pruned before stage 2: "
+            "the author must clear the review before any approval can matter)"
+        )
+        if peer_stage.get("failed"):
+            excludes.append(
+                f"{peer_stage['failed']} peer PR(s) whose stage-2 fetch FAILED -- "
+                "absent from this payload but NOT known to be uninteresting"
+            )
 
     # complete==True is a CERTIFICATION, so it is only ever granted on evidence:
     # a count strictly below the ceiling. Unknown count -> None, never True.
@@ -313,10 +390,14 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
         why = f"fetch returned {ceiling_count}, below the {limit} ceiling"
 
     return {
-        "filter": f"author:{author}" if author else "none",
+        "filter": ("author:{} + peer stage".format(author) if (author and peer_stage)
+                   else (f"author:{author}" if author else "none")),
         "population": (
-            f"open, non-draft PRs authored by {author!r}"
-            if author else "open, non-draft PRs (all authors)"
+            (f"open, non-draft PRs authored by {author!r}, PLUS open non-draft peer "
+             "PRs without an open CHANGES_REQUESTED")
+            if (author and peer_stage)
+            else (f"open, non-draft PRs authored by {author!r}"
+                  if author else "open, non-draft PRs (all authors)")
         ),
         "excludes": excludes,
         "complete": complete,
@@ -325,6 +406,33 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
         "fetched_count": ceiling_count,
         "limit": limit,
     }
+
+
+def _fetch_discovered(repo: str) -> list:  # pragma: no cover — subprocess/gh glue
+    res = subprocess.run(discovery_argv(repo), capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        print(f"pr-flag: discovery gh failed: {res.stderr[:200]}", file=sys.stderr)
+        return []
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
+def _fetch_peer_pr(repo: str, number: int) -> dict:  # pragma: no cover — subprocess/gh glue
+    """Heavy fields for ONE peer PR. Per-PR because the repo-wide form 504s."""
+    res = subprocess.run(
+        ["gh", "pr", "view", str(number), "--repo", repo, "--json",
+         "number,title,author,baseRefName,headRefOid,mergeable,reviewDecision,"
+         "statusCheckRollup,isDraft,reviews"],
+        capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        print(f"pr-flag: peer #{number} gh failed: {res.stderr[:120]}", file=sys.stderr)
+        return {}
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return {}
 
 
 def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
@@ -428,7 +536,22 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
 
     # Bound separately so the PRE-filter size is available to scope_descriptor:
     # the `--limit` ceiling applies here, before raw_state() drops drafts.
-    fetched = _attach_commits(args.repo, _fetch_prs(args.repo, args.owner))
+    own = _fetch_prs(args.repo, args.owner)
+    # Stage 1 reveals the peer half the owner-scoped fetch cannot contain (#2643).
+    # A discovery failure must NOT silently shrink the population back to
+    # owner-only and read as normal, so it is reported and counted.
+    discovered = _fetch_discovered(args.repo)
+    peers, peer_failures = [], 0
+    for number in peer_candidates(discovered, args.owner):
+        pr = _fetch_peer_pr(args.repo, number)
+        if pr:
+            peers.append(pr)
+        else:
+            peer_failures += 1
+    if discovered and not peers and peer_candidates(discovered, args.owner):
+        print("pr-flag: every peer fetch failed — peer half of the population is "
+              "MISSING from this emit, not empty", file=sys.stderr)
+    fetched = _attach_commits(args.repo, own + peers)
     state = raw_state(fetched, args.owner, args.stand)
     h = state_hash(state)
 
@@ -459,6 +582,10 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
         # fetched_count is the PRE-filter size: the ceiling applies to the fetch,
         # not to what survives raw_state(). See scope_descriptor().
         "scope": scope_descriptor(args.repo, args.owner, record_count=len(state),
+                                  peer_stage={"discovered": len(discovered),
+                                              "candidates": len(peer_candidates(discovered, args.owner)),
+                                              "fetched": len(peers),
+                                              "failed": peer_failures},
                                   fetched_count=len(fetched)),
         "prs": state,
     }, indent=2))
