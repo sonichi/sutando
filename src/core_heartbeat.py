@@ -132,8 +132,8 @@ def _observed_session(sock: str) -> str:
             name = (r.stdout or "").strip()
             if name:
                 return name
-    # Both launch paths start this writer DETACHED, so $TMUX is absent in the
-    # real case and the env value is a claim; core_pid() is the existing evidence.
+    # $TMUX is inherited when startup.sh runs inside the pane, but absent when it
+    # runs outside one — there the env value is a claim, so verify it.
     candidate = core_session()
     if core_pid(sock, candidate) is not None:
         return candidate
