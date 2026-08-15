@@ -63,11 +63,13 @@ class RestartRelaunchesTheApp(unittest.TestCase):
                          r'pkill -f "src/Sutando/Sutando"',
                          "restart.sh no longer pkills the app — re-evaluate #2810")
 
-    def test_startup_sh_is_still_syntactically_valid(self):
-        """The edit is in shell, so parse it rather than trusting the diff."""
-        r = subprocess.run(["bash", "-n", str(STARTUP)],
-                           capture_output=True, text=True)
-        self.assertEqual(0, r.returncode, r.stderr)
+    def test_both_edited_scripts_are_syntactically_valid(self):
+        """RESTART carries the functional edit; STARTUP had the block removed.
+        Parsing only the untouched one lets malformed syntax pass its own test."""
+        for script in (RESTART, STARTUP):
+            r = subprocess.run(["bash", "-n", str(script)],
+                               capture_output=True, text=True)
+            self.assertEqual(0, r.returncode, f"{script.name}: {r.stderr}")
 
 
 if __name__ == "__main__":
