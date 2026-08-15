@@ -24,6 +24,12 @@ REPO = Path(__file__).resolve().parents[1]
 # Guards a hang, not promptness — a leaked worker holds stdout open forever, so any
 # bound catches it. Every timing claim here is a separate assert; keep this generous.
 SHUTDOWN_DRAIN_TIMEOUT_S = 30
+# These are early-exit polls, so a generous bound costs a passing run nothing and
+# only stops a slow-but-correct one being reported as a failure.
+EVENT_SETTLE_TIMEOUT_S = 15
+# The second dispatch must follow the first promptly; a serialized notifier would
+# wait out the first task's whole run, which is orders of magnitude longer.
+NO_WAIT_GAP_S = 2.0
 WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 spec = importlib.util.spec_from_file_location("workstream_session_worker", WORKER)
 worker = importlib.util.module_from_spec(spec)
@@ -1205,7 +1211,7 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
         )
         claim = workspace / "state" / "task-event-handler-claims" / task.name
         try:
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while not claim.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert claim.exists()
@@ -1431,7 +1437,7 @@ def test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back(
         overlap = None
         try:
             claim = workspace / "state" / "task-event-handler-claims" / task.name
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while time.monotonic() < deadline:
                 if claim.is_file() and calls.exists():
                     break
@@ -1516,7 +1522,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
         watcher_pgid = process.pid
         try:
             claims = workspace / "state" / "task-event-handler-claims"
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while time.monotonic() < deadline and len(list(claims.glob("task-*.txt"))) < 4:
                 time.sleep(0.01)
             assert sorted(path.name for path in claims.glob("task-*.txt")) == names
@@ -1539,7 +1545,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             assert not remaining_claims
             assert fallback_names == names
             assert len(calls.read_text().splitlines()) <= 2
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while time.monotonic() < deadline:
                 try:
                     os.killpg(watcher_pgid, 0)
@@ -1609,14 +1615,18 @@ def test_codex_notifier_dispatches_each_isolated_task_once_without_waiting() -> 
         )
         try:
             started = time.monotonic()
-            calls = []
-            while time.monotonic() - started < 1.0:
+            calls, first_at = [], None
+            while time.monotonic() - started < EVENT_SETTLE_TIMEOUT_S:
                 calls = log.read_text().splitlines() if log.exists() else []
+                if calls and first_at is None:
+                    first_at = time.monotonic()
                 if len(calls) == 2:
                     break
                 time.sleep(0.01)
             assert sorted(calls) == ["task-one.txt", "task-two.txt"]
-            assert time.monotonic() - started < 1.0
+            # "without waiting" is the GAP between the two dispatches; timing from
+            # spawn instead folds in subprocess startup, which alone exceeded 1s.
+            assert time.monotonic() - first_at < NO_WAIT_GAP_S, time.monotonic() - first_at
         finally:
             os.killpg(process.pid, signal.SIGTERM)
             process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
@@ -1683,7 +1693,7 @@ def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 1.5
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             tmux_calls = ""
             while time.monotonic() < deadline:
                 tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
@@ -1692,7 +1702,7 @@ def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
                 time.sleep(0.01)
             assert "task-a-live.txt" in tmux_calls
             assert "task-z-isolated.txt" not in tmux_calls
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while not handler_log.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert handler_log.read_text().splitlines() == ["task-z-isolated.txt"]
@@ -1736,7 +1746,7 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
         )
         claim = workspace / "state" / "task-event-handler-claims" / task.name
         try:
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while not claim.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert claim.exists()
