@@ -16,7 +16,7 @@ from pathlib import Path
 # This file is bundled verbatim into ag2_sparrow, where its siblings are
 # package submodules; in src/ they are flat modules. Support both.
 try:  # pragma: no cover - exercised by whichever context imports it
-    from .local_task_protocol import find_archived_result
+    from .local_task_protocol import find_result
     from .result_markers import (
         build_requeued_task,
         dedup_decision,
@@ -24,7 +24,7 @@ try:  # pragma: no cover - exercised by whichever context imports it
     )
     from .task_archive import find_task_file
 except ImportError:  # pragma: no cover - flat src/ import path
-    from local_task_protocol import find_archived_result
+    from local_task_protocol import find_result
     from result_markers import (
         build_requeued_task,
         dedup_decision,
@@ -73,7 +73,7 @@ def plan_dedup_recovery(
     """
     holder = (holder_id or "").strip()
     orig_text = _read(find_task_file(Path(tasks_dir), task_id))
-    holder_text = _read(find_archived_result(Path(results_dir), holder)) if holder else None
+    holder_text = _read(find_result(Path(results_dir), holder)) if holder else None
 
     decision = dedup_decision(holder_text, orig_text)
     if decision == "honour":
