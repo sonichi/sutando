@@ -1105,8 +1105,8 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // access_tier values: "owner" (default if omitted) | "any_caller".
 // OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
 // session so the skill registers session handlers without importing core.
-export type SkillSetupCtx = { session: unknown; injectText: (session: unknown, text: string) => void };
-export type SkillSetup = (ctx: SkillSetupCtx) => void;
+export type { SkillSetupCtx, SkillSetup } from './skill-setup-runner.js';
+import type { SkillSetup } from './skill-setup-runner.js';
 
 async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[] }> {
 	// Scan the public-repo `skills/` dir, the per-user workspace
