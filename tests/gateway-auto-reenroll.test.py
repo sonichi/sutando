@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
@@ -261,6 +262,76 @@ class _Status(unittest.TestCase):
             for n, v in saved.items():
                 setattr(gw, n, v)
             _reset()
+
+
+class _Identity(unittest.TestCase):
+    """`_reenroll_identity` must reach the durable per-host identity.
+
+    Enrolment writes the agent mxid to `state/auth/ag2space.json`, which
+    CLAUDE.md designates as the canonical home for per-host install/identity
+    state. Before this the resolver read only the process env and the channel
+    .env — so on a host whose .env carries just the token (the shape `connect`
+    writes), identity was unreachable and the claim could never be issued:
+    `reenroll: agent identity unknown` on every cycle, with the answer sitting
+    on disk one directory away.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state = Path(self._tmp.name)
+        (self.state / "auth").mkdir(parents=True)
+        self._saved_state = gw._STATE
+        gw._STATE = self.state
+        self.addCleanup(lambda: setattr(gw, "_STATE", self._saved_state))
+        # Neutralise the two earlier candidates so this pins the THIRD one.
+        self._env = mock.patch.dict(
+            gw.os.environ, {"AGENT_MXID": "", "AGENT_ID": ""}, clear=False)
+        self._env.start(); self.addCleanup(self._env.stop)
+        for k in ("AGENT_MXID", "AGENT_ID"):
+            gw.os.environ.pop(k, None)
+        self._chan = mock.patch.object(gw, "_config_from_channel_env", return_value="")
+        self._chan.start(); self.addCleanup(self._chan.stop)
+
+    def _write(self, payload):
+        (self.state / "auth" / "ag2space.json").write_text(json.dumps(payload))
+
+    def test_identity_resolves_from_the_auth_state_file(self):
+        """The load-bearing case: fails before this change, which returns ''."""
+        self._write({"agent_id": "@host.agent:ag2.space", "schema_version": 1})
+        self.assertEqual(gw._reenroll_identity(), "@host.agent:ag2.space")
+
+    def test_env_still_wins_over_the_state_file(self):
+        """Precedence is unchanged — the new source is a LAST resort, so a
+        deliberate override cannot be silently outranked by stale enrolment."""
+        self._write({"agent_id": "@stale.agent:ag2.space"})
+        with mock.patch.dict(gw.os.environ, {"AGENT_MXID": "@live.agent:ag2.space"}):
+            self.assertEqual(gw._reenroll_identity(), "@live.agent:ag2.space")
+
+    def test_channel_env_still_wins_over_the_state_file(self):
+        self._write({"agent_id": "@stale.agent:ag2.space"})
+        with mock.patch.object(gw, "_config_from_channel_env",
+                               side_effect=lambda k: "@chan.agent:ag2.space"
+                               if k == "AGENT_MXID" else ""):
+            self.assertEqual(gw._reenroll_identity(), "@chan.agent:ag2.space")
+
+    def test_absent_unreadable_and_malformed_all_yield_empty(self):
+        """Never raise into the claim path: a missing, corrupt, or
+        wrong-shaped record is an unknown identity, not a crash."""
+        self.assertEqual(gw._reenroll_identity(), "")          # absent
+        (self.state / "auth" / "ag2space.json").write_text("{not json")
+        self.assertEqual(gw._reenroll_identity(), "")          # malformed
+        self._write({"agent_id": None})
+        self.assertEqual(gw._reenroll_identity(), "")          # null field
+        self._write({"agent_id": "   "})
+        self.assertEqual(gw._reenroll_identity(), "")          # whitespace only
+
+    def test_identity_appearing_later_is_picked_up_without_a_restart(self):
+        """Re-read per call, matching the channel-env candidates: an operator
+        (or a re-enrolment) landing the file mid-episode must take effect."""
+        self.assertEqual(gw._reenroll_identity(), "")
+        self._write({"agent_id": "@late.agent:ag2.space"})
+        self.assertEqual(gw._reenroll_identity(), "@late.agent:ag2.space")
 
 
 class _ClaimClock(unittest.TestCase):

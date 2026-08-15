@@ -654,8 +654,9 @@ def _provision_base() -> str:
 
 
 def _reenroll_identity() -> str:
-    """Agent mxid: process env first, then the channel .env file — the same
-    fallback the token uses (desktop launchers don't export either)."""
+    """Agent mxid: process env, then the channel .env file — the same fallback
+    the token uses (desktop launchers don't export either) — then the durable
+    per-host identity enrolment wrote to state/auth/ag2space.json."""
     for key in ("AGENT_MXID", "AGENT_ID"):
         v = (os.environ.get(key) or "").strip()
         if v:
@@ -664,7 +665,13 @@ def _reenroll_identity() -> str:
         v = _config_from_channel_env(key).strip()
         if v:
             return v
-    return ""
+    # Re-read per call, like the channel-env candidates: an identity that
+    # appears mid-episode must take effect without a restart.
+    try:
+        rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
+        return str(rec.get("agent_id") or "").strip()
+    except Exception:  # absent, unreadable, or malformed — identity unknown
+        return ""
 
 
 def _reenroll_claim() -> None:
