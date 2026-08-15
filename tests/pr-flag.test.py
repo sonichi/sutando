@@ -109,9 +109,8 @@ def _mergeable_churn_does_not_refire():
     assert pf.state_hash(base) == pf.state_hash(churn), "UNKNOWN churn must NOT move the hash"
     assert pf.mergeable_map(churn) == {key: "MERGEABLE"}, "carried value must persist for the next fire"
 
-    # The control the reviewer asked for: a real transition MUST wake the cron.
-    # The target branch advancing changes nothing else -- not head, base name, ci,
-    # reviews or approvals -- so this is the only carrier.
+    # A real transition MUST wake the cron; nothing else here changes, so
+    # mergeable is the only carrier.
     conflict = pf.carry_unknown_mergeable([dict(base[0], mergeable="CONFLICTING")], prior)
     assert pf.state_hash(base) != pf.state_hash(conflict), "CONFLICTING must move the hash"
     back = pf.carry_unknown_mergeable([dict(base[0], mergeable="MERGEABLE")],
@@ -619,10 +618,66 @@ def main() -> int:
     _prior_read_fails_open_on_any_shape()
     _no_change_gate_is_present_in_source()
     _uncertified_run_is_never_silent()
+    _a_truncated_population_is_never_certified()
     _mergeable_carry_is_revision_scoped()
     print("  ok  #2643 peer-scope + mergeable-churn cases")
     print("\nAll pr-flag core cases pass.")
     return 0
+
+
+def _a_truncated_population_is_never_certified():
+    """P1: a stage landing exactly on its ceiling is complete-looking but partial.
+
+    Two fires, production main(): the first must not persist, the second must
+    not read NO_CHANGE.
+    """
+    import contextlib
+    import io
+    import json
+    import pathlib as _pl
+    import tempfile
+
+    real_prs, real_disc, real_argv, real_dargv = (
+        pf._fetch_prs, pf._fetch_discovered, pf.fetch_argv, pf.discovery_argv)
+    try:
+        for stage in ("owner", "discovery"):
+            rows = [_pr(i, "sonichi") for i in range(1, 4)]
+            pf._fetch_prs = lambda *a, **k: (True, rows)
+            pf._fetch_discovered = lambda *a, **k: (True, [])
+            # Land the stage under test EXACTLY on its declared ceiling.
+            if stage == "owner":
+                pf.fetch_argv = lambda *a, **k: ["gh", "pr", "list", "--limit", "3"]
+                pf.discovery_argv = lambda *a, **k: ["gh", "pr", "list", "--limit", "900"]
+            else:
+                pf.fetch_argv = lambda *a, **k: ["gh", "pr", "list", "--limit", "900"]
+                pf.discovery_argv = lambda *a, **k: ["gh", "pr", "list", "--limit", "0"]
+            with tempfile.TemporaryDirectory() as td:
+                sf = _pl.Path(td) / "state.json"
+                outs = []
+                for _ in range(2):
+                    buf = io.StringIO()
+                    keep = sys.argv
+                    try:
+                        sys.argv = ["pr_flag.py", "--emit", "--repo", "o/r",
+                                    "--owner", "sonichi", "--state-file", str(sf)]
+                        with contextlib.redirect_stdout(buf):
+                            pf.main()
+                    except SystemExit:
+                        pass
+                    finally:
+                        sys.argv = keep
+                    outs.append(buf.getvalue().strip())
+                first, second = outs
+                if first.startswith("{"):
+                    assert json.loads(first)["scope"]["complete"] is not True, \
+                        f"{stage}: a ceiling-bound fetch reported complete"
+                assert second != "NO_CHANGE", \
+                    f"{stage}: the second truncated fire exited NO_CHANGE -- the " \
+                    "partial population was certified and persisted"
+    finally:
+        (pf._fetch_prs, pf._fetch_discovered,
+         pf.fetch_argv, pf.discovery_argv) = (real_prs, real_disc, real_argv, real_dargv)
+    print("  ok  a ceiling-truncated population is never certified or persisted")
 
 
 def _no_change_gate_is_present_in_source():
@@ -647,9 +702,8 @@ def _uncertified_run_is_never_silent():
     import pathlib
     real_prs, real_disc = pf._fetch_prs, pf._fetch_discovered
     try:
-        # Owner fetch survives and yields the same (empty) population as last
-        # run; discovery FAILS. The hash is therefore unchanged while the
-        # population is incomplete -- precisely the silent-outage case.
+        # Owner fetch survives with the same population; discovery FAILS. Hash
+        # unchanged while incomplete -- the silent-outage case.
         pf._fetch_prs = lambda *a, **k: (True, [])
         pf._fetch_discovered = lambda *a, **k: (False, [])
         h = pf.state_hash([])
@@ -706,5 +760,3 @@ def _mergeable_carry_is_revision_scoped():
 
 if __name__ == "__main__":
     sys.exit(main())
-
-

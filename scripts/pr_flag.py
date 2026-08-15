@@ -203,12 +203,8 @@ def raw_state(prs: list, owner_login: str, stand: str = None) -> list:
 
 
 def _mergeable_key(row: dict) -> str:
-    """Cache key for a carried mergeable value.
-
-    Scoped to the REVISION, not the PR: a force-push or retarget parks the field
-    at UNKNOWN, and a number-only key would attach the old revision's MERGEABLE
-    to the new one -- suppressing exactly the wake-up that re-evaluation needs.
-    """
+    """Revision-scoped key: a number-only one attaches the old head/base's
+    MERGEABLE to a new revision, suppressing the needed wake-up."""
     return f"{row.get('number')}@{row.get('head') or ''}#{row.get('base') or ''}"
 
 
@@ -223,8 +219,7 @@ def carry_unknown_mergeable(state: list, previous: dict) -> list:
     for s in state:
         row = dict(s)
         if row.get("mergeable") == "UNKNOWN":
-            # A miss (new revision, or a pre-scoping number-keyed state file)
-            # leaves UNKNOWN in place -- the conservative direction.
+            # A miss (new revision, or a legacy number-keyed file) keeps UNKNOWN.
             prior = (previous or {}).get(_mergeable_key(row))
             if prior:
                 row["mergeable"] = prior
@@ -413,9 +408,8 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
     # measuring the wrong side of the filter. `record_count` stays in the payload
     # as the emitted size — it is what the consumer actually received — but it
     # never decides completeness.
-    # TWO fetches, TWO ceilings. Comparing a combined count to the owner limit
-    # certifies neither: discovery can sit at its own ceiling while the sum stays
-    # under the owner's. Every stage that ran must clear its OWN limit.
+    # Two fetches, two ceilings: each stage must clear its OWN limit, since a
+    # combined count under the owner's hides discovery sitting at its own.
     stages = [("owner fetch", fetched_count if fetched_count is not None
                else record_count, limit)]
     if peer_ok and peer_stage is not None:
@@ -626,9 +620,19 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     prior = read_prior_mergeable(sf)
     state = carry_unknown_mergeable(state, prior)
     h = state_hash(state)
-    # A population we could not certify must not overwrite the last good hash:
-    # doing so lets the next healthy fire read as NO_CHANGE and stay silent.
-    certified = own_ok and disc_ok and peer_failures == 0
+    # Fetch success is not completeness: a stage on its ceiling is truncated,
+    # and certifying it persists a partial hash the next such run reads as NO_CHANGE.
+    scope = scope_descriptor(args.repo, args.owner, record_count=len(state),
+                             peer_stage={"discovered": len(discovered),
+                                         "candidates": len(candidates),
+                                         "fetched": len(peers),
+                                         "failed": peer_failures,
+                                         "discovery_ok": disc_ok,
+                                         "owner_ok": own_ok},
+                             # OWNER-stage size: the owner ceiling applies here.
+                             fetched_count=len(own))
+    certified = (own_ok and disc_ok and peer_failures == 0
+                 and scope.get("complete") is True)
 
     prev = ""
     try:
@@ -636,8 +640,8 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     except Exception:
         prev = ""
 
-    # `certified` gates the fast path: an uncertified run whose surviving rows
-    # happen to hash to the last healthy state would otherwise exit silently.
+    # Gated on `certified`: an uncertified or TRUNCATED run whose surviving rows
+    # hash to the last healthy state would otherwise exit silently.
     if h == prev and certified and not args.force:
         print("NO_CHANGE")
         return 0
@@ -646,18 +650,7 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     print(json.dumps({
         "hash": h,
         "changed": True,
-        # fetched_count is the PRE-filter size: the ceiling applies to the fetch,
-        # not to what survives raw_state(). See scope_descriptor().
-        "scope": scope_descriptor(args.repo, args.owner, record_count=len(state),
-                                  peer_stage={"discovered": len(discovered),
-                                              "candidates": len(candidates),
-                                              "fetched": len(peers),
-                                              "failed": peer_failures,
-                                              "discovery_ok": disc_ok,
-                                              "owner_ok": own_ok},
-                                  # OWNER-stage size: the owner ceiling applies
-                                  # here. Discovery certifies its own, above.
-                                  fetched_count=len(own)),
+        "scope": scope,
         "prs": state,
     }, indent=2))
     try:
@@ -666,8 +659,9 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
             sf.write_text(json.dumps({"hash": h, "count": len(state),
                                       "mergeable": mergeable_map(state)}))
         else:
-            print("pr-flag: population uncertified — hash NOT recorded, so the "
-                  "next healthy fire still emits", file=sys.stderr)
+            print("pr-flag: population uncertified or truncated — hash NOT "
+                  "recorded, so the next healthy fire still emits",
+                  file=sys.stderr)
     except Exception as e:
         print(f"pr-flag: state write failed: {e}", file=sys.stderr)
     return 0
