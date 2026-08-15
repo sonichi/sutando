@@ -474,6 +474,7 @@ class _RecoverLoop(unittest.TestCase):
             return beats["n"] < 6   # bounded observation window, no wall clock
         gw._heartbeat_singleton = beat
         gw._auth_probe = lambda: self.fail("probe must not run with no claim")
+        real = gw.urllib.request.urlopen   # capture BEFORE mutating — the
         gw.urllib.request.urlopen = lambda *a, **k: self.fail("no POST expected")
         try:
             with self.assertRaises(SystemExit):   # singleton hard-stop, not FATAL-401
@@ -481,7 +482,8 @@ class _RecoverLoop(unittest.TestCase):
             self.assertTrue(any("RESTART the wrapper" in ln for ln in logs))
             self.assertIsNone(gw._reenroll_state["code"])
         finally:
-            gw.urllib.request.urlopen = urllib.request.urlopen
+            # module object is shared, so name-restoring reads the mock back
+            gw.urllib.request.urlopen = real
             self._restore(saved, env)
 
 
