@@ -82,6 +82,7 @@ from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
@@ -182,25 +183,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     )
 
 
-def archive_file(src: Path, kind: str, task_id: str) -> None:
-    """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
-    Matches the behavior of telegram-bridge.py / discord-bridge.py."""
-    try:
-        if not src.exists():
-            return
-        from datetime import datetime
-        import shutil
-        ym = datetime.now().strftime("%Y-%m")
-        base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-        dest_dir = base / ym
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
-    except Exception as e:
-        print(f"[Slack] archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+def archive_file(src: Path, kind: str, task_id: str) -> bool:
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy. It used to unlink the source when the move failed,
+    which destroyed the only copy of the task."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(f"[Slack]{m}", flush=True))
 
 
 ACCESS_FILE = channel_access_path("slack")
@@ -1058,9 +1048,20 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
     _claude_config_dir = claude_home_path()
     skill_hints = ""
-    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+    # CONTEXT-FIRST is a correctness step, not a skill hint: it must not be
+    # gated on optional skills. The steps that need them stay conditional inside.
+    if access_tier == "owner":
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
+        hints_lines.append(
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained '
+            f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
+            f'stated here), reconstruct context BEFORE interpreting. Slack has no '
+            f'channel-history fetch in this bridge, so use the embedded thread/reply '
+            f'context above (if present) plus the session transcript, and answer from '
+            f'that, not from memory.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_thread_arg = (
                 f" --thread-ts {shlex.quote(str(reply_thread_ts))}"

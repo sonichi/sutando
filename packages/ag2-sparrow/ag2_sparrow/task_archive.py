@@ -29,4 +29,82 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     if bare.exists():
         return bare
     matches = sorted(tasks_dir.glob(f"{task_id}.claimed-core-*.txt"))
-    return matches[0] if matches else None
+    if matches:
+        return matches[0]
+    # Quarantined last: it is the task's only surviving header block, and
+    # routing needs those headers or a failed archive also strands the reply.
+    quarantined = sorted(tasks_dir.glob(f"{task_id}.txt.archive-failed*"))
+    return quarantined[0] if quarantined else None
+
+
+# Collision NAMING lives here (_move_without_clobbering mints `.N`); collision
+# SELECTION lives with the reader in local_task_protocol. No cross-import: both
+# modules are loaded by PATH with src/ off sys.path, where any import of the
+# other raises ModuleNotFoundError and takes its caller down with it.
+
+
+def _move_without_clobbering(src: Path, dest: Path) -> Path:
+    """Move src to dest, or to dest.N if taken. Returns where it landed.
+    link()+unlink(): rename()/move() REPLACE on POSIX — data loss on a repeat."""
+    import os
+    import shutil
+    base, candidate, n = dest, dest, 0
+    while True:
+        try:
+            os.link(str(src), str(candidate))
+            break
+        except FileExistsError:
+            n += 1
+            candidate = base.with_name(f"{base.name}.{n}")
+        except OSError:
+            # Cross-device: link() can't span filesystems. Fill a private temp
+            # first — the authoritative name created early publishes a stub on a kill.
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=str(base.parent),
+                                       prefix=f".{base.name}.", suffix=".part")
+            try:
+                with open(fd, "wb") as out, open(src, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+                    out.flush()
+                    os.fsync(out.fileno())
+                shutil.copystat(str(src), tmp)
+                while True:
+                    try:
+                        os.link(tmp, str(candidate))   # atomic, refuses existing
+                        break
+                    except FileExistsError:
+                        n += 1
+                        candidate = base.with_name(f"{base.name}.{n}")
+            finally:
+                os.unlink(tmp)
+            break
+    src.unlink()
+    return candidate
+
+
+def archive_file(src: Path, kind: str, task_id: str, *,
+                 tasks_dir: Path, results_dir: Path, log=print) -> bool:
+    """Move src into the archive, NEVER deleting or overwriting a record.
+
+    True when src has left the live queue (archived, quarantined, or never
+    existed); False only when it is still there under its live name.
+    """
+    from datetime import datetime
+    try:
+        if src.exists():
+            base = tasks_dir if kind == "tasks" else results_dir
+            dest_dir = base / datetime.now().strftime("%Y-%m")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            _move_without_clobbering(src, dest_dir / f"{task_id}.txt")
+        return True
+    except Exception as e:
+        log(f"  archive_file({kind}, {task_id}) failed: {e}")
+    try:
+        # The suffix leaves the *.txt glob so the file stops being polled.
+        dest = _move_without_clobbering(
+            src, src.with_suffix(src.suffix + ".archive-failed"))
+        log(f"  archive_file({kind}, {task_id}) quarantined as {dest.name}")
+        return True
+    except Exception as e:
+        log(f"  archive_file({kind}, {task_id}) STILL in the live queue, expect reprocessing: {e}")
+        return False

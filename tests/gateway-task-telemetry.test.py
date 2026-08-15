@@ -28,14 +28,16 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Isolate the channel config BEFORE the bridge import: _ag2space_access_path()
-# resolves under $CLAUDE_CONFIG_DIR (falling back to the real ~/.claude), and
-# _write_task() reads the tierMap from it at write time — without this, the
-# suite depends on the operator's REAL AG2 Space tier map (qingyun-wu CR on
-# #2432 round 2, P1-2: a controlled tierMap mapping the fixture sender to
-# "team" made the owner-activity assertion fail on an operator box).
+# Isolate the channel config BEFORE the bridge import: _write_task() reads the
+# tierMap from _ag2space_access_path() at write time — without this, the suite
+# depends on the operator's REAL AG2 Space tier map (qingyun-wu CR on #2432
+# round 2, P1-2: a controlled tierMap mapping the fixture sender to "team"
+# made the owner-activity assertion fail on an operator box).
 _CFG_ROOT = Path(tempfile.mkdtemp(prefix="rgb-telem-cfg-"))
+# AG2_DEVICE_ENV outranks CLAUDE_CONFIG_DIR in _ag2space_access_path, so setting
+# only the latter still resolves to the operator's install on a configured host.
 os.environ["CLAUDE_CONFIG_DIR"] = str(_CFG_ROOT)
+os.environ["AG2_DEVICE_ENV"] = ""
 _ACCESS = _CFG_ROOT / "channels" / "ag2space" / "access.json"
 _ACCESS.parent.mkdir(parents=True, exist_ok=True)
 _ACCESS.write_text('{"allowFrom": [], "tierMap": {}}')
