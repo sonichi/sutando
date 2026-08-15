@@ -132,7 +132,17 @@ def _observed_session(sock: str) -> str:
             name = (r.stdout or "").strip()
             if name:
                 return name
-    return core_session()
+    # Both launch paths start this writer DETACHED, so $TMUX is absent in the
+    # real case and the env value is a claim; core_pid() is the existing evidence.
+    candidate = core_session()
+    if core_pid(sock, candidate) is not None:
+        return candidate
+    r = _tmux(sock, "list-sessions", "-F", "#{session_name}")
+    if r is not None and r.returncode == 0:
+        for name in (r.stdout or "").split():
+            if name != candidate and core_pid(sock, name) is not None:
+                return name
+    return candidate
 
 
 def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess | None:

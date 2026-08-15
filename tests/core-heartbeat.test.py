@@ -66,7 +66,7 @@ class TestHeartbeatWrite(unittest.TestCase):
         # server on the socket — on a machine that DID, it would have failed.
         # Pinning makes the contract, not the environment, decide.
         _orig = core_heartbeat.core_pid
-        core_heartbeat.core_pid = lambda socket_path=None: 4242
+        core_heartbeat.core_pid = lambda socket_path=None, session=None: 4242
         try:
             core_heartbeat.write_beat(status="custom-status")
         finally:
@@ -121,20 +121,57 @@ class TestHeartbeatWrite(unittest.TestCase):
             os.environ.pop("SUTANDO_TMUX_SESSION", None)
             os.environ.pop("TMUX", None)
 
-    def test_observed_session_falls_back_when_not_inside_tmux(self):
+    def test_observed_session_never_uses_bare_display_message_outside_tmux(self):
         """Outside tmux a bare display-message resolves an arbitrary session on a
-        shared socket, so the contract value is the safer answer."""
+        shared socket. Scoped calls are fine; that one specific call is not."""
         import core_heartbeat
-        _orig = core_heartbeat._tmux
-        core_heartbeat._tmux = lambda sock, *a: (_ for _ in ()).throw(
-            AssertionError("must not ask tmux when $TMUX is unset"))
+        import subprocess as _sp
+        _orig, _origpid = core_heartbeat._tmux, core_heartbeat.core_pid
+
+        def _guard(sock, *a):
+            if a and a[0] == "display-message":
+                raise AssertionError("bare display-message outside tmux")
+            return _sp.CompletedProcess(["tmux"], 1, "", "")
+
+        core_heartbeat._tmux = _guard
+        core_heartbeat.core_pid = lambda socket_path=None, session=None: None
         os.environ.pop("TMUX", None)
         os.environ["SUTANDO_TMUX_SESSION"] = "from-contract"
         try:
             self.assertEqual(core_heartbeat._observed_session("/tmp/s.sock"),
                              "from-contract")
         finally:
-            core_heartbeat._tmux = _orig
+            core_heartbeat._tmux, core_heartbeat.core_pid = _orig, _origpid
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
+
+    def test_write_beat_records_the_live_session_not_a_lying_env(self):
+        """The CR case: $TMUX unset (both launch paths detach the writer) and a
+        lying SUTANDO_TMUX_SESSION must not reach `.alive`."""
+        import core_heartbeat
+        import json as _json
+        import subprocess as _sp
+        _orig, _origpid = core_heartbeat._tmux, core_heartbeat.core_pid
+        LIE, REAL = "custom-core-does-not-exist", "sutando-core"
+
+        def _fake_tmux(sock, *a):
+            if a and a[0] == "list-sessions":
+                return _sp.CompletedProcess(["tmux"], 0, f"{REAL}\n", "")
+            return _sp.CompletedProcess(["tmux"], 1, "", "")
+
+        core_heartbeat._tmux = _fake_tmux
+        core_heartbeat.core_pid = (lambda socket_path=None, session=None:
+                                  4321 if session == REAL else None)
+        os.environ.pop("TMUX", None)
+        os.environ["SUTANDO_TMUX_SESSION"] = LIE
+        try:
+            core_heartbeat.write_beat()
+            rec = _json.loads((self.tmp / "state" / "cores" /
+                               f"{_short_host()}.alive").read_text())
+            self.assertNotEqual(rec["session"], LIE,
+                                "recorded the unverified env value")
+            self.assertEqual(rec["session"], REAL)
+        finally:
+            core_heartbeat._tmux, core_heartbeat.core_pid = _orig, _origpid
             os.environ.pop("SUTANDO_TMUX_SESSION", None)
 
     def test_locality_kind_from_env(self):
