@@ -316,6 +316,19 @@ class TestQuotaAccountIdentity(unittest.TestCase):
                         existing_services={_scoped(core), VANILLA}, proxy_status="warn")
         self.assertEqual(out["status"], "ok")
 
+    def test_stale_proxy_is_still_compared(self):
+        """A "stale" proxy is LISTENING — it is injecting credentials, using
+        pre-deploy code. Lumping it in with down/warn would silence the
+        comparison exactly during a redeploy, when the two sides are most
+        likely to have drifted."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=None,
+                        existing_services={_scoped(core), VANILLA},
+                        proxy_status="stale")
+        self.assertEqual(out["status"], "warn",
+                         "a stale proxy still injects — the comparison must run")
+        self.assertIn(_scoped(core), out["detail"])
+
     def test_no_readable_credential_states_the_no_op(self):
         """Locked keychain / fresh host: an unqualified ok would be
         indistinguishable from a check that actually compared something."""
