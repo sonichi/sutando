@@ -639,46 +639,38 @@ _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipp
 # happens. Unset → exactly the pre-existing FATAL-exit behavior.
 TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
-# Registry-loss self-claim (ag2space-backend #595): a 401 can also mean the
-# SERVER lost this agent's registration (2026-08-14 incident class) while the
-# local bearer is intact. On auth rejection the bridge parks ONE re-enrollment
-# claim; the returned approval code is device-visible only (log + status file
-# — never the owner DM), and binding waits for the owner's concierge approval.
-# After a claim is pending, the re-check loop probes the gateway with the
-# CURRENT token: re-enrollment revalidates the SAME bearer, so waiting for a
-# token-file rotation alone would wait forever. Disable: REMOTE_REENROLL=0.
+# Registry-loss self-claim (backend #595): the code is device-visible only;
+# binding requires the owner's concierge approval. Disable: REMOTE_REENROLL=0.
 REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
     not in ("0", "false", "no", "off")
 REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
-_reenroll_state: dict = {"attempted": False, "code": None, "claimed_at": None}
+REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
+_reenroll_state: dict = {"last_attempt_at": 0.0, "code": None, "claimed_at": None}
 
 
 def _provision_base() -> str:
-    """Gateway base -> provision-api base (…/relay* -> …/api), the same
-    derivation the ops runbook uses (docs/agent-registry-reenroll.md)."""
+    """Gateway base -> provision-api base (…/relay* -> …/api)."""
     return URL.split("/relay")[0].rstrip("/") + "/api"
 
 
 def _reenroll_claim() -> None:
-    """Park ONE re-enrollment claim per auth-rejection episode. Best-effort:
-    every failure only logs — the caller's recovery loop is unaffected. The
-    approval code lands in the log and gateway-status.json: the code is not a
-    credential (binding additionally requires the owner's own Matrix session),
-    it only identifies WHICH claim the owner approves, so device-local
-    surfaces are exactly where it belongs."""
-    if _reenroll_state["attempted"] or not REENROLL_ENABLED:
+    """Best-effort claim: one live code per episode; failed POSTs retry no
+    sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
+    if not REENROLL_ENABLED or _reenroll_state["code"]:
         return
-    _reenroll_state["attempted"] = True
+    if time.time() - _reenroll_state["last_attempt_at"] < REENROLL_CLAIM_RETRY_S:
+        return
     agent_id = (os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID") or "").strip()
     if not agent_id or not TOKEN:
+        # No POST issued -> no cadence stamp; identity may appear later.
         _log("reenroll: AGENT_MXID/AGENT_ID or token unavailable — not claiming")
         return
+    _reenroll_state["last_attempt_at"] = time.time()
     try:
         req = urllib.request.Request(
             _provision_base() + "/connect/reenroll",
             data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
-            # Explicit UA: the prod edge (Cloudflare) 403s urllib's default
-            # (observed live: error 1010) — same contract as _req().
+            # The prod edge 403s urllib's default UA — same contract as _req().
             headers={"Content-Type": "application/json",
                      "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
         with urllib.request.urlopen(req, timeout=20) as r:
@@ -699,12 +691,10 @@ def _reenroll_claim() -> None:
 
 
 def _reenroll_clear(recovered: bool = False) -> None:
-    """End the claim episode. `recovered=True` (the approval-probe success
-    path ONLY) leaves an explicit terminal marker for the status file — the
-    desktop must never infer success from the pending block merely
-    disappearing (a restart clears in-memory state without proving anything)."""
+    """End the episode; recovered=True (probe-success path only) leaves the
+    explicit terminal — disappearance alone must never read as success."""
     was_pending = bool(_reenroll_state.get("code"))
-    _reenroll_state.update({"attempted": False, "code": None, "claimed_at": None})
+    _reenroll_state.update({"last_attempt_at": 0.0, "code": None, "claimed_at": None})
     if recovered and was_pending:
         _reenroll_state["recovered_at"] = int(time.time())
     else:
@@ -712,11 +702,8 @@ def _reenroll_clear(recovered: bool = False) -> None:
 
 
 def _auth_probe() -> bool:
-    """Is the CURRENT token accepted again? (After an approved re-link the
-    gateway revalidates the SAME bearer — nothing rotates.) ONLY a successful
-    authenticated response is a Yes: a 5xx or network error proves nothing
-    about auth, and resuming into a failing gateway just re-enters the error
-    path — keep waiting instead (review P1)."""
+    """True ONLY on a successful authed response — an error proves nothing
+    about auth, so every failure keeps waiting."""
     try:
         _req("GET", "/v1/agents", timeout=15)
         return True
@@ -1210,6 +1197,8 @@ def _recover_auth(code: int) -> bool:
     the token file rotates. Returns True once a rotated token is live; False
     when no TOKEN_FILE is configured (caller keeps the historical FATAL
     exit)."""
+    # A new rejection episode invalidates any prior recovered terminal.
+    _reenroll_state.pop("recovered_at", None)
     if _reload_rotated_token():
         _log("auth rejected but token file already rotated — resuming with new token")
         _reenroll_clear()
@@ -1236,6 +1225,10 @@ def _recover_auth(code: int) -> bool:
             _log("rotated token detected — resuming")
             _reenroll_clear()
             return True
+        if not pending:
+            # Claim retry stays inside the loop (cadence-bounded internally)
+            # so a transient failure isn't a lost episode.
+            _reenroll_claim()
         cycle += 1
         # A transiently-failed claim must not end the episode: re-claiming is
         # safe exactly while nothing is parked (no code to supersede).
@@ -1403,13 +1396,8 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
         }
-        # Registry-loss recovery surface (the desktop reconnect popup's
-        # contract). Pending while a claim awaits owner approval; an explicit
-        # recovered terminal ONLY on the approval-probe success path. A
-        # missing block means "no episode known", never success — a restart
-        # clears in-memory state without proving anything (review P1). The
-        # code is not a credential — approval additionally requires the
-        # owner's own Matrix session — it names WHICH claim gets approved.
+        # Recovery surface: recovered ONLY via the probe-success terminal; a
+        # missing block means "no episode known", never success.
         if _reenroll_state.get("code"):
             payload["reenroll"] = {
                 "pending": True,

@@ -33,7 +33,7 @@ from ag2_sparrow import remote_gateway_bridge as gw  # noqa: E402
 
 def _reset(**over):
     gw._reenroll_state.clear()
-    gw._reenroll_state.update({"attempted": False, "code": None,
+    gw._reenroll_state.update({"last_attempt_at": 0.0, "code": None,
                                "claimed_at": None})
     gw._reenroll_state.update(over)
 
@@ -121,6 +121,48 @@ class _Claim(unittest.TestCase):
             gw.urllib.request.urlopen = real
         self.assertIsNone(gw._reenroll_state["code"])
 
+    def test_transient_claim_failure_retries_after_cadence(self):
+        # Review P1: a failed POST must not burn the episode — it retries
+        # once REENROLL_CLAIM_RETRY_S has passed, and stops once parked.
+        real = gw.urllib.request.urlopen
+        calls = {"n": 0}
+
+        def flaky(req, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("connection refused")  # recovery service deploying
+            return self._serve({"ok": True, "pending": True,
+                                "approval_code": "beef1234"})(req, timeout)
+        gw.urllib.request.urlopen = flaky
+        try:
+            gw._reenroll_claim()                       # fails, stamps cadence
+            self.assertIsNone(gw._reenroll_state["code"])
+            gw._reenroll_claim()                       # inside cadence: no POST
+            self.assertEqual(calls["n"], 1)
+            gw._reenroll_state["last_attempt_at"] = 0.0  # cadence elapsed
+            gw._reenroll_claim()                       # retried -> parks
+            self.assertEqual(gw._reenroll_state["code"], "beef1234")
+            gw._reenroll_state["last_attempt_at"] = 0.0
+            gw._reenroll_claim()                       # parked: one-claim invariant
+            self.assertEqual(calls["n"], 2)
+        finally:
+            gw.urllib.request.urlopen = real
+
+    def test_missing_identity_does_not_consume_the_cadence(self):
+        gw.os.environ.pop("AGENT_MXID", None)
+        gw.os.environ.pop("AGENT_ID", None)
+        gw._reenroll_claim()   # no POST issued
+        self.assertEqual(gw._reenroll_state["last_attempt_at"], 0.0)
+        gw.os.environ["AGENT_MXID"] = "@probe.agent:ag2.space"
+        real = gw.urllib.request.urlopen
+        gw.urllib.request.urlopen = self._serve(
+            {"ok": True, "pending": True, "approval_code": "beef1234"})
+        try:
+            gw._reenroll_claim()   # identity appeared -> claims immediately
+        finally:
+            gw.urllib.request.urlopen = real
+        self.assertEqual(gw._reenroll_state["code"], "beef1234")
+
 
 class _Probe(unittest.TestCase):
     def setUp(self):
@@ -154,7 +196,7 @@ class _Status(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp()) / "gateway-status.json"
         gw.GATEWAY_STATUS_FILE = tmp
         try:
-            _reset(code="beef1234", claimed_at=123, attempted=True)
+            _reset(code="beef1234", claimed_at=123)
             gw._emit_gateway_status(False, error="auth rejected")
             payload = json.loads(tmp.read_text())
             self.assertEqual(payload["reenroll"],
@@ -176,10 +218,34 @@ class _Status(unittest.TestCase):
             _reset()
 
     def test_rotation_win_clears_pending_without_claiming_recovery(self):
-        _reset(code="beef1234", claimed_at=123, attempted=True)
+        _reset(code="beef1234", claimed_at=123)
         gw._reenroll_clear()   # rotation path: episode superseded, NOT recovered
         self.assertIsNone(gw._reenroll_state["code"])
         self.assertNotIn("recovered_at", gw._reenroll_state)
+
+    def test_second_episode_never_republishes_the_old_recovered_terminal(self):
+        # Review P1 (both reviewers; sonichi executed it): recovered episode A,
+        # then a NEW rejection whose claim fails to park -> status must not
+        # advertise the stale recovered:true.
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "_reload_rotated_token", "_reenroll_claim",
+                  "_log", "GATEWAY_STATUS_FILE")}
+        tmp = Path(tempfile.mkdtemp()) / "gateway-status.json"
+        try:
+            _reset(recovered_at=1786767544)   # episode A ended recovered
+            gw.GATEWAY_STATUS_FILE = tmp
+            gw.TOKEN_FILE = ""
+            gw._log = lambda m: None
+            gw._reload_rotated_token = lambda: False
+            gw._reenroll_claim = lambda: None   # claim fails to park (409/net)
+            self.assertFalse(gw._recover_auth(401))   # falls to FATAL contract
+            self.assertNotIn("recovered_at", gw._reenroll_state)
+            gw._emit_gateway_status(False, error="auth rejected HTTP 401")
+            self.assertNotIn("reenroll", json.loads(tmp.read_text()))
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+            _reset()
 
 
 class _RecoverLoop(unittest.TestCase):
@@ -196,7 +262,7 @@ class _RecoverLoop(unittest.TestCase):
             gw._heartbeat_singleton = lambda: True
             gw._emit_gateway_status = lambda *a, **k: None
             gw._log = lambda m: None
-            gw._reenroll_claim = lambda: _reset(attempted=True, code="beef1234",
+            gw._reenroll_claim = lambda: _reset(code="beef1234",
                                                 claimed_at=1)
             probes = {"n": 0}
 
@@ -268,7 +334,7 @@ class _RecoverLoop(unittest.TestCase):
             gw._heartbeat_singleton = lambda: True
             gw._emit_gateway_status = lambda *a, **k: None
             gw._log = lambda m: None
-            gw._reenroll_claim = lambda: _reset(attempted=True, code="beef1234",
+            gw._reenroll_claim = lambda: _reset(code="beef1234",
                                                 claimed_at=1)
             rotations = {"n": 0}
 
