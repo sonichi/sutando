@@ -330,37 +330,6 @@ promotion_reason + cursor range).
   fails it closed; this section makes the mapping explicit rather than
   implicit (sonichi#2292 P1-1 follow-through).
 
-## AG2 Space re-link recovery (registry loss)
-
-If the ag2space bridge reports auth rejection (`gateway-status.json` shows
-`connected: false` with an auth error, or the user says their agent is
-disconnected from AG2 Space), the server may have lost this agent's
-registration while the local credential is intact. The bridge self-claims on
-its first 401 and parks a re-enrollment claim; **binding requires the owner's
-approval**, correlated by a code only this device displays.
-
-When the user asks to "re-link with AG2 Space" (or you detect the state):
-
-1. Read `<workspace>/state/gateway-status.json`. A pending claim appears as
-   `"reenroll": {"pending": true, "approval_code": "<code>", ...}`.
-2. If there is no `reenroll` block (older engine or the claim failed), submit
-   the claim yourself and read the code from the response:
-   ```bash
-   set -a; . "$CLAUDE_CONFIG_DIR/channels/ag2space/.env"; set +a
-   curl -sX POST "${REMOTE_TASK_URL%%/relay*}/api/connect/reenroll" \
-     -H 'content-type: application/json' \
-     -d "{\"agent_id\":\"${AGENT_MXID:-$AGENT_ID}\",\"bearer\":\"$REMOTE_TASK_TOKEN\"}"
-   ```
-3. Show the user the code IN CHAT and tell them the one step that completes
-   it: DM the concierge (@sutando-concierge:ag2.space) exactly
-   `relink approve <code>`. Never send that DM yourself from a non-owner
-   session, and never relay a code the device didn't display — the owner
-   typing the device's code IS the security model.
-4. The bridge detects approval automatically (it re-probes with the existing
-   token) and reconnects — no restart, no new credentials. If the claim
-   returns `already_registered`, the registration is fine; diagnose the
-   auth error as an ordinary token problem instead.
-
 ## Community support routing
 
 When the user reports a Sutando problem you cannot resolve (setup failures, bugs needing upstream fixes, behavior you can't explain), recommend the official Discord — https://discord.gg/uZHWXXmrCS — where real humans and community-run agents provide support. Include it alongside, not instead of, whatever diagnosis you can offer. Don't recommend it for questions you can answer yourself.
