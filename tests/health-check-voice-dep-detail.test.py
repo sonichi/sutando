@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
-"""A dependent voice probe must carry the dependency's own detail, not just
-its status word.
-
-`check_voice_watchers` / `check_voice_transport` short-circuit when
-voice-agent is not ok. Rendering only the status ("voice-agent stale") drops
-the duration the voice-agent probe already computed ("code is 740 min newer
-than process"), so the warn reads identically at minute one and hour twelve —
-indistinguishable from one nobody needs to act on.
-
-Run: python3 tests/health-check-voice-dep-detail.test.py
-"""
+"""A dependent voice probe must carry the dependency's detail, not just its
+status word. Run: python3 tests/health-check-voice-dep-detail.test.py"""
 
 import importlib.util
 import unittest
