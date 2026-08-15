@@ -282,6 +282,33 @@ def resolve_to_target(value: str) -> str:
     )
 
 
+MAX_BODY_BYTES = 65536
+
+
+def _read_body_file(path):
+    """Bounded read of a REGULAR file: a FIFO blocks forever and a device or
+    huge file exhausts memory, so neither may reach read_text()."""
+    import stat as _stat
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise SystemExit(f"ERROR: cannot read --body-file {path!r}: {exc}")
+    if not _stat.S_ISREG(st.st_mode):
+        raise SystemExit(f"ERROR: --body-file {path!r} is not a regular file "
+                         "(a FIFO or device would block or exhaust memory)")
+    if st.st_size > MAX_BODY_BYTES:
+        raise SystemExit(f"ERROR: --body-file {path!r} is {st.st_size} bytes, "
+                         f"over the {MAX_BODY_BYTES} limit")
+    with open(path, "rb") as fh:
+        raw = fh.read(MAX_BODY_BYTES + 1)
+    if len(raw) > MAX_BODY_BYTES:
+        raise SystemExit(f"ERROR: --body-file {path!r} exceeds {MAX_BODY_BYTES} bytes")
+    try:
+        return raw.decode("utf-8").rstrip("\n")
+    except UnicodeDecodeError as exc:
+        raise SystemExit(f"ERROR: --body-file {path!r} is not UTF-8: {exc}")
+
+
 def main():
     argv = sys.argv[1:]
     # Optional explicit recipient: --to <name|id>. When given, the @-mention
@@ -295,28 +322,17 @@ def main():
         to_target = argv[i + 1]
         del argv[i : i + 2]
 
-    # Body from a FILE so prose never crosses a shell quoting boundary: an
-    # apostrophe re-arms backticks and truncates, while the send still succeeds.
-    body_file = None
-    if "--body-file" in argv:
-        i = argv.index("--body-file")
-        if i + 1 >= len(argv):
+    # --body-file must be the FIRST body token: recognising it anywhere would
+    # turn ordinary prose ("document --body-file usage") into a file read.
+    if argv and argv[0] in VALID_KINDS and len(argv) > 1 and argv[1] == "--body-file":
+        if len(argv) < 3:
             sys.exit("ERROR: --body-file requires a path")
-        body_file = argv[i + 1]
-        del argv[i : i + 2]
-
-    if body_file is not None:
-        if len(argv) != 1:
-            sys.exit("ERROR: --body-file takes the body; pass only <kind> "
-                     f"positionally, got {argv[1:]!r}")
-        try:
-            text = pathlib.Path(body_file).read_text(encoding="utf-8").rstrip("\n")
-        except OSError as exc:
-            sys.exit(f"ERROR: cannot read --body-file {body_file!r}: {exc}")
-        if not text.strip():
-            sys.exit(f"ERROR: --body-file {body_file!r} is empty — refusing to "
-                     "post a blank message")
+        if len(argv) > 3:
+            sys.exit(f"ERROR: --body-file takes the body; drop {argv[3:]!r}")
         kind = argv[0]
+        text = _read_body_file(argv[2])
+        if not text.strip():
+            sys.exit(f"ERROR: --body-file {argv[2]!r} is empty — refusing to post")
     else:
         if len(argv) < 2:
             print(__doc__, file=sys.stderr)

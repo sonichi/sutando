@@ -5765,25 +5765,46 @@ def _send_via_rest(channel_id: str, message: str):
     print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
 
 
+MAX_BODY_BYTES = 65536
+
+
+def _read_body_file(path):
+    """Bounded read of a REGULAR file: a FIFO blocks forever and a device or
+    huge file exhausts memory, so neither may reach read_text()."""
+    import stat as _stat
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise SystemExit(f"ERROR: cannot read --body-file {path!r}: {exc}")
+    if not _stat.S_ISREG(st.st_mode):
+        raise SystemExit(f"ERROR: --body-file {path!r} is not a regular file "
+                         "(a FIFO or device would block or exhaust memory)")
+    if st.st_size > MAX_BODY_BYTES:
+        raise SystemExit(f"ERROR: --body-file {path!r} is {st.st_size} bytes, "
+                         f"over the {MAX_BODY_BYTES} limit")
+    with open(path, "rb") as fh:
+        raw = fh.read(MAX_BODY_BYTES + 1)
+    if len(raw) > MAX_BODY_BYTES:
+        raise SystemExit(f"ERROR: --body-file {path!r} exceeds {MAX_BODY_BYTES} bytes")
+    try:
+        return raw.decode("utf-8").rstrip("\n")
+    except UnicodeDecodeError as exc:
+        raise SystemExit(f"ERROR: --body-file {path!r} is not UTF-8: {exc}")
+
+
 def _send_cli_body(argv: list) -> str:
-    """Body for `send`: --body-file when given, else the joined argv. A file
-    keeps prose off the shell, where an apostrophe re-arms backticks."""
-    if "--body-file" in argv:
-        i = argv.index("--body-file")
-        if i + 1 >= len(argv):
-            raise SystemExit("ERROR: --body-file requires a path")
-        path = argv[i + 1]
-        rest = argv[:i] + argv[i + 2:]
-        if rest:
-            raise SystemExit(f"ERROR: --body-file takes the body; drop {rest!r}")
-        try:
-            body = Path(path).read_text(encoding="utf-8").rstrip("\n")
-        except OSError as exc:
-            raise SystemExit(f"ERROR: cannot read --body-file {path!r}: {exc}")
-        if not body.strip():
-            raise SystemExit(f"ERROR: --body-file {path!r} is empty — refusing to send")
-        return body
-    return " ".join(argv)
+    """Body for `send`: --body-file only as the FIRST token, else joined argv.
+    Recognising it later would turn ordinary prose into a file read."""
+    if not argv or argv[0] != "--body-file":
+        return " ".join(argv)
+    if len(argv) < 2:
+        raise SystemExit("ERROR: --body-file requires a path")
+    if len(argv) > 2:
+        raise SystemExit(f"ERROR: --body-file takes the body; drop {argv[2:]!r}")
+    body = _read_body_file(argv[1])
+    if not body.strip():
+        raise SystemExit(f"ERROR: --body-file {argv[1]!r} is empty — refusing to send")
+    return body
 
 
 if __name__ == "__main__":

@@ -140,15 +140,23 @@ try:
         check("--body-file: overhead still measured against the real body",
               _posted.get("kwargs", {}).get("overhead") == len(_sent2) - len(_hazard))
 
-        # positional text alongside --body-file is ambiguous -> refuse
+        # COMPATIBILITY: the flag is only recognised immediately after <kind>.
+        # A later literal occurrence is ordinary prose and must still send.
         _posted.clear()
-        sys.argv = ["post.py", "--to", MEMBER_B, "ping", "also this", "--body-file", str(f)]
+        sys.argv = ["post.py", "--to", MEMBER_B, "ping", "please document", "--body-file", "usage"]
+        b2b.main()
+        check("literal --body-file LATER in a body stays prose",
+              _posted.get("text", "").endswith("please document --body-file usage"))
+
+        # a trailing argument after the path is ambiguous -> refuse
+        _posted.clear()
+        sys.argv = ["post.py", "--to", MEMBER_B, "ping", "--body-file", str(f), "extra"]
         try:
-            b2b.main(); raised2, msg2 = False, ""
-        except SystemExit as e:
-            raised2, msg2 = True, str(e)
-        check("--body-file + positional text → refused, nothing posted",
-              raised2 and "posted" not in _posted and "only <kind>" in msg2.replace("pass only ", "only "))
+            b2b.main(); raised2 = False
+        except SystemExit:
+            raised2 = True
+        check("--body-file + trailing arg → refused, nothing posted",
+              raised2 and "posted" not in _posted)
 
         # an empty file must not post a blank message
         blank = pathlib.Path(td) / "blank.txt"; blank.write_text("   \n", encoding="utf-8")
