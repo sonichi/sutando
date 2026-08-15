@@ -33,6 +33,9 @@ NO_WAIT_GAP_S = 2.0
 # Sits between watcher startup (measured max 1.255s) and the slow handler's 5s
 # sleep, so it discriminates on blocking rather than on host speed.
 NOT_BLOCKED_S = 3.0
+# Teardown is the one place the bound IS the assertion: a worker that outlives
+# shutdown must fail, so this stays short and separate from the settling polls.
+WORKER_EXIT_S = 2.0
 WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 spec = importlib.util.spec_from_file_location("workstream_session_worker", WORKER)
 worker = importlib.util.module_from_spec(spec)
@@ -1548,7 +1551,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             assert not remaining_claims
             assert fallback_names == names
             assert len(calls.read_text().splitlines()) <= 2
-            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
+            deadline = time.monotonic() + WORKER_EXIT_S
             while time.monotonic() < deadline:
                 try:
                     os.killpg(watcher_pgid, 0)
