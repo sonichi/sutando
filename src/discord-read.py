@@ -123,13 +123,16 @@ def _render(msg, clip=CLIP):
     if not snaps:
         return body[:clip] if clip is not None else body
     fwd = (snaps[0].get("message") or {})
-    fwd_body = _redact((fwd.get("content") or "").strip())
+    fwd_body = (fwd.get("content") or "").strip()
     extra = []
     for a in fwd.get("attachments") or []:
         extra.append(f"<attachment: {a.get('filename', '?')}>")
     for e in fwd.get("embeds") or []:
         extra.append(f"<embed: {e.get('title') or e.get('type') or '?'}>")
-    inner = " ".join(x for x in (fwd_body, *extra) if x) or "(forward with no readable body)"
+    # Redact the COMPOSED inner, not the body alone: filenames and embed titles
+    # are user-supplied too, and the bridge filters them on the same path.
+    inner = _redact(" ".join(x for x in (fwd_body, *extra) if x)) \
+        or "(forward with no readable body)"
     prefix = f"{body} " if body else ""
     return f"{prefix}[forwarded] {inner}"
 

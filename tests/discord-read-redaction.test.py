@@ -77,6 +77,51 @@ class ReaderRedaction(unittest.TestCase):
         self.assertIn("[forwarded]", out)
         self.assertNotIn(FAKE_TOKEN, out)
 
+    def test_secret_in_a_forwarded_attachment_filename_is_redacted(self):
+        """The body was redacted while the extras beside it were not — one
+        field to the side of the case above. A filename is user-supplied and
+        the bridge filters it on the same path, so it must not print raw.
+
+        Uses the vault-set grammar deliberately: it is caught by
+        `redact_vault_commands` alone, so this pins the WIRING (extras reach
+        `_redact`) without depending on the optional `secret_scanner` library
+        that `filter_chat_secrets` degrades silently without.
+        """
+        out = dr._render({
+            "content": "",
+            "author": {"username": "sonichi"},
+            "message_snapshots": [{"message": {
+                "content": "",
+                "attachments": [{"filename": f"vault set X {FAKE_TOKEN}.txt"}],
+            }}],
+        }, clip=None)
+        self.assertIn("[forwarded]", out)
+        self.assertNotIn(FAKE_TOKEN, out)
+
+    def test_secret_in_a_forwarded_embed_title_is_redacted(self):
+        """Same gap, the other extra: an embed title is remote-controlled by
+        whoever authored the embedded link."""
+        out = dr._render({
+            "content": "",
+            "author": {"username": "sonichi"},
+            "message_snapshots": [{"message": {
+                "content": "",
+                "embeds": [{"title": f"vault set Z {FAKE_TOKEN}"}],
+            }}],
+        }, clip=None)
+        self.assertIn("[forwarded]", out)
+        self.assertNotIn(FAKE_TOKEN, out)
+
+    def test_forward_with_no_readable_body_still_says_so(self):
+        """Guard the composed-inner refactor: redacting the JOINED string must
+        not turn an empty forward into an empty render."""
+        out = dr._render({
+            "content": "",
+            "author": {"username": "sonichi"},
+            "message_snapshots": [{"message": {"content": ""}}],
+        }, clip=None)
+        self.assertIn("(forward with no readable body)", out)
+
     def test_redaction_happens_before_the_clip(self):
         """The clip can land MID-token. Redacting after it would leave the leading
         characters of a secret printed and no longer matchable — a leak that looks
