@@ -626,11 +626,8 @@ def main() -> int:
 
 
 def _a_truncated_population_is_never_certified():
-    """P1: a stage landing exactly on its ceiling is complete-looking but partial.
-
-    Two fires, production main(): the first must not persist, the second must
-    not read NO_CHANGE.
-    """
+    """P1: two fires through production main() -- a ceiling-bound stage must
+    neither persist its hash nor let the second fire read NO_CHANGE."""
     import contextlib
     import io
     import json
@@ -639,7 +636,11 @@ def _a_truncated_population_is_never_certified():
 
     real_prs, real_disc, real_argv, real_dargv = (
         pf._fetch_prs, pf._fetch_discovered, pf.fetch_argv, pf.discovery_argv)
+    real_stands = pf._gh_stands_page
     try:
+        # _attach_commits() is live under main(); without this seam the two-fire
+        # control makes real `gh api graphql` calls at 60s each.
+        pf._gh_stands_page = lambda *a, **k: (True, [], False, None)
         for stage in ("owner", "discovery"):
             rows = [_pr(i, "sonichi") for i in range(1, 4)]
             pf._fetch_prs = lambda *a, **k: (True, rows)
@@ -677,13 +678,13 @@ def _a_truncated_population_is_never_certified():
     finally:
         (pf._fetch_prs, pf._fetch_discovered,
          pf.fetch_argv, pf.discovery_argv) = (real_prs, real_disc, real_argv, real_dargv)
+        pf._gh_stands_page = real_stands
     print("  ok  a ceiling-truncated population is never certified or persisted")
 
 
 def _no_change_gate_is_present_in_source():
-    """Separate function ON PURPOSE: a source-text assert and a behavioural one
-    in the same body are a single assert -- whichever runs first, and the
-    source one is the weaker."""
+    """Separate ON PURPOSE: a source assert and a behavioural one in the same
+    body are one assert -- whichever runs first, and the source one is weaker."""
     src = (REPO / "scripts" / "pr_flag.py").read_text()
     assert "if h == prev and certified and not args.force:" in src, \
         "the NO_CHANGE fast path must be gated on `certified`"
@@ -692,9 +693,7 @@ def _no_change_gate_is_present_in_source():
 
 def _uncertified_run_is_never_silent():
     """P1: a failed fetch whose survivors hash to the LAST HEALTHY state.
-
-    Carries NO source-text assert, so it can fail on its own.
-    """
+    Carries NO source-text assert, so it can fail on its own."""
     import io
     import json
     import contextlib

@@ -209,12 +209,8 @@ def _mergeable_key(row: dict) -> str:
 
 
 def carry_unknown_mergeable(state: list, previous: dict) -> list:
-    """Replace UNKNOWN mergeable with the last value seen for THIS revision.
-
-    GitHub's lazy recomputation parks the field at UNKNOWN; carrying the previous
-    value keeps that churn out of the hash while leaving a real
-    CONFLICTING/MERGEABLE transition fully visible.
-    """
+    """Carry the last value seen for THIS revision over an UNKNOWN, so GitHub's
+    lazy recompute stays out of the hash while a real transition still shows."""
     out = []
     for s in state:
         row = dict(s)
@@ -234,22 +230,10 @@ def mergeable_map(state: list) -> dict:
 
 
 def state_hash(state: list) -> str:
-    """Stable hash of the objective set. Changes when a PR appears/disappears or
-    any actionable field (base/head/ci/review/approvals/
-    approvals_standing) flips; a title edit does not refire.
+    """Stable hash of the objective set; a title edit does not refire.
 
-    `approvals_standing` is in the key for a reason the head-anchored count
-    cannot cover: a reviewer converting CHANGES_REQUESTED to APPROVED at an
-    OLDER commit moves the enforced gate without moving `approvals`, so before
-    this it did not refire and the agent was never woken for a PR that had just
-    become mergeable.
-
-    `mergeable` is included but must be normalized by `carry_unknown_mergeable`
-    first: GitHub parks it at UNKNOWN while recomputing, and that churn is not a
-    state change. A real CONFLICTING/MERGEABLE flip has no other carrier -- the
-    target branch can advance with head, base name, ci, reviews and approvals all
-    unchanged -- so excluding the field entirely would drop actionable news.
-    """
+    `approvals_standing` and (normalized) `mergeable` are in the key because
+    each carries a gate change no other field does -- see the PR body."""
     key = [[s["number"], s["principal"], s["base"], s["head"], s["ci"],
             s["mergeable"], s["review"], s["approvals"], s["approvals_standing"]]
            for s in state]
@@ -284,11 +268,7 @@ def discovery_argv(repo: str) -> list:
 
 def peer_candidates(discovered: list, owner_login: str) -> list:
     """Peer PRs whose merge the owner could still unblock -- stage 2's input.
-
-    Prunes drafts and peers already carrying CHANGES_REQUESTED (their author must
-    clear the review first). Never prunes on APPROVED: that is the case an owner
-    action most often unblocks.
-    """
+    Prunes drafts and CHANGES_REQUESTED; never prunes on APPROVED."""
     out = []
     for pr in discovered:
         if pr.get("isDraft"):
