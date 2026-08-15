@@ -16,6 +16,17 @@ would then find the real script and the assertions below would fail.
 
 Control arm (run before committing): revert any one builder to
 `Path(__file__).parent / "<script>"` and its case here fails.
+
+Run the ONE-BUILDER revert, not the whole-file one — they fail for different
+reasons and only one of them is evidence:
+
+    revert the WHOLE src file       FAILED (errors=4)    AttributeError: _SRC_DIR
+    revert ONE builder, keep it     FAILED (failures=1)  the exact builder
+
+`errors=4` only proves a symbol is missing; any implementation defining
+`_SRC_DIR` satisfies it. `failures=1` isolates the builder and is the real
+assertion. A reader who runs the obvious whole-file revert will see the bigger
+number and credit this file with more than it earns.
 """
 import importlib.util
 import sys
@@ -90,6 +101,19 @@ class SrcDirWiring(unittest.TestCase):
         finally:
             mb.subprocess.run = real_run
         self.assertEqual(calls, [], "builder resolved a real script — it ignored _SRC_DIR")
+
+    def test_notifier_loader_path_follows_src_dir(self):
+        """The fourth builder — `_load_notifier` at src:472.
+
+        Found while verifying the control arm: reverting THIS one left the
+        suite green, because nothing asserted it. The module docstring claims
+        "every sibling-script path", so an uncovered builder is a gap in the
+        claim, not just in coverage. `_load_notifier` execs the module it
+        resolves, so a stubbed `_SRC_DIR` must make it raise rather than
+        silently load the real script.
+        """
+        with self.assertRaises(Exception):
+            mb._load_notifier()
 
     def test_src_dir_is_absolute_and_real(self):
         """Guards the definition itself: the stub above only means something if
