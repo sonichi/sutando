@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""startup.sh must relaunch Sutando.app, before its terminal exec.
+"""restart.sh must relaunch Sutando.app it killed, before its terminal exec.
 
-Run:
-    python3 tests/startup-relaunches-the-app.test.py
+`restart.sh:73` pkills `src/Sutando/Sutando` and nothing brought it back, so
+every restart silently dropped the owner's hotkeys, menu bar, and the app's
+`checkWatcher()` timer -- the watchdog that re-arms a missing task watcher.
 
-`restart.sh:73` pkills `src/Sutando/Sutando`; `startup.sh` — which restart.sh
-execs to bring services back — never started it, and no launchd job covers it
-(#2810). So every restart silently dropped the owner's hotkeys, the menu bar,
-and the app's `checkWatcher()` timer, which is the watchdog that re-arms a
-missing task watcher. Measured 2026-08-11: the app stayed down ~3 hours after a
-restart, reported only as ordinary staleness.
+The relaunch lives in restart.sh, NOT startup.sh: `tests/startup-headless.test.sh`
+guards startup.sh as headless -- desktop process management belongs to product
+entry points, never the open-source core startup. An earlier revision of this PR
+put it in startup.sh and that guard failed it, correctly.
 
 Two assertions are load-bearing beyond "a launch exists":
 
 * **`pgrep -x`, not `-f`.** `pgrep -f Sutando` matches the argv of the shell
-  running the check, so it reports the app as running when it is not — the
-  liveness probe would then never launch anything.
-* **The launch must precede the final `exec`.** startup.sh ends in
-  `exec bash .../start-cli.sh`, which replaces the process; anything after it
-  is unreachable. A block appended below that line looks correct in a diff,
-  greps as present, and never runs once.
+  running the check, so it reports the app as running when it is not.
+* **The launch must precede the final `exec`.** restart.sh ends in
+  `exec bash .../startup.sh`, which replaces the process; anything after it is
+  unreachable, yet greps as present.
 """
 from __future__ import annotations
 
@@ -33,18 +30,18 @@ STARTUP = REPO / "src" / "startup.sh"
 RESTART = REPO / "src" / "restart.sh"
 
 
-class StartupRelaunchesTheApp(unittest.TestCase):
+class RestartRelaunchesTheApp(unittest.TestCase):
 
     def setUp(self):
-        self.text = STARTUP.read_text()
+        self.text = RESTART.read_text()
 
     def test_startup_launches_the_app_binary(self):
         """FAILS on the parent, which never references the binary as a launch."""
         self.assertIn("src/Sutando/Sutando", self.text,
-                      "startup.sh does not reference the app binary at all")
+                      "restart.sh does not reference the app binary at all")
         self.assertRegex(
             self.text, r'nohup\s+"\$APP_BIN"',
-            "no nohup launch of the app binary in startup.sh")
+            "no nohup launch of the app binary in restart.sh")
 
     def test_liveness_uses_pgrep_x_not_dash_f(self):
         """-f self-matches the checking shell and reports a false positive."""
@@ -61,11 +58,11 @@ class StartupRelaunchesTheApp(unittest.TestCase):
         """
         launch = self.text.index('nohup "$APP_BIN"')
         execs = [m.start() for m in
-                 re.finditer(r'^exec bash "\$REPO/src/agent/start-cli\.sh"',
+                 re.finditer(r'^exec bash "\$REPO/src/startup\.sh"',
                              self.text, re.M)]
-        self.assertTrue(execs, "startup.sh no longer ends in the start-cli exec")
+        self.assertTrue(execs, "restart.sh no longer ends in the startup.sh exec")
         self.assertLess(launch, min(execs),
-                        "the app launch sits AFTER startup.sh's terminal exec, "
+                        "the app launch sits AFTER restart.sh's terminal exec, "
                         "so it can never run")
 
     def test_guarded_against_double_launch(self):
@@ -75,7 +72,7 @@ class StartupRelaunchesTheApp(unittest.TestCase):
                       "the launch is not preceded by an already-running guard")
 
     def test_missing_binary_skips_instead_of_failing(self):
-        """A clone without a built binary must not break startup."""
+        """A clone without a built binary must not break restart."""
         self.assertRegex(self.text, r'elif \[ -x "\$APP_BIN" \]')
         self.assertIn("Sutando.app skipped", self.text)
 

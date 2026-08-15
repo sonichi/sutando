@@ -1316,26 +1316,6 @@ for port_name in $VERIFY_PORTS; do
 done
 echo ""
 
-# Sutando.app — hotkeys, menu bar, and the checkWatcher() timer that re-arms a
-# missing task watcher. restart.sh pkills it and nothing else brought it back.
-APP_BIN="$REPO/src/Sutando/Sutando"
-if pgrep -x Sutando > /dev/null 2>&1; then
-  echo "  ✓ Sutando.app (already running)"
-elif [ -x "$APP_BIN" ]; then
-  echo "  Starting Sutando.app..."
-  nohup "$APP_BIN" > /tmp/sutando-app.log 2>&1 &
-  sleep 1
-  # `pgrep -x`, never `-f`: -f matches this script's own argv and reports a
-  # launch that did not happen. The ✓ stays inside the verified branch.
-  if pgrep -x Sutando > /dev/null 2>&1; then
-    echo "  ✓ Sutando.app"
-  else
-    echo "  ✗ Sutando.app — launched but not running; see /tmp/sutando-app.log"
-  fi
-else
-  echo "  ⊘ Sutando.app skipped — no binary at $APP_BIN"
-fi
-echo ""
 
 # Delegate to the runtime dispatcher — canonical sutando-core launch command.
 # Sutando.app and health recovery use this same Claude-or-Codex selection.
