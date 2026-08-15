@@ -654,8 +654,9 @@ def _provision_base() -> str:
 
 
 def _reenroll_identity() -> str:
-    """Agent mxid: process env first, then the channel .env file — the same
-    fallback the token uses (desktop launchers don't export either)."""
+    """Agent mxid: process env, then the channel .env file — the same fallback
+    the token uses (desktop launchers don't export either) — then the durable
+    per-host identity enrolment wrote to state/auth/ag2space.json."""
     for key in ("AGENT_MXID", "AGENT_ID"):
         v = (os.environ.get(key) or "").strip()
         if v:
@@ -664,7 +665,16 @@ def _reenroll_identity() -> str:
         v = _config_from_channel_env(key).strip()
         if v:
             return v
-    return ""
+    # Re-read per call, like the channel-env candidates: an identity that
+    # appears mid-episode must take effect without a restart.
+    try:
+        rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
+        # Non-string values must read as unknown, not be coerced into a
+        # garbage identity that _reenroll_claim would POST on the cadence.
+        v = rec.get("agent_id")
+        return v.strip() if isinstance(v, str) else ""
+    except Exception:  # absent, unreadable, or malformed — identity unknown
+        return ""
 
 
 def _reenroll_claim() -> None:
@@ -679,8 +689,22 @@ def _reenroll_claim() -> None:
         return
     agent_id = _reenroll_identity()
     if not agent_id or not TOKEN:
-        # No POST issued -> no cadence stamp; identity may appear later.
-        _log("reenroll: AGENT_MXID/AGENT_ID or token unavailable — not claiming")
+        # No POST issued -> no cadence stamp. The instruction must match what
+        # can actually work: file candidates are re-read every cycle, but the
+        # POINTERS to them live in the process env — absent both pointers,
+        # only a wrapper/app restart can deliver the fix (#2924 review).
+        if not agent_id:
+            pointered = os.environ.get("AG2_DEVICE_ENV") \
+                or os.environ.get("CLAUDE_CONFIG_DIR")
+            _log("reenroll: agent identity unknown — write "
+                 "AGENT_MXID=<agent mxid> into the channel .env; retrying "
+                 "(takes effect without restart)" if pointered else
+                 "reenroll: agent identity unknown and no channel-env "
+                 "pointers (AG2_DEVICE_ENV/CLAUDE_CONFIG_DIR) — set "
+                 "AGENT_MXID in the gateway environment and RESTART the "
+                 "wrapper/app; holding the connection wait meanwhile")
+        else:
+            _log("reenroll: no token available — not claiming")
         return
     _reenroll_state["last_attempt_at"] = time.monotonic()
     try:
@@ -1221,11 +1245,15 @@ def _recover_auth(code: int) -> bool:
         _reenroll_clear()
         return True
     _reenroll_claim()
-    if not TOKEN_FILE and not _reenroll_state["code"]:
+    if not TOKEN_FILE and not _reenroll_state["code"] \
+            and not (REENROLL_ENABLED and TOKEN):
+        # Historical FATAL contract survives ONLY where recovery is truly
+        # impossible: reenroll off, or no bearer to claim with (#2924).
         return False
     _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation"
          + (f" in {TOKEN_FILE}" if TOKEN_FILE else "")
-         + (" or re-link approval" if _reenroll_state["code"] else "")
+         + (" or re-link approval" if _reenroll_state["code"]
+            else " or re-link identity/claim")
          + f" (re-check every {AUTH_RECHECK_INTERVAL}s)")
     cycle = 0
     while True:
