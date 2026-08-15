@@ -372,24 +372,8 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
                 "absent from this payload but NOT known to be uninteresting"
             )
 
-    # complete==True is a CERTIFICATION, so it is only ever granted on evidence:
-    # a count strictly below the ceiling. Unknown count -> None, never True.
-    #
-    # The count compared against the ceiling must be the PRE-filter FETCHED count
-    # (@john-the-dev's second blocker on #2645). The ceiling applies to
-    # `_fetch_prs()`; `raw_state()` then drops drafts, so the emitted count is
-    # strictly smaller. Certifying off the emitted count means one dropped draft
-    # at a truncated fetch reads as complete:
-    #
-    #     fetched=1000 (== ceiling, truncated)  ->  emitted=999  ->  "below the
-    #     1000 ceiling"  ->  complete=True, on a population GitHub had cut off.
-    #
-    # Exactly the defect this descriptor exists to remove, reintroduced by
-    # measuring the wrong side of the filter. `record_count` stays in the payload
-    # as the emitted size — it is what the consumer actually received — but it
-    # never decides completeness.
-    # Two fetches, two ceilings: each stage must clear its OWN limit, since a
-    # combined count under the owner's hides discovery sitting at its own.
+    # Certify against the PRE-filter FETCHED count, per fetch: raw_state() drops
+    # drafts, so an emitted count can sit below a ceiling its own fetch hit.
     stages = [("owner fetch", fetched_count if fetched_count is not None
                else record_count, limit)]
     if peer_ok and peer_stage is not None:
