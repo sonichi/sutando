@@ -2555,6 +2555,10 @@ _poll_loops_started = False
 # failing loop can't spin, short enough that delivery resumes on its own.
 POLL_LOOP_RESTART_SEC = 5
 
+# Returned by a poll loop that declined to run because its feature is off.
+# Not a failure, so the supervisor must stop rather than restart it forever.
+LOOP_DISABLED = object()
+
 
 async def _supervise_loop(coro_fn, name):
     """Keep a poll loop alive across crashes.
@@ -2574,7 +2578,10 @@ async def _supervise_loop(coro_fn, name):
     """
     while True:
         try:
-            await coro_fn()
+            if await coro_fn() is LOOP_DISABLED:
+                # Opted out on purpose (feature flag off) — supervising it would
+                # re-enter and re-return every POLL_LOOP_RESTART_SEC forever.
+                return
             # A poll loop returning is itself unexpected (they never exit).
             print(f"  [{name}] loop returned unexpectedly — restarting in {POLL_LOOP_RESTART_SEC}s", flush=True)
         except asyncio.CancelledError:
@@ -5008,7 +5015,7 @@ async def poll_progress():
     must never break the loop or leak an exception into the gateway.
     """
     if not progress_stream.stream_enabled():
-        return  # feature off → never loops; zero overhead, zero risk
+        return LOOP_DISABLED  # feature off → never loops; zero overhead, zero risk
     while True:
         try:
             now = time.time()
