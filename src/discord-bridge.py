@@ -5765,9 +5765,31 @@ def _send_via_rest(channel_id: str, message: str):
     print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
 
 
+def _send_cli_body(argv: list) -> str:
+    """Body for `send`: from --body-file when given, else the joined argv.
+    A file keeps prose off the shell, where an apostrophe re-arms backticks and
+    truncates the message while the send still reports success."""
+    if "--body-file" in argv:
+        i = argv.index("--body-file")
+        if i + 1 >= len(argv):
+            raise SystemExit("ERROR: --body-file requires a path")
+        path = argv[i + 1]
+        rest = argv[:i] + argv[i + 2:]
+        if rest:
+            raise SystemExit(f"ERROR: --body-file takes the body; drop {rest!r}")
+        try:
+            body = Path(path).read_text(encoding="utf-8").rstrip("\n")
+        except OSError as exc:
+            raise SystemExit(f"ERROR: cannot read --body-file {path!r}: {exc}")
+        if not body.strip():
+            raise SystemExit(f"ERROR: --body-file {path!r} is empty — refusing to send")
+        return body
+    return " ".join(argv)
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
-        _send_via_rest(sys.argv[2], " ".join(sys.argv[3:]))
+        _send_via_rest(sys.argv[2], _send_cli_body(sys.argv[3:]))
     else:
         _single_instance_acquire("discord-bridge")
         client.run(TOKEN, log_handler=None)
