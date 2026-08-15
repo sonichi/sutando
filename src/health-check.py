@@ -5746,6 +5746,69 @@ def check_task_watcher() -> dict:
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 
+#: A task-handler claim covers ONE handler run. `codex-bounded.sh` caps a run at
+#: 240s, so a claim outliving these is held, not working. Generous on purpose:
+#: 30x the cap before warn, 120x before down.
+_TASK_CLAIM_WARN_S = 1800.0
+_TASK_CLAIM_DOWN_S = 7200.0
+
+
+def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
+    """Held-but-unsettled task-handler claims — the leak nothing else can see.
+
+    `watch-tasks-stream.sh` takes a claim in `state/task-event-handler-claims/`
+    before dispatching a task to `$SUTANDO_TASK_EVENT_HANDLER`, and releases it
+    on completion. A claim that is never released is invisible: no error path
+    runs, so nothing is logged, and every other probe here reads healthy. The
+    task queue drains, the watcher is alive, results are delivered.
+
+    It stays invisible until the watcher EXITS, because `fallback_outstanding_
+    handlers()` settles each still-held claim by publishing a terminal failure —
+    one user-visible message per claim. So the first and only symptom of a slow
+    leak is a flood at restart, sized by however long the leak ran.
+
+    Measured 2026-08-14: 34 claims accumulated over 21h of task arrivals, oldest
+    31.2h, and drained as 34 Discord messages in two seconds when the watcher was
+    restarted. The retired watcher's whole captured stderr was 228 lines — 194
+    task events plus those 34 shutdown lines, and NOTHING else. Zero handler
+    failures. Nothing in the system could have reported the leak while it grew.
+
+    Age comes from mtime, not a payload: the claim file's format is owned by the
+    shell writer, and a probe that parsed it would break when that changed. mtime
+    is safe here for the reason it is NOT safe for `state/cores/*.alive` — claims
+    are local-only and never synced, so no remote write can refresh one.
+
+    Deliberately NOT a `--fix`: deleting a held claim would drop a task that may
+    still be running, and publishing its failure early is the watcher's call, not
+    a health probe's.
+    """
+    name = "task-claims"
+    base = Path(workspace_dir or WORKSPACE_DIR) / "state" / "task-event-handler-claims"
+    if not base.is_dir():
+        return {"name": name, "status": "ok",
+                "detail": "no claims directory — task-event handler never dispatched on this host"}
+    now = time.time()
+    held = []
+    for entry in base.glob("task-*.txt"):
+        try:
+            held.append((now - entry.stat().st_mtime, entry.name))
+        except OSError:
+            continue          # raced with a release; the next run sees the truth
+    if not held:
+        return {"name": name, "status": "ok", "detail": "no held task-handler claims"}
+    held.sort(reverse=True)
+    oldest_age, oldest_name = held[0]
+    detail = f"{len(held)} held claim(s), oldest {oldest_age / 3600:.1f}h ({oldest_name})"
+    if oldest_age > _TASK_CLAIM_DOWN_S:
+        return {"name": name, "status": "down",
+                "detail": f"{detail} — leaked; each will publish a user-visible "
+                          "failure when the watcher next exits"}
+    if oldest_age > _TASK_CLAIM_WARN_S:
+        return {"name": name, "status": "warn",
+                "detail": f"{detail} — longer than any bounded handler run"}
+    return {"name": name, "status": "ok", "detail": detail}
+
+
 def fix_task_watcher_sentinel(check: dict) -> str:
     """Re-stamp the PID sentinel for a supervised watcher that lost it (--fix).
 
@@ -7840,6 +7903,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_proactive_quarantine())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
+    checks.append(check_task_claim_age())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
