@@ -3027,8 +3027,11 @@ async def _handle_discord_message(message, force=False):
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
         safe_snapshots = filter_chat_secrets(str(message.message_snapshots)).text  # pragma: no cover
         print(f"  [debug] message_snapshots: {safe_snapshots}", flush=True)  # pragma: no cover
-    if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
-        print(f"  [debug] non-default message type: {message.type}", flush=True)
+    # Discord authors these itself; a THREAD_CREATED notice carries the thread NAME
+    # as its content, which became a task whose body was a bare title.
+    if getattr(message, "is_system", None) and message.is_system():
+        print(f"  [skip] system message type={message.type}", flush=True)
+        return
 
     # DMs: bot messages always require explicit @-mention (no channel config path).
     if is_dm and message.author.bot and client.user not in message.mentions:
