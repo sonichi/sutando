@@ -346,6 +346,15 @@ class _Identity(unittest.TestCase):
         self._write({"agent_id": "   "})
         self.assertEqual(gw._reenroll_identity(), "")          # whitespace only
 
+    def test_non_string_agent_id_reads_as_unknown_not_garbage(self):
+        """Review P2: a truthy non-string must not be coerced into a garbage
+        identity — `_reenroll_claim` gates on `if not agent_id`, so '12345'
+        would be POSTed on the cadence and the operator hint never printed."""
+        for bad in (12345, ["@x:ag2.space"], {"v": "@x"}, True, 0.5):
+            self._write({"agent_id": bad})
+            self.assertEqual(gw._reenroll_identity(), "",
+                             f"non-string agent_id {bad!r} must read as unknown")
+
     def test_identity_appearing_later_is_picked_up_without_a_restart(self):
         """Re-read per call, matching the channel-env candidates: an operator
         (or a re-enrolment) landing the file mid-episode must take effect."""

@@ -669,7 +669,10 @@ def _reenroll_identity() -> str:
     # appears mid-episode must take effect without a restart.
     try:
         rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
-        return str(rec.get("agent_id") or "").strip()
+        # Non-string values must read as unknown, not be coerced into a
+        # garbage identity that _reenroll_claim would POST on the cadence.
+        v = rec.get("agent_id")
+        return v.strip() if isinstance(v, str) else ""
     except Exception:  # absent, unreadable, or malformed — identity unknown
         return ""
 
