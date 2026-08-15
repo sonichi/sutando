@@ -1,23 +1,6 @@
 #!/usr/bin/env python3
-"""Regression test: check_task_claim_age must make a LEAKED task-handler claim
-loud while it is leaking, instead of only at watcher exit.
-
-The gap it covers: `watch-tasks-stream.sh` takes a claim in
-state/task-event-handler-claims/ before dispatching a task to
-$SUTANDO_TASK_EVENT_HANDLER and releases it on completion. A claim that is
-never released takes NO error path, so nothing is logged and every other probe
-reads healthy. It surfaces only when the watcher exits, where
-fallback_outstanding_handlers() publishes one user-visible terminal failure per
-held claim — so a slow leak's first and only symptom is a flood at restart.
-
-Measured 2026-08-14: 34 claims accumulated over 21h, oldest 31.2h, and drained
-as 34 Discord messages in two seconds on restart. The retired watcher's entire
-captured stderr was 228 lines — 194 task events plus those 34 shutdown lines,
-and nothing else. Zero handler failures. Nothing could have reported the leak.
-
-Run: python3 tests/health-check-task-claim-age.test.py
-Exit: 0 on pass, 1 on fail.
-"""
+"""check_task_claim_age must make a LEAKED handler claim loud while it is leaking,
+    not only at watcher exit. Run: python3 tests/health-check-task-claim-age.test.py"""
 from __future__ import annotations
 import importlib.util
 import json
@@ -108,9 +91,8 @@ class TestTaskClaimAge(unittest.TestCase):
         )
 
     def test_absent_claims_dir_is_ok(self):
-        """A host that never dispatched to the handler has no directory, and
-        that is not a fault — an absent-is-warn probe warns forever and gets
-        ignored, which is how the alarm this exists to raise would be lost."""
+        """A host that never dispatched has no directory; an absent-is-warn probe warns
+        forever and gets ignored, losing the alarm this exists to raise."""
         self.assertEqual(
             self.hc.check_task_claim_age(workspace_dir=self.ws)["status"], "ok"
         )
@@ -136,10 +118,8 @@ class TestTaskClaimAge(unittest.TestCase):
     # a fixed threshold pages on live work as soon as a deployment raises it.
 
     def test_raised_hard_timeout_does_not_page_on_an_in_flight_handler(self):
-        """The reviewer's control on #2906: hard timeout 7200s, a 1900s live claim.
-
-        Against a fixed 1800s warn this returned `warn` for a handler still well
-        inside its permitted run. It must stay `ok`."""
+        """Hard timeout 7200s with a 1900s live claim returned warn against a fixed 1800s
+        bound. A handler still inside its permitted run must stay ok."""
         self._claim("task-live.txt", 1900)
         with mock.patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "7200"}):
             out = self.hc.check_task_claim_age(workspace_dir=self.ws)
@@ -163,9 +143,8 @@ class TestTaskClaimAge(unittest.TestCase):
             )
 
     def test_unusable_hard_timeout_falls_back_to_the_handler_default(self):
-        """session-worker rejects non-positive/unparseable values too, so the
-        handler is not running with them either — 900s is the honest assumption.
-        Never fail toward a threshold that pages on a permitted run."""
+        """session-worker rejects the same values, so the handler is not running with them
+        either — never fail toward a threshold that pages on a permitted run."""
         self._claim("task-x.txt", 1000)          # < 2*900 warn, > 2*60 if misparsed as small
         for bad in ("", "abc", "0", "-5"):
             with mock.patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": bad}):
@@ -175,9 +154,8 @@ class TestTaskClaimAge(unittest.TestCase):
                 )
 
     def test_unreadable_claim_is_skipped_not_fatal(self):
-        """A claim released mid-scan makes stat() raise. The probe must skip that
-        entry and still judge the rest — a release racing the health check is
-        normal operation, not an error."""
+        """A release racing the scan makes stat() raise; that is normal operation, so the
+        probe must skip the entry and still judge the rest."""
         self._claim("task-old.txt", 9 * 3600)
         real_stat = Path.stat
 
@@ -193,16 +171,8 @@ class TestTaskClaimAge(unittest.TestCase):
         self.assertIn("1 held claim(s)", out["detail"])   # the vanished one is not counted
 
     def test_all_claims_unreadable_reads_as_empty_not_broken(self):
-        """Every entry racing at once is indistinguishable from an empty dir, and
-        an empty dir is the honest report — the next run sees the truth.
-
-        Raises only for claim FILES, never blanket-on-Path.stat: CPython 3.12's
-        `Path.is_dir()` calls stat(), so a global raise breaks the probe's own
-        directory check and the test exercises the wrong failure. It passed on
-        3.14 locally and errored on 3.12 in CI for exactly that reason. The
-        suffix matters too — the claims DIRECTORY is `task-event-handler-claims`,
-        which also starts with `task-`.
-        """
+        """Raises only for claim FILES: Path.is_dir() calls stat(), so a blanket raise breaks
+        the probe's own directory check and exercises the wrong failure."""
         self._claim("task-gone.txt", 10)
         real_stat = Path.stat
 

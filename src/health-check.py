@@ -5754,14 +5754,8 @@ _TASK_CLAIM_DOWN_MULTIPLE = 8
 
 
 def _task_claim_thresholds() -> tuple[float, float]:
-    """(warn, down) seconds, derived from the handler's configured hard timeout.
-
-    Falls back to the handler's own default on anything unparseable or
-    non-positive — `session-worker.py` rejects those too, so a bad value means
-    the handler is not running with it either and the default is the honest
-    assumption. Never returns a threshold that could page on a run still inside
-    its permitted bound.
-    """
+    """(warn, down) seconds from the handler's configured hard timeout, falling back to
+    its default on anything unparseable so a threshold never pages a permitted run."""
     raw = os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "")
     try:
         hard = float(raw)
@@ -5808,13 +5802,8 @@ _TASK_CLAIM_ARCHIVE_GRACE_S = 300
 
 
 def _claim_observations_path(workspace_dir: Path) -> Optional[Path]:
-    """Unsynced store for first-sightings, or None when none exists.
-
-    Anchored on the ENGINE checkout (this file's repo), never the workspace: a
-    deployed layout can keep the workspace beside the checkout, and `state/` is
-    carryable, so a workspace-relative store is refreshable by the same sync
-    that refreshes claim mtime.
-    """
+    """Unsynced first-sighting store, or None. Anchored on the ENGINE checkout, never the
+    workspace, whose state/ is refreshed by the same sync that refreshes claim mtime."""
     engine = REPO_DIR.resolve()          # the module already resolves its own repo
     try:
         # rev-parse, not `engine/".git"`: in a WORKTREE .git is a file.
@@ -5834,11 +5823,8 @@ def _claim_observations_path(workspace_dir: Path) -> Optional[Path]:
 
 
 def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
-    """({name: seconds since first local sighting}, trusted).
-
-    `trusted` is False when no structurally-unsynced store exists -- the caller
-    must then treat age as unavailable rather than trust a syncable mtime.
-    """
+    """({name: seconds since first local sighting}, trusted). trusted=False means no
+    unsynced store exists, so the caller must treat age as unavailable, not as mtime."""
     path = _claim_observations_path(workspace_dir)
     if path is None:
         return {}, False
@@ -5892,13 +5878,8 @@ def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
-    """Held-but-unsettled task-handler claims — a leak no other probe can see.
-
-    The task file is the progress signal: while it exists the work is queued or
-    running, so neither count nor age can condemn the claim. A claim whose task
-    is already archived is leaked at any age. Not a --fix: releasing a claim may
-    drop a running task.
-    """
+    """A claim whose task file still exists is queued or running, so no age condemns it;
+    one whose task is archived is leaked at any age. Not a --fix: release may drop work."""
     name = "task-claims"
     base = Path(workspace_dir or WORKSPACE_DIR) / "state" / "task-event-handler-claims"
     if not base.is_dir():
