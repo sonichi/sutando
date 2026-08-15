@@ -204,6 +204,64 @@ test_load_reuses_existing_valid_token()
 test_load_rejects_wrong_permissions()
 
 # ---------------------------------------------------------------------------
+# Downscale budget tests
+# ---------------------------------------------------------------------------
+
+def test_downscale_invokes_sips_with_bounds() -> None:
+    with tempfile.NamedTemporaryFile() as frame:
+        with unittest.mock.patch.object(sc.subprocess, "run") as run:
+            ok_result = sc._downscale_frame(frame.name, 1280, 60)
+        ok("downscale succeeds when sips succeeds", ok_result)
+        ok("downscale bounds reach sips", run.call_args.args[0] == [
+            "sips", "--resampleHeightWidthMax", "1280", "-s", "format",
+            "jpeg", "-s", "formatOptions", "60", frame.name,
+        ], f"got {run.call_args.args[0] if run.call_args else None}")
+
+
+def test_downscale_failure_only_allows_small_original() -> None:
+    with tempfile.NamedTemporaryFile() as small, tempfile.NamedTemporaryFile() as large:
+        small.write(b"x")
+        small.flush()
+        large.write(b"x" * (sc.DOWNSCALE_FAIL_MAX_BYTES + 1))
+        large.flush()
+        with unittest.mock.patch.object(sc.subprocess, "run", side_effect=RuntimeError("sips failed")):
+            ok("downscale failure permits a small original", sc._downscale_frame(small.name, 1280, 60))
+            ok("downscale failure rejects an over-budget original", not sc._downscale_frame(large.name, 1280, 60))
+    with unittest.mock.patch.object(sc.subprocess, "run", side_effect=RuntimeError("sips failed")), \
+         unittest.mock.patch.object(sc.os.path, "getsize", side_effect=OSError("stat failed")):
+        ok("downscale failure rejects an unreadable original", not sc._downscale_frame("missing.jpg", 1280, 60))
+
+
+def test_capture_downscale_options_and_failure_are_visible() -> None:
+    handler = _FakeHandler("/capture?format=jpeg&maxdim=1280&quality=60&silent=true", "secret-token")
+    with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
+         unittest.mock.patch("os.makedirs"), \
+         unittest.mock.patch("subprocess.run"), \
+         unittest.mock.patch.object(sc, "_downscale_frame", return_value=True) as downscale:
+        handler._handle_capture()
+    ok("capture passes bounded JPEG options to downscale", downscale.call_args.args[1:] == (1280, 60),
+       f"got {downscale.call_args.args if downscale.call_args else None}")
+    ok("capture returns success after downscale", handler._response_code == 200,
+       f"got code={handler._response_code}")
+
+    failed = _FakeHandler("/capture?format=jpeg&maxdim=1280&quality=60&silent=true", "secret-token")
+    with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
+         unittest.mock.patch("os.makedirs"), \
+         unittest.mock.patch("subprocess.run"), \
+         unittest.mock.patch.object(sc, "_downscale_frame", return_value=False):
+        failed._handle_capture()
+    ok("capture rejects a frame that cannot meet the downscale budget", failed._response_code == 500,
+       f"got code={failed._response_code}")
+    ok("downscale budget failure has a stable error", json.loads(failed._buf.getvalue()) == {
+        "status": "error", "error": "downscale failed and frame exceeds budget"
+    }, f"got body={failed._buf.getvalue()!r}")
+
+
+test_downscale_invokes_sips_with_bounds()
+test_downscale_failure_only_allows_small_original()
+test_capture_downscale_options_and_failure_are_visible()
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
