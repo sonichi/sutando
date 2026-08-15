@@ -80,6 +80,21 @@ def test_telegram_active_routes_to_telegram():
     _with_state({"channel": "telegram", "ts": 1779339000}, run)
 
 
+def test_ag2space_active_routes_to_ag2space():
+    """Owner's last activity was in the AG2 Space desktop app (the gateway
+    bridge stamps `channel: ag2space` on every owner message) — the gateway
+    drain claims, discord and telegram skip. Pre-fix, `ag2space` fell into
+    the unrecognized-channel branch and Discord claimed a desktop owner's
+    nudges (or stranded them on a discord-less host)."""
+
+    def run(state):
+        assert should_claim_proactive(state, "ag2space") is True
+        assert should_claim_proactive(state, "discord") is False
+        assert should_claim_proactive(state, "telegram") is False
+
+    _with_state({"channel": "ag2space", "ts": 1786608037}, run)
+
+
 def test_missing_state_file_defaults_to_discord():
     """Fresh install / no activity yet → Discord wins by default. Two
     bridges polling at the same time on a fresh install must NOT both
@@ -198,7 +213,7 @@ def test_bridge_channels_set_is_documented():
     Without this pin, the constant could silently widen and break the
     "non-bridge defaults to Discord" contract."""
     from proactive_routing import BRIDGE_CHANNELS
-    assert BRIDGE_CHANNELS == frozenset({"discord", "telegram"}), (
+    assert BRIDGE_CHANNELS == frozenset({"discord", "telegram", "ag2space"}), (
         f"BRIDGE_CHANNELS changed to {BRIDGE_CHANNELS!r}. If you added a "
         f"new bridge, add a corresponding routing test AND update this "
         f"assertion deliberately."
@@ -208,6 +223,7 @@ def test_bridge_channels_set_is_documented():
 def main():
     test_discord_active_routes_to_discord()
     test_telegram_active_routes_to_telegram()
+    test_ag2space_active_routes_to_ag2space()
     test_missing_state_file_defaults_to_discord()
     test_malformed_state_file_defaults_to_discord()
     test_state_file_missing_channel_field_defaults_to_discord()
