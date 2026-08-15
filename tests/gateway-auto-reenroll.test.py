@@ -315,6 +315,26 @@ class _Identity(unittest.TestCase):
                                if k == "AGENT_MXID" else ""):
             self.assertEqual(gw._reenroll_identity(), "@chan.agent:ag2.space")
 
+    def test_every_earlier_candidate_still_outranks_the_state_file(self):
+        """REVIEW.md lesson 10 — enumerate the adjacent inputs, not just the one
+        you changed. `_reenroll_identity` has SIX inputs; a new last-resort
+        source must not quietly outrank any of the five that precede it, so
+        walk the whole ladder rather than neutralising it wholesale.
+        """
+        self._write({"agent_id": "@stale.agent:ag2.space"})
+        # 1-2: process env, both spellings.
+        for key in ("AGENT_MXID", "AGENT_ID"):
+            with mock.patch.dict(gw.os.environ, {key: f"@env-{key}:ag2.space"}):
+                self.assertEqual(gw._reenroll_identity(), f"@env-{key}:ag2.space",
+                                 f"process env {key} must outrank the state file")
+        # 3-5: channel .env, all three spellings it accepts.
+        for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
+            with mock.patch.object(gw, "_config_from_channel_env",
+                                   side_effect=lambda k, want=key:
+                                   f"@chan-{want}:ag2.space" if k == want else ""):
+                self.assertEqual(gw._reenroll_identity(), f"@chan-{key}:ag2.space",
+                                 f"channel .env {key} must outrank the state file")
+
     def test_absent_unreadable_and_malformed_all_yield_empty(self):
         """Never raise into the claim path: a missing, corrupt, or
         wrong-shaped record is an unknown identity, not a crash."""
