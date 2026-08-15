@@ -79,6 +79,38 @@ class OrphanResultRoutesTest(unittest.TestCase):
         (self.tasks / f"{tid}.txt").write_text(task_text())
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
 
+    def test_a_quarantined_task_still_yields_its_route(self):
+        """A failed archive must not also strand the reply.
+
+        archive_file() mints <id>.txt.archive-failed when it cannot archive;
+        that file is then the task's only surviving header block, so routing
+        has to see it or the result is undeliverable forever.
+        """
+        tid = self._result()
+        (self.tasks / f"{tid}.txt.archive-failed").write_text(task_text())
+        self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_a_suffixed_quarantine_still_yields_its_route(self):
+        tid = self._result()
+        (self.tasks / f"{tid}.txt.archive-failed.1").write_text(task_text())
+        self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_a_live_task_outranks_a_quarantined_leftover(self):
+        """Precedence matters: the quarantined copy can be older, and routing
+        the stale channel_id would post the reply to the wrong place."""
+        tid = self._result()
+        (self.tasks / f"{tid}.txt").write_text(task_text())
+        (self.tasks / f"{tid}.txt.archive-failed").write_text(
+            task_text().replace(SNOWFLAKE, "9" * 19))
+        self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_a_quarantine_for_another_id_is_not_matched(self):
+        """The lookup globs, so a longer id sharing this one's prefix must not
+        satisfy it — that would route one task's reply using another's headers."""
+        tid = self._result()
+        (self.tasks / f"{tid}-extra.txt.archive-failed").write_text(task_text())
+        self.assertEqual(self.routes(), {})
+
     def test_archived_task_still_yields_its_route(self):
         # By the time a result exists the core has usually archived the task,
         # so an archive miss would make the fix work only in a race.
@@ -264,25 +296,28 @@ class WiringTest(unittest.TestCase):
                       "poll_results never calls it, so nothing adopts an orphan route")
 
     def test_delivery_cleanup_archives_a_CLAIMED_task_not_a_rebuilt_bare_name(self):
-        # The resolver deliberately finds `<id>.claimed-core-N`, so the cleanup
-        # that follows delivery must resolve the same path or strand it forever.
-        # Anchored on the comment block: a SIBLING site also ends in
-        # _clear_delivered and already used this idiom, so a looser anchor
-        # matches that one and passes at the parent, proving nothing.
-        m = re.search(r"task_file = ([^\n]*)\n"
-                      r"\s*archive_file\(task_file, \"tasks\", task_id\)\n"
-                      r"(?:\s*#[^\n]*\n)+"
-                      r"\s*_clear_delivered\(task_id\)", self.src)
-        self.assertIsNotNone(
-            m, "the post-delivery cleanup rebuilds a bare task path; a claimed task strands")
+        # ONE owner for the archive-then-clear policy. Asserting the resolver
+        # inside it beats matching call sites: a new site inherits it for free.
+        m = re.search(r"def _archive_delivered_pair\(.*?\n\n\n", self.src, re.S)
+        self.assertIsNotNone(m, "the shared post-delivery cleanup helper is missing")
+        helper = m.group(0)
+        expr = re.search(r"task_file = ([^\n]*)\n", helper)
+        self.assertIsNotNone(expr, "the helper must resolve a task path")
         with tempfile.TemporaryDirectory() as td:
             tasks = Path(td)
             claimed = tasks / "task-99.claimed-core-1.txt"
             claimed.write_text("body")
             ns = {"find_task_file": _task_archive.find_task_file,
                   "TASKS_DIR": tasks, "task_id": "task-99"}
-            self.assertEqual(eval(m.group(1), ns), claimed,
+            self.assertEqual(eval(expr.group(1), ns), claimed,
                              "cleanup resolves the bare name, not the claimed file")
+        # and every delivery path must go THROUGH it rather than open-coding
+        self.assertGreaterEqual(
+            len(re.findall(r"^\s+_archive_delivered_pair\(result_file, task_id\)$",
+                           self.src, re.M)), 2,
+            "both delivery paths must call the shared helper")
+        self.assertNotIn("_gone = archive_file", self.src,
+                         "an open-coded cleanup site bypasses the shared policy")
 
     def test_the_bridge_injects_a_snowflake_validator(self):
         m = re.search(r"def _is_discord_channel_id\(value: str\) -> bool:.*?return ([^\n]+)",

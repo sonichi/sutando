@@ -85,9 +85,29 @@ fi
 # only wire up when a LISTENer actually holds the proxy port — never point
 # the core at a dead port (the #1086/#1291 failure class; same
 # LISTEN-not-any-socket rule as src/restart.sh).
-if [ -z "${ANTHROPIC_BASE_URL:-}" ] \
-   && lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1; then
-  export ANTHROPIC_BASE_URL=http://localhost:7846
+proxy_listener_up() {
+  lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
+}
+if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
+  # A loaded launchd job means the proxy is EXPECTED on this host even when its
+  # listener hasn't bound yet (same loaded-job check as startup.sh/restart.sh).
+  PROXY_EXPECTED=""
+  if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
+    PROXY_EXPECTED=1
+  fi
+  if [ -n "$PROXY_EXPECTED" ]; then
+    # Bounded wait (~10s): a supervised proxy can bind seconds after the core on
+    # a cold boot, and a one-shot check would leave the core unrouted for life.
+    for _ in $(seq 1 20); do
+      proxy_listener_up && break
+      sleep 0.5
+    done
+  fi
+  if proxy_listener_up; then
+    export ANTHROPIC_BASE_URL=http://localhost:7846
+  elif [ -n "$PROXY_EXPECTED" ]; then
+    echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — core runs unrouted this session (no proxy protection, no quota telemetry)" >&2
+  fi
 fi
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   CORE_ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
