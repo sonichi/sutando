@@ -389,7 +389,11 @@ def test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end() 
         package_root = REPO / "packages" / "ag2-sparrow"
         sys.path.insert(0, str(package_root))
         try:
-            import ag2_sparrow.remote_gateway_bridge as gateway
+            # The gateway resolves its token AT IMPORT: env -> channel .env -> Keychain.
+            # A dummy short-circuits that chain so the suite never reads live credentials.
+            with mock.patch.dict(os.environ, {"REMOTE_TASK_TOKEN": "test-dummy-token"},
+                                 clear=False):
+                import ag2_sparrow.remote_gateway_bridge as gateway
         finally:
             sys.path.remove(str(package_root))
 
