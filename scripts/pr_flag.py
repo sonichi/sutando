@@ -295,6 +295,31 @@ def peer_candidates(discovered: list, owner_login: str) -> list:
     return out
 
 
+def read_prior_mergeable(sf) -> dict:
+    """Prior mergeable map, fail-open. Inline, this swallowed only decode/OS
+    errors: valid JSON that is not an object reached .get and raised."""
+    if sf is None or not sf.exists():
+        return {}
+    try:
+        doc = json.loads(sf.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    got = doc.get("mergeable") or {}
+    return got if isinstance(got, dict) else {}
+
+
+def _argv_limit(argv: list):
+    """The `--limit` ceiling an argv carries, or None."""
+    if "--limit" not in argv:
+        return None
+    try:
+        return int(argv[argv.index("--limit") + 1])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
 def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
                      fetched_count: int = None, peer_stage: dict = None) -> dict:
     """Name the emitted population precisely, from the WHOLE pipeline.
@@ -327,11 +352,7 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
     """
     argv = fetch_argv(repo, owner_login)
     author = argv[argv.index("--author") + 1] if "--author" in argv else None
-    limit_s = argv[argv.index("--limit") + 1] if "--limit" in argv else None
-    try:
-        limit = int(limit_s) if limit_s is not None else None
-    except (TypeError, ValueError):
-        limit = None
+    limit = _argv_limit(argv)
 
     # A peer stage that could not run is NOT a widened population. Treat it as
     # owner-only so the payload never claims coverage it does not have.
@@ -380,17 +401,32 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
     # measuring the wrong side of the filter. `record_count` stays in the payload
     # as the emitted size — it is what the consumer actually received — but it
     # never decides completeness.
-    ceiling_count = fetched_count if fetched_count is not None else record_count
-    if ceiling_count is None or limit is None:
+    # TWO fetches, TWO ceilings. Comparing a combined count to the owner limit
+    # certifies neither: discovery can sit at its own ceiling while the sum stays
+    # under the owner's. Every stage that ran must clear its OWN limit.
+    stages = [("owner fetch", fetched_count if fetched_count is not None
+               else record_count, limit)]
+    if peer_ok and peer_stage is not None:
+        stages.append(("discovery", peer_stage.get("discovered"),
+                       _argv_limit(discovery_argv(repo))))
+
+    unknown = [n for n, c, l in stages if c is None or l is None]
+    at_ceiling = [(n, c, l) for n, c, l in stages
+                  if c is not None and l is not None and c >= l]
+    if unknown:
         complete = None
-        why = "fetched count or fetch ceiling unknown — completeness not certified"
-    elif ceiling_count >= limit:
+        why = (f"{', '.join(unknown)} count or ceiling unknown — completeness "
+               "not certified")
+    elif at_ceiling:
         complete = False
-        why = (f"fetch returned {ceiling_count} at a {limit} ceiling — complete "
-               "and truncated are indistinguishable here")
+        why = "; ".join(f"{n} returned {c} at a {l} ceiling — complete and "
+                        f"truncated are indistinguishable here"
+                        for n, c, l in at_ceiling)
     else:
         complete = True
-        why = f"fetch returned {ceiling_count}, below the {limit} ceiling"
+        why = "; ".join(f"{n} returned {c}, below the {l} ceiling"
+                        for n, c, l in stages)
+    ceiling_count = stages[0][1]
 
     if peer_stage and (not peer_ok or peer_stage.get("failed")
                        or not peer_stage.get("owner_ok", True)):
@@ -575,12 +611,7 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
             ws = ""
         sf = Path(ws) / "state" / "pr-flag-state.json" if ws else Path("state/pr-flag-state.json")
 
-    prior = {}
-    if sf is not None and sf.exists():
-        try:
-            prior = json.loads(sf.read_text()).get("mergeable", {}) or {}
-        except (json.JSONDecodeError, OSError):
-            prior = {}
+    prior = read_prior_mergeable(sf)
     state = carry_unknown_mergeable(state, prior)
     h = state_hash(state)
     # A population we could not certify must not overwrite the last good hash:
@@ -610,7 +641,9 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
                                               "failed": peer_failures,
                                               "discovery_ok": disc_ok,
                                               "owner_ok": own_ok},
-                                  fetched_count=len(fetched)),
+                                  # OWNER-stage size: the owner ceiling applies
+                                  # here. Discovery certifies its own, above.
+                                  fetched_count=len(own)),
         "prs": state,
     }, indent=2))
     try:

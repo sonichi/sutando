@@ -151,6 +151,41 @@ def _failed_fetch_is_never_an_empty_population():
     assert of["complete"] is False, "owner fetch failure must not certify complete"
 
 
+def _each_stage_certifies_its_own_ceiling():
+    """Discovery at ITS ceiling must make the widened population incomplete,
+    even when the owner stage is far below the owner ceiling."""
+    d = pf.scope_descriptor("o/r", "o", record_count=100, fetched_count=110,
+                            peer_stage={"discovered": 1000, "candidates": 100,
+                                        "fetched": 100, "failed": 0,
+                                        "discovery_ok": True, "owner_ok": True})
+    assert d["complete"] is False, (
+        "discovery sat at its 1000 ceiling and the population was certified "
+        "complete — a combined count was compared to the owner limit")
+    assert "discovery" in d["complete_reason"], d["complete_reason"]
+    ok = pf.scope_descriptor("o/r", "o", record_count=20, fetched_count=25,
+                             peer_stage={"discovered": 40, "candidates": 5,
+                                         "fetched": 5, "failed": 0,
+                                         "discovery_ok": True, "owner_ok": True})
+    assert ok["complete"] is True, ok["complete_reason"]
+
+
+def _prior_read_fails_open_on_any_shape():
+    """Valid JSON that is not an object must not crash before the fail-open."""
+    import tempfile
+    import pathlib as _pl
+    for payload in ("[]", '"str"', "null", "123", "{ not json",
+                    '{"mergeable": [1, 2]}'):
+        with tempfile.TemporaryDirectory() as td:
+            sf = _pl.Path(td) / "s.json"
+            sf.write_text(payload)
+            assert pf.read_prior_mergeable(sf) == {}, payload
+    with tempfile.TemporaryDirectory() as td:
+        sf = _pl.Path(td) / "s.json"
+        sf.write_text('{"mergeable": {"1": "MERGEABLE"}}')
+        assert pf.read_prior_mergeable(sf) == {"1": "MERGEABLE"}
+    assert pf.read_prior_mergeable(None) == {}
+
+
 def main() -> int:
     OWNER = "sonichi"
 
@@ -578,6 +613,8 @@ def main() -> int:
     _descriptor_tracks_the_widened_population()
     _mergeable_churn_does_not_refire()
     _failed_fetch_is_never_an_empty_population()
+    _each_stage_certifies_its_own_ceiling()
+    _prior_read_fails_open_on_any_shape()
     print("  ok  #2643 peer-scope + mergeable-churn cases")
     print("\nAll pr-flag core cases pass.")
     return 0
