@@ -30,6 +30,9 @@ EVENT_SETTLE_TIMEOUT_S = 15
 # The second dispatch must follow the first promptly; a serialized notifier would
 # wait out the first task's whole run, which is orders of magnitude longer.
 NO_WAIT_GAP_S = 2.0
+# Sits between watcher startup (measured max 1.255s) and the slow handler's 5s
+# sleep, so it discriminates on blocking rather than on host speed.
+NOT_BLOCKED_S = 3.0
 WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 spec = importlib.util.spec_from_file_location("workstream_session_worker", WORKER)
 worker = importlib.util.module_from_spec(spec)
@@ -1279,7 +1282,7 @@ def test_slow_handler_does_not_block_the_next_task_event() -> None:
             line = process.stdout.readline()
             elapsed = time.monotonic() - started
             assert line == "TASK_FILE: task-b-live.txt\n"
-            assert elapsed < 1.0, f"second task event was blocked for {elapsed:.2f}s"
+            assert elapsed < NOT_BLOCKED_S, f"second task event was blocked for {elapsed:.2f}s"
         finally:
             os.killpg(process.pid, signal.SIGTERM)
             process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
