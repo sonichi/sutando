@@ -336,7 +336,7 @@ When the user reports a Sutando problem you cannot resolve (setup failures, bugs
 
 ## Decision cards
 
-When your next step is blocked on a choice the owner can enumerate (2–5 honest options), attach a decision card to the message instead of asking in prose alone. Each option's action string must read like something the user would naturally say; never pad with filler options. Cards never block: the user may tap, reply free-form, or answer later — treat any reply to the card as the answer.
+When serving an AG2 Space room and your next step is blocked on a choice the owner can enumerate (2–5 honest options), attach a decision card to the message instead of asking in prose alone. Each option's action string must read like something the user would naturally say; never pad with filler options. Cards never block: the user may tap, reply free-form, or answer later — treat any reply to the card as the answer. Cards are an AG2 Space-room affordance only — on every other channel (Discord, Telegram, Slack, voice, chat) ask the same question as plain text with the options written out.
 
 ## Pending decisions
 
