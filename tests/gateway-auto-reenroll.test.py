@@ -32,6 +32,7 @@ from ag2_sparrow import remote_gateway_bridge as gw  # noqa: E402
 
 
 def _reset(**over):
+    gw._reenroll_state.clear()
     gw._reenroll_state.update({"attempted": False, "code": None,
                                "claimed_at": None})
     gw._reenroll_state.update(over)
@@ -132,26 +133,23 @@ class _Probe(unittest.TestCase):
         gw._req = lambda *a, **k: {"agents": []}
         self.assertTrue(gw._auth_probe())
 
-    def test_401_is_not_recovery_but_other_http_is(self):
-        def r401(*a, **k):
-            raise urllib.error.HTTPError("u", 401, "no", {}, io.BytesIO(b"{}"))
-        gw._req = r401
-        self.assertFalse(gw._auth_probe())
-
-        def r500(*a, **k):
-            raise urllib.error.HTTPError("u", 500, "err", {}, io.BytesIO(b"{}"))
-        gw._req = r500
-        self.assertTrue(gw._auth_probe())  # auth passed; server hiccup
-
-    def test_network_error_keeps_waiting(self):
-        def down(*a, **k):
-            raise OSError("connection refused")
-        gw._req = down
-        self.assertFalse(gw._auth_probe())
+    def test_only_success_is_recovery(self):
+        # Review P1: a 5xx proves nothing about auth — resuming into a
+        # failing gateway just re-enters the error path. Every non-success
+        # keeps waiting.
+        for exc in (urllib.error.HTTPError("u", 401, "no", {}, io.BytesIO(b"{}")),
+                    urllib.error.HTTPError("u", 403, "no", {}, io.BytesIO(b"{}")),
+                    urllib.error.HTTPError("u", 500, "err", {}, io.BytesIO(b"{}")),
+                    urllib.error.HTTPError("u", 503, "err", {}, io.BytesIO(b"{}")),
+                    OSError("connection refused"), TimeoutError("slow")):
+            def raiser(*a, _e=exc, **k):
+                raise _e
+            gw._req = raiser
+            self.assertFalse(gw._auth_probe(), f"probe passed on {exc!r}")
 
 
 class _Status(unittest.TestCase):
-    def test_status_carries_reenroll_block_only_while_pending(self):
+    def test_status_lifecycle_pending_then_explicit_recovered_terminal(self):
         saved = gw.GATEWAY_STATUS_FILE
         tmp = Path(tempfile.mkdtemp()) / "gateway-status.json"
         gw.GATEWAY_STATUS_FILE = tmp
@@ -162,12 +160,26 @@ class _Status(unittest.TestCase):
             self.assertEqual(payload["reenroll"],
                              {"pending": True, "approval_code": "beef1234",
                               "claimed_at": 123})
+            # Approval-probe success -> EXPLICIT recovered terminal (P1: the
+            # desktop must never infer success from mere disappearance).
+            gw._reenroll_clear(recovered=True)
+            gw._emit_gateway_status(True)
+            block = json.loads(tmp.read_text())["reenroll"]
+            self.assertEqual((block["pending"], block["recovered"]), (False, True))
+            self.assertNotIn("approval_code", block)
+            # Fresh process / no episode -> NO block at all (unknown, not success).
             _reset()
             gw._emit_gateway_status(True)
             self.assertNotIn("reenroll", json.loads(tmp.read_text()))
         finally:
             gw.GATEWAY_STATUS_FILE = saved
             _reset()
+
+    def test_rotation_win_clears_pending_without_claiming_recovery(self):
+        _reset(code="beef1234", claimed_at=123, attempted=True)
+        gw._reenroll_clear()   # rotation path: episode superseded, NOT recovered
+        self.assertIsNone(gw._reenroll_state["code"])
+        self.assertNotIn("recovered_at", gw._reenroll_state)
 
 
 class _RecoverLoop(unittest.TestCase):
@@ -195,6 +207,36 @@ class _RecoverLoop(unittest.TestCase):
             self.assertTrue(gw._recover_auth(401))
             self.assertEqual(probes["n"], 3)
             self.assertIsNone(gw._reenroll_state["code"])  # episode cleared
+            self.assertIn("recovered_at", gw._reenroll_state)  # explicit terminal
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+            _reset()
+
+    def test_rotation_wins_over_pending_claim_and_clears_it(self):
+        # Review P1: rotation used to return True with the stale code still
+        # published — the desktop would keep presenting a dead approval code.
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "AUTH_RECHECK_INTERVAL", "_reload_rotated_token",
+                  "_heartbeat_singleton", "_reenroll_claim",
+                  "_emit_gateway_status", "_log")}
+        try:
+            gw.TOKEN_FILE = "/tmp/token-file"
+            gw.AUTH_RECHECK_INTERVAL = 0
+            gw._heartbeat_singleton = lambda: True
+            gw._emit_gateway_status = lambda *a, **k: None
+            gw._log = lambda m: None
+            gw._reenroll_claim = lambda: _reset(attempted=True, code="beef1234",
+                                                claimed_at=1)
+            rotations = {"n": 0}
+
+            def rotate():
+                rotations["n"] += 1
+                return rotations["n"] >= 2   # in-loop rotation wins
+            gw._reload_rotated_token = rotate
+            self.assertTrue(gw._recover_auth(401))
+            self.assertIsNone(gw._reenroll_state["code"])
+            self.assertNotIn("recovered_at", gw._reenroll_state)
         finally:
             for n, v in saved.items():
                 setattr(gw, n, v)

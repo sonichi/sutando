@@ -698,16 +698,28 @@ def _reenroll_claim() -> None:
         _log(f"reenroll: claim failed: {e}")
 
 
+def _reenroll_clear(recovered: bool = False) -> None:
+    """End the claim episode. `recovered=True` (the approval-probe success
+    path ONLY) leaves an explicit terminal marker for the status file — the
+    desktop must never infer success from the pending block merely
+    disappearing (a restart clears in-memory state without proving anything)."""
+    was_pending = bool(_reenroll_state.get("code"))
+    _reenroll_state.update({"attempted": False, "code": None, "claimed_at": None})
+    if recovered and was_pending:
+        _reenroll_state["recovered_at"] = int(time.time())
+    else:
+        _reenroll_state.pop("recovered_at", None)
+
+
 def _auth_probe() -> bool:
     """Is the CURRENT token accepted again? (After an approved re-link the
-    gateway revalidates the SAME bearer — nothing rotates.) Only a definite
-    401/403 is a No; a network error is not evidence either way, so keep
-    waiting rather than declare recovery on a flaky link."""
+    gateway revalidates the SAME bearer — nothing rotates.) ONLY a successful
+    authenticated response is a Yes: a 5xx or network error proves nothing
+    about auth, and resuming into a failing gateway just re-enters the error
+    path — keep waiting instead (review P1)."""
     try:
         _req("GET", "/v1/agents", timeout=15)
         return True
-    except urllib.error.HTTPError as e:
-        return e.code not in (401, 403)
     except Exception:  # noqa: BLE001
         return False
 _heartbeat_disabled = False
@@ -1200,6 +1212,7 @@ def _recover_auth(code: int) -> bool:
     exit)."""
     if _reload_rotated_token():
         _log("auth rejected but token file already rotated — resuming with new token")
+        _reenroll_clear()
         return True
     _reenroll_claim()
     if not TOKEN_FILE and not _reenroll_state["code"]:
@@ -1221,11 +1234,12 @@ def _recover_auth(code: int) -> bool:
             sys.exit("FATAL: lost poller singleton while waiting for token rotation")
         if _reload_rotated_token():
             _log("rotated token detected — resuming")
+            _reenroll_clear()
             return True
         cycle += 1
         if pending and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
             _log("re-link approved — the existing token is accepted again; resuming")
-            _reenroll_state.update(attempted=False, code=None, claimed_at=None)
+            _reenroll_clear(recovered=True)
             return True
 
 
@@ -1385,7 +1399,10 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "schema_version": 1,
         }
         # Registry-loss recovery surface (the desktop reconnect popup's
-        # contract): present ONLY while a claim awaits owner approval. The
+        # contract). Pending while a claim awaits owner approval; an explicit
+        # recovered terminal ONLY on the approval-probe success path. A
+        # missing block means "no episode known", never success — a restart
+        # clears in-memory state without proving anything (review P1). The
         # code is not a credential — approval additionally requires the
         # owner's own Matrix session — it names WHICH claim gets approved.
         if _reenroll_state.get("code"):
@@ -1393,6 +1410,12 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
                 "pending": True,
                 "approval_code": _reenroll_state["code"],
                 "claimed_at": _reenroll_state["claimed_at"],
+            }
+        elif _reenroll_state.get("recovered_at"):
+            payload["reenroll"] = {
+                "pending": False,
+                "recovered": True,
+                "recovered_at": _reenroll_state["recovered_at"],
             }
         # AWP P0 per-channel health: the task connection is `connected` above; the
         # additive event channel (if running) reports its own status, so a
