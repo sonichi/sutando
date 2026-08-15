@@ -123,9 +123,8 @@ def core_session() -> str:
 
 
 def _observed_session(sock: str) -> str:
-    """The session this process is actually in. Inside tmux display-message is
-    authoritative; outside it the contract name is only a claim, checked against a
-    live pid then the socket's sessions, and returned unverified as a last resort."""
+    """Inside tmux display-message is authoritative; outside, the contract name is only
+    a claim — validated against a live pid and real sessions, else returned unverified."""
     if os.environ.get("TMUX"):
         r = _tmux(sock, "display-message", "-p", "#{session_name}")
         if r is not None and r.returncode == 0:
