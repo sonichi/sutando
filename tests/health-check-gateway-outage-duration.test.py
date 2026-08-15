@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """The gateway warn line must carry HOW LONG the outage has run.
-
-Without it the line is byte-identical at minute one and hour thirteen, so a
-reader cannot tell a blip from a standing outage — and an alert that reads the
-same when ignored as when new is one nobody can act on.
-
-Run: python3 tests/health-check-gateway-outage-duration.test.py
-"""
+Run: python3 tests/health-check-gateway-outage-duration.test.py"""
 from __future__ import annotations
 import importlib.util
 import json
@@ -71,22 +65,34 @@ class TestLastOkAge(unittest.TestCase):
             self.assertIsNone(HC._gateway_last_ok_age_h(bad, NOW))
 
 
+class _Pgrep:
+    """One running bridge, so the probe reaches the serving check."""
+    returncode = 0
+    stdout = "4242\n"
+
+
 class TestWarnDetail(unittest.TestCase):
     """The probe's own output, not just the helper."""
 
     def _detail(self, age_h):
-        with mock.patch.object(HC, "_gateway_serving", return_value=False), \
-             mock.patch.object(HC, "_gateway_last_ok_age_h", return_value=age_h), \
-             mock.patch.object(HC, "_gateway_configured", return_value=True, create=True):
+        # Process discovery is mocked too: without it a checkout with no bridge
+        # running returns "configured but NOT running" and never reaches this.
+        with mock.patch.object(HC, "_gateway_configured", return_value=True, create=True), \
+             mock.patch.object(HC, "subprocess") as sp, \
+             mock.patch.object(HC, "_gateway_lock_pids", return_value={}, create=True), \
+             mock.patch.object(HC, "_gateway_serving", return_value=False), \
+             mock.patch.object(HC, "_gateway_last_ok_age_h", return_value=age_h):
+            sp.run.return_value = _Pgrep()
             r = HC.check_gateway_bridge()
-        return r["detail"] if r else ""
+        self.assertIsNotNone(r, "probe returned None — the warn branch was never reached")
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("NOT serving", r["detail"],
+                      f"probe short-circuited before the serving branch: {r['detail']!r}")
+        return r["detail"]
 
     def test_two_different_outage_lengths_produce_DIFFERENT_lines(self):
-        # The control. This is the whole point: if these two match, the fix is
-        # inert no matter what the other assertions say.
+        # The control: if these two match, the fix is inert whatever else passes.
         short, long = self._detail(0.1), self._detail(13.5)
-        if not short or not long:
-            self.skipTest("probe short-circuited before the warn branch")
         self.assertNotEqual(short, long,
                             "a 6-minute and a 13-hour outage produced identical text")
         self.assertIn("0.1h", short)
@@ -94,8 +100,6 @@ class TestWarnDetail(unittest.TestCase):
 
     def test_an_unknown_start_says_so_rather_than_implying_freshness(self):
         d = self._detail(None)
-        if not d:
-            self.skipTest("probe short-circuited before the warn branch")
         self.assertIn("UNKNOWN", d)
         self.assertNotIn("0.0h", d)
 

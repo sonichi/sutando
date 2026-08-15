@@ -4927,9 +4927,8 @@ GATEWAY_STATUS_MAX_AGE_S = 180.0
 
 def _gateway_last_ok_age_h(path: "Path | None" = None,
                            now: "float | None" = None) -> "float | None":
-    """Hours since the bridge's last SUCCESSFUL poll, per the sidecar's
-    `last_ok_ts`. None when that field is absent or unusable — an outage of
-    unknown start is reported as unknown, never as a fresh one."""
+    """Hours since the sidecar's `last_ok_ts`; None when it is absent or
+    unusable, so an unknown start is never reported as a fresh one."""
     import time as _time
     p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
     now = _time.time() if now is None else now
