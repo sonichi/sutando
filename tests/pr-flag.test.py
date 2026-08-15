@@ -617,6 +617,7 @@ def main() -> int:
     _failed_fetch_is_never_an_empty_population()
     _each_stage_certifies_its_own_ceiling()
     _prior_read_fails_open_on_any_shape()
+    _no_change_gate_is_present_in_source()
     _uncertified_run_is_never_silent()
     _mergeable_carry_is_revision_scoped()
     print("  ok  #2643 peer-scope + mergeable-churn cases")
@@ -624,12 +625,21 @@ def main() -> int:
     return 0
 
 
-def _uncertified_run_is_never_silent():
-    """P1: a failed fetch whose survivors hash to the LAST HEALTHY state."""
+def _no_change_gate_is_present_in_source():
+    """Separate function ON PURPOSE: a source-text assert and a behavioural one
+    in the same body are a single assert -- whichever runs first, and the
+    source one is the weaker."""
     src = (REPO / "scripts" / "pr_flag.py").read_text()
     assert "if h == prev and certified and not args.force:" in src, \
         "the NO_CHANGE fast path must be gated on `certified`"
+    print("  ok  the NO_CHANGE gate is present in source")
 
+
+def _uncertified_run_is_never_silent():
+    """P1: a failed fetch whose survivors hash to the LAST HEALTHY state.
+
+    Carries NO source-text assert, so it can fail on its own.
+    """
     import io
     import json
     import contextlib
