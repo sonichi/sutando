@@ -14,6 +14,7 @@ import unittest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "session-handoff.sh"
 PRIOR = "PRIOR SNAPSHOT — must survive a failed run\n"
+MARKER = "<!-- session-handoff: capture complete -->"
 
 
 class Harness(unittest.TestCase):
@@ -109,6 +110,8 @@ class TestPublishBehaviour(Harness):
         self.assertNotEqual(body, PRIOR, "a successful publish must replace the previous snapshot")
         self.assertIn("## Recent Conversation", body,
                       "the published snapshot must be the real capture, not a stub")
+        self.assertTrue(body.rstrip().endswith(MARKER),
+                        "the terminal marker must be the last line of a published snapshot")
         self.assertEqual(self.stages(), [], "a successful publish must leave no staging file behind")
 
     def test_failed_rename_keeps_the_snapshot_and_reports_failure(self):
@@ -160,6 +163,56 @@ class TestPublishBehaviour(Harness):
 
         self.assertEqual(self.state.read_text(), PRIOR,
                          "an interrupted run must not touch the destination")
+
+    def test_kill_in_the_tail_window_does_not_publish(self):
+        # Pins the kill case in the window past the old gate. NOT the gate
+        # discriminator: a killed run never reaches the gate, so this is green
+        # under both. test_the_gate_is_the_last_line_not_a_section is the one
+        # that fails when the section gate comes back.
+        self.assert_isolated()
+        proc = subprocess.Popen(
+            ["bash", str(self.repo / "src" / "session-handoff.sh")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, cwd=str(self.repo),
+            env={**os.environ, "SUTANDO_REPO_DIR": str(self.repo)},
+        )
+        try:
+            deadline = time.monotonic() + 60
+            killed_in_window = False
+            while time.monotonic() < deadline:
+                stage = self.stages()
+                if stage:
+                    text = stage[0].read_text(errors="replace")
+                    if "## Recent Conversation" in text and MARKER not in text:
+                        proc.kill()
+                        killed_in_window = True
+                        break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(
+                killed_in_window,
+                "never observed a stage past the old gate and short of the marker "
+                "— the window this test exists for was not exercised")
+        finally:
+            proc.communicate(timeout=10)
+
+        self.assertEqual(
+            self.state.read_text(), PRIOR,
+            "a run killed in the tail window must not publish")
+
+    def test_the_gate_is_the_last_line_not_a_section(self):
+        # A section gate pins a token, not a position: any section added after
+        # it narrows the gate with nothing to catch the regression.
+        src = SCRIPT.read_text()
+        self.assertIn('tail -n 1 "$STATE_TMP"', src,
+                      "the publish gate must test the LAST line of the stage")
+        self.assertNotIn(
+            "grep -q '^## Recent Conversation' " + chr(34) + "$STATE_TMP" + chr(34), src,
+            "the section-token gate must not be the publish gate")
+        body = src.split('} > "$STATE_TMP"')[0]
+        self.assertLess(body.rfind("## Relay Notes"), body.rfind("CAPTURE_END_MARKER"),
+                        "the marker must be emitted after every section")
 
     def test_a_stage_is_used_not_the_destination(self):
         src = SCRIPT.read_text()

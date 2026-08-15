@@ -98,6 +98,8 @@ WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of thi
 STATE_FILE="$WORKSPACE_DIR/session-state.md"
 # Staged beside the destination so the publish is a same-filesystem rename.
 STATE_TMP="$(mktemp "${STATE_FILE}.tmp.XXXXXX" 2>/dev/null)" || STATE_TMP="${STATE_FILE}.tmp.$$"
+# Written last inside the capture block; the publish gate tests for it.
+CAPTURE_END_MARKER="<!-- session-handoff: capture complete -->"
 # A prior run killed before its rename leaves a stage behind; it is not state.
 find "$(dirname "$STATE_FILE")" -maxdepth 1 -name "$(basename "$STATE_FILE").tmp.*" \
      ! -name "$(basename "$STATE_TMP")" -mmin +60 -delete 2>/dev/null || true
@@ -345,10 +347,15 @@ print(f'5h: {d[\"utilization_5h\"]:.0%} (resets in {m5}min at {r5.strftime(\"%I:
     done <<< "$unprocessed_relay"
   fi
 
+  # Terminal sentinel: gating on a SECTION pins a token, not a position, so
+  # any section added after it silently narrows the gate. This is emitted last.
+  echo ""
+  echo "$CAPTURE_END_MARKER"
 } > "$STATE_TMP" 2>/dev/null
 
-# A complete-looking stage does not make the rename succeed; gate on both.
-if [ ! -s "$STATE_TMP" ] || ! grep -q '^## Recent Conversation' "$STATE_TMP" 2>/dev/null; then
+# A complete-looking stage does not make the rename succeed; gate on both. The
+# marker is the LAST line written, so a stage truncated anywhere fails here.
+if [ ! -s "$STATE_TMP" ] || [ "$(tail -n 1 "$STATE_TMP" 2>/dev/null)" != "$CAPTURE_END_MARKER" ]; then
   rm -f "$STATE_TMP" 2>/dev/null
   echo "session-handoff: capture incomplete — kept the previous $STATE_FILE" >&2
   exit 1
