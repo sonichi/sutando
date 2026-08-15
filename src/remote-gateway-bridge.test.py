@@ -1053,8 +1053,19 @@ def main() -> int:
     # _reload_rotated_token: no TOKEN_FILE configured → False (FATAL path kept)
     rtc.TOKEN_FILE = ""
     check(rtc._reload_rotated_token() is False, "no TOKEN_FILE → no rotation")
+    # FATAL survives ONLY where recovery is impossible: with reenroll enabled
+    # and a live token, _recover_auth now ENTERS the recheck loop instead
+    # (#2925) — so pin the False contract with the token gone / reenroll off.
+    _tok = rtc.TOKEN
+    rtc.TOKEN = ""
     check(rtc._recover_auth(401) is False,
-          "_recover_auth without TOKEN_FILE → False (caller keeps FATAL exit)")
+          "_recover_auth without TOKEN_FILE and no token → False (FATAL kept)")
+    rtc.TOKEN = _tok
+    _ree = rtc.REENROLL_ENABLED
+    rtc.REENROLL_ENABLED = False
+    check(rtc._recover_auth(401) is False,
+          "_recover_auth without TOKEN_FILE, reenroll off → False (FATAL kept)")
+    rtc.REENROLL_ENABLED = _ree
     # same secret as the running one → no rotation
     rtc.TOKEN_FILE = str(tok_file)
     tok_file.write_text(f"REMOTE_TASK_TOKEN={rtc.TOKEN}\n")
