@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
-"""A Discord-authored system message must not enter the task pipeline.
-
-Creating a thread posts a THREAD_CREATED notice in the parent channel whose
-`content` is the thread NAME and whose body is empty. The bridge logged the
-non-default type and kept going, so that notice became a task file whose whole
-body was a bare title. Observed 2026-08-15 as task-1786810290354.
-
-`Message.is_system()` is the library's own answer to "does this carry user
-content" — it deliberately keeps `thread_starter_message` and the slash-command
-types, which do. Enumerating types here instead would drift from that list.
-"""
+"""A Discord-authored system message must not reach ANY content consumer — the
+guard sits ahead of the mod observer, so a bare thread title is never judged."""
 from __future__ import annotations
 
 import asyncio
@@ -97,32 +88,50 @@ def _guild_message(system: bool, mtype=0, content="PR practice — runs, reflect
 
 
 def _run(msg):
-    """Drive on_message with the first post-guard call recorded."""
-    seen = []
-    orig = bridge._load_welcome_config
-    bridge._load_welcome_config = lambda gid: (seen.append(gid) or (None, None))
+    """Drive on_message, recording the mod observer and the first post-guard call.
+
+    Returns (observed, reached). `observed` is the moderation hook — the consumer
+    the guard used to sit BEHIND, which stores content/author/channel for later
+    judge and action dispatch.
+    """
+    observed, reached = [], []
+
+    async def _spy_observe(m):
+        observed.append(getattr(m, "id", None))
+
+    orig_obs, orig_wel = bridge._observe_for_mod, bridge._load_welcome_config
+    bridge._observe_for_mod = _spy_observe
+    bridge._load_welcome_config = lambda gid: (reached.append(gid) or (None, None))
     try:
         asyncio.run(bridge.on_message(msg))
     except Exception as exc:                      # a later gate may raise on a stub
-        seen.append(("raised", type(exc).__name__))
+        reached.append(("raised", type(exc).__name__))
     finally:
-        bridge._load_welcome_config = orig
-    return seen
+        bridge._observe_for_mod, bridge._load_welcome_config = orig_obs, orig_wel
+    return observed, reached
 
 
-# POSITIVE CONTROL FIRST. Without it, "nothing downstream ran" is satisfied by a
+# POSITIVE CONTROLS FIRST. Without them, "nothing downstream ran" is satisfied by a
 # harness that never reaches the guard at all.
-reached = _run(_guild_message(system=False))
+obs, reached = _run(_guild_message(system=False))
 check(bool(reached), "CONTROL: a non-system message reaches the code after the guard")
+check(bool(obs), "CONTROL: a non-system message DOES reach the moderation observer")
 
-blocked = _run(_guild_message(system=True))
+obs, blocked = _run(_guild_message(system=True))
 check(not blocked, "a system message stops at the guard")
+check(not obs, "a system message never reaches the moderation observer")
 
 # The real shape, against the library's own enum rather than a hand-written int.
 if HAVE_DISCORD:
     import discord as _real
-    real_notice = _guild_message(system=True, mtype=_real.MessageType.thread_created)
-    check(not _run(real_notice), "a real THREAD_CREATED notice stops at the guard")
+    obs, reached = _run(_guild_message(system=True, mtype=_real.MessageType.thread_created))
+    check(not reached, "a real THREAD_CREATED notice stops at the guard")
+    check(not obs, "a real THREAD_CREATED notice is never observed for moderation")
+
+    # thread_starter_message is the dangerous direction: it IS user content.
+    obs, reached = _run(_guild_message(system=False,
+                                       mtype=_real.MessageType.thread_starter_message))
+    check(bool(obs), "a thread_starter_message still reaches the moderation observer")
 
     # And the library must still treat the types that DO carry content as ours.
     check(not _real.Message.is_system(types.SimpleNamespace(

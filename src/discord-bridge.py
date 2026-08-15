@@ -2987,6 +2987,20 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [dm-checkpoint] self-message update failed: {e}", flush=True)
         return
+    # Discord authors these itself; a THREAD_CREATED notice carries the thread NAME
+    # as its content. Ahead of EVERY content consumer, the mod observer included —
+    # a bare thread title must not be judged or actioned. Checkpoint advances first
+    # for the same reason the self-message branch above advances it: the contract is
+    # "do not re-fetch", which is about having seen the message, not processing it.
+    if getattr(message, "is_system", None) and message.is_system():
+        if isinstance(message.channel, discord.DMChannel) and hasattr(message, "id"):
+            try:
+                _update_dm_checkpoint(message.channel.id, message.id)
+            except Exception as e:
+                print(f"  [dm-checkpoint] system-message update failed: {e}", flush=True)
+        print(f"  [skip] system message type={message.type}", flush=True)
+        return
+
     # Auto-mod LLM-judge observation hook (per-guild opt-in via access.json
     # `mod_active`). Pure observe — never blocks the rest of the function.
     # Action only fires from the periodic flush task, not at receive time.
@@ -3027,11 +3041,6 @@ async def _handle_discord_message(message, force=False):
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
         safe_snapshots = filter_chat_secrets(str(message.message_snapshots)).text  # pragma: no cover
         print(f"  [debug] message_snapshots: {safe_snapshots}", flush=True)  # pragma: no cover
-    # Discord authors these itself; a THREAD_CREATED notice carries the thread NAME
-    # as its content, which became a task whose body was a bare title.
-    if getattr(message, "is_system", None) and message.is_system():
-        print(f"  [skip] system message type={message.type}", flush=True)
-        return
 
     # DMs: bot messages always require explicit @-mention (no channel config path).
     if is_dm and message.author.bot and client.user not in message.mentions:
