@@ -390,11 +390,92 @@ class _RecoverLoop(unittest.TestCase):
                 setattr(gw, n, v)
             _reset()
 
-    def test_no_channels_keeps_historical_fatal_contract(self):
+
+    def test_identity_missing_with_token_loops_and_claims_when_identity_appears(self):
+        # Issue #2924 (Chi's-host cohort): token via bare env var, no channel
+        # env pointers -> the OLD contract fatal-crash-looped with the claim
+        # code present but unreachable. Now: enter the loop, retry identity
+        # each cycle, park once it appears — no restart needed.
         saved = {n: getattr(gw, n) for n in
-                 ("TOKEN_FILE", "_reload_rotated_token", "_reenroll_claim")}
+                 ("TOKEN_FILE", "TOKEN", "AUTH_RECHECK_INTERVAL", "REENROLL_ENABLED",
+                  "_reload_rotated_token", "_heartbeat_singleton", "_auth_probe",
+                  "_config_from_channel_env", "_emit_gateway_status", "_log",
+                  "REENROLL_PROBE_EVERY", "URL")}
+        env = {k: gw.os.environ.get(k) for k in ("AGENT_MXID", "AGENT_ID")}
         try:
             gw.TOKEN_FILE = ""
+            gw.TOKEN = "ab" * 24
+            gw.URL = "https://chat.example/relay"
+            gw.REENROLL_ENABLED = True
+            gw.AUTH_RECHECK_INTERVAL = 0
+            gw.REENROLL_PROBE_EVERY = 1
+            gw._reload_rotated_token = lambda: False
+            gw._heartbeat_singleton = lambda: True
+            gw._emit_gateway_status = lambda *a, **k: None
+            gw._log = lambda m: None
+            gw.os.environ.pop("AGENT_MXID", None)
+            gw.os.environ.pop("AGENT_ID", None)
+            reads = {"n": 0}   # operator writes the .env mid-episode
+
+            def cfg(k):
+                if k != "AG2SPACE_USER_ID":
+                    return ""
+                reads["n"] += 1
+                return "@late.agent:ag2.space" if reads["n"] >= 2 else ""
+            gw._config_from_channel_env = cfg
+            polls = {"n": 0}
+
+            def fake_urlopen(req, timeout=0):
+                resp = io.BytesIO(json.dumps(
+                    {"ok": True, "pending": True,
+                     "approval_code": "late1234"}).encode())
+                resp.__enter__ = lambda *a: resp
+                resp.__exit__ = lambda *a: False
+                return resp
+            real = gw.urllib.request.urlopen
+            gw.urllib.request.urlopen = fake_urlopen
+
+            gw._auth_probe = lambda: True
+            try:
+                self.assertTrue(gw._recover_auth(401))   # loops; never fatal
+            finally:
+                gw.urllib.request.urlopen = real
+            self.assertIn("recovered_at", gw._reenroll_state)
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+            for k, v in env.items():
+                if v is None:
+                    gw.os.environ.pop(k, None)
+                else:
+                    gw.os.environ[k] = v
+            _reset()
+
+    def test_fatal_contract_survives_only_where_recovery_impossible(self):
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "TOKEN", "REENROLL_ENABLED",
+                  "_reload_rotated_token", "_reenroll_claim")}
+        try:
+            gw.TOKEN_FILE = ""
+            gw._reload_rotated_token = lambda: False
+            gw._reenroll_claim = lambda: None
+            gw.REENROLL_ENABLED = False    # reenroll off -> fatal preserved
+            gw.TOKEN = "ab" * 24
+            self.assertFalse(gw._recover_auth(401))
+            gw.REENROLL_ENABLED = True     # no bearer at all -> fatal preserved
+            gw.TOKEN = ""
+            self.assertFalse(gw._recover_auth(401))
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+            _reset()
+
+    def test_no_channels_keeps_historical_fatal_contract(self):
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "TOKEN", "_reload_rotated_token", "_reenroll_claim")}
+        try:
+            gw.TOKEN_FILE = ""
+            gw.TOKEN = ""
             gw._reload_rotated_token = lambda: False
             gw._reenroll_claim = lambda: None   # nothing parked
             self.assertFalse(gw._recover_auth(401))

@@ -679,8 +679,13 @@ def _reenroll_claim() -> None:
         return
     agent_id = _reenroll_identity()
     if not agent_id or not TOKEN:
-        # No POST issued -> no cadence stamp; identity may appear later.
-        _log("reenroll: AGENT_MXID/AGENT_ID or token unavailable — not claiming")
+        # No POST issued -> no cadence stamp; retried every cycle, and the
+        # channel-env candidates are re-read from disk each time — so the
+        # operator's fix takes effect without a restart (issue #2924).
+        _log("reenroll: agent identity unknown — set AGENT_MXID=<agent mxid> "
+             "in the gateway env or the channel .env (AG2_DEVICE_ENV); "
+             "retrying on the recheck cadence" if not agent_id
+             else "reenroll: no token available — not claiming")
         return
     _reenroll_state["last_attempt_at"] = time.monotonic()
     try:
@@ -1221,11 +1226,15 @@ def _recover_auth(code: int) -> bool:
         _reenroll_clear()
         return True
     _reenroll_claim()
-    if not TOKEN_FILE and not _reenroll_state["code"]:
+    if not TOKEN_FILE and not _reenroll_state["code"] \
+            and not (REENROLL_ENABLED and TOKEN):
+        # Historical FATAL contract survives ONLY where recovery is truly
+        # impossible: reenroll off, or no bearer to claim with (#2924).
         return False
     _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation"
          + (f" in {TOKEN_FILE}" if TOKEN_FILE else "")
-         + (" or re-link approval" if _reenroll_state["code"] else "")
+         + (" or re-link approval" if _reenroll_state["code"]
+            else " or re-link identity/claim")
          + f" (re-check every {AUTH_RECHECK_INTERVAL}s)")
     cycle = 0
     while True:
