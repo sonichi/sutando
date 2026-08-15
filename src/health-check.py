@@ -3427,7 +3427,11 @@ def check_voice_watchers(voice_check: dict) -> dict:
     vs = voice_check.get("status")
     if vs != "ok":
         check["status"] = "warn"
-        check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
+        dep = (voice_check.get("detail") or "").strip()
+        # Carry the dependency's own detail: a bare status word reads identically
+        # at minute one and hour twelve, so it cannot signal urgency.
+        check["detail"] = (f"voice-agent {vs}" + (f" — {dep}" if dep else "")
+                           if vs else "voice-agent status unknown")
         return check
     log_file = _voice_log_path()
     if not log_file.exists():
@@ -3504,7 +3508,11 @@ def check_voice_transport(voice_check: dict) -> dict:
     vs = voice_check.get("status")
     if vs != "ok":
         check["status"] = "warn"
-        check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
+        dep = (voice_check.get("detail") or "").strip()
+        # Carry the dependency's own detail: a bare status word reads identically
+        # at minute one and hour twelve, so it cannot signal urgency.
+        check["detail"] = (f"voice-agent {vs}" + (f" — {dep}" if dep else "")
+                           if vs else "voice-agent status unknown")
         return check
     log_file = _voice_log_path()
     if not log_file.exists():
