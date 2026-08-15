@@ -354,6 +354,47 @@ class TestClaimExecutionContract(unittest.TestCase):
             self.assertEqual(before, after,
                              "a first sighting moved forward under an mtime refresh")
 
+    def test_rev_parse_raising_yields_no_store(self):
+        # subprocess itself blowing up (git missing) must not crash the probe.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(self.hc.subprocess, "run",
+                                   side_effect=OSError("no git")):
+                self.assertIsNone(self.hc._claim_observations_path(Path(td)))
+
+    def test_a_nonexistent_git_dir_yields_no_store(self):
+        with tempfile.TemporaryDirectory() as td:
+            ok = type("R", (), {"returncode": 0, "stdout": "definitely-not-here"})()
+            with mock.patch.object(self.hc.subprocess, "run", return_value=ok):
+                self.assertIsNone(self.hc._claim_observations_path(Path(td)))
+
+    def test_an_unwritable_store_degrades_to_untrusted(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._claim_in(ws, "task-1.txt", os.getpid(), "must-handle", 40.0, True)
+            with mock.patch.object(Path, "mkdir", side_effect=OSError("read-only")):
+                r = self.hc.check_task_claim_age(ws)
+            self.assertEqual(r["status"], "warn", r["detail"])
+            self.assertIn("unavailable", r["detail"])
+
+    def test_a_registry_holding_a_non_dict_is_ignored_not_fatal(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._claim_in(ws, "task-1.txt", os.getpid(), "must-handle", 40.0, True)
+            p = self.hc._claim_observations_path(ws)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('["a list, not a dict"]')
+            r = self.hc.check_task_claim_age(ws)
+            self.assertEqual(r["status"], "down", r["detail"])
+
+    def test_a_flock_failure_degrades_to_untrusted(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._claim_in(ws, "task-1.txt", os.getpid(), "must-handle", 40.0, True)
+            with mock.patch.object(self.hc.fcntl, "flock",
+                                   side_effect=OSError("locking unsupported")):
+                r = self.hc.check_task_claim_age(ws)
+            self.assertEqual(r["status"], "warn", r["detail"])
+
     def test_archive_before_claim_release_is_not_an_outage(self):
         # The reviewer's case: handler published, bridge archived the task,
         # and finish_handler_task has not processed HANDLER_DONE yet.
