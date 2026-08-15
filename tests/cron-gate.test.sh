@@ -16,7 +16,9 @@ mkdir -p "$TMPDIR/tasks"
 export SUTANDO_TEST_MODE=1
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
-ok()   { echo "  ok  $1"; }
+# Counted, not hardcoded: a literal total silently under-reports added cases.
+PASSED=0
+ok()   { PASSED=$((PASSED + 1)); echo "  ok  $1"; }
 
 # --- empty tasks/ → runs wrapped command --------------------------------------
 out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-empty echo 'ran' 2>&1)"
@@ -78,6 +80,42 @@ esac
 ok "genuine owner task still defers even when a task-cron-* file is present"
 rm -f "$TMPDIR/tasks/task-cron-sync-workspace-1785114482357.txt" "$TMPDIR/tasks/task-9876543210987.txt"
 
+# --- task-workstream-grouping-*.txt (classifier emission) does NOT count ------
+# Queued only while the core is idle and declares access_tier: owner, so the
+# tier filter cannot tell it from a human DM. Body is the real emitted shape.
+cat > "$TMPDIR/tasks/task-workstream-grouping-1786301397837.txt" <<'CLASSIFIER'
+id: task-workstream-grouping-1786301397837
+source: task-workstream-grouping
+access_tier: owner
+priority: low
+task: Internal maintenance only.
+CLASSIFIER
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-classifier-emit echo 'ran-despite-classifier' 2>&1)"
+[ "$out" = "ran-despite-classifier" ] || fail "task-workstream-grouping-*: expected 'ran-despite-classifier', got '$out'"
+ok "task-workstream-grouping-*.txt (classifier emission) does not trigger deferral"
+
+# legacy name is still recognised by the emitter, so exclude it too
+touch "$TMPDIR/tasks/task-project-grouping-1786301397838.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-legacy-emit echo 'ran-despite-legacy' 2>&1)"
+[ "$out" = "ran-despite-legacy" ] || fail "task-project-grouping-*: expected 'ran-despite-legacy', got '$out'"
+ok "legacy task-project-grouping-*.txt does not trigger deferral"
+
+# --- but a genuine owner task alongside a classifier task STILL defers --------
+touch "$TMPDIR/tasks/task-9876543210988.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-owner-plus-classifier echo 'should-not-run' 2>&1)"
+case "$out" in
+  *"deferring test-owner-plus-classifier"*) : ;;
+  *) fail "owner+classifier: expected deferral, got '$out'" ;;
+esac
+case "$out" in
+  *"should-not-run"*) fail "owner+classifier: wrapped command ran" ;;
+  *) : ;;
+esac
+ok "genuine owner task still defers alongside a classifier task"
+rm -f "$TMPDIR/tasks/task-workstream-grouping-1786301397837.txt" \
+      "$TMPDIR/tasks/task-project-grouping-1786301397838.txt" \
+      "$TMPDIR/tasks/task-9876543210988.txt"
+
 # --- usage error: no command → exit 2 -----------------------------------------
 set +e
 SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-usage >/dev/null 2>&1
@@ -106,13 +144,13 @@ out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-team ec
 [ "$out" = "ran-despite-team" ] || fail "team-tier task must NOT defer, got '$out'"
 ok "access_tier: team does not trigger deferral"
 
-for tier in other ambient; do
+for tier in other ambient guest; do
   rm -f "$TMPDIR/tasks/"task-*.txt
   printf 'id: t\naccess_tier: %s\n' "$tier" > "$TMPDIR/tasks/task-$tier-1.txt"
   out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-$tier echo "ran-$tier" 2>&1)"
   [ "$out" = "ran-$tier" ] || fail "access_tier: $tier must NOT defer, got '$out'"
 done
-ok "access_tier: other / ambient do not trigger deferral"
+ok "access_tier: other / ambient / guest do not trigger deferral"
 
 # --- but an OWNER task still defers, even beside non-owner ones ---------------
 printf 'id: t\naccess_tier: owner\ntask: real owner work\n' > "$TMPDIR/tasks/task-owner-1.txt"
@@ -121,7 +159,7 @@ case "$out" in
   *"deferring test-mixed"*) : ;;
   *) fail "owner task beside non-owner ones must still defer, got '$out'" ;;
 esac
-ok "an owner task still defers even alongside team/other/ambient tasks"
+ok "an owner task still defers even alongside team/other/ambient/guest tasks"
 
 # --- a task with NO access_tier line still defers (fails CLOSED) --------------
 # CLAUDE.md: tasks without an access_tier field get full owner processing, so an
@@ -136,4 +174,4 @@ esac
 ok "a task with no access_tier still defers — unknown tier fails closed"
 rm -f "$TMPDIR/tasks/"task-*.txt
 
-echo "OK — 13/13 cron-gate tests passed"
+echo "OK — $PASSED/$PASSED cron-gate tests passed"

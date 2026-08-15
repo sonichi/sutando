@@ -503,7 +503,12 @@ def get_schedules() -> list[dict]:
     out = []
     for job in jobs:
         expr = job.get("cron", "")
-        kind = f'skill:{job["prompt_skill"]}' if job.get("prompt_skill") else "prompt"
+        if job.get("shell_command"):
+            kind = "shell"
+        elif job.get("prompt_skill"):
+            kind = f'skill:{job["prompt_skill"]}'
+        else:
+            kind = "prompt"
         nxt = _cron_next_run(expr, now) if expr else None
         if nxt:
             mins = int((nxt - now).total_seconds() // 60)
@@ -518,6 +523,8 @@ def get_schedules() -> list[dict]:
             next_str = ">7d" if expr else "invalid"
         if job.get("description"):
             desc = job["description"]
+        elif job.get("shell_command"):
+            desc = f'Runs shell command: {job["shell_command"]}'
         elif job.get("prompt_skill"):
             desc = f'Runs the /{job["prompt_skill"]} skill'
         else:
@@ -712,6 +719,56 @@ def render_dashboard() -> str:
     return HTML.replace("__CONTENT__", "\n".join(cards))
 
 
+# ── Mutating-request gate ────────────────────────────────────────────────────
+
+# CORS hides a cross-origin response but does not stop the request, and a
+# safelisted text/plain POST reaches the handler with no preflight.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# A wildcard bind names no host, so the legitimate Host set cannot be derived
+# from it; DASHBOARD_ALLOWED_HOSTS supplies it explicitly for LAN mode.
+_WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
+
+
+def _authority_host(value: str) -> str:
+    """Hostname from a Host/Origin authority, minus port and IPv6 brackets."""
+    v = (value or "").strip().lower()
+    if v.startswith("["):
+        return v[1:].split("]", 1)[0]
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
+def _allowed_mutation_hosts(bind: str, declared: str) -> "set[str] | None":
+    """Host names a mutation may carry. None = wildcard bind with none declared."""
+    names = {h for h in (_authority_host(x) for x in (declared or "").split(",")) if h}
+    if (bind or "").strip().lower() in _WILDCARD_BINDS:
+        return (_LOOPBACK_HOSTS | names) if names else None
+    return _LOOPBACK_HOSTS | {bind.strip().lower()} | names
+
+
+def mutation_request_allowed(origin, host, content_type, *, expect_body,
+                             bind="127.0.0.1", allowed_hosts=""):
+    """Fail-closed gate for state-changing dashboard requests → (ok, reason)."""
+    permitted = _allowed_mutation_hosts(bind, allowed_hosts)
+    if permitted is None:
+        # Refusing loudly beats 403-ing every save with "host not allowed": on a
+        # wildcard bind the operator must name the hosts, or rebinding is free.
+        return False, ("wildcard DASHBOARD_BIND requires DASHBOARD_ALLOWED_HOSTS "
+                       "(comma-separated) before mutations are accepted")
+    if _authority_host(host) not in permitted:
+        # DNS rebinding: the attacker's name resolves to us, so only the Host
+        # header still carries it.
+        return False, "host not allowed"
+    if not origin:
+        return False, "missing Origin"
+    if urlparse(origin).netloc.strip().lower() != (host or "").strip().lower():
+        return False, "cross-origin request refused"
+    if expect_body and (content_type or "").split(";", 1)[0].strip().lower() != "application/json":
+        # Non-safelisted type: a cross-origin sender must preflight, which this
+        # server never grants.
+        return False, "Content-Type must be application/json"
+    return True, None
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     # Drop connections that go silent (e.g. browser speculative preconnects
     # that open TCP and never send a request line). Without this, readline()
@@ -747,11 +804,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(obj).encode())
 
+    def _gate(self, *, expect_body):  # pragma: no cover — reads request headers
+        """Refuse a state-changing request that fails mutation_request_allowed."""
+        ok, why = mutation_request_allowed(
+            self.headers.get("Origin"), self.headers.get("Host", ""),
+            self.headers.get("Content-Type"), expect_body=expect_body,
+            bind=os.environ.get("DASHBOARD_BIND", "127.0.0.1"),
+            allowed_hosts=os.environ.get("DASHBOARD_ALLOWED_HOSTS", ""))
+        if not ok:
+            # Drain first: replying and closing with the body still unread makes
+            # the peer see a connection reset instead of the 403.
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                self.rfile.read(n)
+            self._reply_json(403, {"error": why})
+        return ok
+
     def do_POST(self):  # pragma: no cover — thin HTTP glue over upsert_schedule()
-        """Upsert a cron job. Loopback-only (same bind as GET). Business logic
-        is the unit-tested pure upsert_schedule()."""
+        """Upsert a cron job. Business logic is the unit-tested pure
+        upsert_schedule(); the gate is mutation_request_allowed()."""
         if urlparse(self.path).path != "/api/schedules":
             self.send_response(404); self.end_headers(); return
+        if not self._gate(expect_body=True):
+            return
         code, obj = upsert_schedule(self._json_body())
         self._reply_json(code, obj)
 
@@ -881,7 +959,10 @@ load()
 
 
     def do_DELETE(self):
-        """Handle DELETE requests."""
+        """Handle DELETE requests. Every branch here mutates, so the whole
+        method is gated — /notes/ deletion was reachable the same way."""
+        if not self._gate(expect_body=False):
+            return
         path = urlparse(self.path).path
         if path.startswith("/notes/"):
             raw_slug = path.split("/notes/", 1)[1]
@@ -916,6 +997,10 @@ if __name__ == "__main__":
     # `DASHBOARD_BIND=0.0.0.0` to opt back into LAN exposure when you
     # know you want it. Same env-override shape as `AGENT_API_BIND` in
     # agent-api.py.
+    #
+    # A wildcard bind ALSO requires `DASHBOARD_ALLOWED_HOSTS` (comma-separated
+    # host[:port] the UI is reached by) or every mutation 403s: with 0.0.0.0
+    # there is no host to infer, so the DNS-rebinding gate cannot fail open.
     bind = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client held a connection without completing a request — every later
