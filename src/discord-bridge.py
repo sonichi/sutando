@@ -5766,9 +5766,8 @@ def _send_via_rest(channel_id: str, message: str):
 
 
 def _send_cli_body(argv: list) -> str:
-    """Body for `send`: from --body-file when given, else the joined argv.
-    A file keeps prose off the shell, where an apostrophe re-arms backticks and
-    truncates the message while the send still reports success."""
+    """Body for `send`: --body-file when given, else the joined argv. A file
+    keeps prose off the shell, where an apostrophe re-arms backticks."""
     if "--body-file" in argv:
         i = argv.index("--body-file")
         if i + 1 >= len(argv):
