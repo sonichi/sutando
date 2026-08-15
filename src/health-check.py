@@ -4403,7 +4403,8 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     # describes a proxy that is not the one holding :7846, in someone else's name.
     from_proc = _proxy_config_dir_from_process()
     if from_proc is not _PROXY_ENV_UNREADABLE:
-        return _quota_identity_verdict(name, core_cfg, from_proc, "process")
+        return _quota_identity_verdict(name, core_cfg, from_proc, "process",
+                                       plist_present=plist.is_file())
     if not plist.is_file():
         return {"name": name, "status": "ok",
                 "detail": ("credential proxy is not launchd-managed and its "
@@ -4461,11 +4462,13 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
                 "detail": (f"credential-proxy plist has CLAUDE_CONFIG_DIR as "
                            f"{type(proxy_cfg).__name__}, not a string — cannot resolve its keychain item")}
 
-    return _quota_identity_verdict(name, core_cfg, proxy_cfg, cfg_source)
+    return _quota_identity_verdict(name, core_cfg, proxy_cfg, cfg_source,
+                                   plist_present=True)
 
 
 def _quota_identity_verdict(name: str, core_cfg: Optional[str],
-                            proxy_cfg: Optional[str], source: str) -> dict:
+                            proxy_cfg: Optional[str], source: str,
+                            plist_present: bool = False) -> dict:
     """Compare the two resolved keychain ITEM NAMES and report.
 
     `source` names where the proxy's CLAUDE_CONFIG_DIR came from ("plist" or
@@ -4507,10 +4510,23 @@ def _quota_identity_verdict(name: str, core_cfg: Optional[str],
                 f"Fix: pin CLAUDE_CONFIG_DIR in "
                 f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
                 if source == "plist" else
-                f"this proxy is NOT launchd-managed — it inherited "
-                f"{'no CLAUDE_CONFIG_DIR' if not proxy_cfg else repr(proxy_cfg)} from whatever "
-                f"started it, so there is no plist to correct. Fix: restart the proxy with "
-                f"CLAUDE_CONFIG_DIR set to this core's ({core_cfg!r}). Restarting it changes "
+                # The process path is reached whenever the LISTENER's env is
+                # readable — which says nothing about who started it. Claiming
+                # "not launchd-managed" here asserts state never checked, and
+                # under KeepAlive a plain restart is silently undone.
+                f"this reading came from the running process, which inherited "
+                f"{'no CLAUDE_CONFIG_DIR' if not proxy_cfg else repr(proxy_cfg)}. "
+                + (
+                    f"A credential-proxy plist IS installed, so the proxy may be "
+                    f"launchd-managed: correct CLAUDE_CONFIG_DIR in "
+                    f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist and reload it "
+                    f"FIRST — under KeepAlive a bare restart is respawned with the plist's "
+                    f"environment and the fix does not stick. "
+                    if plist_present else
+                    f"No credential-proxy plist is installed, so there is none to correct. "
+                )
+                + f"Then restart the proxy with CLAUDE_CONFIG_DIR set to this core's "
+                f"({core_cfg!r}). Restarting it changes "
                 f"which account subsequent requests bill, so confirm that is the intended "
                 f"login first."
             )

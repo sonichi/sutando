@@ -470,7 +470,8 @@ class TestNonLaunchdProxyIdentity(unittest.TestCase):
         out = self._run(core, proxy, {_scoped(core), VANILLA})
         self.assertEqual(out["status"], "warn")
         self.assertNotIn("LaunchAgents", out["detail"])
-        self.assertIn("NOT launchd-managed", out["detail"])
+        self.assertIn("no credential-proxy plist is installed", out["detail"].lower())
+        self.assertNotIn("KeepAlive", out["detail"])
         self.assertIn("confirm that is the intended", out["detail"])
 
     def test_matching_process_config_dirs_stay_ok(self):
@@ -546,14 +547,20 @@ class TestStalePlistLosesToTheRunningProxy(unittest.TestCase):
         self.assertEqual(out["status"], "warn")
         self.assertIn(_scoped(core), out["detail"])
 
-    def test_remediation_addresses_the_process_not_the_plist(self):
-        """Editing the plist would not move the running proxy, so the advice
-        must not send anyone there even though the file exists."""
+    def test_remediation_does_not_claim_unmanaged_when_a_plist_exists(self):
+        """The process path is reached whenever the LISTENER's env is readable,
+        which says nothing about who started it. This asserted
+        "NOT launchd-managed" there — management state the code never checked —
+        and on a host where the job IS alive under KeepAlive the advice is
+        unfollowable: a bare restart is respawned with the plist's env.
+        """
         core = "/Users/x/ws/.claude-sutando"
         out = self._run(core, plist_cfg=core, proc_cfg="/Users/x/other/.claude-sutando",
                         existing_services={_scoped(core), VANILLA})
-        self.assertNotIn("LaunchAgents", out["detail"])
-        self.assertIn("NOT launchd-managed", out["detail"])
+        self.assertNotIn("NOT launchd-managed", out["detail"])
+        self.assertIn("plist IS installed", out["detail"])
+        self.assertIn("LaunchAgents", out["detail"])
+        self.assertIn("KeepAlive", out["detail"])
 
     def test_running_proxy_agreeing_is_ok_even_when_the_plist_diverges(self):
         """The converse, and the reason this is a precedence change and not an
