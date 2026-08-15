@@ -25,6 +25,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -123,6 +124,76 @@ class TestTaskClaimAge(unittest.TestCase):
         """A probe that exists but is never appended to `checks` cannot fail."""
         source = (REPO / "src" / "health-check.py").read_text()
         self.assertIn("checks.append(check_task_claim_age())", source)
+
+    # --- thresholds track the HANDLER's configured bound, not a constant -----
+    # Claims wrap session-worker.py, whose hard limit is SUTANDO_TIER_HARD_TIMEOUT
+    # (default 900s, explicitly configurable). A fixed threshold pages on live work
+    # the moment a deployment raises that timeout.
+
+    def test_raised_hard_timeout_does_not_page_on_an_in_flight_handler(self):
+        """The reviewer's control on #2906: hard timeout 7200s, a 1900s live claim.
+
+        Against a fixed 1800s warn this returned `warn` for a handler still well
+        inside its permitted run. It must stay `ok`."""
+        self._claim("task-live.txt", 1900)
+        with mock.patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "7200"}):
+            out = self.hc.check_task_claim_age(workspace_dir=self.ws)
+        self.assertEqual(out["status"], "ok")
+
+    def test_raised_hard_timeout_still_pages_past_its_own_multiple(self):
+        """Deriving from the bound must not disable the probe — 7200s bound still
+        warns past 2x and goes down past 8x."""
+        self._claim("task-stuck.txt", 7200 * 3)
+        with mock.patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "7200"}):
+            self.assertEqual(
+                self.hc.check_task_claim_age(workspace_dir=self.ws)["status"], "warn"
+            )
+
+    def test_lowered_hard_timeout_tightens_the_threshold(self):
+        """A 60s bound makes a 300s claim (5x) late — a fixed 1800s would miss it."""
+        self._claim("task-late.txt", 300)
+        with mock.patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "60"}):
+            self.assertEqual(
+                self.hc.check_task_claim_age(workspace_dir=self.ws)["status"], "warn"
+            )
+
+    def test_unusable_hard_timeout_falls_back_to_the_handler_default(self):
+        """session-worker rejects non-positive/unparseable values too, so the
+        handler is not running with them either — 900s is the honest assumption.
+        Never fail toward a threshold that pages on a permitted run."""
+        self._claim("task-x.txt", 1000)          # < 2*900 warn, > 2*60 if misparsed as small
+        for bad in ("", "abc", "0", "-5"):
+            with mock.patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": bad}):
+                self.assertEqual(
+                    self.hc.check_task_claim_age(workspace_dir=self.ws)["status"], "ok",
+                    f"unusable value {bad!r} must fall back to the 900s default",
+                )
+
+    def test_unreadable_claim_is_skipped_not_fatal(self):
+        """A claim released mid-scan makes stat() raise. The probe must skip that
+        entry and still judge the rest — a release racing the health check is
+        normal operation, not an error."""
+        self._claim("task-old.txt", 9 * 3600)
+        real_stat = Path.stat
+
+        def flaky(self_path, *a, **kw):
+            if self_path.name == "task-gone.txt":
+                raise OSError(2, "No such file or directory")
+            return real_stat(self_path, *a, **kw)
+
+        self._claim("task-gone.txt", 10)
+        with mock.patch.object(Path, "stat", flaky):
+            out = self.hc.check_task_claim_age(workspace_dir=self.ws)
+        self.assertEqual(out["status"], "down")
+        self.assertIn("1 held claim(s)", out["detail"])   # the vanished one is not counted
+
+    def test_all_claims_unreadable_reads_as_empty_not_broken(self):
+        """Every entry racing at once is indistinguishable from an empty dir, and
+        an empty dir is the honest report — the next run sees the truth."""
+        self._claim("task-gone.txt", 10)
+        with mock.patch.object(Path, "stat", lambda *a, **kw: (_ for _ in ()).throw(OSError())):
+            out = self.hc.check_task_claim_age(workspace_dir=self.ws)
+        self.assertEqual(out["status"], "ok")
 
 
 if __name__ == "__main__":

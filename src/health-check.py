@@ -5746,11 +5746,33 @@ def check_task_watcher() -> dict:
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 
-#: A task-handler claim covers ONE handler run. `codex-bounded.sh` caps a run at
-#: 240s, so a claim outliving these is held, not working. Generous on purpose:
-#: 30x the cap before warn, 120x before down.
-_TASK_CLAIM_WARN_S = 1800.0
-_TASK_CLAIM_DOWN_S = 7200.0
+#: A claim covers ONE handler run, so the thresholds must track the handler's OWN
+#: configured bound. `session-worker.py` reads `SUTANDO_TIER_HARD_TIMEOUT`
+#: (default 900s) and is explicitly configurable, so a deployment that raises it
+#: has legitimately longer in-flight claims. Anchoring on a constant instead
+#: pages on live work the moment the timeout is raised.
+_TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S = 900.0
+_TASK_CLAIM_WARN_MULTIPLE = 2
+_TASK_CLAIM_DOWN_MULTIPLE = 8
+
+
+def _task_claim_thresholds() -> tuple[float, float]:
+    """(warn, down) seconds, derived from the handler's configured hard timeout.
+
+    Falls back to the handler's own default on anything unparseable or
+    non-positive — `session-worker.py` rejects those too, so a bad value means
+    the handler is not running with it either and the default is the honest
+    assumption. Never returns a threshold that could page on a run still inside
+    its permitted bound.
+    """
+    raw = os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "")
+    try:
+        hard = float(raw)
+    except (TypeError, ValueError):
+        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+    if hard <= 0:
+        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+    return hard * _TASK_CLAIM_WARN_MULTIPLE, hard * _TASK_CLAIM_DOWN_MULTIPLE
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
@@ -5788,6 +5810,7 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         return {"name": name, "status": "ok",
                 "detail": "no claims directory — task-event handler never dispatched on this host"}
     now = time.time()
+    warn_s, down_s = _task_claim_thresholds()
     held = []
     for entry in base.glob("task-*.txt"):
         try:
@@ -5798,14 +5821,15 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no held task-handler claims"}
     held.sort(reverse=True)
     oldest_age, oldest_name = held[0]
-    detail = f"{len(held)} held claim(s), oldest {oldest_age / 3600:.1f}h ({oldest_name})"
-    if oldest_age > _TASK_CLAIM_DOWN_S:
+    detail = (f"{len(held)} held claim(s), oldest {oldest_age / 3600:.1f}h ({oldest_name}); "
+              f"handler bound {warn_s / _TASK_CLAIM_WARN_MULTIPLE / 60:.0f}m")
+    if oldest_age > down_s:
         return {"name": name, "status": "down",
                 "detail": f"{detail} — leaked; each will publish a user-visible "
                           "failure when the watcher next exits"}
-    if oldest_age > _TASK_CLAIM_WARN_S:
+    if oldest_age > warn_s:
         return {"name": name, "status": "warn",
-                "detail": f"{detail} — longer than any bounded handler run"}
+                "detail": f"{detail} — past {_TASK_CLAIM_WARN_MULTIPLE}x the handler's own bound"}
     return {"name": name, "status": "ok", "detail": detail}
 
 
