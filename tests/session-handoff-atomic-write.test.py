@@ -1,75 +1,155 @@
 #!/usr/bin/env python3
-"""Regression test: an interrupted handoff must not destroy the previous snapshot.
+"""An interrupted or unpublishable handoff must leave the previous snapshot
+byte-identical and must not report success.
 
-The capture block streams for as long as health-check takes. Redirected straight
-at session-state.md it truncates the destination at open, so any interruption
-leaves a stub -- and the file is untracked with no backups, so the prior good
-snapshot is gone with it. Observed 2026-08-15: a 105-byte session-state.md
-containing only a timestamp and `## System Status`, the next section being the
-health-check call.
+Runs the script against a synthetic checkout, so the assertions are about what
+the filesystem holds -- source-shape checks alone pass under `mv ... || true`.
 
 Run: python3 tests/session-handoff-atomic-write.test.py
-Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
+import os
 import pathlib
-import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "session-handoff.sh"
+PRIOR = "PRIOR SNAPSHOT — must survive a failed run\n"
 
 
-class TestAtomicHandoffWrite(unittest.TestCase):
+class Harness(unittest.TestCase):
+    """A synthetic checkout + workspace so the real script can be executed."""
+
     def setUp(self):
-        self.src = SCRIPT.read_text()
+        self._tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self._tmp.name)
+        self.repo = root / "repo"
+        self.ws = root / "ws"
+        (self.repo / "src").mkdir(parents=True)
+        (self.repo / "skills").mkdir()
+        (self.repo / ".git").mkdir()
+        (self.repo / "CLAUDE.md").write_text("# stub\n")
+        self.ws.mkdir()
+        for name in ("session-handoff.sh", "workspace_resolve.sh",
+                     "sutando_config.py", "workspace_default.py"):
+            src = REPO / "src" / name
+            if src.exists():
+                shutil.copy(src, self.repo / "src" / name)
+        # Workspace resolution shells out to scripts/sutando-config.sh -> that
+        # chain must be present or the run dies long before the publish step and
+        # every assertion below passes for the wrong reason.
+        (self.repo / "scripts").mkdir(exist_ok=True)
+        for name in ("sutando-config.sh", "python-binary.sh"):
+            src = REPO / "scripts" / name
+            if src.exists():
+                shutil.copy(src, self.repo / "scripts" / name)
+        # Resolve to our sandbox workspace rather than the real one.
+        (self.repo / "sutando.config.local.json").write_text(
+            '{"workspace": {"path": "%s"}}\n' % self.ws
+        )
+        self.state = self.ws / "session-state.md"
+        self.state.write_text(PRIOR)
 
-    def test_capture_block_does_not_redirect_at_the_destination(self):
-        """The defect in one line: `} > "$STATE_FILE"` truncates on open."""
-        self.assertIsNone(
-            re.search(r'^\}\s*>\s*"\$STATE_FILE"', self.src, re.M),
-            "capture block redirects straight at the destination — an interrupted "
-            "run truncates it and the previous snapshot is unrecoverable",
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    #: Every exit from the publish step emits exactly one of these.
+    PUBLISH_MARKERS = ("Session state saved", "publish failed", "capture incomplete")
+
+    def assert_reached_publish(self, result):
+        """Positive marker, never absence-of-known-failures: a negative list
+        cannot enumerate every early exit, and one slipped through."""
+        blob = (result.stdout or "") + (result.stderr or "")
+        self.assertTrue(
+            any(m in blob for m in self.PUBLISH_MARKERS),
+            "harness never reached the publish step (no publish marker in "
+            f"output) — this assertion would pass vacuously. Got: {blob[:300]!r}",
         )
 
-    def test_capture_block_writes_to_a_stage(self):
-        self.assertIsNotNone(
-            re.search(r'^\}\s*>\s*"\$STATE_TMP"', self.src, re.M),
-            "capture must stream into a stage, not the destination")
-        self.assertIn('STATE_TMP=', self.src, "STATE_TMP must be defined")
+    def run_handoff(self, env_extra=None, timeout=180):
+        env = dict(os.environ)
+        env["SUTANDO_REPO_DIR"] = str(self.repo)
+        env.pop("SUTANDO_TEAM_RUNTIME", None)
+        env.update(env_extra or {})
+        return subprocess.run(
+            ["bash", str(self.repo / "src" / "session-handoff.sh")],
+            capture_output=True, text=True, env=env, timeout=timeout,
+            stdin=subprocess.DEVNULL, cwd=str(self.repo),
+        )
 
-    def test_publish_is_a_rename_gated_on_completeness(self):
-        """A non-empty stage is not a complete one: the truncated file that
-        motivated this was non-empty. Gate on the LAST section being present."""
-        self.assertRegex(self.src, r'mv "\$STATE_TMP" "\$STATE_FILE"',
-                         "publish must be a rename")
-        self.assertIn("Recent Conversation", self.src.split('} > "$STATE_TMP"')[-1],
-                      "the gate must key on the final section, so a partial "
-                      "capture cannot publish")
 
-    def test_incomplete_capture_leaves_the_previous_file_and_fails_loudly(self):
-        tail = self.src.split('} > "$STATE_TMP"')[-1]
-        self.assertIn('rm -f "$STATE_TMP"', tail, "a rejected stage must be removed")
-        self.assertRegex(tail, r'exit 1',
-                         "an incomplete capture must exit non-zero, not report success")
+class TestPublishBehaviour(Harness):
+    def test_failed_rename_keeps_the_snapshot_and_reports_failure(self):
+        """A stub `mv` on PATH: a directory at the destination does not fail
+        the rename (mv moves the file inside it), and chflags did not either."""
+        bin_dir = pathlib.Path(self._tmp.name) / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "mv"
+        stub.write_text("#!/bin/sh\nexit 1\n")
+        stub.chmod(0o755)
+        r = self.run_handoff(env_extra={"PATH": f"{bin_dir}:{os.environ.get('PATH','')}"})
+        self.assert_reached_publish(r)
+        self.assertNotEqual(r.returncode, 0, "a failed publish must exit non-zero")
+        self.assertNotIn("Session state saved", r.stdout,
+                         "a failed publish must not print the success line")
+        self.assertEqual(self.state.read_text(), PRIOR,
+                         "the previous snapshot must be byte-identical")
+        self.assertNotIn("RELAY", r.stdout.upper().replace("RELAY NOTES", ""),
+                         "relay retirement must not run after a failed publish")
 
-    def test_stale_stages_are_swept(self):
-        """A run killed before its rename leaves a stage behind forever."""
-        self.assertRegex(self.src, r'-name "\$\(basename "\$STATE_FILE"\)\.tmp\.\*"',
-                         "stale stages from killed runs must be swept")
+    def test_interrupted_capture_leaves_the_previous_snapshot_intact(self):
+        """Kill the run mid-capture; the old snapshot must be byte-identical."""
+        env = {"PATH": os.environ.get("PATH", "")}
+        proc = subprocess.Popen(
+            ["bash", str(self.repo / "src" / "session-handoff.sh")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, cwd=str(self.repo),
+            env={**os.environ, "SUTANDO_REPO_DIR": str(self.repo), **env},
+        )
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        self.assertEqual(self.state.read_text(), PRIOR,
+                         "an interrupted run must not touch the destination")
+
+    def test_a_stage_is_used_not_the_destination(self):
+        """Whatever the run does, it must not write the destination in place."""
+        src = SCRIPT.read_text()
+        self.assertNotIn('} > "$STATE_FILE"', src,
+                         "capture must not redirect at the destination")
+        self.assertIn('} > "$STATE_TMP"', src)
+
+    def test_success_line_is_downstream_of_the_rename(self):
+        """The message must be unreachable unless mv returned 0."""
+        src = SCRIPT.read_text()
+        tail = src.split('} > "$STATE_TMP"')[-1]
+        mv_at = tail.find('mv "$STATE_TMP" "$STATE_FILE"')
+        ok_at = tail.find("Session state saved")
+        self.assertNotEqual(mv_at, -1, "publish must be a rename")
+        self.assertNotEqual(ok_at, -1)
+        self.assertLess(mv_at, ok_at,
+                        "the success line must come after the rename, not before")
+        self.assertRegex(tail[:ok_at], r'if\s+!\s+mv "\$STATE_TMP"',
+                         "the rename's exit status must gate the success line")
+
+    def test_relay_retirement_cannot_run_after_a_failed_publish(self):
+        """Both failure paths exit before the relay block is reached."""
+        src = SCRIPT.read_text()
+        tail = src.split('} > "$STATE_TMP"')[-1]
+        relay_at = tail.find("RELAY_PROCESSED")
+        self.assertNotEqual(relay_at, -1)
+        self.assertEqual(tail[:relay_at].count("exit 1"), 2,
+                         "both the incomplete-capture and failed-publish paths "
+                         "must exit before relay retirement")
 
     def test_script_is_syntactically_valid(self):
         r = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-
-    def test_relay_retirement_still_gated_on_the_destination(self):
-        """Relay notes retire only once the capture landed. That guard reads
-        $STATE_FILE, which under the fix is written only on success — so it must
-        not have been repointed at the stage."""
-        self.assertNotIn('[ -s "$STATE_TMP" ] && ', self.src.split("RELAY_PROCESSED")[0][-400:],
-                         "relay retirement must remain gated on the published file")
 
 
 if __name__ == "__main__":

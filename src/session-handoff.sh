@@ -347,18 +347,19 @@ print(f'5h: {d[\"utilization_5h\"]:.0%} (resets in {m5}min at {r5.strftime(\"%I:
 
 } > "$STATE_TMP" 2>/dev/null
 
-# Publish only a COMPLETE capture. The block above streams for as long as
-# health-check takes, so a redirect straight to $STATE_FILE truncates the
-# destination at open and leaves a stub if anything interrupts it -- and the
-# file is untracked with no backups, so the previous good snapshot is gone too.
-if [ -s "$STATE_TMP" ] && grep -q '^## Recent Conversation' "$STATE_TMP" 2>/dev/null; then
-  mv "$STATE_TMP" "$STATE_FILE"
-  echo "Session state saved to $STATE_FILE"
-else
+# A complete-looking stage does not make the rename succeed; gate on both.
+if [ ! -s "$STATE_TMP" ] || ! grep -q '^## Recent Conversation' "$STATE_TMP" 2>/dev/null; then
   rm -f "$STATE_TMP" 2>/dev/null
   echo "session-handoff: capture incomplete — kept the previous $STATE_FILE" >&2
   exit 1
 fi
+if ! mv "$STATE_TMP" "$STATE_FILE" 2>/dev/null; then
+  # Stage is KEPT: it is the only copy of a capture that did complete, and the
+  # destination still holds the last good snapshot.
+  echo "session-handoff: publish failed — $STATE_FILE unchanged, capture kept at $STATE_TMP" >&2
+  exit 1
+fi
+echo "Session state saved to $STATE_FILE"
 
 # Retire relay notes to processed/ only now that session-state.md has been
 # written. Confirm each note's content actually landed in $STATE_FILE (its
