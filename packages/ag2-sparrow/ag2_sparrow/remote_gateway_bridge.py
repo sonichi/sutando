@@ -654,12 +654,21 @@ def _provision_base() -> str:
 
 
 def _reenroll_identity() -> str:
-    """Agent mxid: process env first, then the channel .env file — the same
-    fallback the token uses (desktop launchers don't export either)."""
+    """Agent mxid: process env, then the workspace-contract canonical
+    state/auth/ag2space.json, then the channel .env keys. The canonical file
+    exists on hosts whose env carries nothing (recovery #1's only manual
+    step was copying from exactly that file — this closes the gap)."""
     for key in ("AGENT_MXID", "AGENT_ID"):
         v = (os.environ.get(key) or "").strip()
         if v:
             return v
+    try:
+        with open(_STATE / "auth" / "ag2space.json", encoding="utf-8") as fh:
+            v = str((json.load(fh) or {}).get("agent_id") or "").strip()
+        if v:
+            return v
+    except Exception:  # noqa: BLE001 — absent/malformed file: fall through
+        pass
     for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
         v = _config_from_channel_env(key).strip()
         if v:

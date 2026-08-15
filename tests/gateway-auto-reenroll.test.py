@@ -140,6 +140,35 @@ class _Claim(unittest.TestCase):
             gw.urllib.request.urlopen = real
 
 
+
+    def test_identity_resolves_from_canonical_state_auth_file(self):
+        # Recovery #1's only manual step was copying agent_id out of
+        # state/auth/ag2space.json by hand — the bridge now reads the
+        # canonical file itself (proposed by Yixuan's agent, field-verified).
+        import tempfile
+        gw.os.environ.pop("AGENT_MXID", None)
+        gw.os.environ.pop("AGENT_ID", None)
+        saved_cfg = gw._config_from_channel_env
+        gw._config_from_channel_env = lambda k: ""
+        saved_state = gw._STATE
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "auth").mkdir()
+        (tmp / "auth" / "ag2space.json").write_text(json.dumps(
+            {"agent_id": "@canon.agent:ag2.space", "schema_version": 1}))
+        gw._STATE = tmp
+        try:
+            self.assertEqual(gw._reenroll_identity(), "@canon.agent:ag2.space")
+            # env still wins over the file (operator override)
+            gw.os.environ["AGENT_MXID"] = "@env.agent:ag2.space"
+            self.assertEqual(gw._reenroll_identity(), "@env.agent:ag2.space")
+            gw.os.environ.pop("AGENT_MXID", None)
+            # malformed file falls through cleanly
+            (tmp / "auth" / "ag2space.json").write_text("not json")
+            self.assertEqual(gw._reenroll_identity(), "")
+        finally:
+            gw._STATE = saved_state
+            gw._config_from_channel_env = saved_cfg
+
     def test_identity_falls_back_to_the_channel_env_file(self):
         # G3 (live-confirmed on a real install): desktop launchers export
         # NEITHER AGENT_MXID nor AGENT_ID — the channel .env is the source.
