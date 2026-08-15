@@ -27,11 +27,13 @@ mkdir -p "$CFG/hooks"
 cp hooks/context-source-guard.py "$CFG/hooks/"
 # register under BOTH the Bash and Read PreToolUse matchers:
 CFG="$CFG" python3 - <<'PY'
-import json, os
+import json, os, shlex
 cfg = os.environ["CFG"]
 sp = os.path.join(cfg, "settings.json")
 s = json.load(open(sp)) if os.path.isfile(sp) else {}
-cmd = f"python3 {os.path.join(cfg, 'hooks', 'context-source-guard.py')}"
+# Quote: the stored command is re-parsed as a shell word list, and this
+# recipe's target dirs routinely contain a space (e.g. Application Support).
+cmd = f"python3 {shlex.quote(os.path.join(cfg, 'hooks', 'context-source-guard.py'))}"
 pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
 for m in ("Bash", "Read"):
     blk = next((b for b in pre if b.get("matcher") == m), None)
