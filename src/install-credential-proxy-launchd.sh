@@ -74,27 +74,23 @@ PLISTPY
 # Render the template to $1 with this checkout's values. ONE renderer, shared with
 # is-current, so the check can never compare fewer fields than the install writes.
 render_plist() {
-    local _node_xml _node_sed _ccd_xml _ccd_sed _ccd_resolved _brew
+    local _brew _ccd _py
     _brew="$(resolve_brew_bin)"
-    # SUTANDO_NODE is caller-controlled and lands inside plist XML via sed: XML-encode
-    # &<> then escape sed's \ & and the | delimiter so a hostile path cannot corrupt it.
-    _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
-        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
-    _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
     # The RESOLVED dir, not the raw var: an unset var must pin the default the install
     # validated, not an empty string.
-    _ccd_resolved="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path)"
-    _ccd_xml="$(printf '%s' "$_ccd_resolved" \
-        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
-    _ccd_sed="$(printf '%s' "$_ccd_xml" | sed -e 's/[\\&|]/\\&/g')"
-    sed \
-        -e "s|__REPO__|$REPO|g" \
-        -e "s|__WORKSPACE__|$WORKSPACE|g" \
-        -e "s|__BREW_BIN__|$_brew|g" \
-        -e "s|__SUTANDO_NODE__|${_node_sed}|g" \
-        -e "s|__CLAUDE_CONFIG_DIR__|${_ccd_sed}|g" \
-        -e "s|__HOME__|$HOME|g" \
-        "$TEMPLATE" > "$1"
+    _ccd="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
+    [ -n "$_ccd" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; return 1; }
+    # A bare python3 can be the Xcode-CLT stub, which passes an existence check
+    # and raises the install dialog.
+    . "$REPO/scripts/python-binary.sh"
+    _py="$(require_python "$REPO" "render the credential-proxy launchd plist")" || return 1
+    "$_py" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$1" \
+        "REPO=$REPO" \
+        "WORKSPACE=$WORKSPACE" \
+        "BREW_BIN=$_brew" \
+        "SUTANDO_NODE=${SUTANDO_NODE:-}" \
+        "CLAUDE_CONFIG_DIR=$_ccd" \
+        "HOME=$HOME"
 }
 
 # Semantic plist equality. plistlib, not PlistBuddy: the latter is macOS-only, so on
@@ -164,16 +160,18 @@ case "$cmd" in
             fi
         fi
         BREW_BIN="$(resolve_brew_bin)"
+        # Baked in because launchd inherits no shell env; an empty value would
+        # install a proxy that silently reads the vanilla keychain item.
+        CLAUDE_CFG="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
+        [ -n "$CLAUDE_CFG" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; exit 1; }
         echo "Installing $LABEL"
         echo "  repo:      $REPO"
         echo "  workspace: $WORKSPACE"
         echo "  brew bin:  $BREW_BIN"
+        echo "  config:    $CLAUDE_CFG"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
-        # SUTANDO_NODE is caller-controlled and lands inside plist XML via sed
-        # (external review on #2182): XML-encode &<> then escape sed's \ & and
-        # the | delimiter so hostile-looking paths can't corrupt the plist.
-        render_plist "$DEST"
+        render_plist "$DEST" || exit 1
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"

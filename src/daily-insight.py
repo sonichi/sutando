@@ -472,7 +472,42 @@ def _landed_subset_count(repo_root, shas):
     if out.returncode != 0:
         return None
     unlanded = {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
+    if unlanded and _rewrites_shas_on_merge(repo_root, ref) is not False:
+        # Under SHA-rewriting merges "unreachable" and "merged" are one observation.
+        # None is the same not-knowing, so only an explicit False licenses a count.
+        return None
     return sum(1 for s in shas if s not in unlanded)
+
+
+def _rewrites_shas_on_merge(repo_root, ref, sample=200, floor=20):
+    """Tristate: True rewrites SHAs, False does not, None is not enough evidence.
+    `sample` bounds the walk; below `floor` commits the history cannot settle it."""
+    def count(*extra):
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-list", "--count", *extra,
+                 f"-{sample}", ref],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        try:
+            return int(out.stdout.strip())
+        except ValueError:
+            return None
+    total = count()
+    if total is None:
+        return None
+    # Too little history to be evidence of anything: a shallow clone of a
+    # squash-only repo looks identical to a young merge-commit repo here.
+    if total < floor:
+        return None
+    merges = count("--merges")
+    if merges is None:
+        return None
+    return merges == 0
 def dev_activity_insight(dev):
     """Render the dev-activity dict into one headline sentence, or None."""
     if not dev or dev.get("commits_24h", 0) <= 0:

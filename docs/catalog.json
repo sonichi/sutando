@@ -61,7 +61,7 @@
       ],
       "status": "canonical",
       "canonical_for": "built-in capability catalog",
-      "last_verified": "2026-07-29"
+      "last_verified": "2026-08-13"
     },
     "docs/codex-core.md": {
       "title": "Codex CLI as the Sutando core",
@@ -231,7 +231,7 @@
       ],
       "status": "canonical",
       "canonical_for": "workspace operational contract",
-      "last_verified": null
+      "last_verified": "2026-08-11"
     },
     "docs/workspace-design.md": {
       "title": "Workspace design",

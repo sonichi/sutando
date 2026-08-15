@@ -643,24 +643,7 @@ if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
   bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
-# Reap any stale watch-tasks-stream watcher from a prior session. The
-# in-session Stop hook (.claude/settings.json) handles clean shutdown, but
-# a hard crash (SIGKILL, panic, force-quit, power loss) skips it and leaves
-# an orphan fswatch process + stale PID file. On a fresh startup we kill
-# the orphan (if the PID still names a live `watch-tasks-stream` process)
-# and remove the PID file so the new session's watcher writes a fresh one.
-# Skipping kills when the PID has been recycled by an unrelated process is
-# important — `kill $PID` without the cmdline check would target whatever
-# new program happens to hold the recycled PID.
-WATCHER_PID_FILE="$WORKSPACE/state/watch-tasks-stream.pid"
-if [ -f "$WATCHER_PID_FILE" ]; then
-  STALE_PID="$(cat "$WATCHER_PID_FILE" 2>/dev/null || true)"
-  if [ -n "$STALE_PID" ] && ps -p "$STALE_PID" -o args= 2>/dev/null | grep -q "watch-tasks-stream"; then
-    kill "$STALE_PID" 2>/dev/null || true
-    echo "  ✓ reaped stale watch-tasks-stream watcher (pid $STALE_PID)"
-  fi
-  rm -f "$WATCHER_PID_FILE"
-fi
+reap_stale_task_watcher "$WORKSPACE/state/watch-tasks-stream.pid"
 
 # Post-M0: repo-root tasks/results/data are NOT created. Pre-M0 this block
 # ran `mkdir -p tasks results data` as back-compat for unmigrated scripts —
@@ -1125,7 +1108,11 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
       # REMOTE_TASK_CHANNEL_DIR_<INST>.
       _gw_chdir_var="REMOTE_TASK_CHANNEL_DIR_${_gw_var#AG2_REMOTE_TOKEN_}"
       _gw_chdir="${!_gw_chdir_var:-${_gw_inst}-ag2space}"
+      _gw_token_file_var="REMOTE_TASK_TOKEN_FILE_${_gw_var#AG2_REMOTE_TOKEN_}"
+      _gw_token_file="${!_gw_token_file_var:-$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels "$_gw_chdir" .env)}"
+      [ -f "$_gw_token_file" ] || _gw_token_file=""
       SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+        REMOTE_TASK_URL= REMOTE_TASK_TOKEN_FILE="$_gw_token_file" \
         REMOTE_TASK_CHANNEL_DIR="$_gw_chdir" \
         REMOTE_PROACTIVE_ROOM= \
         "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
