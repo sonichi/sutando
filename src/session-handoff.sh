@@ -96,6 +96,11 @@ WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of thi
 # workspace copy permanently stale and re-tripped the legacy-state detector
 # after every compaction (sutando-migrate classifies it newest-mtime).
 STATE_FILE="$WORKSPACE_DIR/session-state.md"
+# Staged beside the destination so the publish is a same-filesystem rename.
+STATE_TMP="$(mktemp "${STATE_FILE}.tmp.XXXXXX" 2>/dev/null)" || STATE_TMP="${STATE_FILE}.tmp.$$"
+# A prior run killed before its rename leaves a stage behind; it is not state.
+find "$(dirname "$STATE_FILE")" -maxdepth 1 -name "$(basename "$STATE_FILE").tmp.*" \
+     ! -name "$(basename "$STATE_TMP")" -mmin +60 -delete 2>/dev/null || true
 
 # JSON-escape one value. host/transcript/trigger are external input, and any
 # raw control char or quote makes the whole line unparseable to every reader.
@@ -340,9 +345,20 @@ print(f'5h: {d[\"utilization_5h\"]:.0%} (resets in {m5}min at {r5.strftime(\"%I:
     done <<< "$unprocessed_relay"
   fi
 
-} > "$STATE_FILE" 2>/dev/null
+} > "$STATE_TMP" 2>/dev/null
 
-echo "Session state saved to $STATE_FILE"
+# Publish only a COMPLETE capture. The block above streams for as long as
+# health-check takes, so a redirect straight to $STATE_FILE truncates the
+# destination at open and leaves a stub if anything interrupts it -- and the
+# file is untracked with no backups, so the previous good snapshot is gone too.
+if [ -s "$STATE_TMP" ] && grep -q '^## Recent Conversation' "$STATE_TMP" 2>/dev/null; then
+  mv "$STATE_TMP" "$STATE_FILE"
+  echo "Session state saved to $STATE_FILE"
+else
+  rm -f "$STATE_TMP" 2>/dev/null
+  echo "session-handoff: capture incomplete — kept the previous $STATE_FILE" >&2
+  exit 1
+fi
 
 # Retire relay notes to processed/ only now that session-state.md has been
 # written. Confirm each note's content actually landed in $STATE_FILE (its
