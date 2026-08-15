@@ -145,9 +145,8 @@ class TestHeartbeatWrite(unittest.TestCase):
             os.environ.pop("SUTANDO_TMUX_SESSION", None)
 
     def test_write_beat_records_the_live_session_not_a_lying_env(self):
-        """The CR case: startup.sh run from OUTSIDE tmux, so $TMUX is unset, plus a
-        lying SUTANDO_TMUX_SESSION. `&` inherits the env, so this is the
-        outside-a-pane launch, not every launch."""
+        """With $TMUX unset and SUTANDO_TMUX_SESSION naming a session that does not
+        exist, the beat records the live session on the socket, not the env's claim."""
         import core_heartbeat
         import json as _json
         import subprocess as _sp
