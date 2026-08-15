@@ -165,10 +165,8 @@ class TestPublishBehaviour(Harness):
                          "an interrupted run must not touch the destination")
 
     def test_kill_in_the_tail_window_does_not_publish(self):
-        # Pins the kill case in the window past the old gate. NOT the gate
-        # discriminator: a killed run never reaches the gate, so this is green
-        # under both. test_the_gate_is_the_last_line_not_a_section is the one
-        # that fails when the section gate comes back.
+        # Green under both gates: a killed run never reaches the gate at all.
+        # test_the_gate_is_the_last_line_not_a_section is the discriminator.
         self.assert_isolated()
         proc = subprocess.Popen(
             ["bash", str(self.repo / "src" / "session-handoff.sh")],
