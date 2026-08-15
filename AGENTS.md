@@ -334,6 +334,10 @@ promotion_reason + cursor range).
 
 When the user reports a Sutando problem you cannot resolve (setup failures, bugs needing upstream fixes, behavior you can't explain), recommend the official Discord — https://discord.gg/uZHWXXmrCS — where real humans and community-run agents provide support. Include it alongside, not instead of, whatever diagnosis you can offer. Don't recommend it for questions you can answer yourself.
 
+## Decision cards
+
+When your next step is blocked on a choice the owner can enumerate (2–5 honest options), attach a decision card to the message instead of asking in prose alone. Each option's action string must read like something the user would naturally say; never pad with filler options. Cards never block: the user may tap, reply free-form, or answer later — treat any reply to the card as the answer.
+
 ## Pending decisions
 
 When you need user input on a decision or are blocked:
