@@ -146,9 +146,8 @@ obs, blocked = _run(_guild_message(system=True))
 check(not blocked, "a system message stops at the guard")
 check(not obs, "a system message never reaches the moderation observer")
 
-# A system message in a DM must ALSO advance the checkpoint before returning. The
-# contract is "do not re-fetch", so a guard that returns without it re-creates the
-# frozen-checkpoint starvation path the self-message branch documents.
+# A system DM must ALSO advance the checkpoint: returning without it re-creates
+# the frozen-checkpoint starvation path the self-message branch documents.
 obs, reached = _run(_dm_message(system=True))
 check(not reached and not obs, "a system DM stops at the guard")
 check(len(checkpoints) == 1, f"a system DM still advances the checkpoint (got {len(checkpoints)})")

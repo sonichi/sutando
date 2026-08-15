@@ -2987,12 +2987,11 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [dm-checkpoint] self-message update failed: {e}", flush=True)
         return
-    # Discord authors these itself; a THREAD_CREATED notice carries the thread NAME
-    # as its content. Ahead of EVERY content consumer, the mod observer included —
-    # a bare thread title must not be judged or actioned. Checkpoint advances first
-    # for the same reason the self-message branch above advances it: the contract is
-    # "do not re-fetch", which is about having seen the message, not processing it.
+    # Ahead of EVERY content consumer, the mod observer included: a THREAD_CREATED
+    # notice carries the thread NAME as content and must not be judged or actioned.
     if getattr(message, "is_system", None) and message.is_system():
+        # Checkpoint first for the self-message branch's reason: "do not re-fetch"
+        # is about having SEEN the message, not about processing it.
         if isinstance(message.channel, discord.DMChannel) and hasattr(message, "id"):
             try:
                 _update_dm_checkpoint(message.channel.id, message.id)
