@@ -133,6 +133,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from orphan_result_routes import orphan_result_routes  # noqa: E402
 
 
@@ -487,21 +488,30 @@ def archive_path(kind: str, task_id: str) -> "Path":
     return month_dir / f"{task_id}.txt"
 
 
-def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into the archive. Silent on failure — archive is for later
-    analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving"."""
-    try:
-        if src.exists():
-            import shutil
-            shutil.move(str(src), str(archive_path(kind, task_id)))
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        # Fall back to unlink so we don't leave stale files.
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+def archive_file(src: "Path", kind: str, task_id: str) -> bool:
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy in task_archive."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(m, flush=True))
+
+
+def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
+    """Archive a delivered task's result + task file, then retire its sentinel.
+
+    One owner for a policy both delivery paths need: the sentinel may only be
+    cleared once the result has actually left the live queue, because a
+    surviving result re-enters the poll loop and the sentinel is the only thing
+    standing between it and a second send.
+    """
+    gone = archive_file(result_file, "results", task_id)
+    # find_task_file, not a reconstructed bare name: a claimed task is
+    # `<id>.claimed-core-N.txt` and would strand forever.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+    if gone:
+        _clear_delivered(task_id)
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
@@ -2545,6 +2555,10 @@ _poll_loops_started = False
 # failing loop can't spin, short enough that delivery resumes on its own.
 POLL_LOOP_RESTART_SEC = 5
 
+# Returned by a poll loop that declined to run because its feature is off.
+# Not a failure, so the supervisor must stop rather than restart it forever.
+LOOP_DISABLED = object()
+
 
 async def _supervise_loop(coro_fn, name):
     """Keep a poll loop alive across crashes.
@@ -2564,7 +2578,10 @@ async def _supervise_loop(coro_fn, name):
     """
     while True:
         try:
-            await coro_fn()
+            if await coro_fn() is LOOP_DISABLED:
+                # Opted out on purpose (feature flag off) — supervising it would
+                # re-enter and re-return every POLL_LOOP_RESTART_SEC forever.
+                return
             # A poll loop returning is itself unexpected (they never exit).
             print(f"  [{name}] loop returned unexpectedly — restarting in {POLL_LOOP_RESTART_SEC}s", flush=True)
         except asyncio.CancelledError:
@@ -4734,10 +4751,7 @@ async def poll_results():
                 # archive_file() finishing. See DELIVERED_DIR docstring.
                 if _is_delivered(task_id):
                     print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
-                    archive_file(result_file, "results", task_id)
-                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
-                    _clear_delivered(task_id)
+                    _archive_delivered_pair(result_file, task_id)
                     continue
 
                 try:
@@ -4941,15 +4955,7 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
-                archive_file(result_file, "results", task_id)
-                # find_task_file, not a reconstructed bare name: a claimed
-                # task is `<id>.claimed-core-N.txt` and would strand forever.
-                task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                archive_file(task_file, "tasks", task_id)
-                # Delivery succeeded + archived — sentinel has served
-                # its purpose, remove to bound `discord-delivered/`
-                # directory growth.
-                _clear_delivered(task_id)
+                _archive_delivered_pair(result_file, task_id)
             else:
                 # CONSECUTIVE means consecutive: an absent file breaks the run, or a
                 # writer that retries accumulates counts across separate appearances.
@@ -5009,7 +5015,7 @@ async def poll_progress():
     must never break the loop or leak an exception into the gateway.
     """
     if not progress_stream.stream_enabled():
-        return  # feature off → never loops; zero overhead, zero risk
+        return LOOP_DISABLED  # feature off → never loops; zero overhead, zero risk
     while True:
         try:
             now = time.time()
