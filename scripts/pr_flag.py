@@ -202,6 +202,30 @@ def raw_state(prs: list, owner_login: str, stand: str = None) -> list:
     return out
 
 
+def carry_unknown_mergeable(state: list, previous: dict) -> list:
+    """Replace UNKNOWN mergeable with the last value seen for that PR.
+
+    GitHub's lazy recomputation parks the field at UNKNOWN; carrying the previous
+    value keeps that churn out of the hash while leaving a real
+    CONFLICTING/MERGEABLE transition fully visible.
+    """
+    out = []
+    for s in state:
+        row = dict(s)
+        if row.get("mergeable") == "UNKNOWN":
+            prior = (previous or {}).get(str(row.get("number")))
+            if prior:
+                row["mergeable"] = prior
+        out.append(row)
+    return out
+
+
+def mergeable_map(state: list) -> dict:
+    """Per-PR mergeable, for the next run to carry forward."""
+    return {str(s.get("number")): s.get("mergeable") for s in state
+            if s.get("mergeable") and s.get("mergeable") != "UNKNOWN"}
+
+
 def state_hash(state: list) -> str:
     """Stable hash of the objective set. Changes when a PR appears/disappears or
     any actionable field (base/head/ci/review/approvals/
@@ -213,20 +237,14 @@ def state_hash(state: list) -> str:
     this it did not refire and the agent was never woken for a PR that had just
     become mergeable.
 
-    `mergeable` is DELIBERATELY EXCLUDED. GitHub computes it lazily and parks it
-    at `UNKNOWN` while recomputing, so it churns without any PR changing. Measured
-    2026-08-14 19:21Z: all 13 rows flipped to UNKNOWN simultaneously, the hash
-    moved, and the cron emitted a digest whose composition was identical to the
-    previous fire — waking the owner for GitHub's cache, not for his repo. Twelve
-    PRs do not change state in the same second; that signature IS the tell.
-
-    Dropping it loses nothing a digest acts on: a real merge-state change is
-    already carried by `head` (a push), `base` (a retarget), `ci`, `review`, or
-    the approval fields. `mergeable` stays in the emitted payload for the agent
-    to read — it is only untrustworthy as a CHANGE signal.
+    `mergeable` is included but must be normalized by `carry_unknown_mergeable`
+    first: GitHub parks it at UNKNOWN while recomputing, and that churn is not a
+    state change. A real CONFLICTING/MERGEABLE flip has no other carrier -- the
+    target branch can advance with head, base name, ci, reviews and approvals all
+    unchanged -- so excluding the field entirely would drop actionable news.
     """
     key = [[s["number"], s["principal"], s["base"], s["head"], s["ci"],
-            s["review"], s["approvals"], s["approvals_standing"]]
+            s["mergeable"], s["review"], s["approvals"], s["approvals_standing"]]
            for s in state]
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -239,18 +257,8 @@ def fetch_argv(repo: str, owner_login: str) -> list:
     the thing it is describing plus a chance to be wrong: widen the fetch, forget
     the string, and the payload now asserts a filter the code no longer applies.
     """
-    # This is STAGE 2 of a two-stage fetch (#2643). It stays `--author`-scoped on
-    # purpose: the heavy fields below cannot be fetched repo-wide. Measured
-    # 2026-08-14 on sonichi/sutando, 70 open non-draft PRs:
-    #
-    #   --author sonichi + statusCheckRollup + reviews  ->  16 rows, 3.6s, rc=0
-    #   same fields, --author dropped                   ->  HTTP 504 after 11.2s
-    #
-    # GitHub times out computing those fields across the full open set, so simply
-    # removing the flag does not widen the digest -- it EMPTIES it, and a fetch
-    # that fails every fire is worse than one that under-answers because the
-    # failure is silent at the consumer. `peer_candidates()` + `_fetch_peer_pr()`
-    # cover the rest of the population; `scope_descriptor()` reads both.
+    # Stage 2 of two. Stays --author-scoped because these heavy fields 504 when
+    # requested repo-wide; discovery_argv covers the rest of the population.
     return [
         "gh", "pr", "list", "--repo", repo, "--state", "open",
         "--author", owner_login, "--limit", "1000",
@@ -259,13 +267,8 @@ def fetch_argv(repo: str, owner_login: str) -> list:
 
 
 def discovery_argv(repo: str) -> list:
-    """STAGE 1: every open PR, light fields only, NO author filter.
-
-    Cheap enough to run repo-wide because it omits `statusCheckRollup` and
-    `reviews` -- the two fields that 504 at that scale. Measured: 78 rows, 20 KB,
-    1.44s. Its job is only to reveal which PRs exist and who owns them, so the
-    expensive stage can be pointed at the ones that matter.
-    """
+    """Stage 1: every open PR, light fields only, no author filter.
+    Omits statusCheckRollup and reviews -- the two fields that 504 repo-wide."""
     return [
         "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
         "--json", "number,author,isDraft,mergeable,reviewDecision,baseRefName,headRefOid",
@@ -273,20 +276,11 @@ def discovery_argv(repo: str) -> list:
 
 
 def peer_candidates(discovered: list, owner_login: str) -> list:
-    """Peer PRs where the owner's review could still matter — the category the
-    cron prompt names and the `--author` fetch structurally cannot contain.
+    """Peer PRs whose merge the owner could still unblock -- stage 2's input.
 
-    Prunes two ways, and both are about not paying for the expensive stage:
-
-    - drafts: never actionable.
-    - peer PRs already carrying CHANGES_REQUESTED: the author has to clear the
-      review before anyone's approval can matter, so it is their problem, not the
-      owner's. Measured 2026-08-14: this drops 43 of 70, leaving 27 heavy calls.
-
-    Deliberately does NOT prune on `reviewDecision == APPROVED`. An approved peer
-    PR is precisely the one whose merge may be one owner action away, and an
-    APPROVED-based filter is the exact scope that once reported 32 owner-needing
-    PRs as 1.
+    Prunes drafts and peers already carrying CHANGES_REQUESTED (their author must
+    clear the review first). Never prunes on APPROVED: that is the case an owner
+    action most often unblocks.
     """
     out = []
     for pr in discovered:
@@ -294,7 +288,7 @@ def peer_candidates(discovered: list, owner_login: str) -> list:
             continue
         author = ((pr.get("author") or {}).get("login") or "")
         if author == owner_login:
-            continue                       # stage 2's own fetch already has these
+            continue                       # fetch_argv already covers these
         if pr.get("reviewDecision") == "CHANGES_REQUESTED":
             continue
         out.append(pr["number"])
@@ -339,18 +333,27 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
     except (TypeError, ValueError):
         limit = None
 
+    # A peer stage that could not run is NOT a widened population. Treat it as
+    # owner-only so the payload never claims coverage it does not have.
+    peer_ok = bool(peer_stage) and peer_stage.get("discovery_ok", True)
     excludes = ["draft PRs (dropped by raw_state, always)"]
-    if author and not peer_stage:
+    if peer_stage and not peer_ok:
+        excludes.append(
+            "peer PRs -- the stage-1 discovery fetch FAILED, so the peer half is "
+            "UNKNOWN this fire, not empty"
+        )
+    if peer_stage and not peer_stage.get("owner_ok", True):
+        excludes.append(
+            "the owner-authored fetch FAILED -- owner rows are UNKNOWN, not absent"
+        )
+    if author and not peer_ok:
         excludes.append(
             f"PRs not authored by {author!r} -- including peer PRs where the "
             "owner's approval is the only thing blocking a merge"
         )
-    elif author and peer_stage:
-        # The author filter still binds STAGE 2, but stage 1 + the peer fetch put
-        # the peer half back. Naming what the widened population still drops is
-        # the whole job of this descriptor: peers with an open CHANGES_REQUESTED
-        # are pruned before the expensive call, and that is a real exclusion even
-        # though it is a defensible one.
+    elif author and peer_ok:
+        # The peer stage restores the peer half, but its own prune is still a
+        # real exclusion and must be declared.
         excludes.append(
             "peer PRs already carrying CHANGES_REQUESTED (pruned before stage 2: "
             "the author must clear the review before any approval can matter)"
@@ -389,13 +392,17 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
         complete = True
         why = f"fetch returned {ceiling_count}, below the {limit} ceiling"
 
+    if peer_stage and (not peer_ok or peer_stage.get("failed")
+                       or not peer_stage.get("owner_ok", True)):
+        complete = False
+        why = "a fetch failed; population is uncertified"
     return {
-        "filter": ("author:{} + peer stage".format(author) if (author and peer_stage)
+        "filter": ("author:{} + peer stage".format(author) if (author and peer_ok)
                    else (f"author:{author}" if author else "none")),
         "population": (
             (f"open, non-draft PRs authored by {author!r}, PLUS open non-draft peer "
              "PRs without an open CHANGES_REQUESTED")
-            if (author and peer_stage)
+            if (author and peer_ok)
             else (f"open, non-draft PRs authored by {author!r}"
                   if author else "open, non-draft PRs (all authors)")
         ),
@@ -408,15 +415,18 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
     }
 
 
-def _fetch_discovered(repo: str) -> list:  # pragma: no cover — subprocess/gh glue
+def _fetch_discovered(repo: str):  # pragma: no cover — subprocess/gh glue
+    """(ok, rows). `ok` is False on ANY failure so an outage can never be
+    serialized as a genuinely empty repository."""
     res = subprocess.run(discovery_argv(repo), capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
         print(f"pr-flag: discovery gh failed: {res.stderr[:200]}", file=sys.stderr)
-        return []
+        return False, []
     try:
-        return json.loads(res.stdout)
+        return True, json.loads(res.stdout)
     except json.JSONDecodeError:
-        return []
+        print("pr-flag: discovery returned unparseable JSON", file=sys.stderr)
+        return False, []
 
 
 def _fetch_peer_pr(repo: str, number: int) -> dict:  # pragma: no cover — subprocess/gh glue
@@ -435,16 +445,18 @@ def _fetch_peer_pr(repo: str, number: int) -> dict:  # pragma: no cover — subp
         return {}
 
 
-def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
+def _fetch_prs(repo: str, owner_login: str):  # pragma: no cover — subprocess/gh glue
+    """(ok, rows) — same contract as _fetch_discovered."""
     cmd = fetch_argv(repo, owner_login)
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
         print(f"pr-flag: gh failed: {res.stderr[:200]}", file=sys.stderr)
-        return []
+        return False, []
     try:
-        return json.loads(res.stdout)
+        return True, json.loads(res.stdout)
     except json.JSONDecodeError:
-        return []
+        print("pr-flag: owner fetch returned unparseable JSON", file=sys.stderr)
+        return False, []
 
 
 
@@ -536,24 +548,21 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
 
     # Bound separately so the PRE-filter size is available to scope_descriptor:
     # the `--limit` ceiling applies here, before raw_state() drops drafts.
-    own = _fetch_prs(args.repo, args.owner)
-    # Stage 1 reveals the peer half the owner-scoped fetch cannot contain (#2643).
-    # A discovery failure must NOT silently shrink the population back to
-    # owner-only and read as normal, so it is reported and counted.
-    discovered = _fetch_discovered(args.repo)
+    own_ok, own = _fetch_prs(args.repo, args.owner)
+    disc_ok, discovered = _fetch_discovered(args.repo)
+    candidates = peer_candidates(discovered, args.owner)
     peers, peer_failures = [], 0
-    for number in peer_candidates(discovered, args.owner):
+    for number in candidates:
         pr = _fetch_peer_pr(args.repo, number)
         if pr:
             peers.append(pr)
         else:
             peer_failures += 1
-    if discovered and not peers and peer_candidates(discovered, args.owner):
-        print("pr-flag: every peer fetch failed — peer half of the population is "
-              "MISSING from this emit, not empty", file=sys.stderr)
+    if not disc_ok:
+        print("pr-flag: discovery FAILED — the peer half is unknown, not empty; "
+              "population is uncertified this fire", file=sys.stderr)
     fetched = _attach_commits(args.repo, own + peers)
     state = raw_state(fetched, args.owner, args.stand)
-    h = state_hash(state)
 
     # dedup: resolve the stored-hash file the same way every reader does
     sf = Path(args.state_file) if args.state_file else None
@@ -565,6 +574,19 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
         except Exception:
             ws = ""
         sf = Path(ws) / "state" / "pr-flag-state.json" if ws else Path("state/pr-flag-state.json")
+
+    prior = {}
+    if sf is not None and sf.exists():
+        try:
+            prior = json.loads(sf.read_text()).get("mergeable", {}) or {}
+        except (json.JSONDecodeError, OSError):
+            prior = {}
+    state = carry_unknown_mergeable(state, prior)
+    h = state_hash(state)
+    # A population we could not certify must not overwrite the last good hash:
+    # doing so lets the next healthy fire read as NO_CHANGE and stay silent.
+    certified = own_ok and disc_ok and peer_failures == 0
+
     prev = ""
     try:
         prev = json.loads(sf.read_text()).get("hash", "")
@@ -583,15 +605,22 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
         # not to what survives raw_state(). See scope_descriptor().
         "scope": scope_descriptor(args.repo, args.owner, record_count=len(state),
                                   peer_stage={"discovered": len(discovered),
-                                              "candidates": len(peer_candidates(discovered, args.owner)),
+                                              "candidates": len(candidates),
                                               "fetched": len(peers),
-                                              "failed": peer_failures},
+                                              "failed": peer_failures,
+                                              "discovery_ok": disc_ok,
+                                              "owner_ok": own_ok},
                                   fetched_count=len(fetched)),
         "prs": state,
     }, indent=2))
     try:
         sf.parent.mkdir(parents=True, exist_ok=True)
-        sf.write_text(json.dumps({"hash": h, "count": len(state)}))
+        if certified:
+            sf.write_text(json.dumps({"hash": h, "count": len(state),
+                                      "mergeable": mergeable_map(state)}))
+        else:
+            print("pr-flag: population uncertified — hash NOT recorded, so the "
+                  "next healthy fire still emits", file=sys.stderr)
     except Exception as e:
         print(f"pr-flag: state write failed: {e}", file=sys.stderr)
     return 0

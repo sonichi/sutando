@@ -95,14 +95,60 @@ def _descriptor_tracks_the_widened_population():
 
 
 def _mergeable_churn_does_not_refire():
-    """GitHub parks mergeable at UNKNOWN while recomputing; that is not a change."""
+    """UNKNOWN churn must not refire; a REAL mergeability flip must."""
     base = [{"number": 1, "principal": "p", "base": "main", "head": "abc", "ci": "green",
              "mergeable": "MERGEABLE", "review": "APPROVED", "approvals": 2,
              "approvals_standing": 2}]
-    churn = [dict(base[0], mergeable="UNKNOWN")]
-    assert pf.state_hash(base) == pf.state_hash(churn), "a mergeable-only flip must NOT move the hash"
+    prior = pf.mergeable_map(base)
+    assert prior == {"1": "MERGEABLE"}, f"map should carry the known value, got {prior}"
+
+    # GitHub parks the field at UNKNOWN mid-recompute: carried forward, no refire.
+    churn = pf.carry_unknown_mergeable([dict(base[0], mergeable="UNKNOWN")], prior)
+    assert pf.state_hash(base) == pf.state_hash(churn), "UNKNOWN churn must NOT move the hash"
+    assert pf.mergeable_map(churn) == {"1": "MERGEABLE"}, "carried value must persist for the next fire"
+
+    # The control the reviewer asked for: a real transition MUST wake the cron.
+    # The target branch advancing changes nothing else -- not head, base name, ci,
+    # reviews or approvals -- so this is the only carrier.
+    conflict = pf.carry_unknown_mergeable([dict(base[0], mergeable="CONFLICTING")], prior)
+    assert pf.state_hash(base) != pf.state_hash(conflict), "CONFLICTING must move the hash"
+    back = pf.carry_unknown_mergeable([dict(base[0], mergeable="MERGEABLE")],
+                                      pf.mergeable_map(conflict))
+    assert pf.state_hash(conflict) != pf.state_hash(back), "recovering to MERGEABLE must move it too"
+
+    # With no prior (first ever fire) UNKNOWN cannot be carried and stays UNKNOWN.
+    fresh = pf.carry_unknown_mergeable([dict(base[0], mergeable="UNKNOWN")], {})
+    assert fresh[0]["mergeable"] == "UNKNOWN", "nothing to carry -> value is left alone"
+
     assert pf.state_hash(base) != pf.state_hash([dict(base[0], head="def")]), "a new head MUST still move the hash"
     assert pf.state_hash(base) != pf.state_hash([dict(base[0], approvals=1)]), "an approval change MUST still move the hash"
+
+
+def _failed_fetch_is_never_an_empty_population():
+    """A discovery outage must not be serialized as a widened, empty population."""
+    ok = {"discovered": 70, "candidates": 13, "fetched": 13, "failed": 0,
+          "discovery_ok": True, "owner_ok": True}
+    good = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=ok)
+    assert "peer" in good["population"], "a healthy peer stage must claim the widened population"
+
+    dead = {"discovered": 0, "candidates": 0, "fetched": 0, "failed": 0,
+            "discovery_ok": False, "owner_ok": True}
+    bad = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=dead)
+    assert any("not authored by" in e for e in bad["excludes"]), "a failed discovery must fall back to declaring owner-only"
+    assert any("UNKNOWN this fire" in e for e in bad["excludes"]), "the failure itself must be declared"
+    assert bad["complete"] is False, "an uncertified population must never certify complete"
+    assert "peer" not in bad["population"], "must not claim a peer half it could not fetch"
+
+    partial = {"discovered": 70, "candidates": 13, "fetched": 11, "failed": 2,
+               "discovery_ok": True, "owner_ok": True}
+    part = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=partial)
+    assert part["complete"] is False, "partial peer fetch must not certify complete"
+
+    ownfail = {"discovered": 70, "candidates": 13, "fetched": 13, "failed": 0,
+               "discovery_ok": True, "owner_ok": False}
+    of = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=ownfail)
+    assert any("owner-authored fetch FAILED" in e for e in of["excludes"]), "an owner fetch failure must be declared too"
+    assert of["complete"] is False, "owner fetch failure must not certify complete"
 
 
 def main() -> int:
@@ -531,6 +577,7 @@ def main() -> int:
     _discovery_is_light()
     _descriptor_tracks_the_widened_population()
     _mergeable_churn_does_not_refire()
+    _failed_fetch_is_never_an_empty_population()
     print("  ok  #2643 peer-scope + mergeable-churn cases")
     print("\nAll pr-flag core cases pass.")
     return 0
