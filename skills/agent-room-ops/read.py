@@ -50,7 +50,7 @@ def _result(ok, messages=None, reason=None, room_id=None, complete=None):
 def _normalize(items):
     out = []
     for m in items or []:
-        out.append({
+        norm = {
             "sender": m.get("sender") or m.get("user_id") or m.get("from"),
             "ts": m.get("ts") or m.get("timestamp"),
             "body": m.get("body") or m.get("text") or m.get("message"),
@@ -60,7 +60,17 @@ def _normalize(items):
             # its own messages (reactions are never pushed as tasks — read is the
             # only surface). Always a list so consumers need no None-check.
             "reactions": m.get("reactions") or [],
-        })
+        }
+        # `fetch` needs media_ref as its handle, so dropping it leaves an attachment
+        # visible but unfetchable. Set only when present, keeping the shape additive.
+        ref = m.get("media_ref")
+        if ref:
+            norm["media_ref"] = ref
+            # Also conditional: the gateway is an external producer, so a media event
+            # arriving without msgtype must not grow an explicit null either.
+            if (mt := m.get("msgtype")):
+                norm["msgtype"] = mt
+        out.append(norm)
     return out
 
 
