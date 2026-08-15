@@ -4906,10 +4906,15 @@ def check_gateway_bridge() -> "dict | None":
     # opinion, keep the previous process-only verdict.
     verdict = _gateway_serving()
     if verdict is False:
+        # WITHOUT the duration this line is byte-identical at minute one and at
+        # hour thirteen, so a reader cannot tell a blip from a standing outage.
+        age_h = _gateway_last_ok_age_h()
+        since = ("last successful poll UNKNOWN" if age_h is None
+                 else f"last successful poll {age_h:.1f}h ago")
         return {
             "name": "gateway-bridge",
             "status": "warn",
-            "detail": "process running but NOT serving — no successful poll; "
+            "detail": f"process running but NOT serving — {since}; "
                       "ag2.space mobile messages are not being delivered",
         }
     if verdict is True:
@@ -4918,6 +4923,23 @@ def check_gateway_bridge() -> "dict | None":
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
+
+
+def _gateway_last_ok_age_h(path: "Path | None" = None,
+                           now: "float | None" = None) -> "float | None":
+    """Hours since the bridge's last SUCCESSFUL poll, per the sidecar's
+    `last_ok_ts`. None when that field is absent or unusable — an outage of
+    unknown start is reported as unknown, never as a fresh one."""
+    import time as _time
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    now = _time.time() if now is None else now
+    try:
+        last = json.loads(Path(p).read_text()).get("last_ok_ts")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    if not isinstance(last, (int, float)) or isinstance(last, bool):
+        return None
+    return max(0.0, (now - float(last)) / 3600.0)
 
 
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
