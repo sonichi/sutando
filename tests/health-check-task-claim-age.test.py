@@ -51,8 +51,14 @@ class TestTaskClaimAge(unittest.TestCase):
 
     def _claim(self, name: str, age_s: float) -> Path:
         self.claims.mkdir(parents=True, exist_ok=True)
+        # The task must EXIST: these cases are about a bounded handler running
+        # too long, not about a claim whose task was already archived.
+        tasks = self.ws / "tasks"
+        tasks.mkdir(parents=True, exist_ok=True)
+        task = tasks / name
+        task.write_text("task\n")
         path = self.claims / name
-        path.write_text("claim\nwatcher-id\n/tasks/x.txt\nmust-handle\n")
+        path.write_text("%d\nwatcher-id\n%s\nmust-handle\n" % (os.getpid(), task))
         stamp = time.time() - age_s
         os.utime(path, (stamp, stamp))
         return path
@@ -214,61 +220,70 @@ class TestTaskClaimAge(unittest.TestCase):
 
 
 class TestClaimExecutionContract(unittest.TestCase):
-    """Age alone condemned every claim, including ones with no deadline."""
+    """The task file is the progress signal; count and age cannot condemn."""
 
     def setUp(self):
         self.hc = _load_health_check()
 
-    def _claim(self, ws, name, pid, disposition, age_h):
-        d = ws / "state" / "task-event-handler-claims"
-        d.mkdir(parents=True, exist_ok=True)
-        f = d / name
-        f.write_text("%s\nWID\n/tmp/t.txt\n%s\n" % (pid, disposition))
+    def _claim(self, ws, name, pid, disposition, age_h, task_exists):
+        cd = ws / "state" / "task-event-handler-claims"
+        cd.mkdir(parents=True, exist_ok=True)
+        td = ws / "tasks"
+        td.mkdir(parents=True, exist_ok=True)
+        tp = td / name
+        if task_exists:
+            tp.write_text("task\n")
+        f = cd / name
+        f.write_text("%s\nWID\n%s\n%s\n" % (pid, tp, disposition))
         t = time.time() - age_h * 3600
         os.utime(f, (t, t))
-        return f
 
     def _run(self, spec):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
-            for i, (pid, disp, age) in enumerate(spec):
-                self._claim(ws, "task-%d.txt" % i, pid, disp, age)
+            for i, (pid, disp, age, exists) in enumerate(spec):
+                self._claim(ws, "task-%d.txt" % i, pid, disp, age, exists)
             return self.hc.check_task_claim_age(ws)
 
-    def test_a_live_unbounded_claim_is_not_leaked_however_old(self):
-        # The reviewer's case: a fallback claim runs on the live core, which has
-        # no hard deadline, so a long owner session must not read as a leak.
-        r = self._run([(os.getpid(), "fallback", 31.2)])
+    def test_a_burst_of_queued_claims_never_alarms(self):
+        # Six fresh fallback claims with their tasks still present. The watcher
+        # claims before queueing and runs 2 workers, so this is a normal burst.
+        r = self._run([(os.getpid(), "fallback", 0.01, True)] * 6)
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_queued_claims_do_not_alarm_on_age_either(self):
+        r = self._run([(os.getpid(), "fallback", 5.0, True)] * 6)
         self.assertEqual(r["status"], "ok", r["detail"])
 
     def test_the_founding_leak_is_still_caught(self):
-        # 34 concurrent fallback claims under a HEALTHY watcher — the incident
-        # this probe exists for. Age cannot see it; concurrency can.
-        r = self._run([(os.getpid(), "fallback", 31.2 - i * 0.5) for i in range(34)])
+        # 34 claims whose tasks are already archived: the work finished and
+        # nothing released them.
+        r = self._run([(os.getpid(), "fallback", 31.0 - i * 0.5, False) for i in range(34)])
         self.assertEqual(r["status"], "down", r["detail"])
-        self.assertIn("held at once", r["detail"])
+        self.assertIn("task already archived", r["detail"])
 
-    def test_an_orphaned_claim_is_down_at_any_age(self):
-        r = self._run([(999999, "fallback", 0.2)])
+    def test_a_single_leaked_claim_is_caught_at_any_age(self):
+        # Strictly better than the count rule this replaced, which needed six.
+        r = self._run([(os.getpid(), "fallback", 0.2, False)])
         self.assertEqual(r["status"], "down", r["detail"])
-        self.assertIn("orphaned", r["detail"])
+
+    def test_a_long_owner_session_is_not_leaked(self):
+        r = self._run([(os.getpid(), "fallback", 31.2, True)])
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_a_dead_owner_is_leaked_even_with_the_task_present(self):
+        r = self._run([(999999, "fallback", 0.1, True)])
+        self.assertEqual(r["status"], "down", r["detail"])
+        self.assertIn("owner process gone", r["detail"])
 
     def test_a_bounded_claim_past_its_hard_timeout_is_down(self):
-        r = self._run([(os.getpid(), "must-handle", 31.2)])
+        r = self._run([(os.getpid(), "must-handle", 31.2, True)])
         self.assertEqual(r["status"], "down", r["detail"])
 
     def test_a_young_bounded_claim_is_ok(self):
-        self.assertEqual(self._run([(os.getpid(), "must-handle", 0.05)])["status"], "ok")
-
-
-    def test_the_warn_tier_of_the_concurrency_signal(self):
-        # down was covered, warn was not — the middle band of my own threshold.
-        r = self._run([(os.getpid(), "fallback", 2.0)] * 3)
-        self.assertEqual(r["status"], "warn", r["detail"])
-        self.assertIn("held at once", r["detail"])
+        self.assertEqual(self._run([(os.getpid(), "must-handle", 0.05, True)])["status"], "ok")
 
     def test_pid_liveness_edge_cases(self):
-        # PermissionError means the process EXISTS under another uid.
         with mock.patch.object(self.hc.os, "kill", side_effect=PermissionError):
             self.assertTrue(self.hc._pid_alive(1))
         for exc in (OverflowError, ValueError, OSError):
@@ -280,7 +295,7 @@ class TestClaimExecutionContract(unittest.TestCase):
             f = Path(td) / "task-x.txt"
             f.write_text("1\nWID\n/tmp/t\nfallback\n")
             with mock.patch.object(Path, "read_text", side_effect=OSError):
-                self.assertEqual(self.hc._claim_owner(f), (None, None))
+                self.assertEqual(self.hc._claim_owner(f), (None, None, None))
 
 
 if __name__ == "__main__":
