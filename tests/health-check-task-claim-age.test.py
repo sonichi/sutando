@@ -261,5 +261,27 @@ class TestClaimExecutionContract(unittest.TestCase):
         self.assertEqual(self._run([(os.getpid(), "must-handle", 0.05)])["status"], "ok")
 
 
+    def test_the_warn_tier_of_the_concurrency_signal(self):
+        # down was covered, warn was not — the middle band of my own threshold.
+        r = self._run([(os.getpid(), "fallback", 2.0)] * 3)
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("held at once", r["detail"])
+
+    def test_pid_liveness_edge_cases(self):
+        # PermissionError means the process EXISTS under another uid.
+        with mock.patch.object(self.hc.os, "kill", side_effect=PermissionError):
+            self.assertTrue(self.hc._pid_alive(1))
+        for exc in (OverflowError, ValueError, OSError):
+            with mock.patch.object(self.hc.os, "kill", side_effect=exc):
+                self.assertFalse(self.hc._pid_alive(1))
+
+    def test_an_unreadable_claim_yields_no_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "task-x.txt"
+            f.write_text("1\nWID\n/tmp/t\nfallback\n")
+            with mock.patch.object(Path, "read_text", side_effect=OSError):
+                self.assertEqual(self.hc._claim_owner(f), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
