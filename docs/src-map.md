@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-210 modules indexed.
+218 modules indexed.
 
 ## `src/`
 
@@ -61,6 +61,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
+- **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
@@ -100,6 +101,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`recording-tools.ts`** — Recording, video playback, and scroll-and-describe tools.
 - **`remote-gateway-bridge.py`** — remote-gateway-bridge.py — sutando loader for the canonical ag2-sparrow client.
 - **`remote-relay-bridge.py`** — remote-relay-bridge.py — DEPRECATED name; renamed to remote-gateway-bridge.py.
+- **`render_plist_template.py`** — Render a launchd plist: literal __TOKEN__ substitution, XML escaping, parse check.
 - **`reply_chain.py`** — Reply-context formatting (pure) — companion to ``discord-bridge.py``.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
@@ -119,6 +121,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
+- **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
@@ -147,15 +150,20 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`voice-agent-config.ts`** — Voice agent tuned-prompt configuration — step 5a-1 of the interaction-planes refactor (LiveAgentRuntime extraction, slice 1).
 - **`voice-agent-state.ts`** — `agent.state` v1 protocol provider + lifecycle snapshot publisher (design 1a′; impl plan WS1 Step 12, amendments R8/A9/A10/S3/Z3).
 - **`voice-agent.ts`** — Sutando — Voice Interface
+- **`voice-audio-health-persist.ts`** — voice-audio-health-persist — worker_threads sqlite writer for the P7 voice_audio_health table (D7.1; §D7.0b round-4 #3: node:sqlite is synchronous, so timer-scheduled writes on the voice event loop can still block audio behind disk latency or busy_timeout — the writes live in a worker thread instead, and the main thread only try-enqueues).
+- **`voice-audio-health.ts`** — voice-audio-health — P7 D7.1 engine-side audio-progress ledger (Tranche A interim).
 - **`voice-config-switch.ts`** — Voice tool: switch voice-agent's model + googleSearch preset at runtime.
 - **`voice-config.ts`** — Per-surface voice configuration loader.
 - **`voice-connect-resolver.ts`** — Transparent voice-connection tier resolution — picks the best reachable endpoint for "call your agent" so the user never chooses a tier.
 - **`voice-context.ts`** — Builds a system prompt for the Claude Code subprocess that injects Sutando identity and user context from the memory system.
+- **`voice-continuity.ts`** — voice-continuity — P7 D7.3 continuity helpers (Tranche A engine-side): the stale-repeat goodbye guard and the centralized conversation-clear.
 - **`voice-error-classifier.ts`** — Classify Gemini Live transport close events into actionable categories.
+- **`voice-health-matrix.ts`** — voice-health-matrix — P7 D7.2: the failure-localization matrix.
 - **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent, phone-conversation, and any plugin voice surface).
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
+- **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.

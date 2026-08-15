@@ -55,9 +55,28 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
+
+
+
+def newest_archived(directory: Path, task_id: str) -> Path | None:
+    """Newest record for task_id in one directory — collision suffix included.
+    A repeat lands as `<id>.txt.1`, so plain `<id>.txt` is the OLDEST, not current."""
+    base = directory / f"{task_id}.txt"
+    if not base.exists():
+        return None          # `.N` is only minted once `.txt` is taken
+    # Probe exact names, never glob: this runs in agent-api's per-poll loop over an
+    # archive dir that reached 5,716 entries, where a glob measured 442x an exists().
+    best, n = base, 1
+    while True:
+        nxt = base.with_name(f"{base.name}.{n}")
+        if not nxt.exists():
+            return best
+        best, n = nxt, n + 1
+
 
 # ── Schema constants ─────────────────────────────────────────────────────────
 
@@ -520,6 +539,17 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     return flat[-1] if flat else None
 
 
+def find_result(results_dir: Path, task_id: str) -> Path | None:
+    """Locate a task's result: live dir first, then archive. Archival trails
+    delivery, so an archive-only lookup reads a fresh result as never delivered."""
+    if not valid_archive_lookup_id(task_id):
+        return None
+    live = Path(results_dir) / f"{task_id}.txt"
+    if live.is_file():
+        return live
+    return find_archived_result(results_dir, task_id)
+
+
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
@@ -550,9 +580,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """
     if not valid_archive_lookup_id(task_id):
         return None
-    fname = f"{task_id}.txt"
-    candidates = [tasks_dir / fname, tasks_dir / "processed" / fname,
-                  tasks_dir / "archive" / fname]
+    dirs = [tasks_dir, tasks_dir / "processed", tasks_dir / "archive"]
     archive_root = tasks_dir / "archive"
     try:
         with os.scandir(archive_root) as entries:
@@ -560,10 +588,13 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
                             if _MONTH_DIR_RE.match(e.name) and e.is_dir())
     except (OSError, ValueError):
         months = []          # missing/unreadable archive is "no months", not an error
-    candidates.extend(archive_root / m / fname for m in months)
-    for p in candidates:
-        if p.exists():
-            return p
+    dirs.extend(archive_root / m for m in months)
+    for d in dirs:
+        # Shared owner picks among collision suffixes: `<id>.txt` is the OLDEST
+        # record once `<id>.txt.1` exists, so `.exists()` here returned stale.
+        hit = newest_archived(d, task_id)
+        if hit is not None:
+            return hit
     return None
 
 
