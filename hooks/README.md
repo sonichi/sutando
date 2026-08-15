@@ -16,13 +16,22 @@ the part an instruction alone can't guarantee, since a raw curl bypasses an inst
 
 ### Deploy (per node)
 
+`~/.claude` is NOT always the config dir. Claude Code honours `$CLAUDE_CONFIG_DIR`, and the
+Sutando core sets it (e.g. to `<workspace>/.claude-sutando`). Registering into
+`~/.claude/settings.json` on such a node edits a file the core never reads — the JSON is valid,
+the hook is present, and the guard is still not armed. Resolve the dir first:
+
 ```bash
-cp hooks/context-source-guard.py ~/.claude/hooks/
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/hooks"
+cp hooks/context-source-guard.py "$CFG/hooks/"
 # register under BOTH the Bash and Read PreToolUse matchers:
-python3 - <<'PY'
+CFG="$CFG" python3 - <<'PY'
 import json, os
-sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
-cmd = "python3 ~/.claude/hooks/context-source-guard.py"
+cfg = os.environ["CFG"]
+sp = os.path.join(cfg, "settings.json")
+s = json.load(open(sp)) if os.path.isfile(sp) else {}
+cmd = f"python3 {os.path.join(cfg, 'hooks', 'context-source-guard.py')}"
 pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
 for m in ("Bash", "Read"):
     blk = next((b for b in pre if b.get("matcher") == m), None)
@@ -30,6 +39,16 @@ for m in ("Bash", "Read"):
     elif cmd not in [h.get("command") for h in blk["hooks"]]: blk["hooks"].append({"type": "command", "command": cmd})
 json.dump(s, open(sp, "w"), indent=2)
 PY
+```
+
+Verify. Registration is the only thing that proves the guard is armed — the file being
+present in `hooks/` does not:
+
+```bash
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" python3 -c 'import json, os
+p = os.path.join(os.environ["CFG"], "settings.json")
+h = json.load(open(p)).get("hooks", {})
+print("armed:", "context-source-guard" in json.dumps(h))'
 ```
 
 `settings.json` registration is read at **session start**; once registered, the script
