@@ -5818,7 +5818,7 @@ def _claim_observations_path(workspace_dir: Path) -> Optional[Path]:
     carryable, so a workspace-relative store is refreshable by the same sync
     that refreshes claim mtime.
     """
-    engine = Path(__file__).resolve().parent.parent
+    engine = REPO_DIR.resolve()          # the module already resolves its own repo
     try:
         # rev-parse, not `engine/".git"`: in a WORKTREE .git is a file.
         out = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=str(engine),
