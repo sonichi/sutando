@@ -103,7 +103,7 @@ class _Claim(unittest.TestCase):
             _reset()
             gw.os.environ.pop("AGENT_MXID", None)
             gw.os.environ.pop("AGENT_ID", None)
-            gw._reenroll_claim()  # attempted, but refuses without identity
+            gw._reenroll_claim()  # runs, but refuses without identity
             self.assertIsNone(gw._reenroll_state["code"])
         finally:
             gw.urllib.request.urlopen = urllib.request.urlopen
@@ -307,7 +307,6 @@ class _RecoverLoop(unittest.TestCase):
 
             def claim():
                 calls["n"] += 1
-                gw._reenroll_state["attempted"] = True
                 if calls["n"] >= 2:   # first POST fails transiently; retry parks
                     gw._reenroll_state["code"] = "cafe5678"
                     gw._reenroll_state["claimed_at"] = 1
