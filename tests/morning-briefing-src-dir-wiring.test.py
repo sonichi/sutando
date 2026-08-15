@@ -74,8 +74,22 @@ class SrcDirWiring(unittest.TestCase):
 
     def test_reminders_path_follows_src_dir(self):
         """Uses `_SRC_DIR.parent` — the one builder that walks UP, so a wrong
-        root here fails differently from the two above."""
-        self.assertIsNone(mb.get_reminders())
+        root here fails differently from the two above.
+
+        Asserts the SUBPROCESS is never reached, for the same reason as
+        `daily_insight`: a reverted builder finds the real script and then
+        returns None anyway when Reminders.app does not answer inside the 10s
+        timeout, so `assertIsNone` passes with the builder reverted. (Verified:
+        it did, taking 10.006s — the timeout, not the guard.)
+        """
+        calls = []
+        real_run = mb.subprocess.run
+        mb.subprocess.run = lambda *a, **k: calls.append(a) or real_run(*a, **k)
+        try:
+            self.assertIsNone(mb.get_reminders())
+        finally:
+            mb.subprocess.run = real_run
+        self.assertEqual(calls, [], "builder resolved a real script — it ignored _SRC_DIR")
 
     def test_src_dir_is_absolute_and_real(self):
         """Guards the definition itself: the stub above only means something if
