@@ -174,6 +174,27 @@ bash src/install-cron-runner-launchd.sh --uninstall
 
 This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner.py`), which reads the same `crons.json`, decides which `"launchd": true` entries are DUE since their last recorded fire, and emits a task file into `tasks/` for each. The streaming watcher hands it to the session — same OS-level → emit-task → process pipeline as `com.sutando.health-check-fallback`. Missed fires (machine asleep/off) catch up exactly once on the next tick, never a backlog storm.
 
+### Mechanical shell jobs
+
+Launchd-owned entries may set `"shell_command"` for work that should not wake a
+model session (for example, a polling or sync script):
+
+```json
+{
+  "name": "sync-workspace",
+  "cron": "*/30 * * * *",
+  "launchd": true,
+  "shell_command": "bash scripts/sync-workspace.sh"
+}
+```
+
+`src/cron-runner.py` executes the command from the repository root, logs its
+command, stdout, stderr, and exit code to `<workspace>/logs/cron-runner.log`,
+and reports non-zero exits on stderr. A shell job runs even when the core
+heartbeat is absent and never creates a `tasks/` file. If an entry contains
+more than one execution form, precedence is `shell_command` > `prompt_skill` >
+`prompt`; use only one form in new configuration.
+
 When the selected core runtime is Codex on macOS, `src/agent/codex/cli/start-cli.sh` performs this installation/reconciliation automatically. Manual installation remains the opt-in path for Claude-core hosts.
 
 **Ownership partition (no double-fire):** the launchd runner handles ONLY `"launchd": true` entries; this session skill (step 3) skips those same entries. Exactly one scheduler owns each cron. Leave `main-loop` / `/proactive-loop` session-owned (it drives the session itself — it is not a task and must never be launchd-owned).

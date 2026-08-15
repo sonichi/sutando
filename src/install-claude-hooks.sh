@@ -99,6 +99,14 @@ HOOKS=(
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
 )
 
+# Skill-declared hooks. A skill owns its hook the way it owns its `tools`;
+# src/skill_hooks.py is the single discovery the health probe also reads.
+while IFS='|' read -r _ev _tok _cmd; do
+  [ -n "${_ev:-}" ] && HOOKS+=("$_ev|$_tok|$_cmd")
+done <<EOF
+$(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
+EOF
+
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
 # Matching uses `.command | contains(substring)` so we don't need to track
 # the exact command string an old installer wrote — just a stable token.
