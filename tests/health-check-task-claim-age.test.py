@@ -20,6 +20,7 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 import importlib.util
+import json
 import os
 import tempfile
 import time
@@ -295,15 +296,63 @@ class TestClaimExecutionContract(unittest.TestCase):
                              "back under its threshold: " + after["detail"])
             self.assertIn("40.0h", after["detail"])
 
-    def test_the_observation_registry_is_outside_the_synced_tree(self):
-        # state/ is carryable by a vault.sync include; the git dir never is.
-        import subprocess
+    def test_the_registry_is_outside_the_workspace_WITHOUT_git_initing_it(self):
+        # The previous version ran `git init` on the temp workspace, so it
+        # CONSTRUCTED the condition it verified. A plain dir is the real case.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)                      # deliberately NOT a git repo
+            p = self.hc._claim_observations_path(ws)
+            self.assertIsNotNone(p, "engine checkout should supply a store")
+            self.assertNotIn(str(ws.resolve()), str(p),
+                             "registry must not live under the workspace: " + str(p))
+
+    def test_no_engine_git_dir_yields_NONE_never_a_workspace_path(self):
+        # Discriminating: forces the branch the happy path never reaches, so a
+        # reintroduced workspace-relative fallback turns this red.
+        import subprocess as _sp
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
-            subprocess.run(["git", "init", "-q", str(ws)], check=False)
+            fail = _sp.CompletedProcess(args=[], returncode=128, stdout="", stderr="")
+            with mock.patch.object(self.hc.subprocess, "run", return_value=fail):
+                p = self.hc._claim_observations_path(ws)
+            self.assertIsNone(
+                p, "with no engine git dir the store must be None, not a "
+                   "workspace path that sync can carry: " + str(p))
+
+    def test_age_is_reported_UNAVAILABLE_when_no_unsynced_store_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._claim_in(ws, "task-1.txt", os.getpid(), "must-handle", 40.0, True)
+            with mock.patch.object(self.hc, "_claim_observations_path",
+                                   return_value=None):
+                r = self.hc.check_task_claim_age(ws)
+            self.assertEqual(r["status"], "warn", r["detail"])
+            self.assertIn("unavailable", r["detail"])
+
+    def test_a_corrupt_registry_does_not_reseed_from_mtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._claim_in(ws, "task-1.txt", os.getpid(), "must-handle", 40.0, True)
             p = self.hc._claim_observations_path(ws)
-            self.assertIn(".git", str(p),
-                          "observations must live under the git dir: " + str(p))
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("{ this is not json")
+            r = self.hc.check_task_claim_age(ws)
+            self.assertEqual(r["status"], "warn", r["detail"])
+            self.assertIn("unavailable", r["detail"])
+
+    def test_a_recorded_first_sighting_is_never_moved_FORWARD(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            f = self._claim_in(ws, "task-1.txt", os.getpid(), "must-handle", 40.0, True)
+            self.hc.check_task_claim_age(ws)           # records the sighting
+            p = self.hc._claim_observations_path(ws)
+            before = json.loads(p.read_text())["task-1.txt"]
+            now = time.time()
+            os.utime(f, (now, now))                    # the sync replay
+            self.hc.check_task_claim_age(ws)
+            after = json.loads(p.read_text())["task-1.txt"]
+            self.assertEqual(before, after,
+                             "a first sighting moved forward under an mtime refresh")
 
     def test_archive_before_claim_release_is_not_an_outage(self):
         # The reviewer's case: handler published, bridge archived the task,

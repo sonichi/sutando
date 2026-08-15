@@ -5810,52 +5810,88 @@ def _claim_owner(path: Path):
 _TASK_CLAIM_ARCHIVE_GRACE_S = 300
 
 
-def _claim_observations_path(workspace_dir: Path) -> Path:
-    """Under the git dir on purpose: `state/` is carryable by a supported
-    vault.sync include, but nothing under the git dir is ever tracked (#2476)."""
+def _claim_observations_path(workspace_dir: Path) -> Optional[Path]:
+    """Unsynced store for first-sightings, or None when none exists.
+
+    Anchored on the ENGINE checkout (this file's repo), never the workspace: a
+    deployed layout can keep the workspace beside the checkout, and `state/` is
+    carryable, so a workspace-relative store is refreshable by the same sync
+    that refreshes claim mtime.
+    """
+    engine = Path(__file__).resolve().parent.parent
     try:
-        out = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=str(workspace_dir),
+        # rev-parse, not `engine/".git"`: in a WORKTREE .git is a file.
+        out = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=str(engine),
                              capture_output=True, text=True, timeout=5)
-        if out.returncode == 0 and out.stdout.strip():
-            git_dir = (workspace_dir / out.stdout.strip()).resolve()
-            return git_dir / "sutando-claim-observations.json"
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        git_dir = (engine / out.stdout.strip()).resolve()
     except Exception:
-        pass
-    # No git dir (a bare workspace): fall back beside the claims, and say so by
-    # name so a reader knows this copy is only as durable as state/ itself.
-    return workspace_dir / "state" / ".claim-observations-local.json"
+        return None
+    if not git_dir.is_dir():
+        return None
+    # Keyed by workspace identity so two workspaces on one host cannot share
+    # (and cross-contaminate) a ledger.
+    key = hashlib.sha1(str(Path(workspace_dir).resolve()).encode()).hexdigest()[:12]
+    return git_dir / "sutando-claim-observations" / f"{key}.json"
 
 
-def _claim_ages(entries: list, workspace_dir: Path, now: float) -> dict:
-    """{name: seconds since THIS host first observed the claim}. mtime is
-    sync-mutable, so a refresh must not push a stale claim under its threshold."""
+def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
+    """({name: seconds since first local sighting}, trusted).
+
+    `trusted` is False when no structurally-unsynced store exists -- the caller
+    must then treat age as unavailable rather than trust a syncable mtime.
+    """
     path = _claim_observations_path(workspace_dir)
-    try:
-        seen = json.loads(path.read_text())
-        if not isinstance(seen, dict):
-            seen = {}
-    except Exception:
-        seen = {}          # unreadable/corrupt -> re-observe, never crash the probe
-    live = {e.name for e in entries}
-    seen = {k: v for k, v in seen.items() if k in live and isinstance(v, (int, float))}
-    ages = {}
-    for e in entries:
-        first = seen.get(e.name)
-        if first is None:
-            # First sighting: seed from mtime, the only evidence there is, but
-            # record it so a later sync refresh cannot move it.
-            try:
-                first = e.stat().st_mtime
-            except OSError:
-                continue      # raced with a release; no age, caller skips it
-            seen[e.name] = first
-        ages[e.name] = max(0.0, now - first)
+    if path is None:
+        return {}, False
+    lock = path.with_suffix(".lock")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(seen))
     except Exception:
-        pass               # read-only fs: degrade to per-run observation
-    return ages
+        return {}, False
+    fd = None
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            seen = json.loads(path.read_text())
+            if not isinstance(seen, dict):
+                seen = {}
+        except FileNotFoundError:
+            seen = {}
+        except Exception:
+            # Corrupt: a reset would reseed every claim from sync-mutable mtime
+            # and suppress exactly what this exists to catch.
+            return {}, False
+        live = {e.name for e in entries}
+        seen = {k: v for k, v in seen.items() if k in live and isinstance(v, (int, float))}
+        ages = {}
+        for e in entries:
+            first = seen.get(e.name)
+            if first is None:
+                try:
+                    first = e.stat().st_mtime
+                except OSError:
+                    continue
+                seen[e.name] = first
+            ages[e.name] = max(0.0, now - first)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w") as fh:
+            json.dump(seen, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return ages, True
+    except Exception:
+        return {}, False
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            except Exception:
+                pass
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
@@ -5876,7 +5912,14 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     bounded, leaked, in_flight, held = [], [], 0, 0
     entries = list(base.glob("task-*.txt"))
     # Ages come from a LOCAL first-sighting, not mtime: mtime is sync-mutable.
-    ages = _claim_ages(entries, Path(workspace_dir or WORKSPACE_DIR), now)
+    ages, age_trusted = _claim_ages(entries, Path(workspace_dir or WORKSPACE_DIR), now)
+    if entries and not age_trusted:
+        # No structurally-unsynced store: mtime is the only signal and it is
+        # refreshable, so report the gap rather than a number we cannot trust.
+        return {"name": name, "status": "warn",
+                "detail": f"{len(entries)} held claim(s); claim AGE is unavailable "
+                          "(no unsynced observation store), so a stale claim cannot "
+                          "be distinguished from a fresh one"}
     for entry in entries:
         age = ages.get(entry.name)
         if age is None:
