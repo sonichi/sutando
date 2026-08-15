@@ -54,6 +54,7 @@ def load_bridge():
 
 bridge = load_bridge()
 
+checkpoints = []
 pass_n = 0
 fail_n = 0
 
@@ -87,7 +88,21 @@ def _guild_message(system: bool, mtype=0, content="PR practice — runs, reflect
     )
 
 
-def _run(msg):
+class _FakeDM:
+    """isinstance target for the DM branch: the real DMChannel cannot be built here."""
+    def __init__(self, cid):
+        self.id = cid
+        self.name = "dm"
+
+
+def _dm_message(system: bool, mtype=0):
+    m = _guild_message(system=system, mtype=mtype)
+    m.guild = None
+    m.channel = _FakeDM(999000111222333444)
+    return m
+
+
+def _run(msg, checkpoint_raises=False):
     """Drive on_message, recording the mod observer and the first post-guard call.
 
     Returns (observed, reached). `observed` is the moderation hook — the consumer
@@ -95,19 +110,29 @@ def _run(msg):
     judge and action dispatch.
     """
     observed, reached = [], []
+    checkpoints.clear()
 
     async def _spy_observe(m):
         observed.append(getattr(m, "id", None))
 
     orig_obs, orig_wel = bridge._observe_for_mod, bridge._load_welcome_config
+    orig_ck, orig_dm = bridge._update_dm_checkpoint, bridge.discord.DMChannel
     bridge._observe_for_mod = _spy_observe
     bridge._load_welcome_config = lambda gid: (reached.append(gid) or (None, None))
+    def _spy_checkpoint(cid, mid):
+        checkpoints.append((cid, mid))
+        if checkpoint_raises:
+            raise OSError("checkpoint store unwritable")
+
+    bridge._update_dm_checkpoint = _spy_checkpoint
+    bridge.discord.DMChannel = _FakeDM
     try:
         asyncio.run(bridge.on_message(msg))
     except Exception as exc:                      # a later gate may raise on a stub
         reached.append(("raised", type(exc).__name__))
     finally:
         bridge._observe_for_mod, bridge._load_welcome_config = orig_obs, orig_wel
+        bridge._update_dm_checkpoint, bridge.discord.DMChannel = orig_ck, orig_dm
     return observed, reached
 
 
@@ -120,6 +145,24 @@ check(bool(obs), "CONTROL: a non-system message DOES reach the moderation observ
 obs, blocked = _run(_guild_message(system=True))
 check(not blocked, "a system message stops at the guard")
 check(not obs, "a system message never reaches the moderation observer")
+
+# A system message in a DM must ALSO advance the checkpoint before returning. The
+# contract is "do not re-fetch", so a guard that returns without it re-creates the
+# frozen-checkpoint starvation path the self-message branch documents.
+obs, reached = _run(_dm_message(system=True))
+check(not reached and not obs, "a system DM stops at the guard")
+check(len(checkpoints) == 1, f"a system DM still advances the checkpoint (got {len(checkpoints)})")
+
+obs, reached = _run(_dm_message(system=False))
+check(not checkpoints or checkpoints[-1][0] == 999000111222333444,
+      "CONTROL: the checkpoint spy is wired to the same channel id")
+
+# A failing checkpoint store must not break the drop: the guard exists to keep the
+# notice out of the pipeline, and that must not depend on a write succeeding.
+obs, reached = _run(_dm_message(system=True), checkpoint_raises=True)
+check(len(checkpoints) == 1, "the failing checkpoint write was actually attempted")
+check(not reached and not obs,
+      "a system DM is still dropped when the checkpoint write raises")
 
 # The real shape, against the library's own enum rather than a hand-written int.
 if HAVE_DISCORD:
