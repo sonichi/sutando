@@ -639,6 +639,77 @@ _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipp
 # happens. Unset → exactly the pre-existing FATAL-exit behavior.
 TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
+# Registry-loss self-claim (ag2space-backend #595): a 401 can also mean the
+# SERVER lost this agent's registration (2026-08-14 incident class) while the
+# local bearer is intact. On auth rejection the bridge parks ONE re-enrollment
+# claim; the returned approval code is device-visible only (log + status file
+# — never the owner DM), and binding waits for the owner's concierge approval.
+# After a claim is pending, the re-check loop probes the gateway with the
+# CURRENT token: re-enrollment revalidates the SAME bearer, so waiting for a
+# token-file rotation alone would wait forever. Disable: REMOTE_REENROLL=0.
+REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
+    not in ("0", "false", "no", "off")
+REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
+_reenroll_state: dict = {"attempted": False, "code": None, "claimed_at": None}
+
+
+def _provision_base() -> str:
+    """Gateway base -> provision-api base (…/relay* -> …/api), the same
+    derivation the ops runbook uses (docs/agent-registry-reenroll.md)."""
+    return URL.split("/relay")[0].rstrip("/") + "/api"
+
+
+def _reenroll_claim() -> None:
+    """Park ONE re-enrollment claim per auth-rejection episode. Best-effort:
+    every failure only logs — the caller's recovery loop is unaffected. The
+    approval code lands in the log and gateway-status.json: the code is not a
+    credential (binding additionally requires the owner's own Matrix session),
+    it only identifies WHICH claim the owner approves, so device-local
+    surfaces are exactly where it belongs."""
+    if _reenroll_state["attempted"] or not REENROLL_ENABLED:
+        return
+    _reenroll_state["attempted"] = True
+    agent_id = (os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID") or "").strip()
+    if not agent_id or not TOKEN:
+        _log("reenroll: AGENT_MXID/AGENT_ID or token unavailable — not claiming")
+        return
+    try:
+        req = urllib.request.Request(
+            _provision_base() + "/connect/reenroll",
+            data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
+            # Explicit UA: the prod edge (Cloudflare) 403s urllib's default
+            # (observed live: error 1010) — same contract as _req().
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = json.loads(r.read() or b"{}")
+        code = str(body.get("approval_code") or "")
+        if body.get("pending") and code:
+            _reenroll_state["code"] = code
+            _reenroll_state["claimed_at"] = int(time.time())
+            _log("RELINK PENDING — this agent's server-side registration was "
+                 f"lost. RELINK CODE: {code} — the owner approves by DMing the "
+                 f"concierge: relink approve {code}")
+        else:
+            _log(f"reenroll: claim not parked ({str(body)[:200]})")
+    except urllib.error.HTTPError as e:
+        _log(f"reenroll: claim refused HTTP {e.code} ({_http_error_body(e)[:200]})")
+    except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
+        _log(f"reenroll: claim failed: {e}")
+
+
+def _auth_probe() -> bool:
+    """Is the CURRENT token accepted again? (After an approved re-link the
+    gateway revalidates the SAME bearer — nothing rotates.) Only a definite
+    401/403 is a No; a network error is not evidence either way, so keep
+    waiting rather than declare recovery on a flaky link."""
+    try:
+        _req("GET", "/v1/agents", timeout=15)
+        return True
+    except urllib.error.HTTPError as e:
+        return e.code not in (401, 403)
+    except Exception:  # noqa: BLE001
+        return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
@@ -1130,19 +1201,31 @@ def _recover_auth(code: int) -> bool:
     if _reload_rotated_token():
         _log("auth rejected but token file already rotated — resuming with new token")
         return True
-    if not TOKEN_FILE:
+    _reenroll_claim()
+    if not TOKEN_FILE and not _reenroll_state["code"]:
         return False
-    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation in "
-         f"{TOKEN_FILE} (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation"
+         + (f" in {TOKEN_FILE}" if TOKEN_FILE else "")
+         + (" or re-link approval" if _reenroll_state["code"] else "")
+         + f" (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    cycle = 0
     while True:
+        pending = _reenroll_state["code"]
         _emit_gateway_status(False,
-                             error=f"auth rejected HTTP {code} — waiting for re-connect",
+                             error=(f"auth rejected HTTP {code} — relink pending "
+                                    f"(code {pending})" if pending else
+                                    f"auth rejected HTTP {code} — waiting for re-connect"),
                              backoff_s=AUTH_RECHECK_INTERVAL)
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting for token rotation")
         if _reload_rotated_token():
             _log("rotated token detected — resuming")
+            return True
+        cycle += 1
+        if pending and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
+            _log("re-link approved — the existing token is accepted again; resuming")
+            _reenroll_state.update(attempted=False, code=None, claimed_at=None)
             return True
 
 
@@ -1301,6 +1384,16 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
         }
+        # Registry-loss recovery surface (the desktop reconnect popup's
+        # contract): present ONLY while a claim awaits owner approval. The
+        # code is not a credential — approval additionally requires the
+        # owner's own Matrix session — it names WHICH claim gets approved.
+        if _reenroll_state.get("code"):
+            payload["reenroll"] = {
+                "pending": True,
+                "approval_code": _reenroll_state["code"],
+                "claimed_at": _reenroll_state["claimed_at"],
+            }
         # AWP P0 per-channel health: the task connection is `connected` above; the
         # additive event channel (if running) reports its own status, so a
         # supervisor never shows the agent healthy while the event stream is dead.
