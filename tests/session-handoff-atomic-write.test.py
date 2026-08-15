@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""An interrupted or unpublishable handoff must leave the previous snapshot
-byte-identical and must not report success.
-
-Runs the script against a synthetic checkout, so the assertions are about what
-the filesystem holds -- source-shape checks alone pass under `mv ... || true`.
-
-Run: python3 tests/session-handoff-atomic-write.test.py
+"""Publish replaces the snapshot only on success; any other exit leaves the
+previous one byte-identical. Run: python3 tests/session-handoff-atomic-write.test.py
 """
 from __future__ import annotations
 import os
@@ -13,6 +8,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -21,7 +17,7 @@ PRIOR = "PRIOR SNAPSHOT — must survive a failed run\n"
 
 
 class Harness(unittest.TestCase):
-    """A synthetic checkout + workspace so the real script can be executed."""
+    """Synthetic checkout + workspace so the real script can be executed."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -38,18 +34,18 @@ class Harness(unittest.TestCase):
             src = REPO / "src" / name
             if src.exists():
                 shutil.copy(src, self.repo / "src" / name)
-        # Workspace resolution shells out to scripts/sutando-config.sh -> that
-        # chain must be present or the run dies long before the publish step and
-        # every assertion below passes for the wrong reason.
+        # Without this chain the run dies before publish and every assertion
+        # below passes for the wrong reason.
         (self.repo / "scripts").mkdir(exist_ok=True)
         for name in ("sutando-config.sh", "python-binary.sh"):
             src = REPO / "scripts" / name
             if src.exists():
                 shutil.copy(src, self.repo / "scripts" / name)
-        # Resolve to our sandbox workspace rather than the real one.
-        (self.repo / "sutando.config.local.json").write_text(
-            '{"workspace": {"path": "%s"}}\n' % self.ws
-        )
+        # _find_repo_root() anchors on sutando.config.json, not the .local
+        # override: writing only .local leaves root=None and resolves to $HOME.
+        cfg = '{"workspace": {"path": "%s"}}\n' % self.ws
+        (self.repo / "sutando.config.json").write_text(cfg)
+        (self.repo / "sutando.config.local.json").write_text(cfg)
         self.state = self.ws / "session-state.md"
         self.state.write_text(PRIOR)
 
@@ -60,14 +56,33 @@ class Harness(unittest.TestCase):
     PUBLISH_MARKERS = ("Session state saved", "publish failed", "capture incomplete")
 
     def assert_reached_publish(self, result):
-        """Positive marker, never absence-of-known-failures: a negative list
-        cannot enumerate every early exit, and one slipped through."""
+        # Positive marker, not absence-of-known-failures: a negative list cannot
+        # enumerate every early exit, and one slipped through.
         blob = (result.stdout or "") + (result.stderr or "")
         self.assertTrue(
             any(m in blob for m in self.PUBLISH_MARKERS),
             "harness never reached the publish step (no publish marker in "
             f"output) — this assertion would pass vacuously. Got: {blob[:300]!r}",
         )
+
+    def assert_isolated(self):
+        """A tmpdir is not isolation until the resolved path is checked — this
+        suite previously ran against ~/sutando-workspace."""
+        out = subprocess.run(
+            ["bash", str(self.repo / "scripts" / "sutando-config.sh"), "workspace"],
+            capture_output=True, text=True, cwd=str(self.repo),
+            env={**os.environ, "SUTANDO_REPO_DIR": str(self.repo)},
+        ).stdout.strip()
+        self.assertTrue(
+            out and pathlib.Path(out).resolve() == self.ws.resolve(),
+            f"harness is NOT isolated: script resolves workspace to {out!r}, "
+            f"expected {self.ws}. Every assertion below would watch a file "
+            f"nothing writes.",
+        )
+
+    def stages(self):
+        """Staging files the script creates beside the destination."""
+        return sorted(self.ws.glob("session-state.md.tmp.*"))
 
     def run_handoff(self, env_extra=None, timeout=180):
         env = dict(os.environ)
@@ -82,9 +97,24 @@ class Harness(unittest.TestCase):
 
 
 class TestPublishBehaviour(Harness):
+    def test_successful_publish_replaces_the_prior_snapshot(self):
+        # The only case proving the harness can publish at all; without it the
+        # failure assertions can hold vacuously.
+        self.assert_isolated()
+        r = self.run_handoff()
+        self.assert_reached_publish(r)
+        self.assertEqual(r.returncode, 0, f"expected success, got {r.returncode}: {r.stderr[:400]!r}")
+        self.assertIn("Session state saved", r.stdout)
+        body = self.state.read_text()
+        self.assertNotEqual(body, PRIOR, "a successful publish must replace the previous snapshot")
+        self.assertIn("## Recent Conversation", body,
+                      "the published snapshot must be the real capture, not a stub")
+        self.assertEqual(self.stages(), [], "a successful publish must leave no staging file behind")
+
     def test_failed_rename_keeps_the_snapshot_and_reports_failure(self):
-        """A stub `mv` on PATH: a directory at the destination does not fail
-        the rename (mv moves the file inside it), and chflags did not either."""
+        # A stub `mv` on PATH: a directory at the destination does not fail the
+        # rename (mv moves the file inside it), and chflags did not either.
+        self.assert_isolated()
         bin_dir = pathlib.Path(self._tmp.name) / "bin"
         bin_dir.mkdir()
         stub = bin_dir / "mv"
@@ -101,31 +131,43 @@ class TestPublishBehaviour(Harness):
                          "relay retirement must not run after a failed publish")
 
     def test_interrupted_capture_leaves_the_previous_snapshot_intact(self):
-        """Kill the run mid-capture; the old snapshot must be byte-identical."""
-        env = {"PATH": os.environ.get("PATH", "")}
+        # Synchronise on the staging file: a bare wait(timeout) passes when the
+        # script dies early for an unrelated reason, interrupting nothing.
+        self.assert_isolated()
         proc = subprocess.Popen(
             ["bash", str(self.repo / "src" / "session-handoff.sh")],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL, cwd=str(self.repo),
-            env={**os.environ, "SUTANDO_REPO_DIR": str(self.repo), **env},
+            env={**os.environ, "SUTANDO_REPO_DIR": str(self.repo)},
         )
         try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if self.stages():
+                    break
+                if proc.poll() is not None:
+                    self.fail(
+                        "script exited before creating a staging file — nothing "
+                        f"was interrupted (rc={proc.returncode})")
+                time.sleep(0.02)
+            else:
+                self.fail("no staging file appeared within 30s — capture never started")
+
+            self.assertIsNone(proc.poll(), "process must still be capturing when killed")
             proc.kill()
-            proc.wait(timeout=10)
+        finally:
+            proc.communicate(timeout=10)
+
         self.assertEqual(self.state.read_text(), PRIOR,
                          "an interrupted run must not touch the destination")
 
     def test_a_stage_is_used_not_the_destination(self):
-        """Whatever the run does, it must not write the destination in place."""
         src = SCRIPT.read_text()
         self.assertNotIn('} > "$STATE_FILE"', src,
                          "capture must not redirect at the destination")
         self.assertIn('} > "$STATE_TMP"', src)
 
     def test_success_line_is_downstream_of_the_rename(self):
-        """The message must be unreachable unless mv returned 0."""
         src = SCRIPT.read_text()
         tail = src.split('} > "$STATE_TMP"')[-1]
         mv_at = tail.find('mv "$STATE_TMP" "$STATE_FILE"')
@@ -138,7 +180,6 @@ class TestPublishBehaviour(Harness):
                          "the rename's exit status must gate the success line")
 
     def test_relay_retirement_cannot_run_after_a_failed_publish(self):
-        """Both failure paths exit before the relay block is reached."""
         src = SCRIPT.read_text()
         tail = src.split('} > "$STATE_TMP"')[-1]
         relay_at = tail.find("RELAY_PROCESSED")
