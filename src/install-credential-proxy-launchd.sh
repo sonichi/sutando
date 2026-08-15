@@ -55,20 +55,13 @@ resolve_brew_bin() {
     fi
 }
 
-# Read one EnvironmentVariables value from a plist. plistlib, not PlistBuddy:
-# the latter is macOS-only, so on Linux CI every comparison would read empty.
-plist_env() {
-    python3 - "$1" "$2" <<'PLISTPY' 2>/dev/null || true
-import plistlib, sys
-try:
-    with open(sys.argv[1], "rb") as fh:
-        env = plistlib.load(fh).get("EnvironmentVariables") or {}
-except Exception:
-    sys.exit(0)
-v = env.get(sys.argv[2])
-if v is not None:
-    sys.stdout.write(str(v))
-PLISTPY
+# Load the interpreter resolver once. Lazy, not top-level: `set -e` is on, so a
+# top-level source aborts before an earlier refusal can name its own reason.
+_load_python_helper() {
+    [ -n "${_PY_HELPER_LOADED:-}" ] && return 0
+    # shellcheck source=../scripts/python-binary.sh
+    . "$REPO/scripts/python-binary.sh" || return 1
+    _PY_HELPER_LOADED=1
 }
 
 # Render the template to $1 with this checkout's values. ONE renderer, shared with
@@ -80,9 +73,7 @@ render_plist() {
     # validated, not an empty string.
     _ccd="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
     [ -n "$_ccd" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; return 1; }
-    # A bare python3 can be the Xcode-CLT stub, which passes an existence check
-    # and raises the install dialog.
-    . "$REPO/scripts/python-binary.sh"
+    _load_python_helper || return 1
     _py="$(require_python "$REPO" "render the credential-proxy launchd plist")" || return 1
     "$_py" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$1" \
         "REPO=$REPO" \
@@ -95,8 +86,14 @@ render_plist() {
 
 # Semantic plist equality. plistlib, not PlistBuddy: the latter is macOS-only, so on
 # Linux CI every read returns empty and any comparison passes vacuously.
+# resolve_python, not require_python: is-current runs on every boot and must stay
+# silent — no interpreter means "cannot compare", which the caller treats as drift.
 plists_equal() {
-    python3 - "$1" "$2" <<'PLISTPY'
+    local _py
+    _load_python_helper || return 1
+    _py="$(resolve_python "$REPO")"
+    [ -n "$_py" ] || return 1
+    "$_py" - "$1" "$2" <<'PLISTPY'
 import plistlib, sys
 try:
     with open(sys.argv[1], "rb") as a, open(sys.argv[2], "rb") as b:
