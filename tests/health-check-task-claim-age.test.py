@@ -262,6 +262,20 @@ class TestClaimExecutionContract(unittest.TestCase):
         self.assertEqual(r["status"], "down", r["detail"])
         self.assertIn("task already archived", r["detail"])
 
+    def test_archive_before_claim_release_is_not_an_outage(self):
+        # The reviewer's case: handler published, bridge archived the task,
+        # and finish_handler_task has not processed HANDLER_DONE yet.
+        r = self._run([(os.getpid(), "fallback", 0.01, False)])
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_a_stranded_old_claim_with_no_task_is_still_caught(self):
+        r = self._run([(os.getpid(), "fallback", 2.0, False)])
+        self.assertEqual(r["status"], "down", r["detail"])
+        self.assertIn("task already archived", r["detail"])
+
+    def test_the_grace_is_a_deliberate_interval_not_zero(self):
+        self.assertGreaterEqual(self.hc._TASK_CLAIM_ARCHIVE_GRACE_S, 60)
+
     def test_a_single_leaked_claim_is_caught_at_any_age(self):
         # Strictly better than the count rule this replaced, which needed six.
         r = self._run([(os.getpid(), "fallback", 0.2, False)])

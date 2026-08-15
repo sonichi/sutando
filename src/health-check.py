@@ -5805,6 +5805,11 @@ def _claim_owner(path: Path):
     return pid, disposition, task_path
 
 
+# Archive-then-release is a normal asynchronous transition, so an absent task
+# only condemns a claim once it is older than the slowest such handoff.
+_TASK_CLAIM_ARCHIVE_GRACE_S = 300
+
+
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     """Held-but-unsettled task-handler claims — a leak no other probe can see.
 
@@ -5833,9 +5838,14 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         # several claims -- so neither count nor age can condemn it.
         task_live = bool(task_path) and Path(task_path).exists()
         if not task_live:
-            # The task was archived, so the work finished and nothing released
-            # the claim. That is the leak, at any age and any count.
-            leaked.append((age, entry.name, "task already archived"))
+            # Archival and claim release are ASYNCHRONOUS: the handler can
+            # publish, the bridge archive the task, and finish_handler_task
+            # still be processing HANDLER_DONE. Only past that window is an
+            # absent task evidence that nothing will release the claim.
+            if age >= _TASK_CLAIM_ARCHIVE_GRACE_S:
+                leaked.append((age, entry.name, "task already archived"))
+            else:
+                in_flight += 1
         elif pid is not None and not _pid_alive(pid):
             leaked.append((age, entry.name, "owner process gone"))
         elif disposition == "must-handle":
