@@ -247,13 +247,17 @@ def _terminate_process_group(process: subprocess.Popen) -> None:
         process.wait(timeout=2)
 
 
-def _run_process_bounded(command: list[str], cwd: Path) -> tuple[int, str, str]:
+def _run_process_bounded(
+    command: list[str], cwd: Path, environment_overrides: Optional[dict[str, str]] = None,
+) -> tuple[int, str, str]:
     """Run a streaming CLI with hard and no-progress deadlines."""
     hard_timeout = float(os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "900"))
     stall_timeout = float(os.environ.get("SUTANDO_TIER_STALL_TIMEOUT", "180"))
     if hard_timeout <= 0 or stall_timeout <= 0:
         raise ValueError("tier runtime timeouts must be positive")
     environment = os.environ.copy()
+    if environment_overrides:
+        environment.update(environment_overrides)
     # Binary pipes read with nonblocking os.read: a text-mode readline() blocks on
     # a partial line even after select() reports readable, so a provider that emits
     # bytes without a newline then stalls would wedge the timeout loop forever
@@ -377,7 +381,7 @@ def _run_team(runtime: str, prompt: str, repo: Path, workspace: Path) -> str:
     secret_filter = _load_team_result_scanner(repo)
     if runtime == "claude":
         return_code, stdout, stderr = _run_process_bounded(
-            _claude_team_command(prompt), cwd)
+            _claude_team_command(prompt), cwd, {"SUTANDO_TEAM_RUNTIME": "1"})
         if return_code:
             raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
         body = _claude_stream_result(stdout)

@@ -3163,7 +3163,8 @@ def _load_channel_env(channel: str) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800, binary_path: Optional[Path] = None) -> None:
+def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800,
+                          binary_path: Optional[Path] = None, artifact_threshold_sec: int = 120) -> None:
     """Mark `check` as 'stale' in place if a process matching `pgrep_pattern`
     started more than `threshold_sec` before `src_file`'s mtime.
 
@@ -3241,6 +3242,23 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         # Pick the OLDEST start time — the tsx wrapper spawns a child node
         # process; we want the parent's launch time, not the child's.
         proc_start = min(starts)
+        # A compiled service executes the ARTIFACT, so src-vs-process cannot see
+        # a deploy that refreshes the artifact without touching source.
+        if binary_path is not None and binary_path.exists():
+            try:
+                bin_mtime = binary_path.stat().st_mtime
+                # Smaller than the source threshold, which exists to absorb
+                # `git checkout` mtime bumps -- those never touch an artifact.
+                if bin_mtime - proc_start > artifact_threshold_sec:
+                    age_min = int((bin_mtime - proc_start) / 60)
+                    check["status"] = "stale"
+                    check["detail"] = (
+                        f"running, but the artifact it executes was rebuilt "
+                        f"{age_min} min after the process started -- restart needed"
+                    )
+                    return
+            except OSError:
+                pass
         src_mtime = src_file.stat().st_mtime
         if src_mtime - proc_start > threshold_sec:
             # Before flagging stale, cross-check with git: mtime gets bumped by
@@ -3397,6 +3415,16 @@ def _voice_log_path() -> Path:
     return workspace_log
 
 
+def _voice_dep_detail(voice_check: dict) -> str:
+    """Status word plus the dependency's own detail. A bare status reads
+    identically at minute one and hour twelve, so it cannot signal urgency."""
+    vs = voice_check.get("status")
+    if not vs:
+        return "voice-agent status unknown"
+    dep = (voice_check.get("detail") or "").strip()
+    return f"voice-agent {vs}" + (f": {dep}" if dep else "")
+
+
 def check_voice_watchers(voice_check: dict) -> dict:
     """Verify all 3 task-bridge watchers are registered in the current
     voice-agent process. Parses logs/voice-agent.log for the most recent
@@ -3409,7 +3437,7 @@ def check_voice_watchers(voice_check: dict) -> dict:
     vs = voice_check.get("status")
     if vs != "ok":
         check["status"] = "warn"
-        check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
+        check["detail"] = _voice_dep_detail(voice_check)
         return check
     log_file = _voice_log_path()
     if not log_file.exists():
@@ -3486,7 +3514,7 @@ def check_voice_transport(voice_check: dict) -> dict:
     vs = voice_check.get("status")
     if vs != "ok":
         check["status"] = "warn"
-        check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
+        check["detail"] = _voice_dep_detail(voice_check)
         return check
     log_file = _voice_log_path()
     if not log_file.exists():
@@ -4027,7 +4055,9 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     # result depends on ambient host state is worse than the bug it guards -- and CI,
     # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
-    if proxy_status != "ok":
+    # "stale" means listening but executing pre-deploy code -- still routing,
+    # so gating it out here would mute this check exactly during a redeploy.
+    if proxy_status not in ("ok", "stale"):
         check["detail"] = "credential proxy not running — quota telemetry not expected"
         return check
     path = status_read_path("quota-state.json", WORKSPACE_DIR)
@@ -4262,7 +4292,9 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     material of any kind, is read or logged.
     """
     name = "quota-account-identity"
-    if proxy_status != "ok":
+    # "stale" means listening but executing pre-deploy code -- still routing,
+    # so gating it out here would mute this check exactly during a redeploy.
+    if proxy_status not in ("ok", "stale"):
         return {"name": name, "status": "ok",
                 "detail": "credential proxy not up — nothing to compare"}
 
@@ -5374,6 +5406,16 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
             # pair past the threshold is stranded rather than in flight.
             if task_age < threshold_age_sec:
                 continue
+        # A declared skip was never going to be delivered. `[deduped:]` stays
+        # reported: it PROMISES delivery elsewhere, so stranding it loses a reply.
+        try:
+            from result_markers import parse_markers  # noqa: PLC0415
+            skips = {a.value for a in parse_markers(path.read_text()).actions
+                     if a.kind == "skip"}
+        except (OSError, ValueError, ImportError):
+            skips = set()          # unreadable -> judge it as before, never silently clear
+        if skips & {"no-send", "REPLIED"}:
+            continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
@@ -5665,11 +5707,15 @@ def check_task_watcher() -> dict:
             if len(roots) == 1 and supervised:
                 # Its session is still its parent, so it IS supervised and there is
                 # no second tree to duplicate work. Killing it is what opens a gap.
+                # `--fix` re-stamps the sentinel instead: the pid is a live watcher,
+                # so naming it restores Stop-hook cleanup without the restart.
                 return {"name": name, "status": "warn",
+                        "_sentinel_restamp_pid": roots[0],
                         "detail": f"watcher pid {roots[0]} runs under a live session "
                                   f"(ppid {parents[roots[0]]}) but wrote no PID "
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
-                                  "it IS draining tasks/. Restart cleanly only when tasks/ is empty."}
+                                  "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
+                                  "restart cleanly only when tasks/ is empty."}
             return {"name": name, "status": "warn",
                     "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
                               f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
@@ -5708,6 +5754,71 @@ def check_task_watcher() -> dict:
                           f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
                           f"more than once. Keep the sentinel's ({pid}), stop the rest"}
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
+
+
+def fix_task_watcher_sentinel(check: dict) -> str:
+    """Re-stamp the PID sentinel for a supervised watcher that lost it (--fix).
+
+    Only the single-supervised-tree case is repairable: that pid IS a live
+    watcher whose session still owns it, so naming it restores Stop-hook
+    cleanup and probe tracking. The alternative the warning offers is a
+    restart, which strands tasks/ mid-drain.
+    """
+    pid = str(check.get("_sentinel_restamp_pid") or "")
+    if not pid.isdigit():
+        return "no re-stampable watcher pid"
+    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # Re-measure before writing: the check ran earlier, and this file is what
+    # the Stop hook kills.
+    if not _is_watcher_argv(_proc_argv(int(pid))):
+        return f"pid {pid} is no longer the watcher — not re-stamped"
+    try:
+        # Separate try: mkdir raises FileExistsError when state/ is a plain
+        # file, which is a write failure, not a competing claim.
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"could not write {pid_file}: {e}"
+    try:
+        # Exclusive create, not exists()-then-write: only the OS can arbitrate
+        # against a watcher claiming the sentinel in the same instant.
+        with open(pid_file, "x") as fh:
+            fh.write(f"{pid}\n")
+    except FileExistsError:
+        return "a watcher re-claimed the sentinel — left its file alone"
+    except OSError as e:
+        return f"could not write {pid_file}: {e}"
+    # The probe above was a snapshot taken BEFORE publication; retract our own
+    # stamp if it went stale mid-write.
+    if not _is_watcher_argv(_proc_argv(int(pid))):
+        try:
+            # Read-then-unlink, NOT arbitrated the way the write above is:
+            # POSIX has no conditional unlink, so a claim landing here is lost.
+            if pid_file.read_text().strip() == pid:
+                pid_file.unlink()
+        except OSError as e:
+            # Reporting a withdrawal that did not happen is the same class of
+            # lie as the stale stamp; the operator needs the real state.
+            return (f"pid {pid} stopped being the watcher mid-write and the "
+                    f"stamp could not be withdrawn: {e}")
+        return f"pid {pid} stopped being the watcher mid-write — sentinel withdrawn"
+    return f"re-stamped the sentinel for live watcher pid {pid}"
+
+
+def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
+    """--fix dispatch for task-watcher: warn-level, so it never reaches the
+    issues loop and needs its own pass (same shape as the skill-symlinks one).
+
+    `stream` is where the repair line goes; a caller emitting JSON on stdout
+    MUST pass sys.stderr. The check is RE-RUN rather than assumed repaired —
+    a fixer's self-report is not evidence of the resulting state.
+    """
+    out = stream if stream is not None else sys.stdout
+    for c in checks:
+        if c["name"] == "task-watcher" and c.get("_sentinel_restamp_pid"):
+            print(f"  {c['name']}: {fix_task_watcher_sentinel(c)}", file=out)
+            fresh = check_task_watcher()
+            c.clear()
+            c.update(fresh)
 
 
 def _fresh_local_core_record(
@@ -6821,6 +6932,18 @@ def check_claude_hook_registration(
                 "detail": "could not parse HOOKS=(...) from install-claude-hooks.sh — "
                           "cannot verify registration (reporting rather than assuming clean)"}
 
+    # Skill-declared hooks are appended to HOOKS at run time, so the static parse
+    # above cannot see them. Same discovery the installer uses — a second copy here
+    # would drift and quietly stop verifying whatever the installer registered.
+    try:
+        sys.path.insert(0, str(repo / "src"))
+        from skill_hooks import discover as _discover_skill_hooks
+        owned.extend(_discover_skill_hooks(repo))
+    except Exception as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"skill-hook discovery failed ({exc}) — "
+                          f"cannot verify skill-declared hooks"}
+
     sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
     settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
     if not settings.is_file():
@@ -7241,6 +7364,38 @@ def check_core_model_pin() -> dict:
     return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 
+def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
+    """True when a live process matching `pgrep_pattern` has `artifact` in argv.
+    A dev host can hold a build it never executes, so gate on the process."""
+    if not artifact.exists():
+        return False
+    try:
+        out = subprocess.run(["/usr/bin/pgrep", "-f", pgrep_pattern],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return any(str(artifact) in _proc_argv(int(pid))
+               for pid in out.split() if pid.isdigit())
+
+
+def check_credential_proxy() -> dict:
+    """Credential proxy (port 7846). probe=False: a forwarding proxy has no
+    liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
+    check = check_port(7846, "credential-proxy", probe=False)
+    if check["status"] == "down":
+        check["status"] = "warn"
+        check["detail"] = "not running (optional)"
+    elif check["status"] == "ok":
+        artifact = REPO_DIR / "dist" / "credential-proxy.js"
+        mark_stale_if_outdated(
+            check,
+            REPO_DIR / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts",
+            "credential-proxy",
+            binary_path=(artifact
+                         if _process_executes_artifact(artifact, "credential-proxy")
+                         else None),
+        )
+    return check
 MENUBAR_LABEL = "com.sutando.menubar"
 MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
 
@@ -7284,17 +7439,9 @@ def run_all_checks() -> list[dict]:
         # startup.sh's lsof guard sees the port as occupied and won't restart it.
         checks.append(c)
 
-    # Credential proxy (port 7846) — the OAuth-injection + quota-header path
-    # (skills/quota-tracker/scripts/credential-proxy.ts). It was previously
-    # unmonitored, so a dead proxy (= broken auth/quota for proxy-routed cores)
-    # never surfaced on the dashboard. Plain TCP-listening check (probe=False):
-    # it's a forwarding proxy with no liveness endpoint, so an HTTP probe would
-    # be forwarded upstream and misread as "wedged". Optional (not every node
-    # routes through it) → down is a warning, not a failure.
-    proxy_check = check_port(7846, "credential-proxy", probe=False)
-    if proxy_check["status"] == "down":
-        proxy_check["status"] = "warn"
-        proxy_check["detail"] = "not running (optional)"
+    # Previously unmonitored, so a dead proxy (= broken auth/quota for
+    # proxy-routed cores) never surfaced on the dashboard.
+    proxy_check = check_credential_proxy()
     checks.append(proxy_check)
 
     # Quota telemetry — only meaningful when the proxy is actually up.
@@ -8976,6 +9123,7 @@ def main():
     # of #2663 — the first version of this hoist printed to stdout regardless).
     if do_fix:
         apply_skill_symlink_fixes(checks, stream=sys.stderr if as_json else sys.stdout)
+        apply_task_watcher_sentinel_fix(checks, stream=sys.stderr if as_json else sys.stdout)
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
@@ -9033,7 +9181,10 @@ def main():
         emit_task_for_failures(checks)
 
     if as_json:
-        print(json.dumps({"checks": checks, "issues": len(issues), "total": len(checks)}, indent=2))
+        # Underscore keys are the fix pass's internal channel, and whether one
+        # is present depends on the flags — so they must not reach consumers.
+        payload = [{k: v for k, v in c.items() if not k.startswith("_")} for c in checks]
+        print(json.dumps({"checks": payload, "issues": len(issues), "total": len(checks)}, indent=2))
         return
 
     # --quiet: print only issues (or nothing if clean). Exit code reflects state.

@@ -190,9 +190,15 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    It reports success in every cheap way: bytes land, the path is right, nothing errors, the file grows. **Only calling the reader shows the zero.** So after writing, assert it:
    ```bash
-   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=[str(x) for x in m.get_waiting_questions()];print(any('<a distinctive phrase from your question>' in x for x in q))"
+   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=m.get_waiting_questions();print(len(q), sum('<distinctive phrase from your TITLE>' in (x.get('title') or '') for x in q))"
    ```
-   A `True` is the only proof the question exists for anyone but you.
+   **Match on `title`, and check that the COUNT went up — not `str(x)`.** ⚠ 2026-08-13: the
+   substring-anywhere form above this line passed while the entry was **swallowed into the
+   neighbouring section's body**, because a merged section still contains your text. The reader
+   splits on `##` ONLY; a `###` heading is body text, not a new question. Tell: a purely additive
+   edit (`git diff --numstat` = N/0) that leaves the count UNCHANGED. I saw that delta=0, explained
+   it away as a stale count, and only a title-level check showed the zero. The count is the
+   discriminator; the substring cannot fail the way this actually fails.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
