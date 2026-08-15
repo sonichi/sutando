@@ -391,65 +391,99 @@ class _RecoverLoop(unittest.TestCase):
             _reset()
 
 
-    def test_identity_missing_with_token_loops_and_claims_when_identity_appears(self):
-        # Issue #2924 (Chi's-host cohort): token via bare env var, no channel
-        # env pointers -> the OLD contract fatal-crash-looped with the claim
-        # code present but unreachable. Now: enter the loop, retry identity
-        # each cycle, park once it appears — no restart needed.
-        saved = {n: getattr(gw, n) for n in
-                 ("TOKEN_FILE", "TOKEN", "AUTH_RECHECK_INTERVAL", "REENROLL_ENABLED",
-                  "_reload_rotated_token", "_heartbeat_singleton", "_auth_probe",
-                  "_config_from_channel_env", "_emit_gateway_status", "_log",
-                  "REENROLL_PROBE_EVERY", "URL")}
-        env = {k: gw.os.environ.get(k) for k in ("AGENT_MXID", "AGENT_ID")}
+    def _loop_harness(self, saved_extra=()):
+        names = ("TOKEN_FILE", "TOKEN", "AUTH_RECHECK_INTERVAL", "REENROLL_ENABLED",
+                 "_reload_rotated_token", "_heartbeat_singleton", "_auth_probe",
+                 "_emit_gateway_status", "_log", "REENROLL_PROBE_EVERY",
+                 "URL") + tuple(saved_extra)
+        saved = {n: getattr(gw, n) for n in names}
+        env = {k: gw.os.environ.get(k)
+               for k in ("AGENT_MXID", "AGENT_ID", "AG2_DEVICE_ENV",
+                         "CLAUDE_CONFIG_DIR")}
+        for k in env:
+            gw.os.environ.pop(k, None)
+        gw.TOKEN_FILE = ""
+        gw.TOKEN = "ab" * 24
+        gw.URL = "https://chat.example/relay"
+        gw.REENROLL_ENABLED = True
+        gw.AUTH_RECHECK_INTERVAL = 0
+        gw.REENROLL_PROBE_EVERY = 1
+        gw._reload_rotated_token = lambda: False
+        gw._emit_gateway_status = lambda *a, **k: None
+        return saved, env
+
+    def _restore(self, saved, env):
+        for n, v in saved.items():
+            setattr(gw, n, v)
+        for k, v in env.items():
+            if v is None:
+                gw.os.environ.pop(k, None)
+            else:
+                gw.os.environ[k] = v
+        _reset()
+
+    def test_pointered_identity_written_midepisode_is_detected_without_restart(self):
+        # Issue #2924 review split, half 1: with a channel-env POINTER present,
+        # the REAL file-reading path detects a newly written AGENT_MXID —
+        # no mocks on the config reader, a real temp .env.
+        saved, env = self._loop_harness()
+        import tempfile
+        envfile = Path(tempfile.mkdtemp()) / "device.env"
+        envfile.write_text("REMOTE_TASK_TOKEN=unused\n")
+        gw.os.environ["AG2_DEVICE_ENV"] = str(envfile)
+        logs = []
+        gw._log = logs.append
+        beats = {"n": 0}
+
+        def beat():
+            beats["n"] += 1
+            if beats["n"] == 2:   # operator writes the fix mid-episode
+                envfile.write_text("AGENT_MXID=@late.agent:ag2.space\n")
+            return beats["n"] < 25
+        gw._heartbeat_singleton = beat
+
+        def fake_urlopen(req, timeout=0):
+            resp = io.BytesIO(json.dumps(
+                {"ok": True, "pending": True,
+                 "approval_code": "late1234"}).encode())
+            resp.__enter__ = lambda *a: resp
+            resp.__exit__ = lambda *a: False
+            return resp
+        real = gw.urllib.request.urlopen
+        gw.urllib.request.urlopen = fake_urlopen
+        gw._auth_probe = lambda: True
         try:
-            gw.TOKEN_FILE = ""
-            gw.TOKEN = "ab" * 24
-            gw.URL = "https://chat.example/relay"
-            gw.REENROLL_ENABLED = True
-            gw.AUTH_RECHECK_INTERVAL = 0
-            gw.REENROLL_PROBE_EVERY = 1
-            gw._reload_rotated_token = lambda: False
-            gw._heartbeat_singleton = lambda: True
-            gw._emit_gateway_status = lambda *a, **k: None
-            gw._log = lambda m: None
-            gw.os.environ.pop("AGENT_MXID", None)
-            gw.os.environ.pop("AGENT_ID", None)
-            reads = {"n": 0}   # operator writes the .env mid-episode
-
-            def cfg(k):
-                if k != "AG2SPACE_USER_ID":
-                    return ""
-                reads["n"] += 1
-                return "@late.agent:ag2.space" if reads["n"] >= 2 else ""
-            gw._config_from_channel_env = cfg
-            polls = {"n": 0}
-
-            def fake_urlopen(req, timeout=0):
-                resp = io.BytesIO(json.dumps(
-                    {"ok": True, "pending": True,
-                     "approval_code": "late1234"}).encode())
-                resp.__enter__ = lambda *a: resp
-                resp.__exit__ = lambda *a: False
-                return resp
-            real = gw.urllib.request.urlopen
-            gw.urllib.request.urlopen = fake_urlopen
-
-            gw._auth_probe = lambda: True
-            try:
-                self.assertTrue(gw._recover_auth(401))   # loops; never fatal
-            finally:
-                gw.urllib.request.urlopen = real
+            self.assertTrue(gw._recover_auth(401))
             self.assertIn("recovered_at", gw._reenroll_state)
+            self.assertTrue(any("without restart" in ln for ln in logs))
         finally:
-            for n, v in saved.items():
-                setattr(gw, n, v)
-            for k, v in env.items():
-                if v is None:
-                    gw.os.environ.pop(k, None)
-                else:
-                    gw.os.environ[k] = v
-            _reset()
+            gw.urllib.request.urlopen = real
+            self._restore(saved, env)
+
+    def test_no_pointer_cohort_waits_stably_and_names_the_restart(self):
+        # Half 2: with NO pointers, no in-process fix is possible — the loop
+        # must hold a stable wait (never fatal, never claim) and the log must
+        # say a wrapper/app restart is required, not promise a live retry.
+        saved, env = self._loop_harness()
+        logs = []
+        gw._log = logs.append
+        beats = {"n": 0}
+
+        def beat():
+            beats["n"] += 1
+            return beats["n"] < 6   # bounded observation window, no wall clock
+        gw._heartbeat_singleton = beat
+        gw._auth_probe = lambda: self.fail("probe must not run with no claim")
+        gw.urllib.request.urlopen = lambda *a, **k: self.fail("no POST expected")
+        try:
+            with self.assertRaises(SystemExit):   # singleton hard-stop, not FATAL-401
+                gw._recover_auth(401)
+            self.assertTrue(any("RESTART the wrapper" in ln for ln in logs))
+            self.assertIsNone(gw._reenroll_state["code"])
+        finally:
+            gw.urllib.request.urlopen = urllib.request.urlopen
+            self._restore(saved, env)
+
 
     def test_fatal_contract_survives_only_where_recovery_impossible(self):
         saved = {n: getattr(gw, n) for n in
