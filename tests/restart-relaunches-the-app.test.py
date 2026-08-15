@@ -1,23 +1,6 @@
 #!/usr/bin/env python3
-"""restart.sh must relaunch Sutando.app it killed, before its terminal exec.
-
-`restart.sh:73` pkills `src/Sutando/Sutando` and nothing brought it back, so
-every restart silently dropped the owner's hotkeys, menu bar, and the app's
-`checkWatcher()` timer -- the watchdog that re-arms a missing task watcher.
-
-The relaunch lives in restart.sh, NOT startup.sh: `tests/startup-headless.test.sh`
-guards startup.sh as headless -- desktop process management belongs to product
-entry points, never the open-source core startup. An earlier revision of this PR
-put it in startup.sh and that guard failed it, correctly.
-
-Two assertions are load-bearing beyond "a launch exists":
-
-* **`pgrep -x`, not `-f`.** `pgrep -f Sutando` matches the argv of the shell
-  running the check, so it reports the app as running when it is not.
-* **The launch must precede the final `exec`.** restart.sh ends in
-  `exec bash .../startup.sh`, which replaces the process; anything after it is
-  unreachable, yet greps as present.
-"""
+"""restart.sh must relaunch the app it kills at :73, before its terminal exec.
+The relaunch lives here, not startup.sh: tests/startup-headless.test.sh guards that file as headless."""
 from __future__ import annotations
 
 import re
@@ -52,10 +35,7 @@ class RestartRelaunchesTheApp(unittest.TestCase):
 
     def test_the_launch_is_reachable_before_the_terminal_exec(self):
         """A block after `exec` greps as present and never runs.
-
-        This is the assertion a source-grep test usually misses: presence is not
-        reachability in a script whose last statement replaces the process.
-        """
+        Presence is not reachability when the last statement replaces the process."""
         launch = self.text.index('nohup "$APP_BIN"')
         execs = [m.start() for m in
                  re.finditer(r'^exec bash "\$REPO/src/startup\.sh"',
