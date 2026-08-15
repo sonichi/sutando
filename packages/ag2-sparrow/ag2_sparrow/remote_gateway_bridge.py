@@ -1237,6 +1237,11 @@ def _recover_auth(code: int) -> bool:
             _reenroll_clear()
             return True
         cycle += 1
+        # A transiently-failed claim must not end the episode: re-claiming is
+        # safe exactly while nothing is parked (no code to supersede).
+        if not pending and cycle % REENROLL_PROBE_EVERY == 0:
+            _reenroll_state["attempted"] = False
+            _reenroll_claim()
         if pending and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
             _log("re-link approved — the existing token is accepted again; resuming")
             _reenroll_clear(recovered=True)

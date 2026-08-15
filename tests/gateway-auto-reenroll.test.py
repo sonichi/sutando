@@ -213,6 +213,48 @@ class _RecoverLoop(unittest.TestCase):
                 setattr(gw, n, v)
             _reset()
 
+    def test_transiently_failed_claim_retries_and_parks_later(self):
+        # Reviewer blocker: `attempted` latched before the POST, so a claim
+        # that failed transiently never retried — on the standard install
+        # (TOKEN_FILE set) the bridge then waited forever with no reenroll
+        # block and no popup. Retrying while nothing is parked is safe.
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "AUTH_RECHECK_INTERVAL", "_reload_rotated_token",
+                  "_heartbeat_singleton", "_auth_probe", "_reenroll_claim",
+                  "_emit_gateway_status", "_log", "REENROLL_PROBE_EVERY")}
+        try:
+            gw.TOKEN_FILE = "/tmp/token-file"   # rotation channel exists: no fatal exit
+            gw.AUTH_RECHECK_INTERVAL = 0
+            gw.REENROLL_PROBE_EVERY = 1
+            gw._reload_rotated_token = lambda: False
+            gw._emit_gateway_status = lambda *a, **k: None
+            gw._log = lambda m: None
+            beats = {"n": 0}
+
+            def beat():
+                beats["n"] += 1
+                # Hard stop: a no-retry regression must FAIL (SystemExit),
+                # never hang the suite.
+                return beats["n"] < 20
+            gw._heartbeat_singleton = beat
+            calls = {"n": 0}
+
+            def claim():
+                calls["n"] += 1
+                gw._reenroll_state["attempted"] = True
+                if calls["n"] >= 2:   # first POST fails transiently; retry parks
+                    gw._reenroll_state["code"] = "cafe5678"
+                    gw._reenroll_state["claimed_at"] = 1
+            gw._reenroll_claim = claim
+            gw._auth_probe = lambda: True
+            self.assertTrue(gw._recover_auth(401))
+            self.assertGreaterEqual(calls["n"], 2)
+            self.assertIn("recovered_at", gw._reenroll_state)  # explicit terminal
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+            _reset()
+
     def test_rotation_wins_over_pending_claim_and_clears_it(self):
         # Review P1: rotation used to return True with the stale code still
         # published — the desktop would keep presenting a dead approval code.
