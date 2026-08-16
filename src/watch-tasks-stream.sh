@@ -50,6 +50,8 @@ fi
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=watcher_sentinel.sh
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
+# shellcheck source=task-emit.sh
+source "$__SCRIPT_DIR/task-emit.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -501,7 +503,7 @@ fallback_outstanding_handlers() {
           1)
             printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
             echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-            printf 'TASK_FILE: %s\n' "$filename" >&9 || true
+            emit_task_file "$filename"
             ;;
           *)
             echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -537,7 +539,7 @@ fallback_outstanding_handlers() {
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
         echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        printf 'TASK_FILE: %s\n' "$filename" >&9 || true
+        emit_task_file "$filename"
         ;;
       *)
         echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2

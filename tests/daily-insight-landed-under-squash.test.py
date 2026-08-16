@@ -19,8 +19,14 @@ def _load():
 
 def _git(repo):
     def g(*a):
-        subprocess.run(["git", "-C", str(repo), *a], check=True,
-                       capture_output=True, text=True)
+        # check=True raises with the exit code only, so a failing fixture reports
+        # "returned non-zero exit status 128" and discards git's reason for it.
+        p = subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+        if p.returncode != 0:
+            raise AssertionError(
+                f"git {' '.join(a)} exited {p.returncode} in {repo}\n"
+                f"  stderr: {(p.stderr or '').strip() or '(empty)'}\n"
+                f"  stdout: {(p.stdout or '').strip() or '(empty)'}")
     return g
 
 
@@ -137,8 +143,11 @@ class TestLandedUnderSquash(unittest.TestCase):
             for i in range(30):
                 g("commit", "-q", "--allow-empty", "-m", f"c{i}")
             dst = pathlib.Path(td) / "shallow"
-            subprocess.run(["git", "clone", "-q", "--depth", "1",
-                            f"file://{src}", str(dst)], check=True, capture_output=True)
+            c = subprocess.run(["git", "clone", "-q", "--depth", "1",
+                                f"file://{src}", str(dst)], capture_output=True, text=True)
+            if c.returncode != 0:
+                raise AssertionError(f"git clone exited {c.returncode}\n"
+                                     f"  stderr: {(c.stderr or '').strip() or '(empty)'}")
             d = _git(dst)
             d("config", "user.email", "t@example.com")
             d("config", "user.name", "t")
