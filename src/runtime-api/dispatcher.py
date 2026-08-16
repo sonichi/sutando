@@ -21,6 +21,7 @@ Do not simplify or reword them.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
 import sqlite3
@@ -31,11 +32,15 @@ from typing import Callable, Mapping, Optional
 _HERE = Path(__file__).resolve().parent
 import sys  # noqa: E402
 sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_HERE.parent))
 
 from protocol import ELICITATION_TYPES, ProtocolError  # noqa: E402
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
 from capability_registry import EphemeralCapabilityRegistry  # noqa: E402
+from attribution_claims import (AttributionError, canonical_account_id,  # noqa: E402
+                                is_canonical_agent_id, normalize_receipt,
+                                performed_by_claim)
 
 
 def _log(msg: str) -> None:
@@ -73,7 +78,17 @@ def _exec_message_send(params: dict) -> dict:
     event_id = reply.get("event_id") or (reply.get("result") or {}).get("event_id")
     if not event_id:
         raise RuntimeError(f"send not confirmed (no event_id in {str(reply)[:120]!r})")
-    return {"executed": True, "eventId": event_id, "roomId": room}
+    result = {"executed": True, "eventId": event_id, "roomId": room}
+    mxid = os.environ.get("AGENT_MXID")
+    if mxid:
+        result["attributionReceipts"] = [{
+            "provider": "ag2space",
+            "account_id": canonical_account_id("ag2space", mxid),
+            "resource_id": str(room),
+            "object_type": "message",
+            "object_id": str(event_id),
+        }]
+    return result
 
 
 EXECUTORS = {
@@ -116,7 +131,8 @@ class RuntimeDispatcher:
     def __init__(self, store: RequestStore, human_actions: HumanActionAdapter,
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
-                 capability_registry: Optional[EphemeralCapabilityRegistry] = None):
+                 capability_registry: Optional[EphemeralCapabilityRegistry] = None,
+                 attribution_writer=None):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
@@ -124,6 +140,8 @@ class RuntimeDispatcher:
         self.capability_registry = (
             capability_registry if capability_registry is not None
             else EphemeralCapabilityRegistry())
+        self.attribution_writer = attribution_writer
+        self._executing: set = set()
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
 
@@ -164,6 +182,55 @@ class RuntimeDispatcher:
         if relinked or n:
             _log(f"recovered {relinked} pending request(s)"
                  + (f", failed {n} interrupted capability execution(s)" if n else ""))
+        self._publish_attribution_outbox()
+
+    @staticmethod
+    def _receipt_list(result: dict):
+        raw = result.get("attributionReceipts") if isinstance(result, dict) else None
+        if raw is None:
+            return [], None
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 8:
+            return [], "attributionReceipts must contain between 1 and 8 receipts"
+        try:
+            return [normalize_receipt(row) for row in raw], None
+        except AttributionError as exc:
+            return [], str(exc)
+
+    def _publish_attribution_outbox(self) -> None:
+        for row in self.store.attribution_outbox():
+            if self.attribution_writer is None or not is_canonical_agent_id(row["actorId"]):
+                self.store.settle_attribution(
+                    row["requestId"], "unavailable",
+                    "canonical daemon agent identity or attribution writer unavailable",
+                )
+                continue
+            asserted_at = datetime.fromtimestamp(
+                row["createdAt"], timezone.utc,
+            ).isoformat().replace("+00:00", "Z")
+            try:
+                for receipt in row["receipts"]:
+                    self.attribution_writer.append(performed_by_claim(
+                        actor_id=row["actorId"], receipt=receipt,
+                        runtime_request_id=row["requestId"], asserted_at=asserted_at,
+                    ))
+            except Exception as exc:  # noqa: BLE001 — outbox remains retryable
+                _log(f"attribution publication pending for {row['requestId']}: {exc}")
+                continue
+            self.store.settle_attribution(row["requestId"], "recorded")
+
+    def _public(self, rec: dict) -> dict:
+        out = {"requestId": rec["requestId"], "status": rec["status"]}
+        if rec.get("result") is not None:
+            out["result"] = dict(rec["result"])
+            attribution = self.store.attribution_status(rec["requestId"])
+            if attribution is not None:
+                out["result"]["attribution"] = {
+                    "status": attribution["status"],
+                    **({"error": attribution["error"]} if attribution.get("error") else {}),
+                }
+        if rec.get("resolvedBy"):
+            out["resolvedBy"] = rec["resolvedBy"]
+        return out
 
     # ── dispatch ───────────────────────────────────────────────────────────
     async def handle(self, method: str, params: dict) -> dict:
@@ -245,11 +312,7 @@ class RuntimeDispatcher:
                                     f"idempotencyKey {idem_key!r} was used for a "
                                     "different action/resource/input — keys are "
                                     "per-execution, pick a new one")
-            return {"requestId": existing["requestId"],
-                    "status": existing["status"],
-                    **({"result": existing["result"]}
-                       if existing.get("result") is not None else {}),
-                    "idempotentReplay": True}
+            return {**self._public(existing), "idempotentReplay": True}
 
         if idem_key:
             existing = self.store.by_idempotency_key(idem_key)
@@ -329,19 +392,44 @@ class RuntimeDispatcher:
                                   resolved_by="executor")
             return {"requestId": rec["requestId"], "status": "failed",
                     "result": result}
+        self._executing.add(rec["requestId"])
         try:
             # Blocking executors (urlopen) must not stall the event loop — one
             # slow send would freeze every client AND the resolver (review P1,
             # measured: a 1.5s executor delayed asyncio.sleep(0) by 1.5s).
             result = await asyncio.to_thread(executor, params)
+            if not isinstance(result, dict):
+                raise RuntimeError("executor result must be a JSON object")
             status = "completed"
         except Exception as e:  # noqa: BLE001 — executor failure = failed request
             result = {"executed": False, "error": str(e)}
             status = "failed"
-        self.store.transition(rec["requestId"], status, result=result,
-                              resolved_by="executor")
-        return {"requestId": rec["requestId"], "status": status,
-                "result": result}
+        try:
+            if status == "completed":
+                receipts, receipt_error = self._receipt_list(result)
+                if receipt_error:
+                    result = {**result, "attribution": {
+                        "status": "unavailable", "error": receipt_error,
+                    }}
+                    won = self.store.transition(
+                        rec["requestId"], status, result=result, resolved_by="executor")
+                elif receipts:
+                    won = self.store.complete_with_receipts(
+                        rec["requestId"], result, self.actor_id, receipts)
+                    if won:
+                        self._publish_attribution_outbox()
+                else:
+                    won = self.store.transition(
+                        rec["requestId"], status, result=result, resolved_by="executor")
+            else:
+                won = self.store.transition(
+                    rec["requestId"], status, result=result, resolved_by="executor")
+            durable = self.store.get(rec["requestId"])
+            if not won:
+                return self._public(durable)
+            return self._public(durable)
+        finally:
+            self._executing.discard(rec["requestId"])
 
     def _get(self, params: dict) -> dict:
         rec = self._require(params)
@@ -362,6 +450,8 @@ class RuntimeDispatcher:
 
     def _cancel(self, params: dict) -> dict:
         rec = self._require(params)
+        if rec["requestId"] in self._executing:
+            raise ProtocolError(-32602, "an executing capability cannot be cancelled")
         self.store.transition(rec["requestId"], "cancelled",
                               resolved_by=self.actor_id)
         return self._public(self.store.get(rec["requestId"]))
@@ -372,15 +462,6 @@ class RuntimeDispatcher:
         if rec is None:
             raise ProtocolError(-32602, f"unknown requestId: {rid!r}")
         return rec
-
-    @staticmethod
-    def _public(rec: dict) -> dict:
-        out = {"requestId": rec["requestId"], "status": rec["status"]}
-        if rec.get("result") is not None:
-            out["result"] = rec["result"]
-        if rec.get("resolvedBy"):
-            out["resolvedBy"] = rec["resolvedBy"]
-        return out
 
     # ── resolution mapping (ha decision → runtime terminal state) ──────────
     def _settle(self, request_id: str) -> None:

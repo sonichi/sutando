@@ -1,0 +1,16 @@
+{
+  "name": "github-attribution",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Attach the authenticated GitHub account to a canonical agent and write an explicit scoped performer-kind policy.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": ["GH_TOKEN"]
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

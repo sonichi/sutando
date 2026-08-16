@@ -47,6 +47,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_requests_idem
   ON runtime_requests (idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_runtime_requests_status
   ON runtime_requests (status);
+CREATE TABLE IF NOT EXISTS attribution_outbox (
+  request_id    TEXT PRIMARY KEY,
+  actor_id      TEXT NOT NULL,
+  receipts_json TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  error         TEXT,
+  created_at    REAL NOT NULL,
+  updated_at    REAL NOT NULL,
+  FOREIGN KEY (request_id) REFERENCES runtime_requests(request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_attribution_outbox_status
+  ON attribution_outbox (status);
 """
 
 
@@ -174,6 +186,57 @@ class RequestStore:
             " status = 'pending'",
             (new_status, json.dumps(result, ensure_ascii=False) if result is not None else None,
              time.time(), resolved_by, request_id))
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def complete_with_receipts(self, request_id: str, result: dict,
+                               actor_id: str, receipts: list[dict]) -> bool:
+        """Complete provider execution and enqueue its receipts atomically."""
+        now = time.time()
+        try:
+            cur = self._db.execute(
+                "UPDATE runtime_requests SET status = 'completed', result_json = ?,"
+                " resolved_at = ?, resolved_by = 'executor' WHERE request_id = ?"
+                " AND status = 'pending'",
+                (json.dumps(result, ensure_ascii=False), now, request_id))
+            if cur.rowcount != 1:
+                self._db.rollback()
+                return False
+            self._db.execute(
+                "INSERT INTO attribution_outbox"
+                " (request_id, actor_id, receipts_json, status, created_at, updated_at)"
+                " VALUES (?, ?, ?, 'pending', ?, ?)",
+                (request_id, actor_id, json.dumps(receipts, ensure_ascii=False), now, now))
+            self._db.commit()
+            return True
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def attribution_outbox(self, status: str = "pending") -> list[dict]:
+        cur = self._db.execute(
+            "SELECT request_id, actor_id, receipts_json, status, error, created_at"
+            " FROM attribution_outbox WHERE status = ? ORDER BY created_at, request_id",
+            (status,))
+        return [{
+            "requestId": row[0], "actorId": row[1], "receipts": json.loads(row[2]),
+            "status": row[3], "error": row[4], "createdAt": row[5],
+        } for row in cur.fetchall()]
+
+    def attribution_status(self, request_id: str):
+        row = self._db.execute(
+            "SELECT status, error FROM attribution_outbox WHERE request_id = ?",
+            (request_id,)).fetchone()
+        return {"status": row[0], "error": row[1]} if row else None
+
+    def settle_attribution(self, request_id: str, status: str,
+                           error=None) -> bool:
+        if status not in {"recorded", "unavailable"}:
+            raise ValueError("attribution status must be recorded or unavailable")
+        cur = self._db.execute(
+            "UPDATE attribution_outbox SET status = ?, error = ?, updated_at = ?"
+            " WHERE request_id = ? AND status = 'pending'",
+            (status, error, time.time(), request_id))
         self._db.commit()
         return cur.rowcount == 1
 

@@ -80,6 +80,13 @@
       "canonical_for": "proposed privileged-capability mediation, authorization, and audit model",
       "last_verified": "2026-08-04"
     },
+    "docs/identity-attribution.md": {
+      "title": "Identity attribution v1",
+      "audience": ["contributors", "maintainers", "agents"],
+      "status": "canonical",
+      "canonical_for": "canonical principal, account, event, claim, receipt-publication, and attribution-resolution contracts",
+      "last_verified": "2026-08-16"
+    },
     "docs/community-use-cases/README.md": {
       "title": "Community use cases",
       "audience": [

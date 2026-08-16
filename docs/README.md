@@ -45,6 +45,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 - [Architecture boundaries](architecture-boundaries.md)
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
+- [Identity attribution v1](identity-attribution.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)

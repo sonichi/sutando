@@ -359,12 +359,22 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     threading.Thread(target=gw.serve_forever, daemon=True).start()
     os.environ["REMOTE_TASK_URL"] = f"http://127.0.0.1:{gw.server_address[1]}"
     os.environ["REMOTE_TASK_TOKEN"] = "test-bearer-not-real"
+    prior_agent_mxid = os.environ.get("AGENT_MXID")
+    os.environ["AGENT_MXID"] = "@agent:example.org"
     try:
         good_send = {"resource": {"roomId": "!r:hs"}, "input": {"body": "hi"}}
         out = rt_dispatcher._exec_message_send(good_send)
-        check(out == {"executed": True, "eventId": "$sent-1", "roomId": "!r:hs"}
-              and hits[0]["op"] == "message",
+        receipt = (out.get("attributionReceipts") or [{}])[0]
+        check(out.get("executed") is True and out.get("eventId") == "$sent-1"
+              and out.get("roomId") == "!r:hs" and hits[0]["op"] == "message",
               "_exec_message_send delivers and returns the event id")
+        check(receipt == {
+                  "provider": "ag2space",
+                  "account_id": "account:ag2space:%40agent%3Aexample.org",
+                  "resource_id": "!r:hs",
+                  "object_type": "message",
+                  "object_id": "$sent-1",
+              }, "_exec_message_send emits a normalized provider receipt")
         try:
             rt_dispatcher._exec_message_send(good_send)  # stub now answers 200 w/o event_id
             check(False, "swallowed 200 fails closed")
@@ -385,6 +395,10 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
         gw.shutdown()
         os.environ.pop("REMOTE_TASK_URL", None)
         os.environ.pop("REMOTE_TASK_TOKEN", None)
+        if prior_agent_mxid is None:
+            os.environ.pop("AGENT_MXID", None)
+        else:
+            os.environ["AGENT_MXID"] = prior_agent_mxid
 
     # _state_dir explicit override branch
     os.environ["SUTANDO_RUNTIME_STATE"] = "/tmp/rt-state-x"

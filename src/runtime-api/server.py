@@ -50,6 +50,10 @@ from rundir import socket_path  # noqa: E402
 from dispatcher import RuntimeDispatcher  # noqa: E402
 from capability_registry import (EphemeralCapabilityRegistry,  # noqa: E402
                                  compose_capability_registry)
+sys.path.insert(0, str(_HERE.parent))
+from attribution_claims import AttributionClaimWriter  # noqa: E402
+from sutando_config import resolve_workspace  # noqa: E402
+from util_paths import _host_label  # noqa: E402
 
 
 def _state_dir() -> Path:
@@ -69,7 +73,8 @@ def _log(msg: str) -> None:
 
 class RuntimeServer:
     def __init__(self, socket_path: str, db_path: str, ha_dir: str,
-                 capability_registry: Optional[EphemeralCapabilityRegistry] = None):
+                 capability_registry: Optional[EphemeralCapabilityRegistry] = None,
+                 attribution_writer=None):
         self.socket_path = socket_path
         self.store = RequestStore(db_path)
         self.ha = HumanActionAdapter(ha_dir)
@@ -84,7 +89,8 @@ class RuntimeServer:
         # dispatcher.py. This class owns socket transport only.
         self.dispatcher = RuntimeDispatcher(
             self.store, self.ha, self.actor_id,
-            capability_registry=capability_registry)
+            capability_registry=capability_registry,
+            attribution_writer=attribution_writer)
 
     # ── transport ──────────────────────────────────────────────────────────
     async def client(self, reader: asyncio.StreamReader,
@@ -139,9 +145,13 @@ class RuntimeServer:
 
 
 def build_runtime_server(provider_factories=(), *, state_dir=None,
-                         runtime_socket=None) -> RuntimeServer:
+                         runtime_socket=None, attribution_writer=None) -> RuntimeServer:
     state = Path(state_dir) if state_dir is not None else _state_dir()
     registry = compose_capability_registry(provider_factories)
+    if attribution_writer is None:
+        workspace = Path(resolve_workspace())
+        attribution_writer = AttributionClaimWriter(
+            workspace / "hosts" / _host_label() / "attribution" / "claims.jsonl")
     return RuntimeServer(
         # Canonical shared resolution (rundir.py) — daemon and CLI must agree
         # on the same default socket, on every platform (review blocker).
@@ -151,6 +161,7 @@ def build_runtime_server(provider_factories=(), *, state_dir=None,
         ha_dir=os.environ.get("SUTANDO_HA_DIR")
         or str(state / "human-actions"),
         capability_registry=registry,
+        attribution_writer=attribution_writer,
     )
 
 
