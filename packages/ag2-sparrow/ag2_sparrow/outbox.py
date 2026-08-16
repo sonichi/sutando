@@ -122,8 +122,12 @@ def process_identity(pid: int) -> ProcessIdentity:
     linux = _linux_process_identity(pid)
     if linux is not None:
         return linux
-    # Darwin fallback; the /proc branch above wins wherever /proc exists.
-    try:  # pragma: no cover - macOS-only, unmeasurable on the Linux CI runner
+    return _darwin_process_identity(pid)
+
+
+def _darwin_process_identity(pid: int) -> ProcessIdentity:  # pragma: no cover - macOS-only; the Linux gate takes the /proc path
+    """Darwin fallback; the /proc branch wins wherever /proc exists."""
+    try:
         libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib",
                               use_errno=True)
     except OSError:
