@@ -196,6 +196,16 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# How many times each proactive body has failed transiently. Keyed by the
+# polled `.txt` name; consumed by send_failure_policy.resolve_failed_send,
+# which bounds the retry at MAX_TRANSIENT_ATTEMPTS and then parks. Without
+# this bound one nudge went out 12 times (2026-08-16).
+_PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
+try:  # pragma: no cover - exercised by whichever context imports it
+    from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
+except ImportError:  # pragma: no cover - flat src/ import path
+    from send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
+
 # Terminal resting place for proactive nudges that can never be delivered
 # (e.g. a body too large for any Matrix event). Kept separate from `archive/`
 # so "delivered" and "given up on" are never confused when auditing.
@@ -2204,6 +2214,52 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
             pass
 
 
+def _resolve_send_failure(claim, original, exc) -> str:
+    """Bounded retry. The DECISION is the shared policy; the file moves are ours.
+
+    src/send_failure_policy.py owns "is this worth retrying, and how many times"
+    — the same ceiling discord-bridge uses. It also offers resolve_failed_send(),
+    which we deliberately do NOT use: that helper derives the body name via
+    claim.with_suffix(".txt"), which only round-trips for the bare `x.sending`
+    claims proactive_recovery mints. Our claims are pid-scoped (`x.sending.<pid>`)
+    so restart recovery can tell a live worker's claim from a dead one's, and
+    with_suffix() would resolve them to `x.sending.txt`. Claim naming is provider
+    mechanics; the ceiling is policy. Share the second, keep the first local.
+
+    Returns the phrase for the caller's log line.
+    """
+    try:
+        try:  # pragma: no cover - exercised by whichever context imports it
+            from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, should_retry
+        except ImportError:  # pragma: no cover - flat src/ import path
+            from send_failure_policy import MAX_TRANSIENT_ATTEMPTS, should_retry
+    except Exception:
+        try:
+            claim.rename(original)
+        except OSError:
+            pass
+        return "will retry (policy module unavailable)"
+
+    key = original.name
+    tried = _PROACTIVE_ATTEMPTS.get(key, 0)
+    if should_retry(exc, tried):
+        _PROACTIVE_ATTEMPTS[key] = tried + 1
+        try:
+            claim.rename(original)
+        except OSError:
+            return "stuck"
+        return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
+
+    _PROACTIVE_ATTEMPTS.pop(key, None)
+    try:
+        UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        claim.rename(UNDELIVERABLE_RESULTS_DIR / key)
+    except OSError:
+        return "stuck"
+    return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried} "
+            "attempt(s) — it will NOT be re-sent")
+
+
 def _post_proactive() -> None:
     """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
 
@@ -2337,13 +2393,13 @@ def _post_proactive() -> None:
                 or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
             )
             if not delivered:
+                # Accepted but unconfirmed. It may ALSO have been delivered, so
+                # the retry must be bounded — an unbounded one duplicates.
+                outcome = _resolve_send_failure(
+                    claim, f, _UnconfirmedDelivery("no event_id in response"))
                 _log(f"proactive send for {f.name} got no delivery signal "
-                     f"(response {str(resp)[:120]!r}) — will retry; check "
+                     f"(response {str(resp)[:120]!r}) — {outcome}; check "
                      "REMOTE_PROACTIVE_ROOM and the agent's room membership")
-                try:
-                    claim.rename(f)
-                except OSError:
-                    pass
                 continue
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -2352,18 +2408,12 @@ def _post_proactive() -> None:
                 except OSError:
                     pass
                 raise
-            _log(f"proactive send failed for {f.name}: HTTP {e.code} — will retry")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            outcome = _resolve_send_failure(claim, f, e)
+            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
             continue
         except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"proactive send network error for {f.name}: {e} — will retry")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            outcome = _resolve_send_failure(claim, f, e)
+            _log(f"proactive send network error for {f.name}: {e} — {outcome}")
             continue
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
