@@ -172,6 +172,7 @@ def _status_beats_id():
     m = adapter_mod()
     classify = need(m, "classify_response")
     from outbox import DeliveryOutcome as O  # noqa: PLC0415
+
     # A trace id in an error envelope is not a delivery receipt; reading it as
     # one archives an item the provider explicitly refused.
     for status, want in ((500, O.OUTCOME_UNKNOWN), (503, O.OUTCOME_UNKNOWN),
