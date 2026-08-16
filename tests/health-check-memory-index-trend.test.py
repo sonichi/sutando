@@ -118,6 +118,36 @@ class TheHelperCanActuallyFire(unittest.TestCase):
         self.assertTrue(note.strip(), "the helper produced nothing on a real history")
 
 
+class RateIsMeasuredFromTheLastCompaction(unittest.TestCase):
+    """A mid-window compaction must not flatten the rate. Measuring growth from the
+    OLDEST point lets a drop cancel everything after it, and the note then reassures
+    at exactly the moment the index is being actively managed and regrowing."""
+
+    def test_growth_after_a_drop_is_not_cancelled_by_the_drop(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        # Rises, is compacted hard, then climbs steadily again — the real shape.
+        sizes = [cap - 1000, cap - 900, cap - 2400, cap - 2000, cap - 1600, cap - 1200]
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), sizes)
+            note = m._index_growth_note(idx, sizes[-1])
+        # From the drop: +1200 B. From the oldest point: only +(-200) B, which the
+        # `grew > 0` guard would suppress entirely.
+        self.assertIn("+1,200 B", note)
+        self.assertIn("remaining headroom", note)
+
+    def test_a_net_shrinking_history_still_reports_the_regrowth(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        # Net change oldest->newest is NEGATIVE, so the old code printed no rate at
+        # all. The post-compaction climb is the number a reader needs.
+        sizes = [cap - 500, cap - 3000, cap - 2500, cap - 2000]
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), sizes)
+            note = m._index_growth_note(idx, sizes[-1])
+        self.assertIn("+1,000 B", note)
+
+
 class DefensiveBranches(unittest.TestCase):
     """The skip/except paths. They are REACHABLE — a rewritten history, a gc'd
     object, a git that is not installed — so covering them with a stub is honest

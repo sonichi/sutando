@@ -2053,7 +2053,14 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
         # Closest the index has come to the cut in the recorded window. This is
         # the number that makes the warning land, and no point reading has it.
         peak = max(sz for _, sz in points)
-        oldest_at, oldest_sz = points[0]
+        # Measure the rate from the last COMPACTION, not the oldest point. A
+        # mid-window drop otherwise cancels the growth after it and the rate
+        # collapses toward zero exactly when the file is being actively managed.
+        start = 0
+        for i in range(1, len(points)):
+            if points[i][1] < points[i - 1][1]:
+                start = i
+        oldest_at, oldest_sz = points[start]
         newest_at, _ = points[-1]
         hours = (newest_at - oldest_at) / 3600.0
         grew = effective_bytes - oldest_sz
