@@ -1263,7 +1263,21 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "pending-questions.md",  # same
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
+    ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
 })
+
+#: Lock guards are not the "loose status/state .json" the contract targets, and
+#: the root is where every consumer already looks: `voice-lock.ts`,
+#: `startup-runtime.sh`, `restart.sh`, `restart-voice-agent.sh` and
+#: `tests/voice-lock.test.py` all resolve `<workspace>/.voice-agent.lock.guard`.
+#: A half-applied move leaves two processes disagreeing about where the lock is,
+#: i.e. a double-started voice agent — worse than the warn it would silence.
+#:
+#: A GLOB, for the reason the sentinel glob above gives: the desktop app writes
+#: `.backend-supervisor.lock.guard` from code that is not in this repo, so a
+#: literal list would carry a name nothing here can grep to, and would miss the
+#: next guard for the same reason.
+WORKSPACE_ROOT_GUARD_GLOB = "*.lock.guard"
 
 #: Migration sentinels are production-owned and DELIBERATELY retained at the
 #: workspace root — `workspace_default.py` writes `.notes-migrated`,
@@ -1348,6 +1362,7 @@ def check_workspace_root_tidy() -> "dict | None":
             and p.name not in WORKSPACE_ROOT_ALLOWED
             and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
             and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
+            and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_GUARD_GLOB)
         )
     except OSError:
         return None                      # unreadable workspace is another probe's job

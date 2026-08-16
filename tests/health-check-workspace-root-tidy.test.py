@@ -150,5 +150,47 @@ with tempfile.TemporaryDirectory() as td:
     check("workspace-root-tidy is wired into run_all_checks()",
           "workspace-root-tidy" in names, True)
 
+    # 10. `.env` is CONTRACT-SANCTIONED, not drift. `sutando_config.resolve_dotenv`
+    #     resolves repo-root -> workspace (#1871), and health-check's own `.env`
+    #     probe reads and validates that second tier — so the two probes disagreed
+    #     about the same file: one required it, the other called it escaped state.
+    td7 = Path(_tf.mkdtemp()); ws7 = td7 / "workspace"; (ws7 / "state").mkdir(parents=True)
+    (ws7 / ".env").write_text("GEMINI_API_KEY=x")
+    check("a workspace .env is not drift", load(ws7).check_workspace_root_tidy(), None)
+
+    # 11. Lock guards live at the root by six-site convention (voice-lock.ts,
+    #     startup-runtime.sh, restart.sh, restart-voice-agent.sh, voice-lock.test.py).
+    #     Moving one without the others leaves two processes disagreeing about where
+    #     the lock is — a double-started voice agent, worse than the warn.
+    #     Matched by GLOB: `.backend-supervisor.lock.guard` is written by the desktop
+    #     app, whose source is not in this repo, so a literal list cannot cover it.
+    td8 = Path(_tf.mkdtemp()); ws8 = td8 / "workspace"; (ws8 / "state").mkdir(parents=True)
+    (ws8 / ".voice-agent.lock.guard").write_text("")
+    (ws8 / ".backend-supervisor.lock.guard").write_text("")
+    check("lock guards are not drift", load(ws8).check_workspace_root_tidy(), None)
+
+    # 12. The exemptions must not swallow the one file that IS this repo's drift.
+    #     Without this, adding `.env` + the guard glob could have been written as a
+    #     blanket dotfile pass and every check above would still be green.
+    td9 = Path(_tf.mkdtemp()); ws9 = td9 / "workspace"; (ws9 / "state").mkdir(parents=True)
+    for name in (".env", ".voice-agent.lock.guard", ".backend-supervisor.lock.guard",
+                 ".voice-agent.pid"):
+        (ws9 / name).write_text("")
+    r12 = load(ws9).check_workspace_root_tidy()
+    check("the real deviant is still flagged", ".voice-agent.pid" in (r12 or {}).get("detail", ""), True)
+    check("and the exempt files are not named alongside it",
+          any(n in (r12 or {}).get("detail", "")
+              for n in (".env", ".lock.guard")), False)
+
+    # 13. A guard-LIKE name that is not a guard stays flagged — `*.lock.guard`
+    #     must not degrade into "anything containing lock".
+    td10 = Path(_tf.mkdtemp()); ws10 = td10 / "workspace"; (ws10 / "state").mkdir(parents=True)
+    (ws10 / "voice.lock").write_text("")
+    (ws10 / ".env.local").write_text("")
+    r13 = load(ws10).check_workspace_root_tidy()
+    check("a bare .lock is still drift", "voice.lock" in (r13 or {}).get("detail", ""), True)
+    check("and so is .env.local (only the resolver's own name is sanctioned)",
+          ".env.local" in (r13 or {}).get("detail", ""), True)
+
 print(("FAILED: " + ", ".join(fails)) if fails else "workspace-root-tidy: all checks passed")
 sys.exit(1 if fails else 0)
