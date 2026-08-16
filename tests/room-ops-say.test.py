@@ -12,6 +12,7 @@ every status line, and the bug would be invisible from the call site.
 
 Run: python3 tests/room-ops-say.test.py
 """
+import os
 import pathlib
 import sys
 import unittest
@@ -134,6 +135,33 @@ class SayRefusesBeforePostingTests(unittest.TestCase):
             res = sy.say("hello", ROOM, agent_mxid="@me:hs")
         self.assertFalse(res["ok"])
         self.assertEqual(res["reason"], "no gateway configured")
+
+
+class SayAgentIdentityTests(unittest.TestCase):
+    def test_agent_mxid_falls_back_to_the_environment(self):
+        """Callers omit --agent constantly; the gate must still see an identity."""
+        seen = {}
+        ctx, _calls = _capture()
+        with ctx, mock.patch.dict(os.environ, {"AGENT_MXID": "@env-agent:hs"}):
+            sy.gate_allows.side_effect = lambda mxid, room, gate: seen.setdefault("mxid", mxid) or True
+            sy.say("hello", ROOM)
+        self.assertEqual(seen["mxid"], "@env-agent:hs")
+
+
+class SayCliDispatchTests(unittest.TestCase):
+    def test_room_ops_say_routes_to_say(self):
+        """Pins the CLI wiring: `room_ops say <room> <msg>` reaches say.say."""
+        import io
+        import room_ops
+        from contextlib import redirect_stdout
+        with mock.patch.object(room_ops._say, "say",
+                               return_value={"ok": True, "room_id": ROOM,
+                                             "event_id": "$e", "reason": None}) as m:
+            with redirect_stdout(io.StringIO()):
+                rc = room_ops._main(["say", ROOM, "hi there"])
+        self.assertEqual(rc, 0)
+        # say() takes (message, room_id); the CLI takes (room_id, message).
+        m.assert_called_once_with("hi there", ROOM, None)
 
 
 class SayNetworkFailureTests(unittest.TestCase):
