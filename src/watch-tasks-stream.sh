@@ -18,8 +18,8 @@
 # arrive — no need to inline file contents in stdout (Monitor's 200ms
 # batching window would group multi-line content awkwardly).
 
-# fd 9 is a stable dup of the real stdout. The EXIT trap can fire while the shell
-# is inside a $( ) capture, which rebinds fd 1 to the substitution's pipe.
+# fd 9 is a stable dup of the real stdout, taken before anything can rebind fd 1.
+# A shutdown emit invoked one $( ) deep writes to the capture pipe, not to stdout.
 exec 9>&1
 
 set -u
