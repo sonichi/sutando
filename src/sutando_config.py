@@ -70,9 +70,12 @@ _DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
 def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
     """How ``health-check.py --fix`` handles a configured-but-down channel bridge."""
     hc = load_config(repo_root).get("health_check") or {}
-    configured = str(hc.get("down_bridge_action") or "restart").strip().lower()
+    # Default ALERT, not restart: a restart that looks successful but leaves the
+    # bridge unable to deliver is worse than a bridge that is visibly down, and
+    # no witnessed clean-main round trip proves delivery continuity yet.
+    configured = str(hc.get("down_bridge_action") or "alert").strip().lower()
     action = os.environ.get("SUTANDO_DOWN_BRIDGE_ACTION", "").strip().lower() or configured
-    return action if action in _DOWN_BRIDGE_ACTIONS else "restart"
+    return action if action in _DOWN_BRIDGE_ACTIONS else "alert"
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:

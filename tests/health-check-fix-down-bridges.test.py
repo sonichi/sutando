@@ -682,19 +682,27 @@ def case_s_checkout_is_canonical() -> list[str]:
 
 
 def case_t_resolve_down_bridge_action() -> list[str]:
-    """resolve_down_bridge_action: config default, env override, unknown→restart."""
+    """resolve_down_bridge_action: default ALERT, env override, unknown -> alert.
+
+    The default is alert because a restart that looks successful but leaves the
+    bridge unable to deliver is worse than one that is visibly down. Stubs the
+    config loader: reading the host's own sutando.config.json made the default
+    assertion pass for the wrong reason on a machine that sets it explicitly."""
     fails = []
+    import sutando_config
     env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
-    with mock.patch.dict(os.environ, env, clear=True):
-        if hc.resolve_down_bridge_action() != "restart":
-            fails.append(f"t) default should be 'restart', got {hc.resolve_down_bridge_action()!r}")
-    with mock.patch.dict(os.environ, {"SUTANDO_DOWN_BRIDGE_ACTION": "alert"}):
-        if hc.resolve_down_bridge_action() != "alert":
-            fails.append("t) env override to 'alert' ignored")
-    with mock.patch.dict(os.environ, {"SUTANDO_DOWN_BRIDGE_ACTION": "bogus"}):
-        if hc.resolve_down_bridge_action() != "restart":
-            fails.append("t) unknown value should fall back to 'restart'")
-        return fails
+    with mock.patch.object(sutando_config, "load_config", lambda *a, **k: {}):
+        with mock.patch.dict(os.environ, env, clear=True):
+            if sutando_config.resolve_down_bridge_action() != "alert":
+                fails.append(f"t) default should be 'alert', got "
+                             f"{sutando_config.resolve_down_bridge_action()!r}")
+        with mock.patch.dict(os.environ, {"SUTANDO_DOWN_BRIDGE_ACTION": "restart"}):
+            if sutando_config.resolve_down_bridge_action() != "restart":
+                fails.append("t) env override to 'restart' ignored")
+        with mock.patch.dict(os.environ, {"SUTANDO_DOWN_BRIDGE_ACTION": "bogus"}):
+            if sutando_config.resolve_down_bridge_action() != "alert":
+                fails.append("t) unknown value should fall back to 'alert'")
+    return fails
 
 def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambient_env=None):
     """Drive main() --fix with `checks` in issues; return (stdout, spawns, kills).
