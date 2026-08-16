@@ -993,9 +993,8 @@ def main() -> int:
                   for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
           "PROACTIVE_TRUST_OK=1: bare {ok:true} archives (opt-in at-least-once)")
 
-    # Retry CEILING (send_failure_policy.MAX_TRANSIENT_ATTEMPTS): a file whose
-    # sends never confirm parks to undeliverable/ instead of looping forever —
-    # the 2026-08-16 duplicate-burst shape (one file, 5-12 re-sends).
+    # Retry CEILING: a file whose sends never confirm parks to undeliverable/
+    # instead of looping forever.
     (rtc.RESULTS_DIR / "proactive-t2c.txt").write_text("nudge 2c")
     STATE["force_room_empty_200"] = True
     _posts_before = len(STATE["room_posts"])

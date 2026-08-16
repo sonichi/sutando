@@ -26,8 +26,19 @@ _TRANSIENT_EXC_NAMES = frozenset({
     "ConnectionClosed",
     "GatewayNotFound",
     "DiscordServerError",
+    # DNS lookup failure (socket.gaierror — an OSError, not a ConnectionError):
+    # a resolver blip retries; the cap parks a genuinely dead hostname.
+    "gaierror",
     # Accepted-but-unconfirmed: retryable, but only under the cap (see the class).
     "UnconfirmedDelivery",
+})
+
+# Checked BEFORE the transient names: these inherit from a listed transient
+# (ClientConnectorError) but a bad cert, wrong CA or pin mismatch is a
+# misconfiguration — no number of retries turns it into a 200.
+_PERMANENT_EXC_NAMES = frozenset({
+    "ClientSSLError",            # + its cert/SSL connector subclasses
+    "ServerFingerprintMismatch",  # reaches the set via ServerConnectionError
 })
 
 
@@ -56,14 +67,31 @@ def is_transient(exc: BaseException) -> bool:
 
     The NAME is checked before the status: a status short-circuit made
     `_TRANSIENT_EXC_NAMES` unreachable for any of those types that carries one.
+
+    Names are matched across the whole MRO, not just the concrete class: aiohttp
+    raises `ClientConnectorDNSError(ClientConnectorError)` for a DNS failure, and
+    an exact-name test misses every such subclass while its listed parent sits
+    right above it. `_PERMANENT_EXC_NAMES` is the exception to that widening.
     """
-    if type(exc).__name__ in _TRANSIENT_EXC_NAMES:
-        return True
-    status = failure_status(exc)
-    if status is not None:
-        # Whole 5xx range: the server failed, not the payload.
-        return status in TRANSIENT_STATUSES or 500 <= status <= 599
-    return isinstance(exc, (TimeoutError, ConnectionError))
+    # urllib's URLError reports the real failure via `.reason`; classify the
+    # wrapper by what it wraps, or a wrapped timeout parks on its first attempt.
+    for _ in range(4):
+        names = [base.__name__ for base in type(exc).__mro__]
+        if any(n in _PERMANENT_EXC_NAMES for n in names):
+            return False
+        if any(n in _TRANSIENT_EXC_NAMES for n in names):
+            return True
+        status = failure_status(exc)
+        if status is not None:
+            # Whole 5xx range: the server failed, not the payload.
+            return status in TRANSIENT_STATUSES or 500 <= status <= 599
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        reason = getattr(exc, "reason", None)
+        if not isinstance(reason, BaseException) or reason is exc:
+            return False
+        exc = reason
+    return False
 
 
 def should_retry(exc: BaseException, attempts: int,

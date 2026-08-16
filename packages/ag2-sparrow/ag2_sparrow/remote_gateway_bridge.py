@@ -199,10 +199,8 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
-# How many times each proactive body has failed transiently. Keyed by the
-# polled `.txt` name; consumed by send_failure_policy.resolve_failed_send,
-# which bounds the retry at MAX_TRANSIENT_ATTEMPTS and then parks. Without
-# this bound one nudge went out 12 times (2026-08-16).
+# Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
+# retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
 _PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
 try:  # pragma: no cover - exercised by whichever context imports it
     from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
@@ -2231,27 +2229,26 @@ def _resolve_send_failure(claim, original, exc) -> str:
 
     Returns the phrase for the caller's log line.
     """
-    try:
-        try:  # pragma: no cover - exercised by whichever context imports it
-            from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, should_retry
-        except ImportError:  # pragma: no cover - flat src/ import path
-            from send_failure_policy import MAX_TRANSIENT_ATTEMPTS, should_retry
-    except Exception:
-        try:
-            claim.rename(original)
-        except OSError:
-            pass
-        return "will retry (policy module unavailable)"
+    try:  # pragma: no cover - exercised by whichever context imports it
+        from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, should_retry
+    except ImportError:  # pragma: no cover - flat src/ import path
+        from send_failure_policy import MAX_TRANSIENT_ATTEMPTS, should_retry
 
     key = original.name
     tried = _PROACTIVE_ATTEMPTS.get(key, 0)
     if should_retry(exc, tried):
         _PROACTIVE_ATTEMPTS[key] = tried + 1
         try:
-            claim.rename(original)
+            # link+unlink, not rename: rename would REPLACE a `.txt` re-written
+            # since the claim; EEXIST means a newer body owns the name — park ours.
+            os.link(claim, original)
+            claim.unlink()
+        except FileExistsError:
+            pass  # fall through to park below
         except OSError:
             return "stuck"
-        return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
+        else:
+            return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
 
     _PROACTIVE_ATTEMPTS.pop(key, None)
     try:
@@ -2259,8 +2256,8 @@ def _resolve_send_failure(claim, original, exc) -> str:
         claim.rename(UNDELIVERABLE_RESULTS_DIR / key)
     except OSError:
         return "stuck"
-    return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried} "
-            "attempt(s) — it will NOT be re-sent")
+    return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried + 1} "
+            "send attempt(s) — it will NOT be re-sent")
 
 
 def _post_proactive() -> None:

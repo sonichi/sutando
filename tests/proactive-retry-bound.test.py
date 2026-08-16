@@ -88,6 +88,60 @@ def main() -> int:
         check(not other.exists() and not out.startswith("will retry"),
               "control: an over-cap count parks immediately (policy is live)")
 
+        # 4. PRODUCTION EXCEPTION SHAPES: _post_proactive hands the resolver
+        # urllib wrappers, not bare exceptions. A wrapped transient must retry
+        # (it parked at attempt 0 before the .reason unwrap); a permanent 4xx
+        # must park at once.
+        import socket
+        import urllib.error
+        for reason, label in [
+            (TimeoutError("t"), "URLError(TimeoutError)"),
+            (ConnectionRefusedError(), "URLError(ConnectionRefusedError)"),
+            (socket.gaierror(8, "nodename nor servname"), "URLError(gaierror)"),
+        ]:
+            rgb._PROACTIVE_ATTEMPTS.clear()
+            f = results / "proactive-net.txt"
+            f.write_text("net")
+            c = results / "proactive-net.sending"
+            f.rename(c)
+            out = rgb._resolve_send_failure(c, f, urllib.error.URLError(reason))
+            check(out.startswith("will retry") and f.exists(),
+                  f"{label} is transient: retried, not parked at attempt 0")
+            f.unlink()
+
+        rgb._PROACTIVE_ATTEMPTS.clear()
+        f = results / "proactive-4xx.txt"
+        f.write_text("gone")
+        c = results / "proactive-4xx.sending"
+        f.rename(c)
+        http404 = urllib.error.HTTPError("http://x", 404, "nf", None, None)
+        out = rgb._resolve_send_failure(c, f, http404)
+        check(not f.exists() and not out.startswith("will retry"),
+              "permanent 4xx parks on the first attempt (no useless retries)")
+
+        # 5. wrapped transients respect the same ceiling
+        rgb._PROACTIVE_ATTEMPTS.clear()
+        rgb._PROACTIVE_ATTEMPTS["proactive-net.txt"] = cap
+        f = results / "proactive-net.txt"
+        f.write_text("net")
+        c = results / "proactive-net.sending"
+        f.rename(c)
+        out = rgb._resolve_send_failure(
+            c, f, urllib.error.URLError(TimeoutError("t")))
+        check(not f.exists() and not out.startswith("will retry"),
+              "a wrapped transient still parks once the cap is reached")
+
+        # 6. the vendored resolve_failed_send is callable: it imports
+        # proactive_recovery, which must ship in the package alongside it
+        from ag2_sparrow.send_failure_policy import resolve_failed_send
+        f = results / "proactive-pkg.txt"
+        f.write_text("pkg")
+        c = results / "proactive-pkg.sending"
+        f.rename(c)
+        out = resolve_failed_send(c, UnconfirmedDelivery("x"), {})
+        check(out in ("retried", "parked"),
+              f"packaged resolve_failed_send runs without ModuleNotFoundError ({out})")
+
     if FAILS:
         print(f"FAILED ({FAILS})")
         return 1
