@@ -74,9 +74,24 @@ Per-user runtime + content. Lives at `<repo>/workspace/` by default (post-M0). S
 | `state/auth/`, `state/cloud-auth.json`, `state/device.json` | ❌ no | Per-host durable | Install/identity state, per-host |
 | `logs/conversation.log` | ❌ no | Per-host runtime | Voice/phone/discord log; large + per-host |
 | `data/conversation.sqlite` | ❌ no | Per-host runtime | SQLite mirror of conversation log |
+| `skill-repos/<repo-name>/` | ❌ no | Per-host clone | Git checkouts of skill **source** repos that `skills/install.sh` symlinks from |
 | `.env` | ❌ no | Per-host secret | Tokens, API keys — must NOT sync |
 
 The sync default is "synced unless excluded"; per-host runtime sub-paths are excluded via the carrier-set gitignore (per PR #1447) + `vault.sync.exclude` user overrides.
+
+### `skill-repos/` — where skill source repos are cloned
+
+A skill's *installed* form is a symlink under `$CLAUDE_CONFIG_DIR/skills/<name>`. The repo it points **at** is a normal git checkout, and that checkout belongs at `<workspace>/skill-repos/<repo-name>/`.
+
+Clone skill repos there rather than into `$HOME`. A checkout outside the workspace is invisible to every workspace-level tool — it is not in the sync carrier set, not in a workspace audit, and not where anyone looks for it — so it drifts on its own schedule and nothing notices. The failure is quiet by construction: the symlinks keep resolving, so the only signal is that a pull cron names a path no convention would predict.
+
+`skill-repos/` is **not** synced. The blanket `*` in the carrier-set gitignore already excludes it, which is what you want: these are independent git repos with their own remotes and history, some of them large, and the vault should not be carrying a nested checkout.
+
+Relocating an existing clone is a three-step change, and the second and third steps are the ones that get missed:
+
+1. `mv` the checkout to `<workspace>/skill-repos/<repo-name>/`.
+2. Re-run the repo's `install.sh`, **then verify each link individually** — a conservative installer refuses to overwrite symlinks pointing outside itself, so it will report `0 linked` and change nothing while every link is still dangling. Clear the dead links first.
+3. Update any cron that names the old path **and re-register it**. A registered job holds the prompt text it was created with; editing the config file alone leaves the old path firing.
 
 ## Decisions (preserved as historical record)
 
