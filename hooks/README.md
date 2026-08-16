@@ -44,14 +44,29 @@ PY
 ```
 
 Verify. Registration is the only thing that proves the guard is armed — the file being
-present in `hooks/` does not:
+present in `hooks/` does not. And registration alone does not prove it *runs*: the
+command is stored as a string and re-parsed by a shell, so an unquoted path splits on
+the space in `Application Support` and the hook dies before reading its input. Execute
+what is registered, don't just look for it:
 
 ```bash
-CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" python3 -c 'import json, os
-p = os.path.join(os.environ["CFG"], "settings.json")
-h = json.load(open(p)).get("hooks", {})
-print("armed:", "context-source-guard" in json.dumps(h))'
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" python3 - <<'PY'
+import json, os, subprocess
+h = json.load(open(os.path.join(os.environ["CFG"], "settings.json"))).get("hooks", {})
+cmds = [k["command"] for m in h.get("PreToolUse", []) for k in m.get("hooks", [])
+        if "context-source-guard" in k.get("command", "")]
+print("registered:", len(cmds))
+for c in cmds:
+    # The guard fail-opens on a Read event, so 0 is the expected exit. A split
+    # path exits 2 — which is PreToolUse's BLOCK code, so the broken recipe
+    # denies every Bash and Read call rather than merely failing to guard.
+    r = subprocess.run(c, shell=True, input='{"tool_name":"Read","tool_input":{}}',
+                       text=True, capture_output=True)
+    print(f"exit {r.returncode}  {'OK' if r.returncode == 0 else 'BROKEN: ' + r.stderr.strip()[:90]}")
+PY
 ```
+
+Both matchers must appear (`Bash` and `Read`), and every line must read `exit 0`.
 
 `settings.json` registration is read at **session start**; once registered, the script
 file itself is executed fresh on every tool call, so updating `context-source-guard.py`
