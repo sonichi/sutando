@@ -100,5 +100,50 @@ check("the marker is a ';' clause, matching the real note's shape",
 check("the marker contains no failure vocabulary",
       any(w in n.lower() for w in ("error", "fail", "broken", "warn")), False)
 
+# 6. THE REMAINING FAIL-SAFE BRANCHES. Each decides what happens when git
+#    answers but unusably, and an untested fail-safe is indistinguishable from
+#    one that never runs. Drive them by making the subprocess answer badly.
+class _Res:
+    def __init__(self, rc=0, out=""):
+        self.returncode, self.stdout = rc, out
+
+
+def note_with_run(fake_run):
+    """Run the real note against a crafted subprocess layer."""
+    with tempfile.TemporaryDirectory() as td:
+        idx = index_in(td, size=16000, gitted=True, revisions=3)
+        eff = len(m._index_effective_text(idx.read_text()).encode())
+        orig = m.subprocess.run
+        m.subprocess.run = fake_run
+        try:
+            return m._index_growth_note(idx, eff)
+        finally:
+            m.subprocess.run = orig
+
+
+# git log succeeds but emits nothing parseable as "<sha> <epoch>"
+check("unparseable git-log output yields the marker",
+      MARK in note_with_run(lambda *a, **k: _Res(0, "not-a-sha not-a-time\n")), True)
+
+# git log is fine; cat-file fails
+_calls = {"n": 0}
+def _cat_fails(*a, **k):
+    _calls["n"] += 1
+    if _calls["n"] == 1:
+        return _Res(0, "aaaa 1700000000\nbbbb 1700003600\n")
+    return _Res(1, "")
+check("a failed cat-file yields the marker", MARK in note_with_run(_cat_fails), True)
+
+# the exception handler: git_argv itself raises
+def _boom(*a, **k):
+    raise OSError("simulated git failure")
+_orig_argv = m.git_argv
+m.git_argv = _boom
+try:
+    check("an exception in the git layer yields the marker",
+          MARK in note_for(size=16000, gitted=True, revisions=3), True)
+finally:
+    m.git_argv = _orig_argv
+
 print(("FAILED: " + ", ".join(fails)) if fails else "index trend unavailable: all checks passed")
 sys.exit(1 if fails else 0)
