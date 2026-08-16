@@ -16,10 +16,12 @@ from __future__ import annotations
 import os
 
 from _gateway import gate_allows, load_gate, gateway, http_json, degrade_reason, HTTPError, URLError
+import receipt as _receipt
 
 
-def _result(ok, *, room_id=None, event_id=None, reason=None):
-    return {"ok": bool(ok), "room_id": room_id, "event_id": event_id, "reason": reason}
+def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
+    return {"ok": bool(ok), "room_id": room_id, "event_id": event_id,
+            "reason": reason, "state": state or (_receipt.CONFIRMED if ok else _receipt.FAILED)}
 
 
 def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None) -> dict:
@@ -57,5 +59,7 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None) ->
         return _result(False, room_id=room_id, reason=degrade_reason(e.code))
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, reason=f"network error: {e}")
-    event_id = parsed.get("event_id") if isinstance(parsed, dict) else None
-    return _result(True, room_id=room_id, event_id=event_id)
+    # Shared with mention via receipt.classify — one reading of the envelope.
+    # UNCONFIRMED stays ok:true so a caller does not re-send a delivered message.
+    state, event_id, reason = _receipt.classify(parsed)
+    return _result(True, room_id=room_id, event_id=event_id, reason=reason, state=state)

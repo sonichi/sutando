@@ -179,12 +179,27 @@ class SayNetworkFailureTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("network error", res["reason"])
 
-    def test_non_dict_response_yields_null_event_id(self):
-        ctx, _calls = _capture(parsed=["not", "a", "dict"])
+    def test_confirmed_only_when_an_event_id_comes_back(self):
+        ctx, _calls = _capture(parsed={"event_id": "$evt"})
         with ctx:
             res = sy.say("hello", ROOM, agent_mxid="@me:hs")
-        self.assertTrue(res["ok"])
-        self.assertIsNone(res["event_id"])
+        self.assertEqual(res["state"], "confirmed")
+        self.assertEqual(res["event_id"], "$evt")
+
+    def test_200_without_proof_is_unconfirmed_not_confirmed(self):
+        """The gateway can answer 200 having swallowed a send failure. Reporting
+        that as confirmed lets a caller drop its fallback and lose the reply."""
+        for body in ({}, {"ok": True}, ["not", "a", "dict"], None):
+            with self.subTest(body=body):
+                ctx, _calls = _capture(parsed=body if body is not None else {})
+                with ctx:
+                    res = sy.say("hello", ROOM, agent_mxid="@me:hs")
+                self.assertEqual(res["state"], "unconfirmed")
+                self.assertIsNone(res["event_id"])
+                self.assertIn("not confirmed", res["reason"])
+                # ok stays true: flipping it would make callers re-send a
+                # delivered message, which cron-notify deliberately avoids.
+                self.assertTrue(res["ok"])
 
 
 if __name__ == "__main__":
