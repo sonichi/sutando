@@ -132,6 +132,8 @@ const PORT = Number(process.env.PORT) || 9900;
 // web-client /ws proxy (SUTANDO_LAN_SHARE), never a direct bind to this port.
 // Set HOST=0.0.0.0 explicitly only for a trusted deployment that needs it.
 const HOST = process.env.HOST || '127.0.0.1';
+
+import { shouldForceClosed } from './voice-connect-watchdog.js';
 // Per-user runtime state lives under the resolved workspace (post-v0.8
 // / #1440 default: <repo>/workspace/), not the repo checkout. Pre-#762
 // voice-agent resolved its tasks/results/state against the repo path via
@@ -1585,6 +1587,7 @@ async function main() {
 	// connect fails fast and bodhi flips back to CLOSED, the 60s lastReconnectAt
 	// throttle prevents a tight retry loop.
 	let lastReconnectAt = 0;
+	let connectingSince = 0;
 	let lastLoggedStatus = '';
 	let matrixBaseline: MatrixBaseline | null = null;
 	let lastMatrixVerdict = '';
@@ -1650,6 +1653,30 @@ async function main() {
 		// issue was fixed.
 		if (state === 'ACTIVE' && voiceFatalBackoffUntil > 0) {
 			voiceFatalBackoffUntil = 0;
+		}
+		// A connect that HANGS never returns to CLOSED, so the recovery guard below
+		// — which only fires from CLOSED — can never see it. Observed live: 23min
+		// in CONNECTING with a client attached, mic captured, nothing reaching the
+		// model. Force CLOSED so the next tick recovers; same transition the
+		// startup path already uses, and valid per bodhi's state table.
+		if (state === 'CONNECTING' && clientConnected) {
+			if (connectingSince === 0) connectingSince = Date.now();
+			else if (shouldForceClosed({
+				state, clientConnected, connectingSince, now: Date.now(),
+				lastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,
+			})) {
+				console.error(`${ts()} [Health] Stuck in CONNECTING for `
+					+ `${Math.round((Date.now() - connectingSince) / 1000)}s — forcing CLOSED to recover`);
+				connectingSince = 0;
+				try {
+					session.sessionManager.transitionTo('CLOSED');
+				} catch (err) {
+					console.error(`${ts()} [Health] Could not force CLOSED (state=${session.sessionManager.state}):`,
+						(err as Error)?.message ?? err);
+				}
+			}
+		} else {
+			connectingSince = 0;
 		}
 		// Recover when session is CLOSED and a client is waiting. handleClientConnected
 		// is bodhi's internal entry point for this exact scenario (CLOSED + client
