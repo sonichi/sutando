@@ -15,6 +15,7 @@ TOKEN="$(cat ~/.config/sutando/screen-capture-token)"
 curl -s -H "X-Sutando-Capture-Token: $TOKEN" http://localhost:7845/capture \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
 # Multi-display: add ?all=true to capture every display, or ?display=N for a specific one.
+# /capture-video takes the same header — it is the other capture route, gated identically.
 ```
 Then use the Read tool on the returned path to view the screenshot. Use this for any screen-related question: "what am I looking at", "help me with this", "what's on my screen", etc.
 
