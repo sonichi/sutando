@@ -179,7 +179,9 @@ if unmeasured="$(python3 scripts/coverage_unmeasured.py "$BASE" coverage.xml)" \
         echo "Changed, but absent from \`coverage.xml\` — outside \`[run] source\` in"
         echo "\`.coveragerc\`, so **diff-cover never examined these lines**:"
         echo
-        printf '-   `%s`\n' $unmeasured
+        # `--` ends option parsing: a format starting with `-` is otherwise
+        # read as a flag, and the report aborts the gate instead of rendering.
+        printf -- '-   `%s`\n' $unmeasured
     } > coverage-gate-report.md
     report="coverage-gate-report.md"
 fi
