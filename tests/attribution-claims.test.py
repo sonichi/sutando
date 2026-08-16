@@ -100,6 +100,27 @@ try:
     check("policy cannot escape its subject account", False)
 except AttributionError:
     check("policy cannot escape its subject account", True)
+try:
+    performer_kind_policy_claim(
+        account_id="account:github:7", performer_kind="agent",
+        scope={"provider": "github", "account_ids": [
+            "account:github:7", "account:github:8"]},
+        asserted_at="2026-08-16T17:00:00Z", author=OWNER,
+        dedupe_key="multi-account-policy",
+    )
+    check("v1 rejects inert multi-account policy scope", False)
+except AttributionError:
+    check("v1 rejects inert multi-account policy scope", True)
+try:
+    performer_kind_policy_claim(
+        account_id="account:github:7", performer_kind="agent",
+        scope={"provider": "github", "account_ids": ["account:github:7"]},
+        asserted_at="2026-08-16T17:00:00Z", author=AGENT,
+        dedupe_key="agent-authored-owner-policy",
+    )
+    check("owner policy requires human authority", False)
+except AttributionError:
+    check("owner policy requires human authority", True)
 retraction = retraction_claim(
     target_claim_id=policy["id"], asserted_at="2026-08-16T17:01:00Z",
     author=OWNER, dedupe_key="retract:policy:test",

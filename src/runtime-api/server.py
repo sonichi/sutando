@@ -8,9 +8,9 @@ durable (request_store.py, SQLite); list/read are not. The approve/answer
 transport is the existing human-action card lifecycle (ha_adapter.py) — no new
 server API or UI in v0.
 
-Identity: the actor is resolved DAEMON-SIDE from the environment
-(SUTANDO_AGENT_ID > AGENT_MXID > AGENT_ID), never from CLI-supplied params —
-a client cannot self-report who it is.
+Identity: request ownership is resolved DAEMON-SIDE from the environment.
+Exact receipt attribution uses `attribution.agent_principal_id` from Sutando
+config. Neither identity can be overridden by client parameters.
 
 Security: socket dir 0700, socket 0600, stale-socket takeover only after a
 connect probe fails, 256 KB frame cap, per-request timeouts. The socket is
@@ -52,7 +52,7 @@ from capability_registry import (EphemeralCapabilityRegistry,  # noqa: E402
                                  compose_capability_registry)
 sys.path.insert(0, str(_HERE.parent))
 from attribution_claims import AttributionClaimWriter  # noqa: E402
-from sutando_config import resolve_workspace  # noqa: E402
+from sutando_config import load_config, resolve_workspace  # noqa: E402
 from util_paths import _host_label  # noqa: E402
 
 
@@ -74,7 +74,7 @@ def _log(msg: str) -> None:
 class RuntimeServer:
     def __init__(self, socket_path: str, db_path: str, ha_dir: str,
                  capability_registry: Optional[EphemeralCapabilityRegistry] = None,
-                 attribution_writer=None):
+                 attribution_writer=None, attribution_actor_id=None):
         self.socket_path = socket_path
         self.store = RequestStore(db_path)
         self.ha = HumanActionAdapter(ha_dir)
@@ -90,7 +90,8 @@ class RuntimeServer:
         self.dispatcher = RuntimeDispatcher(
             self.store, self.ha, self.actor_id,
             capability_registry=capability_registry,
-            attribution_writer=attribution_writer)
+            attribution_writer=attribution_writer,
+            attribution_actor_id=attribution_actor_id)
 
     # ── transport ──────────────────────────────────────────────────────────
     async def client(self, reader: asyncio.StreamReader,
@@ -139,19 +140,24 @@ class RuntimeServer:
             self.client, path=str(sp), limit=MAX_LINE_BYTES + 1024)
         os.chmod(sp, stat.S_IRUSR | stat.S_IWUSR)  # 0600
         self.dispatcher.recover()
+        await self.dispatcher.publish_attribution_outbox()
         _log(f"listening on {sp} (actor={self.actor_id})")
         async with server:
             await asyncio.gather(server.serve_forever(), self.dispatcher.resolver_loop())
 
 
 def build_runtime_server(provider_factories=(), *, state_dir=None,
-                         runtime_socket=None, attribution_writer=None) -> RuntimeServer:
+                         runtime_socket=None, attribution_writer=None,
+                         attribution_actor_id=None) -> RuntimeServer:
     state = Path(state_dir) if state_dir is not None else _state_dir()
     registry = compose_capability_registry(provider_factories)
     if attribution_writer is None:
         workspace = Path(resolve_workspace())
         attribution_writer = AttributionClaimWriter(
             workspace / "hosts" / _host_label() / "attribution" / "claims.jsonl")
+    if attribution_actor_id is None:
+        attribution = load_config().get("attribution") or {}
+        attribution_actor_id = attribution.get("agent_principal_id") or ""
     return RuntimeServer(
         # Canonical shared resolution (rundir.py) — daemon and CLI must agree
         # on the same default socket, on every platform (review blocker).
@@ -162,6 +168,7 @@ def build_runtime_server(provider_factories=(), *, state_dir=None,
         or str(state / "human-actions"),
         capability_registry=registry,
         attribution_writer=attribution_writer,
+        attribution_actor_id=attribution_actor_id,
     )
 
 

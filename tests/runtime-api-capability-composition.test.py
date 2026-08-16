@@ -136,6 +136,17 @@ check(
     == "example.one",
 )
 check("startup socket override reaches the server", wired.socket_path == str(tmp / "wired.sock"))
+identity = "agent:018f0f65-7b4a-7cc1-8f52-8c6ad9a60d7d"
+original_load_config = server.load_config
+try:
+    server.load_config = lambda: {"attribution": {"agent_principal_id": identity}}
+    identified = server.build_runtime_server(
+        state_dir=tmp / "identity-state", runtime_socket=str(tmp / "identity.sock"),
+    )
+finally:
+    server.load_config = original_load_config
+check("startup wires configured exact attribution identity",
+      identified.dispatcher.attribution_actor_id == identity)
 
 forwarded = []
 original_build = server.build_runtime_server
@@ -167,6 +178,7 @@ check("main forwards explicit factories into startup composition", forwarded == 
 
 plain.store.close()
 wired.store.close()
+identified.store.close()
 
 print()
 if FAILS:

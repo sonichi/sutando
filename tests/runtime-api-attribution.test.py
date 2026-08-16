@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -92,8 +93,44 @@ retry = RuntimeDispatcher(
     executors={}, attribution_writer=AttributionClaimWriter(pending_root / "claims.jsonl"),
 )
 retry.recover()
+pending_store._db.execute(
+    "UPDATE attribution_outbox SET next_attempt_at = 0 WHERE request_id = ?",
+    (pending_result["requestId"],),
+)
+pending_store._db.commit()
+run(retry.publish_attribution_outbox())
 check("recovery publishes only the pending claim append",
       pending_store.attribution_status(pending_result["requestId"])["status"] == "recorded")
+
+bounded, bounded_store, _ = fresh(writer=BrokenWriter())
+bounded_result = run(bounded.handle("capability.execute", {"action": "provider.write"}))
+for _ in range(4):
+    bounded_store._db.execute(
+        "UPDATE attribution_outbox SET next_attempt_at = 0 WHERE request_id = ?",
+        (bounded_result["requestId"],),
+    )
+    bounded_store._db.commit()
+    run(bounded.publish_attribution_outbox())
+bounded_status = bounded_store.attribution_status(bounded_result["requestId"])
+check("persistent append failure reaches bounded terminal state",
+      bounded_status["status"] == "unavailable" and bounded_status["error"] == "disk unavailable")
+
+class SlowWriter:
+    def append(self, _claim):
+        time.sleep(0.15)
+
+
+async def responsive_publication():
+    slow, _, _ = fresh(writer=SlowWriter())
+    task = asyncio.create_task(slow.handle("capability.execute", {"action": "provider.write"}))
+    started_at = time.monotonic()
+    await asyncio.sleep(0.02)
+    responsive = time.monotonic() - started_at < 0.1
+    await task
+    return responsive
+
+
+check("claim shard IO does not block the event loop", run(responsive_publication()))
 
 print("── execution cancellation race ──")
 started = threading.Event()

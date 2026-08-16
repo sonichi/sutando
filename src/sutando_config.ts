@@ -46,6 +46,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 	'migrate',
 	'bridges',
 	'stand',
+	'attribution',
 ]);
 
 /**

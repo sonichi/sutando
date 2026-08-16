@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS attribution_outbox (
   actor_id      TEXT NOT NULL,
   receipts_json TEXT NOT NULL,
   status        TEXT NOT NULL,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at REAL NOT NULL DEFAULT 0,
   error         TEXT,
   created_at    REAL NOT NULL,
   updated_at    REAL NOT NULL,
@@ -67,6 +69,7 @@ class RequestStore:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA foreign_keys=ON")
         # Idempotent migration BEFORE the schema script: a pre-idempotency v0
         # DB (the live acceptance created one) has the table without the two
         # newer columns, and CREATE TABLE IF NOT EXISTS won't add them — the
@@ -81,6 +84,13 @@ class RequestStore:
                     self._db.execute(
                         f"ALTER TABLE runtime_requests ADD COLUMN {col} {decl}")
         self._db.executescript(_SCHEMA)
+        outbox_have = {r[1] for r in self._db.execute(
+            "PRAGMA table_info(attribution_outbox)").fetchall()}
+        for col, decl in (("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                          ("next_attempt_at", "REAL NOT NULL DEFAULT 0")):
+            if col not in outbox_have:
+                self._db.execute(
+                    f"ALTER TABLE attribution_outbox ADD COLUMN {col} {decl}")
         self._db.commit()
 
     # ── lifecycle ───────────────────────────────────────────────────────────
@@ -213,14 +223,19 @@ class RequestStore:
             self._db.rollback()
             raise
 
-    def attribution_outbox(self, status: str = "pending") -> list[dict]:
+    def attribution_outbox(self, status: str = "pending", *,
+                           due_before=None, limit: int = 8) -> list[dict]:
+        due = time.time() if due_before is None else float(due_before)
         cur = self._db.execute(
-            "SELECT request_id, actor_id, receipts_json, status, error, created_at"
-            " FROM attribution_outbox WHERE status = ? ORDER BY created_at, request_id",
-            (status,))
+            "SELECT request_id, actor_id, receipts_json, status, error, created_at,"
+            " attempts, next_attempt_at FROM attribution_outbox"
+            " WHERE status = ? AND next_attempt_at <= ?"
+            " ORDER BY created_at, request_id LIMIT ?",
+            (status, due, int(limit)))
         return [{
             "requestId": row[0], "actorId": row[1], "receipts": json.loads(row[2]),
             "status": row[3], "error": row[4], "createdAt": row[5],
+            "attempts": row[6], "nextAttemptAt": row[7],
         } for row in cur.fetchall()]
 
     def attribution_status(self, request_id: str):
@@ -239,6 +254,27 @@ class RequestStore:
             (status, error, time.time(), request_id))
         self._db.commit()
         return cur.rowcount == 1
+
+    def defer_attribution(self, request_id: str, error: str, *,
+                          max_attempts: int = 5, now=None) -> str:
+        current = time.time() if now is None else float(now)
+        row = self._db.execute(
+            "SELECT attempts FROM attribution_outbox"
+            " WHERE request_id = ? AND status = 'pending'", (request_id,),
+        ).fetchone()
+        if row is None:
+            return "missing"
+        attempts = row[0] + 1
+        status = "unavailable" if attempts >= max_attempts else "pending"
+        delay = 0 if status == "unavailable" else min(60.0, 2.0 ** (attempts - 1))
+        self._db.execute(
+            "UPDATE attribution_outbox SET attempts = ?, status = ?, error = ?,"
+            " next_attempt_at = ?, updated_at = ? WHERE request_id = ?"
+            " AND status = 'pending'",
+            (attempts, status, str(error)[:1000], current + delay, current, request_id),
+        )
+        self._db.commit()
+        return status
 
     def consume(self, request_id: str) -> bool:
         """Stamp a one-time-use approval as consumed (approved → consumed_at

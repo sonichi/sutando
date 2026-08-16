@@ -39,12 +39,15 @@ def main() -> int:
     parser.add_argument("--all-repositories", action="store_true")
     parser.add_argument("--exclude-repository", action="append", default=[])
     parser.add_argument("--object-type", action="append", default=[])
+    parser.add_argument("--all-object-types", action="store_true")
     parser.add_argument("--exclude-object-type", action="append", default=[])
     parser.add_argument("--not-before")
     parser.add_argument("--not-after")
     args = parser.parse_args()
     if not args.repository and not args.all_repositories:
         parser.error("pass --repository at least once or explicitly use --all-repositories")
+    if not args.object_type and not args.all_object_types:
+        parser.error("pass --object-type at least once or explicitly use --all-object-types")
     identity = _identity()
     account = canonical_account_id("github", str(identity["id"]))
     asserted_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

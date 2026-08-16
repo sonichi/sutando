@@ -15,6 +15,11 @@
     "path": "/absolute/path/to/your/workspace"
   },
 
+  "attribution": {
+    "_comment": "Stable canonical identity for exact runtime receipts. Generate one once and keep it unchanged across restarts.",
+    "agent_principal_id": "agent:018f0f65-7b4a-7cc1-8f52-8c6ad9a60d7d"
+  },
+
   "vault": {
     "_comment": "Enable + point at your private remote git repo to sync notes/memory/archives off-host.",
     "enabled": true,

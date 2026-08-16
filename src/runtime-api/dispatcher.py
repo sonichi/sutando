@@ -38,7 +38,7 @@ from protocol import ELICITATION_TYPES, ProtocolError  # noqa: E402
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
 from capability_registry import EphemeralCapabilityRegistry  # noqa: E402
-from attribution_claims import (AttributionError, canonical_account_id,  # noqa: E402
+from attribution_claims import (AttributionError, MAX_RECEIPTS, canonical_account_id,  # noqa: E402
                                 is_canonical_agent_id, normalize_receipt,
                                 performed_by_claim)
 
@@ -132,7 +132,7 @@ class RuntimeDispatcher:
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
                  capability_registry: Optional[EphemeralCapabilityRegistry] = None,
-                 attribution_writer=None):
+                 attribution_writer=None, attribution_actor_id=None):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
@@ -141,6 +141,9 @@ class RuntimeDispatcher:
             capability_registry if capability_registry is not None
             else EphemeralCapabilityRegistry())
         self.attribution_writer = attribution_writer
+        self.attribution_actor_id = (
+            actor_id if attribution_actor_id is None else attribution_actor_id
+        )
         self._executing: set = set()
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
@@ -182,21 +185,20 @@ class RuntimeDispatcher:
         if relinked or n:
             _log(f"recovered {relinked} pending request(s)"
                  + (f", failed {n} interrupted capability execution(s)" if n else ""))
-        self._publish_attribution_outbox()
 
     @staticmethod
     def _receipt_list(result: dict):
         raw = result.get("attributionReceipts") if isinstance(result, dict) else None
         if raw is None:
             return [], None
-        if not isinstance(raw, list) or not 1 <= len(raw) <= 8:
-            return [], "attributionReceipts must contain between 1 and 8 receipts"
+        if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_RECEIPTS:
+            return [], f"attributionReceipts must contain between 1 and {MAX_RECEIPTS} receipts"
         try:
             return [normalize_receipt(row) for row in raw], None
         except AttributionError as exc:
             return [], str(exc)
 
-    def _publish_attribution_outbox(self) -> None:
+    async def publish_attribution_outbox(self) -> None:
         for row in self.store.attribution_outbox():
             if self.attribution_writer is None or not is_canonical_agent_id(row["actorId"]):
                 self.store.settle_attribution(
@@ -208,13 +210,16 @@ class RuntimeDispatcher:
                 row["createdAt"], timezone.utc,
             ).isoformat().replace("+00:00", "Z")
             try:
-                for receipt in row["receipts"]:
-                    self.attribution_writer.append(performed_by_claim(
-                        actor_id=row["actorId"], receipt=receipt,
-                        runtime_request_id=row["requestId"], asserted_at=asserted_at,
-                    ))
-            except Exception as exc:  # noqa: BLE001 — outbox remains retryable
-                _log(f"attribution publication pending for {row['requestId']}: {exc}")
+                claims = [performed_by_claim(
+                    actor_id=row["actorId"], receipt=receipt,
+                    runtime_request_id=row["requestId"], asserted_at=asserted_at,
+                ) for receipt in row["receipts"]]
+                await asyncio.to_thread(
+                    lambda: [self.attribution_writer.append(claim) for claim in claims],
+                )
+            except Exception as exc:  # noqa: BLE001 — bounded durable retry
+                state = self.store.defer_attribution(row["requestId"], str(exc))
+                _log(f"attribution publication {state} for {row['requestId']}: {exc}")
                 continue
             self.store.settle_attribution(row["requestId"], "recorded")
 
@@ -415,9 +420,9 @@ class RuntimeDispatcher:
                         rec["requestId"], status, result=result, resolved_by="executor")
                 elif receipts:
                     won = self.store.complete_with_receipts(
-                        rec["requestId"], result, self.actor_id, receipts)
+                        rec["requestId"], result, self.attribution_actor_id, receipts)
                     if won:
-                        self._publish_attribution_outbox()
+                        await self.publish_attribution_outbox()
                 else:
                     won = self.store.transition(
                         rec["requestId"], status, result=result, resolved_by="executor")
@@ -425,8 +430,6 @@ class RuntimeDispatcher:
                 won = self.store.transition(
                     rec["requestId"], status, result=result, resolved_by="executor")
             durable = self.store.get(rec["requestId"])
-            if not won:
-                return self._public(durable)
             return self._public(durable)
         finally:
             self._executing.discard(rec["requestId"])
@@ -503,6 +506,7 @@ class RuntimeDispatcher:
             try:
                 for rec in self.store.pending():
                     self._settle(rec["requestId"])
+                await self.publish_attribution_outbox()
             except Exception as e:  # noqa: BLE001 — resolver must never die
                 _log(f"resolver error (isolated): {e}")
             await asyncio.sleep(RESOLVER_POLL_S)

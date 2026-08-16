@@ -200,8 +200,8 @@ def _scope(value: Any, subject: str) -> dict[str, Any]:
         if match is None or match.group(1) != provider:
             raise AttributionError("scope account IDs must be canonical and match provider")
         clean_accounts.append(account)
-    if subject not in clean_accounts:
-        raise AttributionError("policy subject must be included in scope.account_ids")
+    if clean_accounts != [subject]:
+        raise AttributionError("v1 policy scope must contain only its subject account")
     clean: dict[str, Any] = {"provider": provider, "account_ids": clean_accounts}
     for field, limit in (
         ("resource_ids", 300), ("object_types", 100),
@@ -252,11 +252,15 @@ def validate_claim(value: Mapping[str, Any]) -> dict[str, Any]:
             raise AttributionError("uses_account requires principal subject and account object")
         if basis not in {"provider_auth_observed", "owner_asserted"}:
             raise AttributionError("uses_account has an invalid basis")
+        if basis == "owner_asserted" and not author.startswith("human:"):
+            raise AttributionError("owner_asserted claims require a human author")
     elif predicate == "performer_kind_policy":
         if _ACCOUNT_RE.fullmatch(subject) is None or object_ not in {"agent", "human"}:
             raise AttributionError("performer_kind_policy requires account subject and kind object")
         if basis != "owner_policy":
             raise AttributionError("performer_kind_policy requires owner_policy basis")
+        if not author.startswith("human:"):
+            raise AttributionError("owner_policy claims require a human author")
         clean["scope"] = _scope(value.get("scope"), subject)
     elif predicate == "performed_by":
         event_match = _EVENT_RE.fullmatch(subject)
@@ -274,11 +278,17 @@ def validate_claim(value: Mapping[str, Any]) -> dict[str, Any]:
         clean["evidence"] = {**evidence, "runtime_request_id": request_id}
         if basis not in {"runtime_receipt", "owner_asserted"}:
             raise AttributionError("performed_by has an invalid basis")
+        if basis == "runtime_receipt" and (not author.startswith("agent:") or author != object_):
+            raise AttributionError("runtime_receipt author must be the performed-by agent")
+        if basis == "owner_asserted" and not author.startswith("human:"):
+            raise AttributionError("owner_asserted claims require a human author")
     else:
         if not _CLAIM_RE.fullmatch(subject) or not _CLAIM_RE.fullmatch(object_):
             raise AttributionError("retracts requires claim IDs")
         if basis != "owner_asserted":
             raise AttributionError("retracts requires owner_asserted basis")
+        if not author.startswith("human:"):
+            raise AttributionError("owner_asserted claims require a human author")
     encoded = json.dumps(clean, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_CLAIM_BYTES:
         raise AttributionError(f"claim exceeds the {MAX_CLAIM_BYTES}-byte limit")

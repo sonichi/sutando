@@ -48,6 +48,10 @@ Policy scope names a provider and account IDs and may narrow resource IDs,
 object types, exclusions for either, and inclusive RFC 3339 time bounds. An
 empty optional selector means no further restriction. Broad words such as
 “almost all” are not stored; exclusions must be represented explicitly.
+Version 1 permits exactly the subject account in `account_ids`; multi-account
+policy claims are rejected rather than carrying inert selectors. Owner policy,
+owner assertion, and retraction claims require a canonical human author. A
+runtime receipt must be authored by the same canonical agent it identifies.
 
 ## Storage and publication
 
@@ -74,6 +78,16 @@ The runtime never accepts performer identity from capability parameters. An
 absent, legacy, or invalid daemon identity leaves exact attribution unavailable.
 V1 assumes one daemon represents one logical agent; authenticated per-client
 identities are a later protocol.
+
+Configure the stable identity in `sutando.config.local.json`:
+
+```json
+{"attribution":{"agent_principal_id":"agent:<uuid>"}}
+```
+
+Outbox publication runs off the async request path, retries due records during
+normal daemon uptime with exponential backoff, and marks a record unavailable
+after five failed attempts. The last error remains visible on the request.
 
 Direct `gh`, `git`, or other unmediated writes remain unattributed.
 

@@ -21,6 +21,8 @@ Use `--all-repositories` only for an intentional account-wide policy. Narrow it
 with `--exclude-repository`, `--object-type`, `--exclude-object-type`,
 `--not-before`, or `--not-after`. The command reads the immutable account ID
 from `gh api user`; it does not accept a login or account ID from the caller.
+Likewise, omit `--object-type` only when explicitly passing
+`--all-object-types`.
 
 The command writes two owner-local claims: the agent may use the observed
 account, and matching activity is agent-produced. The latter classifies only
