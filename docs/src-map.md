@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-217 modules indexed.
+219 modules indexed.
 
 ## `src/`
 
@@ -20,6 +20,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
+- **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -168,6 +169,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
+- **`workspace_layout.py`** — Spawn-time guard for the `<repo>/workspace` wiring: heals recoverable breaks to the durable symlink; a real directory HOLDING data is never touched.
 - **`workspace_lock.py`** — Atomic per-workspace role lock for sutando singleton enforcement (MC1).
 - **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
 - **`write_calendar_cache.py`** — Producer for the morning-briefing Google-calendar cache (PR #2256).
