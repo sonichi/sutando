@@ -2055,10 +2055,19 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
         # Closest the index has come to the cut in the recorded window. This is
         # the number that makes the warning land, and no point reading has it.
         peak = max(sz for _, sz in points)
-        oldest_at, oldest_sz = points[0]
+        # FASTEST sustained climb to now, over every start point: a single anchor
+        # can be undercut by a compaction or by 1-byte jitter, a max cannot.
         newest_at, _ = points[-1]
-        hours = (newest_at - oldest_at) / 3600.0
-        grew = effective_bytes - oldest_sz
+        hours = grew = 0.0
+        best_rate = 0.0
+        for at, sz in points:
+            span = (newest_at - at) / 3600.0
+            gain = effective_bytes - sz
+            if span < 0.5 or gain <= 0:
+                continue
+            if gain / span > best_rate:
+                best_rate, hours, grew = gain / span, span, gain
+        grew = int(grew)
         note = ""
         if peak > MEMORY_INDEX_LOAD_BYTES:
             # Not "nearly" — it was OVER, so the tail was genuinely unread for as
@@ -4360,6 +4369,23 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
     return None
 
 
+def _plist_via_plutil(path: "Path") -> "dict | None":
+    """Parse a plist without `plistlib`. None on any failure, which keeps the
+    caller's existing warn wherever plutil is absent or unusable."""
+    try:
+        out = subprocess.run(["/usr/bin/plutil", "-convert", "json", "-o", "-", str(path)],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(out.stdout)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
     """Does the proxy resolve THIS core's login, or a different account's?
 
@@ -4463,15 +4489,21 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     try:
         import plistlib
     except ImportError as exc:
-        return {"name": name, "status": "warn",
-                "detail": (f"cannot parse the credential-proxy plist — this Python "
-                           f"cannot import plistlib ({exc.__class__.__name__}: {exc}). "
-                           f"Every other check is unaffected.")}
-    try:
-        rendered = plistlib.loads(plist.read_bytes())
-    except (OSError, ValueError) as exc:
-        return {"name": name, "status": "warn",
-                "detail": f"cannot read the credential-proxy plist ({exc})"}
+        # plutil needs no expat, so the comparison stays answerable on exactly
+        # the hosts where this import fails.
+        rendered = _plist_via_plutil(plist)
+        if rendered is None:
+            return {"name": name, "status": "warn",
+                    "detail": (f"cannot parse the credential-proxy plist — this Python "
+                               f"cannot import plistlib ({exc.__class__.__name__}: {exc}) "
+                               f"and plutil could not read it either. "
+                               f"Every other check is unaffected.")}
+    else:
+        try:
+            rendered = plistlib.loads(plist.read_bytes())
+        except (OSError, ValueError) as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"cannot read the credential-proxy plist ({exc})"}
     # A plist can PARSE and still be the wrong shape — `EnvironmentVariables`
     # encoded as a string, say. `.get` on that raises AttributeError, which is
     # not caught above and would abort the whole health run, taking every later
