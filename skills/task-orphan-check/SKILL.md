@@ -37,7 +37,7 @@ If no live tasks, emit "orphan-check: no live tasks, nothing to recover" and idl
 
 For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g. `task-1779570142563`). The file is `tasks/<id>.txt`. Per-task paths below use `<id>` consistently — note `<id>` already includes the `task-` prefix; do NOT add it again.
 
-1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (if Discord), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner).
+1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (if Discord), `chat_id` (Telegram), `room_name` / `channel_name` (whichever the surface carries — ag2.space sends `room_name` and no `channel_name`, so a reader that parses only the latter gets nothing and step 3b falls back to the raw id), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner).
 
 2. **Cross-reference completion markers** (any single match = task already completed):
    - **`<workspace>/results/<id>.txt`** exists → **DONE**. The result file is the canonical completion marker; if it exists the task was processed.
