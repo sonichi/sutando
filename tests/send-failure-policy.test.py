@@ -134,6 +134,29 @@ class TestIsTransient(unittest.TestCase):
         self.assertTrue(sfp.is_transient(ClientProxyConnectionError("proxy down")))
         self.assertTrue(sfp.is_transient(ClientConnectorDNSError("dns")))
 
+    def test_urlerror_wrapper_classified_by_its_reason(self):
+        # urllib wraps the real failure; the wrapper alone reads as permanent.
+        import socket
+        import urllib.error
+        for inner in (TimeoutError("t"), ConnectionRefusedError(),
+                      socket.gaierror(8, "nodename nor servname")):
+            self.assertTrue(sfp.is_transient(urllib.error.URLError(inner)), inner)
+        self.assertFalse(sfp.is_transient(urllib.error.URLError("not an exception")))
+
+    def test_nested_reason_chain_unwraps_but_is_bounded(self):
+        import urllib.error
+        nested = urllib.error.URLError(urllib.error.URLError(TimeoutError("t")))
+        self.assertTrue(sfp.is_transient(nested))
+        # deeper than the unwrap bound: parks rather than loops
+        deep = ValueError("leaf")
+        for _ in range(6):
+            deep = urllib.error.URLError(deep)
+        self.assertFalse(sfp.is_transient(deep))
+        # cyclic .reason must not hang
+        cyc = urllib.error.URLError("x")
+        cyc.reason = cyc
+        self.assertFalse(sfp.is_transient(cyc))
+
     def test_unknown_failure_parks(self):
         # Parking an unknown error loses nothing — quarantine preserves the body and
         # health-check reports it — while retrying forever would bury the log.
