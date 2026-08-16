@@ -172,8 +172,8 @@ def _status_beats_id():
     m = adapter_mod()
     classify = need(m, "classify_response")
     from outbox import DeliveryOutcome as O  # noqa: PLC0415
-    # Error envelopes routinely carry a trace/correlation id. Reading that as a
-    # delivery receipt archives an item the provider explicitly refused.
+    # A trace id in an error envelope is not a delivery receipt; reading it as
+    # one archives an item the provider explicitly refused.
     for status, want in ((500, O.OUTCOME_UNKNOWN), (503, O.OUTCOME_UNKNOWN),
                          (400, O.NOT_DELIVERED), (404, O.NOT_DELIVERED)):
         got = classify(status=status, body={"id": "trace-123", "error": "failed"})

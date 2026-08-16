@@ -42,9 +42,8 @@ class DeliveryReceipt:
 
 def classify_response(status: Optional[int], body: Any) -> DeliveryReceipt:
     """Provider response -> receipt. Pure; no I/O, no policy."""
-    # Status decides first. Error envelopes routinely carry an `id` (a trace or
-    # correlation id), and reading that as a receipt archives an item the
-    # provider just told us it did not accept.
+    # Status decides first: an error envelope's `id` is a trace id, and reading
+    # it as a receipt archives an item the provider just refused.
     if status is None:
         return DeliveryReceipt(DeliveryOutcome.OUTCOME_UNKNOWN,
                                detail="no response (timeout or transport failure)")

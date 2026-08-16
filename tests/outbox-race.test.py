@@ -49,8 +49,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     # Phase 2 — RECLAIM of a dead owner's claim. Exclusion on acquire says
-    # nothing about this: the failure is two drainers acting on the same stale
-    # observation, where the second's release deletes the first's fresh claim.
+    # nothing about two drainers acting on one stale observation.
     rc_totals, orphaned = [], 0
     for r in range(rounds * 2):
         with tempfile.TemporaryDirectory() as tmp:
