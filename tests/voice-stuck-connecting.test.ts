@@ -11,7 +11,7 @@
  * reimplementation passes while production drifts. It lives in its own module
  * because importing voice-agent.ts boots a voice agent — main() is unguarded.
  */
-import { shouldForceClosed } from '../src/voice-connect-watchdog.js';
+import { shouldForceClosed, parseStuckConnectingMs, DEFAULT_STUCK_CONNECTING_MS } from '../src/voice-connect-watchdog.js';
 
 let failed = 0;
 function check(name: string, got: unknown, want: unknown): void {
@@ -64,5 +64,25 @@ check('...and an expired one does not',
 check('the observed incident would have recovered',
 	shouldForceClosed({ ...base, now: base.connectingSince + 23 * 60_000 }), true);
 
+
+// --- VOICE_STUCK_CONNECTING_MS parsing (review nit: `Number(x) || d` ate 0 and typos) ---
+
+check('an unset override takes the default', parseStuckConnectingMs(undefined), DEFAULT_STUCK_CONNECTING_MS);
+check('an empty override takes the default', parseStuckConnectingMs('   '), DEFAULT_STUCK_CONNECTING_MS);
+check('0 is honoured, not swallowed', parseStuckConnectingMs('0'), 0);
+check('a valid override is used verbatim', parseStuckConnectingMs('45000'), 45_000);
+check('threshold 0 disables the force entirely',
+	shouldForceClosed({ ...base, thresholdMs: 0, now: 1e12 }), false);
+
+for (const bad of ['abc', '12x', 'NaN', '-1']) {
+	const warnings: string[] = [];
+	check(`${bad} falls back to the default`,
+		parseStuckConnectingMs(bad, (m) => { warnings.push(m); }), DEFAULT_STUCK_CONNECTING_MS);
+	check(`${bad} warns exactly once`, warnings.length, 1);
+	check(`${bad} names the variable in the warning`,
+		warnings[0]?.includes('VOICE_STUCK_CONNECTING_MS'), true);
+}
+
 console.log(failed ? `FAILED: ${failed} check(s)` : 'voice stuck-CONNECTING watchdog: all checks passed');
 process.exit(failed ? 1 : 0);
+

@@ -74,6 +74,7 @@ import {
 } from './voice-agent-state.js';
 
 import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_paths.js';
+import { shouldForceClosed } from './voice-connect-watchdog.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -133,7 +134,6 @@ const PORT = Number(process.env.PORT) || 9900;
 // Set HOST=0.0.0.0 explicitly only for a trusted deployment that needs it.
 const HOST = process.env.HOST || '127.0.0.1';
 
-import { shouldForceClosed } from './voice-connect-watchdog.js';
 // Per-user runtime state lives under the resolved workspace (post-v0.8
 // / #1440 default: <repo>/workspace/), not the repo checkout. Pre-#762
 // voice-agent resolved its tasks/results/state against the repo path via
