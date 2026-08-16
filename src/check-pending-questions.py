@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -26,7 +27,25 @@ from dm_ban import is_dm_banned  # noqa: E402
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
-LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
+# No read-fallback to the old root path on purpose: a missing stamp makes the
+# reader notify ONCE rather than suppress, so the move costs one notification.
+LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
+
+
+def write_notify_stamp(questions, now=None):
+    """Record that this question set was just notified.
+
+    Named so it is testable without driving `main`, which fires a real notification.
+    """
+    LAST_NOTIFY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time()) if now is None else now
+    LAST_NOTIFY_FILE.write_text(f"{ts} {questions_key(questions)}")
+    # Retire AFTER the new stamp exists: a crash between the two costs at most a
+    # cooldown. Path derived from LAST_NOTIFY_FILE so a redirected test stays in tmp.
+    try:
+        (LAST_NOTIFY_FILE.parent.parent / ".last-pq-notify").unlink(missing_ok=True)
+    except OSError:
+        pass
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 # How long an UNCHANGED question set stays quiet before it is raised again. This
 # is the floor that stops "notify only when the set changes" from turning an
@@ -295,7 +314,22 @@ def notify_discord_dm(questions):
     if is_dm_banned(RESULTS_DIR.parent):
         print("dm-ban.sentinel present — DM delivery suppressed (macOS-only)")
         return
-    path.write_text("\n".join(lines))
+    # Each body is a whole snapshot, so a stale one is wrong, not redundant. Look
+    # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
+    superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
+    # Appear at the deliverable name in one step, from a scratch name no other run
+    # can hold: a poll claims proactive-*.txt on sight and would DM a partial body.
+    fd, tmp_name = tempfile.mkstemp(dir=RESULTS_DIR, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines))
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    for old in superseded:
+        old.unlink(missing_ok=True)
 
 
 # A proactive-*.txt is only a DELIVERY if some bridge drains it. On a host where
@@ -467,7 +501,7 @@ def main():
     # exact "claimed an outcome it never achieved" failure this script exists to
     # remove, reproduced in its own control flow.
     summary = deliver(questions, count, titles)
-    LAST_NOTIFY_FILE.write_text(f"{int(time.time())} {questions_key(questions)}")
+    write_notify_stamp(questions)  # pragma: no cover — covered as a unit; reaching here fires a real notification
     print(summary)
 
 

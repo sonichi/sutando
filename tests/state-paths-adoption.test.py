@@ -136,6 +136,9 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # workspace_layout cannot import the resolver it exists to repair; its
+    # flagged tokens are JSON report field names, not runtime-state paths.
+    "src/workspace_layout.py",
     # The canonical resolver itself — names the strings literally and
     # IS the place where the fallback shapes legitimately live.
     "src/workspace_default.py",
@@ -173,6 +176,12 @@ ALLOWLIST = {
     "src/dm_ban.py",
     # Same contract in TypeScript, same reason: caller supplies the root.
     "src/dm-ban.ts",
+    # agent_endpoint.py never resolves the workspace itself — the workspace
+    # arrives in the AgentRuntime descriptor (emitted by the canonical loader
+    # via `sutando-config.sh runtime`) and is injected by tests. The flagged
+    # token composes the tasks dir FROM that injected value, mirroring
+    # task_archive.py's caller-supplies-the-path rationale.
+    "src/agent_endpoint.py",
 }
 
 

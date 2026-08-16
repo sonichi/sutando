@@ -42,6 +42,9 @@ _TMP_HOME = tempfile.mkdtemp(prefix="owner-activity-test-home-")
 atexit.register(lambda: shutil.rmtree(_TMP_HOME, ignore_errors=True))
 os.environ["HOME"] = _TMP_HOME
 os.environ["CLAUDE_CONFIG_DIR"] = str(Path(_TMP_HOME) / ".claude")
+# AG2_DEVICE_ENV outranks CLAUDE_CONFIG_DIR in _ag2space_access_path; this suite
+# passes without it only while the operator's real map omits its fixture sender.
+os.environ["AG2_DEVICE_ENV"] = ""
 _ch_env = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / ".env"
 _ch_env.parent.mkdir(parents=True, exist_ok=True)
 _ch_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
@@ -127,6 +130,7 @@ class TestGatewayWriterChannelId(unittest.TestCase):
                 # channel_id present → recorded + bracket prefix stripped from summary
                 gw._write_owner_activity({"task": "[AG2 @u] hi there",
                                           "source": "ag2space",
+                                          "access_tier": "owner",
                                           "channel_id": "!room:ag2.space"})
                 data = json.loads(f.read_text())
                 self.assertEqual(data["channel"], "ag2space")
@@ -134,7 +138,8 @@ class TestGatewayWriterChannelId(unittest.TestCase):
                 self.assertEqual(data["summary"], "hi there")
                 # channel_id omitted → key absent (back-compat with older readers)
                 f.unlink()
-                gw._write_owner_activity({"task": "[AG2 @u] no room", "source": "ag2space"})
+                gw._write_owner_activity({"task": "[AG2 @u] no room", "source": "ag2space",
+                                          "access_tier": "owner"})
                 self.assertNotIn("channel_id", json.loads(f.read_text()))
             finally:
                 gw.OWNER_ACTIVITY_FILE, gw.LOCAL_TIER = orig_file, orig_tier

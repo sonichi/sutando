@@ -217,6 +217,22 @@ def _quota_freshness(data: dict, quota_file) -> dict:
 
 
 
+def _quota_has_data(quota: dict) -> bool:
+    """Whether a reading actually exists, as opposed to defaulting to zero.
+
+    The tiles below format utilization with `.get(..., 0)`, so an ABSENT file
+    rendered as "0% used" plus a green check — absence shown as "healthy,
+    nothing consumed", which is the confidently-wrong failure get_quota_status
+    exists to avoid. Same discriminator as the age label.
+    """
+    return bool(quota.get("headers")) or quota.get("age_h") is not None
+
+
+# Glyph is a THREE-way split, not two: no reading -> "—", a reading the API
+# refused -> "✗", a good reading -> "✓". Collapsing the last two hides a real
+# rate-limit behind a check.
+
+
 def _quota_age_label(quota: dict) -> str:
     """One short string for the panel: how old this reading is.
 
@@ -487,7 +503,12 @@ def get_schedules() -> list[dict]:
     out = []
     for job in jobs:
         expr = job.get("cron", "")
-        kind = f'skill:{job["prompt_skill"]}' if job.get("prompt_skill") else "prompt"
+        if job.get("shell_command"):
+            kind = "shell"
+        elif job.get("prompt_skill"):
+            kind = f'skill:{job["prompt_skill"]}'
+        else:
+            kind = "prompt"
         nxt = _cron_next_run(expr, now) if expr else None
         if nxt:
             mins = int((nxt - now).total_seconds() // 60)
@@ -502,6 +523,8 @@ def get_schedules() -> list[dict]:
             next_str = ">7d" if expr else "invalid"
         if job.get("description"):
             desc = job["description"]
+        elif job.get("shell_command"):
+            desc = f'Runs shell command: {job["shell_command"]}'
         elif job.get("prompt_skill"):
             desc = f'Runs the /{job["prompt_skill"]} skill'
         else:
@@ -548,9 +571,9 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
 <div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
-<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("✓" if stats["quota"].get("available", True) else "✗")}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
-<div class="stat"><div class="stat-val">{int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)}%</div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
-<div class="stat"><div class="stat-val">{int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)}%</div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
+<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
+<div class="stat"><div class="stat-val">{(str(int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
+<div class="stat"><div class="stat-val">{(str(int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
 </div></div>""")
 
     # Services (ports + daemons only)
@@ -666,7 +689,7 @@ def render_dashboard() -> str:
         '</tr>'
     )
     cards.append(
-        '<div class="card full"><h2>Schedules</h2>'
+        '<div class="card full" id="schedules"><h2>Schedules</h2>'
         '<table style="width:100%;font-size:11px;border-collapse:collapse">'
         '<tr style="color:#555;text-align:left"><th>Name</th><th>Cron</th>'
         '<th>Type</th><th>Next run</th><th></th></tr>'
@@ -694,6 +717,56 @@ def render_dashboard() -> str:
 </div></div>""")
 
     return HTML.replace("__CONTENT__", "\n".join(cards))
+
+
+# ── Mutating-request gate ────────────────────────────────────────────────────
+
+# CORS hides a cross-origin response but does not stop the request, and a
+# safelisted text/plain POST reaches the handler with no preflight.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# A wildcard bind names no host, so the legitimate Host set cannot be derived
+# from it; DASHBOARD_ALLOWED_HOSTS supplies it explicitly for LAN mode.
+_WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
+
+
+def _authority_host(value: str) -> str:
+    """Hostname from a Host/Origin authority, minus port and IPv6 brackets."""
+    v = (value or "").strip().lower()
+    if v.startswith("["):
+        return v[1:].split("]", 1)[0]
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
+def _allowed_mutation_hosts(bind: str, declared: str) -> "set[str] | None":
+    """Host names a mutation may carry. None = wildcard bind with none declared."""
+    names = {h for h in (_authority_host(x) for x in (declared or "").split(",")) if h}
+    if (bind or "").strip().lower() in _WILDCARD_BINDS:
+        return (_LOOPBACK_HOSTS | names) if names else None
+    return _LOOPBACK_HOSTS | {bind.strip().lower()} | names
+
+
+def mutation_request_allowed(origin, host, content_type, *, expect_body,
+                             bind="127.0.0.1", allowed_hosts=""):
+    """Fail-closed gate for state-changing dashboard requests → (ok, reason)."""
+    permitted = _allowed_mutation_hosts(bind, allowed_hosts)
+    if permitted is None:
+        # Refusing loudly beats 403-ing every save with "host not allowed": on a
+        # wildcard bind the operator must name the hosts, or rebinding is free.
+        return False, ("wildcard DASHBOARD_BIND requires DASHBOARD_ALLOWED_HOSTS "
+                       "(comma-separated) before mutations are accepted")
+    if _authority_host(host) not in permitted:
+        # DNS rebinding: the attacker's name resolves to us, so only the Host
+        # header still carries it.
+        return False, "host not allowed"
+    if not origin:
+        return False, "missing Origin"
+    if urlparse(origin).netloc.strip().lower() != (host or "").strip().lower():
+        return False, "cross-origin request refused"
+    if expect_body and (content_type or "").split(";", 1)[0].strip().lower() != "application/json":
+        # Non-safelisted type: a cross-origin sender must preflight, which this
+        # server never grants.
+        return False, "Content-Type must be application/json"
+    return True, None
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -731,11 +804,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(obj).encode())
 
+    def _gate(self, *, expect_body):  # pragma: no cover — reads request headers
+        """Refuse a state-changing request that fails mutation_request_allowed."""
+        ok, why = mutation_request_allowed(
+            self.headers.get("Origin"), self.headers.get("Host", ""),
+            self.headers.get("Content-Type"), expect_body=expect_body,
+            bind=os.environ.get("DASHBOARD_BIND", "127.0.0.1"),
+            allowed_hosts=os.environ.get("DASHBOARD_ALLOWED_HOSTS", ""))
+        if not ok:
+            # Drain first: replying and closing with the body still unread makes
+            # the peer see a connection reset instead of the 403.
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                self.rfile.read(n)
+            self._reply_json(403, {"error": why})
+        return ok
+
     def do_POST(self):  # pragma: no cover — thin HTTP glue over upsert_schedule()
-        """Upsert a cron job. Loopback-only (same bind as GET). Business logic
-        is the unit-tested pure upsert_schedule()."""
+        """Upsert a cron job. Business logic is the unit-tested pure
+        upsert_schedule(); the gate is mutation_request_allowed()."""
         if urlparse(self.path).path != "/api/schedules":
             self.send_response(404); self.end_headers(); return
+        if not self._gate(expect_body=True):
+            return
         code, obj = upsert_schedule(self._json_body())
         self._reply_json(code, obj)
 
@@ -865,7 +959,10 @@ load()
 
 
     def do_DELETE(self):
-        """Handle DELETE requests."""
+        """Handle DELETE requests. Every branch here mutates, so the whole
+        method is gated — /notes/ deletion was reachable the same way."""
+        if not self._gate(expect_body=False):
+            return
         path = urlparse(self.path).path
         if path.startswith("/notes/"):
             raw_slug = path.split("/notes/", 1)[1]
@@ -900,6 +997,10 @@ if __name__ == "__main__":
     # `DASHBOARD_BIND=0.0.0.0` to opt back into LAN exposure when you
     # know you want it. Same env-override shape as `AGENT_API_BIND` in
     # agent-api.py.
+    #
+    # A wildcard bind ALSO requires `DASHBOARD_ALLOWED_HOSTS` (comma-separated
+    # host[:port] the UI is reached by) or every mutation 403s: with 0.0.0.0
+    # there is no host to infer, so the DNS-rebinding gate cannot fail open.
     bind = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client held a connection without completing a request — every later
