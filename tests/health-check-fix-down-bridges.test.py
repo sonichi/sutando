@@ -704,9 +704,8 @@ def case_t_resolve_down_bridge_action() -> list[str]:
             if sutando_config.resolve_down_bridge_action() != "alert":
                 fails.append("t) unknown value should fall back to 'alert'")
 
-    # The stubs above test the missing-key fallback, which is NOT what an install
-    # receives: sutando.config.json sets the key explicitly, so the shipped answer
-    # comes from the tracked file and no stubbed case can see it.
+    # The stubs above cover the missing-key fallback, a state no install is in:
+    # sutando.config.json sets the key, so only an unstubbed read sees what ships.
     env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
     with mock.patch.dict(os.environ, env, clear=True):
         shipped = sutando_config.resolve_down_bridge_action(REPO)
