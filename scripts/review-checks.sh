@@ -11,21 +11,24 @@
 #   git diff | bash scripts/review-checks.sh                 # scan a diff on stdin
 #   bash scripts/review-checks.sh --diff pr.diff             # scan a diff file
 #   bash scripts/review-checks.sh --guide path/to/REVIEW.md --diff pr.diff
+#   bash scripts/review-checks.sh --allow-empty --diff pr.diff  # empty input OK
 #
 # Guide resolution: --guide wins; else <repo>/REVIEW.md. Missing
 # guide -> generic fallback patterns + a stderr note (degrades safely).
 #
-# Exit: 0 = clean; 1 = a check flagged something; 2 = usage error OR the scanner
-#       failed to launch/run (fail-closed — NEVER print PASS in that case).
+# Exit: 0 = clean; 1 = a check flagged something; 2 = usage error, EMPTY input, or
+#       scanner failure — all fail-closed, no PASS. --allow-empty makes empty = 0.
 set -u
 
 DIFF_FILE=""
 GUIDE=""
+ALLOW_EMPTY=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --diff)  DIFF_FILE="${2:?--diff needs a path}"; shift 2;;
         --guide) GUIDE="${2:?--guide needs a path}";    shift 2;;
-        -h|--help) sed -n '2,16p' "$0"; exit 0;;
+        --allow-empty) ALLOW_EMPTY=1; shift;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0;;
         *) echo "review-checks: unknown arg '$1'" >&2; exit 2;;
     esac
 done
@@ -41,7 +44,17 @@ else
 fi
 # Non-empty test via regex (NOT ${DIFF//…/} — that global substitution is
 # O(pathological) on a large string under macOS bash 3.2 and effectively hangs).
-[[ "$DIFF" =~ [^[:space:]] ]] || { echo "review-checks: empty diff — nothing to check." >&2; exit 0; }
+if [[ ! "$DIFF" =~ [^[:space:]] ]]; then
+    # "Nothing was scanned" is not "nothing was found": exiting 0 here let every
+    # wrapper (and every agent) read a no-op invocation as a clean gate.
+    if [[ -n "$ALLOW_EMPTY" ]]; then
+        echo "review-checks: empty diff — nothing to check (--allow-empty)." >&2
+        exit 0
+    fi
+    echo "review-checks: ERROR — empty diff; nothing was scanned, so this is NOT a pass." >&2
+    echo "  Pipe a diff, or pass --diff <file>; use --allow-empty to accept an empty input." >&2
+    exit 2
+fi
 
 [[ -n "$GUIDE" ]] || GUIDE="$REPO/REVIEW.md"
 

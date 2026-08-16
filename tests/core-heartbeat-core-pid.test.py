@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory() as td:
           str(ch._alive_path()).startswith(str(tmp)))
 
     # --- payload: pid is the CORE's, writer's pid kept separately ------------
-    ch.core_pid = lambda socket_path=None: 424242
+    ch.core_pid = lambda socket_path=None, session=None: 424242
     ch.write_beat()
     rec = json.loads(alive.read_text())
     check("pid is the CORE's pane pid (424242)", rec.get("pid") == 424242)
@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory() as td:
     check("socket is still recorded (unchanged contract)", "socket" in rec)
 
     # --- fail-open: tmux unusable must not blank the field or stop reporting -
-    ch.core_pid = lambda socket_path=None: None
+    ch.core_pid = lambda socket_path=None, session=None: None
     alive.unlink()
     ch.write_beat()
     rec2 = json.loads(alive.read_text())

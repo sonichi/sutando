@@ -16,6 +16,14 @@ curl -s http://localhost:7845/capture | python3 -c 'import json,sys; print(json.
 ```
 Then use the Read tool on the returned path to view the screenshot. Use this for any screen-related question: "what am I looking at", "help me with this", "what's on my screen", etc.
 
+`/capture` returns the display's native resolution — on a Retina screen that is
+megabyte-class per frame. Frames entering a live voice session (the Watch/vision
+stream, pull or push) are bounded first: anything over 200 KB is resampled to a
+1280 px long edge and re-encoded as JPEG q60, measured at ~2.5 MB → ~236 KB on a
+3024×1964 display. Frames share one websocket with realtime audio, so an
+unbounded frame delays speech, not just vision. Reading a captured file from disk
+is unaffected — the bound applies only on the way into a session.
+
 **Notes** — the user's second brain. Save and retrieve notes:
 - Save: write to `notes/{slug}.md` with a descriptive filename
 - Retrieve: search notes with `Glob("notes/**/*.md")` or `Grep` for content
@@ -119,8 +127,17 @@ node src/browser.mjs "https://example.com"                    # get page text
 node src/browser.mjs "https://example.com" screenshot         # full-page screenshot → path
 node src/browser.mjs "https://example.com" "fill:#email:me@x.com" "click:#submit"  # fill + click
 node src/browser.mjs "https://example.com" --headed           # watch automation live
+node src/browser.mjs "https://example.com" screenshot --timeout=60000  # override the 45s command limit
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
+Non-interactive commands are bounded to 45 seconds by default; `--timeout` may
+raise that command-level limit to at most 300,000 ms. Navigation uses the
+remaining command budget, and declared `wait:` actions must fit the budget or
+the command fails before launching with guidance to pass a larger `--timeout`.
+Up to five seconds of the limit is reserved for cleanup. Normal completion,
+errors, timeouts, `SIGINT`, and `SIGTERM` all close the page, context, and browser
+before the command exits. A second signal during cleanup restores Node's normal
+immediate termination behavior instead of being swallowed.
 
 **File search (Spotlight)** — find any file on the Mac:
 ```bash
