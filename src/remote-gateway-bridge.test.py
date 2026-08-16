@@ -974,9 +974,8 @@ def main() -> int:
     # file restores for retry, same as the empty-200 case above.
     bare_ok = rtc.RESULTS_DIR / "proactive-t15.txt"
     bare_ok.write_text("bare-ok nudge\n")
-    # Hermetic: the module import may have read a REAL channel .env where the
-    # operator set REMOTE_PROACTIVE_TRUST_OK=1 (the 2026-08-16 stopgap). This
-    # case tests the DEFAULT, so pin it off explicitly.
+    # Pin the default off: the module import may have read a real channel .env
+    # where the operator opted in to trust-ok.
     rtc.PROACTIVE_TRUST_OK = False
     STATE["force_room_ok_only"] = True
     rtc._post_proactive()

@@ -88,10 +88,8 @@ def main() -> int:
         check(not other.exists() and not out.startswith("will retry"),
               "control: an over-cap count parks immediately (policy is live)")
 
-        # 4. PRODUCTION EXCEPTION SHAPES: _post_proactive hands the resolver
-        # urllib wrappers, not bare exceptions. A wrapped transient must retry
-        # (it parked at attempt 0 before the .reason unwrap); a permanent 4xx
-        # must park at once.
+        # 4. Production shapes: urllib WRAPPERS, not bare exceptions — a
+        # wrapped transient must retry, a permanent 4xx must park at once.
         import socket
         import urllib.error
         for reason, label in [
