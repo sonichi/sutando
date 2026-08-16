@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Every TASK_FILE emit must be non-fatal AND non-silent.
+#
+# The normal-path emits use `|| exit 0` (no consumer -> stop). The shutdown and
+# handler-fallback emits must not abort the rest of the drain, so they cannot use
+# that — but `|| true` made them non-fatal AND silent, and a lost line then left
+# no trace beside the stderr note the preceding `echo` had already printed. That
+# is the shape #2934 fails with: stderr carries "optional task handler failed",
+# stdout carries no TASK_FILE line, and nothing on disk says whether the write
+# failed or succeeded-then-vanished.
+#
+# Sources the REAL emitters rather than restating them: a hand-copied
+# reimplementation passes while production drifts.
+#
+# Runs under CI (the shell-standalone-tests step) and manually via
+# `bash tests/watch-tasks-stream-shutdown-emit.test.sh`.
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+WATCHER="$REPO/src/watch-tasks-stream.sh"
+EMITTERS="$REPO/src/task-emit.sh"
+
+fail=0
+check() {  # check <label> <expected> <actual>
+    if [ "$2" = "$3" ]; then
+        echo "  ok   $1"
+    else
+        echo "  FAIL $1: expected '$2', got '$3'"; fail=1
+    fi
+}
+
+# ── structural: no silent form survives, and every site routes through a helper ──
+silent=$(grep -cE "printf 'TASK_FILE: %s\\\\n' \"\\\$filename\"( >&9)? \|\| true" \
+    "$WATCHER" "$EMITTERS" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+check "no emit still uses the silent \`|| true\` form" "0" "$silent"
+
+check "both shutdown call sites go through the shutdown emitter" \
+      "2" "$(grep -cE '^\s+emit_task_file "\$filename"' "$WATCHER" || true)"
+check "the handler-fallback site goes through its own emitter" \
+      "1" "$(grep -cE '^\s+emit_fallback_task_file "\$filename"' "$WATCHER" || true)"
+
+# fd 9 must still be the stable dup of real stdout the shutdown emitter writes to.
+grep -q '^exec 9>&1' "$WATCHER" \
+    || { echo "  FAIL fd 9 is no longer a dup of stdout"; fail=1; }
+
+# The fallback runs in normal drain on real stdout; borrowing fd 9 here would be
+# a behaviour change, not a diagnostic.
+fb_body=$(awk '/^emit_fallback_task_file\(\) \{/,/^\}/' "$EMITTERS")
+# Non-vacuity: an empty extraction makes the >&9 assertion below pass for the
+# wrong reason — absence of a function reads identically to a correct one.
+check "the fallback emitter was actually found" \
+      "1" "$(printf '%s\n' "$fb_body" | grep -c "printf 'TASK_FILE: " || true)"
+check "the fallback emitter writes to stdout, not fd 9" \
+      "0" "$(printf '%s\n' "$fb_body" | grep -c '>&9' || true)"
+
+# ── behavioural: SOURCE the real emitters and drive both branches of each ──
+TMPDIR_T="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_T"' EXIT
+
+# Shutdown emitter: healthy fd 9, then closed fd 9.
+{
+    echo 'set -u'
+    echo "source \"$EMITTERS\""
+    echo 'exec 9>&1'
+    echo 'emit_task_file "task-ok.txt"; echo "rc=$?"'
+    echo 'exec 9>&-'
+    echo 'emit_task_file "task-broken.txt"; echo "rc=$?"'
+} > "$TMPDIR_T/shutdown.sh"
+
+out="$(bash "$TMPDIR_T/shutdown.sh" 2>"$TMPDIR_T/err")"
+err="$(cat "$TMPDIR_T/err")"
+
+check "healthy fd 9 emits the TASK_FILE line" \
+      "1" "$(printf '%s\n' "$out" | grep -c '^TASK_FILE: task-ok.txt$' || true)"
+# Two rc=0 lines: the second is only reached if the FAILING call returned
+# rather than exiting — that is the non-fatal half, pinned without a extra case.
+check "both calls return 0 (non-fatal)" \
+      "2" "$(printf '%s\n' "$out" | grep -c '^rc=0$' || true)"
+check "a failed shutdown emit names the file on stderr" \
+      "1" "$(printf '%s\n' "$err" | grep -c 'FAILED to emit TASK_FILE for task-broken.txt' || true)"
+check "a failed shutdown emit puts nothing on stdout" \
+      "0" "$(printf '%s\n' "$out" | grep -c 'task-broken.txt' || true)"
+
+# Fallback emitter: healthy stdout, then closed stdout.
+{
+    echo 'set -u'
+    echo "source \"$EMITTERS\""
+    echo 'emit_fallback_task_file "task-fb-ok.txt"; echo "rc=$?"'
+    echo 'exec 1>&-'
+    echo 'emit_fallback_task_file "task-fb-broken.txt"; echo "rc=$?" >&2'
+} > "$TMPDIR_T/fallback.sh"
+
+out_fb="$(bash "$TMPDIR_T/fallback.sh" 2>"$TMPDIR_T/err-fb")"
+err_fb="$(cat "$TMPDIR_T/err-fb")"
+
+check "healthy stdout emits the fallback TASK_FILE line" \
+      "1" "$(printf '%s\n' "$out_fb" | grep -c '^TASK_FILE: task-fb-ok.txt$' || true)"
+check "a failed fallback emit names the file on stderr" \
+      "1" "$(printf '%s\n' "$err_fb" | grep -c 'FAILED to emit TASK_FILE for task-fb-broken.txt' || true)"
+check "a failed fallback emit is non-fatal (caller still runs)" \
+      "1" "$(printf '%s\n' "$err_fb" | grep -c '^rc=0$' || true)"
+
+# The two emitters must stay distinguishable in the log: the CI occurrence of
+# #2934 fired on the fallback ("failed for"), not on a shutdown emit
+# ("interrupted for"), and one shared message would erase that discriminator.
+check "the two failure messages name different destinations" \
+      "1" "$(printf '%s\n%s\n' "$err" "$err_fb" | grep -c 'on fd 9' || true)"
+check "...and the fallback names stdout" \
+      "1" "$(printf '%s\n%s\n' "$err" "$err_fb" | grep -c 'on stdout after a handler fallback' || true)"
+
+if [ "$fail" -ne 0 ]; then
+    echo "Results: FAILED"; exit 1
+fi
+echo "Results: watch-tasks-stream emit diagnostics — all checks passed"
