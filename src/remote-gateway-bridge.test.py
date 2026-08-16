@@ -1724,6 +1724,71 @@ def main() -> int:
             else:
                 os.environ[_k] = _v
 
+    # ── long-poll read timeout is the documented empty poll, not an outage ──
+    # The relay's contract is `200 {"tasks": []}` when the hold window expires.
+    # When it instead lets the client's read timeout fire, the two are
+    # indistinguishable, and treating the timeout as a network error backed the
+    # bridge off (up to 60s) and flipped gateway-status.json to
+    # `connected: false` while tasks were still arriving and results delivering.
+    grace = rtc.POLL_TIMEOUT_GRACE_S
+    check(grace >= rtc.POLL_WAIT + 10,
+          "poll-timeout: the grace covers at least one whole poll window")
+    check(rtc._poll_timeout_is_empty(1000.0, 1000.0),
+          "poll-timeout: a timeout right after a good poll reads as an empty poll")
+    check(rtc._poll_timeout_is_empty(1000.0, 1000.0 + grace),
+          "poll-timeout: still benign at exactly the grace boundary")
+    check(not rtc._poll_timeout_is_empty(1000.0, 1000.0 + grace + 1),
+          "poll-timeout: past the grace it is a real outage again")
+    check(not rtc._poll_timeout_is_empty(1000.0, 1000.0 + 86400),
+          "poll-timeout: a wedged relay never looks healthy, however long it hangs")
+
+    # The narrow catch must be a READ timeout only: a connect failure arrives as
+    # URLError, which is not a TimeoutError, so it keeps taking the outage path.
+    class _SlowBody(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "13")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(2)
+            self.wfile.write(b'{"tasks": []}')
+
+    slow = ThreadingHTTPServer(("127.0.0.1", 0), _SlowBody)
+    threading.Thread(target=slow.serve_forever, daemon=True).start()
+    try:
+        import urllib.error
+        import urllib.request
+        raised = None
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{slow.server_address[1]}/v1/tasks?wait=25",
+                    timeout=1) as _r:
+                _r.read()
+        except Exception as e:  # noqa: BLE001 — the type IS the assertion
+            raised = e
+        check(isinstance(raised, TimeoutError),
+              "poll-timeout: a held long poll raises TimeoutError (the type the bridge catches)")
+        check(not isinstance(raised, urllib.error.URLError),
+              "poll-timeout: it is NOT a URLError, so connect failures stay on the outage path")
+    finally:
+        slow.shutdown()
+
+    # Wiring: the policy is only worth anything if the poll call site consults
+    # it. Asserted against the loaded function, not a copy of the file.
+    import inspect
+    _loop = inspect.getsource(rtc.main)
+    _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1][:400]
+    check("_poll_timeout_is_empty" in _poll_call,
+          "poll-timeout: the poll call site consults the policy")
+    check("except TimeoutError" in _poll_call,
+          "poll-timeout: the catch is scoped to the poll, not the whole iteration")
+    check("raise" in _poll_call,
+          "poll-timeout: past the grace it re-raises into the existing outage path")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1
