@@ -525,14 +525,17 @@ def main() -> int:
           "newline in field cannot forge a second access_tier line")
     check("collaborator: true" not in flines,
           "newline in field cannot forge collaborator access")
-    # Minor — no-send / deduped markers are archived, never POSTed to the gateway
+    # Skip markers still POST to close the lease; the server suppresses their
+    # user-facing delivery.
     _before = len(STATE["results"])
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (rtc.RESULTS_DIR / "task-MARK.txt").write_text("[no-send]\n")
     rtc._post_ready_results({"task-MARK"})
-    check(len(STATE["results"]) == _before
-          and not (rtc.RESULTS_DIR / "task-MARK.txt").exists(),
-          "[no-send] marker archived, not POSTed to gateway")
+    _posted = STATE["results"][_before:]
+    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-MARK.txt").exists(),
+          "[no-send] marker POSTed (closes the lease) and archived")
+    check(bool(_posted) and "[no-send]" in (_posted[0].get("body") or ""),
+          "[no-send] body keeps its marker so the server suppresses delivery")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -578,10 +581,13 @@ def main() -> int:
     # 3. result file → POST back + archive
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (rtc.RESULTS_DIR / "task-MOCK1.txt").write_text("the reply\n")
+    # Delta, not an absolute count: marker results now POST too, so earlier
+    # cases legitimately leave entries in STATE["results"].
+    _rb3 = len(STATE["results"])
     rtc._post_ready_results({"task-MOCK1"})
-    check(len(STATE["results"]) == 1, "result POSTed")
-    if STATE["results"]:
-        r = STATE["results"][0]
+    check(len(STATE["results"]) == _rb3 + 1, "result POSTed")
+    if len(STATE["results"]) > _rb3:
+        r = STATE["results"][_rb3]
         check(r.get("id") == "task-MOCK1" and r.get("body") == "the reply",
               "result payload correct (id + body)")
     check(not (rtc.RESULTS_DIR / "task-MOCK1.txt").exists(), "result file archived after POST")
@@ -779,7 +785,7 @@ def main() -> int:
           "a body flushed after an AGED empty claim is still delivered")
 
     # Oversized body → dead-lettered once instead of retrying forever, and it
-    # lands in archive/undeliverable so "given up on" is not confused with
+    # lands in results/undelivered/ so "given up on" is not confused with
     # "delivered".
     huge = rtc.RESULTS_DIR / "proactive-t3c.txt"
     huge.write_text("x" * (rtc._PROACTIVE_MAX_BODY_B + 1))
@@ -968,6 +974,9 @@ def main() -> int:
     # file restores for retry, same as the empty-200 case above.
     bare_ok = rtc.RESULTS_DIR / "proactive-t15.txt"
     bare_ok.write_text("bare-ok nudge\n")
+    # Pin the default off: the module import may have read a real channel .env
+    # where the operator opted in to trust-ok.
+    rtc.PROACTIVE_TRUST_OK = False
     STATE["force_room_ok_only"] = True
     rtc._post_proactive()
     check(bare_ok.exists(),
@@ -982,6 +991,30 @@ def main() -> int:
           and any(p.name.startswith("proactive-t15")
                   for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
           "PROACTIVE_TRUST_OK=1: bare {ok:true} archives (opt-in at-least-once)")
+
+    # Retry CEILING: a file whose sends never confirm parks to undeliverable/
+    # instead of looping forever.
+    (rtc.RESULTS_DIR / "proactive-t2c.txt").write_text("nudge 2c")
+    STATE["force_room_empty_200"] = True
+    _posts_before = len(STATE["room_posts"])
+    for _ in range(rtc.MAX_TRANSIENT_ATTEMPTS + 3):     # more passes than the cap
+        rtc._post_proactive()
+    STATE["force_room_empty_200"] = False
+    _undeliv = rtc.UNDELIVERABLE_RESULTS_DIR
+    # should_retry(exc, tried) counts RETRIES: the initial attempt plus
+    # MAX_TRANSIENT_ATTEMPTS retries = cap+1 posts total, then park.
+    check(len(STATE["room_posts"]) - _posts_before == rtc.MAX_TRANSIENT_ATTEMPTS + 1,
+          f"unconfirmed proactive sends stop at initial+{rtc.MAX_TRANSIENT_ATTEMPTS} "
+          f"retries, not one per pass forever")
+    check(not (rtc.RESULTS_DIR / "proactive-t2c.txt").exists()
+          and _undeliv.exists()
+          and any(x.name.startswith("proactive-t2c") for x in _undeliv.iterdir()),
+          "past the cap the file parks to undeliverable/, recoverable by hand")
+    # A later success must start from a FRESH count (ledger cleared on park).
+    (rtc.RESULTS_DIR / "proactive-t2d.txt").write_text("nudge 2d")
+    rtc._post_proactive()
+    check(not (rtc.RESULTS_DIR / "proactive-t2d.txt").exists(),
+          "post-park deliveries are unaffected by the exhausted file's count")
 
     # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
     # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen
@@ -1053,8 +1086,19 @@ def main() -> int:
     # _reload_rotated_token: no TOKEN_FILE configured → False (FATAL path kept)
     rtc.TOKEN_FILE = ""
     check(rtc._reload_rotated_token() is False, "no TOKEN_FILE → no rotation")
+    # FATAL survives ONLY where recovery is impossible: with reenroll enabled
+    # and a live token, _recover_auth now ENTERS the recheck loop instead
+    # (#2925) — so pin the False contract with the token gone / reenroll off.
+    _tok = rtc.TOKEN
+    rtc.TOKEN = ""
     check(rtc._recover_auth(401) is False,
-          "_recover_auth without TOKEN_FILE → False (caller keeps FATAL exit)")
+          "_recover_auth without TOKEN_FILE and no token → False (FATAL kept)")
+    rtc.TOKEN = _tok
+    _ree = rtc.REENROLL_ENABLED
+    rtc.REENROLL_ENABLED = False
+    check(rtc._recover_auth(401) is False,
+          "_recover_auth without TOKEN_FILE, reenroll off → False (FATAL kept)")
+    rtc.REENROLL_ENABLED = _ree
     # same secret as the running one → no rotation
     rtc.TOKEN_FILE = str(tok_file)
     tok_file.write_text(f"REMOTE_TASK_TOKEN={rtc.TOKEN}\n")
@@ -1706,6 +1750,71 @@ def main() -> int:
                 os.environ.pop(_k, None)
             else:
                 os.environ[_k] = _v
+
+    # ── long-poll read timeout is the documented empty poll, not an outage ──
+    # The relay's contract is `200 {"tasks": []}` when the hold window expires.
+    # When it instead lets the client's read timeout fire, the two are
+    # indistinguishable, and treating the timeout as a network error backed the
+    # bridge off (up to 60s) and flipped gateway-status.json to
+    # `connected: false` while tasks were still arriving and results delivering.
+    grace = rtc.POLL_TIMEOUT_GRACE_S
+    check(grace >= rtc.POLL_WAIT + 10,
+          "poll-timeout: the grace covers at least one whole poll window")
+    check(rtc._poll_timeout_is_empty(1000.0, 1000.0),
+          "poll-timeout: a timeout right after a good poll reads as an empty poll")
+    check(rtc._poll_timeout_is_empty(1000.0, 1000.0 + grace),
+          "poll-timeout: still benign at exactly the grace boundary")
+    check(not rtc._poll_timeout_is_empty(1000.0, 1000.0 + grace + 1),
+          "poll-timeout: past the grace it is a real outage again")
+    check(not rtc._poll_timeout_is_empty(1000.0, 1000.0 + 86400),
+          "poll-timeout: a wedged relay never looks healthy, however long it hangs")
+
+    # The narrow catch must be a READ timeout only: a connect failure arrives as
+    # URLError, which is not a TimeoutError, so it keeps taking the outage path.
+    class _SlowBody(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "13")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(2)
+            self.wfile.write(b'{"tasks": []}')
+
+    slow = ThreadingHTTPServer(("127.0.0.1", 0), _SlowBody)
+    threading.Thread(target=slow.serve_forever, daemon=True).start()
+    try:
+        import urllib.error
+        import urllib.request
+        raised = None
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{slow.server_address[1]}/v1/tasks?wait=25",
+                    timeout=1) as _r:
+                _r.read()
+        except Exception as e:  # noqa: BLE001 — the type IS the assertion
+            raised = e
+        check(isinstance(raised, TimeoutError),
+              "poll-timeout: a held long poll raises TimeoutError (the type the bridge catches)")
+        check(not isinstance(raised, urllib.error.URLError),
+              "poll-timeout: it is NOT a URLError, so connect failures stay on the outage path")
+    finally:
+        slow.shutdown()
+
+    # Wiring: the policy is only worth anything if the poll call site consults
+    # it. Asserted against the loaded function, not a copy of the file.
+    import inspect
+    _loop = inspect.getsource(rtc.main)
+    _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1][:400]
+    check("_poll_timeout_is_empty" in _poll_call,
+          "poll-timeout: the poll call site consults the policy")
+    check("except TimeoutError" in _poll_call,
+          "poll-timeout: the catch is scoped to the poll, not the whole iteration")
+    check("raise" in _poll_call,
+          "poll-timeout: past the grace it re-raises into the existing outage path")
 
     srv.shutdown()
     if FAILS:

@@ -187,6 +187,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
@@ -196,10 +197,18 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
-# Terminal resting place for proactive nudges that can never be delivered
-# (e.g. a body too large for any Matrix event). Kept separate from `archive/`
-# so "delivered" and "given up on" are never confused when auditing.
-UNDELIVERABLE_RESULTS_DIR = ARCHIVE_RESULTS_DIR / "undeliverable"
+# Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
+# retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
+_PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
+try:  # pragma: no cover - exercised by whichever context imports it
+    from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
+except ImportError:  # pragma: no cover - flat src/ import path
+    from send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
+
+# Terminal resting place for proactive nudges that can never be delivered.
+# results/undelivered/ is the repo-wide quarantine convention — health-check's
+# probe and every other bridge scan it; an archive/ subdir is invisible to both.
+UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
 # via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
@@ -585,6 +594,10 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# A read timeout on the long poll is indistinguishable from the documented
+# `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
+# has succeeded for this long.
+POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 # gateway message (POST /v1/room op:message) and archived. This is the
@@ -639,6 +652,117 @@ _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipp
 # happens. Unset → exactly the pre-existing FATAL-exit behavior.
 TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
+# Registry-loss self-claim (backend #595): the code is device-visible only;
+# binding requires the owner's concierge approval. Disable: REMOTE_REENROLL=0.
+REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
+    not in ("0", "false", "no", "off")
+REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
+REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
+_reenroll_state: dict = {"last_attempt_at": None, "code": None, "claimed_at": None}
+
+
+def _provision_base() -> str:
+    """Gateway base -> provision-api base (…/relay* -> …/api)."""
+    return URL.split("/relay")[0].rstrip("/") + "/api"
+
+
+def _reenroll_identity() -> str:
+    """Agent mxid: process env, then the channel .env file — the same fallback
+    the token uses (desktop launchers don't export either) — then the durable
+    per-host identity enrolment wrote to state/auth/ag2space.json."""
+    for key in ("AGENT_MXID", "AGENT_ID"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v
+    for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
+        v = _config_from_channel_env(key).strip()
+        if v:
+            return v
+    # Re-read per call, like the channel-env candidates: an identity that
+    # appears mid-episode must take effect without a restart.
+    try:
+        rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
+        # Non-string values must read as unknown, not be coerced into a
+        # garbage identity that _reenroll_claim would POST on the cadence.
+        v = rec.get("agent_id")
+        return v.strip() if isinstance(v, str) else ""
+    except Exception:  # absent, unreadable, or malformed — identity unknown
+        return ""
+
+
+def _reenroll_claim() -> None:
+    """Best-effort claim: one live code per episode; failed POSTs retry no
+    sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
+    if not REENROLL_ENABLED or _reenroll_state["code"]:
+        return
+    last = _reenroll_state["last_attempt_at"]
+    # Monotonic: a wall-clock step backward must not suppress claims (review
+    # P2); None = never attempted, so a fresh boot claims immediately.
+    if last is not None and time.monotonic() - last < REENROLL_CLAIM_RETRY_S:
+        return
+    agent_id = _reenroll_identity()
+    if not agent_id or not TOKEN:
+        # No POST issued -> no cadence stamp. The instruction must match what
+        # can actually work: file candidates are re-read every cycle, but the
+        # POINTERS to them live in the process env — absent both pointers,
+        # only a wrapper/app restart can deliver the fix (#2924 review).
+        if not agent_id:
+            pointered = os.environ.get("AG2_DEVICE_ENV") \
+                or os.environ.get("CLAUDE_CONFIG_DIR")
+            _log("reenroll: agent identity unknown — write "
+                 "AGENT_MXID=<agent mxid> into the channel .env; retrying "
+                 "(takes effect without restart)" if pointered else
+                 "reenroll: agent identity unknown and no channel-env "
+                 "pointers (AG2_DEVICE_ENV/CLAUDE_CONFIG_DIR) — set "
+                 "AGENT_MXID in the gateway environment and RESTART the "
+                 "wrapper/app; holding the connection wait meanwhile")
+        else:
+            _log("reenroll: no token available — not claiming")
+        return
+    _reenroll_state["last_attempt_at"] = time.monotonic()
+    try:
+        req = urllib.request.Request(
+            _provision_base() + "/connect/reenroll",
+            data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
+            # The prod edge 403s urllib's default UA — same contract as _req().
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = json.loads(r.read() or b"{}")
+        code = str(body.get("approval_code") or "")
+        if body.get("pending") and code:
+            _reenroll_state["code"] = code
+            _reenroll_state["claimed_at"] = int(time.time())
+            _log("RELINK PENDING — this agent's server-side registration was "
+                 f"lost. RELINK CODE: {code} — the owner approves by DMing the "
+                 f"concierge: relink approve {code}")
+        else:
+            _log(f"reenroll: claim not parked ({str(body)[:200]})")
+    except urllib.error.HTTPError as e:
+        _log(f"reenroll: claim refused HTTP {e.code} ({_http_error_body(e)[:200]})")
+    except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
+        _log(f"reenroll: claim failed: {e}")
+
+
+def _reenroll_clear(recovered: bool = False) -> None:
+    """End the episode; recovered=True (probe-success path only) leaves the
+    explicit terminal — disappearance alone must never read as success."""
+    was_pending = bool(_reenroll_state.get("code"))
+    _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
+    if recovered and was_pending:
+        _reenroll_state["recovered_at"] = int(time.time())
+    else:
+        _reenroll_state.pop("recovered_at", None)
+
+
+def _auth_probe() -> bool:
+    """True ONLY on a successful authed response — an error proves nothing
+    about auth, so every failure keeps waiting."""
+    try:
+        _req("GET", "/v1/agents", timeout=15)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
@@ -1127,22 +1251,46 @@ def _recover_auth(code: int) -> bool:
     the token file rotates. Returns True once a rotated token is live; False
     when no TOKEN_FILE is configured (caller keeps the historical FATAL
     exit)."""
+    # A new rejection episode invalidates any prior recovered terminal.
+    _reenroll_state.pop("recovered_at", None)
     if _reload_rotated_token():
         _log("auth rejected but token file already rotated — resuming with new token")
+        _reenroll_clear()
         return True
-    if not TOKEN_FILE:
+    _reenroll_claim()
+    if not TOKEN_FILE and not _reenroll_state["code"] \
+            and not (REENROLL_ENABLED and TOKEN):
+        # Historical FATAL contract survives ONLY where recovery is truly
+        # impossible: reenroll off, or no bearer to claim with (#2924).
         return False
-    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation in "
-         f"{TOKEN_FILE} (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation"
+         + (f" in {TOKEN_FILE}" if TOKEN_FILE else "")
+         + (" or re-link approval" if _reenroll_state["code"]
+            else " or re-link identity/claim")
+         + f" (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    cycle = 0
     while True:
+        pending = _reenroll_state["code"]
         _emit_gateway_status(False,
-                             error=f"auth rejected HTTP {code} — waiting for re-connect",
+                             error=(f"auth rejected HTTP {code} — relink pending "
+                                    f"(code {pending})" if pending else
+                                    f"auth rejected HTTP {code} — waiting for re-connect"),
                              backoff_s=AUTH_RECHECK_INTERVAL)
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting for token rotation")
         if _reload_rotated_token():
             _log("rotated token detected — resuming")
+            _reenroll_clear()
+            return True
+        if not pending:
+            # A transient failure isn't a lost episode: retry stays in the
+            # loop, cadence-bounded internally (safe while nothing is parked).
+            _reenroll_claim()
+        cycle += 1
+        if pending and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
+            _log("re-link approved — the existing token is accepted again; resuming")
+            _reenroll_clear(recovered=True)
             return True
 
 
@@ -1301,6 +1449,20 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
         }
+        # Recovery surface: recovered ONLY via the probe-success terminal; a
+        # missing block means "no episode known", never success.
+        if _reenroll_state.get("code"):
+            payload["reenroll"] = {
+                "pending": True,
+                "approval_code": _reenroll_state["code"],
+                "claimed_at": _reenroll_state["claimed_at"],
+            }
+        elif _reenroll_state.get("recovered_at"):
+            payload["reenroll"] = {
+                "pending": False,
+                "recovered": True,
+                "recovered_at": _reenroll_state["recovered_at"],
+            }
         # AWP P0 per-channel health: the task connection is `connected` above; the
         # additive event channel (if running) reports its own status, so a
         # supervisor never shows the agent healthy while the event stream is dead.
@@ -2055,6 +2217,27 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
             pass
 
 
+def _resolve_send_failure(claim, original, exc) -> str:
+    """Bounded retry: decision AND file moves are the shared policy's
+    (send_failure_policy.resolve_failed_send). This binder passes sparrow's
+    pid-scoped claim's real body path — with_suffix() cannot derive it — and
+    the park directory, then renders the bridge's log phrase. Single sends
+    can't partially deliver, so `progressed` stays False here.
+
+    Returns the phrase for the caller's log line.
+    """
+    tried = _PROACTIVE_ATTEMPTS.get(original.name, 0)
+    outcome = resolve_failed_send(
+        claim, exc, _PROACTIVE_ATTEMPTS,
+        body=original, undelivered_dir=UNDELIVERABLE_RESULTS_DIR)
+    if outcome == "retried":
+        return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
+    if outcome == "parked":
+        return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried + 1} "
+                "send attempt(s) — it will NOT be re-sent")
+    return "stuck"
+
+
 def _post_proactive() -> None:
     """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
 
@@ -2188,13 +2371,13 @@ def _post_proactive() -> None:
                 or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
             )
             if not delivered:
+                # Accepted but unconfirmed. It may ALSO have been delivered, so
+                # the retry must be bounded — an unbounded one duplicates.
+                outcome = _resolve_send_failure(
+                    claim, f, _UnconfirmedDelivery("no event_id in response"))
                 _log(f"proactive send for {f.name} got no delivery signal "
-                     f"(response {str(resp)[:120]!r}) — will retry; check "
+                     f"(response {str(resp)[:120]!r}) — {outcome}; check "
                      "REMOTE_PROACTIVE_ROOM and the agent's room membership")
-                try:
-                    claim.rename(f)
-                except OSError:
-                    pass
                 continue
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -2203,24 +2386,19 @@ def _post_proactive() -> None:
                 except OSError:
                     pass
                 raise
-            _log(f"proactive send failed for {f.name}: HTTP {e.code} — will retry")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            outcome = _resolve_send_failure(claim, f, e)
+            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
             continue
         except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"proactive send network error for {f.name}: {e} — will retry")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            outcome = _resolve_send_failure(claim, f, e)
+            _log(f"proactive send network error for {f.name}: {e} — {outcome}")
             continue
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
         except OSError:
             claim.unlink(missing_ok=True)
+        _PROACTIVE_ATTEMPTS.pop(f.name, None)
         _log(f"delivered proactive {f.name}")
 
 
@@ -2330,13 +2508,26 @@ def _post_ready_results(inflight: set[str]) -> None:
                 changed = True
                 continue
         if skip:
-            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
-            # archive without POSTing (match the other bridges' semantics).
+            # Skip markers still POST: only add_result closes the server lease;
+            # the server suppresses their user-facing delivery.
+            try:
+                _delivery = _delivery_tid(tid)
+                if _delivery is None:
+                    _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                    continue
+                _req("POST", "/v1/results",
+                     {"id": _broker_tid(_delivery), "body": body})
+            except urllib.error.HTTPError as e:
+                _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
+                continue
+            except (urllib.error.URLError, TimeoutError) as e:
+                _log(f"result POST network error for {tid}: {e} — will retry")
+                continue
             _archive_result(rfile, tid)
             inflight.discard(tid)
             _forget_task_room(tid)
             changed = True
-            _log(f"archived {tid} (marker {skip.value}, not sent)")
+            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
             continue
         out_body = parsed.body
         redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
@@ -2566,6 +2757,16 @@ def _maybe_start_event_channel() -> None:
         _log(f"event channel start failed (task delivery unaffected): {e}")
 
 
+def _poll_timeout_is_empty(last_ok: float, now: float,
+                           grace: float = POLL_TIMEOUT_GRACE_S) -> bool:
+    """Whether a long-poll read timeout should be read as `{"tasks": []}`.
+
+    False once no poll has succeeded within `grace`, so a wedged relay still
+    reaches the outage path instead of looping quietly forever.
+    """
+    return (now - last_ok) <= grace
+
+
 def main() -> None:
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
@@ -2593,6 +2794,7 @@ def main() -> None:
         _log(f"running unsupervised — output also logged to {_LOG_FILE}; "
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
+    last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     while True:
@@ -2605,7 +2807,15 @@ def main() -> None:
                      "— exiting to avoid dual-poll")
                 return
             _post_heartbeat(inflight)
-            resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+            try:
+                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+                last_poll_ok = time.time()
+            except TimeoutError:
+                # Read timeout only — a connect failure arrives as URLError and
+                # still takes the outage path below.
+                if not _poll_timeout_is_empty(last_poll_ok, time.time()):
+                    raise
+                resp = {"tasks": []}
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
