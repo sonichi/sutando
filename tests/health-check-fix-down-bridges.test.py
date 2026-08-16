@@ -607,8 +607,8 @@ def case_p_action_alert_alerts_not_restarts() -> list[str]:
 
 
 def case_q_restart_guard_fail_downgrades_to_alert() -> list[str]:
-    """action="restart" but the checkout guard fails → alert, do NOT restart
-    (the 2026-07-25 fix: never auto-restart onto a non-canonical checkout)."""
+    """action="restart" but the checkout guard fails → alert, do NOT restart:
+    a non-canonical checkout must never be the code an auto-restart relaunches."""
     fails = []
     sent = []
     checks = [check("discord-bridge", "warn", "configured but not running")]
