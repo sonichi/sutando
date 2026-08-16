@@ -5770,8 +5770,9 @@ def _send_via_rest(channel_id: str, message: str):
         # successful send; reporting it as a failure invites the retry that
         # duplicates it — the exact defect this verb exists to make fixable.
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                raw = resp.read()
+            # Not a `with`: callers fake urlopen with a plain response object,
+            # and requiring the context-manager protocol breaks them.
+            raw = urllib.request.urlopen(req, timeout=10).read()
         except Exception as e:
             print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
             sys.exit(1)
