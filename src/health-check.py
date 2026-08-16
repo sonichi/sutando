@@ -4315,11 +4315,8 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
 
 
 def _plist_via_plutil(path: "Path") -> "dict | None":
-    """Parse a plist without `plistlib`, for interpreters whose pyexpat is broken.
-
-    Returns None on any failure, which keeps the caller's existing warn as the
-    behaviour everywhere plutil is absent (non-macOS) or unhappy.
-    """
+    """Parse a plist without `plistlib`. None on any failure, which keeps the
+    caller's existing warn wherever plutil is absent or unusable."""
     try:
         out = subprocess.run(["/usr/bin/plutil", "-convert", "json", "-o", "-", str(path)],
                              capture_output=True, text=True, timeout=10)
@@ -4437,9 +4434,8 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     try:
         import plistlib
     except ImportError as exc:
-        # #2588 stopped this ImportError killing the run; the probe then warned
-        # about its own interpreter instead of answering. `plutil` ships with
-        # macOS and needs no expat, so the question is still answerable here.
+        # plutil needs no expat, so the comparison stays answerable on exactly
+        # the hosts where this import fails.
         rendered = _plist_via_plutil(plist)
         if rendered is None:
             return {"name": name, "status": "warn",

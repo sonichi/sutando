@@ -400,12 +400,8 @@ class TestQuotaAccountIdentity(unittest.TestCase):
     # ---- an interpreter that cannot import plistlib must still ANSWER -------
 
     def test_plistlib_unavailable_answers_via_plutil(self):
-        """A broken pyexpat is an interpreter fault, not an unanswerable question.
-
-        #2588 stopped that ImportError killing the whole run; with no fallback the
-        probe then reported on its own interpreter instead of on the two logins,
-        and a live host warned that way for two weeks while the real answer was
-        "same item"."""
+        """A broken pyexpat is an interpreter fault, not an unanswerable
+        question: the two logins must still be compared."""
         core = "/Users/x/ws/.claude-sutando"
         payload = json.dumps({"Label": "com.sutando.credential-proxy",
                               "EnvironmentVariables": {"CLAUDE_CONFIG_DIR": core}})
@@ -418,8 +414,8 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         self.assertIn("same keychain item", out["detail"])
 
     def test_plutil_unusable_keeps_the_original_warning(self):
-        """No plutil (every non-macOS host), a non-zero exit, or JSON whose root
-        is not a mapping must keep the warn — never become a false "ok"."""
+        """No plutil, a bad exit, or a non-mapping root keeps the warn — a
+        fallback must never turn "cannot tell" into "ok"."""
         core = "/Users/x/ws/.claude-sutando"
         cases = [("side_effect", OSError("no plutil binary")),
                  ("side_effect", hc.subprocess.SubprocessError("timeout")),
