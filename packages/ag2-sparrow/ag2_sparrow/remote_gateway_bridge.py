@@ -2479,13 +2479,33 @@ def _post_ready_results(inflight: set[str]) -> None:
                 changed = True
                 continue
         if skip:
-            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
-            # archive without POSTing (match the other bridges' semantics).
+            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing REPLY" — they
+            # do NOT mean "don't tell the server". This transport has a
+            # server-side lease that only add_result closes; archiving locally
+            # without POSTing leaves it open forever (it keeps extending under
+            # the ack+alive gate), so the sweeper rewrites it every cycle.
+            # POST the RAW body: the server records the result and completes
+            # the lease first, then its own parse_result drops the delivery for
+            # exactly these three markers — so suppression stays server-side
+            # and this client cannot leak a marker into a room.
+            try:
+                _delivery = _delivery_tid(tid)
+                if _delivery is None:
+                    _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                    continue
+                _req("POST", "/v1/results",
+                     {"id": _broker_tid(_delivery), "body": body})
+            except urllib.error.HTTPError as e:
+                _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
+                continue
+            except (urllib.error.URLError, TimeoutError) as e:
+                _log(f"result POST network error for {tid}: {e} — will retry")
+                continue
             _archive_result(rfile, tid)
             inflight.discard(tid)
             _forget_task_room(tid)
             changed = True
-            _log(f"archived {tid} (marker {skip.value}, not sent)")
+            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
             continue
         out_body = parsed.body
         redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
