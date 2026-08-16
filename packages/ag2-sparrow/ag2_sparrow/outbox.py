@@ -22,9 +22,11 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import errno
+import hashlib
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -192,9 +194,19 @@ def _claims_dir(root: Path) -> Path:
     return Path(root) / CLAIMS_DIR
 
 
+def _safe_key(item_id: str) -> str:
+    """Filesystem-safe AND injective: distinct ids never share a path.
+
+    The readable part is lossy ("a/b" and "a_b" both sanitize to "a_b"), so the
+    digest of the raw id decides identity; without it two unrelated items share
+    one claim and one is denied delivery.
+    """
+    readable = "".join(c if (c.isalnum() or c in "-._") else "_" for c in item_id)[:80]
+    return f"{readable}.{hashlib.sha256(item_id.encode('utf-8')).hexdigest()[:16]}"
+
+
 def _claim_path(root: Path, item_id: str) -> Path:
-    safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in item_id)
-    return _claims_dir(root) / f"{safe}.claim"
+    return _claims_dir(root) / f"{_safe_key(item_id)}.claim"
 
 
 def acquire_delivery_claim(root: Path, item_id: str, drainer_id: str) -> bool:
@@ -236,7 +248,10 @@ def read_delivery_claim(root: Path, item_id: str) -> Optional[ClaimRecord]:
     know what they had done — collapsing that to "free" is how a half-finished
     delivery gets repeated.
     """
-    p = _claim_path(Path(root), item_id)
+    return _read_claim_at(_claim_path(Path(root), item_id), item_id)
+
+
+def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
     try:
         raw = p.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -247,11 +262,22 @@ def read_delivery_claim(root: Path, item_id: str) -> Optional[ClaimRecord]:
         d = json.loads(raw)
     except json.JSONDecodeError:
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
-    return ClaimRecord(item_id=d.get("item_id", item_id),
-                       drainer_id=d.get("drainer_id", ""),
-                       pid=int(d.get("pid", -1)),
-                       start_usec=d.get("start_usec"),
-                       claimed_at=float(d.get("claimed_at", 0.0)))
+    if not isinstance(d, dict):
+        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
+    # Valid JSON carrying wrong types is still a claim we cannot read. Raising
+    # here would abort a drainer mid-scan; UNKNOWN keeps the item un-stealable.
+    try:
+        pid = int(d.get("pid", -1))
+        claimed_at = float(d.get("claimed_at", 0.0))
+        raw_start = d.get("start_usec")
+        start_usec = None if raw_start is None else int(raw_start)
+    except (TypeError, ValueError):
+        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
+    return ClaimRecord(item_id=str(d.get("item_id", item_id)),
+                       drainer_id=str(d.get("drainer_id", "")),
+                       pid=pid,
+                       start_usec=start_usec,
+                       claimed_at=claimed_at)
 
 
 def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
@@ -264,12 +290,90 @@ def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
     rec = read_delivery_claim(Path(root), item_id)
     if rec is None:
         return True                       # nothing holds it
+    return _record_is_reclaimable(rec, ttl_seconds)
+
+
+def _record_is_reclaimable(rec: ClaimRecord, ttl_seconds: float) -> bool:
     if rec.state == "UNKNOWN":
         return False                      # torn: we do not know; do not steal
     owner = process_identity(rec.pid)
-    if owner.state in (OwnerState.ALIVE, OwnerState.UNKNOWN):
+    if owner.state is OwnerState.UNKNOWN:
+        return False
+    if owner.state is OwnerState.ALIVE and not _pid_was_reused(rec, owner):
         return False
     return (time.time() - rec.claimed_at) >= ttl_seconds
+
+
+def _pid_was_reused(rec: ClaimRecord, owner: ProcessIdentity) -> bool:
+    """Is the pid ALIVE but a DIFFERENT process than the one that claimed?
+
+    Without this the birth token is dead weight: a recycled pid reads ALIVE, the
+    liveness check returns early, and the TTL never gets a say — the item stalls
+    forever rather than being redelivered.
+    """
+    if rec.start_usec is None or owner.start_usec is None:
+        return False                      # cannot tell: treat as the same owner
+    return rec.start_usec != owner.start_usec
+
+
+def _same_claim(a: ClaimRecord, b: ClaimRecord) -> bool:
+    return (a.drainer_id, a.pid, a.start_usec, a.claimed_at) == \
+           (b.drainer_id, b.pid, b.start_usec, b.claimed_at)
+
+
+def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
+                           drainer_id: str) -> bool:
+    """Atomically take over a reclaimable claim; True if THIS caller now holds it.
+
+    `may_reclaim_delivery` + release + acquire is check-then-act: two drainers
+    can both observe the same stale claim, and the second's release deletes the
+    first's fresh claim, so both then hold the item. The rename below is the
+    compare-and-swap — only one caller can move a given file.
+    """
+    root = Path(root)
+    observed = read_delivery_claim(root, item_id)
+    if observed is None:
+        return acquire_delivery_claim(root, item_id, drainer_id)
+    if not _record_is_reclaimable(observed, ttl_seconds):
+        return False
+    src = _claim_path(root, item_id)
+    tomb = src.with_name(f"{src.name}.reclaim-{uuid.uuid4().hex}")
+    try:
+        os.rename(str(src), str(tomb))
+    except OSError:
+        return False                      # someone moved it first: they won
+    taken = _read_claim_at(tomb, item_id)
+    if taken is None or not _same_claim(taken, observed):
+        _restore_claim(src, tomb)         # not the record we judged: put it back
+        return False
+    try:
+        tomb.unlink()
+    except FileNotFoundError:
+        pass
+    return acquire_delivery_claim(root, item_id, drainer_id)
+
+
+def _restore_claim(src: Path, tomb: Path) -> None:
+    """Put a wrongly-taken claim back, without clobbering a newer one.
+
+    O_EXCL rather than rename: if the slot is occupied again the newer claim is
+    the valid one and this tombstone must simply be dropped.
+    """
+    try:
+        payload = tomb.read_bytes()
+    except FileNotFoundError:
+        return
+    try:
+        fd = os.open(str(src), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+    except FileExistsError:
+        pass
+    finally:
+        try:
+            tomb.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def release_delivery_claim(root: Path, item_id: str) -> None:
@@ -286,8 +390,7 @@ def _items_dir(root: Path) -> Path:
 
 
 def _item_path(root: Path, item_id: str) -> Path:
-    safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in item_id)
-    return _items_dir(root) / f"{safe}.json"
+    return _items_dir(root) / f"{_safe_key(item_id)}.json"
 
 
 def _read_item(root: Path, item_id: str) -> dict:

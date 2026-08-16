@@ -166,6 +166,25 @@ def _adapter_has_no_policy():
             "is exactly the loop this whole design exists to remove")
 
 
+# 7 ---------------------------------------------------------------------------
+@contract("an error status is never overridden by an id in its body")
+def _status_beats_id():
+    m = adapter_mod()
+    classify = need(m, "classify_response")
+    from outbox import DeliveryOutcome as O  # noqa: PLC0415
+    # Error envelopes routinely carry a trace/correlation id. Reading that as a
+    # delivery receipt archives an item the provider explicitly refused.
+    for status, want in ((500, O.OUTCOME_UNKNOWN), (503, O.OUTCOME_UNKNOWN),
+                         (400, O.NOT_DELIVERED), (404, O.NOT_DELIVERED)):
+        got = classify(status=status, body={"id": "trace-123", "error": "failed"})
+        assert got.outcome == want, (
+            f"status {status} with an id in the body -> {got.outcome.name}, expected "
+            f"{want.name}; the id scan must not run before status semantics")
+        assert got.receipt_id is None, (
+            f"status {status} produced receipt_id={got.receipt_id!r}; an error "
+            "envelope's id is not a delivery receipt")
+
+
 def main() -> int:
     print(f"  target: src/outbox_adapter.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)

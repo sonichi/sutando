@@ -42,6 +42,18 @@ class DeliveryReceipt:
 
 def classify_response(status: Optional[int], body: Any) -> DeliveryReceipt:
     """Provider response -> receipt. Pure; no I/O, no policy."""
+    # Status decides first. Error envelopes routinely carry an `id` (a trace or
+    # correlation id), and reading that as a receipt archives an item the
+    # provider just told us it did not accept.
+    if status is None:
+        return DeliveryReceipt(DeliveryOutcome.OUTCOME_UNKNOWN,
+                               detail="no response (timeout or transport failure)")
+    if 400 <= status < 500:
+        return DeliveryReceipt(DeliveryOutcome.NOT_DELIVERED,
+                               detail="refused by the provider")
+    if not (200 <= status < 300):
+        return DeliveryReceipt(DeliveryOutcome.OUTCOME_UNKNOWN,
+                               detail="provider error; the write may have applied")
     rid = None
     if isinstance(body, dict):
         for k in _ID_KEYS:
@@ -52,18 +64,9 @@ def classify_response(status: Optional[int], body: Any) -> DeliveryReceipt:
     if rid:
         return DeliveryReceipt(DeliveryOutcome.CONFIRMED, receipt_id=rid,
                                detail="provider returned an identifier")
-    if status is None:
-        return DeliveryReceipt(DeliveryOutcome.OUTCOME_UNKNOWN,
-                               detail="no response (timeout or transport failure)")
-    if 200 <= status < 300:
-        # Accepted, unproven. The honest state, and the reason this seam exists.
-        return DeliveryReceipt(DeliveryOutcome.OUTCOME_UNKNOWN,
-                               detail="accepted without an identifier")
-    if 400 <= status < 500:
-        return DeliveryReceipt(DeliveryOutcome.NOT_DELIVERED,
-                               detail="refused by the provider")
+    # Accepted, unproven. The honest state, and the reason this seam exists.
     return DeliveryReceipt(DeliveryOutcome.OUTCOME_UNKNOWN,
-                           detail="provider error; the write may have applied")
+                           detail="accepted without an identifier")
 
 
 class DeliveryAdapter:

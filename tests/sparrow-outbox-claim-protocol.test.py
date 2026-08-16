@@ -51,9 +51,11 @@ Run: python3 tests/sparrow-outbox-claim-protocol.test.py
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -225,6 +227,143 @@ def _proc_stat_parse():
         "breaks any parser that splits the whole line")
     assert raw.split()[21] != "555000", (
         "the naive split now agrees, so this control no longer proves anything")
+
+
+# 8 ---------------------------------------------------------------------------
+@contract("distinct item ids never share a claim file (path encoding is injective)")
+def _c8():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        a, b = "a/b", "a_b"
+        assert claim_path(root, a) != claim_path(root, b), (
+            f"{a!r} and {b!r} map to one path {claim_path(root, a).name!r}")
+        assert acquire(root, a, "d1") is True, "first distinct id must acquire"
+        assert acquire(root, b, "d2") is True, (
+            f"{b!r} was denied because {a!r} holds a colliding claim file")
+
+
+# 9 ---------------------------------------------------------------------------
+@contract("a REUSED pid does not hold the claim forever: the birth token is compared")
+def _c9():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    may = need(m, "may_reclaim_delivery")
+    claim_path = need(m, "_claim_path")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-reuse", "d1") is True
+        # Same pid (live), different birth time => a DIFFERENT process.
+        p = claim_path(root, "item-reuse")
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        rec["start_usec"] = 111
+        rec["claimed_at"] = 0.0
+        p.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
+        assert may(root, "item-reuse", 1.0) is True, (
+            "pid is alive but its birth token differs, so the recorded owner is "
+            "gone; the item must be reclaimable rather than stalled forever")
+
+
+# 10 --------------------------------------------------------------------------
+@contract("a claim with valid JSON but wrong types reads UNKNOWN, never raises")
+def _c10():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    may = need(m, "may_reclaim_delivery")
+    claim_path = need(m, "_claim_path")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-typed", "d1") is True
+        claim_path(root, "item-typed").write_text(
+            '{"pid": "not-an-int", "claimed_at": "soon"}', encoding="utf-8")
+        rec = read(root, "item-typed")          # must not raise
+        assert rec is not None and rec.state == "UNKNOWN", (
+            f"wrong-typed claim must read UNKNOWN, got {rec}")
+        assert may(root, "item-typed", 0.0) is False, "UNKNOWN is never stealable"
+
+
+# 11 --------------------------------------------------------------------------
+@contract("two drainers acting on the SAME stale observation: only one ends up holding it")
+def _c11():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    reclaim = need(m, "reclaim_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-cas", "dead-owner") is True
+        p = claim_path(root, "item-cas")
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        rec["pid"] = 999999                  # a pid that is not running
+        rec["claimed_at"] = 0.0              # and long past any TTL
+        p.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
+        # Both drainers observed the same stale claim before either acted.
+        first = reclaim(root, "item-cas", 1.0, "A")
+        second = reclaim(root, "item-cas", 1.0, "B")
+        assert [first, second].count(True) == 1, (
+            f"exactly one drainer may take it, got A={first} B={second}")
+        holder = read(root, "item-cas")
+        assert holder is not None and holder.drainer_id == "A", (
+            f"the winner's claim must survive, holder={holder}")
+
+
+# 12 --------------------------------------------------------------------------
+@contract("a drainer acting on a STALE observation must not destroy the new holder's claim")
+def _c12():
+    """The check-then-act failure, with the interleaving pinned rather than raced.
+
+    A observes the stale claim, then B reclaims it completely, then A proceeds on
+    its stale judgment. A must not be able to delete B's fresh claim. Racing two
+    processes reproduces this only ~40% of the time, which is not a guard.
+    """
+    m = outbox()
+    reclaim = need(m, "reclaim_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    with tempfile.TemporaryDirectory() as tmp:
+        root, item = Path(tmp), "item-aba"
+        (root / ".claims").mkdir(parents=True, exist_ok=True)
+        claim_path(root, item).write_text(json.dumps({
+            "item_id": item, "drainer_id": "dead-owner", "pid": 999999,
+            "start_usec": 1, "claimed_at": 0.0,
+        }, sort_keys=True), encoding="utf-8")
+
+        observed, b_done = threading.Event(), threading.Event()
+        original, slow = m.read_delivery_claim, {"on": True}
+
+        def paused_read(*a, **kw):
+            rec = original(*a, **kw)
+            if slow["on"]:
+                slow["on"] = False
+                observed.set()
+                b_done.wait(10)      # B reclaims while A holds this observation
+            return rec
+
+        m.read_delivery_claim = paused_read
+        try:
+            out = {}
+            a = threading.Thread(target=lambda: out.update(a=reclaim(root, item, 1.0, "A")))
+            a.start()
+            assert observed.wait(10), "A never reached its observation"
+            slow["on"] = False                       # B must not pause
+            out["b"] = reclaim(root, item, 1.0, "B")
+            b_done.set()
+            a.join(10)
+        finally:
+            m.read_delivery_claim = original
+
+        holder = read(root, item)
+        assert holder is not None, "the item ended up held by nobody"
+        assert [out.get("a"), out["b"]].count(True) == 1, (
+            f"both drainers hold the item: A={out.get('a')} B={out['b']} — "
+            "A acted on an observation that was already superseded")
+        assert holder.drainer_id == "B", (
+            f"B reclaimed it, but the surviving claim is {holder.drainer_id!r}; "
+            "A deleted a claim it never judged")
 
 
 def main() -> int:
