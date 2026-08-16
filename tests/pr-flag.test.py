@@ -63,6 +63,21 @@ def main() -> int:
     assert pf._ci_state([{"__typename": "StatusContext", "state": "PENDING"}]) == "pending"
     assert pf._ci_state([{"__typename": "StatusContext", "state": "EXPECTED"}]) == "pending"
     assert pf._ci_state([{"__typename": "StatusContext", "state": "FAILURE"}]) == "failing"
+
+    # Completed conclusions outside the failure tuple must not read as green.
+    # These are COMPLETED, so the pending branch cannot catch them either.
+    for conclusion in ("ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"):
+        assert pf._ci_state([{"status": "COMPLETED", "conclusion": conclusion}]) == "failing", conclusion
+    # Any conclusion GitHub adds later is failing, not green, by construction.
+    assert pf._ci_state([{"status": "COMPLETED", "conclusion": "SOME_FUTURE_ENUM"}]) == "failing"
+    assert pf._ci_state([{"status": "COMPLETED", "conclusion": None}]) == "failing"
+    # SKIPPED and NEUTRAL are genuinely green; SKIPPED occurs on this repo, so
+    # an allow-list of SUCCESS alone would flag healthy PRs as failing.
+    assert pf._ci_state([{"status": "COMPLETED", "conclusion": "SKIPPED"}]) == "green"
+    assert pf._ci_state([{"status": "COMPLETED", "conclusion": "NEUTRAL"}]) == "green"
+    # A queued-but-not-started run is pending, not green.
+    assert pf._ci_state([{"status": "WAITING"}]) == "pending"
+    assert pf._ci_state([{"status": "IN_PROGRESS"}, {"conclusion": "FAILURE"}]) == "failing"
     assert pf._ci_state([{"__typename": "StatusContext", "state": "ERROR"}]) == "failing"
     assert pf._ci_state([
         {"__typename": "CheckRun", "status": "IN_PROGRESS"},

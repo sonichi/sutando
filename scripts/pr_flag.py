@@ -31,22 +31,35 @@ import sys
 from pathlib import Path
 
 
+# A check is green only if it says so. Naming the failures instead lets any
+# conclusion GitHub adds later default to green, which is the wrong direction.
+_GREEN_CONCLUSIONS = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
+_GREEN_STATES = frozenset({"SUCCESS"})
+_RUNNING_STATUSES = frozenset({"IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED"})
+_RUNNING_STATES = frozenset({"PENDING", "EXPECTED"})
+
+
+def _check_state(c) -> str:
+    """Check runs carry status+conclusion, commit statuses carry state; anything
+    unrecognised is failing so an unknown value never reads as mergeable."""
+    if c.get("status") in _RUNNING_STATUSES or c.get("state") in _RUNNING_STATES:
+        return "pending"
+    if "conclusion" in c and c.get("conclusion") is not None:
+        return "green" if c["conclusion"] in _GREEN_CONCLUSIONS else "failing"
+    if "state" in c and c.get("state") is not None:
+        return "green" if c["state"] in _GREEN_STATES else "failing"
+    return "failing"
+
+
 def _ci_state(rollup) -> str:
     """Collapse a statusCheckRollup list into one of green/pending/failing/none."""
     rc = rollup or []
     if not rc:
         return "none"
-    if any(
-        c.get("conclusion") in ("FAILURE", "CANCELLED", "TIMED_OUT")
-        or c.get("state") in ("FAILURE", "ERROR")
-        for c in rc
-    ):
+    states = [_check_state(c) for c in rc]
+    if "failing" in states:
         return "failing"
-    if any(
-        c.get("status") in ("IN_PROGRESS", "QUEUED", "PENDING")
-        or c.get("state") in ("PENDING", "EXPECTED")
-        for c in rc
-    ):
+    if "pending" in states:
         return "pending"
     return "green"
 

@@ -101,7 +101,8 @@ def render(guide: Path, pr: str | None) -> str:
             f"Machine-readable checks: {n_flag} flag pattern(s), {n_allow} allow pattern(s).",
             "CI runs these; it does NOT scan an arbitrary PR diff for you. To scan one:",
             "    gh pr diff <PR> > /tmp/pr.diff && bash scripts/review-checks.sh --diff /tmp/pr.diff",
-            "Note: with no --diff it compares the WORKING TREE and reports 'empty diff'."]
+            "Note: with no --diff the runner reads the diff from STDIN — and with",
+            "nothing piped it exits 2, because an unscanned diff is not a pass."]
     return "\n".join(out)
 
 
