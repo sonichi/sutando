@@ -2988,6 +2988,19 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [dm-checkpoint] self-message update failed: {e}", flush=True)
         return
+    # Ahead of EVERY content consumer, the mod observer included: a THREAD_CREATED
+    # notice carries the thread NAME as content and must not be judged or actioned.
+    if getattr(message, "is_system", None) and message.is_system():
+        # Checkpoint first for the self-message branch's reason: "do not re-fetch"
+        # is about having SEEN the message, not about processing it.
+        if isinstance(message.channel, discord.DMChannel) and hasattr(message, "id"):
+            try:
+                _update_dm_checkpoint(message.channel.id, message.id)
+            except Exception as e:
+                print(f"  [dm-checkpoint] system-message update failed: {e}", flush=True)
+        print(f"  [skip] system message type={message.type}", flush=True)
+        return
+
     # Auto-mod LLM-judge observation hook (per-guild opt-in via access.json
     # `mod_active`). Pure observe — never blocks the rest of the function.
     # Action only fires from the periodic flush task, not at receive time.
@@ -3028,8 +3041,6 @@ async def _handle_discord_message(message, force=False):
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
         safe_snapshots = filter_chat_secrets(str(message.message_snapshots)).text  # pragma: no cover
         print(f"  [debug] message_snapshots: {safe_snapshots}", flush=True)  # pragma: no cover
-    if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
-        print(f"  [debug] non-default message type: {message.type}", flush=True)
 
     # DMs: bot messages always require explicit @-mention (no channel config path).
     if is_dm and message.author.bot and client.user not in message.mentions:
