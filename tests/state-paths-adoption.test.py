@@ -171,6 +171,8 @@ ALLOWLIST = {
     # Pure locator: takes workspace_dir from its callers and never resolves
     # one itself. Same rationale as task_archive.py.
     "src/dm_ban.py",
+    # Same contract in TypeScript, same reason: caller supplies the root.
+    "src/dm-ban.ts",
 }
 
 
