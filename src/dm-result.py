@@ -34,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util_paths import claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from dm_ban import is_dm_banned  # noqa: E402
 import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
 from result_markers import parse_markers  # noqa: E402  — skip markers ([no-send] etc.)
 REPO = resolve_workspace()
@@ -419,6 +420,10 @@ def main():
     skip = next((a for a in parse_markers(text).actions if a.kind == "skip"), None)
     if skip:
         print(f"dm-result: [{skip.value}] marker — not delivering")
+        return
+
+    if is_dm_banned(REPO):
+        print("dm-result: dm-ban.sentinel present — not delivering")
         return
 
     if voice_connected():

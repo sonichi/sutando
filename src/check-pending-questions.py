@@ -22,6 +22,7 @@ from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
+from dm_ban import is_dm_banned  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
@@ -279,6 +280,9 @@ def notify_voice(questions):
     ts = int(time.time() * 1000)
     path = RESULTS_DIR / f"question-{ts}.txt"
     titles = [q["title"] for q in questions]
+    if is_dm_banned(RESULTS_DIR.parent):
+        print("dm-ban.sentinel present — question-file DM suppressed")
+        return
     path.write_text(
         f"You have {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting for your answer: "
         + "; ".join(titles)
@@ -305,6 +309,11 @@ def notify_discord_dm(questions):
     lines.append(
         f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
     )
+    # While dm-ban.sentinel exists, DM delivery is suppressed; the macOS
+    # notification still fires and questions stay readable in the file.
+    if is_dm_banned(RESULTS_DIR.parent):
+        print("dm-ban.sentinel present — DM delivery suppressed (macOS-only)")
+        return
     # Each body is a whole snapshot, so a stale one is wrong, not redundant. Look
     # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
     superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
@@ -334,6 +343,9 @@ UNDRAINED_AGE_S = 600
 # (see notes/proactive-delivery-void-inventory.md). One unrelated stale file would
 # otherwise produce a confident, wrong "the DM path is not reaching the owner".
 PROACTIVE_PREFIX = "proactive-pending-q-"
+
+import pathlib as _pl
+_DM_BAN = None  # resolved lazily against the workspace at write time
 
 
 def undrained_proactive_files():

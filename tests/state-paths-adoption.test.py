@@ -171,6 +171,11 @@ ALLOWLIST = {
     # The flagged tokens are the state/prompt field names of the core-supervisor.json
     # schema (the hash key + docstring), not a workspace-path composition.
     "src/core-supervisor-relay.py",
+    # Pure locator: takes workspace_dir from its callers and never resolves
+    # one itself. Same rationale as task_archive.py.
+    "src/dm_ban.py",
+    # Same contract in TypeScript, same reason: caller supplies the root.
+    "src/dm-ban.ts",
     # agent_endpoint.py never resolves the workspace itself — the workspace
     # arrives in the AgentRuntime descriptor (emitted by the canonical loader
     # via `sutando-config.sh runtime`) and is injected by tests. The flagged

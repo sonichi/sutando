@@ -17,6 +17,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
+import { isDmBanned } from './dm-ban.js';
 import { injectText } from './browser-tools.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -129,13 +130,20 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				// silently lost. Cartesia stays as a bonus path when available
 				// (some users keep the web UI open).
 				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
-				try {
-					const proactiveTs = Math.floor(Date.now() / 1000);
-					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
-					const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
-					writeFileSync(proactivePath, dmBody);
-				} catch (e) {
-					console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
+				// Checked OUTSIDE the try: suppression is a successful outcome, and
+				// throwing it into the write's catch logs every ban as a failure.
+				if (isDmBanned(WORKSPACE_DIR)) {
+					console.log(`${ts()} [TaskBridge] dm-ban.sentinel present — stuck-voice DM suppressed`);
+				} else {
+					try {
+						// The result file itself still lands in results/ either way.
+						const proactiveTs = Math.floor(Date.now() / 1000);
+						const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
+						const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
+						writeFileSync(proactivePath, dmBody);
+					} catch (e) {
+						console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
+					}
 				}
 				if (cartesiaApiKey && generateSpeech) {
 					const truncated = (result.match(/^[\s\S]{0,500}[.!?]/)?.[0] || result.slice(0, 500)).trim();
