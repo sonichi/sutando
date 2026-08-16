@@ -134,6 +134,52 @@ class CronRunnerHealthTest(unittest.TestCase):
             self.assertEqual(unreadable["status"], "down")
             self.assertIn("unreadable", unreadable["detail"])
 
+    def test_a_killed_invocation_with_fresh_state_is_degraded_not_down(self):
+        """`check_launchd` reports the LAST invocation, not whether work happens.
+
+        Measured on a live host: launchd showed `exit=-9` (SIGKILL, code signing)
+        while the runner wrote state every ~120s and that morning's briefing was
+        emitted on the minute. The old early return called that `down`.
+        """
+        killed = lambda _: {"status": "stopped", "detail": "pid=- exit=-9"}
+        with tempfile.TemporaryDirectory() as td:
+            workspace = self._workspace(Path(td), [
+                {"name": "digest", "cron": "2 6 * * *", "launchd": True},
+            ])
+            state = workspace / "state" / "cron-runner-state.json"
+            state.parent.mkdir(parents=True)
+            state.write_text("{}")
+            mtime = state.stat().st_mtime
+
+            fresh = health.check_cron_runner(
+                workspace, "test-host", "codex", killed, now=mtime + 120
+            )
+            self.assertEqual(fresh["status"], "warn", fresh["detail"])
+            self.assertIn("120s ago", fresh["detail"])
+            self.assertIn("schedules still fire", fresh["detail"])
+            self.assertIn("exit=-9", fresh["detail"])
+
+            # Past the freshness bound nothing proves work is happening, so the
+            # original verdict must survive.
+            stale = health.check_cron_runner(
+                workspace, "test-host", "codex", killed, now=mtime + 181
+            )
+            self.assertEqual(stale["status"], "down")
+            self.assertIn("launchd is stopped", stale["detail"])
+
+    def test_a_killed_invocation_with_no_state_file_stays_down(self):
+        """Regression guard: the freshness read moved ABOVE the launchd branch,
+        so a missing file must not be described as if the runner were loaded."""
+        killed = lambda _: {"status": "not_loaded", "detail": "not found"}
+        with tempfile.TemporaryDirectory() as td:
+            workspace = self._workspace(Path(td), [
+                {"name": "digest", "cron": "2 6 * * *", "launchd": True},
+            ])
+            res = health.check_cron_runner(workspace, "test-host", "codex", killed)
+            self.assertEqual(res["status"], "down")
+            self.assertIn("launchd is not_loaded", res["detail"])
+            self.assertNotIn("runner loaded", res["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()
