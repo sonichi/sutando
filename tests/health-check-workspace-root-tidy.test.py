@@ -162,8 +162,9 @@ with tempfile.TemporaryDirectory() as td:
     #     startup-runtime.sh, restart.sh, restart-voice-agent.sh, voice-lock.test.py).
     #     Moving one without the others leaves two processes disagreeing about where
     #     the lock is — a double-started voice agent, worse than the warn.
-    #     Matched by GLOB: `.backend-supervisor.lock.guard` is written by the desktop
-    #     app, whose source is not in this repo, so a literal list cannot cover it.
+    #     Both are exempt BY NAME, not by a `*.lock.guard` glob: state/locks/ is where
+    #     workspace_lock.py writes this artifact type, so an unknown guard at the root
+    #     is a resolution bug the probe must keep catching — test 13 pins that.
     td8 = Path(_tf.mkdtemp()); ws8 = td8 / "workspace"; (ws8 / "state").mkdir(parents=True)
     (ws8 / ".voice-agent.lock.guard").write_text("")
     (ws8 / ".backend-supervisor.lock.guard").write_text("")
