@@ -246,11 +246,30 @@ with tempfile.TemporaryDirectory() as td:
         # --- the configured cap/exts must be honored, not decorative ---------
         pathlib.Path("cfg.py").write_text("# one\n# two\n# three\nx = 1\n")
         d = diff_for("cfg.py", "# one\n# two\n# three\nx = 1\n")
-        rc, out, err = run_main(d, env={"RC_PROSE_CAP": "3", "RC_PROSE_EXTS": ".ts"})
+        rc, out, err = run_main(d, env={"RC_PROSE_CAP": "3", "RC_PROSE_EXTS": ".pyi"})
         if rc == 0 and out.strip() == "":
-            print("  ok: RC_PROSE_EXTS=.ts puts a .py file out of scope")
+            print("  ok: RC_PROSE_EXTS=.pyi puts a .py file out of scope")
         else:
             failures.append(f"RC_PROSE_EXTS ignored: rc={rc} out={out!r}")
+
+        # A non-Python extension must REFUSE, not scan. Before this gate it was
+        # selected, tokenized as Python, found commentless and reported PASS.
+        pathlib.Path("cfg.ts").write_text("// one\n// two\n// three\n// four\nexport const y = 1;\n")
+        dts = diff_for("cfg.ts", "// one\n// two\n// three\n// four\nexport const y = 1;\n")
+        rc, out, err = run_main(dts, env={"RC_PROSE_CAP": "2", "RC_PROSE_EXTS": ".ts"})
+        if rc == 2 and "FAIL-CLOSED" in err and ".ts" in err:
+            print("  ok: a configured .ts is REFUSED, not silently passed")
+        else:
+            failures.append(f"unsupported ext must fail closed: rc={rc} out={out!r} err={err!r}")
+        # The same body under a supported ext must still be FOUND — otherwise the
+        # refusal above could be passing for the wrong reason.
+        pathlib.Path("cfg2.py").write_text("# one\n# two\n# three\n# four\ny = 1\n")
+        dpy = diff_for("cfg2.py", "# one\n# two\n# three\n# four\ny = 1\n")
+        rc, out, err = run_main(dpy, env={"RC_PROSE_CAP": "2", "RC_PROSE_EXTS": ".py"})
+        if rc == 0 and "cfg2.py:1" in out:
+            print("  ok: control — the same 4-line run IS caught under .py")
+        else:
+            failures.append(f"control failed, refusal proves nothing: rc={rc} out={out!r}")
         rc, out, err = run_main(d, env={"RC_PROSE_CAP": "3"})
         if rc == 0 and out.strip() == "":
             print("  ok: RC_PROSE_CAP=3 does not flag a 3-line block")
@@ -284,16 +303,32 @@ with tempfile.TemporaryDirectory() as td:
     (pathlib.Path(td) / "a.py").write_text(py_body)
     guide = pathlib.Path(td) / "GUIDE.md"
     guide.write_text("```yaml\nchecks:\n  prose-cap:\n    prose_cap: 2\n"
-                     "    prose_exts: ['.ts']\n```\n")
+                     "    prose_exts: ['.pyi']\n```\n")
     diff = (f"diff --git a/a.py b/a.py\nindex 0000000..{blob_sha(py_body)} 100644\n"
             f"--- a/a.py\n+++ b/a.py\n@@ -1,4 +1,4 @@\n"
             + "".join("+" + l + "\n" for l in py_body.splitlines()))
     r = subprocess.run(["bash", str(ROOT / "scripts" / "review-checks.sh"),
                         "--guide", str(guide)], input=diff, capture_output=True, text=True, cwd=td)
-    if "exts .ts" in r.stderr and "a.py:1" not in (r.stdout + r.stderr):
-        print("  ok: a guide declaring prose_exts ['.ts'] puts .py out of scope END-TO-END")
+    if "exts .pyi" in r.stderr and "a.py:1" not in (r.stdout + r.stderr):
+        print("  ok: a guide declaring prose_exts ['.pyi'] puts .py out of scope END-TO-END")
     else:
         failures.append(f"guide prose_exts ignored by the runner: out={r.stdout!r} err={r.stderr[-300:]!r}")
+
+    # END-TO-END through the SHELL: a guide naming a non-Python extension must
+    # take the runner down, not hand it a PASS assembled from an unread file.
+    (pathlib.Path(td) / "a.ts").write_text(ts_body)
+    guide.write_text("```yaml\nchecks:\n  prose-cap:\n    prose_cap: 2\n"
+                     "    prose_exts: ['.ts']\n```\n")
+    tsdiff = (f"diff --git a/a.ts b/a.ts\nindex 0000000..{blob_sha(ts_body)} 100644\n"
+              f"--- a/a.ts\n+++ b/a.ts\n@@ -1,3 +1,3 @@\n"
+              + "".join("+" + l + "\n" for l in ts_body.splitlines()))
+    r = subprocess.run(["bash", str(ROOT / "scripts" / "review-checks.sh"),
+                        "--guide", str(guide)], input=tsdiff, capture_output=True, text=True, cwd=td)
+    if r.returncode != 0 and "FAIL-CLOSED" in r.stderr and "PASS" not in r.stdout:
+        print("  ok: a guide declaring prose_exts ['.ts'] takes the RUNNER down END-TO-END")
+    else:
+        failures.append(f"runner passed an unsupported ext: rc={r.returncode} "
+                        f"out={r.stdout!r} err={r.stderr[-300:]!r}")
 
     guide.write_text("```yaml\nchecks:\n  prose-cap:\n    prose_cap: 2\n"
                      "    prose_exts: ['.py']\n```\n")

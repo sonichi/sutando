@@ -18,6 +18,9 @@ INDEX = re.compile(r"^index [0-9a-f]+\.\.([0-9a-f]+)")
 # Fallbacks only. review-checks.sh normally supplies both from REVIEW.md.
 DEFAULT_CAP = 2
 DEFAULT_EXTS = (".py",)
+# Classification is `tokenize`, so only Python comment syntax is decidable here.
+# Any other extension yields zero COMMENT tokens — a clean PASS over unread text.
+SUPPORTED_EXTS = (".py", ".pyi")
 
 
 def comment_lines(path):
@@ -121,11 +124,21 @@ def _config():
         cap = DEFAULT_CAP
     raw_exts = os.environ.get("RC_PROSE_EXTS", "").strip()
     exts = tuple(e.strip() for e in raw_exts.split(",") if e.strip()) or DEFAULT_EXTS
-    return cap, exts
+    unsupported = tuple(e for e in exts if e not in SUPPORTED_EXTS)
+    return cap, exts, unsupported
 
 
 def main():
-    cap, exts = _config()
+    cap, exts, unsupported = _config()
+    # Refuse rather than scan: an unsupported extension is selected, tokenized as
+    # Python, found to hold no comments, and reported PASS without being read.
+    if unsupported:
+        for e in unsupported:
+            print(f"prose-cap: configured extension {e!r} is not Python-tokenizable; "
+                  "its comment syntax cannot be classified here", file=sys.stderr)
+        print(f"prose-cap: FAIL-CLOSED — {len(unsupported)} configured extension(s) "
+              f"unsupported (supported: {','.join(SUPPORTED_EXTS)})", file=sys.stderr)
+        return 2
     diff_text = sys.stdin.read()
     if not diff_text.strip():
         print("prose-cap: empty diff; nothing scanned, so this is NOT a pass", file=sys.stderr)
