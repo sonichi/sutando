@@ -63,6 +63,35 @@ def _load_or_create_capture_token() -> str | None:
 
 
 CAPTURE_TOKEN = _load_or_create_capture_token()
+
+
+_PREFLIGHT = "unset"
+
+
+def screen_capture_permitted():
+    """True/False from CGPreflightScreenCaptureAccess, or None when unknowable.
+
+    Preflight only — never CGRequestScreenCaptureAccess, which raises a system
+    prompt and would make a capture request user-visible.
+    """
+    global _PREFLIGHT
+    if _PREFLIGHT == "unset":
+        try:
+            import ctypes
+            import ctypes.util
+            _cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+            _fn = _cg.CGPreflightScreenCaptureAccess
+            _fn.restype = ctypes.c_bool
+            _fn.argtypes = []
+            _PREFLIGHT = _fn
+        except Exception:
+            _PREFLIGHT = None
+    if _PREFLIGHT is None:
+        return None
+    try:
+        return bool(_PREFLIGHT())
+    except Exception:
+        return None
 # Web-client endpoint for agent-state reporting. When a /capture happens we
 # flash state=seeing on the menu-bar avatar for ~1.5s — makes screen-capture
 # visible to the user without them needing to watch the web UI.
@@ -183,6 +212,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(payload).encode())
 
+    def _require_screen_permission(self) -> bool:
+        """Fail closed ONLY on an explicit denial. `screencapture` exits 0 under
+        TCC denial and writes a desktop-only frame, so success and denial are
+        otherwise byte-identical to every caller."""
+        if screen_capture_permitted() is False:
+            self._send_json(503, {
+                "status": "denied",
+                "error": "screen recording permission not granted",
+                "remedy": "System Settings > Privacy & Security > Screen & System Audio "
+                          "Recording: remove this app's row, re-add it, then quit and reopen it",
+            })
+            return False
+        return True
+
     def _require_capture_token(self) -> bool:
         """Fail closed unless the request carries the startup capture token."""
         supplied = self.headers.get("X-Sutando-Capture-Token", "")
@@ -208,6 +251,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Reject if no valid token — a browser page on loopback cannot set a
         # custom header on a no-cors fetch, so this is a same-origin CSRF guard.
         if not self._require_capture_token():
+            return
+        if not self._require_screen_permission():
             return
         # Parse display number from query: /capture?display=2 or /capture?all=true
         from urllib.parse import urlparse, parse_qs
@@ -289,6 +334,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Token gate runs before any side effect, so an unauthorized request
         # produces no flash and no recording.
         if not self._require_capture_token():
+            return
+        if not self._require_screen_permission():
             return
         from urllib.parse import urlparse, parse_qs
         query = parse_qs(urlparse(self.path).query)
