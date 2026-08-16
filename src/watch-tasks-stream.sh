@@ -1,7 +1,4 @@
 #!/bin/bash
-# fd 9 is a stable dup of the real stdout. The EXIT trap can fire while the shell
-# is inside a $( ) capture, which rebinds fd 1 to the substitution's pipe.
-exec 9>&1
 # Streaming task watcher — the canonical task-detection path.
 #
 # Runs fswatch indefinitely and emits ONE line per new task file appearance.
@@ -20,6 +17,10 @@ exec 9>&1
 # The agent reads the named files via the Read tool when notifications
 # arrive — no need to inline file contents in stdout (Monitor's 200ms
 # batching window would group multi-line content awkwardly).
+
+# fd 9 is a stable dup of the real stdout. The EXIT trap can fire while the shell
+# is inside a $( ) capture, which rebinds fd 1 to the substitution's pipe.
+exec 9>&1
 
 set -u
 
