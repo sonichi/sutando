@@ -1550,7 +1550,10 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             assert all(1 <= events[name] <= 2 for name in names), events
             assert not remaining_claims
             assert fallback_names == names
-            assert len(calls.read_text().splitlines()) <= 2
+            handler_calls = calls.read_text().splitlines()
+            # The cap is a concurrency bound; without the contents a breach
+            # reports a bare AssertionError and says nothing about which ran.
+            assert len(handler_calls) <= 2, handler_calls
             deadline = time.monotonic() + WORKER_EXIT_S
             while time.monotonic() < deadline:
                 try:
