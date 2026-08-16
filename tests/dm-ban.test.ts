@@ -5,9 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isDmBanned } from '../src/dm-ban.js';
 
-// The TypeScript half of src/dm_ban.py's contract. The defect this pins: the
-// runtime used existsSync(), which returns false for EVERY error, so an
-// unreadable sentinel authorised the very DM the ban exists to suppress.
+// The TypeScript half of src/dm_ban.py's contract. An unreadable sentinel
+// counts as banned, so a read error can never authorise the DM.
 
 function ws(): string {
 	const d = mkdtempSync(join(tmpdir(), 'dmban-'));
