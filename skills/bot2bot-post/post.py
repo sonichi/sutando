@@ -3,12 +3,17 @@
 
 Usage:
     python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> <text>
+    python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> --body-file <path>
     python3 skills/bot2bot-post/post.py claim "refactor X, ETA 20m"
     python3 skills/bot2bot-post/post.py --to pro ping "your take on the WIRE topic?"
     python3 skills/bot2bot-post/post.py --to lucy opinion "disagreement axis below"
     python3 skills/bot2bot-post/post.py done "shipped PR #472"
 
 Kinds: claim | blocked | done | ping | nack | opinion
+--body-file <path>: read the body from a FILE instead of argv. Use it for any
+prose containing backticks or apostrophes — an apostrophe closes a
+single-quoted shell argument and re-arms the backticks, truncating the message
+at that point while the send still reports success.
 Peers (for --to): a name from ~/.claude/channels/discord/peers.json, or a raw numeric id
 
 The target channel ID is read from `$CLAUDE_CONFIG_DIR/channels/discord/access.json`:
@@ -41,6 +46,7 @@ Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env.
 """
 import json
 import os
+import pathlib
 import sys
 import urllib.request
 import urllib.error
@@ -276,6 +282,12 @@ def resolve_to_target(value: str) -> str:
     )
 
 
+_repo = next(p for p in pathlib.Path(__file__).resolve().parents
+             if (p / "src" / "body_file.py").is_file())
+sys.path.insert(0, str(_repo / "src"))
+from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402
+
+
 def main():
     argv = sys.argv[1:]
     # Optional explicit recipient: --to <name|id>. When given, the @-mention
@@ -289,11 +301,23 @@ def main():
         to_target = argv[i + 1]
         del argv[i : i + 2]
 
-    if len(argv) < 2:
-        print(__doc__, file=sys.stderr)
-        sys.exit(1)
-    kind = argv[0]
-    text = " ".join(argv[1:])
+    # --body-file must be the FIRST body token: recognising it anywhere would
+    # turn ordinary prose ("document --body-file usage") into a file read.
+    if argv and argv[0] in VALID_KINDS and len(argv) > 1 and argv[1] == "--body-file":
+        if len(argv) < 3:
+            sys.exit("ERROR: --body-file requires a path")
+        if len(argv) > 3:
+            sys.exit(f"ERROR: --body-file takes the body; drop {argv[3:]!r}")
+        kind = argv[0]
+        text = _read_body_file(argv[2])
+        if not text.strip():
+            sys.exit(f"ERROR: --body-file {argv[2]!r} is empty — refusing to post")
+    else:
+        if len(argv) < 2:
+            print(__doc__, file=sys.stderr)
+            sys.exit(1)
+        kind = argv[0]
+        text = " ".join(argv[1:])
     if kind not in VALID_KINDS:
         sys.exit(f"ERROR: kind must be one of {sorted(VALID_KINDS)}, got {kind!r}")
 

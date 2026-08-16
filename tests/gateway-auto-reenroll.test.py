@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
@@ -240,13 +241,16 @@ class _Status(unittest.TestCase):
         # Review P1: a NEW rejection after a recovered episode must not
         # keep advertising the stale recovered:true terminal.
         saved = {n: getattr(gw, n) for n in
-                 ("TOKEN_FILE", "_reload_rotated_token", "_reenroll_claim",
-                  "_log", "GATEWAY_STATUS_FILE")}
+                 ("TOKEN_FILE", "TOKEN", "_reload_rotated_token",
+                  "_reenroll_claim", "_log", "GATEWAY_STATUS_FILE")}
         tmp = Path(tempfile.mkdtemp()) / "gateway-status.json"
         try:
             _reset(recovered_at=1786767544)   # episode A ended recovered
             gw.GATEWAY_STATUS_FILE = tmp
             gw.TOKEN_FILE = ""
+            # A host-resolved TOKEN would (correctly) enter the loop under the
+            # narrowed guard — stub it so the FATAL branch is actually taken.
+            gw.TOKEN = ""
             gw._log = lambda m: None
             gw._reload_rotated_token = lambda: False
             gw._reenroll_claim = lambda: None   # claim fails to park (409/net)
@@ -258,6 +262,105 @@ class _Status(unittest.TestCase):
             for n, v in saved.items():
                 setattr(gw, n, v)
             _reset()
+
+
+class _Identity(unittest.TestCase):
+    """`_reenroll_identity` must reach the durable per-host identity.
+
+    Enrolment writes the agent mxid to `state/auth/ag2space.json`, which
+    CLAUDE.md designates as the canonical home for per-host install/identity
+    state. Before this the resolver read only the process env and the channel
+    .env — so on a host whose .env carries just the token (the shape `connect`
+    writes), identity was unreachable and the claim could never be issued:
+    `reenroll: agent identity unknown` on every cycle, with the answer sitting
+    on disk one directory away.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state = Path(self._tmp.name)
+        (self.state / "auth").mkdir(parents=True)
+        self._saved_state = gw._STATE
+        gw._STATE = self.state
+        self.addCleanup(lambda: setattr(gw, "_STATE", self._saved_state))
+        # Neutralise the two earlier candidates so this pins the THIRD one.
+        self._env = mock.patch.dict(
+            gw.os.environ, {"AGENT_MXID": "", "AGENT_ID": ""}, clear=False)
+        self._env.start(); self.addCleanup(self._env.stop)
+        for k in ("AGENT_MXID", "AGENT_ID"):
+            gw.os.environ.pop(k, None)
+        self._chan = mock.patch.object(gw, "_config_from_channel_env", return_value="")
+        self._chan.start(); self.addCleanup(self._chan.stop)
+
+    def _write(self, payload):
+        (self.state / "auth" / "ag2space.json").write_text(json.dumps(payload))
+
+    def test_identity_resolves_from_the_auth_state_file(self):
+        """The load-bearing case: fails before this change, which returns ''."""
+        self._write({"agent_id": "@host.agent:ag2.space", "schema_version": 1})
+        self.assertEqual(gw._reenroll_identity(), "@host.agent:ag2.space")
+
+    def test_env_still_wins_over_the_state_file(self):
+        """Precedence is unchanged — the new source is a LAST resort, so a
+        deliberate override cannot be silently outranked by stale enrolment."""
+        self._write({"agent_id": "@stale.agent:ag2.space"})
+        with mock.patch.dict(gw.os.environ, {"AGENT_MXID": "@live.agent:ag2.space"}):
+            self.assertEqual(gw._reenroll_identity(), "@live.agent:ag2.space")
+
+    def test_channel_env_still_wins_over_the_state_file(self):
+        self._write({"agent_id": "@stale.agent:ag2.space"})
+        with mock.patch.object(gw, "_config_from_channel_env",
+                               side_effect=lambda k: "@chan.agent:ag2.space"
+                               if k == "AGENT_MXID" else ""):
+            self.assertEqual(gw._reenroll_identity(), "@chan.agent:ag2.space")
+
+    def test_every_earlier_candidate_still_outranks_the_state_file(self):
+        """REVIEW.md lesson 10 — enumerate the adjacent inputs, not just the one
+        you changed. `_reenroll_identity` has SIX inputs; a new last-resort
+        source must not quietly outrank any of the five that precede it, so
+        walk the whole ladder rather than neutralising it wholesale.
+        """
+        self._write({"agent_id": "@stale.agent:ag2.space"})
+        # 1-2: process env, both spellings.
+        for key in ("AGENT_MXID", "AGENT_ID"):
+            with mock.patch.dict(gw.os.environ, {key: f"@env-{key}:ag2.space"}):
+                self.assertEqual(gw._reenroll_identity(), f"@env-{key}:ag2.space",
+                                 f"process env {key} must outrank the state file")
+        # 3-5: channel .env, all three spellings it accepts.
+        for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
+            with mock.patch.object(gw, "_config_from_channel_env",
+                                   side_effect=lambda k, want=key:
+                                   f"@chan-{want}:ag2.space" if k == want else ""):
+                self.assertEqual(gw._reenroll_identity(), f"@chan-{key}:ag2.space",
+                                 f"channel .env {key} must outrank the state file")
+
+    def test_absent_unreadable_and_malformed_all_yield_empty(self):
+        """Never raise into the claim path: a missing, corrupt, or
+        wrong-shaped record is an unknown identity, not a crash."""
+        self.assertEqual(gw._reenroll_identity(), "")          # absent
+        (self.state / "auth" / "ag2space.json").write_text("{not json")
+        self.assertEqual(gw._reenroll_identity(), "")          # malformed
+        self._write({"agent_id": None})
+        self.assertEqual(gw._reenroll_identity(), "")          # null field
+        self._write({"agent_id": "   "})
+        self.assertEqual(gw._reenroll_identity(), "")          # whitespace only
+
+    def test_non_string_agent_id_reads_as_unknown_not_garbage(self):
+        """Review P2: a truthy non-string must not be coerced into a garbage
+        identity — `_reenroll_claim` gates on `if not agent_id`, so '12345'
+        would be POSTed on the cadence and the operator hint never printed."""
+        for bad in (12345, ["@x:ag2.space"], {"v": "@x"}, True, 0.5):
+            self._write({"agent_id": bad})
+            self.assertEqual(gw._reenroll_identity(), "",
+                             f"non-string agent_id {bad!r} must read as unknown")
+
+    def test_identity_appearing_later_is_picked_up_without_a_restart(self):
+        """Re-read per call, matching the channel-env candidates: an operator
+        (or a re-enrolment) landing the file mid-episode must take effect."""
+        self.assertEqual(gw._reenroll_identity(), "")
+        self._write({"agent_id": "@late.agent:ag2.space"})
+        self.assertEqual(gw._reenroll_identity(), "@late.agent:ag2.space")
 
 
 class _ClaimClock(unittest.TestCase):
@@ -390,11 +493,128 @@ class _RecoverLoop(unittest.TestCase):
                 setattr(gw, n, v)
             _reset()
 
-    def test_no_channels_keeps_historical_fatal_contract(self):
+
+    def _loop_harness(self, saved_extra=()):
+        names = ("TOKEN_FILE", "TOKEN", "AUTH_RECHECK_INTERVAL", "REENROLL_ENABLED",
+                 "_reload_rotated_token", "_heartbeat_singleton", "_auth_probe",
+                 "_emit_gateway_status", "_log", "REENROLL_PROBE_EVERY",
+                 "URL") + tuple(saved_extra)
+        saved = {n: getattr(gw, n) for n in names}
+        env = {k: gw.os.environ.get(k)
+               for k in ("AGENT_MXID", "AGENT_ID", "AG2_DEVICE_ENV",
+                         "CLAUDE_CONFIG_DIR")}
+        for k in env:
+            gw.os.environ.pop(k, None)
+        gw.TOKEN_FILE = ""
+        gw.TOKEN = "ab" * 24
+        gw.URL = "https://chat.example/relay"
+        gw.REENROLL_ENABLED = True
+        gw.AUTH_RECHECK_INTERVAL = 0
+        gw.REENROLL_PROBE_EVERY = 1
+        gw._reload_rotated_token = lambda: False
+        gw._emit_gateway_status = lambda *a, **k: None
+        return saved, env
+
+    def _restore(self, saved, env):
+        for n, v in saved.items():
+            setattr(gw, n, v)
+        for k, v in env.items():
+            if v is None:
+                gw.os.environ.pop(k, None)
+            else:
+                gw.os.environ[k] = v
+        _reset()
+
+    def test_pointered_identity_written_midepisode_is_detected_without_restart(self):
+        # Issue #2924 review split, half 1: with a channel-env POINTER present,
+        # the REAL file-reading path detects a newly written AGENT_MXID —
+        # no mocks on the config reader, a real temp .env.
+        saved, env = self._loop_harness()
+        import tempfile
+        envfile = Path(tempfile.mkdtemp()) / "device.env"
+        envfile.write_text("REMOTE_TASK_TOKEN=unused\n")
+        gw.os.environ["AG2_DEVICE_ENV"] = str(envfile)
+        logs = []
+        gw._log = logs.append
+        beats = {"n": 0}
+
+        def beat():
+            beats["n"] += 1
+            if beats["n"] == 2:   # operator writes the fix mid-episode
+                envfile.write_text("AGENT_MXID=@late.agent:ag2.space\n")
+            return beats["n"] < 25
+        gw._heartbeat_singleton = beat
+
+        def fake_urlopen(req, timeout=0):
+            resp = io.BytesIO(json.dumps(
+                {"ok": True, "pending": True,
+                 "approval_code": "late1234"}).encode())
+            resp.__enter__ = lambda *a: resp
+            resp.__exit__ = lambda *a: False
+            return resp
+        real = gw.urllib.request.urlopen
+        gw.urllib.request.urlopen = fake_urlopen
+        gw._auth_probe = lambda: True
+        try:
+            self.assertTrue(gw._recover_auth(401))
+            self.assertIn("recovered_at", gw._reenroll_state)
+            self.assertTrue(any("without restart" in ln for ln in logs))
+        finally:
+            gw.urllib.request.urlopen = real
+            self._restore(saved, env)
+
+    def test_no_pointer_cohort_waits_stably_and_names_the_restart(self):
+        # Half 2: with NO pointers, no in-process fix is possible — the loop
+        # must hold a stable wait (never fatal, never claim) and the log must
+        # say a wrapper/app restart is required, not promise a live retry.
+        saved, env = self._loop_harness()
+        logs = []
+        gw._log = logs.append
+        beats = {"n": 0}
+
+        def beat():
+            beats["n"] += 1
+            return beats["n"] < 6   # bounded observation window, no wall clock
+        gw._heartbeat_singleton = beat
+        gw._auth_probe = lambda: self.fail("probe must not run with no claim")
+        real = gw.urllib.request.urlopen   # capture BEFORE mutating — the
+        gw.urllib.request.urlopen = lambda *a, **k: self.fail("no POST expected")
+        try:
+            with self.assertRaises(SystemExit):   # singleton hard-stop, not FATAL-401
+                gw._recover_auth(401)
+            self.assertTrue(any("RESTART the wrapper" in ln for ln in logs))
+            self.assertIsNone(gw._reenroll_state["code"])
+        finally:
+            # module object is shared, so name-restoring reads the mock back
+            gw.urllib.request.urlopen = real
+            self._restore(saved, env)
+
+
+    def test_fatal_contract_survives_only_where_recovery_impossible(self):
         saved = {n: getattr(gw, n) for n in
-                 ("TOKEN_FILE", "_reload_rotated_token", "_reenroll_claim")}
+                 ("TOKEN_FILE", "TOKEN", "REENROLL_ENABLED",
+                  "_reload_rotated_token", "_reenroll_claim")}
         try:
             gw.TOKEN_FILE = ""
+            gw._reload_rotated_token = lambda: False
+            gw._reenroll_claim = lambda: None
+            gw.REENROLL_ENABLED = False    # reenroll off -> fatal preserved
+            gw.TOKEN = "ab" * 24
+            self.assertFalse(gw._recover_auth(401))
+            gw.REENROLL_ENABLED = True     # no bearer at all -> fatal preserved
+            gw.TOKEN = ""
+            self.assertFalse(gw._recover_auth(401))
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+            _reset()
+
+    def test_no_channels_keeps_historical_fatal_contract(self):
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "TOKEN", "_reload_rotated_token", "_reenroll_claim")}
+        try:
+            gw.TOKEN_FILE = ""
+            gw.TOKEN = ""
             gw._reload_rotated_token = lambda: False
             gw._reenroll_claim = lambda: None   # nothing parked
             self.assertFalse(gw._recover_auth(401))
