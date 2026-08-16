@@ -319,6 +319,88 @@ ok "and the repo-path hook is still installed on the same event" \
    "$(echo "$CCMDS" | grep -q 'session-handoff' && echo 0 || echo 1)"
 rm -rf "$CROOT"
 
+# ---- upgrade path: a pre-existing runner-first skill hook must be MIGRATED ----
+# The outage case: a re-run must replace the old `python3 <path>` entry, not add beside it.
+UROOT="$(mktemp -d)"; UREPO="$UROOT/repo"
+mkdir -p "$UREPO/.claude" "$UREPO/src" "$UREPO/skills/demo/hooks"
+cp "$HERE/../src/install-claude-hooks.sh" "$UREPO/src/"
+cp "$HERE/../src/skill_hooks.py" "$UREPO/src/"
+printf '#!/bin/bash\n:\n' > "$UREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$UREPO/src/check-pending-tasks.sh"
+chmod +x "$UREPO/src/"*.sh
+printf '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/g.py"}]}\n' \
+    > "$UREPO/skills/demo/manifest.json"
+printf 'import sys; sys.exit(2)\n' > "$UREPO/skills/demo/hooks/g.py"
+# Resolve the fixture path: skill_hooks writes RESOLVED paths, and macOS mktemp's
+# /var/... alias would seed a string no installer ever wrote (false migration failure).
+GPATH="$(python3 -c "import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())" "$UREPO/skills/demo/hooks/g.py")"
+export U_SETTINGS="$UREPO/.claude/settings.json"
+# Seed EXACTLY what a previous installer wrote, plus an operator variant that
+# invokes the same script — the negative control the sweep must not eat.
+U_OLD="python3 $GPATH" python3 - <<'PY'
+import json, os
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    {"type": "command", "command": os.environ["U_OLD"]},
+    {"type": "command", "command": "bash -x " + os.environ["U_OLD"].split(" ", 1)[1]},
+]}]}}, open(os.environ["U_SETTINGS"], "w"), indent=2)
+PY
+bash "$UREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+UCMDS="$(python3 -c "
+import json, os
+d = json.load(open(os.environ['U_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get('PreToolUse', []) for h in g['hooks']))
+")"
+ok "old runner-first skill hook is REMOVED on re-run (not left beside the new one)" \
+   "$(echo "$UCMDS" | grep -qx "python3 $GPATH" && echo 1 || echo 0)"
+ok "guarded skill hook is registered exactly once" \
+   "$([ "$(echo "$UCMDS" | grep -c '^\[ -f .*g\.py ')" = 1 ] && echo 0 || echo 1)"
+ok "operator's own variant on the same script survives (negative control)" \
+   "$(echo "$UCMDS" | grep -q 'bash -x ' && echo 0 || echo 1)"
+# The point of the whole change: with the script gone, nothing blocks.
+rm -f "$GPATH"
+UGUARD="$(echo "$UCMDS" | grep '^\[ -f .*g\.py ' | head -1)"
+bash -c "$UGUARD" >/dev/null 2>&1
+ok "with the script deleted the guarded hook exits 0 (tool not blocked)" "$?"
+rm -rf "$UROOT"
+
+# ---- same upgrade, on a repo path containing `exec ` and `|` ----
+# `${CMD#*exec }` splits inside such a path; the `|` exercises the NUL field framing.
+EROOT="$(mktemp -d)"; EREPO="$EROOT/exec repo|x/repo"
+mkdir -p "$EREPO/.claude" "$EREPO/src" "$EREPO/skills/demo/hooks"
+cp "$HERE/../src/install-claude-hooks.sh" "$EREPO/src/"
+cp "$HERE/../src/skill_hooks.py" "$EREPO/src/"
+printf '#!/bin/bash\n:\n' > "$EREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$EREPO/src/check-pending-tasks.sh"
+chmod +x "$EREPO/src/"*.sh
+printf '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/g.py"}]}\n' \
+    > "$EREPO/skills/demo/manifest.json"
+printf 'import sys; sys.exit(2)\n' > "$EREPO/skills/demo/hooks/g.py"
+EPATH="$(python3 -c "import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())" "$EREPO/skills/demo/hooks/g.py")"
+export E_SETTINGS="$EREPO/.claude/settings.json"
+# shq quotes the path, so the seeded legacy entry must be quoted the same way an
+# installer would have written it — otherwise the fixture is not what it claims.
+E_OLD="python3 $(python3 -c "import shlex,sys;print(shlex.quote(sys.argv[1]))" "$EPATH")"
+export E_OLD
+python3 - <<'PY'
+import json, os
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    {"type": "command", "command": os.environ["E_OLD"]},
+]}]}}, open(os.environ["E_SETTINGS"], "w"), indent=2)
+PY
+bash "$EREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+ECMDS="$(python3 -c "
+import json, os
+d = json.load(open(os.environ['E_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get('PreToolUse', []) for h in g['hooks']))
+")"
+ok "path containing 'exec ': legacy entry is REMOVED, not left blocking" \
+   "$(echo "$ECMDS" | grep -qxF "$E_OLD" && echo 1 || echo 0)"
+# No trailing space in the pattern: this path needs quoting, so shq emits `g.py'`
+# where an ordinary path emits a bare `g.py `.
+ok "path containing 'exec ': guarded hook registered exactly once" \
+   "$([ "$(echo "$ECMDS" | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
+rm -rf "$EROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then

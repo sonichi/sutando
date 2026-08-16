@@ -28,14 +28,16 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Isolate the channel config BEFORE the bridge import: _ag2space_access_path()
-# resolves under $CLAUDE_CONFIG_DIR (falling back to the real ~/.claude), and
-# _write_task() reads the tierMap from it at write time — without this, the
-# suite depends on the operator's REAL AG2 Space tier map (qingyun-wu CR on
-# #2432 round 2, P1-2: a controlled tierMap mapping the fixture sender to
-# "team" made the owner-activity assertion fail on an operator box).
+# Isolate the channel config BEFORE the bridge import: _write_task() reads the
+# tierMap from _ag2space_access_path() at write time — without this, the suite
+# depends on the operator's REAL AG2 Space tier map (qingyun-wu CR on #2432
+# round 2, P1-2: a controlled tierMap mapping the fixture sender to "team"
+# made the owner-activity assertion fail on an operator box).
 _CFG_ROOT = Path(tempfile.mkdtemp(prefix="rgb-telem-cfg-"))
+# AG2_DEVICE_ENV outranks CLAUDE_CONFIG_DIR in _ag2space_access_path, so setting
+# only the latter still resolves to the operator's install on a configured host.
 os.environ["CLAUDE_CONFIG_DIR"] = str(_CFG_ROOT)
+os.environ["AG2_DEVICE_ENV"] = ""
 _ACCESS = _CFG_ROOT / "channels" / "ag2space" / "access.json"
 _ACCESS.parent.mkdir(parents=True, exist_ok=True)
 _ACCESS.write_text('{"allowFrom": [], "tierMap": {}}')
@@ -83,6 +85,7 @@ def _fresh_dirs():
     # Reset the tierMap to the seeded EMPTY config and drop the mtime cache so
     # no case inherits another case's (or the host's) tier state.
     _ACCESS.write_text('{"allowFrom": [], "tierMap": {}}')
+    rgb._TIER_MAP_CACHE["ident"] = None
     rgb._TIER_MAP_CACHE["mtime"] = None
     rgb._TIER_MAP_CACHE["map"] = {}
     return tmp
@@ -118,21 +121,25 @@ class _FakeTelemetry:
 _fresh_dirs()
 with _FakeTelemetry() as t:
     tid = rgb._write_task({"id": "task-telem1", "task": "hello", "source": "ag2space",
-                           "user_id": "@rui:ag2.space", "channel_id": "!room:ag2.space"})
+                           "user_id": "@rui:ag2.space", "access_tier": "owner",
+                           "channel_id": "!room:ag2.space"})
 check("write returns the task id", tid == "task-telem1")
 check("one task_processed event", t.calls == ["ag2space"], repr(t.calls))
 
 # 2. no source on the task → falls back to PROVIDER (matches the file header)
 _fresh_dirs()
 with _FakeTelemetry() as t:
-    rgb._write_task({"id": "task-telem2", "task": "hi", "user_id": "@rui:ag2.space"})
+    rgb._write_task({"id": "task-telem2", "task": "hi", "user_id": "@rui:ag2.space",
+                     "access_tier": "owner"})
 check("sourceless task tags PROVIDER", t.calls == [rgb.PROVIDER], repr(t.calls))
 
 # 3. idempotent re-write (file already queued) → no second event
 _fresh_dirs()
 with _FakeTelemetry() as t:
-    rgb._write_task({"id": "task-telem3", "task": "x", "source": "ag2space"})
-    rgb._write_task({"id": "task-telem3", "task": "x", "source": "ag2space"})
+    rgb._write_task({"id": "task-telem3", "task": "x", "source": "ag2space",
+                     "access_tier": "owner"})
+    rgb._write_task({"id": "task-telem3", "task": "x", "source": "ag2space",
+                     "access_tier": "owner"})
 check("idempotent re-write counted once", t.calls == ["ag2space"], repr(t.calls))
 
 # 4. gateway redelivery of an archived task → no event (and no task file)
@@ -141,7 +148,8 @@ archive = rgb.TASKS_DIR / "archive"
 archive.mkdir(parents=True, exist_ok=True)
 (archive / "task-telem4.txt").write_text("done long ago\n")
 with _FakeTelemetry() as t:
-    rgb._write_task({"id": "task-telem4", "task": "replay", "source": "ag2space"})
+    rgb._write_task({"id": "task-telem4", "task": "replay", "source": "ag2space",
+                     "access_tier": "owner"})
 check("archived redelivery not counted", t.calls == [], repr(t.calls))
 check("archived redelivery writes no task file",
       not (rgb.TASKS_DIR / "task-telem4.txt").exists())
@@ -150,7 +158,8 @@ check("archived redelivery writes no task file",
 _fresh_dirs()
 _prev = sys.modules.pop("telemetry", None)
 try:
-    tid = rgb._write_task({"id": "task-telem5", "task": "standalone", "source": "ag2space"})
+    tid = rgb._write_task({"id": "task-telem5", "task": "standalone", "source": "ag2space",
+                           "access_tier": "owner"})
 finally:
     if _prev is not None:
         sys.modules["telemetry"] = _prev
@@ -160,7 +169,8 @@ check("missing telemetry module → task still queued",
 # 6. telemetry raising mid-call → write still succeeds (fire-and-forget)
 _fresh_dirs()
 with _FakeTelemetry(raise_on_call=True) as t:
-    tid = rgb._write_task({"id": "task-telem6", "task": "boom", "source": "ag2space"})
+    tid = rgb._write_task({"id": "task-telem6", "task": "boom", "source": "ag2space",
+                           "access_tier": "owner"})
 check("raising telemetry never breaks the write",
       tid == "task-telem6" and (rgb.TASKS_DIR / "task-telem6.txt").exists())
 check("raising telemetry was attempted", t.calls == ["ag2space"], repr(t.calls))
@@ -196,6 +206,7 @@ def _write_with_real_telemetry(task: dict):
     its network sink stubbed to a capture list. Joins sender threads so the
     captured payloads are complete before asserting."""
     tmp = _fresh_dirs()
+    task = {"access_tier": "owner", **task}
     real = _load_real_telemetry(tmp / "telem-state")
     payloads = []
     real._post = lambda payload: payloads.append(payload)  # network boundary stub
@@ -218,7 +229,8 @@ def _write_with_real_telemetry(task: dict):
 #    exact metric the owner reported missing), not "unknown".
 tmp7, payloads = _write_with_real_telemetry(
     {"id": "task-telem7", "task": "hello", "source": "ag2space",
-     "user_id": "@rui:ag2.space", "channel_id": "!room:ag2.space"})
+     "user_id": "@rui:ag2.space", "access_tier": "owner",
+     "channel_id": "!room:ag2.space"})
 tp = [p for p in payloads if p.get("event") == "task_processed"]
 check("real pipeline emits one task_processed", len(tp) == 1, repr(payloads))
 check("real pipeline keeps source=ag2space",
@@ -327,6 +339,7 @@ check("raw secret value never reaches the payload",
 #     proving no assertion secretly depends on the host's ambient tierMap.
 tmp7d = _fresh_dirs()
 _ACCESS.write_text('{"allowFrom": [], "tierMap": {"@rui:ag2.space": "team"}}')
+rgb._TIER_MAP_CACHE["ident"] = None
 rgb._TIER_MAP_CACHE["mtime"] = None  # force re-read of the hostile map
 real = _load_real_telemetry(tmp7d / "telem-state")
 payloads = []
@@ -336,7 +349,8 @@ sys.modules["telemetry"] = real
 try:
     before = set(threading.enumerate())
     rgb._write_task({"id": "task-telem7d", "task": "hi", "source": "ag2space",
-                     "user_id": "@rui:ag2.space", "channel_id": "!room:ag2.space"})
+                     "user_id": "@rui:ag2.space", "access_tier": "owner",
+                     "channel_id": "!room:ag2.space"})
     for th in set(threading.enumerate()) - before:
         th.join(timeout=2)
 finally:

@@ -76,6 +76,50 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
 fi
+# Route the core through the credential proxy when one is live (quota
+# telemetry, #2211/#2288). startup.sh exports ANTHROPIC_BASE_URL for cores
+# it launches, but a start-cli-launched core (app restart-intercept,
+# --restart, supervisor) never runs startup.sh — the proxy sits idle,
+# quota-state.json goes stale, and the proactive loop's budget governor
+# runs blind. Guarded twice: honor a caller-set ANTHROPIC_BASE_URL, and
+# only wire up when a LISTENer actually holds the proxy port — never point
+# the core at a dead port (the #1086/#1291 failure class; same
+# LISTEN-not-any-socket rule as src/restart.sh).
+proxy_listener_up() {
+  lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
+}
+if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
+  # A loaded launchd job means the proxy is EXPECTED on this host even when its
+  # listener hasn't bound yet (same loaded-job check as startup.sh/restart.sh).
+  PROXY_EXPECTED=""
+  if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
+    PROXY_EXPECTED=1
+  fi
+  if [ -n "$PROXY_EXPECTED" ]; then
+    # Bounded wait (~10s): a supervised proxy can bind seconds after the core on
+    # a cold boot, and a one-shot check would leave the core unrouted for life.
+    for _ in $(seq 1 20); do
+      proxy_listener_up && break
+      sleep 0.5
+    done
+  fi
+  if proxy_listener_up; then
+    export ANTHROPIC_BASE_URL=http://localhost:7846
+  elif [ -n "$PROXY_EXPECTED" ]; then
+    echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — core runs unrouted this session (no proxy protection, no quota telemetry)" >&2
+  fi
+fi
+if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+  CORE_ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
+fi
+# Test probe: dump the assembled core env forwarding and exit — lets the
+# regression suite assert the proxy-routing policy (live listener forwards,
+# dead port omits, caller preset wins) against the REAL CORE_ENV_ARGS under
+# a stubbed lsof, without touching tmux. No production caller passes this.
+if [ "${1:-}" = "--print-core-env" ]; then
+  printf '%s\n' ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"}
+  exit 0
+fi
 
 tmux_available() {
   command -v tmux > /dev/null 2>&1

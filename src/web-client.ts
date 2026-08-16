@@ -17,6 +17,7 @@ import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
 import { OVERLAY_MANAGER_HTML } from './overlay-manager-ui.js';
 import { resolveWorkspace, statusReadPath } from './workspace_default.js';
+import { readBodyCapped } from './http-body-limit.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -920,6 +921,9 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Restore the chat transcript saved before the last reload, then watch for
+  // new entries to persist.
+  try { initTranscriptPersistence(); } catch {}
 });
 
 // ─── Remote toggle via SSE ────────────────────────────────
@@ -1240,6 +1244,83 @@ function persistTaskMap() {
 function persistExpanded() {
   try { localStorage.setItem(PERSIST_KEY_EXPAND, JSON.stringify(Array.from(expandedTasks))); } catch {}
 }
+
+// ─── Transcript persistence ──────────────────────────────
+// A MutationObserver is used so every append path is captured without editing
+// each call site.
+const PERSIST_KEY_TRANSCRIPT = 'sutando-transcript-v1';
+const TRANSCRIPT_MAX_ENTRIES = 50;
+const TRANSCRIPT_MAX_ENTRY_LEN = 20000; // skip oversized entries (e.g. data-URL images) to stay under localStorage quota
+let _transcriptRestoring = false;
+let _snapshotTimer = null;
+function snapshotTranscript() {
+  try {
+    const t = $('transcript');
+    if (!t) return;
+    const kids = Array.from(t.children).slice(-TRANSCRIPT_MAX_ENTRIES);
+    const entries = kids.map(el => {
+      // Drop the injected copy button (its onclick can't survive an innerHTML
+      // round-trip) — a live one is re-added on restore.
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('.copy-btn').forEach(b => b.remove());
+      return { cls: el.className, html: clone.innerHTML };
+    }).map(e => {
+      if (!e.html) return null;
+      // Oversized entries get a static placeholder, not a silent drop: omitting
+      // the bubble would make the restored transcript lie. Never user content.
+      if (e.html.length >= TRANSCRIPT_MAX_ENTRY_LEN) {
+        return { cls: e.cls, html: '<em class="t-not-persisted">[image/attachment not kept across reloads — too large for local storage]</em>' };
+      }
+      return e;
+    }).filter(Boolean);
+    try {
+      localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries));
+    } catch {
+      // Quota exceeded — keep only the most recent half and retry once.
+      try { localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries.slice(-Math.ceil(entries.length / 2)))); } catch {}
+    }
+  } catch {}
+}
+function scheduleSnapshot() {
+  if (_transcriptRestoring) return;
+  if (_snapshotTimer) clearTimeout(_snapshotTimer);
+  _snapshotTimer = setTimeout(snapshotTranscript, 400);
+}
+function restoreTranscript() {
+  let entries;
+  try { entries = JSON.parse(localStorage.getItem(PERSIST_KEY_TRANSCRIPT) || '[]'); } catch { return; }
+  if (!Array.isArray(entries) || !entries.length) return;
+  _transcriptRestoring = true;
+  const t = $('transcript');
+  // Clear the freshly-rendered default seed so it isn't duplicated by the
+  // seed entry captured in the snapshot.
+  t.innerHTML = '';
+  entries.forEach(e => {
+    const el = document.createElement('div');
+    el.className = e.cls || 't-entry';
+    // Sanitize on restore — stored html may include agent-origin markdown.
+    if (window.DOMPurify) {
+      try { el.innerHTML = window.DOMPurify.sanitize(e.html); } catch { el.textContent = e.html; }
+    } else {
+      el.textContent = e.html;
+    }
+    t.appendChild(el);
+    // Re-attach a live copy button on user/assistant bubbles.
+    if (el.classList.contains('t-assistant') || el.classList.contains('t-user')) addCopyBtn(el);
+  });
+  _transcriptRestoring = false;
+  scrollTranscript(true);
+}
+function initTranscriptPersistence() {
+  restoreTranscript();
+  try {
+    const t = $('transcript');
+    if (t && window.MutationObserver) {
+      new MutationObserver(scheduleSnapshot).observe(t, { childList: true, subtree: true, characterData: true });
+    }
+  } catch {}
+}
+
 const taskMap = window.taskMap = loadPersistedTaskMap();
 let taskWorkstreamNames = Object.create(null);
 
@@ -2347,17 +2428,59 @@ function updateVisionPreviewStats() {
   if (stats) stats.textContent = _visionFrameCount + ' frame' + (_visionFrameCount === 1 ? '' : 's');
 }
 
+// P7 D7.4: this page's main thread also runs the voice capture
+// (ScriptProcessor in the vendored transport) — drawImage + JPEG encode
+// there competes with audio. A tiny Blob-URL worker does the draw + encode
+// in an OffscreenCanvas; the main thread only grabs a cheap ImageBitmap.
+// One frame in flight at a time (latest-frame discipline, no backlog).
+var _visionWorker = null;
+var _visionWorkerBusy = false;
+function ensureVisionWorker() {
+  if (_visionWorker !== null) return _visionWorker;
+  if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined' || typeof Worker === 'undefined') {
+    _visionWorker = false; // feature-detected once; falsy → main-thread fallback
+    return _visionWorker;
+  }
+  var src = 'onmessage=async function(e){var d=e.data;try{' +
+    'var c=new OffscreenCanvas(d.w,d.h);var x=c.getContext("2d");' +
+    'x.drawImage(d.bmp,0,0,d.w,d.h);d.bmp.close();' +
+    'var b=await c.convertToBlob({type:"image/jpeg",quality:d.q});' +
+    'postMessage({ok:true,blob:b});}catch(err){postMessage({ok:false});}}';
+  try {
+    _visionWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    _visionWorker.onmessage = function(e) {
+      _visionWorkerBusy = false;
+      if (e.data && e.data.ok && e.data.blob) _postVisionBlob(e.data.blob);
+    };
+    _visionWorker.onerror = function() { _visionWorkerBusy = false; };
+  } catch (e) { _visionWorker = false; }
+  return _visionWorker;
+}
+
 function captureAndSendFrame() {
   var preview = document.getElementById('vision-preview');
   if (!preview || !_visionStream) return;
   // Wait for the video to actually have pixels — readyState >= HAVE_CURRENT_DATA (2)
   if (preview.readyState < 2 || !preview.videoWidth || !preview.videoHeight) return;
+  var worker = ensureVisionWorker();
+  if (worker) {
+    if (_visionWorkerBusy) return; // latest-frame: skip, never queue
+    _visionWorkerBusy = true;
+    createImageBitmap(preview).then(function(bmp) {
+      worker.postMessage({ bmp: bmp, w: VISION_FRAME_WIDTH, h: VISION_FRAME_HEIGHT, q: VISION_FRAME_QUALITY }, [bmp]);
+    }).catch(function() { _visionWorkerBusy = false; });
+    return;
+  }
+  // Fallback (no OffscreenCanvas): the original main-thread canvas path.
   if (!_visionCanvas) _visionCanvas = document.createElement('canvas');
   _visionCanvas.width = VISION_FRAME_WIDTH;
   _visionCanvas.height = VISION_FRAME_HEIGHT;
   var ctx = _visionCanvas.getContext('2d');
   ctx.drawImage(preview, 0, 0, VISION_FRAME_WIDTH, VISION_FRAME_HEIGHT);
-  _visionCanvas.toBlob(function(blob) {
+  _visionCanvas.toBlob(function(blob) { _postVisionBlob(blob); }, 'image/jpeg', VISION_FRAME_QUALITY);
+}
+
+function _postVisionBlob(blob) {
     if (!blob) return;
     // Skip blank frames — getDisplayMedia sometimes paints a black frame
     // for the first tick when the user switches surfaces; uploading a
@@ -2387,11 +2510,11 @@ function captureAndSendFrame() {
         }
       }
     }).catch(function() { /* network blip — next tick will retry */ });
-  }, 'image/jpeg', VISION_FRAME_QUALITY);
 }
 
 function teardownPushSession() {
   _visionPushActive = false;
+  _visionWorkerBusy = false; // an in-flight encode must not block the next session's first frame
   if (_visionFrameTimer) { clearInterval(_visionFrameTimer); _visionFrameTimer = null; }
   if (_visionStream) {
     try { _visionStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
@@ -4104,15 +4227,23 @@ const server = createServer((req, res) => {
 		const port = Number(process.env.VISION_CONTROL_PORT) || 7847;
 		const method = req.method === 'POST' ? 'POST' : 'GET';
 		const isFrame = url.pathname === '/vision/frame';
-		const chunks: Buffer[] = [];
-		req.on('data', (c: Buffer) => chunks.push(c));
-		req.on('end', async () => {
+		// This surface binds 0.0.0.0 by default, and every oversized frame it
+		// forwards costs a subprocess downstream — so the body is capped here,
+		// not just at the control server.
+		void readBodyCapped(req).then(async (body) => {
+			if (!body) {
+				res.writeHead(413, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ status: 'failed', error: 'body too large' }));
+				return;
+			}
 			try {
 				const incomingType = (req.headers['content-type'] as string | undefined) || (isFrame ? 'image/jpeg' : 'application/json');
 				const r = await fetch(`http://127.0.0.1:${port}${url.pathname}`, {
 					method,
 					headers: method === 'POST' ? { 'Content-Type': incomingType } : undefined,
-					body: method === 'POST' ? (chunks.length ? Buffer.concat(chunks) : (isFrame ? Buffer.alloc(0) : '{}')) : undefined,
+					// Uint8Array view, not the Buffer itself: fetch's BodyInit does not
+					// accept Buffer under @types/node's generic-backed Buffer type.
+					body: method === 'POST' ? (body.byteLength ? new Uint8Array(body) : (isFrame ? new Uint8Array(0) : '{}')) : undefined,
 				});
 				const text = await r.text();
 				res.writeHead(r.status, { 'Content-Type': 'application/json' });
