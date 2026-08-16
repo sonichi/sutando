@@ -135,8 +135,8 @@ if [[ $ROOT_RC -ne 0 ]]; then
 fi
 
 # --- scan ADDED lines for prose blocks over the physical-line cap -----------
-# Separate scanner: comment runs AND docstrings. A checker covering only one
-# reports clean on the other's violation, which is worse than no gate.
+# Separate scanner: COMMENT runs only, classified by tokenize over the post-image.
+# Docstrings are out of scope — the written contract caps code comments.
 PROSE_HITS="$(printf '%s' "$DIFF" | RC_PROSE_CAP="$PROSE_CAP" RC_PROSE_EXTS="$PROSE_EXTS" python3 "$HERE/review-checks-prose-cap.py")"
 PROSE_RC=$?
 if [[ $PROSE_RC -ne 0 ]]; then

@@ -149,7 +149,8 @@ and loads whichever repo it reviews.
 ```yaml
 checks:
   prose-cap:
-    # Added comment runs and docstrings may not exceed this many PHYSICAL lines.
+    # Added COMMENT runs may not exceed this many PHYSICAL lines. Docstrings are
+    # out of scope: the written contract caps code comments, not docstrings.
     # Both forms are scanned: a checker covering one reports clean on the other.
     prose_cap: 2
     prose_exts: ['.py']

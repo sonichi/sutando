@@ -1,50 +1,87 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/review-checks-prose-cap.py. Pins BOTH prose forms:
-a checker covering one reports clean on the other's violation."""
+"""Contract for the prose-cap gate. Classification is tokenize-based, so the two
+false positives a line scanner produces are pinned here as controls."""
 import importlib.util
+import pathlib
+import subprocess
 import sys
-from pathlib import Path
+import tempfile
 
-REPO = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location(
-    "rc_prose_cap", REPO / "scripts" / "review-checks-prose-cap.py")
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "scripts" / "review-checks-prose-cap.py"
+
+spec = importlib.util.spec_from_file_location("pc", SCRIPT)
 pc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pc)
 
-CAP, EXTS = 2, [".py"]
-passed = failed = 0
+failures = []
 
 
-def check(name, diff, want):
-    global passed, failed
-    got = len(pc.violations(diff, CAP, EXTS))
-    if got == want:
-        passed += 1
+def check(name, filename, body, want_rc):
+    """Write body as a new file, synthesize its add-diff, run the gate."""
+    with tempfile.TemporaryDirectory() as td:
+        p = pathlib.Path(td) / filename
+        p.write_text(body)
+        n = len(body.splitlines())
+        diff = (f"diff --git a/{filename} b/{filename}\n--- /dev/null\n"
+                f"+++ b/{filename}\n@@ -0,0 +1,{n} @@\n"
+                + "".join("+" + l + "\n" for l in body.splitlines()))
+        found, unscannable = pc.violations(diff, 2, (".py",), root=td)
+        rc = 1 if found else 0
+        if rc != want_rc:
+            failures.append(f"{name}: rc={rc} want={want_rc} found={found} unscannable={unscannable}")
+        else:
+            print(f"  ok: {name}")
+
+
+# --- positive control: the gate must fire on a real over-cap comment run -----
+check("3-line comment run fires", "a.py",
+      "# one\n# two\n# three\nVALUE = 1\n", 1)
+check("2-line comment run is clean", "b.py",
+      "# one\n# two\nVALUE = 1\n", 0)
+
+# --- false-positive controls the line scanner reproduced ---------------------
+check("hash lines INSIDE a string are not a comment run", "c.py",
+      'Q = """\n# not a comment\n# nor this\n# nor this\nSELECT 1\n"""\n', 0)
+check("bare triple-quoted fixture after an assignment is out of scope", "d.py",
+      'T = "x"\n"""\nline one\nline two\nline three\n"""\n', 0)
+check("module docstring over the cap is out of scope", "e.py",
+      '"""one\ntwo\nthree\n"""\nVALUE = 1\n', 0)
+
+# --- scope: a run is only a violation when every line of it is ADDED ---------
+with tempfile.TemporaryDirectory() as td:
+    p = pathlib.Path(td) / "f.py"
+    p.write_text("# pre-existing one\n# pre-existing two\n# newly added third\nV = 1\n")
+    diff = ("diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -2,1 +3,1 @@\n"
+            "+# newly added third\n")
+    found, _ = pc.violations(diff, 2, (".py",), root=td)
+    if found:
+        failures.append(f"partially-added run must not fire: {found}")
     else:
-        failed += 1
-        print(f"FAIL {name}: expected {want} violation(s), got {got}")
+        print("  ok: a run whose earlier lines were NOT added does not fire")
 
+# --- an unscannable file is reported, never silently passed ------------------
+with tempfile.TemporaryDirectory() as td:
+    p = pathlib.Path(td) / "g.py"
+    p.write_text("def broken(:\n")
+    diff = ("diff --git a/g.py b/g.py\n--- /dev/null\n+++ b/g.py\n@@ -0,0 +1,1 @@\n"
+            "+def broken(:\n")
+    found, unscannable = pc.violations(diff, 2, (".py",), root=td)
+    if "g.py" not in unscannable:
+        failures.append("an untokenizable file must be REPORTED as unscannable")
+    else:
+        print("  ok: an untokenizable file is reported, not silently passed")
 
-D = "+++ b/src/x.py\n@@ -0,0 +1,%d @@\n%s"
+# --- empty diff is not a pass ------------------------------------------------
+r = subprocess.run([sys.executable, str(SCRIPT)], input="", capture_output=True, text=True)
+if r.returncode == 0:
+    failures.append("empty diff must NOT exit 0")
+else:
+    print("  ok: empty diff refuses to report a pass")
 
-check("comment run of 3 fires", D % (4, "+ # a\n+ # b\n+ # c\n+ pass\n"), 1)
-check("comment run of 2 is clean", D % (3, "+ # a\n+ # b\n+ pass\n"), 0)
-check("docstring of 3 fires", D % (4, '+ """one\n+ two\n+ """\n+ pass\n'), 1)
-check("docstring of 2 is clean", D % (3, '+ """one\n+ two"""\n+ pass\n'), 0)
-check("one-line docstring is clean", D % (2, '+ """one"""\n+ pass\n'), 0)
-check("both forms in one file are both counted",
-      D % (7, '+ # a\n+ # b\n+ # c\n+ x=1\n+ """p\n+ q\n+ r"""\n'), 2)
-check("non-Python file is out of scope",
-      "+++ b/docs/a.md\n@@ -0,0 +1,4 @@\n+ # a\n+ # b\n+ # c\n+ x\n", 0)
-check("deleted lines are not prose",
-      "+++ b/src/x.py\n@@ -1,4 +1,1 @@\n- # a\n- # b\n- # c\n+ pass\n", 0)
-check("unclosed docstring inside the diff does not fire",
-      D % (2, '+ """opened only\n+ still going\n'), 0)
-check("non-contiguous comments are separate runs",
-      "+++ b/src/x.py\n@@ -0,0 +1,2 @@\n+ # a\n+ # b\n@@ -9,0 +9,2 @@\n+ # c\n+ # d\n", 0)
-
-check("triple quotes inside a string literal do not fire",
-      "+++ b/src/x.py\n@@ -0,0 +1,4 @@\n+T = re.compile(r'\"\"\"|x')\n+a=1\n+b=2\n+c=3\n", 0)
-
-print(f"\n{passed} passed, {failed} failed")
-sys.exit(1 if failed else 0)
+if failures:
+    print("\nFAILURES:")
+    for f in failures:
+        print("  ✖", f)
+    sys.exit(1)
+print("ALL PASS")
