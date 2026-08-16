@@ -2,6 +2,7 @@
 """Contract for the prose-cap gate. Classification is tokenize-based, so the two
 false positives a line scanner produces are pinned here as controls."""
 import contextlib
+import hashlib
 import importlib.util
 import io
 import os
@@ -17,6 +18,12 @@ spec = importlib.util.spec_from_file_location("pc", SCRIPT)
 pc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pc)
 
+def blob_sha(text):
+    """git's blob hash for `text` — what a real diff's `index a..b` post-image is."""
+    b = text.encode()
+    return hashlib.sha1(b"blob %d\0" % len(b) + b).hexdigest()
+
+
 failures = []
 
 
@@ -26,7 +33,8 @@ def check(name, filename, body, want_rc):
         p = pathlib.Path(td) / filename
         p.write_text(body)
         n = len(body.splitlines())
-        diff = (f"diff --git a/{filename} b/{filename}\n--- /dev/null\n"
+        diff = (f"diff --git a/{filename} b/{filename}\n"
+                f"index 0000000..{blob_sha(body)} 100644\n--- /dev/null\n"
                 f"+++ b/{filename}\n@@ -0,0 +1,{n} @@\n"
                 + "".join("+" + l + "\n" for l in body.splitlines()))
         found, unscannable, _absent = pc.violations(diff, 2, (".py",), root=td)
@@ -55,8 +63,8 @@ check("module docstring over the cap is out of scope", "e.py",
 with tempfile.TemporaryDirectory() as td:
     p = pathlib.Path(td) / "f.py"
     p.write_text("# pre-existing one\n# pre-existing two\n# newly added third\nV = 1\n")
-    diff = ("diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -2,1 +3,1 @@\n"
-            "+# newly added third\n")
+    diff = (f"diff --git a/f.py b/f.py\nindex 0000000..{blob_sha(p.read_text())} 100644\n"
+            "--- a/f.py\n+++ b/f.py\n@@ -2,1 +3,1 @@\n+# newly added third\n")
     found, _, _absent = pc.violations(diff, 2, (".py",), root=td)
     if found:
         failures.append(f"partially-added run must not fire: {found}")
@@ -67,8 +75,8 @@ with tempfile.TemporaryDirectory() as td:
 with tempfile.TemporaryDirectory() as td:
     p = pathlib.Path(td) / "g.py"
     p.write_text("def broken(:\n")
-    diff = ("diff --git a/g.py b/g.py\n--- /dev/null\n+++ b/g.py\n@@ -0,0 +1,1 @@\n"
-            "+def broken(:\n")
+    diff = (f"diff --git a/g.py b/g.py\nindex 0000000..{blob_sha(p.read_text())} 100644\n"
+            "--- /dev/null\n+++ b/g.py\n@@ -0,0 +1,1 @@\n+def broken(:\n")
     found, unscannable, _absent = pc.violations(diff, 2, (".py",), root=td)
     if "g.py" not in unscannable:
         failures.append("an untokenizable file must be REPORTED as unscannable")
@@ -81,7 +89,8 @@ with tempfile.TemporaryDirectory() as td:
     disk = "# disk one\n# disk two\n# disk three\nV = 1\n"
     (pathlib.Path(td) / "rev.py").write_text(disk)
 
-    same = ("diff --git a/rev.py b/rev.py\n--- /dev/null\n+++ b/rev.py\n@@ -0,0 +1,4 @@\n"
+    same = (f"diff --git a/rev.py b/rev.py\nindex 0000000..{blob_sha(disk)} 100644\n"
+            "--- /dev/null\n+++ b/rev.py\n@@ -0,0 +1,4 @@\n"
             + "".join("+" + l + "\n" for l in disk.splitlines()))
     found, _u, det = pc.violations(same, 2, (".py",), root=td)
     if found and not det:
@@ -89,23 +98,40 @@ with tempfile.TemporaryDirectory() as td:
     else:
         failures.append(f"matching-revision control must fire: found={found} detached={det}")
 
-    other = ("diff --git a/rev.py b/rev.py\n--- /dev/null\n+++ b/rev.py\n@@ -0,0 +1,4 @@\n"
-             "+# submitted one\n+# submitted two\n+# submitted three\n+V = 1\n")
+    submitted = "# submitted one\n# submitted two\n# submitted three\nV = 1\n"
+    other = (f"diff --git a/rev.py b/rev.py\nindex 0000000..{blob_sha(submitted)} 100644\n"
+             "--- /dev/null\n+++ b/rev.py\n@@ -0,0 +1,4 @@\n"
+             + "".join("+" + l + "\n" for l in submitted.splitlines()))
     found, _u, det = pc.violations(other, 2, (".py",), root=td)
     if not found and det == ["rev.py"]:
         print("  ok: a foreign revision is SKIPPED, not reported as the diff's own finding")
     else:
         failures.append(f"foreign revision must not produce findings: found={found} detached={det}")
 
+# --- the reviewer's control: SAME added lines, DIFFERENT surrounding context ---
+# Only the triple-quote OUTSIDE the hunk decides they tokenize as STRING.
+with tempfile.TemporaryDirectory() as td:
+    submitted = 'x = 1\n# one\n# two\n# three\n'
+    foreign = 'x = 1\n"""\n# one\n# two\n# three\n"""\n'
+    (pathlib.Path(td) / "ctx.py").write_text(foreign)
+    d = (f"diff --git a/ctx.py b/ctx.py\nindex 0000000..{blob_sha(submitted)} 100644\n"
+         "--- a/ctx.py\n+++ b/ctx.py\n@@ -1,4 +1,4 @@\n x = 1\n+# one\n+# two\n+# three\n")
+    found, _u, det = pc.violations(d, 2, (".py",), root=td)
+    if not found and det == ["ctx.py"]:
+        print("  ok: identical added lines in a foreign context are SKIPPED, not judged")
+    else:
+        failures.append(f"foreign surrounding context must SKIP: found={found} detached={det}")
+
 # --- branch coverage: paths violations() takes that the cases above miss -----
-def diff_for(filename, body, *, context_lines=0):
+def diff_for(filename, body, *, disk=None):
     # body=None models a diff naming a file with no post-image on disk.
     if body is None:
         return (f"diff --git a/{filename} b/{filename}\n--- /dev/null\n"
                 f"+++ b/{filename}\n@@ -0,0 +1,3 @@\n+# one\n+# two\n+# three\n")
     n = len(body.splitlines())
-    head = (f"diff --git a/{filename} b/{filename}\n--- a/{filename}\n"
-            f"+++ b/{filename}\n@@ -1,{n} +1,{n} @@\n")
+    head = (f"diff --git a/{filename} b/{filename}\n"
+            f"index 0000000..{blob_sha(body if disk is None else disk)} 100644\n"
+            f"--- a/{filename}\n+++ b/{filename}\n@@ -1,{n} +1,{n} @@\n")
     return head + "".join("+" + l + "\n" for l in body.splitlines())
 
 
@@ -122,7 +148,8 @@ with tempfile.TemporaryDirectory() as td:
     # A run split by a NON-added comment line must flush at the boundary.
     p2 = pathlib.Path(td) / "split.py"
     p2.write_text("# a1\n# a2\n# a3\n# preexisting\n# b1\n# b2\n# b3\nV = 1\n")
-    d = ("diff --git a/split.py b/split.py\n--- a/split.py\n+++ b/split.py\n@@ -1,8 +1,8 @@\n"
+    d = (f"diff --git a/split.py b/split.py\nindex 0000000..{blob_sha(p2.read_text())} 100644\n"
+         "--- a/split.py\n+++ b/split.py\n@@ -1,8 +1,8 @@\n"
          "+# a1\n+# a2\n+# a3\n # preexisting\n+# b1\n+# b2\n+# b3\n V = 1\n")
     found, _, _absent = pc.violations(d, 2, (".py",), root=td)
     if len(found) == 2:
@@ -248,6 +275,35 @@ if r.returncode == 0:
     failures.append("empty diff must NOT exit 0 (subprocess)")
 else:
     print("  ok: empty diff refuses to report a pass (as a real subprocess too)")
+
+# --- END-TO-END: the guide's prose_exts must reach the runner, not just the module.
+# The shell hardcoded ".py", so a guide naming another extension was decorative.
+with tempfile.TemporaryDirectory() as td:
+    ts_body = "// one\n// two\n// three\n"
+    py_body = "# one\n# two\n# three\nV = 1\n"
+    (pathlib.Path(td) / "a.py").write_text(py_body)
+    guide = pathlib.Path(td) / "GUIDE.md"
+    guide.write_text("```yaml\nchecks:\n  prose-cap:\n    prose_cap: 2\n"
+                     "    prose_exts: ['.ts']\n```\n")
+    diff = (f"diff --git a/a.py b/a.py\nindex 0000000..{blob_sha(py_body)} 100644\n"
+            f"--- a/a.py\n+++ b/a.py\n@@ -1,4 +1,4 @@\n"
+            + "".join("+" + l + "\n" for l in py_body.splitlines()))
+    r = subprocess.run(["bash", str(ROOT / "scripts" / "review-checks.sh"),
+                        "--guide", str(guide)], input=diff, capture_output=True, text=True, cwd=td)
+    if "exts .ts" in r.stderr and "a.py:1" not in (r.stdout + r.stderr):
+        print("  ok: a guide declaring prose_exts ['.ts'] puts .py out of scope END-TO-END")
+    else:
+        failures.append(f"guide prose_exts ignored by the runner: out={r.stdout!r} err={r.stderr[-300:]!r}")
+
+    guide.write_text("```yaml\nchecks:\n  prose-cap:\n    prose_cap: 2\n"
+                     "    prose_exts: ['.py']\n```\n")
+    r = subprocess.run(["bash", str(ROOT / "scripts" / "review-checks.sh"),
+                        "--guide", str(guide)], input=diff, capture_output=True, text=True, cwd=td)
+    if "a.py:1" in (r.stdout + r.stderr) and r.returncode == 1:
+        print("  ok: control — the same runner DOES flag it when the guide says '.py'")
+    else:
+        failures.append(f"guide control failed to flag: out={r.stdout!r} err={r.stderr[-300:]!r}")
+
 
 if failures:
     print("\nFAILURES:")

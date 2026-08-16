@@ -6,6 +6,7 @@ inside a string literal is a STRING token and can never be read as a comment.
 Scope stays added-lines-only: a block counts only if every line of it is added.
 Docstrings are deliberately out of scope — the written contract caps comments.
 """
+import hashlib
 import os
 import re
 import sys
@@ -13,6 +14,7 @@ import tokenize
 from pathlib import Path
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+INDEX = re.compile(r"^index [0-9a-f]+\.\.([0-9a-f]+)")
 # Fallbacks only. review-checks.sh normally supplies both from REVIEW.md.
 DEFAULT_CAP = 2
 DEFAULT_EXTS = (".py",)
@@ -29,13 +31,22 @@ def comment_lines(path):
 
 
 def added_by_file(diff_text):
-    """{path: {post-image line number: its text}} from a unified diff."""
-    out, path, lineno = {}, None, 0
+    """({path: {post-image line: text}}, {path: post-image blob sha}) from a diff.
+    The sha rides `index a..b`; it is the only whole-file identity a diff carries."""
+    out, shas, path, lineno, pending = {}, {}, None, 0, None
     for raw in diff_text.splitlines():
+        m = INDEX.match(raw)
+        if m:
+            pending = m.group(1)
+            continue
         if raw.startswith("+++ "):
             p = raw[4:].strip()
             path = None if p == "/dev/null" else re.sub(r"^b/", "", p)
-            out.setdefault(path, {}) if path else None
+            if path:
+                out.setdefault(path, {})
+                if pending:
+                    shas[path] = pending
+            pending = None
             continue
         m = HUNK.match(raw)
         if m:
@@ -48,40 +59,39 @@ def added_by_file(diff_text):
             lineno += 1
         elif not raw.startswith("-"):
             lineno += 1
-    return out
+    return out, shas
 
 
-def post_image_matches(path, added):
-    """True when every added line is on disk verbatim at its own number — i.e. this
-    tree really is the diff's post-image, not some neighbouring revision of it."""
-    try:
-        lines = path.read_text().splitlines()
-    except (OSError, UnicodeDecodeError):
+def post_image_matches(path, sha):
+    """True only when the file hashes to the diff's post-image blob. Comparing the
+    added lines is not enough: context outside the hunk decides how they tokenize."""
+    if not sha:
         return False
-    return all(n <= len(lines) and lines[n - 1] == text for n, text in added.items())
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    full = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    return full.startswith(sha) or sha.startswith(full)
 
 
 def violations(diff_text, cap, exts, root="."):
     """(found, unreadable, detached). found = (path, first_line, length) per run over cap.
     Detached and unreadable are split because only one of them is a fault."""
     found, unreadable, detached = [], [], []
-    for path, added in added_by_file(diff_text).items():
+    by_file, shas = added_by_file(diff_text)
+    for path, added in by_file.items():
         if not added or not any(path.endswith(e) for e in exts):
             continue
         full = Path(root) / path
-        # A diff can legitimately arrive without its tree (`gh pr diff > pr.diff`).
-        # Tokenizing needs the post-image, so those files are out of reach, not broken.
-        if not full.exists():
+        # A diff can legitimately arrive without its tree (`gh pr diff > pr.diff`),
+        # and a tree at another revision is worse: its line numbers still resolve.
+        if not full.exists() or not post_image_matches(full, shas.get(path)):
             detached.append(path)
             continue
         cl = comment_lines(full)
         if cl is None:
             unreadable.append(path)
-            continue
-        # A file at some OTHER revision is worse than a missing one: the line numbers
-        # still resolve, so it yields confident findings about content nobody submitted.
-        if not post_image_matches(full, added):
-            detached.append(path)
             continue
         # Walk only the comment lines that were added, grouping consecutive runs.
         run = []

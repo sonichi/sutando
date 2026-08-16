@@ -126,7 +126,11 @@ fi
 # above cannot see it whatever its patterns.
 PROSE_CAP="$(sed -n 's/^ *prose_cap: *//p' "$GUIDE" | head -1)"
 PROSE_CAP="${PROSE_CAP:-2}"
-PROSE_EXTS=".py"
+# Read from the guide like every other check. Hardcoding it made REVIEW.md's
+# declaration decorative: a guide naming .ts still only ever got .py scanned.
+PROSE_EXTS="$(sed -n 's/^ *prose_exts: *//p' "$GUIDE" 2>/dev/null | head -1 | tr -d "[]\"' ")"
+[[ -n "$PROSE_EXTS" ]] || PROSE_EXTS="$(parse_list prose_exts | tr '\n' ',' | sed 's/,$//')"
+PROSE_EXTS="${PROSE_EXTS:-.py}"
 ROOT_HITS="$(printf '%s' "$DIFF" | RC_ROOT_ARTIFACT_GLOBS="$ROOT_GLOBS" python3 "$HERE/review-checks-root-artifacts.py")"
 ROOT_RC=$?
 if [[ $ROOT_RC -ne 0 ]]; then
