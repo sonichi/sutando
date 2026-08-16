@@ -34,10 +34,12 @@ def claim_for_delivery(path: Path, recipient: Optional[object]) -> Optional[Path
     return claim
 
 
-def release_claim(claim: Path) -> bool:
+def release_claim(claim: Path, target: "Optional[Path]" = None) -> bool:
     """Return a ``.sending`` claim to the polling stream; True if released.
-    Deleting it instead discards a message that is still being written."""
-    target = claim.with_suffix(".txt")
+    Deleting it instead discards a message that is still being written.
+    ``target`` overrides the ``.txt`` sibling for pid-scoped claim names."""
+    if target is None:
+        target = claim.with_suffix(".txt")
     try:
         # Same clobber hazard as the claim: exists()-then-rename is check-then-act.
         os.link(claim, target)

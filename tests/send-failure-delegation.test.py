@@ -71,6 +71,31 @@ class TestDelegation(unittest.TestCase):
         self.assertIn("release_claim", policy)
 
 
+SPARROW = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
+           / "remote_gateway_bridge.py").read_text()
+
+
+class TestSparrowDelegation(unittest.TestCase):
+    """The gateway bridge's failure resolver is a binder, not a third copy."""
+
+    def test_sparrow_delegates_the_transition(self):
+        self.assertIn("resolve_failed_send", SPARROW)
+        body = SPARROW.split("def _resolve_send_failure", 1)[1]
+        body = body.split("\ndef ", 1)[0]
+        # The binder passes its pid-scoped body and park dir; it must not carry
+        # its own requeue or park move — that is how a third copy starts.
+        self.assertIn("resolve_failed_send(", body)
+        self.assertNotIn("os.link", body)
+        self.assertNotIn(".rename(", body)
+        self.assertNotIn("should_retry", body)
+
+    def test_sparrow_parks_to_the_repo_wide_quarantine(self):
+        # results/undelivered/ is what health-check's probe scans; an archive/
+        # subdir is a park with no reader (review blocker, 2026-08-16).
+        self.assertIn('UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"',
+                      SPARROW)
+
+
 class TestReleaseClaimActuallyReturnsTheBody(unittest.TestCase):
     """The retry depends on release_claim restoring the polled name."""
 
@@ -83,6 +108,14 @@ class TestReleaseClaimActuallyReturnsTheBody(unittest.TestCase):
                   and p.suffix == ".txt"]
         self.assertEqual(polled, ["proactive-x.txt"],
                          "after a transient failure the body must be re-pollable")
+
+    def test_release_honors_an_explicit_target_for_pid_scoped_claims(self):
+        d = Path(tempfile.mkdtemp())
+        claim = d / "proactive-x.sending.4321"
+        claim.write_text("body")
+        self.assertTrue(release_claim(claim, target=d / "proactive-x.txt"))
+        self.assertTrue((d / "proactive-x.txt").exists(),
+                        "explicit target restores the real polled name")
 
     def test_release_refuses_to_clobber_an_existing_txt(self):
         d = Path(tempfile.mkdtemp())

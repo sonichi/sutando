@@ -785,7 +785,7 @@ def main() -> int:
           "a body flushed after an AGED empty claim is still delivered")
 
     # Oversized body → dead-lettered once instead of retrying forever, and it
-    # lands in archive/undeliverable so "given up on" is not confused with
+    # lands in results/undelivered/ so "given up on" is not confused with
     # "delivered".
     huge = rtc.RESULTS_DIR / "proactive-t3c.txt"
     huge.write_text("x" * (rtc._PROACTIVE_MAX_BODY_B + 1))
@@ -1000,7 +1000,7 @@ def main() -> int:
     for _ in range(rtc.MAX_TRANSIENT_ATTEMPTS + 3):     # more passes than the cap
         rtc._post_proactive()
     STATE["force_room_empty_200"] = False
-    _undeliv = rtc.ARCHIVE_RESULTS_DIR / "undeliverable"
+    _undeliv = rtc.UNDELIVERABLE_RESULTS_DIR
     # should_retry(exc, tried) counts RETRIES: the initial attempt plus
     # MAX_TRANSIENT_ATTEMPTS retries = cap+1 posts total, then park.
     check(len(STATE["room_posts"]) - _posts_before == rtc.MAX_TRANSIENT_ATTEMPTS + 1,

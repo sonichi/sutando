@@ -104,13 +104,19 @@ def should_retry(exc: BaseException, attempts: int,
 
 
 def resolve_failed_send(claim: Path, exc: BaseException,
-                        attempts: "dict[str, int]", progressed: bool = False) -> str:
+                        attempts: "dict[str, int]", progressed: bool = False,
+                        *, body: "Path | None" = None,
+                        undelivered_dir: "Path | None" = None) -> str:
     """Decide and CARRY OUT the transition. Returns "retried" (claim released),
     "parked" (moved to undelivered/), or "stuck" (unmovable, left for the next poll).
 
-    `attempts` is mutated in place, keyed by the body's polled `.txt` name.
+    `attempts` is mutated in place, keyed by the polled body name. `body` and
+    `undelivered_dir` let adapters with pid-scoped claim names (which break the
+    `.txt`-sibling derivation) bind their own paths — the transition stays here.
     """
-    key = claim.with_suffix(".txt").name
+    if body is None:
+        body = claim.with_suffix(".txt")
+    key = body.name
     tried = attempts.get(key, 0)
     # `progressed` means part of the body already reached the recipient. Re-sending
     # from the start would repeat it, so a partial delivery parks instead.
@@ -123,12 +129,13 @@ def resolve_failed_send(claim: Path, exc: BaseException,
             from .proactive_recovery import release_claim
         except ImportError:  # pragma: no cover - flat src/ import path
             from proactive_recovery import release_claim
-        if release_claim(claim):
+        if release_claim(claim, target=body):
             attempts[key] = tried + 1
             return "retried"
     attempts.pop(key, None)
     try:
-        undelivered = claim.parent / "undelivered"
+        undelivered = undelivered_dir if undelivered_dir is not None \
+            else claim.parent / "undelivered"
         undelivered.mkdir(parents=True, exist_ok=True)
         # Drop the `.sending` claim suffix: a quarantined `*.sending` reads as
         # in-flight, which is what the restart sweep looks for.

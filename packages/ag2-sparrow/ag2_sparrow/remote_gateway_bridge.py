@@ -187,9 +187,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
-# Module-level for tests and callers; _resolve_send_failure ALSO lazy-imports
-# with a flat-path fallback so the bundled copy works in both contexts.
-from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
@@ -207,10 +205,10 @@ try:  # pragma: no cover - exercised by whichever context imports it
 except ImportError:  # pragma: no cover - flat src/ import path
     from send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
 
-# Terminal resting place for proactive nudges that can never be delivered
-# (e.g. a body too large for any Matrix event). Kept separate from `archive/`
-# so "delivered" and "given up on" are never confused when auditing.
-UNDELIVERABLE_RESULTS_DIR = ARCHIVE_RESULTS_DIR / "undeliverable"
+# Terminal resting place for proactive nudges that can never be delivered.
+# results/undelivered/ is the repo-wide quarantine convention — health-check's
+# probe and every other bridge scan it; an archive/ subdir is invisible to both.
+UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
 # via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
@@ -2220,48 +2218,24 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
 
 
 def _resolve_send_failure(claim, original, exc) -> str:
-    """Bounded retry. The DECISION is the shared policy; the file moves are ours.
-
-    src/send_failure_policy.py owns "is this worth retrying, and how many times"
-    — the same ceiling discord-bridge uses. It also offers resolve_failed_send(),
-    which we deliberately do NOT use: that helper derives the body name via
-    claim.with_suffix(".txt"), which only round-trips for the bare `x.sending`
-    claims proactive_recovery mints. Our claims are pid-scoped (`x.sending.<pid>`)
-    so restart recovery can tell a live worker's claim from a dead one's, and
-    with_suffix() would resolve them to `x.sending.txt`. Claim naming is provider
-    mechanics; the ceiling is policy. Share the second, keep the first local.
+    """Bounded retry: decision AND file moves are the shared policy's
+    (send_failure_policy.resolve_failed_send). This binder passes sparrow's
+    pid-scoped claim's real body path — with_suffix() cannot derive it — and
+    the park directory, then renders the bridge's log phrase. Single sends
+    can't partially deliver, so `progressed` stays False here.
 
     Returns the phrase for the caller's log line.
     """
-    try:  # pragma: no cover - exercised by whichever context imports it
-        from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, should_retry
-    except ImportError:  # pragma: no cover - flat src/ import path
-        from send_failure_policy import MAX_TRANSIENT_ATTEMPTS, should_retry
-
-    key = original.name
-    tried = _PROACTIVE_ATTEMPTS.get(key, 0)
-    if should_retry(exc, tried):
-        _PROACTIVE_ATTEMPTS[key] = tried + 1
-        try:
-            # link+unlink, not rename: rename would REPLACE a `.txt` re-written
-            # since the claim; EEXIST means a newer body owns the name — park ours.
-            os.link(claim, original)
-            claim.unlink()
-        except FileExistsError:
-            pass  # fall through to park below
-        except OSError:
-            return "stuck"
-        else:
-            return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
-
-    _PROACTIVE_ATTEMPTS.pop(key, None)
-    try:
-        UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        claim.rename(UNDELIVERABLE_RESULTS_DIR / key)
-    except OSError:
-        return "stuck"
-    return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried + 1} "
-            "send attempt(s) — it will NOT be re-sent")
+    tried = _PROACTIVE_ATTEMPTS.get(original.name, 0)
+    outcome = resolve_failed_send(
+        claim, exc, _PROACTIVE_ATTEMPTS,
+        body=original, undelivered_dir=UNDELIVERABLE_RESULTS_DIR)
+    if outcome == "retried":
+        return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
+    if outcome == "parked":
+        return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried + 1} "
+                "send attempt(s) — it will NOT be re-sent")
+    return "stuck"
 
 
 def _post_proactive() -> None:
