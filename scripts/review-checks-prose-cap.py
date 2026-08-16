@@ -6,12 +6,16 @@ inside a string literal is a STRING token and can never be read as a comment.
 Scope stays added-lines-only: a block counts only if every line of it is added.
 Docstrings are deliberately out of scope — the written contract caps comments.
 """
+import os
 import re
 import sys
 import tokenize
 from pathlib import Path
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+# Fallbacks only. review-checks.sh normally supplies both from REVIEW.md.
+DEFAULT_CAP = 2
+DEFAULT_EXTS = (".py",)
 
 
 def comment_lines(path):
@@ -76,24 +80,43 @@ def violations(diff_text, cap, exts, root="."):
     return found, unscannable
 
 
+def _config():
+    """(cap, exts) from the runner's env. review-checks.sh sources both from
+    REVIEW.md's `checks:` block, so ignoring them makes that surface a lie."""
+    raw_cap = os.environ.get("RC_PROSE_CAP", "").strip()
+    try:
+        cap = int(raw_cap) if raw_cap else DEFAULT_CAP
+    except ValueError:
+        cap = DEFAULT_CAP
+    raw_exts = os.environ.get("RC_PROSE_EXTS", "").strip()
+    exts = tuple(e.strip() for e in raw_exts.split(",") if e.strip()) or DEFAULT_EXTS
+    return cap, exts
+
+
 def main():
-    cap = 2
-    exts = (".py",)
+    cap, exts = _config()
     diff_text = sys.stdin.read()
     if not diff_text.strip():
         print("prose-cap: empty diff; nothing scanned, so this is NOT a pass", file=sys.stderr)
         return 2
     found, unscannable = violations(diff_text, cap, exts)
-    for path in unscannable:
-        print(f"prose-cap: NOTE {path} could not be tokenized; not scanned", file=sys.stderr)
     for path, line, length in found:
         print(f"prose-cap: {path}:{line} comment block is {length} lines (cap {cap})")
-    # The runner reads a non-zero exit as "the scanner could not run" and fails
-    # closed; findings ride stdout, so a violation must still exit 0.
+    # An in-scope file we could not tokenize was NOT checked. Reporting PASS for it
+    # would be a verdict about a read that never happened, so exit non-zero — the
+    # runner reads that as "the scanner could not run" and fails closed.
+    if unscannable:
+        for path in unscannable:
+            print(f"prose-cap: {path} has no readable post-image; NOT scanned", file=sys.stderr)
+        print(f"prose-cap: FAIL-CLOSED — {len(unscannable)} in-scope file(s) unverified",
+              file=sys.stderr)
+        return 2
+    # Findings ride stdout and must still exit 0: a violation is a successful scan.
     if found:
         print(f"prose-cap: {len(found)} block(s) over the {cap}-line cap", file=sys.stderr)
     else:
-        print("prose-cap: PASS (comment blocks within cap)", file=sys.stderr)
+        print(f"prose-cap: PASS (comment blocks within cap {cap}, exts {','.join(exts)})",
+              file=sys.stderr)
     return 0
 
 

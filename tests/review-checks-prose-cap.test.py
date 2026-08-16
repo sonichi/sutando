@@ -77,6 +77,10 @@ with tempfile.TemporaryDirectory() as td:
 
 # --- branch coverage: paths violations() takes that the cases above miss -----
 def diff_for(filename, body, *, context_lines=0):
+    # body=None models a diff naming a file with no post-image on disk.
+    if body is None:
+        return (f"diff --git a/{filename} b/{filename}\n--- /dev/null\n"
+                f"+++ b/{filename}\n@@ -0,0 +1,3 @@\n+# one\n+# two\n+# three\n")
     n = len(body.splitlines())
     head = (f"diff --git a/{filename} b/{filename}\n--- a/{filename}\n"
             f"+++ b/{filename}\n@@ -1,{n} +1,{n} @@\n")
@@ -118,15 +122,25 @@ with tempfile.TemporaryDirectory() as td:
 # --- main(): drive it in-process so the paths are attributed ------------------
 
 
-def run_main(diff):
+def run_main(diff, env=None):
+    """Drive main() in-process. `env` sets RC_* for this call only, so a leaked
+    value cannot make a later case pass for the wrong reason."""
     out, err = io.StringIO(), io.StringIO()
     stdin = sys.stdin
+    saved = {k: os.environ.get(k) for k in ("RC_PROSE_CAP", "RC_PROSE_EXTS")}
+    for k in saved:
+        os.environ.pop(k, None)
+    os.environ.update(env or {})
     sys.stdin = io.StringIO(diff)
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = pc.main()
     finally:
         sys.stdin = stdin
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
     return rc, out.getvalue(), err.getvalue()
 
 
@@ -150,10 +164,37 @@ with tempfile.TemporaryDirectory() as td:
 
         pathlib.Path("bad.py").write_text("def broken(:\n")
         rc, out, err = run_main(diff_for("bad.py", "def broken(:\n"))
-        if rc == 0 and "could not be tokenized" in err:
-            print("  ok: main() NOTEs an untokenizable file on stderr")
+        if rc != 0 and "FAIL-CLOSED" in err:
+            print("  ok: an unreadable post-image FAILS CLOSED, never PASS")
         else:
             failures.append(f"main unscannable path: rc={rc} err={err!r}")
+
+        # A file in the diff with NO post-image at all is the reviewer's control:
+        # it used to print PASS, which is a verdict about a read that never ran.
+        rc, out, err = run_main(diff_for("missing.py", None))
+        if rc != 0 and "PASS" not in err:
+            print("  ok: a diff naming an absent file cannot report PASS")
+        else:
+            failures.append(f"absent post-image: rc={rc} err={err!r}")
+
+        # --- the configured cap/exts must be honored, not decorative ---------
+        pathlib.Path("cfg.py").write_text("# one\n# two\n# three\nx = 1\n")
+        d = diff_for("cfg.py", "# one\n# two\n# three\nx = 1\n")
+        rc, out, err = run_main(d, env={"RC_PROSE_CAP": "3", "RC_PROSE_EXTS": ".ts"})
+        if rc == 0 and out.strip() == "":
+            print("  ok: RC_PROSE_EXTS=.ts puts a .py file out of scope")
+        else:
+            failures.append(f"RC_PROSE_EXTS ignored: rc={rc} out={out!r}")
+        rc, out, err = run_main(d, env={"RC_PROSE_CAP": "3"})
+        if rc == 0 and out.strip() == "":
+            print("  ok: RC_PROSE_CAP=3 does not flag a 3-line block")
+        else:
+            failures.append(f"RC_PROSE_CAP ignored: rc={rc} out={out!r}")
+        rc, out, err = run_main(d)
+        if rc == 0 and "cap 2" in out:
+            print("  ok: with no env, the default cap 2 still flags it")
+        else:
+            failures.append(f"default cap regressed: rc={rc} out={out!r}")
     finally:
         os.chdir(_cwd)
 
