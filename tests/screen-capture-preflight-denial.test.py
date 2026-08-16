@@ -119,15 +119,32 @@ for route in ("_handle_capture", "_handle_capture_video"):
     body = src.split(f"def {route}(self) -> None:", 1)[1][:900] if f"def {route}" in src else ""
     check(f"{route} calls the permission gate",
           "_require_screen_permission" in body, True)
+    # `find` not `index`: absent raises. But -1 must FAIL rather than compare
+    # less-than-everything, so presence is required explicitly.
+    _gi = body.find("_require_screen_permission")
+    _si = body.find("screencapture")
     check(f"{route} gates BEFORE screencapture runs",
-          body.index("_require_screen_permission") < (body.index("screencapture")
-                                                      if "screencapture" in body else len(body)), True)
+          _gi != -1 and (_si == -1 or _gi < _si), True)
+
+class _SkipSection(Exception):
+    """Raised to skip section 7 wholesale when the probe does not exist."""
+
 
 # 7. THE FAIL-SAFE BRANCHES. Each `except` in the probe decides what happens
 #    when the platform will not answer, and an untested fail-safe is
 #    indistinguishable from one that never runs. Drive all three.
-_saved = m._PREFLIGHT
+# Absent at the merge-base — skip rather than crash, so the control still
+# reports every other behaviour instead of dying here.
+_HAS_PROBE = hasattr(m, "_PREFLIGHT") and hasattr(m, "screen_capture_permitted")
+_saved = m._PREFLIGHT if _HAS_PROBE else None
 try:
+    if not _HAS_PROBE:
+        for _n in ("an unresolvable symbol yields None",
+                   "a raising preflight yields None, not a crash",
+                   "a failed library load yields None",
+                   "...and is cached, so it is attempted only once"):
+            check(_n, "<no probe>", None)
+        raise _SkipSection
     m._PREFLIGHT = None                       # resolved once, unavailable
     check("an unresolvable symbol yields None", m.screen_capture_permitted(), None)
 
@@ -147,8 +164,11 @@ try:
         check("...and is cached, so it is attempted only once", m._PREFLIGHT, None)
     finally:
         ctypes.util.find_library = _orig_find
+except _SkipSection:
+    pass
 finally:
-    m._PREFLIGHT = _saved
+    if _HAS_PROBE:
+        m._PREFLIGHT = _saved
 
 print(("FAILED: " + ", ".join(fails)) if fails else "screen-capture preflight: all checks passed")
 sys.exit(1 if fails else 0)
