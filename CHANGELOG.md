@@ -2,6 +2,28 @@
 
 All notable changes are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [v0.10.0] — 2026-08-12
+
+316 PRs since v0.9.0: 60 features, 202 fixes. Full curated notes live on the
+[GitHub release](https://github.com/sonichi/sutando/releases/tag/v0.10.0).
+
+### Added
+
+- AG2 Space rooms as a first-class surface: one core serves several homeservers, channel lanes named by homeserver domain, a channel directory per gateway instance, and room membership carried in the task envelope. ([#2701], [#2702], [#2685], [#2686], [#2503])
+- `grant` verb to make a room authoritative for a decision; new members default to guest, not owner. ([#2718])
+- Workstream isolation: task history is grouped into inferred workstreams, used as context, and core sessions are isolated per workstream. ([#2586], [#2602], [#2603])
+- Graceful restart handshake, a compound-signal gate for relaunching a genuinely dead core, human-triggered restart/stop, and a boot gate that aborts before starting services when the CLI cannot authenticate. ([#2334], [#2404], [#2408], [#2413])
+- `engine-conflict-resolve`: resolve a conflicted self-upgrade in a scratch worktree, confirm before applying. ([#2790])
+- New skills — Bee actions, Microsoft 365, media transcripts, and document ingest. ([#2714], [#2682], [#2435], [#2377], [#2434])
+
+### Fixed
+
+- 202 fixes, concentrated in the bridges, the task/result protocol, and the core lifecycle. Notable: an empty results file is no longer archived on its mtime (open-fd data loss) ([#2360]); the credential proxy never injects a known-expired token ([#2793]); a not-yet-existing workspace directory no longer bricks import ([#2813]).
+
+### Changed
+
+- No breaking changes and no new workspace migrations. Upgrading from v0.9.0 requires no action.
+
 ## [v0.3.0] — 2026-06-05
 
 > **DRAFT — release-prep PR.** Polish and curate before tagging. Items marked `<!-- review -->` warrant a closer look; entries grouped by theme. The headline change is the workspace-contract rollup (M0 + M1 + M2 + sync-workspace) — that subsection is dedicated below.

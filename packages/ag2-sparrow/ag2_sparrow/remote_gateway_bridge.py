@@ -64,6 +64,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 # Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
@@ -376,6 +377,44 @@ def _parse_onboarding_token(raw):
 CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
 
 
+def _channel_env_candidates():
+    """Readable channel-.env candidates in precedence order, as [(path, vals)].
+    A candidate lacking a key must not shadow a later one that carries it."""
+    candidates = [os.environ.get("AG2_DEVICE_ENV")]
+    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _cfg:
+        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
+    out = []
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        # Every candidate is read eagerly now, so one the old early-return never
+        # opened can be undecodable — and that is not an OSError.
+        except (OSError, UnicodeDecodeError):
+            continue
+        vals = {}
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            key, _, val = ln.partition("=")
+            vals[key.strip()] = val.strip().strip('"').strip("'")
+        out.append((path, vals))
+    return out
+
+
+def _config_from_channel_env(key: str) -> str:
+    """First candidate CARRYING `key`, else "". Presence decides, not truth: an
+    explicit blank is a decision here exactly as it is in the environment."""
+    for _path, vals in _channel_env_candidates():
+        if key in vals:
+            return vals[key]
+    return ""
+
+
 def _token_from_ag2space_env():
     """Fallback token source when the launcher didn't export it into the env.
 
@@ -406,26 +445,9 @@ def _token_from_ag2space_env():
     WRONG identity (reinstall, account switch, leftover config). Both real launchers
     are covered above; the bare-home guess only adds a footgun.
     """
-    candidates = [os.environ.get("AG2_DEVICE_ENV")]
-    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
-    if _cfg:
-        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
-    for path in candidates:
-        if not path:
-            continue
-        try:
-            with open(path, encoding="utf-8") as fh:
-                lines = fh.read().splitlines()
-        except OSError:
-            continue
-        vals = {}
-        for ln in lines:
-            ln = ln.strip()
-            if not ln or ln.startswith("#") or "=" not in ln:
-                continue
-            key, _, val = ln.partition("=")
-            vals[key.strip()] = val.strip().strip('"').strip("'")
-        # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
+    for path, vals in _channel_env_candidates():
+        # Truthiness here, presence in _config_from_channel_env: a blank secret is
+        # absence and must fall through to the legacy alias; a blank room is a choice.
         tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
         if tok:
             # Name the exact file — which .env supplied the token is load-bearing
@@ -574,7 +596,25 @@ POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 # Deliberately an EXPLICIT room id, not auto-learned from recent task
 # channel_ids: a proactive nudge is often owner-private, and auto-targeting
 # the last active room could deliver it to a shared room.
-PROACTIVE_ROOM = os.environ.get("REMOTE_PROACTIVE_ROOM") or ""
+# An explicit empty export is a decision (startup.sh blanks it per named
+# instance); only an ABSENT var falls through to this deployment's .env.
+_PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
+PROACTIVE_ROOM = (
+    _PROACTIVE_ROOM_ENV
+    if _PROACTIVE_ROOM_ENV is not None
+    else _config_from_channel_env("REMOTE_PROACTIVE_ROOM")
+)
+# Host-injected claim gate (Path -> bool), consulted per file before the claim
+# rename; None (standalone default) claims every routable file unchanged.
+PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
+# event_id: trust the bare ok as delivered (at-least-once beats never).
+_PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
+PROACTIVE_TRUST_OK = (
+    _PROACTIVE_TRUST_OK_ENV
+    if _PROACTIVE_TRUST_OK_ENV is not None
+    else _config_from_channel_env("REMOTE_PROACTIVE_TRUST_OK")
+) == "1"
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 # rotation (_reload_rotated_token) propagates to their next request without a
@@ -599,6 +639,117 @@ _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipp
 # happens. Unset → exactly the pre-existing FATAL-exit behavior.
 TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
+# Registry-loss self-claim (backend #595): the code is device-visible only;
+# binding requires the owner's concierge approval. Disable: REMOTE_REENROLL=0.
+REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
+    not in ("0", "false", "no", "off")
+REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
+REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
+_reenroll_state: dict = {"last_attempt_at": None, "code": None, "claimed_at": None}
+
+
+def _provision_base() -> str:
+    """Gateway base -> provision-api base (…/relay* -> …/api)."""
+    return URL.split("/relay")[0].rstrip("/") + "/api"
+
+
+def _reenroll_identity() -> str:
+    """Agent mxid: process env, then the channel .env file — the same fallback
+    the token uses (desktop launchers don't export either) — then the durable
+    per-host identity enrolment wrote to state/auth/ag2space.json."""
+    for key in ("AGENT_MXID", "AGENT_ID"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v
+    for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
+        v = _config_from_channel_env(key).strip()
+        if v:
+            return v
+    # Re-read per call, like the channel-env candidates: an identity that
+    # appears mid-episode must take effect without a restart.
+    try:
+        rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
+        # Non-string values must read as unknown, not be coerced into a
+        # garbage identity that _reenroll_claim would POST on the cadence.
+        v = rec.get("agent_id")
+        return v.strip() if isinstance(v, str) else ""
+    except Exception:  # absent, unreadable, or malformed — identity unknown
+        return ""
+
+
+def _reenroll_claim() -> None:
+    """Best-effort claim: one live code per episode; failed POSTs retry no
+    sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
+    if not REENROLL_ENABLED or _reenroll_state["code"]:
+        return
+    last = _reenroll_state["last_attempt_at"]
+    # Monotonic: a wall-clock step backward must not suppress claims (review
+    # P2); None = never attempted, so a fresh boot claims immediately.
+    if last is not None and time.monotonic() - last < REENROLL_CLAIM_RETRY_S:
+        return
+    agent_id = _reenroll_identity()
+    if not agent_id or not TOKEN:
+        # No POST issued -> no cadence stamp. The instruction must match what
+        # can actually work: file candidates are re-read every cycle, but the
+        # POINTERS to them live in the process env — absent both pointers,
+        # only a wrapper/app restart can deliver the fix (#2924 review).
+        if not agent_id:
+            pointered = os.environ.get("AG2_DEVICE_ENV") \
+                or os.environ.get("CLAUDE_CONFIG_DIR")
+            _log("reenroll: agent identity unknown — write "
+                 "AGENT_MXID=<agent mxid> into the channel .env; retrying "
+                 "(takes effect without restart)" if pointered else
+                 "reenroll: agent identity unknown and no channel-env "
+                 "pointers (AG2_DEVICE_ENV/CLAUDE_CONFIG_DIR) — set "
+                 "AGENT_MXID in the gateway environment and RESTART the "
+                 "wrapper/app; holding the connection wait meanwhile")
+        else:
+            _log("reenroll: no token available — not claiming")
+        return
+    _reenroll_state["last_attempt_at"] = time.monotonic()
+    try:
+        req = urllib.request.Request(
+            _provision_base() + "/connect/reenroll",
+            data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
+            # The prod edge 403s urllib's default UA — same contract as _req().
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = json.loads(r.read() or b"{}")
+        code = str(body.get("approval_code") or "")
+        if body.get("pending") and code:
+            _reenroll_state["code"] = code
+            _reenroll_state["claimed_at"] = int(time.time())
+            _log("RELINK PENDING — this agent's server-side registration was "
+                 f"lost. RELINK CODE: {code} — the owner approves by DMing the "
+                 f"concierge: relink approve {code}")
+        else:
+            _log(f"reenroll: claim not parked ({str(body)[:200]})")
+    except urllib.error.HTTPError as e:
+        _log(f"reenroll: claim refused HTTP {e.code} ({_http_error_body(e)[:200]})")
+    except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
+        _log(f"reenroll: claim failed: {e}")
+
+
+def _reenroll_clear(recovered: bool = False) -> None:
+    """End the episode; recovered=True (probe-success path only) leaves the
+    explicit terminal — disappearance alone must never read as success."""
+    was_pending = bool(_reenroll_state.get("code"))
+    _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
+    if recovered and was_pending:
+        _reenroll_state["recovered_at"] = int(time.time())
+    else:
+        _reenroll_state.pop("recovered_at", None)
+
+
+def _auth_probe() -> bool:
+    """True ONLY on a successful authed response — an error proves nothing
+    about auth, so every failure keeps waiting."""
+    try:
+        _req("GET", "/v1/agents", timeout=15)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
@@ -641,9 +792,39 @@ if LOCAL_TIER not in ("owner", "team", "guest"):
 
 # A local per-sender map can only cap the broker tier; unlisted senders use LOCAL_TIER.
 # Cache identity includes mtime, size, and inode so revocations take effect promptly.
+_ACCESS_PATH_LOGGED = None
+
+
 def _ag2space_access_path():
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
+    """Resolve the map only from the launcher-provided active config.
+    The desktop .env pointer wins over the config-root fallback."""
+    device_env = os.environ.get("AG2_DEVICE_ENV")
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if device_env:
+        channel_dir = os.path.dirname(
+            os.path.abspath(os.path.expanduser(device_env))
+        )
+        path = os.path.join(channel_dir, "access.json")
+    elif config_dir:
+        path = os.path.join(
+            os.path.abspath(os.path.expanduser(config_dir)),
+            "channels",
+            CHANNEL_DIR,
+            "access.json",
+        )
+    else:
+        path = ""
+
+    global _ACCESS_PATH_LOGGED
+    if path != _ACCESS_PATH_LOGGED:
+        detail = path or "disabled (no AG2_DEVICE_ENV or CLAUDE_CONFIG_DIR)"
+        print(
+            f"[remote-gateway-bridge] access tier map path: {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _ACCESS_PATH_LOGGED = path
+    return path
 
 
 # Known tier vocabulary and privilege ordering. `_tier_for` uses this ordering
@@ -657,7 +838,7 @@ def _normalized_tier(value):
         tier = "guest"
     return tier if tier in _TIER_RANK else "guest"
 
-_TIER_MAP_CACHE = {"ident": None, "map": {}}
+_TIER_MAP_CACHE = {"path": None, "ident": None, "map": {}}
 
 
 def _has_above_local(cached) -> bool:
@@ -674,18 +855,35 @@ def _stale_safe(cached):
 
 
 def _load_tier_map():
-    """Return the cached local sender caps, preserving safe caps on read errors.
-    Only a successful changed-file read replaces the cache."""
+    """Preserve safe caps on same-path faults, but never across path switches.
+    An absent launcher config explicitly clears the cache."""
     path = _ag2space_access_path()
+    if not path:
+        _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
+            path,
+            None,
+            {},
+        )
+        return {}
     try:
         st = os.stat(path)
     except OSError:
-        # Absent/unstattable → keep last-known-good (initially {} before any load).
+        # Keep last-known-good only for the same configured path. Carrying a
+        # map across a path switch would leak trust decisions between installs.
+        if path != _TIER_MAP_CACHE["path"]:
+            _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE[
+                "map"
+            ] = (path, None, {})
+            return {}
         return _stale_safe(_TIER_MAP_CACHE["map"])
     # Size and inode supplement nanosecond mtime so same-timestamp rewrites are detected.
     ident = (st.st_mtime_ns, st.st_size, st.st_ino)
     # Re-read while an above-default grant is cached so revocation cannot be masked.
-    if ident == _TIER_MAP_CACHE["ident"] and not _has_above_local(_TIER_MAP_CACHE["map"]):
+    if (
+        path == _TIER_MAP_CACHE["path"]
+        and ident == _TIER_MAP_CACHE["ident"]
+        and not _has_above_local(_TIER_MAP_CACHE["map"])
+    ):
         # File present and UNCHANGED — this cache is current, not stale. Return it
         # verbatim: projecting here would drop a legitimate up-tier on every call.
         return _TIER_MAP_CACHE["map"]
@@ -698,10 +896,19 @@ def _load_tier_map():
             if isinstance(who, str) and t in ("owner", "team", "guest", "other"):
                 tm[who.strip()] = _normalized_tier(t)
     except Exception:
-        # Malformed / mid-write → keep last-known-good; don't advance mtime so a
-        # later successful read of the fixed file is still picked up.
+        # As above, fail closed across config switches but retain the same
+        # path's safe caps for a malformed or mid-write file.
+        if path != _TIER_MAP_CACHE["path"]:
+            _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE[
+                "map"
+            ] = (path, None, {})
+            return {}
         return _stale_safe(_TIER_MAP_CACHE["map"])
-    _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = ident, tm
+    _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
+        path,
+        ident,
+        tm,
+    )
     return tm
 
 
@@ -828,6 +1035,48 @@ def _redact_url(value: str) -> str:
         return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
     except Exception:  # noqa: BLE001 — redaction must never break status I/O
         return str(value)
+
+
+class _NeverFatalStream:
+    """Logging must never take the poll loop down.
+
+    Mirrors the merged `src/discord-bridge.py` fix (#2856). This package is
+    standalone (`dependencies = []`, imports nothing from sutando's `src/`), so
+    the guard is local by necessity rather than duplicated policy.
+
+    The loop's own `except Exception  # keep the loop alive` cannot help here:
+    every handler calls `_log()` first, so a `BrokenPipeError` from that print
+    is raised *inside* the handler and escapes it. Stdout is a pipe whenever the
+    launcher pipes to `tee`, which is how this bridge runs today.
+
+    Swallow ONLY OSError (the EPIPE/EBADF class); anything else still propagates
+    so real bugs are not masked.
+    """
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except OSError:
+            # Report the write as accepted: callers must not branch on it.
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _NeverFatalStream(sys.stdout)
+sys.stderr = _NeverFatalStream(sys.stderr)
 
 
 def _log(msg: str) -> None:
@@ -989,22 +1238,46 @@ def _recover_auth(code: int) -> bool:
     the token file rotates. Returns True once a rotated token is live; False
     when no TOKEN_FILE is configured (caller keeps the historical FATAL
     exit)."""
+    # A new rejection episode invalidates any prior recovered terminal.
+    _reenroll_state.pop("recovered_at", None)
     if _reload_rotated_token():
         _log("auth rejected but token file already rotated — resuming with new token")
+        _reenroll_clear()
         return True
-    if not TOKEN_FILE:
+    _reenroll_claim()
+    if not TOKEN_FILE and not _reenroll_state["code"] \
+            and not (REENROLL_ENABLED and TOKEN):
+        # Historical FATAL contract survives ONLY where recovery is truly
+        # impossible: reenroll off, or no bearer to claim with (#2924).
         return False
-    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation in "
-         f"{TOKEN_FILE} (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation"
+         + (f" in {TOKEN_FILE}" if TOKEN_FILE else "")
+         + (" or re-link approval" if _reenroll_state["code"]
+            else " or re-link identity/claim")
+         + f" (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    cycle = 0
     while True:
+        pending = _reenroll_state["code"]
         _emit_gateway_status(False,
-                             error=f"auth rejected HTTP {code} — waiting for re-connect",
+                             error=(f"auth rejected HTTP {code} — relink pending "
+                                    f"(code {pending})" if pending else
+                                    f"auth rejected HTTP {code} — waiting for re-connect"),
                              backoff_s=AUTH_RECHECK_INTERVAL)
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting for token rotation")
         if _reload_rotated_token():
             _log("rotated token detected — resuming")
+            _reenroll_clear()
+            return True
+        if not pending:
+            # A transient failure isn't a lost episode: retry stays in the
+            # loop, cadence-bounded internally (safe while nothing is parked).
+            _reenroll_claim()
+        cycle += 1
+        if pending and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
+            _log("re-link approved — the existing token is accepted again; resuming")
+            _reenroll_clear(recovered=True)
             return True
 
 
@@ -1109,7 +1382,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
-                             "core-status"],
+                             "core-status", "team-collaborator"],
         }
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).
@@ -1163,6 +1436,20 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
         }
+        # Recovery surface: recovered ONLY via the probe-success terminal; a
+        # missing block means "no episode known", never success.
+        if _reenroll_state.get("code"):
+            payload["reenroll"] = {
+                "pending": True,
+                "approval_code": _reenroll_state["code"],
+                "claimed_at": _reenroll_state["claimed_at"],
+            }
+        elif _reenroll_state.get("recovered_at"):
+            payload["reenroll"] = {
+                "pending": False,
+                "recovered": True,
+                "recovered_at": _reenroll_state["recovered_at"],
+            }
         # AWP P0 per-channel health: the task connection is `connected` above; the
         # additive event channel (if running) reports its own status, so a
         # supervisor never shows the agent healthy while the event stream is dead.
@@ -1458,11 +1745,20 @@ def _write_task(task: dict) -> str | None:
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    # Promote only the exact broker boolean plus Team request; the legacy Guest
+    # wire tier keeps old nodes restricted and body text cannot opt itself in.
+    broker_tier = _normalized_tier(task.get("access_tier"))
+    requested_tier = _normalized_tier(task.get("requested_access_tier"))
+    broker_collaborator = (
+        task.get("collaborator") is True
+        and (broker_tier == "team" or requested_tier == "team")
+    )
+    attested_tier = "team" if broker_collaborator else broker_tier
+    # Resolved once and reused below so routing and owner-activity cannot diverge.
+    sender_tier = _tier_for(task.get("user_id"), attested_tier)
+    collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
     _secret_types: tuple = ()
-    # Resolved once, reused everywhere below so the tier decision can never diverge;
-    # must run before the "task" field is reached in the loop below.
-    sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -1476,6 +1772,10 @@ def _write_task(task: dict) -> str | None:
                 it = "message"
             lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
+            # Keep the established id/timestamp prefix stable, but place this
+            # trusted execution-policy header before all untrusted body text.
+            if collaborator_enabled:
+                lines.append("collaborator: true")
             # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
             # reaches the agent as body content (owner directive 2026-07-16) —
             # see _strip_room_ops_meta. Runs first so the stripped body is what
@@ -1913,7 +2213,8 @@ def _post_proactive() -> None:
     to `.txt` for retry on the next loop pass. Auth errors propagate to the
     caller (the poll loop owns auth handling); everything else is per-file
     fail-open — one malformed nudge never blocks the rest. No-op without
-    PROACTIVE_ROOM."""
+    PROACTIVE_ROOM. A host-injected PROACTIVE_CLAIM_GATE may defer a file
+    that belongs to another bridge (cross-bridge routing stays host policy)."""
     if not PROACTIVE_ROOM:
         return
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
@@ -1927,6 +2228,12 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if PROACTIVE_CLAIM_GATE is not None:
+            try:
+                if not PROACTIVE_CLAIM_GATE(f):
+                    continue  # another bridge's file right now; retry next pass
+            except Exception:
+                pass  # a broken gate must not strand owner nudges — claim
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -2025,7 +2332,11 @@ def _post_proactive() -> None:
             # a failed send: the claim is renamed back and retried next pass,
             # loudly, so a misconfigured room is visible instead of silently
             # eating nudges.
-            if not (isinstance(resp, dict) and resp.get("event_id")):
+            delivered = isinstance(resp, dict) and (
+                bool(resp.get("event_id"))
+                or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
+            )
+            if not delivered:
                 _log(f"proactive send for {f.name} got no delivery signal "
                      f"(response {str(resp)[:120]!r}) — will retry; check "
                      "REMOTE_PROACTIVE_ROOM and the agent's room membership")
@@ -2168,13 +2479,26 @@ def _post_ready_results(inflight: set[str]) -> None:
                 changed = True
                 continue
         if skip:
-            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
-            # archive without POSTing (match the other bridges' semantics).
+            # Skip markers still POST: only add_result closes the server lease;
+            # the server suppresses their user-facing delivery.
+            try:
+                _delivery = _delivery_tid(tid)
+                if _delivery is None:
+                    _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                    continue
+                _req("POST", "/v1/results",
+                     {"id": _broker_tid(_delivery), "body": body})
+            except urllib.error.HTTPError as e:
+                _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
+                continue
+            except (urllib.error.URLError, TimeoutError) as e:
+                _log(f"result POST network error for {tid}: {e} — will retry")
+                continue
             _archive_result(rfile, tid)
             inflight.discard(tid)
             _forget_task_room(tid)
             changed = True
-            _log(f"archived {tid} (marker {skip.value}, not sent)")
+            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
             continue
         out_body = parsed.body
         redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
@@ -2326,6 +2650,18 @@ def _acquire_singleton() -> bool:
     return True
 
 
+def _react_sender(timeout: int = 10):
+    """The 👀 receipt's room-verb call. Lives here because the room-verb
+    endpoint surface is frozen to this adapter edge, not to sparrow modules."""
+    def _react(room_id, message_id, key) -> None:
+        # safe="" — the default safe="/" would split a room id containing "/"
+        # across path segments and misroute the react.
+        safe_room = urllib.parse.quote(str(room_id), safe="")
+        _req("POST", f"/v1/rooms/{safe_room}/react",
+             {"event_id": message_id, "key": key}, timeout=timeout)
+    return _react
+
+
 def _maybe_start_event_channel() -> None:
     """AWP P0: start the persistent Workspace-Event channel in its OWN daemon
     thread, ISOLATED from task delivery. Opt-in (SPARROW_EVENTS truthy) and
@@ -2363,6 +2699,17 @@ def _maybe_start_event_channel() -> None:
                                     ha_room, log=_log,
                                     include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
                                     .strip().lower() in ("1", "true", "yes", "on"))
+        # 👀 receipt: OPT-IN because it scopes by room_id alone, so default-on
+        # would react in shared rooms. Wrapped OUTERMOST, chain-transparent.
+        if (str(os.environ.get("SPARROW_OBSERVE_REACT", "")).strip().lower()
+                in ("1", "true", "yes", "on")):
+            mxid = os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID")
+            if mxid:
+                from .default_observer import ReactObserverHandler
+                handler = ReactObserverHandler(handler, _react_sender(), mxid,
+                                               log=_log)
+            else:
+                _log("react-observer: AGENT_MXID/AGENT_ID unset — observed-receipt off")
         consumer = EventConsumer(inbox, handler)
 
         def _drain_loop():

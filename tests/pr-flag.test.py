@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for the pure core of scripts/pr_flag.py.
+Unit tests for the pure core of scripts/pf.py.
 
 After the 2026-07-27 refactor (Chi: "are you using a script to do judgement that
 should be done by an agent?"), the script does ONLY mechanical state-gathering +
@@ -50,6 +50,143 @@ def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=Fals
     }
 
 
+# --- #2643: the peer half the owner-scoped fetch structurally cannot contain ---
+
+def _peer_cases():
+    disc = [
+        {"number": 1, "author": {"login": "sonichi"}, "isDraft": False, "reviewDecision": "APPROVED"},
+        {"number": 2, "author": {"login": "peer"}, "isDraft": False, "reviewDecision": "APPROVED"},
+        {"number": 3, "author": {"login": "peer"}, "isDraft": False, "reviewDecision": "CHANGES_REQUESTED"},
+        {"number": 4, "author": {"login": "peer"}, "isDraft": True, "reviewDecision": "APPROVED"},
+        {"number": 5, "author": {"login": "peer2"}, "isDraft": False, "reviewDecision": None},
+        {"number": 6, "author": {"login": "peer2"}, "isDraft": False, "reviewDecision": "REVIEW_REQUIRED"},
+    ]
+    got = pf.peer_candidates(disc, "sonichi")
+    # own PR excluded (stage 2 already has it); CR pruned; draft pruned;
+    # APPROVED kept -- that is the one an owner action may unblock.
+    assert got == [2, 5, 6], f"peer candidates should be [2,5,6], got {got}"
+    assert pf.peer_candidates([], "sonichi") == [], "no discovery -> no candidates, not a crash"
+    # An APPROVED-based filter is the scope that once reported 32 owner-needing
+    # PRs as 1. Assert we did not reintroduce it.
+    assert 2 in got, "an APPROVED peer PR must survive pruning"
+
+
+def _discovery_is_light():
+    """Stage 1 must omit the two fields that 504 repo-wide, or it IS stage 2."""
+    argv = pf.discovery_argv("o/r")
+    fields = argv[argv.index("--json") + 1]
+    assert "statusCheckRollup" not in fields, "discovery must not request statusCheckRollup"
+    assert "reviews" not in fields, "discovery must not request reviews"
+    assert "--author" not in argv, "discovery must NOT be author-scoped -- that is the point"
+
+
+def _descriptor_tracks_the_widened_population():
+    """Metadata must not claim peers are excluded once they are fetched."""
+    narrow = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3)
+    assert any("not authored by" in e for e in narrow["excludes"]), "author exclusion must still be declared without a peer stage"
+    stage = {"discovered": 70, "candidates": 13, "fetched": 13, "failed": 0}
+    wide = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=stage)
+    assert not any("not authored by" in e for e in wide["excludes"]), "must not still claim peers are excluded once fetched"
+    assert any("CHANGES_REQUESTED" in e for e in wide["excludes"]), "the CR prune is a real exclusion and must be declared"
+    assert "peer" in wide["population"], "population string must name the peer half"
+    bad = {"discovered": 70, "candidates": 13, "fetched": 11, "failed": 2}
+    failed = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=bad)
+    assert any("FAILED" in e for e in failed["excludes"]), "a failed peer fetch must be declared, not read as 'no peers'"
+
+
+def _mergeable_churn_does_not_refire():
+    """UNKNOWN churn must not refire; a REAL mergeability flip must."""
+    base = [{"number": 1, "principal": "p", "base": "main", "head": "abc", "ci": "green",
+             "mergeable": "MERGEABLE", "review": "APPROVED", "approvals": 2,
+             "approvals_standing": 2}]
+    prior = pf.mergeable_map(base)
+    key = pf._mergeable_key(base[0])
+    assert prior == {key: "MERGEABLE"}, f"map should carry the known value, got {prior}"
+    assert key != "1", "the key must be revision-scoped, not the bare PR number"
+
+    # GitHub parks the field at UNKNOWN mid-recompute: carried forward, no refire.
+    churn = pf.carry_unknown_mergeable([dict(base[0], mergeable="UNKNOWN")], prior)
+    assert pf.state_hash(base) == pf.state_hash(churn), "UNKNOWN churn must NOT move the hash"
+    assert pf.mergeable_map(churn) == {key: "MERGEABLE"}, "carried value must persist for the next fire"
+
+    # A real transition MUST wake the cron; nothing else here changes, so
+    # mergeable is the only carrier.
+    conflict = pf.carry_unknown_mergeable([dict(base[0], mergeable="CONFLICTING")], prior)
+    assert pf.state_hash(base) != pf.state_hash(conflict), "CONFLICTING must move the hash"
+    back = pf.carry_unknown_mergeable([dict(base[0], mergeable="MERGEABLE")],
+                                      pf.mergeable_map(conflict))
+    assert pf.state_hash(conflict) != pf.state_hash(back), "recovering to MERGEABLE must move it too"
+
+    # With no prior (first ever fire) UNKNOWN cannot be carried and stays UNKNOWN.
+    fresh = pf.carry_unknown_mergeable([dict(base[0], mergeable="UNKNOWN")], {})
+    assert fresh[0]["mergeable"] == "UNKNOWN", "nothing to carry -> value is left alone"
+
+    assert pf.state_hash(base) != pf.state_hash([dict(base[0], head="def")]), "a new head MUST still move the hash"
+    assert pf.state_hash(base) != pf.state_hash([dict(base[0], approvals=1)]), "an approval change MUST still move the hash"
+
+
+def _failed_fetch_is_never_an_empty_population():
+    """A discovery outage must not be serialized as a widened, empty population."""
+    ok = {"discovered": 70, "candidates": 13, "fetched": 13, "failed": 0,
+          "discovery_ok": True, "owner_ok": True}
+    good = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=ok)
+    assert "peer" in good["population"], "a healthy peer stage must claim the widened population"
+
+    dead = {"discovered": 0, "candidates": 0, "fetched": 0, "failed": 0,
+            "discovery_ok": False, "owner_ok": True}
+    bad = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=dead)
+    assert any("not authored by" in e for e in bad["excludes"]), "a failed discovery must fall back to declaring owner-only"
+    assert any("UNKNOWN this fire" in e for e in bad["excludes"]), "the failure itself must be declared"
+    assert bad["complete"] is False, "an uncertified population must never certify complete"
+    assert "peer" not in bad["population"], "must not claim a peer half it could not fetch"
+
+    partial = {"discovered": 70, "candidates": 13, "fetched": 11, "failed": 2,
+               "discovery_ok": True, "owner_ok": True}
+    part = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=partial)
+    assert part["complete"] is False, "partial peer fetch must not certify complete"
+
+    ownfail = {"discovered": 70, "candidates": 13, "fetched": 13, "failed": 0,
+               "discovery_ok": True, "owner_ok": False}
+    of = pf.scope_descriptor("o/r", "sonichi", record_count=3, fetched_count=3, peer_stage=ownfail)
+    assert any("owner-authored fetch FAILED" in e for e in of["excludes"]), "an owner fetch failure must be declared too"
+    assert of["complete"] is False, "owner fetch failure must not certify complete"
+
+
+def _each_stage_certifies_its_own_ceiling():
+    """Discovery at ITS ceiling must make the widened population incomplete,
+    even when the owner stage is far below the owner ceiling."""
+    d = pf.scope_descriptor("o/r", "o", record_count=100, fetched_count=110,
+                            peer_stage={"discovered": 1000, "candidates": 100,
+                                        "fetched": 100, "failed": 0,
+                                        "discovery_ok": True, "owner_ok": True})
+    assert d["complete"] is False, (
+        "discovery sat at its 1000 ceiling and the population was certified "
+        "complete — a combined count was compared to the owner limit")
+    assert "discovery" in d["complete_reason"], d["complete_reason"]
+    ok = pf.scope_descriptor("o/r", "o", record_count=20, fetched_count=25,
+                             peer_stage={"discovered": 40, "candidates": 5,
+                                         "fetched": 5, "failed": 0,
+                                         "discovery_ok": True, "owner_ok": True})
+    assert ok["complete"] is True, ok["complete_reason"]
+
+
+def _prior_read_fails_open_on_any_shape():
+    """Valid JSON that is not an object must not crash before the fail-open."""
+    import tempfile
+    import pathlib as _pl
+    for payload in ("[]", '"str"', "null", "123", "{ not json",
+                    '{"mergeable": [1, 2]}'):
+        with tempfile.TemporaryDirectory() as td:
+            sf = _pl.Path(td) / "s.json"
+            sf.write_text(payload)
+            assert pf.read_prior_mergeable(sf) == {}, payload
+    with tempfile.TemporaryDirectory() as td:
+        sf = _pl.Path(td) / "s.json"
+        sf.write_text('{"mergeable": {"1": "MERGEABLE"}}')
+        assert pf.read_prior_mergeable(sf) == {"1": "MERGEABLE"}
+    assert pf.read_prior_mergeable(None) == {}
+
+
 def main() -> int:
     OWNER = "sonichi"
 
@@ -63,6 +200,21 @@ def main() -> int:
     assert pf._ci_state([{"__typename": "StatusContext", "state": "PENDING"}]) == "pending"
     assert pf._ci_state([{"__typename": "StatusContext", "state": "EXPECTED"}]) == "pending"
     assert pf._ci_state([{"__typename": "StatusContext", "state": "FAILURE"}]) == "failing"
+
+    # Completed conclusions outside the failure tuple must not read as green.
+    # These are COMPLETED, so the pending branch cannot catch them either.
+    for conclusion in ("ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"):
+        assert pf._ci_state([{"status": "COMPLETED", "conclusion": conclusion}]) == "failing", conclusion
+    # Any conclusion GitHub adds later is failing, not green, by construction.
+    assert pf._ci_state([{"status": "COMPLETED", "conclusion": "SOME_FUTURE_ENUM"}]) == "failing"
+    assert pf._ci_state([{"status": "COMPLETED", "conclusion": None}]) == "failing"
+    # SKIPPED and NEUTRAL are genuinely green; SKIPPED occurs on this repo, so
+    # an allow-list of SUCCESS alone would flag healthy PRs as failing.
+    assert pf._ci_state([{"status": "COMPLETED", "conclusion": "SKIPPED"}]) == "green"
+    assert pf._ci_state([{"status": "COMPLETED", "conclusion": "NEUTRAL"}]) == "green"
+    # A queued-but-not-started run is pending, not green.
+    assert pf._ci_state([{"status": "WAITING"}]) == "pending"
+    assert pf._ci_state([{"status": "IN_PROGRESS"}, {"conclusion": "FAILURE"}]) == "failing"
     assert pf._ci_state([{"__typename": "StatusContext", "state": "ERROR"}]) == "failing"
     assert pf._ci_state([
         {"__typename": "CheckRun", "status": "IN_PROGRESS"},
@@ -457,8 +609,152 @@ def main() -> int:
     assert "--author" in argv and argv[argv.index("--author") + 1] == "someowner", argv
     print("  ok  fetch_argv is the real gh command the descriptor reads")
 
+    _peer_cases()
+    _discovery_is_light()
+    _descriptor_tracks_the_widened_population()
+    _mergeable_churn_does_not_refire()
+    _failed_fetch_is_never_an_empty_population()
+    _each_stage_certifies_its_own_ceiling()
+    _prior_read_fails_open_on_any_shape()
+    _no_change_gate_is_present_in_source()
+    _uncertified_run_is_never_silent()
+    _a_truncated_population_is_never_certified()
+    _mergeable_carry_is_revision_scoped()
+    print("  ok  #2643 peer-scope + mergeable-churn cases")
     print("\nAll pr-flag core cases pass.")
     return 0
+
+
+def _a_truncated_population_is_never_certified():
+    """P1: two fires through production main() -- a ceiling-bound stage must
+    neither persist its hash nor let the second fire read NO_CHANGE."""
+    import contextlib
+    import io
+    import json
+    import pathlib as _pl
+    import tempfile
+
+    real_prs, real_disc, real_argv, real_dargv = (
+        pf._fetch_prs, pf._fetch_discovered, pf.fetch_argv, pf.discovery_argv)
+    real_stands = pf._gh_stands_page
+    try:
+        # _attach_commits() is live under main(); without this seam the two-fire
+        # control makes real `gh api graphql` calls at 60s each.
+        pf._gh_stands_page = lambda *a, **k: (True, [], False, None)
+        for stage in ("owner", "discovery"):
+            rows = [_pr(i, "sonichi") for i in range(1, 4)]
+            pf._fetch_prs = lambda *a, **k: (True, rows)
+            pf._fetch_discovered = lambda *a, **k: (True, [])
+            # Land the stage under test EXACTLY on its declared ceiling.
+            if stage == "owner":
+                pf.fetch_argv = lambda *a, **k: ["gh", "pr", "list", "--limit", "3"]
+                pf.discovery_argv = lambda *a, **k: ["gh", "pr", "list", "--limit", "900"]
+            else:
+                pf.fetch_argv = lambda *a, **k: ["gh", "pr", "list", "--limit", "900"]
+                pf.discovery_argv = lambda *a, **k: ["gh", "pr", "list", "--limit", "0"]
+            with tempfile.TemporaryDirectory() as td:
+                sf = _pl.Path(td) / "state.json"
+                outs = []
+                for _ in range(2):
+                    buf = io.StringIO()
+                    keep = sys.argv
+                    try:
+                        sys.argv = ["pr_flag.py", "--emit", "--repo", "o/r",
+                                    "--owner", "sonichi", "--state-file", str(sf)]
+                        with contextlib.redirect_stdout(buf):
+                            pf.main()
+                    except SystemExit:
+                        pass
+                    finally:
+                        sys.argv = keep
+                    outs.append(buf.getvalue().strip())
+                first, second = outs
+                if first.startswith("{"):
+                    assert json.loads(first)["scope"]["complete"] is not True, \
+                        f"{stage}: a ceiling-bound fetch reported complete"
+                assert second != "NO_CHANGE", \
+                    f"{stage}: the second truncated fire exited NO_CHANGE -- the " \
+                    "partial population was certified and persisted"
+    finally:
+        (pf._fetch_prs, pf._fetch_discovered,
+         pf.fetch_argv, pf.discovery_argv) = (real_prs, real_disc, real_argv, real_dargv)
+        pf._gh_stands_page = real_stands
+    print("  ok  a ceiling-truncated population is never certified or persisted")
+
+
+def _no_change_gate_is_present_in_source():
+    """Separate ON PURPOSE: a source assert and a behavioural one in the same
+    body are one assert -- whichever runs first, and the source one is weaker."""
+    src = (REPO / "scripts" / "pr_flag.py").read_text()
+    assert "if h == prev and certified and not args.force:" in src, \
+        "the NO_CHANGE fast path must be gated on `certified`"
+    print("  ok  the NO_CHANGE gate is present in source")
+
+
+def _uncertified_run_is_never_silent():
+    """P1: a failed fetch whose survivors hash to the LAST HEALTHY state.
+    Carries NO source-text assert, so it can fail on its own."""
+    import io
+    import json
+    import contextlib
+    import tempfile
+    import pathlib
+    real_prs, real_disc = pf._fetch_prs, pf._fetch_discovered
+    try:
+        # Owner fetch survives with the same population; discovery FAILS. Hash
+        # unchanged while incomplete -- the silent-outage case.
+        pf._fetch_prs = lambda *a, **k: (True, [])
+        pf._fetch_discovered = lambda *a, **k: (False, [])
+        h = pf.state_hash([])
+        with tempfile.TemporaryDirectory() as td:
+            sf = pathlib.Path(td) / "state.json"
+            sf.write_text(json.dumps({"hash": h}))
+            argv = ["pr_flag.py", "--emit", "--repo", "o/r", "--owner", "o",
+                    "--state-file", str(sf)]
+            out = io.StringIO()
+            real_argv = sys.argv
+            try:
+                sys.argv = argv
+                with contextlib.redirect_stdout(out):
+                    pf.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = real_argv
+            printed = out.getvalue().strip()
+            assert printed != "NO_CHANGE", \
+                "an uncertified run exited NO_CHANGE -- the outage is invisible " \
+                "to the monitor and the population was never declared incomplete"
+    finally:
+        pf._fetch_prs, pf._fetch_discovered = real_prs, real_disc
+    print("  ok  an uncertified run never collapses to NO_CHANGE")
+
+
+def _mergeable_carry_is_revision_scoped():
+    """P1: UNKNOWN must not inherit a DIFFERENT revision's mergeability."""
+    prev = pf.mergeable_map(
+        [{"number": 7, "head": "aaa", "base": "main", "mergeable": "MERGEABLE"}])
+
+    same = pf.carry_unknown_mergeable(
+        [{"number": 7, "head": "aaa", "base": "main", "mergeable": "UNKNOWN"}], prev)
+    assert same[0]["mergeable"] == "MERGEABLE", same
+
+    forced = pf.carry_unknown_mergeable(
+        [{"number": 7, "head": "bbb", "base": "main", "mergeable": "UNKNOWN"}], prev)
+    assert forced[0]["mergeable"] == "UNKNOWN", \
+        "a force-pushed head inherited the old revision's MERGEABLE"
+
+    retargeted = pf.carry_unknown_mergeable(
+        [{"number": 7, "head": "aaa", "base": "release", "mergeable": "UNKNOWN"}], prev)
+    assert retargeted[0]["mergeable"] == "UNKNOWN", \
+        "a retargeted base inherited the old revision's MERGEABLE"
+
+    legacy = pf.carry_unknown_mergeable(
+        [{"number": 7, "head": "aaa", "base": "main", "mergeable": "UNKNOWN"}],
+        {"7": "MERGEABLE"})
+    assert legacy[0]["mergeable"] == "UNKNOWN", \
+        "a pre-scoping number-keyed state file must fail open, not carry"
+    print("  ok  carried mergeable is scoped to (number, head, base)")
 
 
 if __name__ == "__main__":

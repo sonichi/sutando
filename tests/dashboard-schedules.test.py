@@ -120,6 +120,9 @@ def test_get_schedules_formats_all_branches():
         # minute-bucket + prompt-derived desc with Run: prefix, HTML chars, truncation
         {"name": "sync", "cron": f"{soon.minute} {soon.hour} * * *",
          "prompt": "Run: sync & flush <everything> " + "x" * 120},
+        # mechanical launchd job → shell kind and command-derived desc
+        {"name": "poll", "cron": f"{soon.minute} {soon.hour} * * *",
+         "shell_command": "bash scripts/poll.sh"},
         # valid expr but no match in horizon → ">7d"
         {"name": "leap", "cron": "0 0 30 2 *"},
         # no cron → "invalid"; no name → "?"
@@ -133,6 +136,8 @@ def test_get_schedules_formats_all_branches():
     assert by_name["loop"]["desc"] == "Runs the /proactive-loop skill"
     assert by_name["brief"]["desc"] == "Daily briefing"
     assert by_name["brief"]["kind"] == "prompt"
+    assert by_name["poll"]["kind"] == "shell"
+    assert by_name["poll"]["desc"] == "Runs shell command: bash scripts/poll.sh"
 
     # next-string buckets
     assert by_name["loop"]["next"].endswith("(in 0m)") or "in " in by_name["loop"]["next"]

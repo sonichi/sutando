@@ -150,14 +150,21 @@ class _NoSuchPath(type(_real_path())):
         return False
 
 
+# `_SRC_DIR` is resolved ONCE at import, so stubbing `_mod.Path` here no longer
+# reaches these path builds — point the directory itself at nothing instead.
+# Stubbing Path alone left both cases running the REAL scripts and passing for
+# an unrelated reason (a Reminders.app timeout also yields None).
+_real_src_dir = _mod._SRC_DIR
 try:
     _mod.Path = lambda *a, **k: _NoSuchPath(_real_path(*a, **k))
+    _mod._SRC_DIR = _real_path("/nonexistent-sutando-src")
     ok("get_reminders() returns None when reminders.py is absent",
        _mod.get_reminders() is None)
     ok("get_health_issues() returns None when health-check.py is absent",
        _mod.get_health_issues() is None)
 finally:
     _mod.Path = _real_path
+    _mod._SRC_DIR = _real_src_dir
 
 # a briefing built entirely from unavailable gathers says nothing false
 allgone = _mod.synthesize(None, None, None, [], [], None)

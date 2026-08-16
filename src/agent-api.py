@@ -143,8 +143,8 @@ def _emit_task_processed(content: str) -> None:
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 
 RESULT_DIR = WORKSPACE_DIR / "results"
-TASK_DIR.mkdir(exist_ok=True)
-RESULT_DIR.mkdir(exist_ok=True)
+TASK_DIR.mkdir(parents=True, exist_ok=True)
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory task history (survives file cleanup, lost on restart)
 # {task_id: {status, text, time, result}}

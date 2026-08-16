@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check_quota_account_identity — does the proxy inject THIS core's login?
+"""check_quota_account_identity — does the proxy resolve THIS core's login?
 
 Pins the failure observed 2026-08-03: the credential proxy was up, routing, and
 writing a seconds-old quota-state.json **for a different account**. The owner's
@@ -17,9 +17,11 @@ Keychain access is stubbed — these tests never touch the real keychain and nev
 read a token. The production code compares keychain ITEM NAMES only.
 """
 import hashlib
+import json
 import importlib.util
 import os
 import plistlib
+import re
 import sys
 import tempfile
 import unittest
@@ -241,6 +243,34 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         self.assertIn("com.sutando.credential-proxy.plist", out["detail"])
         self.assertIn("reload", out["detail"].lower())
 
+    def test_warn_states_every_billing_outcome_with_its_condition(self):
+        """Both proxy branches turn on request state this check never reads, so
+        no clause may name a billing outcome without its condition."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=None,
+                        existing_services={_scoped(core), VANILLA})
+        detail = out["detail"]
+        self.assertNotIn(
+            "Quota numbers describe the proxy's account, not yours", detail,
+            "the billing consequence is conditional on the proxy's token being "
+            "injectable, which this check cannot observe")
+        self.assertIn(
+            "pass-through", detail.lower(),
+            "the other outcome — stored token unusable, client credential "
+            "forwarded — must be named too")
+        self.assertIn(
+            "authorization header", detail.lower(),
+            "injection is gated on the request carrying one; without that "
+            "qualifier the injecting branch still reads as unconditional")
+        # Clause-level: naming a charge without its condition is the defect,
+        # wherever in the sentence it sits.
+        billing = [c for c in re.split(r"[.;]", detail) if "bill" in c.lower()]
+        self.assertTrue(billing, "the billing outcome must still be named")
+        for clause in billing:
+            self.assertRegex(
+                clause.lower(), r"\b(if|unless|when|usable|unusable)\b",
+                f"billing asserted with no condition attached: {clause.strip()!r}")
+
     # ---- agreement cases: must NOT warn -----------------------------------
 
     def test_matching_config_dirs_ok(self):
@@ -250,6 +280,21 @@ class TestQuotaAccountIdentity(unittest.TestCase):
                         existing_services={_scoped(core), VANILLA})
         self.assertEqual(out["status"], "ok")
         self.assertIn(_scoped(core), out["detail"])
+
+    def test_ok_reports_the_name_match_not_an_injection(self):
+        """A proxy whose stored token is unusable resolves the SAME item and
+        passes through, so a name match cannot report an injection."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=core,
+                        existing_services={_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "ok")
+        self.assertNotIn(
+            "inject", out["detail"].lower(),
+            "a name match does not establish that the token is injected; "
+            "saying so invites the reader to treat ok as proof of behaviour")
+        self.assertIn(
+            "name match", out["detail"].lower(),
+            "say what was actually compared, so the limit travels with the claim")
 
     def test_no_scoped_item_means_both_fall_back_to_vanilla(self):
         """Core is namespaced but has never logged in there, so its scoped item
@@ -271,6 +316,19 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         out = self._run(core_cfg=core, plist_cfg=None,
                         existing_services={_scoped(core), VANILLA}, proxy_status="warn")
         self.assertEqual(out["status"], "ok")
+
+    def test_stale_proxy_is_still_compared(self):
+        """A "stale" proxy is LISTENING — it is injecting credentials, using
+        pre-deploy code. Lumping it in with down/warn would silence the
+        comparison exactly during a redeploy, when the two sides are most
+        likely to have drifted."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=None,
+                        existing_services={_scoped(core), VANILLA},
+                        proxy_status="stale")
+        self.assertEqual(out["status"], "warn",
+                         "a stale proxy still injects — the comparison must run")
+        self.assertIn(_scoped(core), out["detail"])
 
     def test_no_readable_credential_states_the_no_op(self):
         """Locked keychain / fresh host: an unqualified ok would be
@@ -337,6 +395,54 @@ class TestQuotaAccountIdentity(unittest.TestCase):
             hc._resolved_credential_service(core)
         for call in run.call_args_list:
             self.assertNotIn("-w", call.args[0], "must not read the secret value")
+
+
+    # ---- an interpreter that cannot import plistlib must still ANSWER -------
+
+    def test_plistlib_unavailable_answers_via_plutil(self):
+        """A broken pyexpat is an interpreter fault, not an unanswerable
+        question: the two logins must still be compared."""
+        core = "/Users/x/ws/.claude-sutando"
+        payload = json.dumps({"Label": "com.sutando.credential-proxy",
+                              "EnvironmentVariables": {"CLAUDE_CONFIG_DIR": core}})
+        with mock.patch.dict(sys.modules, {"plistlib": None}), \
+             mock.patch.object(hc.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=payload)):
+            out = self._run(core_cfg=core, plist_cfg=core,
+                            existing_services={_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "ok", out["detail"])
+        self.assertIn("same keychain item", out["detail"])
+
+    def test_plutil_unusable_keeps_the_original_warning(self):
+        """No plutil, a bad exit, or a non-mapping root keeps the warn — a
+        fallback must never turn "cannot tell" into "ok"."""
+        core = "/Users/x/ws/.claude-sutando"
+        cases = [("side_effect", OSError("no plutil binary")),
+                 ("side_effect", hc.subprocess.SubprocessError("timeout")),
+                 ("return_value", mock.Mock(returncode=1, stdout="")),
+                 ("return_value", mock.Mock(returncode=0, stdout="not json")),
+                 ("return_value", mock.Mock(returncode=0, stdout='["a list"]'))]
+        for kind, outcome in cases:
+            with self.subTest(outcome=repr(outcome)[:40]):
+                with mock.patch.dict(sys.modules, {"plistlib": None}), \
+                     mock.patch.object(hc.subprocess, "run", **{kind: outcome}):
+                    out = self._run(core_cfg=core, plist_cfg=core,
+                                    existing_services={_scoped(core), VANILLA})
+                self.assertEqual(out["status"], "warn", out["detail"])
+                self.assertIn("cannot import plistlib", out["detail"])
+
+    def test_plutil_is_asked_for_the_plist_path_and_json(self):
+        """Pin the invocation: json output, to stdout, for THIS plist."""
+        core = "/Users/x/ws/.claude-sutando"
+        payload = json.dumps({"EnvironmentVariables": {"CLAUDE_CONFIG_DIR": core}})
+        with mock.patch.dict(sys.modules, {"plistlib": None}), \
+             mock.patch.object(hc.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=payload)) as run:
+            self._run(core_cfg=core, plist_cfg=core,
+                      existing_services={_scoped(core), VANILLA})
+        argv = run.call_args_list[0].args[0]
+        self.assertEqual(argv[:4], ["/usr/bin/plutil", "-convert", "json", "-o"])
+        self.assertTrue(argv[-1].endswith("com.sutando.credential-proxy.plist"), argv)
 
 
 if __name__ == "__main__":
