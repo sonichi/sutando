@@ -28,6 +28,14 @@ _TRANSIENT_EXC_NAMES = frozenset({
     "DiscordServerError",
 })
 
+# Checked BEFORE the transient names: these inherit from a listed transient
+# (ClientConnectorError) but a bad cert, wrong CA or pin mismatch is a
+# misconfiguration — no number of retries turns it into a 200.
+_PERMANENT_EXC_NAMES = frozenset({
+    "ClientSSLError",            # + its cert/SSL connector subclasses
+    "ServerFingerprintMismatch",  # reaches the set via ServerConnectionError
+})
+
 
 def failure_status(exc: BaseException) -> int | None:
     """The HTTP status of a failed send, or None.
@@ -48,9 +56,12 @@ def is_transient(exc: BaseException) -> bool:
     Names are matched across the whole MRO, not just the concrete class: aiohttp
     raises `ClientConnectorDNSError(ClientConnectorError)` for a DNS failure, and
     an exact-name test misses every such subclass while its listed parent sits
-    right above it.
+    right above it. `_PERMANENT_EXC_NAMES` is the exception to that widening.
     """
-    if any(base.__name__ in _TRANSIENT_EXC_NAMES for base in type(exc).__mro__):
+    names = [base.__name__ for base in type(exc).__mro__]
+    if any(n in _PERMANENT_EXC_NAMES for n in names):
+        return False
+    if any(n in _TRANSIENT_EXC_NAMES for n in names):
         return True
     status = failure_status(exc)
     if status is not None:
