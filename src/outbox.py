@@ -371,24 +371,72 @@ def release_delivery_claim(root: Path, item_id: str, drainer_id: Optional[str] =
         raise ValueError("release_delivery_claim needs a drainer_id, or force=True")
     root = Path(root)
     p = _claim_path(root, item_id)
-    if not force:
-        rec = _read_claim_at(p, item_id)
-        # A torn claim has no readable owner, so nobody can prove they hold it.
-        if rec is None or rec.state == "UNKNOWN" or rec.drainer_id != drainer_id:
-            return False
-    released = True
+    released = _force_release(p) if force else _release_own_instance(p, item_id, drainer_id)
+    if released:
+        # Swap names are CAS tokens, not state: they mean something only while a
+        # peer could still hold the observation they encode, which ends here.
+        for stale in _claims_dir(root).glob(f"{p.name}.reclaim-*"):
+            _discard(stale)
+    return released
+
+
+def _discard(p: Path) -> None:
     try:
         p.unlink()
     except FileNotFoundError:
-        released = False
-    # The swap names are CAS tokens, not state. They are only meaningful while a
-    # peer could still hold the observation they encode, which ends here.
-    for stale in _claims_dir(root).glob(f"{p.name}.reclaim-*"):
-        try:
-            stale.unlink()
-        except FileNotFoundError:
-            pass
-    return released
+        pass
+
+
+def _force_release(p: Path) -> bool:
+    try:
+        p.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
+    """Release only the claim INSTANCE this caller inspected.
+
+    Read-then-unlink deletes whatever occupies the slot by the time it runs — a
+    successor included. The rename is atomic, so there is no gap between the
+    decision and the act for a turnover to land in.
+    """
+    observed = _read_claim_at(p, item_id)
+    # A torn claim has no readable owner, so nobody can prove they hold it.
+    if observed is None or observed.state == "UNKNOWN" or observed.drainer_id != drainer_id:
+        return False
+    tomb = p.with_name(f"{p.name}.release-{_claim_stamp(observed)}")
+    try:
+        os.rename(str(p), str(tomb))
+    except OSError:
+        return False
+    taken = _read_claim_at(tomb, item_id)
+    if taken is not None and _same_claim(taken, observed):
+        _discard(tomb)
+        return True
+    _reinstate(p, tomb)
+    return False
+
+
+def _reinstate(p: Path, tomb: Path) -> None:
+    """Put back a claim this caller took but did not own.
+
+    O_EXCL rather than rename: if the slot is occupied again, that newer claim is
+    the valid one and this copy must be dropped instead of overwriting it.
+    """
+    try:
+        payload = tomb.read_bytes()
+    except FileNotFoundError:
+        return
+    try:
+        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+    except FileExistsError:
+        pass
+    finally:
+        _discard(tomb)
 
 
 # -- item lifecycle -----------------------------------------------------------

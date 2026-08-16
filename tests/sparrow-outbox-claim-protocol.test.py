@@ -398,6 +398,49 @@ def _c13():
             pass
 
 
+# 14 --------------------------------------------------------------------------
+@contract("a stale release must not delete the successor's claim (release ABA)")
+def _c14():
+    """The check-then-unlink twin of contract 12, on the release path.
+
+    A passes its ownership check, the slot turns over underneath it (a force
+    release plus a successor acquire), and A's unlink then deletes a claim A
+    never owned — leaving the item free while the successor believes it holds it.
+    """
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-aba", "A") is True
+        original, tripped = m._read_claim_at, {"done": False}
+
+        def turnover(path, item_id):
+            rec = original(path, item_id)
+            # Fire once, after A has read its own record and before it acts.
+            if not tripped["done"] and rec is not None and rec.drainer_id == "A":
+                tripped["done"] = True
+                release(root, "item-aba", force=True)      # operator recovery
+                acquire(root, "item-aba", "B")             # successor takes it
+            return rec
+
+        m._read_claim_at = turnover
+        try:
+            out = release(root, "item-aba", "A")
+        finally:
+            m._read_claim_at = original
+
+        holder = read(root, "item-aba")
+        assert holder is not None, (
+            "A released a claim it no longer owned; the item is now free while B "
+            "believes it holds delivery — a third drainer acquires and both send")
+        assert holder.drainer_id == "B", (
+            f"the surviving claim is {holder.drainer_id!r}, expected B")
+        assert out is False, (
+            "A reported a successful release of a claim that was no longer its own")
+
+
 def main() -> int:
     print(f"  target: src/outbox.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)
