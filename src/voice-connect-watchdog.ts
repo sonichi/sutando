@@ -7,6 +7,14 @@
 
 export const DEFAULT_STUCK_CONNECTING_MS = 120_000;
 
+/** Lower bound for a positive override. bodhi bounds a dial at 30s
+ *  (DEFAULT_CONNECT_TIMEOUT_MS; 45s on the reconnect path) — a threshold
+ *  below that inverts the backstop into a dial-killer, and the forced CLOSED
+ *  cannot bump bodhi's private dial generation, so a late dial RESOLUTION
+ *  would land in a session already declared dead. 60s = 2x the dial bound;
+ *  `0` remains the explicit disable and is never clamped. */
+export const MIN_STUCK_CONNECTING_MS = 60_000;
+
 /** Parse the VOICE_STUCK_CONNECTING_MS override. `0` disables the watchdog —
  *  `Number(x) || default` could not express that, and swallowed typos silently. */
 export function parseStuckConnectingMs(
@@ -19,6 +27,11 @@ export function parseStuckConnectingMs(
 		warn(`[voice] VOICE_STUCK_CONNECTING_MS=${JSON.stringify(raw)} is not a non-negative number; `
 			+ `using ${DEFAULT_STUCK_CONNECTING_MS}ms`);
 		return DEFAULT_STUCK_CONNECTING_MS;
+	}
+	if (n > 0 && n < MIN_STUCK_CONNECTING_MS) {
+		warn(`[voice] VOICE_STUCK_CONNECTING_MS=${JSON.stringify(raw)} is below the safe floor `
+			+ `(upstream dial deadline is 30-45s); clamping to ${MIN_STUCK_CONNECTING_MS}ms`);
+		return MIN_STUCK_CONNECTING_MS;
 	}
 	return n;
 }

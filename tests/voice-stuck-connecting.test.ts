@@ -12,7 +12,7 @@
  * because importing voice-agent.ts boots a voice agent — main() is unguarded.
  */
 import {
-	DEFAULT_STUCK_CONNECTING_MS, nextConnectingTick, parseStuckConnectingMs, shouldForceClosed,
+	DEFAULT_STUCK_CONNECTING_MS, MIN_STUCK_CONNECTING_MS, nextConnectingTick, parseStuckConnectingMs, shouldForceClosed,
 } from '../src/voice-connect-watchdog.js';
 
 let failed = 0;
@@ -72,7 +72,18 @@ check('the observed incident would have recovered',
 check('an unset override takes the default', parseStuckConnectingMs(undefined), DEFAULT_STUCK_CONNECTING_MS);
 check('an empty override takes the default', parseStuckConnectingMs('   '), DEFAULT_STUCK_CONNECTING_MS);
 check('0 is honoured, not swallowed', parseStuckConnectingMs('0'), 0);
-check('a valid override is used verbatim', parseStuckConnectingMs('45000'), 45_000);
+check('a valid override is used verbatim', parseStuckConnectingMs('180000'), 180_000);
+
+// The safety margin is enforced, not assumed: a positive threshold below the
+// upstream dial deadline would let the watchdog kill legitimate dials.
+{
+	const warnings: string[] = [];
+	check('a positive sub-floor override clamps to the floor',
+		parseStuckConnectingMs('5000', (m) => { warnings.push(m); }), MIN_STUCK_CONNECTING_MS);
+	check('...and warns once', warnings.length, 1);
+	check('...naming the variable', warnings[0]?.includes('VOICE_STUCK_CONNECTING_MS'), true);
+}
+check('the floor itself is accepted verbatim', parseStuckConnectingMs('60000'), MIN_STUCK_CONNECTING_MS);
 check('threshold 0 disables the force entirely',
 	shouldForceClosed({ ...base, thresholdMs: 0, now: 1e12 }), false);
 
