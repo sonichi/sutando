@@ -187,6 +187,8 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+# Module-level for tests and callers; _resolve_send_failure ALSO lazy-imports
+# with a flat-path fallback so the bundled copy works in both contexts.
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
