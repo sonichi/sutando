@@ -4314,6 +4314,26 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
     return None
 
 
+def _plist_via_plutil(path: "Path") -> "dict | None":
+    """Parse a plist without `plistlib`, for interpreters whose pyexpat is broken.
+
+    Returns None on any failure, which keeps the caller's existing warn as the
+    behaviour everywhere plutil is absent (non-macOS) or unhappy.
+    """
+    try:
+        out = subprocess.run(["/usr/bin/plutil", "-convert", "json", "-o", "-", str(path)],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(out.stdout)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
     """Does the proxy resolve THIS core's login, or a different account's?
 
@@ -4417,15 +4437,22 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     try:
         import plistlib
     except ImportError as exc:
-        return {"name": name, "status": "warn",
-                "detail": (f"cannot parse the credential-proxy plist — this Python "
-                           f"cannot import plistlib ({exc.__class__.__name__}: {exc}). "
-                           f"Every other check is unaffected.")}
-    try:
-        rendered = plistlib.loads(plist.read_bytes())
-    except (OSError, ValueError) as exc:
-        return {"name": name, "status": "warn",
-                "detail": f"cannot read the credential-proxy plist ({exc})"}
+        # #2588 stopped this ImportError killing the run; the probe then warned
+        # about its own interpreter instead of answering. `plutil` ships with
+        # macOS and needs no expat, so the question is still answerable here.
+        rendered = _plist_via_plutil(plist)
+        if rendered is None:
+            return {"name": name, "status": "warn",
+                    "detail": (f"cannot parse the credential-proxy plist — this Python "
+                               f"cannot import plistlib ({exc.__class__.__name__}: {exc}) "
+                               f"and plutil could not read it either. "
+                               f"Every other check is unaffected.")}
+    else:
+        try:
+            rendered = plistlib.loads(plist.read_bytes())
+        except (OSError, ValueError) as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"cannot read the credential-proxy plist ({exc})"}
     # A plist can PARSE and still be the wrong shape — `EnvironmentVariables`
     # encoded as a string, say. `.get` on that raises AttributeError, which is
     # not caught above and would abort the whole health run, taking every later
