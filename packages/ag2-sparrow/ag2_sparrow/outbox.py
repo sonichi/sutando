@@ -26,7 +26,6 @@ import hashlib
 import json
 import os
 import time
-import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -321,6 +320,13 @@ def _same_claim(a: ClaimRecord, b: ClaimRecord) -> bool:
            (b.drainer_id, b.pid, b.start_usec, b.claimed_at)
 
 
+def _claim_stamp(rec: ClaimRecord) -> str:
+    """One name per claim INSTANCE. A unique name per caller would let every
+    drainer win its own swap, which is not a compare-and-swap at all."""
+    token = f"{rec.drainer_id}|{rec.pid}|{rec.start_usec}|{rec.claimed_at!r}"
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
 def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
                            drainer_id: str) -> bool:
     """Atomically take over a reclaimable claim; True if THIS caller now holds it.
@@ -337,50 +343,37 @@ def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
     if not _record_is_reclaimable(observed, ttl_seconds):
         return False
     src = _claim_path(root, item_id)
-    tomb = src.with_name(f"{src.name}.reclaim-{uuid.uuid4().hex}")
+    # The name is derived from the OBSERVED record, so every drainer judging the
+    # same claim competes for one name and O_EXCL-on-link picks a single winner.
+    tomb = src.with_name(f"{src.name}.reclaim-{_claim_stamp(observed)}")
     try:
-        os.rename(str(src), str(tomb))
+        os.link(str(src), str(tomb))
     except OSError:
-        return False                      # someone moved it first: they won
-    taken = _read_claim_at(tomb, item_id)
+        return False                      # another drainer judged this same record
+    taken = _read_claim_at(src, item_id)
     if taken is None or not _same_claim(taken, observed):
-        _restore_claim(src, tomb)         # not the record we judged: put it back
-        return False
+        return False                      # it moved on; our observation is stale
     try:
-        tomb.unlink()
+        os.unlink(str(src))
     except FileNotFoundError:
-        pass
+        return False
     return acquire_delivery_claim(root, item_id, drainer_id)
 
 
-def _restore_claim(src: Path, tomb: Path) -> None:
-    """Put a wrongly-taken claim back, without clobbering a newer one.
-
-    O_EXCL rather than rename: if the slot is occupied again the newer claim is
-    the valid one and this tombstone must simply be dropped.
-    """
+def release_delivery_claim(root: Path, item_id: str) -> None:
+    root = Path(root)
+    p = _claim_path(root, item_id)
     try:
-        payload = tomb.read_bytes()
+        p.unlink()
     except FileNotFoundError:
-        return
-    try:
-        fd = os.open(str(src), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(payload)
-    except FileExistsError:
         pass
-    finally:
+    # The swap names are CAS tokens, not state. They are only meaningful while a
+    # peer could still hold the observation they encode, which ends here.
+    for stale in _claims_dir(root).glob(f"{p.name}.reclaim-*"):
         try:
-            tomb.unlink()
+            stale.unlink()
         except FileNotFoundError:
             pass
-
-
-def release_delivery_claim(root: Path, item_id: str) -> None:
-    try:
-        _claim_path(Path(root), item_id).unlink()
-    except FileNotFoundError:
-        pass
 
 
 # -- item lifecycle -----------------------------------------------------------

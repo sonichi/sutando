@@ -35,6 +35,18 @@ def check(title: str, ok: bool, detail: str = "") -> None:
         print(f"  FAIL {title}\n         {detail}")
 
 
+def check_call(title: str, fn, predicate, detail: str = "") -> None:
+    """check() for a probe that may RAISE. Without this a raise ends the run and
+    the remaining checks never execute, which reads short rather than broken."""
+    try:
+        got = fn()
+    except Exception as exc:  # noqa: BLE001
+        FAILS.append(title)
+        print(f"  ERR  {title}\n         {type(exc).__name__}: {exc}")
+        return
+    check(title, predicate(got), detail)
+
+
 def main() -> int:
     # 1 — the live gateway reply is not proof
     r = classify_response(200, {"ok": True})
@@ -60,6 +72,21 @@ def main() -> int:
           "PROACTIVE_TRUST_OK and isinstance(resp, dict)" in src,
           "the at-least-once opt-in was removed; that is a documented, tested "
           "feature, not a fallback")
+
+    # 4 — the bridge passes a literal 200, so status-first cannot help: this
+    # gateway reports failure inside a 200 body. Only the key set can.
+    check("the bridge pins the accepted identifier to event_id",
+          'id_keys=("event_id",)' in src,
+          "the call site takes the default key set, so ts/id/message_id now "
+          "confirm a proactive send that the pre-outbox path retried")
+    for shape in ({"ok": True, "ts": "170099"},
+                  {"errcode": "M_LIMIT_EXCEEDED", "id": "req-9"},
+                  {"ok": False, "message_id": "m1"}):
+        check_call(f"still unconfirmed at the bridge's key set: {shape}",
+                   lambda s=shape: classify_response(200, s, id_keys=("event_id",)),
+                   lambda r: r.outcome is DeliveryOutcome.OUTCOME_UNKNOWN,
+                   "a gateway reply that delivered nothing would be archived as "
+                   "delivered, and nothing later corrects it")
 
     print(f"\n  {len(FAILS)} failure(s)")
     if FAILS:

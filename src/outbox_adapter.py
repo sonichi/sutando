@@ -20,7 +20,7 @@ Contracts: tests/outbox-adapter-contract.test.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 try:  # vendored into ag2_sparrow as a package module; flat in src/
     from .outbox import DeliveryOutcome, RetrySafety
@@ -40,8 +40,13 @@ class DeliveryReceipt:
     detail: str = ""
 
 
-def classify_response(status: Optional[int], body: Any) -> DeliveryReceipt:
-    """Provider response -> receipt. Pure; no I/O, no policy."""
+def classify_response(status: Optional[int], body: Any,
+                      id_keys: Sequence[str] = _ID_KEYS) -> DeliveryReceipt:
+    """Provider response -> receipt. Pure; no I/O, no policy.
+
+    `id_keys` narrows what counts as proof. A caller whose provider names its
+    receipt must pin it, or the broad default widens what that path accepts.
+    """
     # Status decides first: an error envelope's `id` is a trace id, and reading
     # it as a receipt archives an item the provider just refused.
     if status is None:
@@ -55,7 +60,7 @@ def classify_response(status: Optional[int], body: Any) -> DeliveryReceipt:
                                detail="provider error; the write may have applied")
     rid = None
     if isinstance(body, dict):
-        for k in _ID_KEYS:
+        for k in id_keys:
             v = body.get(k)
             if isinstance(v, str) and v:
                 rid = v

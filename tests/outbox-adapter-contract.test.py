@@ -186,6 +186,25 @@ def _status_beats_id():
             "envelope's id is not a delivery receipt")
 
 
+# 8 ---------------------------------------------------------------------------
+@contract("a caller may pin which keys count as proof")
+def _id_keys_are_pinnable():
+    m = adapter_mod()
+    classify = need(m, "classify_response")
+    from outbox import DeliveryOutcome as O  # noqa: PLC0415
+
+    # Status-first does not help a caller whose transport reports failure INSIDE
+    # a 200 body; only narrowing the key set can, so the seam must allow it.
+    body = {"ok": True, "ts": "170099"}
+    assert classify(200, body).outcome == O.CONFIRMED, (
+        "the default key set is deliberately broad, and that default is what "
+        "makes pinning necessary rather than optional")
+    r = classify(200, body, id_keys=("event_id",))
+    assert r.outcome == O.OUTCOME_UNKNOWN and r.receipt_id is None, (
+        f"got {r.outcome} / {r.receipt_id!r}; a caller that knows its provider "
+        "proves delivery only with event_id must be able to say so")
+
+
 def main() -> int:
     print(f"  target: src/outbox_adapter.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)

@@ -2368,9 +2368,9 @@ def _post_proactive() -> None:
             # a failed send: the claim is renamed back and retried next pass,
             # loudly, so a misconfigured room is visible instead of silently
             # eating nudges.
-            # Only an identifier proves delivery. TRUST_OK stays a separate
-            # clause: it is an at-least-once opt-in, not a fallback.
-            receipt = classify_response(200, resp)
+            # event_id is pinned: the gateway answers HTTP 200 with an error
+            # envelope, and ts/id/message_id in one are not delivery receipts.
+            receipt = classify_response(200, resp, id_keys=("event_id",))
             delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
                 PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True
             )

@@ -51,19 +51,21 @@ if __name__ == "__main__":
     # Phase 2 — RECLAIM of a dead owner's claim. Exclusion on acquire says
     # nothing about two drainers acting on one stale observation.
     rc_totals, orphaned = [], 0
-    for r in range(rounds * 2):
-        with tempfile.TemporaryDirectory() as tmp:
-            item = f"item-reclaim-{r}"
-            plant_stale_claim(tmp, item)
-            with mp.Pool(N) as pool:
+    # ONE warm pool for every round. A fresh pool per round pays process startup
+    # inside the window under test, which staggers the workers and hides the race.
+    with mp.Pool(N) as pool:
+        for r in range(rounds * 2):
+            with tempfile.TemporaryDirectory() as tmp:
+                item = f"item-reclaim-{r}"
+                plant_stale_claim(tmp, item)
                 got = pool.map(reclaim_worker, [(tmp, item, i) for i in range(N)], chunksize=1)
-            winners = [g for g in got if g]
-            rc_totals.append(len(winners))
-            held = read_delivery_claim(tmp, item)
-            # The winner must still hold it: a loser that unlinks unconditionally
-            # destroys the winner's claim and the item is delivered twice.
-            if len(winners) == 1 and (held is None or held.drainer_id != winners[0]):
-                orphaned += 1
+                winners = [g for g in got if g]
+                rc_totals.append(len(winners))
+                held = read_delivery_claim(tmp, item)
+                # The winner must still hold it: a loser that unlinks unconditionally
+                # destroys the winner's claim and the item is delivered twice.
+                if len(winners) == 1 and (held is None or held.drainer_id != winners[0]):
+                    orphaned += 1
     print(f"\n  {rounds} rounds x {N} concurrent PROCESSES reclaiming one dead owner's claim")
     print(f"  winners per round: {rc_totals}")
     bad_rc = [t for t in rc_totals if t != 1]
