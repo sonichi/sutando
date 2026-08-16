@@ -30,6 +30,45 @@ from pathlib import Path
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
+
+class _NeverFatalStream:
+    """Logging must never take delivery down.
+
+    Because the streams above are LINE-buffered, every `print()` flushes at the
+    newline — so if the far end of stdout goes away (supervisor exits, pipe
+    closed, launcher reaped), that flush raises `BrokenPipeError` *inside
+    whatever code was logging*, not at some later flush point.
+
+    Swallow ONLY OSError (the EPIPE/EBADF class). A logging failure is not a
+    reason to stop delivering; anything else still propagates so real bugs are
+    not masked.
+    """
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except OSError:
+            # Report the write as accepted: callers must not branch on it.
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _NeverFatalStream(sys.stdout)
+sys.stderr = _NeverFatalStream(sys.stderr)
+
 # Self-rescue: this bridge HAS to keep running — Discord is the primary channel
 # the owner uses to reach Sutando. If `python3` on $PATH happens to resolve to
 # an interpreter that lacks `discord.py` (e.g. miniconda's python on a Mac that
@@ -94,6 +133,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from orphan_result_routes import orphan_result_routes  # noqa: E402
 
 
@@ -125,6 +165,41 @@ REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
+
+#: Consecutive polls each result file has been present-but-empty. Bridge-owned
+#: state; threshold and wording live in result_router so the bridges cannot drift.
+_empty_result_polls: "dict[str, int]" = {}
+
+
+class EmptyResultError(Exception):
+    """A result file that stayed empty past the bound — never delivered."""
+
+
+async def _note_empty_result(task_id: str, result_file) -> None:
+    """At the bound: owner DM, audit row, drain `pending_replies`, archive. Below it a
+    no-op, because that window is indistinguishable from a normal partial write."""
+    notice = result_router.note_empty_result(
+        _empty_result_polls, task_id, str(result_file))
+    if not notice:
+        return                                    # still inside the write window
+    print(f"  {notice}", flush=True)
+    # Pop every task-scoped map the normal-delivery cleanup pops, or the task
+    # reports resolved while still visible to queue-health.
+    _empty_result_polls.pop(task_id, None)
+    channel = pending_replies.pop(task_id, None)  # stop re-polling it
+    _atomic_write_pending_replies(
+        {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
+    _progress_msgs.pop(task_id, None)             # else the placeholder never clears
+    tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
+    archive_file(result_file, "results", task_id)
+    # Archive the SOURCE TASK too. Without this the task file sits in tasks/
+    # forever: discovery re-reads it and queue health counts it as pending work.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+
+
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
@@ -413,21 +488,30 @@ def archive_path(kind: str, task_id: str) -> "Path":
     return month_dir / f"{task_id}.txt"
 
 
-def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into the archive. Silent on failure — archive is for later
-    analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving"."""
-    try:
-        if src.exists():
-            import shutil
-            shutil.move(str(src), str(archive_path(kind, task_id)))
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        # Fall back to unlink so we don't leave stale files.
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+def archive_file(src: "Path", kind: str, task_id: str) -> bool:
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy in task_archive."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(m, flush=True))
+
+
+def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
+    """Archive a delivered task's result + task file, then retire its sentinel.
+
+    One owner for a policy both delivery paths need: the sentinel may only be
+    cleared once the result has actually left the live queue, because a
+    surviving result re-enters the poll loop and the sentinel is the only thing
+    standing between it and a second send.
+    """
+    gone = archive_file(result_file, "results", task_id)
+    # find_task_file, not a reconstructed bare name: a claimed task is
+    # `<id>.claimed-core-N.txt` and would strand forever.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+    if gone:
+        _clear_delivered(task_id)
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
@@ -2467,6 +2551,45 @@ def _recover_orphan_sending_files() -> int:
 # re-fires on every gateway reconnect, so without this the loops accumulate.
 _poll_loops_started = False
 
+# Restart delay after a poll loop crashes. Long enough that a persistently
+# failing loop can't spin, short enough that delivery resumes on its own.
+POLL_LOOP_RESTART_SEC = 5
+
+# Returned by a poll loop that declined to run because its feature is off.
+# Not a failure, so the supervisor must stop rather than restart it forever.
+LOOP_DISABLED = object()
+
+
+async def _supervise_loop(coro_fn, name):
+    """Keep a poll loop alive across crashes.
+
+    Each `poll_*` coroutine is an unbounded `while True`, so an exception that
+    escapes its body ends that loop *permanently* while the process stays up —
+    the bridge keeps receiving and silently stops delivering, with nothing in
+    the logs (the escape can itself be a logging failure; see
+    `_NeverFatalStream`). `poll_results` in particular has no loop-level
+    try/except at all, so one raise past its inner handler is terminal.
+
+    Restart instead of dying. Re-entry is safe for these loops: they rebuild
+    their state from `pending_replies` / `results/` on each pass, and re-send is
+    gated by the `_mark_delivered` sentinel, so a restarted loop cannot
+    duplicate a delivery that already happened. `CancelledError` is re-raised —
+    shutdown must stay prompt.
+    """
+    while True:
+        try:
+            if await coro_fn() is LOOP_DISABLED:
+                # Opted out on purpose (feature flag off) — supervising it would
+                # re-enter and re-return every POLL_LOOP_RESTART_SEC forever.
+                return
+            # A poll loop returning is itself unexpected (they never exit).
+            print(f"  [{name}] loop returned unexpectedly — restarting in {POLL_LOOP_RESTART_SEC}s", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"  [{name}] loop crashed: {type(exc).__name__}: {exc} — restarting in {POLL_LOOP_RESTART_SEC}s", flush=True)
+        await asyncio.sleep(POLL_LOOP_RESTART_SEC)
+
 
 @client.event
 async def on_ready():
@@ -2533,13 +2656,13 @@ async def on_ready():
     global _poll_loops_started
     if not _poll_loops_started:
         _poll_loops_started = True
-        client.loop.create_task(poll_results())
-        client.loop.create_task(poll_progress())
-        client.loop.create_task(poll_approved())
-        client.loop.create_task(poll_proactive())
-        client.loop.create_task(poll_dm_fallback())
+        client.loop.create_task(_supervise_loop(poll_results, "poll_results"))
+        client.loop.create_task(_supervise_loop(poll_progress, "poll_progress"))
+        client.loop.create_task(_supervise_loop(poll_approved, "poll_approved"))
+        client.loop.create_task(_supervise_loop(poll_proactive, "poll_proactive"))
+        client.loop.create_task(_supervise_loop(poll_dm_fallback, "poll_dm_fallback"))
         # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
-        client.loop.create_task(_mod_flush_timer_loop())
+        client.loop.create_task(_supervise_loop(_mod_flush_timer_loop, "_mod_flush_timer_loop"))
 
 
 def _message_mentions_bot(message):
@@ -4521,7 +4644,9 @@ async def poll_results():
                 import re
                 reply_text = read_ready_result(result_file)
                 if reply_text is None:
+                    await _note_empty_result(task_id, result_file)
                     continue
+                _empty_result_polls.pop(task_id, None)
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving
@@ -4626,10 +4751,7 @@ async def poll_results():
                 # archive_file() finishing. See DELIVERED_DIR docstring.
                 if _is_delivered(task_id):
                     print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
-                    archive_file(result_file, "results", task_id)
-                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
-                    _clear_delivered(task_id)
+                    _archive_delivered_pair(result_file, task_id)
                     continue
 
                 try:
@@ -4833,15 +4955,11 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
-                archive_file(result_file, "results", task_id)
-                # find_task_file, not a reconstructed bare name: a claimed
-                # task is `<id>.claimed-core-N.txt` and would strand forever.
-                task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                archive_file(task_file, "tasks", task_id)
-                # Delivery succeeded + archived — sentinel has served
-                # its purpose, remove to bound `discord-delivered/`
-                # directory growth.
-                _clear_delivered(task_id)
+                _archive_delivered_pair(result_file, task_id)
+            else:
+                # CONSECUTIVE means consecutive: an absent file breaks the run, or a
+                # writer that retries accumulates counts across separate appearances.
+                _empty_result_polls.pop(task_id, None)
         await asyncio.sleep(1)
 
 
@@ -4897,7 +5015,7 @@ async def poll_progress():
     must never break the loop or leak an exception into the gateway.
     """
     if not progress_stream.stream_enabled():
-        return  # feature off → never loops; zero overhead, zero risk
+        return LOOP_DISABLED  # feature off → never loops; zero overhead, zero risk
     while True:
         try:
             now = time.time()
@@ -5647,9 +5765,27 @@ def _send_via_rest(channel_id: str, message: str):
     print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
 
 
+from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402  — shared owner of the --body-file bounds
+
+
+def _send_cli_body(argv: list) -> str:
+    """Body for `send`: --body-file only as the FIRST token, else joined argv.
+    Recognising it later would turn ordinary prose into a file read."""
+    if not argv or argv[0] != "--body-file":
+        return " ".join(argv)
+    if len(argv) < 2:
+        raise SystemExit("ERROR: --body-file requires a path")
+    if len(argv) > 2:
+        raise SystemExit(f"ERROR: --body-file takes the body; drop {argv[2:]!r}")
+    body = _read_body_file(argv[1])
+    if not body.strip():
+        raise SystemExit(f"ERROR: --body-file {argv[1]!r} is empty — refusing to send")
+    return body
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
-        _send_via_rest(sys.argv[2], " ".join(sys.argv[3:]))
+        _send_via_rest(sys.argv[2], _send_cli_body(sys.argv[3:]))
     else:
         _single_instance_acquire("discord-bridge")
         client.run(TOKEN, log_handler=None)

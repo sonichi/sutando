@@ -49,9 +49,14 @@ class TestSlackBridgeChannelRedirectGuard(unittest.TestCase):
         peek_pos = SRC.find("peek", proactive_block_start)
         self.assertGreater(peek_pos, 0, "peek variable not found after proactive- block")
 
-        # Find rename after the proactive-file check
-        rename_pos = SRC.find(".rename(", proactive_block_start)
-        self.assertGreater(rename_pos, 0, "rename call not found after proactive- block")
+        # The claim is inline (`.rename`) or delegated (`claim_for_delivery`); both are
+        # the moment the file leaves the `*.txt` glob, so take whichever comes first.
+        claim_sites = [p for p in (SRC.find(".rename(", proactive_block_start),
+                                   SRC.find("claim_for_delivery(", proactive_block_start))
+                       if p > 0]
+        self.assertTrue(claim_sites, "no claim site (.rename or claim_for_delivery) found "
+                                     "after proactive- block")
+        rename_pos = min(claim_sites)
 
         # Peek must come BEFORE rename
         self.assertLess(

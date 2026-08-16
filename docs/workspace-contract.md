@@ -77,7 +77,7 @@ When the agent writes a new file under `<repo>/workspace/`, walk this list top-t
 7. **Done/in-flight/next snapshot?** → append to `build_log.md`.
 8. **Blocked question for the owner?** → append to `pending-questions.md`.
 9. **Durable input data?** → `data/<topic>/`.
-10. **Continuity note for the next session?** → `relay/relay-<ts>.md` (consumed by `/catchup-after-startup`).
+10. **Continuity note for the next session?** → `relay/relay-<ts>.md` (consumed by `src/session-handoff.sh`).
 11. **Personal skill the user adds for their own use?** → `skills/<skill-name>/` (local-only, not contributed to `skills/` at the repo root).
 
 If two layers seem to fit, prefer the more specific one (state JSON beats logs beats notes).

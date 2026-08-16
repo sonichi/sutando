@@ -8,6 +8,7 @@ import io
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,18 @@ REPO = Path(__file__).resolve().parents[1]
 # Guards a hang, not promptness — a leaked worker holds stdout open forever, so any
 # bound catches it. Every timing claim here is a separate assert; keep this generous.
 SHUTDOWN_DRAIN_TIMEOUT_S = 30
+# These are early-exit polls, so a generous bound costs a passing run nothing and
+# only stops a slow-but-correct one being reported as a failure.
+EVENT_SETTLE_TIMEOUT_S = 15
+# The second dispatch must follow the first promptly; a serialized notifier would
+# wait out the first task's whole run, which is orders of magnitude longer.
+NO_WAIT_GAP_S = 2.0
+# Sits between watcher startup (measured max 1.255s) and the slow handler's 5s
+# sleep, so it discriminates on blocking rather than on host speed.
+NOT_BLOCKED_S = 3.0
+# Teardown is the one place the bound IS the assertion: a worker that outlives
+# shutdown must fail, so this stays short and separate from the settling polls.
+WORKER_EXIT_S = 2.0
 WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 spec = importlib.util.spec_from_file_location("workstream_session_worker", WORKER)
 worker = importlib.util.module_from_spec(spec)
@@ -183,7 +196,8 @@ def test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan() -> N
 import json, os, sys
 with open(os.environ['PROVIDER_LOG'], 'a') as f:
     f.write(json.dumps({'args': sys.argv[1:], 'cwd': os.getcwd(),
-                        'integration': os.environ.get('TEAM_INTEGRATION_TOKEN')}) + '\\n')
+                        'integration': os.environ.get('TEAM_INTEGRATION_TOKEN'),
+                        'team_runtime': os.environ.get('SUTANDO_TEAM_RUNTIME')}) + '\\n')
 open('claude-work.txt', 'w').write('normal work\\n')
 print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
 """)
@@ -208,6 +222,7 @@ print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
         team_args = call["args"]
         assert Path(call["cwd"]).resolve() == project.resolve()
         assert call["integration"] == "available-to-team-runtime"
+        assert call["team_runtime"] == "1"
         assert team_args[:2] == ["-p", "--no-session-persistence"]
         assert "--dangerously-skip-permissions" in team_args
         assert team_args[team_args.index("--add-dir") + 1] == str(Path.home())
@@ -222,6 +237,49 @@ print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
         assert (project / "claude-work.txt").read_text() == "normal work\n"
         assert (workspace / "results" / team.name).read_text() == "safe claude result"
         assert not (workspace / "results" / guest.name).exists()
+
+
+def test_team_runtime_skips_the_owner_session_handoff() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        environment = {
+            "HOME": str(root),
+            "PATH": os.environ["PATH"],
+            "SUTANDO_REPO_DIR": str(root / "missing-repo"),
+            "SUTANDO_TEAM_RUNTIME": "1",
+        }
+        result = subprocess.run(
+            ["bash", str(_staged_handoff(root))],
+            cwd=root, env=environment, capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode == 0
+        assert result.stdout == "" and result.stderr == ""
+        assert not (root / "session-state.md").exists()
+
+
+def _staged_handoff(root: Path) -> Path:
+    """Copy the script somewhere whose parent is NOT a checkout. Run from the repo
+    its own parent passes _repo_ok, so the no-checkout path is unreachable."""
+    staged = root / "stage" / "src"
+    staged.mkdir(parents=True)
+    shutil.copy(REPO / "src" / "session-handoff.sh", staged / "session-handoff.sh")
+    return staged / "session-handoff.sh"
+
+
+def test_owner_session_handoff_does_not_accept_the_team_bypass_by_default() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        result = subprocess.run(
+            ["bash", str(_staged_handoff(root))],
+            cwd=root,
+            env={"HOME": str(root), "PATH": os.environ["PATH"],
+                 "SUTANDO_REPO_DIR": str(root / "missing-repo")},
+            capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode != 0, (
+            f"expected the no-checkout hard failure; got rc=0 "
+            f"(stdout={result.stdout!r} stderr={result.stderr!r})")
+        assert "could not locate a valid Sutando checkout" in result.stderr
 
 
 def test_team_codex_uses_normal_workspace_and_owner_configuration() -> None:
@@ -261,6 +319,74 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('safe codex result\\n')
         assert (workspace / "results" / team.name).read_text() == "safe codex result\n"
 
 
+def test_provider_launches_do_not_inherit_an_open_parent_fifo() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        project = root / "project"
+        results = workspace / "results"
+        project.mkdir()
+        results.mkdir(parents=True)
+        team = _task(workspace, "task-team-open-fifo", "team")
+        claude_owner = _task(workspace, "task-claude-open-fifo")
+        codex_owner = _task(workspace, "task-codex-open-fifo")
+        _store(workspace, {
+            claude_owner.stem: {"workstream_id": "workstream-a"},
+            codex_owner.stem: {"workstream_id": "workstream-a"},
+        })
+        _executable(root / "codex", """#!/usr/bin/env python3
+import json, os, pathlib, sys
+assert sys.stdin.read() == ''
+args = sys.argv[1:]
+pathlib.Path(args[args.index('-o') + 1]).write_text('safe codex fifo result\\n')
+print(json.dumps({'type': 'thread.started',
+                  'thread_id': '12345678-1234-1234-8234-123456789abc'}))
+""")
+        _executable(root / "claude", """#!/usr/bin/env python3
+import sys
+assert sys.stdin.read() == ''
+print('safe claude fifo result')
+""")
+
+        for runtime, task, expected in (
+            ("codex", team, "safe codex fifo result\n"),
+            ("claude", claude_owner, "safe claude fifo result\n"),
+            ("codex", codex_owner, "safe codex fifo result\n"),
+        ):
+            fifo = root / f"{task.stem}-events"
+            os.mkfifo(fifo)
+            fifo_fd = os.open(fifo, os.O_RDWR)
+            process = subprocess.Popen(
+                [
+                    sys.executable, str(WORKER), "--runtime", runtime,
+                    "--workspace", str(workspace), "--task-file", str(task),
+                    "--results-dir", str(results), "--repo", str(REPO),
+                ],
+                cwd=REPO,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "SUTANDO_ISOLATED_WORKING_DIR": str(project),
+                    "SUTANDO_TIER_HARD_TIMEOUT": "5",
+                    "SUTANDO_TIER_STALL_TIMEOUT": "3",
+                },
+                stdin=fifo_fd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                os.close(fifo_fd)
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=2)
+            assert process.returncode == 0, (runtime, task.name, stdout, stderr)
+            assert (results / task.name).read_text() == expected
+
+
 def test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -275,7 +401,11 @@ def test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end() 
         package_root = REPO / "packages" / "ag2-sparrow"
         sys.path.insert(0, str(package_root))
         try:
-            import ag2_sparrow.remote_gateway_bridge as gateway
+            # The gateway resolves its token AT IMPORT: env -> channel .env -> Keychain.
+            # A dummy short-circuits that chain so the suite never reads live credentials.
+            with mock.patch.dict(os.environ, {"REMOTE_TASK_TOKEN": "test-dummy-token"},
+                                 clear=False):
+                import ag2_sparrow.remote_gateway_bridge as gateway
         finally:
             sys.path.remove(str(package_root))
 
@@ -1087,13 +1217,13 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
         )
         claim = workspace / "state" / "task-event-handler-claims" / task.name
         try:
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while not claim.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert claim.exists()
             assert claim.read_text().splitlines()[3] == "must-handle"
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=3)
+            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             assert "TASK_FILE:" not in stdout
             assert "safe terminal failure" in stderr
             assert "No unrestricted fallback was used" in (results / task.name).read_text()
@@ -1102,7 +1232,7 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate(timeout=2)
+                process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_slow_handler_does_not_block_the_next_task_event() -> None:
@@ -1155,7 +1285,7 @@ def test_slow_handler_does_not_block_the_next_task_event() -> None:
             line = process.stdout.readline()
             elapsed = time.monotonic() - started
             assert line == "TASK_FILE: task-b-live.txt\n"
-            assert elapsed < 1.0, f"second task event was blocked for {elapsed:.2f}s"
+            assert elapsed < NOT_BLOCKED_S, f"second task event was blocked for {elapsed:.2f}s"
         finally:
             os.killpg(process.pid, signal.SIGTERM)
             process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
@@ -1313,7 +1443,7 @@ def test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back(
         overlap = None
         try:
             claim = workspace / "state" / "task-event-handler-claims" / task.name
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while time.monotonic() < deadline:
                 if claim.is_file() and calls.exists():
                     break
@@ -1398,7 +1528,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
         watcher_pgid = process.pid
         try:
             claims = workspace / "state" / "task-event-handler-claims"
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while time.monotonic() < deadline and len(list(claims.glob("task-*.txt"))) < 4:
                 time.sleep(0.01)
             assert sorted(path.name for path in claims.glob("task-*.txt")) == names
@@ -1421,7 +1551,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             assert not remaining_claims
             assert fallback_names == names
             assert len(calls.read_text().splitlines()) <= 2
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + WORKER_EXIT_S
             while time.monotonic() < deadline:
                 try:
                     os.killpg(watcher_pgid, 0)
@@ -1491,14 +1621,18 @@ def test_codex_notifier_dispatches_each_isolated_task_once_without_waiting() -> 
         )
         try:
             started = time.monotonic()
-            calls = []
-            while time.monotonic() - started < 1.0:
+            calls, first_at = [], None
+            while time.monotonic() - started < EVENT_SETTLE_TIMEOUT_S:
                 calls = log.read_text().splitlines() if log.exists() else []
+                if calls and first_at is None:
+                    first_at = time.monotonic()
                 if len(calls) == 2:
                     break
                 time.sleep(0.01)
             assert sorted(calls) == ["task-one.txt", "task-two.txt"]
-            assert time.monotonic() - started < 1.0
+            # "without waiting" is the GAP between the two dispatches; timing from
+            # spawn instead folds in subprocess startup, which alone exceeded 1s.
+            assert time.monotonic() - first_at < NO_WAIT_GAP_S, time.monotonic() - first_at
         finally:
             os.killpg(process.pid, signal.SIGTERM)
             process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
@@ -1565,7 +1699,7 @@ def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 1.5
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             tmux_calls = ""
             while time.monotonic() < deadline:
                 tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
@@ -1574,7 +1708,7 @@ def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
                 time.sleep(0.01)
             assert "task-a-live.txt" in tmux_calls
             assert "task-z-isolated.txt" not in tmux_calls
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while not handler_log.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert handler_log.read_text().splitlines() == ["task-z-isolated.txt"]
@@ -1618,7 +1752,7 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
         )
         claim = workspace / "state" / "task-event-handler-claims" / task.name
         try:
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + EVENT_SETTLE_TIMEOUT_S
             while not claim.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert claim.exists()
@@ -1628,7 +1762,7 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
             lines[3] = "must-handl"
             claim.write_text("\n".join(lines) + "\n")
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=3)
+            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             assert "TASK_FILE:" not in stdout, (
                 "an unrecognised disposition was published to the unrestricted core")
             assert "no recognised disposition" in stderr
@@ -1636,7 +1770,7 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate(timeout=2)
+                process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
 def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
@@ -1663,7 +1797,10 @@ if __name__ == "__main__":
     test_team_collaborator_requires_one_exact_pre_body_stamp()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan()
+    test_team_runtime_skips_the_owner_session_handoff()
+    test_owner_session_handoff_does_not_accept_the_team_bypass_by_default()
     test_team_codex_uses_normal_workspace_and_owner_configuration()
+    test_provider_launches_do_not_inherit_an_open_parent_fifo()
     test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end()
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()

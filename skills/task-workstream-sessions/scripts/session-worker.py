@@ -247,13 +247,17 @@ def _terminate_process_group(process: subprocess.Popen) -> None:
         process.wait(timeout=2)
 
 
-def _run_process_bounded(command: list[str], cwd: Path) -> tuple[int, str, str]:
+def _run_process_bounded(
+    command: list[str], cwd: Path, environment_overrides: Optional[dict[str, str]] = None,
+) -> tuple[int, str, str]:
     """Run a streaming CLI with hard and no-progress deadlines."""
     hard_timeout = float(os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "900"))
     stall_timeout = float(os.environ.get("SUTANDO_TIER_STALL_TIMEOUT", "180"))
     if hard_timeout <= 0 or stall_timeout <= 0:
         raise ValueError("tier runtime timeouts must be positive")
     environment = os.environ.copy()
+    if environment_overrides:
+        environment.update(environment_overrides)
     # Binary pipes read with nonblocking os.read: a text-mode readline() blocks on
     # a partial line even after select() reports readable, so a provider that emits
     # bytes without a newline then stalls would wedge the timeout loop forever
@@ -261,7 +265,7 @@ def _run_process_bounded(command: list[str], cwd: Path) -> tuple[int, str, str]:
     # returns whatever is available immediately, so the loop always makes it back
     # to the deadline checks and can fail closed.
     process = subprocess.Popen(
-        command, cwd=cwd, env=environment, stdout=subprocess.PIPE,
+        command, cwd=cwd, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, start_new_session=True,
     )
     assert process.stdout is not None and process.stderr is not None
@@ -377,7 +381,7 @@ def _run_team(runtime: str, prompt: str, repo: Path, workspace: Path) -> str:
     secret_filter = _load_team_result_scanner(repo)
     if runtime == "claude":
         return_code, stdout, stderr = _run_process_bounded(
-            _claude_team_command(prompt), cwd)
+            _claude_team_command(prompt), cwd, {"SUTANDO_TEAM_RUNTIME": "1"})
         if return_code:
             raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
         body = _claude_stream_result(stdout)
@@ -518,7 +522,7 @@ def _run_claude(workspace: Path, workstream_id: str, prompt: str, repo: Path) ->
     result = subprocess.run(
         _claude_command(session_id, not created, prompt, repo),
         cwd=os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo)),
-        text=True,
+        text=True, stdin=subprocess.DEVNULL,
         capture_output=True,
         check=False,
     )
@@ -544,7 +548,7 @@ def _run_codex(workspace: Path, workstream_id: str, prompt: str, repo: Path) -> 
             process = subprocess.Popen(
                 _codex_command(session_id or None, prompt, repo, output_file),
                 cwd=os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo)),
-                text=True,
+                text=True, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
             )
