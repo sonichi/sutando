@@ -525,13 +525,8 @@ def main() -> int:
           "newline in field cannot forge a second access_tier line")
     check("collaborator: true" not in flines,
           "newline in field cannot forge collaborator access")
-    # A skip-marker result must STILL be POSTed. The marker means "no
-    # user-facing reply", not "don't tell the server": only add_result closes
-    # the server-side lease, and the server's own parse_result drops the
-    # delivery for [no-send]/[REPLIED]/[deduped:]. This assertion previously
-    # required the opposite and so pinned the defect in place — archiving
-    # without POSTing left every marker task's lease open forever, extending
-    # under the ack+alive gate and rewritten by the sweeper each cycle.
+    # Skip markers still POST to close the lease; the server suppresses their
+    # user-facing delivery.
     _before = len(STATE["results"])
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (rtc.RESULTS_DIR / "task-MARK.txt").write_text("[no-send]\n")
