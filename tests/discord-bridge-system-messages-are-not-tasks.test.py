@@ -103,12 +103,8 @@ def _dm_message(system: bool, mtype=0):
 
 
 def _run(msg, checkpoint_raises=False):
-    """Drive on_message, recording the mod observer and the first post-guard call.
-
-    Returns (observed, reached). `observed` is the moderation hook — the consumer
-    the guard used to sit BEHIND, which stores content/author/channel for later
-    judge and action dispatch.
-    """
+    """Drive on_message; returns (observed, reached).
+    `observed` is the moderation hook the guard used to sit BEHIND."""
     observed, reached = [], []
     checkpoints.clear()
 
