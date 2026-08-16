@@ -1,7 +1,6 @@
 #!/bin/bash
 # A shutdown emit invoked one command-substitution deep must reach the REAL
-# stdout, not the substitution's capture pipe. The mutation arm is part of the
-# test: without `>&9` the assertion has to fail, or it proves nothing.
+# stdout. The mutation arm is part of the test; rationale is in the PR body.
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,9 +10,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
-# Run one arm: establish fd 9 as a dup of this subprocess's real stdout, source
-# the unit under test, then invoke the emitter INSIDE a command substitution --
-# where fd 1 is the capture pipe and fd 9 still is not.
+# Establish fd 9 as a dup of real stdout, source the unit, then invoke the
+# emitter INSIDE a substitution -- where fd 1 is the capture pipe and fd 9 is not.
 run_arm() {
 	bash -c '
 		exec 9>&1
@@ -31,7 +29,7 @@ case "$fixed_out" in
 	*) fail "shipped unit: emit did not reach real stdout (got: '$fixed_out')" ;;
 esac
 
-# --- arm 2: mutation -- drop the fd-9 redirect, keep everything else ----------
+# --- arm 2: mutation -- drop the fd-9 redirect, keep everything else ---
 MUTANT="$TMP/task-emit-mutant.sh"
 sed 's/ >&9 / /' "$UNIT" > "$MUTANT"
 grep -q '>&9' "$MUTANT" && fail "mutation did not apply -- mutant still redirects to fd 9"
