@@ -27,6 +27,7 @@ MAP = {
     "workspace_lock.py": "workspace_lock.py",
     "chat_secret_filter.py": "chat_secret_filter.py",
     "vault_set_grammar.py": "vault_set_grammar.py",
+    "send_failure_policy.py": "send_failure_policy.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"
