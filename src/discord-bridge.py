@@ -5765,9 +5765,27 @@ def _send_via_rest(channel_id: str, message: str):
     print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
 
 
+from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402  — shared owner of the --body-file bounds
+
+
+def _send_cli_body(argv: list) -> str:
+    """Body for `send`: --body-file only as the FIRST token, else joined argv.
+    Recognising it later would turn ordinary prose into a file read."""
+    if not argv or argv[0] != "--body-file":
+        return " ".join(argv)
+    if len(argv) < 2:
+        raise SystemExit("ERROR: --body-file requires a path")
+    if len(argv) > 2:
+        raise SystemExit(f"ERROR: --body-file takes the body; drop {argv[2:]!r}")
+    body = _read_body_file(argv[1])
+    if not body.strip():
+        raise SystemExit(f"ERROR: --body-file {argv[1]!r} is empty — refusing to send")
+    return body
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
-        _send_via_rest(sys.argv[2], " ".join(sys.argv[3:]))
+        _send_via_rest(sys.argv[2], _send_cli_body(sys.argv[3:]))
     else:
         _single_instance_acquire("discord-bridge")
         client.run(TOKEN, log_handler=None)
