@@ -74,7 +74,7 @@ import {
 } from './voice-agent-state.js';
 
 import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_paths.js';
-import { shouldForceClosed } from './voice-connect-watchdog.js';
+import { nextConnectingTick } from './voice-connect-watchdog.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -1659,24 +1659,25 @@ async function main() {
 		// in CONNECTING with a client attached, mic captured, nothing reaching the
 		// model. Force CLOSED so the next tick recovers; same transition the
 		// startup path already uses, and valid per bodhi's state table.
-		if (state === 'CONNECTING' && clientConnected) {
-			if (connectingSince === 0) connectingSince = Date.now();
-			else if (shouldForceClosed({
-				state, clientConnected, connectingSince, now: Date.now(),
-				lastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,
-			})) {
-				console.error(`${ts()} [Health] Stuck in CONNECTING for `
-					+ `${Math.round((Date.now() - connectingSince) / 1000)}s — forcing CLOSED to recover`);
+		// The hang clock keys on STATE, not client attachment: a panel reload
+		// mid-hang must not restart the countdown (policy + tests live in
+		// voice-connect-watchdog.ts).
+		const tick = nextConnectingTick({
+			connectingSince, state, clientConnected, now: Date.now(),
+			lastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,
+		});
+		connectingSince = tick.connectingSince;
+		if (tick.forceClose) {
+			console.error(`${ts()} [Health] Stuck in CONNECTING for `
+				+ `${Math.round((Date.now() - connectingSince) / 1000)}s — forcing CLOSED to recover`);
+			try {
+				session.sessionManager.transitionTo('CLOSED');
 				connectingSince = 0;
-				try {
-					session.sessionManager.transitionTo('CLOSED');
-				} catch (err) {
-					console.error(`${ts()} [Health] Could not force CLOSED (state=${session.sessionManager.state}):`,
-						(err as Error)?.message ?? err);
-				}
+			} catch (err) {
+				// Clock stays armed: the throttles in shouldForceClosed bound retries.
+				console.error(`${ts()} [Health] Could not force CLOSED (state=${session.sessionManager.state}):`,
+					(err as Error)?.message ?? err);
 			}
-		} else {
-			connectingSince = 0;
 		}
 		// Recover when session is CLOSED and a client is waiting. handleClientConnected
 		// is bodhi's internal entry point for this exact scenario (CLOSED + client

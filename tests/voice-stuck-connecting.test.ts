@@ -11,7 +11,9 @@
  * reimplementation passes while production drifts. It lives in its own module
  * because importing voice-agent.ts boots a voice agent — main() is unguarded.
  */
-import { shouldForceClosed, parseStuckConnectingMs, DEFAULT_STUCK_CONNECTING_MS } from '../src/voice-connect-watchdog.js';
+import {
+	DEFAULT_STUCK_CONNECTING_MS, nextConnectingTick, parseStuckConnectingMs, shouldForceClosed,
+} from '../src/voice-connect-watchdog.js';
 
 let failed = 0;
 function check(name: string, got: unknown, want: unknown): void {
@@ -82,6 +84,30 @@ for (const bad of ['abc', '12x', 'NaN', '-1']) {
 	check(`${bad} names the variable in the warning`,
 		warnings[0]?.includes('VOICE_STUCK_CONNECTING_MS'), true);
 }
+
+// --- The tick LIFECYCLE (review blocker): the hang clock keys on state alone.
+//     A client detaching mid-hang must not reset it — a user reloading the
+//     panel is the common human response to a hung session, and resetting
+//     would push recovery out indefinitely.
+const t0 = 2_000_000;
+const tickBase = {
+	state: 'CONNECTING', clientConnected: true, now: t0,
+	lastReconnectAt: 0, fatalBackoffUntil: 0, thresholdMs: T,
+};
+check('first CONNECTING observation arms the clock',
+	nextConnectingTick({ ...tickBase, connectingSince: 0 }).connectingSince, t0);
+check('...without firing on the arming tick',
+	nextConnectingTick({ ...tickBase, connectingSince: 0, now: t0 + T + 1 }).forceClose, false);
+check('a client detaching mid-hang does NOT reset the clock',
+	nextConnectingTick({ ...tickBase, clientConnected: false, connectingSince: t0, now: t0 + 60_000 }).connectingSince, t0);
+check('...and does not fire while detached',
+	nextConnectingTick({ ...tickBase, clientConnected: false, connectingSince: t0, now: t0 + T + 1 }).forceClose, false);
+check('a reload straddling the hang still fires from the ORIGINAL arm time',
+	nextConnectingTick({ ...tickBase, connectingSince: t0, now: t0 + T + 1 }).forceClose, true);
+check('leaving CONNECTING resets the clock',
+	nextConnectingTick({ ...tickBase, state: 'ACTIVE', connectingSince: t0 }).connectingSince, 0);
+check('...and never fires from another state',
+	nextConnectingTick({ ...tickBase, state: 'CLOSED', connectingSince: t0, now: t0 + T + 1 }).forceClose, false);
 
 console.log(failed ? `FAILED: ${failed} check(s)` : 'voice stuck-CONNECTING watchdog: all checks passed');
 process.exit(failed ? 1 : 0);

@@ -45,3 +45,22 @@ export function shouldForceClosed(o: {
 	if (o.now - o.lastReconnectAt <= 60_000) return false;
 	return o.now > o.fatalBackoffUntil;
 }
+
+/** One health-tick step of the hang clock.
+ *
+ *  The clock keys on STATE alone: a client detaching must NOT reset it — the
+ *  session is still hung, and a user reloading the panel (the one
+ *  self-recovery action they have) would otherwise restart the countdown and
+ *  push recovery out indefinitely. Attachment is checked at FIRE time instead,
+ *  via shouldForceClosed. The caller owns the transition and should zero the
+ *  clock only after it succeeds, so a failed force keeps the clock armed.
+ */
+export function nextConnectingTick(o: {
+	connectingSince: number; state: string; clientConnected: boolean;
+	now: number; lastReconnectAt: number; fatalBackoffUntil: number;
+	thresholdMs?: number;
+}): { connectingSince: number; forceClose: boolean } {
+	if (o.state !== 'CONNECTING') return { connectingSince: 0, forceClose: false };
+	if (o.connectingSince === 0) return { connectingSince: o.now, forceClose: false };
+	return { connectingSince: o.connectingSince, forceClose: shouldForceClosed(o) };
+}
