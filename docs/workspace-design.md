@@ -74,7 +74,7 @@ Per-user runtime + content. Lives at `<repo>/workspace/` by default (post-M0). S
 | `state/auth/`, `state/cloud-auth.json`, `state/device.json` | ❌ no | Per-host durable | Install/identity state, per-host |
 | `logs/conversation.log` | ❌ no | Per-host runtime | Voice/phone/discord log; large + per-host |
 | `data/conversation.sqlite` | ❌ no | Per-host runtime | SQLite mirror of conversation log |
-| `skill-repos/<repo-name>/` | ❌ no | Per-host clone | Git checkouts of skill **source** repos that `skills/install.sh` symlinks from |
+| `skill-repos/<repo-name>/` | ❌ no | Per-host clone | Git checkouts of skill **source** repos; each is linked by its OWN installer, not by `skills/install.sh` |
 | `.env` | ❌ no | Per-host secret | Tokens, API keys — must NOT sync |
 
 The sync default is "synced unless excluded"; per-host runtime sub-paths are excluded via the carrier-set gitignore (per PR #1447) + `vault.sync.exclude` user overrides.
@@ -87,11 +87,16 @@ Clone skill repos there rather than into `$HOME`. A checkout outside the workspa
 
 `skill-repos/` is **not** synced. The blanket `*` in the carrier-set gitignore already excludes it, which is what you want: these are independent git repos with their own remotes and history, some of them large, and the vault should not be carrying a nested checkout.
 
-Relocating an existing clone is a three-step change, and the second and third steps are the ones that get missed:
+**`skills/install.sh` does not manage these.** It iterates only its own directory — `for skill_dir in "$SKILLS_DIR"/*/` — so it links the built-in `skills/*/` of this repo and nothing else; the string `skill-repos` does not appear in it. Each external checkout is linked by **its own** installer, at `skill-repos/<repo-name>/scripts/install.sh`. Measured on this host: 58 links point into this repo, 35 into `skill-repos/`, 3 elsewhere.
+
+Relocating a clone therefore depends on which installer owns it, because they differ on the one step that matters:
 
 1. `mv` the checkout to `<workspace>/skill-repos/<repo-name>/`.
-2. Re-run the repo's `install.sh`, **then verify each link individually** — a conservative installer refuses to overwrite symlinks pointing outside itself, so it will report `0 linked` and change nothing while every link is still dangling. Clear the dead links first.
-3. Update any cron that names the old path **and re-register it**. A registered job holds the prompt text it was created with; editing the config file alone leaves the old path firing.
+2. **Check how that repo's installer treats an existing symlink**, then act accordingly:
+   - `ln -sfn` (e.g. `sutando-personal`) — force-relinks in place. Re-run it; nothing to clear.
+   - skip-if-points-elsewhere (e.g. `sutando-skills`, which prints `⚠ <name> (symlink points elsewhere … skipping)`) — re-running it after a move changes **nothing**, because every link still names the old path. Remove those links first, then re-run.
+3. Verify each resulting link resolves, rather than trusting the installer's own count.
+4. Update any cron that names the old path **and re-register it**. A registered job holds the prompt text it was created with; editing the config file alone leaves the old path firing.
 
 ## Decisions (preserved as historical record)
 
