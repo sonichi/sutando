@@ -92,9 +92,8 @@ def _redactor():
             _log_fallback("chat_secret_filter unavailable (%s) — using the narrower "
                           "vault_set_grammar; non-vault secrets are NOT filtered" % exc)
         except Exception as exc2:
-            # Fail CLOSED. Returning the raw body here would be exactly the
-            # defect, and both modules are tracked files — absence means the
-            # install is broken, not that redaction is optional.
+            # Fail CLOSED: returning the raw body IS the defect, and both modules
+            # are tracked files, so absence means a broken install.
             _REDACTOR = lambda s: "[REDACTION UNAVAILABLE — body withheld]" if s else s
             _log_fallback("no redaction module importable (%s / %s) — WITHHOLDING every "
                           "body; this is pinned for the life of the process" % (exc, exc2))

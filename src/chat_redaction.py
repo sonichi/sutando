@@ -22,9 +22,8 @@ reaches for a "long" value to prove the gap closed will pass on the old code.
 from __future__ import annotations
 
 
-# Imported eagerly, NOT inside the function: the room-ops reader picks its
-# redactor once and falls back if this module cannot import. A lazy import would
-# defer that failure to call time, past the ladder that exists to catch it.
+# Eager, not lazy: the reader picks its redactor once and degrades if this module
+# will not import — a lazy import defers that past the ladder built to catch it.
 from chat_secret_filter import filter_chat_secrets
 from vault_intercept import redact_vault_commands
 
