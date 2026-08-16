@@ -395,6 +395,35 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stdout)
         self.assertNotIn("no unmerged peer content", r.stdout)
 
+    def test_a_live_path_that_became_a_DIRECTORY_stays_in_the_report(self):
+        """Non-comparable is not reconciled: dropping the row reads as 'nothing to do'."""
+        d = self.batch / "memory"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "became-dir.md").write_text("# a\nline1\npeer-only\n")
+        (self.ws / "memory").mkdir(exist_ok=True)
+        (self.ws / "memory" / "became-dir.md").mkdir()      # live path is now a DIRECTORY
+
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("became-dir.md", r.stdout)
+        self.assertIn("NOT A FILE", r.stdout)
+        self.assertNotIn("no unmerged peer content", r.stdout)
+
+    def test_the_directory_disposition_is_DISTINCT_from_a_missing_live_file(self):
+        """Two different states must not print the same line — `None` already means absent."""
+        d = self.batch / "memory"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "gone.md").write_text("# a\npeer-only\n")
+        (d / "isdir.md").write_text("# a\npeer-only\n")
+        (self.ws / "memory").mkdir(exist_ok=True)
+        (self.ws / "memory" / "isdir.md").mkdir()           # exists, not a file
+        # gone.md is deliberately never created live -> the None branch
+
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("live file MISSING", r.stdout)
+        self.assertIn("NOT A FILE", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
