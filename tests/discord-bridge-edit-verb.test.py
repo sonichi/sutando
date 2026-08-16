@@ -122,6 +122,24 @@ def main() -> int:
         check("message_id 4242" in buf.getvalue(),
               f"send prints the created message_id (got {buf.getvalue()!r})")
 
+        # 4b. A PATCH that genuinely fails must exit nonzero and say so. The
+        #     refusals above all short-circuit BEFORE the request, so without
+        #     this the failing-request path was never exercised at all.
+        def fake_raise(req, timeout=None):
+            raise RuntimeError("403 Forbidden")
+
+        urllib.request.urlopen = fake_raise
+        buf = io.StringIO()
+        rc = None
+        try:
+            with redirect_stdout(buf):
+                _mod._edit_via_rest("111", "222", "nope")
+        except SystemExit as e:
+            rc = e.code
+        check(rc == 1, f"a failing PATCH exits 1 (got {rc})")
+        check("Edit failed" in buf.getvalue(),
+              f"...and names the failure (got {buf.getvalue()!r})")
+
         # 5. A COMMITTED send whose response body is unreadable is still a send.
         #    Reporting it as a failure invites the retry that duplicates it.
         calls = []
