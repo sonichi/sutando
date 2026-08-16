@@ -67,8 +67,8 @@ _discord_stub.Intents = _Intents
 _discord_stub.Client = _Client
 _discord_stub.AllowedMentions = _AllowedMentions
 class _Thread:
-    """Production discord.py always provides Thread; the stub omitted it, so
-    the thread branch was unreachable under test and went uncovered."""
+    """The stub omitted Thread, so the thread branch was unreachable under
+    test and went uncovered."""
 
 
 _discord_stub.Thread = _Thread
@@ -449,8 +449,7 @@ def _auto_thread_reference(task_id, channel):
 
 
 def case_e_auto_thread_quotes_in_a_plain_channel():
-    """No directive, but an anchor is registered: the reply quotes the message
-    that triggered it. Pins the behaviour the thread case must also get."""
+    """Anchor registered, no directive: the reply quotes what triggered it."""
     fails = []
     sent = _auto_thread_reference("test-task-e", _MockChannel(channel_id=111222333))
     if not sent:
@@ -462,9 +461,8 @@ def case_e_auto_thread_quotes_in_a_plain_channel():
 
 
 def case_f_auto_thread_quotes_inside_a_thread_too():
-    """A Discord THREAD gets the same quote. Position stops identifying what a
-    message answers once several exchanges interleave, which is every busy
-    thread — so 'the thread anchors it implicitly' does not hold there."""
+    """A Discord THREAD gets the same quote: interleaved exchanges make
+    position stop identifying what a message answers."""
     fails = []
     sent = _auto_thread_reference("test-task-f", _MockThreadChannel(channel_id=444000111))
     if not sent:
@@ -478,9 +476,8 @@ def case_f_auto_thread_quotes_inside_a_thread_too():
 
 
 def case_g_the_stub_can_actually_see_a_thread():
-    """Guard: if the stub's Thread were missing or _MockThreadChannel were not
-    one, case f would pass for the wrong reason — an absent class reads exactly
-    like a channel that is not a thread."""
+    """Guard: an absent Thread class reads exactly like a non-thread channel,
+    so without this case f would pass for the wrong reason."""
     fails = []
     if getattr(bridge.discord, "Thread", None) is None:
         fails.append("g) the stub exposes no Thread class, so case f proves nothing")

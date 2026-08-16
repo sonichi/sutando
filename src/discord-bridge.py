@@ -4777,11 +4777,8 @@ async def poll_results():
                     reply_to_id = int(reply_match.group(1)) if reply_match else None
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
-                    # Auto-thread: if the agent didn't pick an explicit
-                    # [reply: <id>], default to the triggering message so the
-                    # reply appears quoted under what it's answering. Threads
-                    # included: a busy thread interleaves several exchanges, so
-                    # position stops identifying what a message answers.
+                    # Default to quoting the triggering message. Threads too:
+                    # interleaved exchanges make position stop identifying it.
                     if reply_to_id is None:
                         reply_to_id = source_message_anchor
 
