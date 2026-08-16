@@ -49,6 +49,35 @@ class TestIsTransient(unittest.TestCase):
 
         self.assertTrue(sfp.is_transient(ServerDisconnectedError()))
 
+    def test_a_subclass_of_a_listed_transient_is_transient(self):
+        # aiohttp raises ClientConnectorDNSError(ClientConnectorError) for a DNS
+        # failure, so the concrete name is NOT the listed one. Matching only the
+        # concrete class parked an owner's DM permanently on the first blip —
+        # the retry budget was never spent because the branch was never entered.
+        class ClientConnectorError(Exception):
+            pass
+
+        class ClientConnectorDNSError(ClientConnectorError):
+            pass
+
+        exc = ClientConnectorDNSError(
+            "Cannot connect to host discord.com:443 ssl:default "
+            "[nodename nor servname provided, or not known]")
+        self.assertNotIn(type(exc).__name__, sfp._TRANSIENT_EXC_NAMES)
+        self.assertTrue(sfp.is_transient(exc))
+        self.assertTrue(sfp.should_retry(exc, 0))
+
+    def test_an_unlisted_hierarchy_still_parks(self):
+        # The MRO walk must not turn "any exception" into a retry: only a listed
+        # ancestor counts.
+        class SomeLibraryError(Exception):
+            pass
+
+        class MalformedPayloadError(SomeLibraryError):
+            pass
+
+        self.assertFalse(sfp.is_transient(MalformedPayloadError("bad body")))
+
     def test_unknown_failure_parks(self):
         # Parking an unknown error loses nothing — quarantine preserves the body and
         # health-check reports it — while retrying forever would bury the log.

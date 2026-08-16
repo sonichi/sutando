@@ -44,8 +44,13 @@ def is_transient(exc: BaseException) -> bool:
 
     The NAME is checked before the status: a status short-circuit made
     `_TRANSIENT_EXC_NAMES` unreachable for any of those types that carries one.
+
+    Names are matched across the whole MRO, not just the concrete class: aiohttp
+    raises `ClientConnectorDNSError(ClientConnectorError)` for a DNS failure, and
+    an exact-name test misses every such subclass while its listed parent sits
+    right above it.
     """
-    if type(exc).__name__ in _TRANSIENT_EXC_NAMES:
+    if any(base.__name__ in _TRANSIENT_EXC_NAMES for base in type(exc).__mro__):
         return True
     status = failure_status(exc)
     if status is not None:
