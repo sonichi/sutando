@@ -104,5 +104,101 @@ class MeasuredFilesParsing(unittest.TestCase):
             self.assertEqual(self.m.measured_files(Path(td) / "absent.xml"), set())
 
 
+class MalformedConfig(unittest.TestCase):
+    def setUp(self):
+        self.m = _mod()
+
+    def test_an_unparsable_rcfile_yields_no_globs_rather_than_raising(self):
+        # Same fail-open contract as the report: the gate's verdict must never
+        # depend on this helper, so a broken config loses the exemptions rather
+        # than the run.
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / ".coveragerc"
+            bad.write_text("[run\nomit = tests/*\n")   # unclosed section header
+            self.assertEqual(self.m.omit_globs(bad), [])
+
+
+class ChangedFilesComeFromGit(unittest.TestCase):
+    """`changed_py` runs git in the CWD, so drive it against a real repo."""
+
+    def setUp(self):
+        self.m = _mod()
+
+    def _repo(self, td: Path) -> Path:
+        import os
+        import subprocess
+        r = td / "repo"
+        r.mkdir()
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
+        run = lambda *a: subprocess.run(["git", "-C", str(r), *a],  # noqa: E731
+                                        check=True, capture_output=True, env=env)
+        subprocess.run(["git", "init", "-q", "-b", "base", str(r)],
+                       check=True, capture_output=True)
+        (r / "kept.py").write_text("x = 1\n")
+        run("add", "-A"); run("commit", "-qm", "base")
+        run("switch", "-qc", "topic")
+        (r / "added.py").write_text("y = 2\n")
+        (r / "notpython.md").write_text("doc\n")
+        run("add", "-A"); run("commit", "-qm", "topic")
+        return r
+
+    def test_only_changed_python_files_are_returned(self):
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            r = self._repo(Path(td))
+            cwd = os.getcwd()
+            try:
+                os.chdir(r)
+                self.assertEqual(self.m.changed_py("base"), ["added.py"])
+            finally:
+                os.chdir(cwd)
+
+    def test_a_failing_git_yields_no_files_rather_than_raising(self):
+        # An unknown base ref (or a non-repo cwd) must not take the gate down.
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            r = self._repo(Path(td))
+            cwd = os.getcwd()
+            try:
+                os.chdir(r)
+                self.assertEqual(self.m.changed_py("no-such-ref"), [])
+            finally:
+                os.chdir(cwd)
+
+
+class CommandLine(unittest.TestCase):
+    def setUp(self):
+        self.m = _mod()
+
+    def test_too_few_arguments_exits_nonzero_without_printing_paths(self):
+        import io
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.m.main(["coverage_unmeasured.py"])
+        self.assertEqual(rc, 2)
+        self.assertIn("Usage", err.getvalue())
+
+    def test_it_prints_one_unmeasured_path_per_line(self):
+        import contextlib
+        import io
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            xml = Path(td) / "coverage.xml"
+            xml.write_text(XML)
+            rc_file = Path(td) / ".coveragerc"
+            rc_file.write_text("[run]\nomit =\n    tests/*\n")
+            self.m.changed_py = lambda base: ["packages/x/bridge.py", "tests/a.test.py",
+                                              "src/health-check.py"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = self.m.main(["prog", "origin/main", str(xml), "--rcfile", str(rc_file)])
+        self.assertEqual(rc, 0)
+        # tests/ omitted on purpose; health-check.py is in the report by suffix.
+        self.assertEqual(out.getvalue().split(), ["packages/x/bridge.py"])
+        self.assertNotIn("tests/a.test.py", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
