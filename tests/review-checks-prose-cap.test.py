@@ -29,7 +29,7 @@ def check(name, filename, body, want_rc):
         diff = (f"diff --git a/{filename} b/{filename}\n--- /dev/null\n"
                 f"+++ b/{filename}\n@@ -0,0 +1,{n} @@\n"
                 + "".join("+" + l + "\n" for l in body.splitlines()))
-        found, unscannable = pc.violations(diff, 2, (".py",), root=td)
+        found, unscannable, _absent = pc.violations(diff, 2, (".py",), root=td)
         rc = 1 if found else 0
         if rc != want_rc:
             failures.append(f"{name}: rc={rc} want={want_rc} found={found} unscannable={unscannable}")
@@ -57,23 +57,45 @@ with tempfile.TemporaryDirectory() as td:
     p.write_text("# pre-existing one\n# pre-existing two\n# newly added third\nV = 1\n")
     diff = ("diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -2,1 +3,1 @@\n"
             "+# newly added third\n")
-    found, _ = pc.violations(diff, 2, (".py",), root=td)
+    found, _, _absent = pc.violations(diff, 2, (".py",), root=td)
     if found:
         failures.append(f"partially-added run must not fire: {found}")
     else:
         print("  ok: a run whose earlier lines were NOT added does not fire")
 
-# --- an unscannable file is reported, never silently passed ------------------
+# --- an unreadable file is reported, never silently passed ------------------
 with tempfile.TemporaryDirectory() as td:
     p = pathlib.Path(td) / "g.py"
     p.write_text("def broken(:\n")
     diff = ("diff --git a/g.py b/g.py\n--- /dev/null\n+++ b/g.py\n@@ -0,0 +1,1 @@\n"
             "+def broken(:\n")
-    found, unscannable = pc.violations(diff, 2, (".py",), root=td)
+    found, unscannable, _absent = pc.violations(diff, 2, (".py",), root=td)
     if "g.py" not in unscannable:
         failures.append("an untokenizable file must be REPORTED as unscannable")
     else:
         print("  ok: an untokenizable file is reported, not silently passed")
+
+# --- a tree at a DIFFERENT revision must not yield findings about its content --
+# Control runs first: a SKIPPED that merely switched the gate off fails the pair.
+with tempfile.TemporaryDirectory() as td:
+    disk = "# disk one\n# disk two\n# disk three\nV = 1\n"
+    (pathlib.Path(td) / "rev.py").write_text(disk)
+
+    same = ("diff --git a/rev.py b/rev.py\n--- /dev/null\n+++ b/rev.py\n@@ -0,0 +1,4 @@\n"
+            + "".join("+" + l + "\n" for l in disk.splitlines()))
+    found, _u, det = pc.violations(same, 2, (".py",), root=td)
+    if found and not det:
+        print("  ok: control — when the tree IS the diff's revision, the run still fires")
+    else:
+        failures.append(f"matching-revision control must fire: found={found} detached={det}")
+
+    other = ("diff --git a/rev.py b/rev.py\n--- /dev/null\n+++ b/rev.py\n@@ -0,0 +1,4 @@\n"
+             "+# submitted one\n+# submitted two\n+# submitted three\n+V = 1\n")
+    found, _u, det = pc.violations(other, 2, (".py",), root=td)
+    if not found and det == ["rev.py"]:
+        print("  ok: a foreign revision is SKIPPED, not reported as the diff's own finding")
+    else:
+        failures.append(f"foreign revision must not produce findings: found={found} detached={det}")
 
 # --- branch coverage: paths violations() takes that the cases above miss -----
 def diff_for(filename, body, *, context_lines=0):
@@ -90,7 +112,7 @@ def diff_for(filename, body, *, context_lines=0):
 with tempfile.TemporaryDirectory() as td:
     # A non-.py file in the diff must be skipped by the extension filter.
     (pathlib.Path(td) / "notes.md").write_text("# one\n# two\n# three\n")
-    found, _ = pc.violations(diff_for("notes.md", "# one\n# two\n# three\n"), 2, (".py",), root=td)
+    found, _, _absent = pc.violations(diff_for("notes.md", "# one\n# two\n# three\n"), 2, (".py",), root=td)
     print("  ok: non-.py file is skipped by the extension filter" if not found
           else f"  FAIL ext filter: {found}")
     if found:
@@ -102,7 +124,7 @@ with tempfile.TemporaryDirectory() as td:
     p2.write_text("# a1\n# a2\n# a3\n# preexisting\n# b1\n# b2\n# b3\nV = 1\n")
     d = ("diff --git a/split.py b/split.py\n--- a/split.py\n+++ b/split.py\n@@ -1,8 +1,8 @@\n"
          "+# a1\n+# a2\n+# a3\n # preexisting\n+# b1\n+# b2\n+# b3\n V = 1\n")
-    found, _ = pc.violations(d, 2, (".py",), root=td)
+    found, _, _absent = pc.violations(d, 2, (".py",), root=td)
     if len(found) == 2:
         print("  ok: a run split by a non-added comment flushes as two runs")
     else:
@@ -113,7 +135,7 @@ with tempfile.TemporaryDirectory() as td:
     # so the first run must flush at the gap rather than merging across it.
     p3 = pathlib.Path(td) / "gap.py"
     p3.write_text("# a1\n# a2\n# a3\nV = 1\n# b1\n# b2\n# b3\nW = 2\n")
-    found, _ = pc.violations(diff_for("gap.py", p3.read_text()), 2, (".py",), root=td)
+    found, _, _absent = pc.violations(diff_for("gap.py", p3.read_text()), 2, (".py",), root=td)
     if len(found) == 2 and found[0][1] == 1 and found[1][1] == 5:
         print("  ok: runs separated by code flush at the gap, not merged")
     else:
@@ -169,13 +191,30 @@ with tempfile.TemporaryDirectory() as td:
         else:
             failures.append(f"main unscannable path: rc={rc} err={err!r}")
 
-        # A file in the diff with NO post-image at all is the reviewer's control:
-        # it used to print PASS, which is a verdict about a read that never ran.
+        # No post-image must say SKIPPED, never PASS (a verdict about an unread file)
+        # and never non-zero (that failed 3 sibling suites on every detached diff).
         rc, out, err = run_main(diff_for("missing.py", None))
-        if rc != 0 and "PASS" not in err:
-            print("  ok: a diff naming an absent file cannot report PASS")
+        if rc == 0 and "PASS" not in err and "SKIPPED" in err:
+            print("  ok: an absent post-image reports SKIPPED — neither PASS nor fail-closed")
         else:
             failures.append(f"absent post-image: rc={rc} err={err!r}")
+
+        # The regression itself: a detached diff must leave the OTHER scanners' verdict
+        # intact. review-checks.sh exits 2 on any non-zero here, so this is the gate.
+        rc, out, err = run_main(diff_for("gone.py", None).replace("+# one\n+# two\n+# three\n",
+                                                                 "+harmless = 1\n"))
+        if rc == 0 and out.strip() == "":
+            print("  ok: a clean detached diff exits 0, so the runner still reports its peers")
+        else:
+            failures.append(f"detached clean diff must not fail closed: rc={rc} out={out!r}")
+
+        # Present-but-unparseable stays fail-closed: it was reachable and still unread.
+        pathlib.Path("held.py").write_text("def broken(:\n")
+        rc, out, err = run_main(diff_for("held.py", "def broken(:\n"))
+        if rc == 2 and "FAIL-CLOSED" in err:
+            print("  ok: absent and unreadable are different answers (unreadable still gates)")
+        else:
+            failures.append(f"unreadable must stay fail-closed: rc={rc} err={err!r}")
 
         # --- the configured cap/exts must be honored, not decorative ---------
         pathlib.Path("cfg.py").write_text("# one\n# two\n# three\nx = 1\n")

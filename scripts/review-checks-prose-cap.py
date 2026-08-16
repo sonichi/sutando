@@ -29,38 +29,59 @@ def comment_lines(path):
 
 
 def added_by_file(diff_text):
-    """{path: {added line numbers in the post-image}} from a unified diff."""
+    """{path: {post-image line number: its text}} from a unified diff."""
     out, path, lineno = {}, None, 0
     for raw in diff_text.splitlines():
         if raw.startswith("+++ "):
             p = raw[4:].strip()
             path = None if p == "/dev/null" else re.sub(r"^b/", "", p)
-            out.setdefault(path, set()) if path else None
+            out.setdefault(path, {}) if path else None
             continue
         m = HUNK.match(raw)
         if m:
             lineno = int(m.group(1))
             continue
-        if path is None:
-            continue
+        if path is None or raw.startswith("\\"):
+            continue  # "\ No newline at end of file" occupies no post-image line.
         if raw.startswith("+"):
-            out.setdefault(path, set()).add(lineno)
+            out.setdefault(path, {})[lineno] = raw[1:]
             lineno += 1
         elif not raw.startswith("-"):
             lineno += 1
     return out
 
 
+def post_image_matches(path, added):
+    """True when every added line is on disk verbatim at its own number — i.e. this
+    tree really is the diff's post-image, not some neighbouring revision of it."""
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return all(n <= len(lines) and lines[n - 1] == text for n, text in added.items())
+
+
 def violations(diff_text, cap, exts, root="."):
-    """(path, first_line, length) for each fully-added comment run longer than cap."""
-    found, unscannable = [], []
+    """(found, unreadable, detached). found = (path, first_line, length) per run over cap.
+    Detached and unreadable are split because only one of them is a fault."""
+    found, unreadable, detached = [], [], []
     for path, added in added_by_file(diff_text).items():
         if not added or not any(path.endswith(e) for e in exts):
             continue
         full = Path(root) / path
+        # A diff can legitimately arrive without its tree (`gh pr diff > pr.diff`).
+        # Tokenizing needs the post-image, so those files are out of reach, not broken.
+        if not full.exists():
+            detached.append(path)
+            continue
         cl = comment_lines(full)
         if cl is None:
-            unscannable.append(path)
+            unreadable.append(path)
+            continue
+        # A file at some OTHER revision is worse than a missing one: the line numbers
+        # still resolve, so it yields confident findings about content nobody submitted.
+        if not post_image_matches(full, added):
+            detached.append(path)
             continue
         # Walk only the comment lines that were added, grouping consecutive runs.
         run = []
@@ -77,7 +98,7 @@ def violations(diff_text, cap, exts, root="."):
             run.append(n)
         if len(run) > cap:
             found.append((path, run[0], len(run)))
-    return found, unscannable
+    return found, unreadable, detached
 
 
 def _config():
@@ -99,20 +120,27 @@ def main():
     if not diff_text.strip():
         print("prose-cap: empty diff; nothing scanned, so this is NOT a pass", file=sys.stderr)
         return 2
-    found, unscannable = violations(diff_text, cap, exts)
+    found, unreadable, detached = violations(diff_text, cap, exts)
     for path, line, length in found:
         print(f"prose-cap: {path}:{line} comment block is {length} lines (cap {cap})")
-    # An unread post-image was never checked, so PASS would be a verdict about a
-    # read that did not happen. Non-zero is the runner's fail-closed signal.
-    if unscannable:
-        for path in unscannable:
+    # A file that IS here and still would not parse is a fault: it was meant to be
+    # read and was not, so a verdict about it would be about a read that never ran.
+    if unreadable:
+        for path in unreadable:
             print(f"prose-cap: {path} has no readable post-image; NOT scanned", file=sys.stderr)
-        print(f"prose-cap: FAIL-CLOSED — {len(unscannable)} in-scope file(s) unverified",
+        print(f"prose-cap: FAIL-CLOSED — {len(unreadable)} in-scope file(s) unverified",
               file=sys.stderr)
         return 2
     # Findings ride stdout and must still exit 0: a violation is a successful scan.
     if found:
         print(f"prose-cap: {len(found)} block(s) over the {cap}-line cap", file=sys.stderr)
+    elif detached:
+        # Never a bare PASS here — the scan had nothing to read, which is a different
+        # answer from "read it and it was clean", and the runner reprints the distinction.
+        for path in detached:
+            print(f"prose-cap: {path} has no matching post-image here; NOT scanned", file=sys.stderr)
+        print(f"prose-cap: SKIPPED — {len(detached)} in-scope file(s) are not this tree's revision",
+              file=sys.stderr)
     else:
         print(f"prose-cap: PASS (comment blocks within cap {cap}, exts {','.join(exts)})",
               file=sys.stderr)

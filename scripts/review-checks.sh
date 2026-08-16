@@ -137,8 +137,16 @@ fi
 # --- scan ADDED lines for prose blocks over the physical-line cap -----------
 # Separate scanner: COMMENT runs only, classified by tokenize over the post-image.
 # Docstrings are out of scope — the written contract caps code comments.
-PROSE_HITS="$(printf '%s' "$DIFF" | RC_PROSE_CAP="$PROSE_CAP" RC_PROSE_EXTS="$PROSE_EXTS" python3 "$HERE/review-checks-prose-cap.py")"
+PROSE_ERR="$(mktemp -t review-checks-prose.XXXXXX)"
+trap 'rm -f "$PROSE_ERR"' EXIT
+PROSE_HITS="$(printf '%s' "$DIFF" | RC_PROSE_CAP="$PROSE_CAP" RC_PROSE_EXTS="$PROSE_EXTS" python3 "$HERE/review-checks-prose-cap.py" 2>"$PROSE_ERR")"
 PROSE_RC=$?
+cat "$PROSE_ERR" >&2
+# A diff detached from its tree (`gh pr diff`) leaves prose-cap nothing to read.
+# That is not a failure, but the summary must not report it as a clean scan.
+PROSE_SCOPE="hardcoded-paths + root-artifacts + prose-cap clean"
+grep -q '^prose-cap: SKIPPED' "$PROSE_ERR" &&
+    PROSE_SCOPE="hardcoded-paths + root-artifacts clean; prose-cap SKIPPED — no post-image"
 # Fail-closed is asserted AFTER the other scanners report. Exiting here would
 # suppress real hardcoded-path/root-artifact findings already in hand.
 
@@ -166,5 +174,5 @@ if [[ $PROSE_RC -ne 0 ]]; then
     exit 2
 fi
 [[ $FAILED -eq 1 ]] && exit 1
-echo "review-checks: PASS (hardcoded-paths + root-artifacts + prose-cap clean)"
+echo "review-checks: PASS ($PROSE_SCOPE)"
 exit 0
