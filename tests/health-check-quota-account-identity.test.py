@@ -17,6 +17,7 @@ Keychain access is stubbed — these tests never touch the real keychain and nev
 read a token. The production code compares keychain ITEM NAMES only.
 """
 import hashlib
+import json
 import importlib.util
 import os
 import plistlib
@@ -394,6 +395,54 @@ class TestQuotaAccountIdentity(unittest.TestCase):
             hc._resolved_credential_service(core)
         for call in run.call_args_list:
             self.assertNotIn("-w", call.args[0], "must not read the secret value")
+
+
+    # ---- an interpreter that cannot import plistlib must still ANSWER -------
+
+    def test_plistlib_unavailable_answers_via_plutil(self):
+        """A broken pyexpat is an interpreter fault, not an unanswerable
+        question: the two logins must still be compared."""
+        core = "/Users/x/ws/.claude-sutando"
+        payload = json.dumps({"Label": "com.sutando.credential-proxy",
+                              "EnvironmentVariables": {"CLAUDE_CONFIG_DIR": core}})
+        with mock.patch.dict(sys.modules, {"plistlib": None}), \
+             mock.patch.object(hc.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=payload)):
+            out = self._run(core_cfg=core, plist_cfg=core,
+                            existing_services={_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "ok", out["detail"])
+        self.assertIn("same keychain item", out["detail"])
+
+    def test_plutil_unusable_keeps_the_original_warning(self):
+        """No plutil, a bad exit, or a non-mapping root keeps the warn — a
+        fallback must never turn "cannot tell" into "ok"."""
+        core = "/Users/x/ws/.claude-sutando"
+        cases = [("side_effect", OSError("no plutil binary")),
+                 ("side_effect", hc.subprocess.SubprocessError("timeout")),
+                 ("return_value", mock.Mock(returncode=1, stdout="")),
+                 ("return_value", mock.Mock(returncode=0, stdout="not json")),
+                 ("return_value", mock.Mock(returncode=0, stdout='["a list"]'))]
+        for kind, outcome in cases:
+            with self.subTest(outcome=repr(outcome)[:40]):
+                with mock.patch.dict(sys.modules, {"plistlib": None}), \
+                     mock.patch.object(hc.subprocess, "run", **{kind: outcome}):
+                    out = self._run(core_cfg=core, plist_cfg=core,
+                                    existing_services={_scoped(core), VANILLA})
+                self.assertEqual(out["status"], "warn", out["detail"])
+                self.assertIn("cannot import plistlib", out["detail"])
+
+    def test_plutil_is_asked_for_the_plist_path_and_json(self):
+        """Pin the invocation: json output, to stdout, for THIS plist."""
+        core = "/Users/x/ws/.claude-sutando"
+        payload = json.dumps({"EnvironmentVariables": {"CLAUDE_CONFIG_DIR": core}})
+        with mock.patch.dict(sys.modules, {"plistlib": None}), \
+             mock.patch.object(hc.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=payload)) as run:
+            self._run(core_cfg=core, plist_cfg=core,
+                      existing_services={_scoped(core), VANILLA})
+        argv = run.call_args_list[0].args[0]
+        self.assertEqual(argv[:4], ["/usr/bin/plutil", "-convert", "json", "-o"])
+        self.assertTrue(argv[-1].endswith("com.sutando.credential-proxy.plist"), argv)
 
 
 if __name__ == "__main__":
