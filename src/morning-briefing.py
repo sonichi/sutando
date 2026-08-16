@@ -19,7 +19,10 @@ from pathlib import Path
 from urllib.request import urlopen
 from urllib.error import URLError
 
-sys.path.insert(0, str(Path(__file__).parent))
+# Sibling scripts are launched with cwd=WORKSPACE, so their paths must not depend
+# on it. Defensive only: Python >=3.11 already absolutises __file__ (bpo-20443).
+_SRC_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import personal_path  # noqa: E402
 
@@ -319,7 +322,7 @@ def get_reminders() -> "list[str] | None":
     clean" — the same shape as the 2026-07-21 falsely-clear calendar bug
     (#2256), which is why `get_calendar_events()` already draws this line.
     """
-    script_path = Path(__file__).parent.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
+    script_path = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
     if not script_path.exists():
         return None
     try:
@@ -466,7 +469,7 @@ def _load_notifier():
     """
     import importlib.util
 
-    src = Path(__file__).parent / "check-pending-questions.py"
+    src = _SRC_DIR / "check-pending-questions.py"
     spec = importlib.util.spec_from_file_location("_cpq_predicate", src)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -596,7 +599,7 @@ def get_health_issues() -> "list[str] | None":
     None means it did not run. A timed-out health check returning [] made the
     briefing assert a clean system it had never inspected.
     """
-    hc = Path(__file__).parent / "health-check.py"
+    hc = _SRC_DIR / "health-check.py"
     if not hc.exists():
         return None
     try:
@@ -639,7 +642,7 @@ def get_daily_insight() -> str | None:
     if sentinel.exists():
         return sentinel.read_text().strip() or None
     # Not yet generated — run it
-    hc = Path(__file__).parent / "daily-insight.py"
+    hc = _SRC_DIR / "daily-insight.py"
     if not hc.exists():
         return None
     try:
