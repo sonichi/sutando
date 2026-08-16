@@ -17,9 +17,11 @@ THREE states and lets the caller choose which risk it carries.
 """
 from __future__ import annotations
 
-CONFIRMED = "confirmed"      # an event id came back: the send is proven
-UNCONFIRMED = "unconfirmed"  # 200, but nothing that proves delivery
-FAILED = "failed"            # transport or HTTP error
+# confirmed = an event id came back. unconfirmed = 200 with nothing proving
+# delivery. failed = transport or HTTP error.
+CONFIRMED = "confirmed"
+UNCONFIRMED = "unconfirmed"
+FAILED = "failed"
 
 
 def event_id_of(parsed) -> str | None:
