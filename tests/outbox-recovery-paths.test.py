@@ -88,7 +88,7 @@ def main() -> int:
         check("requeue also releases the claim",
               ob.read_delivery_claim(root, "i") is None,
               "a re-queued item still holding its claim can never be picked up")
-        ob.release_delivery_claim(root, "not-there")   # must not raise
+        ob.release_delivery_claim(root, "not-there", "d1")   # must not raise
         check("releasing an absent claim is a no-op", True)
 
         # --- adapter: the paths the contract suite skipped -------------------

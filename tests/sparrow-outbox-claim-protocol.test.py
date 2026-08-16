@@ -366,6 +366,38 @@ def _c12():
             "A deleted a claim it never judged")
 
 
+# 13 --------------------------------------------------------------------------
+@contract("a drainer cannot release a claim it does not hold")
+def _c13():
+    """The CAS fixes the composed path; this closes the primitive it composed.
+
+    reclaim_delivery_claim is safe, but acquire/release stayed exported, so a
+    caller could still delete a live claim by hand — the exact unlink that made
+    the check-then-act race destructive.
+    """
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-own", "winner") is True
+        assert release(root, "item-own", "stranger") is False, (
+            "a non-owner must not be able to release someone else's claim")
+        assert read(root, "item-own") is not None, (
+            "the winner's claim was deleted by a drainer that never held it")
+        assert release(root, "item-own", "winner") is True, "the owner may release"
+        assert read(root, "item-own") is None
+        # An operator recovery legitimately force-releases, but must say so.
+        assert acquire(root, "item-force", "w2") is True
+        assert release(root, "item-force", force=True) is True
+        try:
+            release(root, "item-nobody")
+            raise AssertionError("release with neither a drainer_id nor force must refuse")
+        except ValueError:
+            pass
+
+
 def main() -> int:
     print(f"  target: src/outbox.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)

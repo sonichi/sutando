@@ -360,13 +360,27 @@ def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
     return acquire_delivery_claim(root, item_id, drainer_id)
 
 
-def release_delivery_claim(root: Path, item_id: str) -> None:
+def release_delivery_claim(root: Path, item_id: str, drainer_id: Optional[str] = None,
+                           *, force: bool = False) -> bool:
+    """Release a claim; True if one was removed.
+
+    Ownership-checked by default. An unconditional unlink is exactly what let a
+    losing drainer delete the winner's claim, so the destructive form is named.
+    """
+    if drainer_id is None and not force:
+        raise ValueError("release_delivery_claim needs a drainer_id, or force=True")
     root = Path(root)
     p = _claim_path(root, item_id)
+    if not force:
+        rec = _read_claim_at(p, item_id)
+        # A torn claim has no readable owner, so nobody can prove they hold it.
+        if rec is None or rec.state == "UNKNOWN" or rec.drainer_id != drainer_id:
+            return False
+    released = True
     try:
         p.unlink()
     except FileNotFoundError:
-        pass
+        released = False
     # The swap names are CAS tokens, not state. They are only meaningful while a
     # peer could still hold the observation they encode, which ends here.
     for stale in _claims_dir(root).glob(f"{p.name}.reclaim-*"):
@@ -374,6 +388,7 @@ def release_delivery_claim(root: Path, item_id: str) -> None:
             stale.unlink()
         except FileNotFoundError:
             pass
+    return released
 
 
 # -- item lifecycle -----------------------------------------------------------
@@ -430,4 +445,4 @@ def requeue_item(root: Path, item_id: str) -> None:
     d["attempts"] = 0
     d["reason"] = None
     _write_item(Path(root), item_id, d)
-    release_delivery_claim(Path(root), item_id)
+    release_delivery_claim(Path(root), item_id, force=True)
