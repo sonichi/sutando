@@ -785,7 +785,7 @@ def main() -> int:
           "a body flushed after an AGED empty claim is still delivered")
 
     # Oversized body → dead-lettered once instead of retrying forever, and it
-    # lands in archive/undeliverable so "given up on" is not confused with
+    # lands in results/undelivered/ so "given up on" is not confused with
     # "delivered".
     huge = rtc.RESULTS_DIR / "proactive-t3c.txt"
     huge.write_text("x" * (rtc._PROACTIVE_MAX_BODY_B + 1))
@@ -974,6 +974,9 @@ def main() -> int:
     # file restores for retry, same as the empty-200 case above.
     bare_ok = rtc.RESULTS_DIR / "proactive-t15.txt"
     bare_ok.write_text("bare-ok nudge\n")
+    # Pin the default off: the module import may have read a real channel .env
+    # where the operator opted in to trust-ok.
+    rtc.PROACTIVE_TRUST_OK = False
     STATE["force_room_ok_only"] = True
     rtc._post_proactive()
     check(bare_ok.exists(),
@@ -988,6 +991,30 @@ def main() -> int:
           and any(p.name.startswith("proactive-t15")
                   for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
           "PROACTIVE_TRUST_OK=1: bare {ok:true} archives (opt-in at-least-once)")
+
+    # Retry CEILING: a file whose sends never confirm parks to undeliverable/
+    # instead of looping forever.
+    (rtc.RESULTS_DIR / "proactive-t2c.txt").write_text("nudge 2c")
+    STATE["force_room_empty_200"] = True
+    _posts_before = len(STATE["room_posts"])
+    for _ in range(rtc.MAX_TRANSIENT_ATTEMPTS + 3):     # more passes than the cap
+        rtc._post_proactive()
+    STATE["force_room_empty_200"] = False
+    _undeliv = rtc.UNDELIVERABLE_RESULTS_DIR
+    # should_retry(exc, tried) counts RETRIES: the initial attempt plus
+    # MAX_TRANSIENT_ATTEMPTS retries = cap+1 posts total, then park.
+    check(len(STATE["room_posts"]) - _posts_before == rtc.MAX_TRANSIENT_ATTEMPTS + 1,
+          f"unconfirmed proactive sends stop at initial+{rtc.MAX_TRANSIENT_ATTEMPTS} "
+          f"retries, not one per pass forever")
+    check(not (rtc.RESULTS_DIR / "proactive-t2c.txt").exists()
+          and _undeliv.exists()
+          and any(x.name.startswith("proactive-t2c") for x in _undeliv.iterdir()),
+          "past the cap the file parks to undeliverable/, recoverable by hand")
+    # A later success must start from a FRESH count (ledger cleared on park).
+    (rtc.RESULTS_DIR / "proactive-t2d.txt").write_text("nudge 2d")
+    rtc._post_proactive()
+    check(not (rtc.RESULTS_DIR / "proactive-t2d.txt").exists(),
+          "post-park deliveries are unaffected by the exhausted file's count")
 
     # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
     # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen
