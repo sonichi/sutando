@@ -1265,7 +1265,29 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "pending-questions.md",  # same
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
+    ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    # The two lock guards that legitimately sit at the ROOT, by name. Exempt
+    # until they migrate to state/locks/ the way workspace_lock.py already
+    # writes <workspace>/state/locks/<role>.lock.guard.
+    ".voice-agent.lock.guard",
+    ".backend-supervisor.lock.guard",
 })
+
+#: Why those two guards are named rather than matched by `*.lock.guard`:
+#: `state/locks/<role>.lock.guard` (workspace_lock.py) is where this artifact
+#: type belongs, and this probe only lists ROOT files — so a role guard that
+#: appears at the root is a workspace-resolution bug, exactly the class the
+#: probe exists to catch. A glob would have hidden it.
+#:
+#: `.voice-agent.lock.guard` stays because six sites resolve it at the root
+#: (voice-lock.ts, startup-runtime.sh, restart.sh, restart-voice-agent.sh,
+#: voice-agent.ts, tests/voice-lock.test.py) and a half-applied move leaves two
+#: processes disagreeing about where the lock is — a double-started voice agent.
+#: `.backend-supervisor.lock.guard` is written by the desktop app, whose source
+#: is not in this repo (`backend-supervisor.lock.guard`: 0 hits here).
+#:
+#: `.voice-agent.pid` is deliberately NOT exempt: state/locks/ is a real
+#: destination that exists in-tree, so its warn names somewhere to go (#2722).
 
 #: Migration sentinels are production-owned and DELIBERATELY retained at the
 #: workspace root — `workspace_default.py` writes `.notes-migrated`,
