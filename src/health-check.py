@@ -7191,7 +7191,9 @@ def check_claude_hook_registration(
     try:
         sys.path.insert(0, str(repo / "src"))
         from skill_hooks import discover as _discover_skill_hooks
-        owned.extend(_discover_skill_hooks(repo))
+        # [:3] — the 4th field is the prior command, which only the installer's
+        # migration sweep uses; `owned` also holds 3-tuples parsed from the script.
+        owned.extend(r[:3] for r in _discover_skill_hooks(repo))
     except Exception as exc:
         return {"name": name, "status": "warn",
                 "detail": f"skill-hook discovery failed ({exc}) — "
@@ -9293,7 +9295,7 @@ def community_support_line() -> str:
 
 
 #: Statuses that are NOT problems. Everything else is, by the same rule the
-#: issue list uses: `issues = [c for c in checks if c["status"] not in ("ok", "warn")]`.
+#: issue list uses: `issues = [c for c in checks if is_issue(c)]`.
 #: `stale` is an issue but gets its own glyph because it names a specific remedy.
 _BENIGN_STATUSES = ("ok", "warn")
 
@@ -9325,6 +9327,12 @@ def status_icon(status: str) -> str:
     return "✗"
 
 
+def is_issue(check) -> bool:
+    """The single definition of "not healthy". `summary_line` and the exit-code
+    list must use this one, or a run exits non-zero while printing an all-clear."""
+    return check.get("status") not in _BENIGN_STATUSES
+
+
 def summary_line(checks) -> str:
     """The no-failures summary. Warnings are deliberately NOT issues — they must
     not fail the exit code or wake the launchd notifier, and that is unchanged.
@@ -9336,7 +9344,15 @@ def summary_line(checks) -> str:
     Pure and importable on purpose, so a regression test exercises THIS code
     rather than a copy of it.
     """
+    fails = [c for c in checks if is_issue(c)]
     warns = [c for c in checks if c.get("status") == "warn"]
+    if fails:
+        line = (f"{len(fails)} ISSUE(S): "
+                + ", ".join(c["name"] for c in fails))
+        if warns:
+            line += (f" — plus {len(warns)} warning(s): "
+                     + ", ".join(c["name"] for c in warns))
+        return line
     if not warns:
         return "All systems operational."
     return (f"No failures — {len(warns)} warning(s): "
@@ -9352,7 +9368,7 @@ def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
-    issues = [c for c in checks if c["status"] not in ("ok", "warn")]
+    issues = [c for c in checks if is_issue(c)]
     codex_notifier = (
         next(
             (
@@ -9474,7 +9490,9 @@ def main():
         if not quiet:
             print(summary_line(checks))
     else:
-        print(f"{len(issues)} issue(s) found:")
+        # One summary for both outcomes: a separate issue-count header here is how
+        # the exit code and the printed summary drifted apart in the first place.
+        print(summary_line(checks))
         for c in issues:
             print(f"  - {c['name']}: {c['status']} ({c['detail']})")
         print(community_support_line())  # pragma: no cover — main() summary glue; the line's content is unit-tested via community_support_line()
