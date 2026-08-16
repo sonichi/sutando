@@ -1,4 +1,7 @@
 #!/bin/bash
+# fd 9 is a stable dup of the real stdout. The EXIT trap can fire while the shell
+# is inside a $( ) capture, which rebinds fd 1 to the substitution's pipe.
+exec 9>&1
 # Streaming task watcher — the canonical task-detection path.
 #
 # Runs fswatch indefinitely and emits ONE line per new task file appearance.
@@ -497,7 +500,7 @@ fallback_outstanding_handlers() {
           1)
             printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
             echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-            printf 'TASK_FILE: %s\n' "$filename" || true
+            printf 'TASK_FILE: %s\n' "$filename" >&9 || true
             ;;
           *)
             echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -533,7 +536,7 @@ fallback_outstanding_handlers() {
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
         echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        printf 'TASK_FILE: %s\n' "$filename" || true
+        printf 'TASK_FILE: %s\n' "$filename" >&9 || true
         ;;
       *)
         echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
