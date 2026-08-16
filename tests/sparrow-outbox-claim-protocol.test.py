@@ -147,11 +147,20 @@ def _three_states():
         assert hasattr(State, want), f"OwnerState.{want} missing"
     assert ident(os.getpid()).state == State.ALIVE, "own live pid must read ALIVE"
     assert ident(999_999).state == State.DEAD, "absent pid must read DEAD (ESRCH)"
-    # pid 1 is alive but not inspectable without privilege -> EPERM -> UNKNOWN.
-    # A bool probe collapses this to 'dead' and steals a live owner's claim.
-    assert ident(1).state == State.UNKNOWN, (
-        "a live-but-opaque owner (EPERM) must read UNKNOWN, not DEAD — measured on "
-        "Darwin 2026-08-16: every root-owned live process answers EPERM")
+    # pid 1 is alive. Whether it is INSPECTABLE is platform-specific: on Darwin
+    # proc_pidinfo answers EPERM (-> UNKNOWN), on Linux /proc/1/stat is
+    # world-readable (-> ALIVE). The invariant that holds everywhere, and the
+    # one a claim protocol actually needs, is that it must never read DEAD —
+    # that is the value that lets another drainer steal a live owner's claim.
+    assert ident(1).state != State.DEAD, (
+        f"pid 1 read {ident(1).state}; a live process must never read DEAD, however "
+        "opaque it is. This is the value that steals a running worker's claim")
+    if sys.platform == "darwin":
+        # Stronger, and Darwin-specific: measured 2026-08-16, every root-owned
+        # live process answers EPERM there, so a two-state probe calls them all
+        # dead. Asserted only where it is true.
+        assert ident(1).state == State.UNKNOWN, (
+            "on Darwin a root-owned live process is EPERM -> UNKNOWN, not ALIVE")
 
 
 # 4 ---------------------------------------------------------------------------
