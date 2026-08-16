@@ -122,9 +122,8 @@ def main() -> int:
         check("message_id 4242" in buf.getvalue(),
               f"send prints the created message_id (got {buf.getvalue()!r})")
 
-        # 4b. A PATCH that genuinely fails must exit nonzero and say so. The
-        #     refusals above all short-circuit BEFORE the request, so without
-        #     this the failing-request path was never exercised at all.
+        # 4b. The refusals above short-circuit before the request, so the
+        #     failing-request path is otherwise never exercised.
         def fake_raise(req, timeout=None):
             raise RuntimeError("403 Forbidden")
 
@@ -165,9 +164,8 @@ def main() -> int:
         check("Send failed" not in out, "...and is not reported as a send failure")
         check("unavailable" in out, f"...but the id is reported unavailable (got {out!r})")
 
-        # 5b. urlopen SUCCEEDS, then read() raises. Discord has committed the
-        #     message at that point, so this must NOT report a send failure —
-        #     the reviewer's case: a truncated/reset body invites a duplicate.
+        # 5b. urlopen succeeds, then read() raises: the message is committed,
+        #     so reporting a send failure here invites a duplicate retry.
         calls = []
 
         class _RaisingRead:
