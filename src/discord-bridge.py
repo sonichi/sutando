@@ -5763,24 +5763,33 @@ def _send_via_rest(channel_id: str, message: str):
     if not chunks:
         # Empty message — nothing to send. Treat as no-op rather than error.
         return
-    ids = []
     for i, chunk in enumerate(chunks, 1):
         data = json.dumps({"content": chunk}).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
+        # Transport ONLY. A committed message whose response we cannot read is a
+        # successful send; reporting it as a failure invites the retry that
+        # duplicates it — the exact defect this verb exists to make fixable.
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                # The id is the only handle an edit can address. Discarding it
-                # made every sent message permanently unrevisable.
-                ids.append(str(json.loads(resp.read().decode()).get("id", "")))
+                raw = resp.read()
         except Exception as e:
             print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
             sys.exit(1)
+        # Best-effort, and emitted per chunk: buffering until every chunk lands
+        # leaves an earlier delivered chunk unaddressable when a later one fails.
+        try:
+            body = json.loads(raw.decode())
+            mid = body.get("id") if isinstance(body, dict) else None
+            mid = str(mid) if isinstance(mid, (str, int)) and str(mid) else None
+        except Exception:
+            mid = None
+        if mid:
+            print(f"message_id {mid}")
+        else:
+            print(f"message_id unavailable (chunk {i}/{len(chunks)}) — sent, not addressable")
     suffix = "..." if len(message) > 80 else ""
     chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
     print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
-    for mid in ids:
-        if mid:
-            print(f"message_id {mid}")
 
 
 def _edit_via_rest(channel_id: str, message_id: str, message: str):

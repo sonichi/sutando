@@ -121,6 +121,57 @@ def main() -> int:
             _mod._send_via_rest("111", "hello")
         check("message_id 4242" in buf.getvalue(),
               f"send prints the created message_id (got {buf.getvalue()!r})")
+
+        # 5. A COMMITTED send whose response body is unreadable is still a send.
+        #    Reporting it as a failure invites the retry that duplicates it.
+        calls = []
+
+        class _BadBody(_Resp):
+            def read(self):
+                return b"<html>gateway</html>"
+
+        def fake_bad(req, timeout=None):
+            calls.append(req.full_url)
+            return _BadBody({})
+
+        urllib.request.urlopen = fake_bad
+        buf = io.StringIO()
+        rc = None
+        try:
+            with redirect_stdout(buf):
+                _mod._send_via_rest("111", "hello")
+        except SystemExit as e:
+            rc = e.code
+        out = buf.getvalue()
+        check(rc is None, f"malformed response body does NOT exit nonzero (got exit {rc})")
+        check("Send failed" not in out, "...and is not reported as a send failure")
+        check("unavailable" in out, f"...but the id is reported unavailable (got {out!r})")
+
+        # 6. A later-chunk failure must not swallow the EARLIER chunk's id —
+        #    that chunk is delivered and would otherwise be unrevisable.
+        calls = []
+        state = {"n": 0}
+
+        def fake_second_fails(req, timeout=None):
+            state["n"] += 1
+            calls.append(req.full_url)
+            if state["n"] == 1:
+                return _Resp({"id": "7001"})
+            raise RuntimeError("boom on chunk 2")
+
+        urllib.request.urlopen = fake_second_fails
+        buf = io.StringIO()
+        rc = None
+        try:
+            with redirect_stdout(buf):
+                _mod._send_via_rest("111", "y" * 3000)  # forces >1 chunk
+        except SystemExit as e:
+            rc = e.code
+        out = buf.getvalue()
+        check(state["n"] >= 2, f"the body really did chunk (requests={state['n']})")
+        check("message_id 7001" in out,
+              f"chunk 1's id is printed BEFORE chunk 2 fails (got {out!r})")
+        check(rc == 1, f"and the overall send still fails (exit {rc})")
     finally:
         urllib.request.urlopen = real
 
