@@ -264,18 +264,15 @@ finish_handler_task() {
 
 handler_result_exists() {
   # Readiness is result_ready's contract (rejects whitespace-only too) and the
-  # archive lookup is local_task_protocol's; this must not re-decide either.
+  # live-then-archive lookup is local_task_protocol's; this must not re-decide either.
   local filename="$1" task_id="${filename%.txt}"
   [ -n "$SUTANDO_PY_BIN" ] || return 1
-  "$SUTANDO_PY_BIN" - "$__REPO_ROOT" "$RESULTS_DIR" "$task_id" "$filename" <<'PYEOF' 2>/dev/null
+  "$SUTANDO_PY_BIN" - "$__REPO_ROOT" "$RESULTS_DIR" "$task_id" <<'PYEOF' 2>/dev/null
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "src"))
-from local_task_protocol import find_archived_result
+from local_task_protocol import find_result
 from result_ready import read_ready_result
-results = pathlib.Path(sys.argv[2])
-if read_ready_result(results / sys.argv[4]) is not None:
-    raise SystemExit(0)
-found = find_archived_result(results, sys.argv[3])
+found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
 raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
 PYEOF
 }
