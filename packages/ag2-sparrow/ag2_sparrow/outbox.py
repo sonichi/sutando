@@ -405,7 +405,7 @@ def _read_item(root: Path, item_id: str) -> dict:
     try:
         return json.loads(_item_path(root, item_id).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"item_id": item_id, "attempts": 0, "state": "QUEUED", "reason": None}
+        return {"item_id": item_id, "attempts": 0, "status": "QUEUED", "reason": None}
 
 
 def _write_item(root: Path, item_id: str, data: dict) -> None:
@@ -429,7 +429,7 @@ def note_attempt(root: Path, item_id: str) -> int:
 
 def park_item(root: Path, item_id: str, reason: str = "") -> None:
     d = _read_item(Path(root), item_id)
-    d["state"] = "PARKED"
+    d["status"] = "PARKED"
     d["reason"] = reason
     _write_item(Path(root), item_id, d)
 
@@ -441,7 +441,7 @@ def requeue_item(root: Path, item_id: str) -> None:
     which is indistinguishable from a broken destination and hides the recovery.
     """
     d = _read_item(Path(root), item_id)
-    d["state"] = "QUEUED"
+    d["status"] = "QUEUED"
     d["attempts"] = 0
     d["reason"] = None
     _write_item(Path(root), item_id, d)
