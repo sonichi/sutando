@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "tsx --test --test-force-exit 'tests/**/*.test.ts' && npm run test:py",
-    "test:py": "l=$(mktemp); s=$(mktemp); find tests -name '*.test.py' -not -path '*/node_modules/*' > \"$l\"; d=$?; if [ \"$d\" -ne 0 ]; then echo \"python: test DISCOVERY exited $d \u2014 partial file list, refusing to report a count\"; rm -f \"$l\" \"$s\"; exit 1; fi; sort \"$l\" > \"$s\"; o=$?; if [ \"$o\" -ne 0 ]; then echo \"python: test-list SORT exited $o \u2014 partial ordering, refusing to report a count\"; rm -f \"$l\" \"$s\"; exit 1; fi; { fail=0; n=0; failed=''; while IFS= read -r f; do n=$((n+1)); echo \"--- $f ---\"; python3 \"$f\" </dev/null || { fail=1; failed=\"$failed $f\"; }; done; if [ \"$n\" -eq 0 ]; then echo 'python: 0 test files discovered under tests/ \u2014 refusing to report success'; exit 1; fi; if [ \"$fail\" -eq 0 ]; then echo \"python: $n file(s) ran, all passed\"; else echo \"python: $n file(s) ran, failed:$failed\"; fi; exit \"$fail\"; } < \"$s\"; rc=$?; rm -f \"$l\" \"$s\"; exit \"$rc\"",
+    "test:py": "l=$(mktemp); s=$(mktemp); find tests -name '*.test.py' -not -path '*/node_modules/*' > \"$l\"; d=$?; if [ \"$d\" -ne 0 ]; then echo \"python: test DISCOVERY exited $d — partial file list, refusing to report a count\"; rm -f \"$l\" \"$s\"; exit 1; fi; sort \"$l\" > \"$s\"; o=$?; if [ \"$o\" -ne 0 ]; then echo \"python: test-list SORT exited $o — partial ordering, refusing to report a count\"; rm -f \"$l\" \"$s\"; exit 1; fi; { fail=0; n=0; failed=''; while IFS= read -r f; do n=$((n+1)); echo \"--- $f ---\"; python3 \"$f\" </dev/null || { fail=1; failed=\"$failed $f\"; }; done; if [ \"$n\" -eq 0 ]; then echo 'python: 0 test files discovered under tests/ — refusing to report success'; exit 1; fi; if [ \"$fail\" -eq 0 ]; then echo \"python: $n file(s) ran, all passed\"; else echo \"python: $n file(s) ran, failed:$failed\"; fi; exit \"$fail\"; } < \"$s\"; rc=$?; rm -f \"$l\" \"$s\"; exit \"$rc\"",
     "build:bundle": "node scripts/build-bundle.mjs"
   },
   "dependencies": {
@@ -19,7 +19,7 @@
     "@google/genai": "^1.49.0",
     "@types/ws": "^8.18.1",
     "ai": "^6.0.149",
-    "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent#25cc6e8e011a1487673bccbc9affe098fb1fa725",
+    "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent#ca0f61de2ee5156502096a1d0b90bea99ba77b59",
     "dotenv": "^17.4.1",
     "playwright": "^1.58.2",
     "ws": "^8.20.0",
