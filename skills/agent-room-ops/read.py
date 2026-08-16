@@ -68,8 +68,8 @@ def _redactor():
     `remote_gateway_bridge` scrubs a pasted secret before the task file is
     persisted; this reader returned the same message verbatim, so a secret the
     bridge removed on the way in came back out on the same room. Delegating to
-    `src/chat_secret_filter` keeps the two symmetric by construction; a regex
-    copied to this side would drift from the one it has to match.
+    `src/chat_redaction` — the chain both paths now call — keeps them symmetric
+    by construction; a regex copied to this side would drift from its twin.
     """
     global _REDACTOR
     if _REDACTOR is not None:
@@ -78,8 +78,10 @@ def _redactor():
     if src not in sys.path:
         sys.path.insert(0, src)
     try:
-        from chat_secret_filter import filter_chat_secrets
-        _REDACTOR = lambda s: filter_chat_secrets(s).text
+        # The shared chain, not one half of it: chat_secret_filter alone is blind
+        # to a vault-set value with no provider signature, at any length.
+        from chat_redaction import redact_chat_body
+        _REDACTOR = redact_chat_body
     except Exception as exc:
         try:
             # Narrower, but the vault-set grammar is the case this reader was

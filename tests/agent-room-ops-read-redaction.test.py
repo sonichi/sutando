@@ -40,15 +40,35 @@ class ReadRedactsWhatWriteRedacts(unittest.TestCase):
                          "the reader handed back a secret the bridge would have scrubbed")
 
     def test_the_reader_matches_the_writer_exactly(self):
-        """The point is PARITY. Comparing against the canonical filter (rather
-        than asserting a fixed redacted string) is what keeps this true when the
-        patterns change."""
+        """The point is PARITY, and it must pin the whole CHAIN.
+
+        Pinning `filter_chat_secrets` alone is what let the leak through: that
+        filter matches provider signatures, so a vault-set value with none
+        survived it and the reader agreed with a half-redacted writer."""
         sys.path.insert(0, str(_ROOT / "src"))
-        from chat_secret_filter import filter_chat_secrets
+        from chat_redaction import redact_chat_body
         raw = f"vault set TELEGRAM_BOT_TOKEN {FAKE_TG}"
         m = _read_mod()
         self.assertEqual(m._normalize([{"body": raw, "event_id": "e"}])[0]["body"],
-                         filter_chat_secrets(raw).text)
+                         redact_chat_body(raw))
+
+    def test_a_signatureless_vault_value_is_redacted_at_any_length(self):
+        """@john-the-dev's blocker, reproduced then pinned.
+
+        LENGTH is not the discriminator — a 40-char generic value also survives
+        the signature filter — so a test reaching for a 'long' value would pass
+        against the broken code. Each case carries its own control."""
+        sys.path.insert(0, str(_ROOT / "src"))
+        from chat_secret_filter import filter_chat_secrets
+        m = _read_mod()
+        for value in ("hunter2secret", "a" * 40):
+            raw = f"vault set MY_API_KEY {value}"
+            self.assertEqual(filter_chat_secrets(raw).text, raw,
+                             "control: the signature filter alone must still pass this "
+                             "through, or this case proves nothing")
+            out = m._normalize([{"body": raw, "event_id": "e"}])[0]["body"]
+            self.assertNotIn(value, out,
+                             f"the read path leaked a signature-less vault value: {out!r}")
 
     def test_ordinary_prose_is_untouched(self):
         """Without this, 'redact everything' would satisfy the tests above."""
@@ -78,6 +98,9 @@ class ReadRedactsWhatWriteRedacts(unittest.TestCase):
         m = _read_mod()
         m._REDACTOR = None
         orig = sys.modules.pop("chat_secret_filter", None)
+        # chat_redaction binds the filter at import; a cached copy would keep the
+        # canonical rung alive and silently skip the branch under test.
+        orig_chain = sys.modules.pop("chat_redaction", None)
         try:
             sys.modules["chat_secret_filter"] = None      # force ImportError on the canonical one
             body = m._normalize([{"body": f"vault set TELEGRAM_BOT_TOKEN {FAKE_TG}",
@@ -87,8 +110,11 @@ class ReadRedactsWhatWriteRedacts(unittest.TestCase):
                           "expected the grammar fallback, not the fail-closed placeholder")
         finally:
             sys.modules.pop("chat_secret_filter", None)
+            sys.modules.pop("chat_redaction", None)
             if orig is not None:
                 sys.modules["chat_secret_filter"] = orig
+            if orig_chain is not None:
+                sys.modules["chat_redaction"] = orig_chain
             m._REDACTOR = None
 
     def test_redaction_failure_withholds_the_body_rather_than_leaking_it(self):
@@ -98,13 +124,16 @@ class ReadRedactsWhatWriteRedacts(unittest.TestCase):
         m._REDACTOR = None
         orig = sys.modules.pop("chat_secret_filter", None)
         orig_g = sys.modules.pop("vault_set_grammar", None)
+        orig_c = sys.modules.pop("chat_redaction", None)
         try:
             sys.modules["chat_secret_filter"] = None   # force ImportError
             sys.modules["vault_set_grammar"] = None
+            sys.modules["chat_redaction"] = None       # the chain binds both at import
             body = m._normalize([{"body": f"vault set X {FAKE_TG}", "event_id": "e"}])[0]["body"]
             self.assertNotIn(FAKE_TG, body)
         finally:
-            for k, v in (("chat_secret_filter", orig), ("vault_set_grammar", orig_g)):
+            for k, v in (("chat_secret_filter", orig), ("vault_set_grammar", orig_g),
+                         ("chat_redaction", orig_c)):
                 sys.modules.pop(k, None)
                 if v is not None:
                     sys.modules[k] = v
@@ -120,6 +149,9 @@ class DegradedRedactorAnnouncesItself(unittest.TestCase):
     def _select_with(self, missing):
         m = _read_mod()
         m._REDACTOR = None
+        # The first rung imports the chain, which binds its two halves at import
+        # time; a cached copy would survive the poisoning and never degrade.
+        missing = list(missing) + ["chat_redaction"]
         saved = {k: sys.modules.pop(k, None) for k in missing}
         err = io.StringIO()
         try:
@@ -157,3 +189,4 @@ class DegradedRedactorAnnouncesItself(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
