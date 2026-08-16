@@ -170,5 +170,67 @@ finally:
     if _HAS_PROBE:
         m._PREFLIGHT = _saved
 
+# 8. THE LOAD SUCCESS PATH, deterministically. On a Linux CI runner
+#    find_library("CoreGraphics") returns None and the load raises, so the
+#    success branch is unreachable there — it was covered locally only because
+#    this host is macOS. Inject a fake library so the path runs anywhere.
+if _HAS_PROBE:
+    import ctypes
+    import ctypes.util
+
+    class _FakeFn:
+        restype = None
+        argtypes = None
+        def __call__(self):
+            return True
+
+    class _FakeCG:
+        def __init__(self):
+            self.CGPreflightScreenCaptureAccess = _FakeFn()
+
+    _of, _ol = ctypes.util.find_library, ctypes.cdll.LoadLibrary
+    _saved2 = m._PREFLIGHT
+    try:
+        ctypes.util.find_library = lambda _n: "fake-coregraphics"
+        ctypes.cdll.LoadLibrary = lambda _p: _FakeCG()
+        m._PREFLIGHT = "unset"
+        check("the load SUCCESS path resolves and returns a bool",
+              m.screen_capture_permitted(), True)
+        check("...and caches the resolved function rather than re-loading",
+              callable(m._PREFLIGHT), True)
+    finally:
+        ctypes.util.find_library, ctypes.cdll.LoadLibrary = _of, _ol
+        m._PREFLIGHT = _saved2
+
+# 9. THE HANDLER CALL SITES. Binding the gate directly never executes the two
+#    `if not self._require_screen_permission(): return` lines in the handlers,
+#    so a gate wired into neither would still pass every check above.
+if _HAS_PROBE:
+    class _FakeReq:
+        def __init__(self, path):
+            self.path = path
+            self.headers = {"X-Sutando-Capture-Token": m.CAPTURE_TOKEN}
+            self.sent = []
+        def _send_json(self, status, payload):
+            self.sent.append((status, payload))
+        def _require_capture_token(self):
+            return True
+        def _require_screen_permission(self):
+            return m.Handler._require_screen_permission(self)
+
+    _orig = m.screen_capture_permitted
+    m.screen_capture_permitted = lambda: False
+    try:
+        for route, path in (("_handle_capture", "/capture"),
+                            ("_handle_capture_video", "/capture-video")):
+            r = _FakeReq(path)
+            getattr(m.Handler, route)(r)
+            check(f"{route} refuses a denied capture at its gate",
+                  [st for st, _ in r.sent], [503])
+            check(f"{route} produces no frame when denied",
+                  any("path" in pl for _, pl in r.sent), False)
+    finally:
+        m.screen_capture_permitted = _orig
+
 print(("FAILED: " + ", ".join(fails)) if fails else "screen-capture preflight: all checks passed")
 sys.exit(1 if fails else 0)
