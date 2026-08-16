@@ -24,12 +24,25 @@ export function runSkillSetups(
 			log('[skill-setup] hook threw:', err instanceof Error ? err.message : err);
 			continue;
 		}
-		if (isThenable(result)) {
-			// Not awaited: awaiting a hung skill would stall bootstrap. The catch is
-			// what keeps an async throw from becoming a process-killing rejection.
-			result.then(undefined, (err: unknown) => {
-				log('[skill-setup] async hook rejected:', err instanceof Error ? err.message : err);
-			});
+		// `.then` is skill-controlled, so reading it can throw. Inspection stays
+		// inside isolation or a throwing getter escapes and kills the whole loop.
+		let thenable: boolean;
+		try {
+			thenable = isThenable(result);
+		} catch (err) {
+			log('[skill-setup] thenable inspection threw:', err instanceof Error ? err.message : err);
+			continue;
+		}
+		if (thenable) {
+			// Not awaited: awaiting a hung skill would stall bootstrap. Assimilate via
+			// Promise.resolve so an untrusted `then` rejects instead of throwing here.
+			try {
+				Promise.resolve(result).then(undefined, (err: unknown) => {
+					log('[skill-setup] async hook rejected:', err instanceof Error ? err.message : err);
+				});
+			} catch (err) {
+				log('[skill-setup] thenable assimilation threw:', err instanceof Error ? err.message : err);
+			}
 			log('[skill-setup] hook returned a thenable; setup() must be synchronous so '
 				+ 'registration completes before session start — async work will not be awaited');
 			continue;

@@ -86,6 +86,29 @@ describe('optional skill setup() cannot crash or stall bootstrap', () => {
 		assert.deepEqual(logs, []);
 	});
 
+	it('a throwing then GETTER does not escape isolation', () => {
+		logs.length = 0;
+		let later = false;
+		const setups: SkillSetup[] = [
+			(() => ({ get then() { throw new Error('getter boom'); } })) as unknown as SkillSetup,
+			() => { later = true; },
+		];
+		assert.equal(runSkillSetups(setups, CTX, log), 1);
+		assert.ok(later, 'a skill-controlled then getter aborted the loop');
+		assert.ok(logs.some(l => l.includes('inspection threw')), logs.join('|'));
+	});
+
+	it('a throwing then METHOD does not escape isolation', () => {
+		logs.length = 0;
+		let later = false;
+		const setups: SkillSetup[] = [
+			(() => ({ then() { throw new Error('method boom'); } })) as unknown as SkillSetup,
+			() => { later = true; },
+		];
+		assert.equal(runSkillSetups(setups, CTX, log), 1);
+		assert.ok(later, 'a skill-controlled then() aborted the loop');
+	});
+
 	it('every hook runs even when all of them throw', () => {
 		logs.length = 0;
 		let calls = 0;
