@@ -74,11 +74,17 @@ class FileAttachTests(unittest.TestCase):
     def _result(self, tid: str, body: str) -> None:
         (self.mod.RESULTS_DIR / f"{tid}.txt").write_text(body)
 
-    # 1 — unified-parser skip semantics
-    def test_skip_marker_archives_without_posting(self):
+    # 1 — unified-parser skip semantics: a skip marker suppresses the USER
+    # reply, not the server POST. Only add_result closes the server-side
+    # lease, and the server's own parse_result drops delivery for these
+    # markers — the old zero-POST assertion pinned the zombie-lease defect.
+    def test_skip_marker_posts_raw_body_then_archives(self):
         self._result("t1", "[no-send] internal only")
         self.mod._post_ready_results({"t1"})
-        self.assertEqual(self.calls, [])
+        posts = [c for c in self.calls if c[0] == "POST" and c[1] == "/v1/results"]
+        self.assertEqual(len(posts), 1)
+        self.assertIn("[no-send]", (posts[0][2] or {}).get("body", ""),
+                      "raw marker preserved so the server suppresses delivery")
         self.assertTrue(list((self.mod.ARCHIVE_RESULTS_DIR).glob("t1-*.txt")))
 
     # 2 — happy path: allowlisted file uploads, marker stripped, room from map
