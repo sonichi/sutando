@@ -159,6 +159,30 @@ if [ "$gate_rc" -eq 0 ]; then
 else
     verdict="❌ **Diff coverage BELOW the ${FAIL_UNDER}% bar** — uncovered changed lines listed below. Whole-tree (informational): **${total}%**."
 fi
-publish_summary "$verdict" diff-cover.md
+
+# diff-cover reports only on files IN coverage.xml, so a changed file outside
+# `[run] source` is neither covered nor uncovered — the gate passes without
+# having looked at it. Report, never fail: this names the silence, it does not
+# move the bar.
+report="diff-cover.md"
+if unmeasured="$(python3 scripts/coverage_unmeasured.py "$BASE" coverage.xml)" \
+   && [ -n "$unmeasured" ]; then
+    echo
+    echo "coverage-gate: NOT MEASURED — changed, but absent from coverage.xml:"
+    printf '  %s\n' $unmeasured
+    echo "coverage-gate: their changed lines are outside the bar, not inside and clean."
+    {
+        cat diff-cover.md
+        echo
+        echo "### ⚠️ Not measured"
+        echo
+        echo "Changed, but absent from \`coverage.xml\` — outside \`[run] source\` in"
+        echo "\`.coveragerc\`, so **diff-cover never examined these lines**:"
+        echo
+        printf '-   `%s`\n' $unmeasured
+    } > coverage-gate-report.md
+    report="coverage-gate-report.md"
+fi
+publish_summary "$verdict" "$report"
 
 exit "$gate_rc"
