@@ -69,6 +69,26 @@ class ReadRedactsWhatWriteRedacts(unittest.TestCase):
         self.assertEqual(out["media_ref"], "mxc://x")
         self.assertEqual(out["msgtype"], "m.image")
 
+    def test_the_grammar_fallback_still_redacts_when_the_canonical_filter_is_gone(self):
+        """The MIDDLE branch. Without this the fallback ladder has an untested
+        rung, which is indistinguishable from a rung that never runs — and it is
+        the one that carries the reported case (`vault set`)."""
+        m = _read_mod()
+        m._REDACTOR = None
+        orig = sys.modules.pop("chat_secret_filter", None)
+        try:
+            sys.modules["chat_secret_filter"] = None      # force ImportError on the canonical one
+            body = m._normalize([{"body": f"vault set TELEGRAM_BOT_TOKEN {FAKE_TG}",
+                                  "event_id": "e"}])[0]["body"]
+            self.assertNotIn(FAKE_TG, body)
+            self.assertIn("VAULT-SET-REDACTED", body,
+                          "expected the grammar fallback, not the fail-closed placeholder")
+        finally:
+            sys.modules.pop("chat_secret_filter", None)
+            if orig is not None:
+                sys.modules["chat_secret_filter"] = orig
+            m._REDACTOR = None
+
     def test_redaction_failure_withholds_the_body_rather_than_leaking_it(self):
         """Fail CLOSED. Returning the raw body when no filter loads would be the
         exact defect this fixes, so the unavailable path must not degrade to it."""
