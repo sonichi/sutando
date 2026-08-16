@@ -133,9 +133,8 @@ def unmerged(workspace: pathlib.Path):
             if not live.exists():
                 out.append((batch.name, rel, None))
                 continue
-            # A saved path can now resolve to a DIRECTORY (skills/<name> became a
-            # symlinked dir): read_text() would raise IsADirectoryError. It is
-            # non-comparable, not reconciled, so it stays in the report.
+            # A saved path can resolve to a directory, which read_text() cannot
+            # read. Non-comparable is not reconciled, so the row stays.
             if not live.is_file():
                 out.append((batch.name, rel, NOT_A_FILE))
                 continue

@@ -396,10 +396,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("no unmerged peer content", r.stdout)
 
     def test_a_live_path_that_became_a_DIRECTORY_stays_in_the_report(self):
-        """Non-comparable is not reconciled: dropping the row reads as 'nothing to do'.
-
-        Fails in the broken state, where the directory case `continue`d silently and
-        the run reported a clean workspace it had never compared."""
+        """Non-comparable is not reconciled: dropping the row reads as 'nothing to do'."""
         d = self.batch / "memory"
         d.mkdir(parents=True, exist_ok=True)
         (d / "became-dir.md").write_text("# a\nline1\npeer-only\n")
