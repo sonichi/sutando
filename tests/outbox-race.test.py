@@ -4,8 +4,8 @@ import sys
 import tempfile
 # CI runs this with no arguments, so the repo root must be derived, not passed.
 REPO = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, 'packages/ag2-sparrow'))
-from ag2_sparrow.outbox import acquire_delivery_claim   # PRODUCTION writer
+sys.path.insert(0, os.path.join(REPO, 'src'))
+from outbox import acquire_delivery_claim   # PRODUCTION writer
 
 def worker(args):
     root, item, i = args

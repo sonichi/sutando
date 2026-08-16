@@ -57,7 +57,9 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+# Import the CANONICAL src/ copy: .coveragerc measures src, not packages/,
+# so testing the vendored copy would leave these lines unmeasured.
+sys.path.insert(0, str(REPO / "src"))
 
 NOT_IMPL: list[str] = []
 FAILED: list[str] = []
@@ -71,15 +73,15 @@ class NotImplementedYet(Exception):
 
 def outbox():
     try:
-        import ag2_sparrow.outbox as m  # noqa: PLC0415
+        import outbox as m  # noqa: PLC0415
     except ImportError as exc:
-        raise NotImplementedYet(f"ag2_sparrow.outbox: {exc}") from exc
+        raise NotImplementedYet(f"src/outbox.py: {exc}") from exc
     return m
 
 
 def need(mod, name: str):
     if not hasattr(mod, name):
-        raise NotImplementedYet(f"ag2_sparrow.outbox.{name}")
+        raise NotImplementedYet(f"outbox.{name}")
     return getattr(mod, name)
 
 
@@ -235,7 +237,7 @@ def _proc_stat_parse():
 
 
 def main() -> int:
-    print(f"  target: ag2_sparrow.outbox  (repo {REPO.name})\n")
+    print(f"  target: src/outbox.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)
     print(f"\n  {total} contracts: {len(PASSED)} pass, {len(FAILED)} FAIL, "
           f"{len(ERRORED)} ERROR, {len(NOT_IMPL)} not-implemented")

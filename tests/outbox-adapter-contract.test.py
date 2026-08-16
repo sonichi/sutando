@@ -39,7 +39,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+sys.path.insert(0, str(REPO / "src"))
 
 NOT_IMPL: list[str] = []
 FAILED: list[str] = []
@@ -53,9 +53,9 @@ class NotImplementedYet(Exception):
 
 def adapter_mod():
     try:
-        import ag2_sparrow.outbox_adapter as m  # noqa: PLC0415
+        import outbox_adapter as m  # noqa: PLC0415
     except ImportError as exc:
-        raise NotImplementedYet(f"ag2_sparrow.outbox_adapter: {exc}") from exc
+        raise NotImplementedYet(f"src/outbox_adapter.py: {exc}") from exc
     return m
 
 
@@ -90,7 +90,7 @@ def contract(title):
 def _ok_no_id_is_unknown():
     m = adapter_mod()
     classify = need(m, "classify_response")
-    from ag2_sparrow.outbox import DeliveryOutcome as O  # noqa: PLC0415
+    from outbox import DeliveryOutcome as O  # noqa: PLC0415
     r = classify(status=200, body={"ok": True})
     assert r.outcome == O.OUTCOME_UNKNOWN, (
         f"got {r.outcome}; a 200 with no id is the live AG2 Space reply and is NOT proof of "
@@ -103,7 +103,7 @@ def _ok_no_id_is_unknown():
 def _id_is_confirmed():
     m = adapter_mod()
     classify = need(m, "classify_response")
-    from ag2_sparrow.outbox import DeliveryOutcome as O  # noqa: PLC0415
+    from outbox import DeliveryOutcome as O  # noqa: PLC0415
     r = classify(status=200, body={"ok": True, "event_id": "$abc"})
     assert r.outcome == O.CONFIRMED, f"got {r.outcome}; an explicit id is the positive proof"
     assert r.receipt_id == "$abc", f"the id must be carried on the receipt; got {r.receipt_id!r}"
@@ -114,7 +114,7 @@ def _id_is_confirmed():
 def _status_mapping():
     m = adapter_mod()
     classify = need(m, "classify_response")
-    from ag2_sparrow.outbox import DeliveryOutcome as O  # noqa: PLC0415
+    from outbox import DeliveryOutcome as O  # noqa: PLC0415
     assert classify(status=403, body={}).outcome == O.NOT_DELIVERED, (
         "a refusal is a definite no — the request was understood and rejected")
     assert classify(status=500, body={}).outcome == O.OUTCOME_UNKNOWN, (
@@ -127,7 +127,7 @@ def _status_mapping():
 @contract("the core decides from the RECEIPT, never from transport details")
 def _core_is_transport_agnostic():
     m = adapter_mod()
-    import ag2_sparrow.outbox as core  # noqa: PLC0415
+    import outbox as core  # noqa: PLC0415
     src = Path(core.__file__).read_text(encoding="utf-8")
     for leak in ("status_code", "http", "urllib", "requests", "event_id", "200", "403"):
         assert leak not in src.lower().replace("https://", ""), (
@@ -141,7 +141,7 @@ def _core_is_transport_agnostic():
 def _raise_is_unknown():
     m = adapter_mod()
     Adapter = need(m, "DeliveryAdapter")
-    from ag2_sparrow.outbox import DeliveryOutcome as O  # noqa: PLC0415
+    from outbox import DeliveryOutcome as O  # noqa: PLC0415
 
     class Exploding(Adapter):
         def _transmit(self, item):
@@ -167,7 +167,7 @@ def _adapter_has_no_policy():
 
 
 def main() -> int:
-    print(f"  target: ag2_sparrow.outbox_adapter  (repo {REPO.name})\n")
+    print(f"  target: src/outbox_adapter.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)
     print(f"\n  {total} contracts: {len(PASSED)} pass, {len(FAILED)} FAIL, "
           f"{len(ERRORED)} ERROR, {len(NOT_IMPL)} not-implemented")
