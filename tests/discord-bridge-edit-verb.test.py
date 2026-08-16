@@ -165,6 +165,32 @@ def main() -> int:
         check("Send failed" not in out, "...and is not reported as a send failure")
         check("unavailable" in out, f"...but the id is reported unavailable (got {out!r})")
 
+        # 5b. urlopen SUCCEEDS, then read() raises. Discord has committed the
+        #     message at that point, so this must NOT report a send failure —
+        #     the reviewer's case: a truncated/reset body invites a duplicate.
+        calls = []
+
+        class _RaisingRead:
+            def read(self):
+                raise ConnectionResetError("peer reset mid-body")
+
+        def fake_read_raises(req, timeout=None):
+            calls.append(req.full_url)
+            return _RaisingRead()
+
+        urllib.request.urlopen = fake_read_raises
+        buf = io.StringIO()
+        rc = None
+        try:
+            with redirect_stdout(buf):
+                _mod._send_via_rest("111", "hello")
+        except SystemExit as e:
+            rc = e.code
+        out = buf.getvalue()
+        check(rc is None, f"a raising read() does NOT exit nonzero (got exit {rc})")
+        check("Send failed" not in out, "...and is not reported as a send failure")
+        check("unavailable" in out, f"...but the id is reported unavailable (got {out!r})")
+
         # 6. A later-chunk failure must not swallow the EARLIER chunk's id —
         #    that chunk is delivered and would otherwise be unrevisable.
         calls = []

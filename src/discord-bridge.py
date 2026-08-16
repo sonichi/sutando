@@ -5769,17 +5769,19 @@ def _send_via_rest(channel_id: str, message: str):
         # Transport ONLY. A committed message whose response we cannot read is a
         # successful send; reporting it as a failure invites the retry that
         # duplicates it — the exact defect this verb exists to make fixable.
+        # Transport ONLY — and note `read()` is NOT here. Once urlopen returns,
+        # Discord has committed the message; a body that fails mid-read is a
+        # successful send with an unreadable receipt, not a failed one.
+        # Not a `with`: callers fake urlopen with a plain response object.
         try:
-            # Not a `with`: callers fake urlopen with a plain response object,
-            # and requiring the context-manager protocol breaks them.
-            raw = urllib.request.urlopen(req, timeout=10).read()
+            resp = urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
             sys.exit(1)
         # Best-effort, and emitted per chunk: buffering until every chunk lands
         # leaves an earlier delivered chunk unaddressable when a later one fails.
         try:
-            body = json.loads(raw.decode())
+            body = json.loads(resp.read().decode())
             mid = body.get("id") if isinstance(body, dict) else None
             mid = str(mid) if isinstance(mid, (str, int)) and str(mid) else None
         except Exception:
