@@ -207,11 +207,8 @@ def main() -> int:
           "redelivery RE-ACKED upstream (acks=2) — matches main()'s pending_ack loop")
     real_after = [r for r in STATE["results"] if not str(r.get("body", "")).startswith("[no-send]")]
     marker_after = [r for r in STATE["results"] if str(r.get("body", "")).startswith("[no-send]")]
-    # The redelivery's [no-send] marker MUST be POSTed too — it is what closes
-    # the redelivered lease server-side (add_result completes before its
-    # parse_result drops the delivery). The old assertion required zero marker
-    # POSTs and so pinned the zombie-lease defect: locally archived, lease
-    # extending forever under the ack+alive gate.
+    # The raw skip marker still POSTs to close the redelivered lease; the
+    # server suppresses its user-facing delivery.
     check(len(real_after) == 1 and len(STATE["results"]) == results_before + 1,
           "exactly ONE real result across the whole cycle — no duplicate delivery")
     check(len(marker_after) == 1 and "[no-send]" in str(marker_after[0].get("body", "")),
