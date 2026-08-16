@@ -102,9 +102,8 @@ def main():
     found, unscannable = violations(diff_text, cap, exts)
     for path, line, length in found:
         print(f"prose-cap: {path}:{line} comment block is {length} lines (cap {cap})")
-    # An in-scope file we could not tokenize was NOT checked. Reporting PASS for it
-    # would be a verdict about a read that never happened, so exit non-zero — the
-    # runner reads that as "the scanner could not run" and fails closed.
+    # An unread post-image was never checked, so PASS would be a verdict about a
+    # read that did not happen. Non-zero is the runner's fail-closed signal.
     if unscannable:
         for path in unscannable:
             print(f"prose-cap: {path} has no readable post-image; NOT scanned", file=sys.stderr)
