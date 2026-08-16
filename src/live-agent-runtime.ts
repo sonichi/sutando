@@ -13,10 +13,11 @@
  * it carries only control/durable-work traffic into the session.
  */
 
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
+import { isDmBanned } from './dm-ban.js';
 import { injectText } from './browser-tools.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -130,9 +131,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				// (some users keep the web UI open).
 				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
 				try {
-					// While dm-ban.sentinel exists, skip the DM — the result file
-					// itself still lands in results/ for the normal path.
-					if (existsSync(join(WORKSPACE_DIR, 'state', 'dm-ban.sentinel'))) {
+					// While the ban holds, skip the DM — the result file itself still
+					// lands in results/. Unreadable sentinel counts as banned.
+					if (isDmBanned(WORKSPACE_DIR)) {
 						console.log(`${ts()} [TaskBridge] dm-ban.sentinel present — stuck-voice DM suppressed`);
 						throw new Error('__dm_ban_skip__');
 					}
