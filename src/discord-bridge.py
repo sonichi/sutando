@@ -4779,23 +4779,11 @@ async def poll_results():
                         reply_text = reply_pattern.sub('', reply_text).strip()
                     # Auto-thread: if the agent didn't pick an explicit
                     # [reply: <id>], default to the triggering message so the
-                    # reply appears quoted under what it's answering. Skip
-                    # when the channel is already a Discord thread — thread
-                    # context anchors the reply implicitly, no extra quote
-                    # needed.
-                    #
-                    # getattr instead of bare `discord.Thread` so the
-                    # test-stub discord module (tests/discord-bridge-*.test.py)
-                    # — which intentionally omits Thread to keep the stub
-                    # surface small — doesn't AttributeError here. Production
-                    # discord.py always provides Thread; the getattr fallback
-                    # only matters under test, where treating "no Thread
-                    # class" as "channel isn't a thread" is correct.
+                    # reply appears quoted under what it's answering. Threads
+                    # included: a busy thread interleaves several exchanges, so
+                    # position stops identifying what a message answers.
                     if reply_to_id is None:
-                        _thread_cls = getattr(discord, 'Thread', None)
-                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
-                        if not is_thread:
-                            reply_to_id = source_message_anchor
+                        reply_to_id = source_message_anchor
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different
