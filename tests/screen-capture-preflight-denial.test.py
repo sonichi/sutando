@@ -123,5 +123,32 @@ for route in ("_handle_capture", "_handle_capture_video"):
           body.index("_require_screen_permission") < (body.index("screencapture")
                                                       if "screencapture" in body else len(body)), True)
 
+# 7. THE FAIL-SAFE BRANCHES. Each `except` in the probe decides what happens
+#    when the platform will not answer, and an untested fail-safe is
+#    indistinguishable from one that never runs. Drive all three.
+_saved = m._PREFLIGHT
+try:
+    m._PREFLIGHT = None                       # resolved once, unavailable
+    check("an unresolvable symbol yields None", m.screen_capture_permitted(), None)
+
+    def _boom():
+        raise OSError("simulated CoreGraphics failure")
+    m._PREFLIGHT = _boom                      # resolves, then raises when called
+    check("a raising preflight yields None, not a crash",
+          m.screen_capture_permitted(), None)
+
+    # The load path itself: force find_library to miss, so LoadLibrary raises.
+    import ctypes.util
+    _orig_find = ctypes.util.find_library
+    ctypes.util.find_library = lambda _name: "no-such-framework-xyz"
+    try:
+        m._PREFLIGHT = "unset"                # force a fresh resolution attempt
+        check("a failed library load yields None", m.screen_capture_permitted(), None)
+        check("...and is cached, so it is attempted only once", m._PREFLIGHT, None)
+    finally:
+        ctypes.util.find_library = _orig_find
+finally:
+    m._PREFLIGHT = _saved
+
 print(("FAILED: " + ", ".join(fails)) if fails else "screen-capture preflight: all checks passed")
 sys.exit(1 if fails else 0)
