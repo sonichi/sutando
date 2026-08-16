@@ -18,6 +18,10 @@
 # arrive — no need to inline file contents in stdout (Monitor's 200ms
 # batching window would group multi-line content awkwardly).
 
+# fd 9 is a stable dup of the real stdout, taken before anything can rebind fd 1.
+# A shutdown emit invoked one $( ) deep writes to the capture pipe, not to stdout.
+exec 9>&1
+
 set -u
 
 if [ "${1:-}" = "--handler-runner" ]; then
@@ -497,7 +501,7 @@ fallback_outstanding_handlers() {
           1)
             printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
             echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-            printf 'TASK_FILE: %s\n' "$filename" || true
+            printf 'TASK_FILE: %s\n' "$filename" >&9 || true
             ;;
           *)
             echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -533,7 +537,7 @@ fallback_outstanding_handlers() {
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
         echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        printf 'TASK_FILE: %s\n' "$filename" || true
+        printf 'TASK_FILE: %s\n' "$filename" >&9 || true
         ;;
       *)
         echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
