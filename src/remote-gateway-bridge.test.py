@@ -1003,9 +1003,11 @@ def main() -> int:
         rtc._post_proactive()
     STATE["force_room_empty_200"] = False
     _undeliv = rtc.ARCHIVE_RESULTS_DIR / "undeliverable"
-    check(len(STATE["room_posts"]) - _posts_before == rtc.MAX_TRANSIENT_ATTEMPTS,
-          f"unconfirmed proactive sends stop at the cap "
-          f"({rtc.MAX_TRANSIENT_ATTEMPTS}), not one per pass forever")
+    # should_retry(exc, tried) counts RETRIES: the initial attempt plus
+    # MAX_TRANSIENT_ATTEMPTS retries = cap+1 posts total, then park.
+    check(len(STATE["room_posts"]) - _posts_before == rtc.MAX_TRANSIENT_ATTEMPTS + 1,
+          f"unconfirmed proactive sends stop at initial+{rtc.MAX_TRANSIENT_ATTEMPTS} "
+          f"retries, not one per pass forever")
     check(not (rtc.RESULTS_DIR / "proactive-t2c.txt").exists()
           and _undeliv.exists()
           and any(x.name.startswith("proactive-t2c") for x in _undeliv.iterdir()),

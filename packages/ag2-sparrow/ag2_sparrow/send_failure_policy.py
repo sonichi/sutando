@@ -26,7 +26,19 @@ _TRANSIENT_EXC_NAMES = frozenset({
     "ConnectionClosed",
     "GatewayNotFound",
     "DiscordServerError",
+    # Accepted-but-unconfirmed: retryable, but only under the cap (see the class).
+    "UnconfirmedDelivery",
 })
+
+
+class UnconfirmedDelivery(Exception):
+    """The server ACCEPTED a send but did not confirm it (no event id).
+
+    Transient-with-cap on purpose. The send may in fact have been delivered,
+    so an UNBOUNDED retry duplicates it — that is the 2026-08-16 incident,
+    where one nudge went out 12 times. The cap is what makes retrying safe:
+    a momentary withholding still recovers, a systematic one parks loudly.
+    """
 
 
 def failure_status(exc: BaseException) -> int | None:
@@ -77,7 +89,12 @@ def resolve_failed_send(claim: Path, exc: BaseException,
     if not progressed and should_retry(exc, tried):
         # release_claim refuses to clobber a `.txt` written since the claim, so a
         # False here means a newer body exists — park this one rather than drop it.
-        from proactive_recovery import release_claim
+        # Bundled verbatim into ag2_sparrow, where siblings are package
+        # submodules; in src/ they are flat modules. Support both.
+        try:  # pragma: no cover - exercised by whichever context imports it
+            from .proactive_recovery import release_claim
+        except ImportError:  # pragma: no cover - flat src/ import path
+            from proactive_recovery import release_claim
         if release_claim(claim):
             attempts[key] = tried + 1
             return "retried"
