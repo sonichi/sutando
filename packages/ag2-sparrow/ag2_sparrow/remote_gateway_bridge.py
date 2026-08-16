@@ -187,6 +187,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
@@ -2095,6 +2096,9 @@ _ORPHAN_MIN_AGE_S = 600
 # orphaned nudge is noted once instead of on every pass. Discarded when the file
 # gains a body (so a later empty re-observation logs again).
 _EMPTY_LOGGED: "set[str]" = set()
+# Per-file failed-send count. The send_failure_policy cap bounds the
+# retry: past it the file parks to undeliverable/ instead of looping.
+_PROACTIVE_ATTEMPTS: dict[str, int] = {}
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -2181,6 +2185,24 @@ def _recover_orphan_proactive() -> None:
             _log(f"recovered orphan proactive claim {f.name}")
         except OSError:
             pass
+
+
+def _proactive_send_failed(claim: Path, f: Path, why: str) -> None:
+    """Bounded requeue (send_failure_policy cap): park past the ceiling."""
+    n = _PROACTIVE_ATTEMPTS.get(f.name, 0) + 1
+    _PROACTIVE_ATTEMPTS[f.name] = n
+    if n >= MAX_TRANSIENT_ATTEMPTS:
+        _log(f"proactive {f.name}: {why} — attempt {n}/{MAX_TRANSIENT_ATTEMPTS}, "
+             "retry ceiling reached; parking to undeliverable/ (re-queue by "
+             "moving it back after fixing the cause)")
+        _PROACTIVE_ATTEMPTS.pop(f.name, None)
+        _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
+        return
+    _log(f"proactive {f.name}: {why} — will retry ({n}/{MAX_TRANSIENT_ATTEMPTS})")
+    try:
+        claim.rename(f)
+    except OSError:
+        pass
 
 
 def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
@@ -2337,13 +2359,9 @@ def _post_proactive() -> None:
                 or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
             )
             if not delivered:
-                _log(f"proactive send for {f.name} got no delivery signal "
-                     f"(response {str(resp)[:120]!r}) — will retry; check "
-                     "REMOTE_PROACTIVE_ROOM and the agent's room membership")
-                try:
-                    claim.rename(f)
-                except OSError:
-                    pass
+                _proactive_send_failed(
+                    claim, f, f"no delivery signal (response {str(resp)[:120]!r}; "
+                    "check REMOTE_PROACTIVE_ROOM and room membership)")
                 continue
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -2352,24 +2370,17 @@ def _post_proactive() -> None:
                 except OSError:
                     pass
                 raise
-            _log(f"proactive send failed for {f.name}: HTTP {e.code} — will retry")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            _proactive_send_failed(claim, f, f"HTTP {e.code}")
             continue
         except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"proactive send network error for {f.name}: {e} — will retry")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            _proactive_send_failed(claim, f, f"network error: {e}")
             continue
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
         except OSError:
             claim.unlink(missing_ok=True)
+        _PROACTIVE_ATTEMPTS.pop(f.name, None)
         _log(f"delivered proactive {f.name}")
 
 

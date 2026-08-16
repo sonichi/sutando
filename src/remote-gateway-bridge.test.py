@@ -974,6 +974,10 @@ def main() -> int:
     # file restores for retry, same as the empty-200 case above.
     bare_ok = rtc.RESULTS_DIR / "proactive-t15.txt"
     bare_ok.write_text("bare-ok nudge\n")
+    # Hermetic: the module import may have read a REAL channel .env where the
+    # operator set REMOTE_PROACTIVE_TRUST_OK=1 (the 2026-08-16 stopgap). This
+    # case tests the DEFAULT, so pin it off explicitly.
+    rtc.PROACTIVE_TRUST_OK = False
     STATE["force_room_ok_only"] = True
     rtc._post_proactive()
     check(bare_ok.exists(),
@@ -988,6 +992,29 @@ def main() -> int:
           and any(p.name.startswith("proactive-t15")
                   for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
           "PROACTIVE_TRUST_OK=1: bare {ok:true} archives (opt-in at-least-once)")
+
+    # Retry CEILING (send_failure_policy.MAX_TRANSIENT_ATTEMPTS): a file whose
+    # sends never confirm parks to undeliverable/ instead of looping forever —
+    # the 2026-08-16 duplicate-burst shape (one file, 5-12 re-sends).
+    (rtc.RESULTS_DIR / "proactive-t2c.txt").write_text("nudge 2c")
+    STATE["force_room_empty_200"] = True
+    _posts_before = len(STATE["room_posts"])
+    for _ in range(rtc.MAX_TRANSIENT_ATTEMPTS + 3):     # more passes than the cap
+        rtc._post_proactive()
+    STATE["force_room_empty_200"] = False
+    _undeliv = rtc.ARCHIVE_RESULTS_DIR / "undeliverable"
+    check(len(STATE["room_posts"]) - _posts_before == rtc.MAX_TRANSIENT_ATTEMPTS,
+          f"unconfirmed proactive sends stop at the cap "
+          f"({rtc.MAX_TRANSIENT_ATTEMPTS}), not one per pass forever")
+    check(not (rtc.RESULTS_DIR / "proactive-t2c.txt").exists()
+          and _undeliv.exists()
+          and any(x.name.startswith("proactive-t2c") for x in _undeliv.iterdir()),
+          "past the cap the file parks to undeliverable/, recoverable by hand")
+    # A later success must start from a FRESH count (ledger cleared on park).
+    (rtc.RESULTS_DIR / "proactive-t2d.txt").write_text("nudge 2d")
+    rtc._post_proactive()
+    check(not (rtc.RESULTS_DIR / "proactive-t2d.txt").exists(),
+          "post-park deliveries are unaffected by the exhausted file's count")
 
     # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
     # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen
