@@ -81,26 +81,28 @@ class OverCapIsNamedAsLoss(unittest.TestCase):
 
 
 class FailsOpen(unittest.TestCase):
+    """Fails open — but SAYS SO (#2958). These paths used to return "", which
+    made "could not measure" indistinguishable from "measured, unremarkable"."""
     """A trend is a nicety; suppressing the level would be a regression."""
 
-    def test_not_a_git_repo_returns_empty(self):
+    def test_not_a_git_repo_says_unavailable(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x" * 100)
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_single_commit_is_not_a_trend(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             idx = _repo_with_sizes(Path(td), [1000])
-            self.assertEqual(m._index_growth_note(idx, 1000), "")
+            self.assertEqual(m._index_growth_note(idx, 1000), m._TREND_UNAVAILABLE)
 
-    def test_missing_file_returns_empty(self):
+    def test_missing_file_says_unavailable(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(
-                m._index_growth_note(Path(td) / "nope" / "MEMORY.md", 100), "")
+                m._index_growth_note(Path(td) / "nope" / "MEMORY.md", 100), m._TREND_UNAVAILABLE)
 
 
 class TheHelperCanActuallyFire(unittest.TestCase):
@@ -188,7 +190,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_a_truncated_batch_stream_stops_cleanly(self):
         """`--batch` output that ends mid-record (a killed git, a short pipe).
@@ -206,7 +208,7 @@ class DefensiveBranches(unittest.TestCase):
                                       "SubprocessError": Exception})
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"; idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_an_object_cat_file_reports_missing_is_skipped(self):
         """`cat-file --batch-check` does NOT fail on a bad spec — it prints
@@ -232,9 +234,9 @@ class DefensiveBranches(unittest.TestCase):
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
             # both objects skipped -> 0 points -> ""
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
-    def test_a_failing_batch_returns_empty(self):
+    def test_a_failing_batch_says_unavailable(self):
         m = _hc()
         state = {"first": True}
 
@@ -251,7 +253,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_git_unavailable_is_swallowed(self):
         m = _hc()
@@ -263,7 +265,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
 
 class HistoricalBytesUseTheSAMEUnitsAsTheLimit(unittest.TestCase):
