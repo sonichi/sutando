@@ -91,6 +91,44 @@ def main() -> int:
         ob.release_delivery_claim(root, "not-there", "d1")   # must not raise
         check("releasing an absent claim is a no-op", True)
 
+        # force= skips the ownership read, so it reaches the unlink and takes the
+        # FileNotFoundError branch. The ownership path returns before that.
+        check("a forced release of an absent claim reports False, not True",
+              ob.release_delivery_claim(root, "not-there", force=True) is False,
+              "returning True would tell a caller it released something that was never there")
+
+        # Swap tokens are CAS scratch, not state: a release must sweep them, or a
+        # crashed reclaim leaves a name that blocks every future swap on that item.
+        ob.acquire_delivery_claim(root, "sweep", "d1")
+        claim = ob._claim_path(root, "sweep")
+        for suffix in ("aaa", "bbb"):
+            (claim.parent / f"{claim.name}.reclaim-{suffix}").write_text("x", encoding="utf-8")
+        check("release sweeps leftover swap tokens",
+              ob.release_delivery_claim(root, "sweep", "d1") is True
+              and not list(claim.parent.glob(f"{claim.name}.reclaim-*")),
+              "a stale token makes os.link fail forever, so the item can never be reclaimed")
+
+        # A token that vanishes mid-sweep (a peer swept concurrently) must not
+        # abort the release — that would strand the claim it just unlinked.
+        ob.acquire_delivery_claim(root, "vanish", "d1")
+        vclaim = ob._claim_path(root, "vanish")
+        (vclaim.parent / f"{vclaim.name}.reclaim-zzz").write_text("x", encoding="utf-8")
+        real_unlink = Path.unlink
+
+        def vanishing(self, *a, **kw):
+            if ".reclaim-" in self.name:
+                raise FileNotFoundError(str(self))
+            return real_unlink(self, *a, **kw)
+
+        Path.unlink = vanishing
+        try:
+            released = ob.release_delivery_claim(root, "vanish", "d1")
+        finally:
+            Path.unlink = real_unlink
+        check("a swap token deleted by a peer mid-sweep does not abort the release",
+              released is True,
+              "raising here would leave the claim released but the caller believing it failed")
+
         # --- adapter: the paths the contract suite skipped -------------------
         import outbox_adapter as oa
 
