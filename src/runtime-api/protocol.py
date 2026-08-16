@@ -1,8 +1,8 @@
 """runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 
 The runtime API is the request-response upstream between a long-running agent
-process and its human owner: approval, elicitation, governed capability
-execution, and bounded ephemeral capability reads. It is deliberately NOT an activity/observability channel (tool
+process and its human owner: approval, elicitation, and governed capability
+execution. It is deliberately NOT an activity/observability channel (tool
 events and metrics already flow through the hooks collector) and NOT a task
 channel (task/result files own that).
 
@@ -16,8 +16,6 @@ never loses a pending request (they are durable in the store).
 v0 methods:
   approval.request      {taskId?, action, resource?, reason?, expiresInS?}
   elicitation.request   {taskId?, question, type, options?, expiresInS?}
-  capability.list       {}
-  capability.read       {capabilityId, operation, resource?, cursor?, limit?}
   capability.execute    {taskId?, action, resource?, input?, idempotencyKey?}
   request.get           {requestId}
   request.wait          {requestId, timeoutS?}
@@ -37,8 +35,6 @@ ELICITATION_TYPES = ("free_text", "single_select", "multi_select", "confirmation
 METHODS = (
     "approval.request",
     "elicitation.request",
-    "capability.list",
-    "capability.read",
     "capability.execute",
     "request.get",
     "request.wait",
