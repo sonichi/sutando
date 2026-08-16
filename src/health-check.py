@@ -51,6 +51,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 # bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
+from git_binary import developer_tools_installed  # noqa: E402
+from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
@@ -3115,31 +3117,47 @@ def fix_down_bridges(checks: list) -> list:
             and c["status"] == "warn"
             and c.get("detail") == "configured but not running"
         ):
-            name = c["name"]
-            interp = _bridge_interpreter(name)
-            if interp is None:
-                # No interpreter that can import the bridge's dependency —
-                # spawning would just crash-loop (startup.sh skips it too).
-                continue
-            child_env = os.environ.copy()
-            if name == "slack-bridge":
-                # startup.sh sources channels/slack/.env so SLACK_BOT_TOKEN /
-                # SLACK_APP_TOKEN reach the child. Mirror that here; skip the
-                # restart if the env file / tokens are missing (fail-safe).
-                slack_env = _load_channel_env("slack")
-                if "SLACK_BOT_TOKEN" not in {**os.environ, **slack_env}:
-                    continue
-                child_env.update(slack_env)
-            log_path = WORKSPACE_DIR / "logs" / f"{name}.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            # `with` closes the parent's handle after Popen; the child holds
-            # its own dup of the fd, so the log stays writable.
-            with open(str(log_path), "a") as log_f:
-                subprocess.Popen([interp, str(REPO_DIR / "src" / f"{name}.py")],
-                                 stdout=log_f, stderr=subprocess.STDOUT,
-                                 env=child_env, start_new_session=True)
-            restarted.append(name)
+            if _launch_bridge(c["name"]):
+                restarted.append(c["name"])
     return restarted
+
+
+def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
+    """Single owner of bridge-launch policy for every restart path (down and
+    stale); side-effect-free so stale callers can confirm a relaunch pre-kill."""
+    interp = _bridge_interpreter(name)
+    if interp is None:
+        # No interpreter can import the bridge's dependency (startup.sh skips too).
+        return None
+    child_env = os.environ.copy()
+    if name == "slack-bridge":
+        # slack-bridge exits without BOTH tokens non-empty; the Keychain vault is
+        # a real source (same env -> .env -> vault tiering as the bridge itself).
+        slack_env = _load_channel_env("slack")
+        merged = {**os.environ, **slack_env}
+        if not all(merged.get(v) or token_from_vault(v)
+                   for v in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")):
+            return None
+        # Vault values stay out of the plan — the bridge resolves them itself.
+        child_env.update(slack_env)
+    return interp, child_env
+
+
+def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
+    """Spawn a bridge per _bridge_launch_plan; True if spawned."""
+    plan = plan or _bridge_launch_plan(name)
+    if plan is None:
+        return False
+    interp, child_env = plan
+    log_path = WORKSPACE_DIR / "logs" / f"{name}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # `with` closes the parent's handle after Popen; the child holds
+    # its own dup of the fd, so the log stays writable.
+    with open(str(log_path), "a") as log_f:
+        subprocess.Popen([interp, str(REPO_DIR / "src" / f"{name}.py")],
+                         stdout=log_f, stderr=subprocess.STDOUT,
+                         env=child_env, start_new_session=True)
+    return True
 
 
 # Interpreter candidates, in the same priority order startup.sh probes. First
@@ -3162,11 +3180,19 @@ def _bridge_interpreter(name: str) -> "str | None":
     bridges with no hard import gate (telegram), return sys.executable.
     Returns None when no candidate can import the required module (caller then
     skips the restart, matching startup.sh's labeled-skip behavior).
+
+    The bare `python3` candidate is substituted via _resolved_bare_python3
+    before probing — probing executes it, and bare python3 can be the CLT stub.
     """
     required = _BRIDGE_REQUIRED_IMPORT.get(name)
     if required is None:
         return sys.executable
     for cand in _BRIDGE_INTERP_CANDIDATES:
+        if cand == "python3":
+            resolved = _resolved_bare_python3()
+            if resolved is None:
+                continue
+            cand = resolved
         try:
             if shutil.which(cand) is None and not Path(cand).exists():
                 continue
@@ -3177,6 +3203,26 @@ def _bridge_interpreter(name: str) -> "str | None":
         except (subprocess.TimeoutExpired, OSError):
             continue
     return None
+
+
+def _resolved_bare_python3() -> "str | None":
+    """Stand-in for the bare `python3` candidate, mirroring startup.sh's
+    resolve_python: never return the Xcode-CLT stub (executing it pops a modal)."""
+    override = os.environ.get("SUTANDO_PY", "")
+    if override and os.access(override, os.X_OK):
+        return override
+    bundled = REPO_DIR.parent / "runtime" / "python" / "bin" / "python3"
+    if os.access(bundled, os.X_OK):
+        return str(bundled)
+    path_py = shutil.which("python3")
+    if not path_py:
+        return None
+    if sys.platform != "darwin":
+        return path_py
+    # Directory compare, not full-path (versioned siblings share the inode).
+    if os.path.realpath(os.path.dirname(path_py)) != os.path.realpath("/usr/bin"):
+        return path_py
+    return path_py if developer_tools_installed() else None
 
 
 def _load_channel_env(channel: str) -> dict:
@@ -9570,6 +9616,12 @@ def main():
                     if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):
                         print(f"  {c['name']}: token invalid — regenerate at discord.com/developers/applications (no restart)")
                     else:
+                        # Plan BEFORE any kill: killing a working stale bridge
+                        # with no viable relaunch turns a warning into an outage.
+                        plan = _bridge_launch_plan(c["name"])
+                        if plan is None:
+                            print(f"  {c['name']}: no capable interpreter/env — restart skipped (see startup.sh launch requirements)")
+                            continue
                         # If stale (process older than source code), kill old PID first
                         # so the new process doesn't conflict with a still-running zombie.
                         if c["status"] == "stale":
@@ -9591,14 +9643,9 @@ def main():
                                 import time as _t; _t.sleep(1)
                             except Exception:
                                 pass
-                        # Use sys.executable to avoid launchd's minimal PATH
-                        # resolving `python3` to /usr/bin/python3 (3.9), which
-                        # doesn't have the homebrew site-packages (discord,
-                        # dotenv, etc.) — restart would crash on import.
-                        # Log path uses logs/ (post-PR #251 refactor).
-                        subprocess.Popen([sys.executable, str(REPO_DIR / "src" / f"{c['name']}.py")],
-                                         stdout=open(str(WORKSPACE_DIR / "logs" / f"{c['name']}.log"), "a"),
-                                         stderr=subprocess.STDOUT, start_new_session=True)
+                        # Shared launch policy — a bare sys.executable spawn
+                        # crash-loops on missing imports.
+                        _launch_bridge(c["name"], plan)
                         print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
                     # Two distinct failure modes:
