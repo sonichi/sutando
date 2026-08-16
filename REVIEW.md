@@ -94,6 +94,13 @@ and loads whichever repo it reviews.
    "changes requested: …" / "LGTM, non-blocking". And it is only honest if you actually
    ran these criteria on *this* PR — a readiness claim with no evidence attached
    (no test run, no failure-mode named, no blast-radius call) is an over-claim.
+   **Findings are not a verdict.** A review that ends on analysis leaves the author unable
+   to tell "these are blockers" from "these are notes and I would merge it", so say which,
+   and for anything short of ready, name the one thing that would change it.
+   The verdict is a **recommendation, never a gate**: it does not substitute for the merge
+   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, two recorded
+   approvals). *Grounded by:* a #2824 review that listed one clarity question and two minor
+   notes and never said it was ready; the owner had to ask "do you recommend approval?".
 
 9. **A negative result is not evidence until the instrument is shown able to produce a
    positive.** Much of a PR's evidence is a *zero*: "no other call sites", "no conflicts",
@@ -116,10 +123,47 @@ and loads whichever repo it reviews.
    The tell is that a broken instrument and a clean result are *byte-identical*, so the
    author's confidence carries no information.
 
+10. **A fix that changes a decision rule is itself a decision rule — enumerate the
+    adjacent inputs before pushing.** When a patch changes *how something is judged*
+    (a readiness test, a routing check, a marker classification), the next reviewer will
+    find the input one step to the side of the one you tested. Before pushing, list the
+    other values that reach the same decision and exercise each; and when the repo already
+    owns that judgement, ask the owner rather than restating its knowledge — the shared
+    copy is where the edge cases have already been paid for.
+    *Grounded by:* two PRs on 2026-08-13, five and six rounds each, every round a real
+    finding and every one adjacent to the last. (a) #2867 — the reap's "does a result
+    exist?" rule was rebuilt four times: a hand-rolled archive glob (a prefix collision
+    satisfied the wrong task), then `-s` (accepted whitespace-only, which the shared
+    `result_ready` contract rejects), then an overwrite that destroyed a late answer, then
+    a check-then-`mv` that relocated one out of the delivery path. `local_task_protocol`
+    and `result_ready` already answered the first two correctly. (b) #2868 — "is this
+    session routed?" went display-suppression → durable burn history → any non-empty
+    `ANTHROPIC_BASE_URL` → any scheme on the right host:port → a diagnosis line asserting
+    a cause it had not checked → that same line echoing URL credentials into a shared
+    self-diagnose bundle. Each fix was correct for the case its test named.
+    The tell that you are in this pattern: your test suite grows by exactly one case per
+    round, and each new case is the previous one with a single field changed.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
 checks:
+  root-artifacts:
+    # Added files at the REPO ROOT matching these are PR-draft leftovers. Root
+    # only; omitting the key uses these defaults rather than disabling the check.
+    root_artifact_glob:
+      - 'prbody*'
+      - 'pr-body*'
+      - 'pr_body*'
+      - 'reply*.md'
+      - 'comment*.md'
+      - 'draft*.md'
+      - '*.patch'
+      - '*.diff'
+      - '*.orig'
+      - '*.rej'
+      - 'nohup.out'
+
   hardcoded-paths:
     # Added lines containing any of these substrings are flagged as errors...
     flag:
