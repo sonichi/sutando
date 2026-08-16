@@ -52,6 +52,16 @@ def _result(ok, messages=None, reason=None, room_id=None, complete=None):
 _REDACTOR = None
 
 
+def _log_fallback(msg):
+    """Announce a degraded redactor once, at selection.
+
+    Withheld bodies and genuinely-secret-laden ones look identical downstream,
+    and the choice is cached for the process, so without this an operator
+    cannot tell a broken install from a quiet room.
+    """
+    print("room-ops read: %s" % msg, file=sys.stderr)
+
+
 def _redactor():
     """The WRITE path's own filter, resolved once — not a second implementation.
 
@@ -70,18 +80,22 @@ def _redactor():
     try:
         from chat_secret_filter import filter_chat_secrets
         _REDACTOR = lambda s: filter_chat_secrets(s).text
-    except Exception:
+    except Exception as exc:
         try:
             # Narrower, but the vault-set grammar is the case this reader was
             # reported on, so a partial filter still beats passing it through.
             from vault_set_grammar import redact_vault_commands
             _REDACTOR = lambda s: redact_vault_commands(
                 s, placeholder="[VAULT-SET-REDACTED: filter unavailable]")
-        except Exception:
+            _log_fallback("chat_secret_filter unavailable (%s) — using the narrower "
+                          "vault_set_grammar; non-vault secrets are NOT filtered" % exc)
+        except Exception as exc2:
             # Fail CLOSED. Returning the raw body here would be exactly the
             # defect, and both modules are tracked files — absence means the
             # install is broken, not that redaction is optional.
             _REDACTOR = lambda s: "[REDACTION UNAVAILABLE — body withheld]" if s else s
+            _log_fallback("no redaction module importable (%s / %s) — WITHHOLDING every "
+                          "body; this is pinned for the life of the process" % (exc, exc2))
     return _REDACTOR
 
 

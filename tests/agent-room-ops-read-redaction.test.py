@@ -7,7 +7,9 @@ same secret came back out of the same room in the same process (#2945). These
 pin the symmetry, not a particular regex — the reader delegates to
 `src/chat_secret_filter`, so a pattern change lands on both sides at once.
 """
+import contextlib
 import importlib.util
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -107,6 +109,50 @@ class ReadRedactsWhatWriteRedacts(unittest.TestCase):
                 if v is not None:
                     sys.modules[k] = v
             m._REDACTOR = None
+
+
+class DegradedRedactorAnnouncesItself(unittest.TestCase):
+    """A withheld body and a genuinely secret-laden one look identical downstream,
+    and the choice is cached for the life of the process. Without a line at
+    selection an operator cannot tell a broken install from a quiet room
+    (reviewer's question on #2955)."""
+
+    def _select_with(self, missing):
+        m = _read_mod()
+        m._REDACTOR = None
+        saved = {k: sys.modules.pop(k, None) for k in missing}
+        err = io.StringIO()
+        try:
+            for k in missing:
+                sys.modules[k] = None          # force ImportError
+            with contextlib.redirect_stderr(err):
+                m._normalize([{"body": "hello", "event_id": "e"}])
+        finally:
+            for k in missing:
+                sys.modules.pop(k, None)
+                if saved.get(k) is not None:
+                    sys.modules[k] = saved[k]
+            m._REDACTOR = None
+        return err.getvalue()
+
+    def test_the_grammar_fallback_says_so(self):
+        out = self._select_with(["chat_secret_filter"])
+        self.assertIn("vault_set_grammar", out)
+        self.assertIn("NOT filtered", out, "must say what it stopped covering")
+
+    def test_the_withhold_state_says_it_is_pinned(self):
+        out = self._select_with(["chat_secret_filter", "vault_set_grammar"])
+        self.assertIn("WITHHOLDING", out)
+        self.assertIn("pinned", out, "the operator needs to know a repair will not take effect")
+
+    def test_the_healthy_path_is_silent(self):
+        """Without this, logging unconditionally would satisfy both tests above."""
+        m = _read_mod()
+        m._REDACTOR = None
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            m._normalize([{"body": "hello", "event_id": "e"}])
+        self.assertEqual(err.getvalue(), "", "the working redactor must not chatter")
 
 
 if __name__ == "__main__":
