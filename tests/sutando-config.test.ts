@@ -504,11 +504,8 @@ describe('sutando_config loader', () => {
 	});
 
 	it('the REPO-TRACKED sutando.config.json loads without an unknown-key warning', () => {
-		// The test above proves `health_check` is a known key using a SYNTHETIC config.
-		// That cannot catch the actual drift this PR is about: a key added to the shipped
-		// sutando.config.json but registered only in the Python loader. This one reads the
-		// real tracked file, so any future top-level key that the TS twin does not know
-		// fails here instead of warning on every TS service's first config load.
+		// A synthetic config cannot catch a key added to the shipped file but
+		// registered only in the Python loader; this reads the tracked file.
 		const trackedPath = resolve(
 			fileURLToPath(new URL('.', import.meta.url)), '..', 'sutando.config.json');
 		const tracked = JSON.parse(readFileSync(trackedPath, 'utf8'));

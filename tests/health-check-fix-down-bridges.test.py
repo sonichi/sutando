@@ -821,10 +821,8 @@ def case_q_down_path_requires_both_slack_tokens() -> list[str]:
                  mock.patch.object(hc, "token_from_vault", return_value=""), \
                  mock.patch.dict(hc.os.environ, clean_env, clear=True), \
                  mock.patch.object(hc.subprocess, "Popen", side_effect=lambda *a, **k: spawned.append(a) or mock.MagicMock()):
-                # This PR runs the canonical-checkout guard BEFORE launching, and the
-                # guard AND the alert path shell out (git, osascript) — this Popen
-                # stub records those too, so an unstubbed policy layer reads as
-                # "slack was launched". Inject all three seams this PR provides.
+                # The guard and alert path also shell out, so this stub records
+                # them too: an unstubbed layer would read as "slack was launched".
                 restarted = hc.fix_down_bridges(
                     checks, guard=lambda repo: (True, "test"),
                     sender=lambda msg: True, notifier=lambda msg: True)
