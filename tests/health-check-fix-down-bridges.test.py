@@ -24,6 +24,7 @@ Exit code: 0 on pass, 1 on fail.
 from __future__ import annotations
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -702,6 +703,26 @@ def case_t_resolve_down_bridge_action() -> list[str]:
         with mock.patch.dict(os.environ, {"SUTANDO_DOWN_BRIDGE_ACTION": "bogus"}):
             if sutando_config.resolve_down_bridge_action() != "alert":
                 fails.append("t) unknown value should fall back to 'alert'")
+
+    # The stubs above test the missing-key fallback, which is NOT what an install
+    # receives: sutando.config.json sets the key explicitly, so the shipped answer
+    # comes from the tracked file and no stubbed case can see it.
+    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
+    with mock.patch.dict(os.environ, env, clear=True):
+        shipped = sutando_config.resolve_down_bridge_action(REPO)
+        if shipped != "alert":
+            fails.append(f"t) the TRACKED sutando.config.json must ship 'alert', "
+                         f"got {shipped!r} — a code-side default cannot override it")
+    tracked = json.loads((REPO / "sutando.config.json").read_text())
+    if (tracked.get("health_check") or {}).get("down_bridge_action") != "alert":
+        fails.append("t) sutando.config.json health_check.down_bridge_action must be 'alert'")
+
+    # Opt-in still reaches the restart arm, from the config rather than the env.
+    with mock.patch.object(sutando_config, "load_config",
+                           lambda *a, **k: {"health_check": {"down_bridge_action": "restart"}}):
+        with mock.patch.dict(os.environ, env, clear=True):
+            if sutando_config.resolve_down_bridge_action() != "restart":
+                fails.append("t) explicit config opt-in to 'restart' ignored")
     return fails
 
 def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambient_env=None):

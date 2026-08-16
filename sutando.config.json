@@ -40,7 +40,7 @@
     "interval_seconds": 1800
   },
   "health_check": {
-    "down_bridge_action": "restart"
+    "down_bridge_action": "alert"
   },
   "bridges": {
     "progress_stream": false
