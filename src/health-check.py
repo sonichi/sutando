@@ -53,6 +53,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from workspace_layout import inspect_layout  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -1290,6 +1291,27 @@ WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "stand-avatar.png",
     "voice-context-active",
 })
+
+
+def check_workspace_wiring() -> "dict | None":
+    """Report-only mirror of the spawn-time guard: `materialized-with-data` FAILS
+    (auto-heal would orphan its files — needs a merge); other broken states warn."""
+    report = inspect_layout(REPO_DIR)
+    state = report["state"]
+    if state == "ok":
+        return None
+    status = "fail" if state == "materialized-with-data" else "warn"
+    fix = (
+        "merge stray files into the durable workspace, then rerun "
+        "`python3 src/workspace_layout.py --ensure`"
+        if status == "fail"
+        else "`python3 src/workspace_layout.py --ensure` (or restart the core)"
+    )
+    return {
+        "name": "workspace-wiring",
+        "status": status,
+        "detail": f"{state}: {report['detail']} — {fix}",
+    }
 
 
 def check_workspace_root_tidy() -> "dict | None":
@@ -3441,6 +3463,16 @@ def _voice_log_path() -> Path:
     return workspace_log
 
 
+def _voice_dep_detail(voice_check: dict) -> str:
+    """Status word plus the dependency's own detail. A bare status reads
+    identically at minute one and hour twelve, so it cannot signal urgency."""
+    vs = voice_check.get("status")
+    if not vs:
+        return "voice-agent status unknown"
+    dep = (voice_check.get("detail") or "").strip()
+    return f"voice-agent {vs}" + (f": {dep}" if dep else "")
+
+
 def check_voice_watchers(voice_check: dict) -> dict:
     """Verify all 3 task-bridge watchers are registered in the current
     voice-agent process. Parses logs/voice-agent.log for the most recent
@@ -3453,7 +3485,7 @@ def check_voice_watchers(voice_check: dict) -> dict:
     vs = voice_check.get("status")
     if vs != "ok":
         check["status"] = "warn"
-        check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
+        check["detail"] = _voice_dep_detail(voice_check)
         return check
     log_file = _voice_log_path()
     if not log_file.exists():
@@ -3530,7 +3562,7 @@ def check_voice_transport(voice_check: dict) -> dict:
     vs = voice_check.get("status")
     if vs != "ok":
         check["status"] = "warn"
-        check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
+        check["detail"] = _voice_dep_detail(voice_check)
         return check
     log_file = _voice_log_path()
     if not log_file.exists():
@@ -4932,10 +4964,15 @@ def check_gateway_bridge() -> "dict | None":
     # opinion, keep the previous process-only verdict.
     verdict = _gateway_serving()
     if verdict is False:
+        # WITHOUT the duration this line is byte-identical at minute one and at
+        # hour thirteen, so a reader cannot tell a blip from a standing outage.
+        age_h = _gateway_last_ok_age_h()
+        since = ("last successful poll UNKNOWN" if age_h is None
+                 else f"last successful poll {age_h:.1f}h ago")
         return {
             "name": "gateway-bridge",
             "status": "warn",
-            "detail": "process running but NOT serving — no successful poll; "
+            "detail": f"process running but NOT serving — {since}; "
                       "ag2.space mobile messages are not being delivered",
         }
     if verdict is True:
@@ -4944,6 +4981,22 @@ def check_gateway_bridge() -> "dict | None":
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
+
+
+def _gateway_last_ok_age_h(path: "Path | None" = None,
+                           now: "float | None" = None) -> "float | None":
+    """Hours since the sidecar's `last_ok_ts`; None when it is absent or
+    unusable, so an unknown start is never reported as a fresh one."""
+    import time as _time
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    now = _time.time() if now is None else now
+    try:
+        last = json.loads(Path(p).read_text()).get("last_ok_ts")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    if not isinstance(last, (int, float)) or isinstance(last, bool):
+        return None
+    return max(0.0, (now - float(last)) / 3600.0)
 
 
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
@@ -5770,6 +5823,216 @@ def check_task_watcher() -> dict:
                           f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
                           f"more than once. Keep the sentinel's ({pid}), stop the rest"}
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
+
+
+#: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
+#: configurable): a constant pages on live work the moment a deploy raises it.
+_TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S = 900.0
+_TASK_CLAIM_WARN_MULTIPLE = 2
+_TASK_CLAIM_DOWN_MULTIPLE = 8
+
+
+def _task_claim_thresholds() -> tuple[float, float]:
+    """(warn, down) seconds from the handler's configured hard timeout, falling back to
+    its default on anything unparseable so a threshold never pages a permitted run."""
+    raw = os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "")
+    try:
+        hard = float(raw)
+    except (TypeError, ValueError):
+        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+    if hard <= 0:
+        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+    return hard * _TASK_CLAIM_WARN_MULTIPLE, hard * _TASK_CLAIM_DOWN_MULTIPLE
+
+
+def _pid_alive(pid: int) -> bool:
+    """Signal 0 probes existence without delivering anything."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True           # exists, owned by someone else
+    except (OverflowError, ValueError, OSError):
+        return False
+    return True
+
+
+def _claim_owner(path: Path):
+    """(owner_pid, disposition, task_path) from a claim file; any may be None.
+
+    Format is the shell writer's: pid, watcher id, task path, disposition.
+    """
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None, None, None
+    pid = None
+    if lines and lines[0].strip().isdigit():
+        pid = int(lines[0].strip())
+    task_path = lines[2].strip() if len(lines) > 2 else None
+    disposition = lines[3].strip() if len(lines) > 3 else None
+    return pid, disposition, task_path
+
+
+# Archive-then-release is a normal asynchronous transition, so an absent task
+# only condemns a claim once it is older than the slowest such handoff.
+_TASK_CLAIM_ARCHIVE_GRACE_S = 300
+
+
+def _claim_observations_path(workspace_dir: Path) -> Optional[Path]:
+    """Unsynced first-sighting store, or None. Anchored on the ENGINE checkout, never the
+    workspace, whose state/ is refreshed by the same sync that refreshes claim mtime."""
+    engine = REPO_DIR.resolve()          # the module already resolves its own repo
+    try:
+        # rev-parse, not `engine/".git"`: in a WORKTREE .git is a file.
+        out = subprocess.run(git_argv("rev-parse", "--git-dir"), cwd=str(engine),
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        git_dir = (engine / out.stdout.strip()).resolve()
+    except Exception:
+        return None
+    if not git_dir.is_dir():
+        return None
+    # Keyed by workspace identity so two workspaces on one host cannot share
+    # (and cross-contaminate) a ledger.
+    key = hashlib.sha1(str(Path(workspace_dir).resolve()).encode()).hexdigest()[:12]
+    return git_dir / "sutando-claim-observations" / f"{key}.json"
+
+
+def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
+    """({name: seconds since first local sighting}, trusted). trusted=False means no
+    unsynced store exists, so the caller must treat age as unavailable, not as mtime."""
+    path = _claim_observations_path(workspace_dir)
+    if path is None:
+        return {}, False
+    lock = path.with_suffix(".lock")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return {}, False
+    fd = None
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            seen = json.loads(path.read_text())
+            if not isinstance(seen, dict):
+                seen = {}
+        except FileNotFoundError:
+            seen = {}
+        except Exception:
+            # Corrupt: a reset would reseed every claim from sync-mutable mtime
+            # and suppress exactly what this exists to catch.
+            return {}, False
+        live = {e.name for e in entries}
+        seen = {k: v for k, v in seen.items() if k in live and isinstance(v, (int, float))}
+        ages = {}
+        for e in entries:
+            first = seen.get(e.name)
+            if first is None:
+                try:
+                    first = e.stat().st_mtime
+                except OSError:
+                    continue
+                seen[e.name] = first
+            ages[e.name] = max(0.0, now - first)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w") as fh:
+            json.dump(seen, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return ages, True
+    except Exception:
+        return {}, False
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
+    """A claim whose task file still exists is queued or running, so no age condemns it;
+    one whose task is archived is leaked at any age. Not a --fix: release may drop work."""
+    name = "task-claims"
+    base = Path(workspace_dir or WORKSPACE_DIR) / "state" / "task-event-handler-claims"
+    if not base.is_dir():
+        return {"name": name, "status": "ok",
+                "detail": "no claims directory — task-event handler never dispatched on this host"}
+    now = time.time()
+    warn_s, down_s = _task_claim_thresholds()
+    bounded, leaked, in_flight, held = [], [], 0, 0
+    entries = list(base.glob("task-*.txt"))
+    # Ages come from a LOCAL first-sighting; mtime is sync-mutable. An untrusted
+    # ledger degrades only the AGE-DEPENDENT decisions, so keep scanning.
+    ages, age_trusted = _claim_ages(entries, Path(workspace_dir or WORKSPACE_DIR), now)
+    age_unknown = 0
+    for entry in entries:
+        age = ages.get(entry.name)
+        if age is None and age_trusted:
+            continue          # raced with a release; the next run sees the truth
+        held += 1
+        pid, disposition, task_path = _claim_owner(entry)
+        # The task file is the progress signal: while it exists the work is queued
+        # or running, and 2 workers legitimately hold several claims in a burst.
+        task_live = bool(task_path) and Path(task_path).exists()
+        # Age-INDEPENDENT and definitive, so it is checked FIRST: nothing can
+        # release a claim whose owner is gone, whatever the ledger says.
+        if pid is not None and not _pid_alive(pid):
+            leaked.append((age or 0.0, entry.name, "owner process gone"))
+        elif not task_live:
+            # Archival and claim release are ASYNCHRONOUS; only past that window
+            # is an absent task evidence that nothing will release the claim.
+            if age is None:
+                age_unknown += 1          # grace needs an age we do not have
+            elif age >= _TASK_CLAIM_ARCHIVE_GRACE_S:
+                leaked.append((age, entry.name, "task already archived"))
+            else:
+                in_flight += 1
+        elif disposition == "must-handle":
+            if age is None:
+                age_unknown += 1          # the bound is an age comparison
+            else:
+                bounded.append((age, entry.name))
+        else:
+            in_flight += 1
+
+    if not held:
+        return {"name": name, "status": "ok", "detail": "no held task-handler claims"}
+
+    if leaked:
+        leaked.sort(reverse=True)
+        age, who, why = leaked[0]
+        return {"name": name, "status": "down",
+                "detail": f"{len(leaked)} of {held} held claim(s) leaked — {why}, "
+                          f"oldest {age / 3600:.1f}h ({who}); nothing will release "
+                          "them, and each publishes a user-visible failure when the "
+                          "watcher next exits"}
+    if bounded:
+        bounded.sort(reverse=True)
+        age, who = bounded[0]
+        detail = (f"{held} held claim(s); oldest bounded {age / 3600:.1f}h ({who}); "
+                  f"handler bound {warn_s / _TASK_CLAIM_WARN_MULTIPLE / 60:.0f}m")
+        if age > down_s:
+            return {"name": name, "status": "down",
+                    "detail": f"{detail} — past its own hard timeout; leaked"}
+        if age > warn_s:
+            return {"name": name, "status": "warn",
+                    "detail": f"{detail} — past {_TASK_CLAIM_WARN_MULTIPLE}x the handler's own bound"}
+    if age_unknown:
+        return {"name": name, "status": "warn",
+                "detail": f"{held} held claim(s); no leak or dead owner found, but "
+                          f"claim AGE is unavailable for {age_unknown} of them (no "
+                          "trusted observation store), so stale cannot be told from "
+                          "fresh for those"}
+    return {"name": name, "status": "ok",
+            "detail": f"{held} held claim(s), {in_flight} still queued or running; "
+                      "none leaked and none past its own execution contract"}
 
 
 def fix_task_watcher_sentinel(check: dict) -> str:
@@ -6954,7 +7217,9 @@ def check_claude_hook_registration(
     try:
         sys.path.insert(0, str(repo / "src"))
         from skill_hooks import discover as _discover_skill_hooks
-        owned.extend(_discover_skill_hooks(repo))
+        # [:3] — the 4th field is the prior command, which only the installer's
+        # migration sweep uses; `owned` also holds 3-tuples parsed from the script.
+        owned.extend(r[:3] for r in _discover_skill_hooks(repo))
     except Exception as exc:
         return {"name": name, "status": "warn",
                 "detail": f"skill-hook discovery failed ({exc}) — "
@@ -7514,6 +7779,10 @@ def run_all_checks() -> list[dict]:
     if _root_tidy:
         checks.append(_root_tidy)
 
+    _wiring = check_workspace_wiring()
+    if _wiring:
+        checks.append(_wiring)
+
     _mem_index = check_memory_index_integrity()
     if _mem_index:
         checks.append(_mem_index)
@@ -7866,6 +8135,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_proactive_quarantine())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
+    checks.append(check_task_claim_age())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
@@ -9051,7 +9321,7 @@ def community_support_line() -> str:
 
 
 #: Statuses that are NOT problems. Everything else is, by the same rule the
-#: issue list uses: `issues = [c for c in checks if c["status"] not in ("ok", "warn")]`.
+#: issue list uses: `issues = [c for c in checks if is_issue(c)]`.
 #: `stale` is an issue but gets its own glyph because it names a specific remedy.
 _BENIGN_STATUSES = ("ok", "warn")
 
@@ -9083,6 +9353,12 @@ def status_icon(status: str) -> str:
     return "✗"
 
 
+def is_issue(check) -> bool:
+    """The single definition of "not healthy". `summary_line` and the exit-code
+    list must use this one, or a run exits non-zero while printing an all-clear."""
+    return check.get("status") not in _BENIGN_STATUSES
+
+
 def summary_line(checks) -> str:
     """The no-failures summary. Warnings are deliberately NOT issues — they must
     not fail the exit code or wake the launchd notifier, and that is unchanged.
@@ -9094,7 +9370,15 @@ def summary_line(checks) -> str:
     Pure and importable on purpose, so a regression test exercises THIS code
     rather than a copy of it.
     """
+    fails = [c for c in checks if is_issue(c)]
     warns = [c for c in checks if c.get("status") == "warn"]
+    if fails:
+        line = (f"{len(fails)} ISSUE(S): "
+                + ", ".join(c["name"] for c in fails))
+        if warns:
+            line += (f" — plus {len(warns)} warning(s): "
+                     + ", ".join(c["name"] for c in warns))
+        return line
     if not warns:
         return "All systems operational."
     return (f"No failures — {len(warns)} warning(s): "
@@ -9110,7 +9394,7 @@ def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
-    issues = [c for c in checks if c["status"] not in ("ok", "warn")]
+    issues = [c for c in checks if is_issue(c)]
     codex_notifier = (
         next(
             (
@@ -9232,7 +9516,9 @@ def main():
         if not quiet:
             print(summary_line(checks))
     else:
-        print(f"{len(issues)} issue(s) found:")
+        # One summary for both outcomes: a separate issue-count header here is how
+        # the exit code and the printed summary drifted apart in the first place.
+        print(summary_line(checks))
         for c in issues:
             print(f"  - {c['name']}: {c['status']} ({c['detail']})")
         print(community_support_line())  # pragma: no cover — main() summary glue; the line's content is unit-tested via community_support_line()
