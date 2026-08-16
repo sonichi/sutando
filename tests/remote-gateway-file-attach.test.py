@@ -3,7 +3,7 @@
 
 Covers:
   1. `_post_ready_results` routes marker decisions through the unified
-     parser (parse_markers, #873): skip markers archive without POSTing.
+     parser: skip markers POST raw to close the lease, then archive.
   2. `[file:]` markers upload via POST /v1/rooms/{room}/media, the marker
      is stripped from the delivered body, and the room comes from the
      task→room sidecar map recorded at queue time.
@@ -74,10 +74,8 @@ class FileAttachTests(unittest.TestCase):
     def _result(self, tid: str, body: str) -> None:
         (self.mod.RESULTS_DIR / f"{tid}.txt").write_text(body)
 
-    # 1 — unified-parser skip semantics: a skip marker suppresses the USER
-    # reply, not the server POST. Only add_result closes the server-side
-    # lease, and the server's own parse_result drops delivery for these
-    # markers — the old zero-POST assertion pinned the zombie-lease defect.
+    # Skip markers still POST to close the lease; the server suppresses their
+    # user-facing delivery.
     def test_skip_marker_posts_raw_body_then_archives(self):
         self._result("t1", "[no-send] internal only")
         self.mod._post_ready_results({"t1"})
