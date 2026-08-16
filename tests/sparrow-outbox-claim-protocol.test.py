@@ -95,9 +95,8 @@ def contract(title):
         except AssertionError as exc:
             FAILED.append(f"{title}: {exc}")
             print(f"  FAIL {title}\n         {exc}")
-        except Exception as exc:  # noqa: BLE001
-            # A raise is not a verdict; without this it kills the run and every
-            # later contract silently never executes.
+        except Exception as exc:  # noqa: BLE001 - a raise is not a verdict
+            # Without this it kills the run and later contracts never execute.
             ERRORED.append(f"{title}: {type(exc).__name__}: {exc}")
             print(f"  ERR  {title}\n         {type(exc).__name__}: {exc}")
         else:
