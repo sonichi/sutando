@@ -182,7 +182,19 @@ with tempfile.TemporaryDirectory() as td:
           any(n in (r12 or {}).get("detail", "")
               for n in (".env", ".lock.guard")), False)
 
-    # 13. A guard-LIKE name that is not a guard stays flagged — `*.lock.guard`
+    # 13. An UNKNOWN root .lock.guard is still drift. state/locks/ is where
+    #     workspace_lock.py already writes this artifact type, and this probe
+    #     only lists ROOT files — so a role guard appearing at the root is a
+    #     workspace-resolution bug, the class the probe exists to catch. A
+    #     `*.lock.guard` glob would have hidden it; the two real root guards
+    #     are exempt by name instead.
+    td11 = Path(_tf.mkdtemp()); ws11 = td11 / "workspace"; (ws11 / "state").mkdir(parents=True)
+    (ws11 / "sync-worker.lock.guard").write_text("")
+    r11 = load(ws11).check_workspace_root_tidy()
+    check("an unknown root .lock.guard is still drift",
+          "sync-worker.lock.guard" in (r11 or {}).get("detail", ""), True)
+
+    # 14. A guard-LIKE name that is not a guard stays flagged — the exemption
     #     must not degrade into "anything containing lock".
     td10 = Path(_tf.mkdtemp()); ws10 = td10 / "workspace"; (ws10 / "state").mkdir(parents=True)
     (ws10 / "voice.lock").write_text("")
