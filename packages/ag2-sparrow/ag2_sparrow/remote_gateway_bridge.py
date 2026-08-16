@@ -2479,15 +2479,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                 changed = True
                 continue
         if skip:
-            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing REPLY" — they
-            # do NOT mean "don't tell the server". This transport has a
-            # server-side lease that only add_result closes; archiving locally
-            # without POSTing leaves it open forever (it keeps extending under
-            # the ack+alive gate), so the sweeper rewrites it every cycle.
-            # POST the RAW body: the server records the result and completes
-            # the lease first, then its own parse_result drops the delivery for
-            # exactly these three markers — so suppression stays server-side
-            # and this client cannot leak a marker into a room.
+            # Skip markers still POST: only add_result closes the server lease;
+            # the server suppresses their user-facing delivery.
             try:
                 _delivery = _delivery_tid(tid)
                 if _delivery is None:
