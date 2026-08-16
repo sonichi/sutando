@@ -96,9 +96,8 @@ def contract(title):
             FAILED.append(f"{title}: {exc}")
             print(f"  FAIL {title}\n         {exc}")
         except Exception as exc:  # noqa: BLE001
-            # A FOURTH state. An implementation that RAISES rather than returning
-            # a wrong value would otherwise kill the run at this contract and
-            # every later one silently never executes.
+            # A raise is not a verdict; without this it kills the run and every
+            # later contract silently never executes.
             ERRORED.append(f"{title}: {type(exc).__name__}: {exc}")
             print(f"  ERR  {title}\n         {type(exc).__name__}: {exc}")
         else:
@@ -149,18 +148,14 @@ def _three_states():
         assert hasattr(State, want), f"OwnerState.{want} missing"
     assert ident(os.getpid()).state == State.ALIVE, "own live pid must read ALIVE"
     assert ident(999_999).state == State.DEAD, "absent pid must read DEAD (ESRCH)"
-    # pid 1 is alive. Whether it is INSPECTABLE is platform-specific: on Darwin
-    # proc_pidinfo answers EPERM (-> UNKNOWN), on Linux /proc/1/stat is
-    # world-readable (-> ALIVE). The invariant that holds everywhere, and the
-    # one a claim protocol actually needs, is that it must never read DEAD —
-    # that is the value that lets another drainer steal a live owner's claim.
+    # Inspectability is platform-specific; never-DEAD is not. DEAD is the value
+    # that lets another drainer steal a live owner's claim.
     assert ident(1).state != State.DEAD, (
         f"pid 1 read {ident(1).state}; a live process must never read DEAD, however "
         "opaque it is. This is the value that steals a running worker's claim")
     if sys.platform == "darwin":
-        # Stronger, and Darwin-specific: measured 2026-08-16, every root-owned
-        # live process answers EPERM there, so a two-state probe calls them all
-        # dead. Asserted only where it is true.
+        # Darwin-specific: root-owned live processes answer EPERM there, so a
+        # two-state probe calls them all dead.
         assert ident(1).state == State.UNKNOWN, (
             "on Darwin a root-owned live process is EPERM -> UNKNOWN, not ALIVE")
 
@@ -199,10 +194,8 @@ def _requeue_resets_budget():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         acquire(root, "item-6", drainer_id="d1")
-        # BURN THE BUDGET FIRST. Without this the item sits at 0 attempts, the
-        # assertion below holds whether or not requeue resets anything, and the
-        # contract cannot fail the way the system actually fails. Caught by
-        # mutation 2026-08-16: deleting the reset changed no test outcome.
+        # Burn the budget first: at 0 attempts the assertion below holds whether
+        # or not requeue resets anything.
         for _ in range(3):
             note(root, "item-6")
         assert attempts(root, "item-6") == 3, (
@@ -223,9 +216,8 @@ def _proc_stat_parse():
     m = outbox()
     parse = need(m, "_linux_process_identity")   # presence is the contract here
     del parse
-    # The parser locates fields after the LAST ')' because comm is arbitrary
-    # text in parens. A naive line.split()[21] returns 0 on this input, which
-    # would silently give every such process a bogus birth token.
+    # Fields come after the LAST ')': comm is arbitrary text in parens, and a
+    # naive line.split()[21] returns 0 here.
     raw = ("4321 (my weird ) proc) S 1 4321 4321 0 -1 4194304 1 0 0 0 1 1 0 0 "
            "20 0 1 0 555000 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
     after = raw[raw.rindex(")") + 1:].split()

@@ -121,10 +121,8 @@ def process_identity(pid: int) -> ProcessIdentity:
     linux = _linux_process_identity(pid)
     if linux is not None:
         return linux
-    # Darwin fallback. Unreachable wherever /proc exists, so it is unmeasurable
-    # on the Linux CI runner that gates coverage; the /proc path above is
-    # unmeasurable on macOS for the same reason. Exempt the branch the gating
-    # platform cannot execute — flip this if CI ever moves to macOS.
+    # Darwin fallback: unmeasurable on the Linux runner that gates coverage,
+    # as /proc is on macOS. Flip the pragma if CI moves to macOS.
     try:  # pragma: no cover - macOS-only; CI runs Linux and takes the branch above
         libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib",
                               use_errno=True)

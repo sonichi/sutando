@@ -54,10 +54,8 @@ def main() -> int:
     check("the bridge derives `delivered` from the receipt",
           bool(m) and "CONFIRMED" in m.group(1),
           "delivered is no longer computed from the outbox receipt")
-    # PROACTIVE_TRUST_OK is a deliberate at-least-once opt-in with its own
-    # test ("bare {ok:true} archives"). It must survive as a SEPARATE clause,
-    # not be folded into the receipt: the receipt reports what the response
-    # proves, the flag chooses what to do when it proves nothing.
+    # The receipt reports what the response proves; the flag chooses what to do
+    # when it proves nothing. Separate clauses, never folded.
     check("the trust opt-in survives as its own clause",
           "PROACTIVE_TRUST_OK and isinstance(resp, dict)" in src,
           "the at-least-once opt-in was removed; that is a documented, tested "

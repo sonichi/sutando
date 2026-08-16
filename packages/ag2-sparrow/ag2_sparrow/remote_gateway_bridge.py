@@ -2368,12 +2368,8 @@ def _post_proactive() -> None:
             # a failed send: the claim is renamed back and retried next pass,
             # loudly, so a misconfigured room is visible instead of silently
             # eating nudges.
-            # Classify through the outbox: an identifier is CONFIRMED, a 2xx
-            # without one is OUTCOME_UNKNOWN — only the first is proof of
-            # delivery. PROACTIVE_TRUST_OK stays as its own clause because it is
-            # a deliberate at-least-once opt-in, not a fallback: it says "treat
-            # accepted as delivered", which is a choice about semantics rather
-            # than a reading of the response.
+            # Only an identifier proves delivery. TRUST_OK stays a separate
+            # clause: it is an at-least-once opt-in, not a fallback.
             receipt = classify_response(200, resp)
             delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
                 PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True

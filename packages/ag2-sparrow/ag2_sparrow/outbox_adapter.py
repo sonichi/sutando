@@ -82,8 +82,7 @@ class DeliveryAdapter:
         try:
             status, body = self._transmit(item)
         except Exception as exc:  # noqa: BLE001
-            # A raise mid-write is the case where the peer may already have
-            # processed the request; NOT_DELIVERED here would re-send it.
+            # The peer may already have processed it; NOT_DELIVERED re-sends.
             return DeliveryReceipt(DeliveryOutcome.OUTCOME_UNKNOWN,
                                    detail=f"{type(exc).__name__}: {exc}")
         return classify_response(status, body)
