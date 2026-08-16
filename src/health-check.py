@@ -2053,17 +2053,19 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
         # Closest the index has come to the cut in the recorded window. This is
         # the number that makes the warning land, and no point reading has it.
         peak = max(sz for _, sz in points)
-        # Measure the rate from the last COMPACTION, not the oldest point. A
-        # mid-window drop otherwise cancels the growth after it and the rate
-        # collapses toward zero exactly when the file is being actively managed.
-        start = 0
-        for i in range(1, len(points)):
-            if points[i][1] < points[i - 1][1]:
-                start = i
-        oldest_at, oldest_sz = points[start]
+        # FASTEST sustained climb to now, over every start point: a single anchor
+        # can be undercut by a compaction or by 1-byte jitter, a max cannot.
         newest_at, _ = points[-1]
-        hours = (newest_at - oldest_at) / 3600.0
-        grew = effective_bytes - oldest_sz
+        hours = grew = 0.0
+        best_rate = 0.0
+        for at, sz in points:
+            span = (newest_at - at) / 3600.0
+            gain = effective_bytes - sz
+            if span < 0.5 or gain <= 0:
+                continue
+            if gain / span > best_rate:
+                best_rate, hours, grew = gain / span, span, gain
+        grew = int(grew)
         note = ""
         if peak > MEMORY_INDEX_LOAD_BYTES:
             # Not "nearly" — it was OVER, so the tail was genuinely unread for as

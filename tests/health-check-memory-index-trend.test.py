@@ -119,9 +119,8 @@ class TheHelperCanActuallyFire(unittest.TestCase):
 
 
 class RateIsMeasuredFromTheLastCompaction(unittest.TestCase):
-    """A mid-window compaction must not flatten the rate. Measuring growth from the
-    OLDEST point lets a drop cancel everything after it, and the note then reassures
-    at exactly the moment the index is being actively managed and regrowing."""
+    """Neither a compaction nor a 1-byte dip may lower the reported rate.
+    Rationale and the reviewer's jitter control are in the PR body."""
 
     def test_growth_after_a_drop_is_not_cancelled_by_the_drop(self):
         m = _hc()
@@ -135,6 +134,19 @@ class RateIsMeasuredFromTheLastCompaction(unittest.TestCase):
         # `grew > 0` guard would suppress entirely.
         self.assertIn("+1,200 B", note)
         self.assertIn("remaining headroom", note)
+
+    def test_a_one_byte_dip_does_not_reset_the_baseline(self):
+        """The reviewer's jitter control: a 1-B decrease near the end must not
+        become the baseline and hide a 900-B climb behind it."""
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        sizes = [cap - 1000, cap - 100, cap - 101, cap - 100]
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), sizes)
+            note = m._index_growth_note(idx, sizes[-1])
+        # Anchoring on the last decrease reports +1 B; the real climb is +900 B.
+        self.assertIn("+900 B", note)
+        self.assertNotIn("+1 B", note)
 
     def test_a_net_shrinking_history_still_reports_the_regrowth(self):
         m = _hc()
