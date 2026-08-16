@@ -129,6 +129,88 @@ def main() -> int:
               released is True,
               "raising here would leave the claim released but the caller believing it failed")
 
+        # --- reclaim: the arms only a concurrent peer reaches -----------------
+        with tempfile.TemporaryDirectory() as t3:
+            r3 = Path(t3)
+
+            # An owner we cannot inspect is never displaced, whatever the TTL.
+            ob.acquire_delivery_claim(r3, "opaque", "d1")
+            real_ident = ob.process_identity
+            ob.process_identity = lambda pid: ob.ProcessIdentity(pid, ob.OwnerState.UNKNOWN)
+            try:
+                verdict = ob.may_reclaim_delivery(r3, "opaque", 0.0)
+            finally:
+                ob.process_identity = real_ident
+            check("an UNKNOWN owner is never reclaimed, even past the TTL",
+                  verdict is False, "an uninspectable owner may still be sending")
+
+            # The slot turns over after the swap is won: our judgement is stale.
+            ob.acquire_delivery_claim(r3, "moved", "dead")
+            cp = ob._claim_path(r3, "moved")
+            rec = json.loads(cp.read_text(encoding="utf-8"))
+            rec.update(pid=999999, claimed_at=0.0)
+            cp.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
+            real_read, calls = ob._read_claim_at, {"n": 0}
+
+            def shifting(path, item_id):
+                calls["n"] += 1
+                got = real_read(path, item_id)
+                if calls["n"] >= 2 and got is not None:
+                    return ob.ClaimRecord(item_id, "someone-else", 4242, 7, 9.0)
+                return got
+
+            ob._read_claim_at = shifting
+            try:
+                took = ob.reclaim_delivery_claim(r3, "moved", 1.0, "B")
+            finally:
+                ob._read_claim_at = real_read
+            check("reclaim aborts when the slot moved on after its swap",
+                  took is False, "acting on a superseded observation is the ABA this guards")
+
+            # The claim vanishes between the swap and the unlink.
+            ob.acquire_delivery_claim(r3, "gone", "dead2")
+            gp = ob._claim_path(r3, "gone")
+            rec = json.loads(gp.read_text(encoding="utf-8"))
+            rec.update(pid=999999, claimed_at=0.0)
+            gp.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
+            real_unlink = os.unlink
+
+            def unlink_gone(path, *a, **kw):
+                if str(path).endswith(".claim"):
+                    raise FileNotFoundError(str(path))
+                return real_unlink(path, *a, **kw)
+
+            os.unlink = unlink_gone
+            try:
+                took2 = ob.reclaim_delivery_claim(r3, "gone", 1.0, "C")
+            finally:
+                os.unlink = real_unlink
+            check("reclaim reports False when the claim vanishes mid-swap",
+                  took2 is False, "a vanished claim is not a successful takeover")
+
+        with tempfile.TemporaryDirectory() as t4:
+            r2 = Path(t4)
+            # release: the rename arm, and both reinstate arms.
+            ob.acquire_delivery_claim(r2, "vanish2", "d1")
+            real_rename = os.rename
+            os.rename = lambda s, d: (_ for _ in ()).throw(OSError("gone"))
+            try:
+                out = ob.release_delivery_claim(r2, "vanish2", "d1")
+            finally:
+                os.rename = real_rename
+            check("a release whose swap fails reports False", out is False,
+                  "reporting True would tell the caller the slot is free when it is not")
+
+            ob.acquire_delivery_claim(r2, "reins", "A")
+            p = ob._claim_path(r2, "reins")
+            tomb = p.with_name(p.name + ".release-deadbeef")
+            tomb.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+            ob._reinstate(p, tomb)          # slot still occupied -> drop the copy
+            check("reinstate never overwrites a slot that is occupied again",
+                  ob.read_delivery_claim(r2, "reins").drainer_id == "A" and not tomb.exists())
+            ob._reinstate(p, p.with_name(p.name + ".release-absent"))
+            check("reinstate of an absent tomb is a no-op", True)
+
         # --- adapter: the paths the contract suite skipped -------------------
         import outbox_adapter as oa
 
