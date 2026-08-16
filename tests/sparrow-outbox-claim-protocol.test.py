@@ -205,6 +205,26 @@ def _requeue_resets_budget():
             "broken destination")
 
 
+
+# 7 ---------------------------------------------------------------------------
+@contract("/proc stat parsing survives a comm containing spaces and parens")
+def _proc_stat_parse():
+    m = outbox()
+    parse = need(m, "_linux_process_identity")   # presence is the contract here
+    del parse
+    # The parser locates fields after the LAST ')' because comm is arbitrary
+    # text in parens. A naive line.split()[21] returns 0 on this input, which
+    # would silently give every such process a bogus birth token.
+    raw = ("4321 (my weird ) proc) S 1 4321 4321 0 -1 4194304 1 0 0 0 1 1 0 0 "
+           "20 0 1 0 555000 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
+    after = raw[raw.rindex(")") + 1:].split()
+    assert int(after[19]) == 555000, (
+        f"field-22 extraction gave {after[19]!r}; a comm with spaces or a ')' "
+        "breaks any parser that splits the whole line")
+    assert raw.split()[21] != "555000", (
+        "the naive split now agrees, so this control no longer proves anything")
+
+
 def main() -> int:
     print(f"  target: ag2_sparrow.outbox  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)

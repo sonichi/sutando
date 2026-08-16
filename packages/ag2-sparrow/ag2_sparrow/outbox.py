@@ -69,6 +69,48 @@ class _ProcBsdInfo(ctypes.Structure):
     ]
 
 
+def _linux_process_identity(pid: int) -> Optional[ProcessIdentity]:
+    """Linux identity from /proc. Returns None when this is not a /proc system.
+
+    Field 22 of /proc/<pid>/stat is the process start time in clock ticks since
+    boot; combined with /proc/stat's btime it yields an absolute start instant.
+    Resolution is one clock tick (typically 10ms) rather than the microsecond
+    Darwin gives, which is coarser but still distinguishes a recycled pid from
+    the original in every case a delivery claim cares about.
+
+    The comm field can contain spaces and parentheses, so the fields after it
+    are located from the LAST ')' rather than by splitting the whole line.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            raw = fh.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        if not os.path.isdir("/proc/self"):
+            return None                      # not a /proc system at all
+        return ProcessIdentity(pid, OwnerState.DEAD)
+    except PermissionError:
+        return ProcessIdentity(pid, OwnerState.UNKNOWN)
+    except OSError:
+        return ProcessIdentity(pid, OwnerState.UNKNOWN)
+    try:
+        after_comm = raw[raw.rindex(")") + 1:].split()
+        start_ticks = int(after_comm[19])            # field 22, 1-based
+        hz = os.sysconf("SC_CLK_TCK") or 100
+        btime = 0
+        with open("/proc/stat", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("btime "):
+                    btime = int(line.split()[1])
+                    break
+        usec = (btime + start_ticks / hz) * 1_000_000 if btime else None
+        return ProcessIdentity(pid, OwnerState.ALIVE,
+                               int(usec) if usec is not None else None)
+    except (ValueError, IndexError, OSError):
+        # It exists — we just could not parse its birth time. Alive without a
+        # token is still ALIVE; claiming UNKNOWN here would block reclamation.
+        return ProcessIdentity(pid, OwnerState.ALIVE)
+
+
 def process_identity(pid: int) -> ProcessIdentity:
     """ALIVE / DEAD / UNKNOWN for a pid, with a microsecond birth token when visible.
 
@@ -76,6 +118,9 @@ def process_identity(pid: int) -> ProcessIdentity:
     one case a two-state probe gets catastrophically wrong, because "unknown"
     then reads as "dead" and the claim gets stolen from a running worker.
     """
+    linux = _linux_process_identity(pid)
+    if linux is not None:
+        return linux
     try:
         libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib",
                               use_errno=True)
