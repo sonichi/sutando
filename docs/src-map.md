@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-218 modules indexed.
+220 modules indexed.
 
 ## `src/`
 
@@ -20,6 +20,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
+- **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -132,6 +133,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`task-bridge.ts`** — Voice → Claude Code session bridge.
 - **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).
+- **`task-emit.sh`** — Shutdown-path TASK_FILE emitter — sourceable so a test can invoke it in isolation.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
 - **`task_priority.py`** — Task priority taxonomy + readers.

@@ -48,7 +48,15 @@ def check(name: str, status: str, detail: str) -> dict:
 def run_with_popen_stub(checks: list, *, action="restart",
                         guard=lambda repo: (True, "test-clean"),
                         sender=None, notifier=None) -> tuple[list, list]:
-    """Call fix_down_bridges with Popen stubbed; return (restarted, spawn argvs)."""
+    """Call fix_down_bridges with Popen stubbed; return (restarted, spawn argvs).
+
+    Also stubs the interpreter probe and slack-env load so the test is
+    hermetic: without these, fix_down_bridges would probe the host for
+    discord.py / slack_bolt (flaky across machines) and skip the restart when
+    absent. Here every bridge gets a known-good interpreter and slack gets a
+    token, so the restart path is exercised deterministically; the vault tier
+    is stubbed empty (never the real Keychain).
+    """
     spawned = []
     notified = []
 
@@ -59,7 +67,8 @@ def run_with_popen_stub(checks: list, *, action="restart",
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
-             mock.patch.object(hc, "_load_channel_env", return_value={"SLACK_BOT_TOKEN": "xoxb-test"}), \
+             mock.patch.object(hc, "_load_channel_env", return_value={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_APP_TOKEN": "xapp-test"}), \
+             mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
             restarted = hc.fix_down_bridges(
                 checks, action=action, guard=guard,
@@ -252,11 +261,12 @@ def case_h_launch_parity_failsafe_skips() -> list[str]:
     ]
     # discord: no capable interpreter (None). slack: interpreter fine but env
     # has no token — and ensure the ambient env doesn't carry one either.
-    clean_env = {k: v for k, v in os.environ.items() if k != "SLACK_BOT_TOKEN"}
+    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", side_effect=lambda n: None if n == "discord-bridge" else "python3"), \
              mock.patch.object(hc, "_load_channel_env", return_value={}), \
+             mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.dict(hc.os.environ, clean_env, clear=True), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
             restarted = hc.fix_down_bridges(
@@ -684,6 +694,285 @@ def case_t_resolve_down_bridge_action() -> list[str]:
     with mock.patch.dict(os.environ, {"SUTANDO_DOWN_BRIDGE_ACTION": "bogus"}):
         if hc.resolve_down_bridge_action() != "restart":
             fails.append("t) unknown value should fall back to 'restart'")
+        return fails
+
+def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambient_env=None):
+    """Drive main() --fix with `checks` in issues; return (stdout, spawns, kills).
+    plan="REAL" resolves the real plan (interpreter stubbed, channel env/ambient injectable)."""
+    spawned, killed = [], []
+    real_run = hc.subprocess.run
+
+    def fake_popen(argv, **kwargs):
+        spawned.append(argv)
+        return mock.MagicMock()
+
+    def fake_run(argv, *args, **kwargs):
+        if isinstance(argv, list) and argv and argv[0] == "/usr/bin/pgrep":
+            return subprocess.CompletedProcess(argv, 0, stdout="4242\n", stderr="")
+        if isinstance(argv, list) and argv and argv[0] == "/bin/kill":
+            killed.append(argv[1])
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    if plan == "REAL":
+        plan_patch = mock.patch.object(hc, "_bridge_interpreter", return_value="/usr/local/bin/python3-probed")
+        env_patch = mock.patch.object(hc, "_load_channel_env", return_value=channel_env or {})
+        ambient = ambient_env if ambient_env is not None else {
+            k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+        os_patch = mock.patch.dict(hc.os.environ, ambient, clear=True)
+    else:
+        plan_patch = mock.patch.object(hc, "_bridge_launch_plan", return_value=plan)
+        env_patch = mock.patch.object(hc, "_load_channel_env", return_value={})
+        os_patch = mock.patch.dict(hc.os.environ, dict(os.environ), clear=True)
+
+    captured = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(sys, "argv", ["health-check.py", "--fix"]), \
+             mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+             mock.patch.object(hc, "run_all_checks", return_value=checks), \
+             mock.patch.object(hc, "fix_down_bridges", return_value=[]), \
+             mock.patch.object(hc, "token_from_vault", return_value=""), \
+             plan_patch, env_patch, os_patch, \
+             mock.patch.object(hc.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen), \
+             mock.patch("time.sleep", lambda *_: None):
+            try:
+                with redirect_stdout(captured):
+                    hc.main()
+            except SystemExit:
+                pass
+    return captured.getvalue(), spawned, killed
+
+
+def case_o_stale_restart_uses_launch_plan() -> list[str]:
+    """Stale relaunch goes through the shared plan (probed interpreter +
+    channel env), never bare sys.executable."""
+    fails = []
+    checks = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
+    plan = ("/usr/local/bin/python3-probed", dict(os.environ))
+    out, spawned, killed = _run_main_fix_with_stale(checks, plan)
+    if "slack-bridge: restarted (stale code)" not in out:
+        fails.append(f"o) missing 'restarted (stale code)' line; got: {out!r}")
+    if killed != ["4242"]:
+        fails.append(f"o) expected old pid 4242 killed, got {killed}")
+    if len(spawned) != 1 or spawned[0][0] != "/usr/local/bin/python3-probed":
+        fails.append(f"o) spawn must use the plan's interpreter, got {spawned}")
+    if any(argv[0] == sys.executable for argv in spawned):
+        fails.append("o) stale restart still used sys.executable")
+    return fails
+
+
+def case_p_stale_no_plan_skips_without_kill() -> list[str]:
+    """No viable plan leaves the stale bridge RUNNING — no kill, no spawn
+    (a kill with a failed relaunch turns a warning into an outage)."""
+    fails = []
+    checks = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
+    out, spawned, killed = _run_main_fix_with_stale(checks, plan=None)
+    if killed:
+        fails.append(f"p) killed a stale bridge with no relaunch plan: {killed}")
+    if spawned:
+        fails.append(f"p) spawned despite missing plan: {spawned}")
+    if "restart skipped" not in out:
+        fails.append(f"p) missing skip message; got: {out!r}")
+    return fails
+
+
+def case_q_down_path_requires_both_slack_tokens() -> list[str]:
+    """Down path: a missing OR present-but-empty app token must skip the
+    slack restart (the bridge treats empty strings as missing)."""
+    fails = []
+    checks = [check("slack-bridge", "warn", "configured but not running")]
+    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+    for label, env in (("absent", {"SLACK_BOT_TOKEN": "xoxb-only"}),
+                       ("empty", {"SLACK_BOT_TOKEN": "xoxb-ok", "SLACK_APP_TOKEN": ""})):
+        spawned = []
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+                 mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+                 mock.patch.object(hc, "_load_channel_env", return_value=env), \
+                 mock.patch.object(hc, "token_from_vault", return_value=""), \
+                 mock.patch.dict(hc.os.environ, clean_env, clear=True), \
+                 mock.patch.object(hc.subprocess, "Popen", side_effect=lambda *a, **k: spawned.append(a) or mock.MagicMock()):
+                # This PR runs the canonical-checkout guard BEFORE launching, and the
+                # guard AND the alert path shell out (git, osascript) — this Popen
+                # stub records those too, so an unstubbed policy layer reads as
+                # "slack was launched". Inject all three seams this PR provides.
+                restarted = hc.fix_down_bridges(
+                    checks, guard=lambda repo: (True, "test"),
+                    sender=lambda msg: True, notifier=lambda msg: True)
+        if restarted or spawned:
+            fails.append(f"q) {label}-app-token slack was launched anyway: {restarted or spawned}")
+    return fails
+
+
+def case_r_stale_missing_app_token_no_kill_no_spawn() -> list[str]:
+    """Stale path with the REAL plan: a missing OR present-but-empty app token
+    must leave the running stale bridge alone — no kill, no spawn."""
+    fails = []
+    checks = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
+    for label, env in (("absent", {"SLACK_BOT_TOKEN": "xoxb-only"}),
+                       ("empty", {"SLACK_BOT_TOKEN": "xoxb-ok", "SLACK_APP_TOKEN": ""})):
+        out, spawned, killed = _run_main_fix_with_stale(checks, plan="REAL", channel_env=env)
+        if killed:
+            fails.append(f"r) {label}: killed the stale bridge: {killed}")
+        if spawned:
+            fails.append(f"r) {label}: spawned anyway: {spawned}")
+        if "restart skipped" not in out:
+            fails.append(f"r) {label}: missing skip message; got: {out!r}")
+    return fails
+
+
+def case_s_vault_only_slack_tokens_launchable() -> list[str]:
+    """Vault-only slack install (tokens only in the Keychain vault, injected
+    here) must yield a launchable plan with no secrets embedded in the env."""
+    fails = []
+    clean_env = {k: v for k, v in os.environ.items() if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")}
+    fake_vault = {"SLACK_BOT_TOKEN": "xoxb-vault-secret", "SLACK_APP_TOKEN": "xapp-vault-secret"}
+    with mock.patch.object(hc, "_bridge_interpreter", return_value="/usr/fake/python3-probed"), \
+         mock.patch.object(hc, "_load_channel_env", return_value={}), \
+         mock.patch.object(hc, "token_from_vault", side_effect=lambda v: fake_vault.get(v, "")), \
+         mock.patch.dict(hc.os.environ, clean_env, clear=True):
+        plan = hc._bridge_launch_plan("slack-bridge")
+    if plan is None:
+        fails.append("s) vault-only slack install yields launch_plan=None (bridge left down)")
+    else:
+        interp, child_env = plan
+        if interp != "/usr/fake/python3-probed":
+            fails.append(f"s) plan interpreter wrong: {interp!r}")
+        leaked = [k for k, v in child_env.items() if v in fake_vault.values()]
+        if leaked:
+            fails.append(f"s) vault secret embedded in child env under {leaked}")
+
+    # One vault token alone is not enough — the gate still requires BOTH.
+    with mock.patch.object(hc, "_bridge_interpreter", return_value="/usr/fake/python3-probed"), \
+         mock.patch.object(hc, "_load_channel_env", return_value={}), \
+         mock.patch.object(hc, "token_from_vault", side_effect=lambda v: fake_vault.get(v, "") if v == "SLACK_BOT_TOKEN" else ""), \
+         mock.patch.dict(hc.os.environ, clean_env, clear=True):
+        plan = hc._bridge_launch_plan("slack-bridge")
+    if plan is not None:
+        fails.append("s) bot-token-only vault still produced a plan")
+    return fails
+
+
+def case_t_interpreter_probe_never_execs_bare_python3() -> list[str]:
+    """The bare `python3` candidate never reaches subprocess execution: it is
+    substituted via _resolved_bare_python3, and dropped when unresolvable."""
+    fails = []
+    executed = []
+
+    def fake_run(argv, **kwargs):
+        executed.append(argv[0])
+        return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"")
+
+    # (1) substitute resolves -> the RESOLVED path is probed, never "python3".
+    with mock.patch.object(hc, "_BRIDGE_INTERP_CANDIDATES", ["/nonexistent/python3-missing", "python3"]), \
+         mock.patch.object(hc, "_resolved_bare_python3", return_value="/usr/fake/python3-resolved"), \
+         mock.patch.object(hc.shutil, "which", side_effect=lambda c: c if "resolved" in c else None), \
+         mock.patch.object(hc.subprocess, "run", side_effect=fake_run):
+        hc._bridge_interpreter("slack-bridge")
+    if "python3" in executed:
+        fails.append(f"t) bare python3 was executed: {executed}")
+    if "/usr/fake/python3-resolved" not in executed:
+        fails.append(f"t) resolved substitute not probed: {executed}")
+
+    # (2) substitute unresolvable -> candidate dropped, nothing executed.
+    executed.clear()
+    with mock.patch.object(hc, "_BRIDGE_INTERP_CANDIDATES", ["python3"]), \
+         mock.patch.object(hc, "_resolved_bare_python3", return_value=None), \
+         mock.patch.object(hc.shutil, "which", side_effect=lambda c: c), \
+         mock.patch.object(hc.subprocess, "run", side_effect=fake_run):
+        got = hc._bridge_interpreter("discord-bridge")
+    if executed:
+        fails.append(f"t) dropped bare candidate still executed: {executed}")
+    if got is not None:
+        fails.append(f"t) expected None with only an unresolvable bare candidate, got {got!r}")
+
+    # (3) the shipped candidate list carries no bare token other than the one
+    # the loop substitutes — a new bare entry would dodge the substitution.
+    bare = [c for c in hc._BRIDGE_INTERP_CANDIDATES if not c.startswith("/")]
+    if bare != ["python3"]:
+        fails.append(f"t) unexpected bare candidates in shipped list: {bare}")
+    return fails
+
+
+def case_u_resolved_bare_python3_policy() -> list[str]:
+    """_resolved_bare_python3 walks startup.sh's order ($SUTANDO_PY, bundled,
+    PATH) and refuses a system-bin python3 unless the developer tools exist."""
+    fails = []
+    clean_env = {k: v for k, v in os.environ.items() if k != "SUTANDO_PY"}
+    system_stub = os.path.join("/usr", "bin", "python3")  # assembled: literal is review-flagged
+    with tempfile.TemporaryDirectory() as td:
+        fake_repo = Path(td) / "repo"
+        fake_repo.mkdir()
+
+        # (1) $SUTANDO_PY override wins.
+        py = Path(td) / "custom-python3"
+        py.write_text("#!/bin/sh\n")
+        py.chmod(0o755)
+        with mock.patch.dict(hc.os.environ, {**clean_env, "SUTANDO_PY": str(py)}, clear=True), \
+             mock.patch.object(hc, "REPO_DIR", fake_repo):
+            got = hc._resolved_bare_python3()
+        if got != str(py):
+            fails.append(f"u) SUTANDO_PY override ignored: {got!r}")
+
+        # (2) system-bin python3 without developer tools -> refused (the stub).
+        with mock.patch.dict(hc.os.environ, clean_env, clear=True), \
+             mock.patch.object(hc, "REPO_DIR", fake_repo), \
+             mock.patch.object(hc.sys, "platform", "darwin"), \
+             mock.patch.object(hc.shutil, "which", return_value=system_stub), \
+             mock.patch.object(hc, "developer_tools_installed", return_value=False):
+            got = hc._resolved_bare_python3()
+        if got is not None:
+            fails.append(f"u) system stub returned without developer tools: {got!r}")
+
+        # (3) same location WITH the tools -> real interpreter, accepted.
+        with mock.patch.dict(hc.os.environ, clean_env, clear=True), \
+             mock.patch.object(hc, "REPO_DIR", fake_repo), \
+             mock.patch.object(hc.sys, "platform", "darwin"), \
+             mock.patch.object(hc.shutil, "which", return_value=system_stub), \
+             mock.patch.object(hc, "developer_tools_installed", return_value=True):
+            got = hc._resolved_bare_python3()
+        if got != system_stub:
+            fails.append(f"u) system python3 refused despite developer tools: {got!r}")
+
+        # (4) non-system PATH python3 (Homebrew/pyenv/...) -> accepted as-is.
+        with mock.patch.dict(hc.os.environ, clean_env, clear=True), \
+             mock.patch.object(hc, "REPO_DIR", fake_repo), \
+             mock.patch.object(hc.sys, "platform", "darwin"), \
+             mock.patch.object(hc.shutil, "which", return_value="/usr/fake/bin/python3"):
+            got = hc._resolved_bare_python3()
+        if got != "/usr/fake/bin/python3":
+            fails.append(f"u) non-system PATH python3 not accepted: {got!r}")
+
+        # (5) bundled runtime interpreter beside the repo wins over PATH.
+        bundled = Path(td) / "runtime" / "python" / "bin" / "python3"
+        bundled.parent.mkdir(parents=True, exist_ok=True)
+        bundled.write_text("#!/bin/sh\n")
+        bundled.chmod(0o755)
+        with mock.patch.dict(hc.os.environ, clean_env, clear=True), \
+             mock.patch.object(hc, "REPO_DIR", fake_repo), \
+             mock.patch.object(hc.shutil, "which", return_value="/usr/fake/bin/python3"):
+            got = hc._resolved_bare_python3()
+        if got != str(bundled):
+            fails.append(f"u) bundled runtime interpreter not preferred: {got!r}")
+        bundled.unlink()
+
+        # (6) nothing on PATH and no bundled runtime -> None (candidate dropped).
+        with mock.patch.dict(hc.os.environ, clean_env, clear=True), \
+             mock.patch.object(hc, "REPO_DIR", fake_repo), \
+             mock.patch.object(hc.shutil, "which", return_value=None):
+            got = hc._resolved_bare_python3()
+        if got is not None:
+            fails.append(f"u) expected None with no runnable python3, got {got!r}")
+
+        # (7) non-darwin: no CLT stub exists, PATH python3 accepted directly.
+        with mock.patch.dict(hc.os.environ, clean_env, clear=True), \
+             mock.patch.object(hc, "REPO_DIR", fake_repo), \
+             mock.patch.object(hc.sys, "platform", "linux"), \
+             mock.patch.object(hc.shutil, "which", return_value="/usr/fake/bin/python3"):
+            got = hc._resolved_bare_python3()
+        if got != "/usr/fake/bin/python3":
+            fails.append(f"u) non-darwin PATH python3 not accepted: {got!r}")
     return fails
 
 
@@ -710,7 +999,14 @@ def main() -> int:
                  case_u_defaults_from_config_and_module,
                  case_v_alert_send_failure_is_swallowed,
                  case_w_alert_undelivered_is_observable,
-                 case_x_failed_sender_falls_back_to_a_local_owner_surface):
+                 case_x_failed_sender_falls_back_to_a_local_owner_surface,
+                 case_o_stale_restart_uses_launch_plan,
+                 case_p_stale_no_plan_skips_without_kill,
+                 case_q_down_path_requires_both_slack_tokens,
+                 case_r_stale_missing_app_token_no_kill_no_spawn,
+                 case_s_vault_only_slack_tokens_launchable,
+                 case_t_interpreter_probe_never_execs_bare_python3,
+                 case_u_resolved_bare_python3_policy):
         fails = case()
         status = "PASS" if not fails else "FAIL"
         print(f"  {status} {case.__name__}")
