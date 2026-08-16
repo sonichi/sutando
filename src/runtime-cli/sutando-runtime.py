@@ -4,13 +4,10 @@
 The agent-facing command for human-collaboration requests; the agent never
 touches the socket, JSON-RPC, or any remote API directly:
 
-  sutando-runtime approval request --action change.apply \
-      --resource '{"target":"item-42"}' --reason "checks green"
+  sutando-runtime approval request --action github.pull_request.merge \
+      --resource '{"repository":"o/r","pullRequest":1}' --reason "checks green"
   sutando-runtime elicitation request --question "Deploy where?" \
       --type single_select --options '["staging","production"]'
-  sutando-runtime capability list
-  sutando-runtime capability read --capability example.activity \
-      --operation records.list --resource '{"scope":"mine"}'
   sutando-runtime capability execute --action message.send \
       --resource '{"roomId":"!r:hs"}' --input '{"body":"hi"}'
   sutando-runtime request get <requestId>
@@ -99,18 +96,8 @@ def main(argv=None) -> int:
     eli.add_argument("--options")
     eli.add_argument("--expires-in", type=float)
 
-    capability_commands = sub.add_parser("capability").add_subparsers(
-        dest="cmd", required=True)
-    capability_commands.add_parser("list")
-
-    read = capability_commands.add_parser("read")
-    read.add_argument("--capability", required=True)
-    read.add_argument("--operation", required=True)
-    read.add_argument("--resource")
-    read.add_argument("--cursor")
-    read.add_argument("--limit", type=int)
-
-    cap = capability_commands.add_parser("execute")
+    cap = sub.add_parser("capability").add_subparsers(dest="cmd", required=True) \
+             .add_parser("execute")
     cap.add_argument("--task-id")
     cap.add_argument("--action", required=True)
     cap.add_argument("--resource")
@@ -139,25 +126,11 @@ def main(argv=None) -> int:
                 "type": args.type, "options": _jarg(args.options),
                 "expiresInS": args.expires_in}, timeout=15)
         elif args.group == "capability":
-            if args.cmd == "list":
-                result = _rpc("capability.list", {}, timeout=15)
-            elif args.cmd == "read":
-                params = {
-                    "capabilityId": args.capability,
-                    "operation": args.operation,
-                    "resource": _jarg(args.resource),
-                    "cursor": _jarg(args.cursor),
-                    "limit": args.limit,
-                }
-                result = _rpc("capability.read",
-                              {key: value for key, value in params.items()
-                               if value is not None}, timeout=15)
-            else:
-                result = _rpc("capability.execute", {
-                    "taskId": args.task_id, "action": args.action,
-                    "resource": _jarg(args.resource), "input": _jarg(args.input),
-                    "idempotencyKey": args.idempotency_key,
-                    "approvalRequestId": args.approval}, timeout=60)
+            result = _rpc("capability.execute", {
+                "taskId": args.task_id, "action": args.action,
+                "resource": _jarg(args.resource), "input": _jarg(args.input),
+                "idempotencyKey": args.idempotency_key,
+                "approvalRequestId": args.approval}, timeout=60)
         else:
             method = f"request.{args.cmd}"
             params = {"requestId": args.request_id}
