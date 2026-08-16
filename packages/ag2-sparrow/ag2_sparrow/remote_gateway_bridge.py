@@ -654,8 +654,9 @@ def _provision_base() -> str:
 
 
 def _reenroll_identity() -> str:
-    """Agent mxid: process env first, then the channel .env file — the same
-    fallback the token uses (desktop launchers don't export either)."""
+    """Agent mxid: process env, then the channel .env file — the same fallback
+    the token uses (desktop launchers don't export either) — then the durable
+    per-host identity enrolment wrote to state/auth/ag2space.json."""
     for key in ("AGENT_MXID", "AGENT_ID"):
         v = (os.environ.get(key) or "").strip()
         if v:
@@ -664,7 +665,16 @@ def _reenroll_identity() -> str:
         v = _config_from_channel_env(key).strip()
         if v:
             return v
-    return ""
+    # Re-read per call, like the channel-env candidates: an identity that
+    # appears mid-episode must take effect without a restart.
+    try:
+        rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
+        # Non-string values must read as unknown, not be coerced into a
+        # garbage identity that _reenroll_claim would POST on the cadence.
+        v = rec.get("agent_id")
+        return v.strip() if isinstance(v, str) else ""
+    except Exception:  # absent, unreadable, or malformed — identity unknown
+        return ""
 
 
 def _reenroll_claim() -> None:
@@ -2469,13 +2479,26 @@ def _post_ready_results(inflight: set[str]) -> None:
                 changed = True
                 continue
         if skip:
-            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
-            # archive without POSTing (match the other bridges' semantics).
+            # Skip markers still POST: only add_result closes the server lease;
+            # the server suppresses their user-facing delivery.
+            try:
+                _delivery = _delivery_tid(tid)
+                if _delivery is None:
+                    _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                    continue
+                _req("POST", "/v1/results",
+                     {"id": _broker_tid(_delivery), "body": body})
+            except urllib.error.HTTPError as e:
+                _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
+                continue
+            except (urllib.error.URLError, TimeoutError) as e:
+                _log(f"result POST network error for {tid}: {e} — will retry")
+                continue
             _archive_result(rfile, tid)
             inflight.discard(tid)
             _forget_task_room(tid)
             changed = True
-            _log(f"archived {tid} (marker {skip.value}, not sent)")
+            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
             continue
         out_body = parsed.body
         redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
