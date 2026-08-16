@@ -1970,6 +1970,12 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
 
+# Said instead of "" when the trend cannot be computed. Silence made "no history
+# to read" indistinguishable from "read it, nothing to report" — the projection
+# that warns about approaching the cut simply never ran, and nothing said so.
+_TREND_UNAVAILABLE = "; growth trend unavailable (no readable index history on this host)"
+
+
 def _index_growth_note(index: Path, effective_bytes: int) -> str:
     """A trend for the memory-index warning, or "" when it cannot be measured.
 
@@ -1998,7 +2004,7 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             capture_output=True, text=True, timeout=10,
         )
         if proc.returncode != 0 or not proc.stdout.strip():
-            return ""
+            return _TREND_UNAVAILABLE
         # One `cat-file --batch` instead of a `git show` per commit. The first
         # draft spawned 1 + N processes (13 here) on a path that runs EVERY
         # proactive pass for as long as the warning stands — 658 ms on
@@ -2023,14 +2029,14 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
                 continue
             stamps.append((sha, int(at)))
         if not stamps:
-            return ""
+            return _TREND_UNAVAILABLE
         batch = subprocess.run(
             git_argv("-C", str(repo), "cat-file", "--batch"),
             input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
             capture_output=True, timeout=20,
         )
         if batch.returncode != 0:
-            return ""
+            return _TREND_UNAVAILABLE
         points: "list[tuple[int, int]]" = []
         buf, idx = batch.stdout, 0
         for sha, at in stamps:
@@ -2050,7 +2056,7 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             eff = _index_effective_text(body.decode("utf-8", "ignore"))
             points.append((at, len(eff.encode("utf-8"))))
         if len(points) < 2:
-            return ""
+            return _TREND_UNAVAILABLE
         points.sort()
         # Closest the index has come to the cut in the recorded window. This is
         # the number that makes the warning land, and no point reading has it.
@@ -2089,7 +2095,7 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
                         if rate > 0 and left > 0 else ""))
         return note
     except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
-        return ""
+        return _TREND_UNAVAILABLE
 
 
 def check_memory_index_integrity() -> "dict | None":
