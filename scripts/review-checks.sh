@@ -139,10 +139,8 @@ fi
 # Docstrings are out of scope — the written contract caps code comments.
 PROSE_HITS="$(printf '%s' "$DIFF" | RC_PROSE_CAP="$PROSE_CAP" RC_PROSE_EXTS="$PROSE_EXTS" python3 "$HERE/review-checks-prose-cap.py")"
 PROSE_RC=$?
-if [[ $PROSE_RC -ne 0 ]]; then
-    echo "review-checks: ERROR — prose-cap scanner failed to run (exit $PROSE_RC); failing closed (NOT a pass)." >&2
-    exit 2
-fi
+# Fail-closed is asserted AFTER the other scanners report. Exiting here would
+# suppress real hardcoded-path/root-artifact findings already in hand.
 
 FAILED=0
 if [[ "$HITS" =~ [^[:space:]] ]]; then
@@ -162,6 +160,10 @@ if [[ "$PROSE_HITS" =~ [^[:space:]] ]]; then
     printf '%s\n' "$PROSE_HITS" >&2
     echo "review-checks: $(printf '%s\n' "$PROSE_HITS" | grep -c '') block(s) over the cap. Keep the constraint in the code and move the narrative to the PR body." >&2
     FAILED=1
+fi
+if [[ $PROSE_RC -ne 0 ]]; then
+    echo "review-checks: ERROR — prose-cap scanner failed to run (exit $PROSE_RC); failing closed (NOT a pass)." >&2
+    exit 2
 fi
 [[ $FAILED -eq 1 ]] && exit 1
 echo "review-checks: PASS (hardcoded-paths + root-artifacts + prose-cap clean)"
