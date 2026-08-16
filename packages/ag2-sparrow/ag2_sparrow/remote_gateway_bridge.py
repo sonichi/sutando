@@ -187,6 +187,8 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .outbox import DeliveryOutcome
+from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
@@ -2366,9 +2368,15 @@ def _post_proactive() -> None:
             # a failed send: the claim is renamed back and retried next pass,
             # loudly, so a misconfigured room is visible instead of silently
             # eating nudges.
-            delivered = isinstance(resp, dict) and (
-                bool(resp.get("event_id"))
-                or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
+            # Classify through the outbox: an identifier is CONFIRMED, a 2xx
+            # without one is OUTCOME_UNKNOWN — only the first is proof of
+            # delivery. PROACTIVE_TRUST_OK stays as its own clause because it is
+            # a deliberate at-least-once opt-in, not a fallback: it says "treat
+            # accepted as delivered", which is a choice about semantics rather
+            # than a reading of the response.
+            receipt = classify_response(200, resp)
+            delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
+                PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True
             )
             if not delivered:
                 # Accepted but unconfirmed. It may ALSO have been delivered, so
