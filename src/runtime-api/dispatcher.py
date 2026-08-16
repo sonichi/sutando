@@ -26,7 +26,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Optional
 
 _HERE = Path(__file__).resolve().parent
 import sys  # noqa: E402
@@ -35,6 +35,7 @@ sys.path.insert(0, str(_HERE))
 from protocol import ELICITATION_TYPES, ProtocolError  # noqa: E402
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
+from capability_registry import EphemeralCapabilityRegistry  # noqa: E402
 
 
 def _log(msg: str) -> None:
@@ -116,7 +117,8 @@ class RuntimeDispatcher:
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
                  agents_view=None, identity_view=None, tasks_view=None,
-                 runtime_view=None, schedules_view=None):
+                 runtime_view=None, schedules_view=None,
+                 capability_registry: Optional[EphemeralCapabilityRegistry] = None):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
@@ -128,6 +130,9 @@ class RuntimeDispatcher:
         self.tasks = tasks_view
         self.runtime = runtime_view
         self.schedules = schedules_view
+        self.capability_registry = (
+            capability_registry if capability_registry is not None
+            else EphemeralCapabilityRegistry())
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
 
@@ -201,6 +206,10 @@ class RuntimeDispatcher:
             return self._approval_respond(params)
         if method == "human_action.status":
             return self._get(params)
+        if method == "capability.list":
+            return self.capability_registry.list(params)
+        if method == "capability.read":
+            return await self.capability_registry.read(params)
         if method == "capability.execute":
             return await self._capability(params)
         if method == "request.list":
@@ -597,4 +606,3 @@ class RuntimeDispatcher:
             except Exception as e:  # noqa: BLE001 — resolver must never die
                 _log(f"resolver error (isolated): {e}")
             await asyncio.sleep(RESOLVER_POLL_S)
-

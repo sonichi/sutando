@@ -151,6 +151,11 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
+    # Multi-instance envelope (isolation spec V1): which Sutando instance a
+    # task belongs to. Header status defangs a forged body-line claim the
+    # same as attachments/platform_card; consumers may verify it against
+    # their own instance before executing.
+    "instance_id",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 

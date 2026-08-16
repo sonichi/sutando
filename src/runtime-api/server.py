@@ -2,9 +2,11 @@
 
 JSON-RPC over a private Unix socket (see protocol.py) bridging a long-running
 agent to human collaboration: approval.request / elicitation.request /
-capability.execute, plus request.get/wait/cancel. Requests are durable
-(request_store.py, SQLite) and the approve/answer transport is the existing
-human-action card lifecycle (ha_adapter.py) — no new server API or UI in v0.
+capability.execute, bounded ephemeral capability.list/read, plus
+request.get/wait/cancel. Approval, elicitation and execution requests are
+durable (request_store.py, SQLite); list/read are not. The approve/answer
+transport is the existing human-action card lifecycle (ha_adapter.py) — no new
+server API or UI in v0.
 
 Identity: the actor is resolved DAEMON-SIDE from the environment
 (SUTANDO_AGENT_ID > AGENT_MXID > AGENT_ID), never from CLI-supplied params —
@@ -37,6 +39,7 @@ import stat
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
@@ -53,6 +56,9 @@ from tasks_view import TasksView  # noqa: E402
 from runtime_view import RuntimeView  # noqa: E402
 from schedules_view import SchedulesView  # noqa: E402
 import instance_registry  # noqa: E402
+from capability_registry import (EphemeralCapabilityRegistry,  # noqa: E402
+                                 compose_capability_registry)
+
 
 def _state_dir() -> Path:
     ws = os.environ.get("SUTANDO_RUNTIME_STATE")
@@ -99,7 +105,8 @@ def _host_label() -> str | None:
 
 class RuntimeServer:
     def __init__(self, socket_path: str, db_path: str, ha_dir: str,
-                 state_dir: str | None = None):
+                 state_dir: str | None = None,
+                 capability_registry: Optional[EphemeralCapabilityRegistry] = None):
         self.socket_path = socket_path
         self.store = RequestStore(db_path)
         self.ha = HumanActionAdapter(ha_dir)
@@ -144,7 +151,8 @@ class RuntimeServer:
             # never the bare hostname (#1745).
             schedules_view=(SchedulesView(Path(state_dir).parent / "hosts"
                                           / host_label / "crons.json")
-                            if state_dir and host_label else None))
+                            if state_dir and host_label else None),
+            capability_registry=capability_registry)
 
     def _register_instance(self) -> None:
         """Boot-time manifest write (registry M1). Best-effort: a registry
@@ -623,18 +631,25 @@ class RuntimeServer:
                 adv.terminate()
 
 
-def main() -> None:
-    state = _state_dir()
-    srv = RuntimeServer(
+def build_runtime_server(provider_factories=(), *, state_dir=None,
+                         runtime_socket=None) -> RuntimeServer:
+    state = Path(state_dir) if state_dir is not None else _state_dir()
+    registry = compose_capability_registry(provider_factories)
+    return RuntimeServer(
         # Canonical shared resolution (rundir.py) — daemon and CLI must agree
         # on the same default socket, on every platform (review blocker).
-        socket_path=socket_path(),
+        socket_path=runtime_socket or socket_path(),
         db_path=os.environ.get("SUTANDO_RUNTIME_DB")
         or str(state / "runtime-state.sqlite"),
         ha_dir=os.environ.get("SUTANDO_HA_DIR")
         or str(state / "human-actions"),
         state_dir=str(state),
+        capability_registry=registry,
     )
+
+
+def main(provider_factories=()) -> None:
+    srv = build_runtime_server(provider_factories)
     import signal
 
     def _term(_sig, _frm):
