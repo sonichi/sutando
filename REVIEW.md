@@ -150,8 +150,7 @@ and loads whichever repo it reviews.
 checks:
   prose-cap:
     # Added COMMENT runs may not exceed this many PHYSICAL lines. Docstrings are
-    # out of scope: the written contract caps code comments, not docstrings.
-    # Both forms are scanned: a checker covering one reports clean on the other.
+    # out of scope: CLAUDE.md caps "code comments" and never says "docstring".
     prose_cap: 2
     prose_exts: ['.py']
 
