@@ -30,6 +30,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # suppress. An actionable message beats that dialog.
 . "$REPO/scripts/python-binary.sh"
 PY="$(resolve_python "$REPO")"
+
 if [ -z "$PY" ]; then
   {
     echo "✗ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
@@ -45,6 +46,14 @@ if [ -z "$PY" ]; then
   } >&2
   exit 1
 fi
+
+# Must run after the PY-validity abort but before ANY workspace-derived write:
+# a write below on a broken link materializes an unhealable real dir.
+_wl_out="$("$PY" "$REPO/src/workspace_layout.py" --ensure)" || {
+  echo "✗ workspace wiring broken and not auto-healable — refusing to start services onto a stranded workspace. Diagnose: $PY $REPO/src/workspace_layout.py --check" >&2
+  exit 1
+}
+case "$_wl_out" in *'"action": "healed-'*) echo "🔧 workspace wiring healed: $_wl_out" >&2 ;; esac
 cd "$REPO"
 
 # Belt-and-suspenders startup log → always recoverable from /tmp (Lucy's Bug #5
@@ -1315,6 +1324,7 @@ for port_name in $VERIFY_PORTS; do
   fi
 done
 echo ""
+
 
 # Delegate to the runtime dispatcher — canonical sutando-core launch command.
 # Sutando.app and health recovery use this same Claude-or-Codex selection.
