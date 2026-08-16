@@ -202,18 +202,40 @@ def raw_state(prs: list, owner_login: str, stand: str = None) -> list:
     return out
 
 
-def state_hash(state: list) -> str:
-    """Stable hash of the objective set. Changes when a PR appears/disappears or
-    any actionable field (base/head/ci/mergeable/review/approvals/
-    approvals_standing) flips; a title edit does not refire.
+def _mergeable_key(row: dict) -> str:
+    """Revision-scoped key: a number-only one attaches the old head/base's
+    MERGEABLE to a new revision, suppressing the needed wake-up."""
+    return f"{row.get('number')}@{row.get('head') or ''}#{row.get('base') or ''}"
 
-    `approvals_standing` is in the key for a reason the head-anchored count
-    cannot cover: a reviewer converting CHANGES_REQUESTED to APPROVED at an
-    OLDER commit moves the enforced gate without moving `approvals`, so before
-    this it did not refire and the agent was never woken for a PR that had just
-    become mergeable."""
-    key = [[s["number"], s["principal"], s["base"], s["head"], s["ci"], s["mergeable"],
-            s["review"], s["approvals"], s["approvals_standing"]]
+
+def carry_unknown_mergeable(state: list, previous: dict) -> list:
+    """Carry the last value seen for THIS revision over an UNKNOWN, so GitHub's
+    lazy recompute stays out of the hash while a real transition still shows."""
+    out = []
+    for s in state:
+        row = dict(s)
+        if row.get("mergeable") == "UNKNOWN":
+            # A miss (new revision, or a legacy number-keyed file) keeps UNKNOWN.
+            prior = (previous or {}).get(_mergeable_key(row))
+            if prior:
+                row["mergeable"] = prior
+        out.append(row)
+    return out
+
+
+def mergeable_map(state: list) -> dict:
+    """Per-REVISION mergeable, for the next run to carry forward."""
+    return {_mergeable_key(s): s.get("mergeable") for s in state
+            if s.get("mergeable") and s.get("mergeable") != "UNKNOWN"}
+
+
+def state_hash(state: list) -> str:
+    """Stable hash of the objective set; a title edit does not refire.
+
+    `approvals_standing` and (normalized) `mergeable` are in the key because
+    each carries a gate change no other field does -- see the PR body."""
+    key = [[s["number"], s["principal"], s["base"], s["head"], s["ci"],
+            s["mergeable"], s["review"], s["approvals"], s["approvals_standing"]]
            for s in state]
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -226,12 +248,8 @@ def fetch_argv(repo: str, owner_login: str) -> list:
     the thing it is describing plus a chance to be wrong: widen the fetch, forget
     the string, and the payload now asserts a filter the code no longer applies.
     """
-    # SCOPE NOTE: `--author owner_login` means this only ever sees the owner's OWN
-    # PRs (24 of 116 open on 2026-08-02). Peer PRs where the owner's approval is
-    # the thing unblocking a merge are not fetched at all, so they cannot appear
-    # in any digest built from this state. Left alone deliberately -- widening the
-    # fetch is a scope decision, not a field-completeness fix, and belongs in its
-    # own change (issue #2643).
+    # Stage 2 of two. Stays --author-scoped because these heavy fields 504 when
+    # requested repo-wide; discovery_argv covers the rest of the population.
     return [
         "gh", "pr", "list", "--repo", repo, "--state", "open",
         "--author", owner_login, "--limit", "1000",
@@ -239,8 +257,58 @@ def fetch_argv(repo: str, owner_login: str) -> list:
     ]
 
 
+def discovery_argv(repo: str) -> list:
+    """Stage 1: every open PR, light fields only, no author filter.
+    Omits statusCheckRollup and reviews -- the two fields that 504 repo-wide."""
+    return [
+        "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
+        "--json", "number,author,isDraft,mergeable,reviewDecision,baseRefName,headRefOid",
+    ]
+
+
+def peer_candidates(discovered: list, owner_login: str) -> list:
+    """Peer PRs whose merge the owner could still unblock -- stage 2's input.
+    Prunes drafts and CHANGES_REQUESTED; never prunes on APPROVED."""
+    out = []
+    for pr in discovered:
+        if pr.get("isDraft"):
+            continue
+        author = ((pr.get("author") or {}).get("login") or "")
+        if author == owner_login:
+            continue                       # fetch_argv already covers these
+        if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+            continue
+        out.append(pr["number"])
+    return out
+
+
+def read_prior_mergeable(sf) -> dict:
+    """Prior mergeable map, fail-open. Inline, this swallowed only decode/OS
+    errors: valid JSON that is not an object reached .get and raised."""
+    if sf is None or not sf.exists():
+        return {}
+    try:
+        doc = json.loads(sf.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    got = doc.get("mergeable") or {}
+    return got if isinstance(got, dict) else {}
+
+
+def _argv_limit(argv: list):
+    """The `--limit` ceiling an argv carries, or None."""
+    if "--limit" not in argv:
+        return None
+    try:
+        return int(argv[argv.index("--limit") + 1])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
 def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
-                     fetched_count: int = None) -> dict:
+                     fetched_count: int = None, peer_stage: dict = None) -> dict:
     """Name the emitted population precisely, from the WHOLE pipeline.
 
     Why this exists: the payload carries counts, per-PR CI, approvals and merge
@@ -271,52 +339,78 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
     """
     argv = fetch_argv(repo, owner_login)
     author = argv[argv.index("--author") + 1] if "--author" in argv else None
-    limit_s = argv[argv.index("--limit") + 1] if "--limit" in argv else None
-    try:
-        limit = int(limit_s) if limit_s is not None else None
-    except (TypeError, ValueError):
-        limit = None
+    limit = _argv_limit(argv)
 
+    # A peer stage that could not run is NOT a widened population. Treat it as
+    # owner-only so the payload never claims coverage it does not have.
+    peer_ok = bool(peer_stage) and peer_stage.get("discovery_ok", True)
     excludes = ["draft PRs (dropped by raw_state, always)"]
-    if author:
+    if peer_stage and not peer_ok:
+        excludes.append(
+            "peer PRs -- the stage-1 discovery fetch FAILED, so the peer half is "
+            "UNKNOWN this fire, not empty"
+        )
+    if peer_stage and not peer_stage.get("owner_ok", True):
+        excludes.append(
+            "the owner-authored fetch FAILED -- owner rows are UNKNOWN, not absent"
+        )
+    if author and not peer_ok:
         excludes.append(
             f"PRs not authored by {author!r} -- including peer PRs where the "
             "owner's approval is the only thing blocking a merge"
         )
+    elif author and peer_ok:
+        # The peer stage restores the peer half, but its own prune is still a
+        # real exclusion and must be declared.
+        excludes.append(
+            "peer PRs already carrying CHANGES_REQUESTED (pruned before stage 2: "
+            "the author must clear the review before any approval can matter)"
+        )
+        if peer_stage.get("failed"):
+            excludes.append(
+                f"{peer_stage['failed']} peer PR(s) whose stage-2 fetch FAILED -- "
+                "absent from this payload but NOT known to be uninteresting"
+            )
 
-    # complete==True is a CERTIFICATION, so it is only ever granted on evidence:
-    # a count strictly below the ceiling. Unknown count -> None, never True.
-    #
-    # The count compared against the ceiling must be the PRE-filter FETCHED count
-    # (@john-the-dev's second blocker on #2645). The ceiling applies to
-    # `_fetch_prs()`; `raw_state()` then drops drafts, so the emitted count is
-    # strictly smaller. Certifying off the emitted count means one dropped draft
-    # at a truncated fetch reads as complete:
-    #
-    #     fetched=1000 (== ceiling, truncated)  ->  emitted=999  ->  "below the
-    #     1000 ceiling"  ->  complete=True, on a population GitHub had cut off.
-    #
-    # Exactly the defect this descriptor exists to remove, reintroduced by
-    # measuring the wrong side of the filter. `record_count` stays in the payload
-    # as the emitted size — it is what the consumer actually received — but it
-    # never decides completeness.
-    ceiling_count = fetched_count if fetched_count is not None else record_count
-    if ceiling_count is None or limit is None:
+    # Certify against the PRE-filter FETCHED count, per fetch: raw_state() drops
+    # drafts, so an emitted count can sit below a ceiling its own fetch hit.
+    stages = [("owner fetch", fetched_count if fetched_count is not None
+               else record_count, limit)]
+    if peer_ok and peer_stage is not None:
+        stages.append(("discovery", peer_stage.get("discovered"),
+                       _argv_limit(discovery_argv(repo))))
+
+    unknown = [n for n, c, l in stages if c is None or l is None]
+    at_ceiling = [(n, c, l) for n, c, l in stages
+                  if c is not None and l is not None and c >= l]
+    if unknown:
         complete = None
-        why = "fetched count or fetch ceiling unknown — completeness not certified"
-    elif ceiling_count >= limit:
+        why = (f"{', '.join(unknown)} count or ceiling unknown — completeness "
+               "not certified")
+    elif at_ceiling:
         complete = False
-        why = (f"fetch returned {ceiling_count} at a {limit} ceiling — complete "
-               "and truncated are indistinguishable here")
+        why = "; ".join(f"{n} returned {c} at a {l} ceiling — complete and "
+                        f"truncated are indistinguishable here"
+                        for n, c, l in at_ceiling)
     else:
         complete = True
-        why = f"fetch returned {ceiling_count}, below the {limit} ceiling"
+        why = "; ".join(f"{n} returned {c}, below the {l} ceiling"
+                        for n, c, l in stages)
+    ceiling_count = stages[0][1]
 
+    if peer_stage and (not peer_ok or peer_stage.get("failed")
+                       or not peer_stage.get("owner_ok", True)):
+        complete = False
+        why = "a fetch failed; population is uncertified"
     return {
-        "filter": f"author:{author}" if author else "none",
+        "filter": ("author:{} + peer stage".format(author) if (author and peer_ok)
+                   else (f"author:{author}" if author else "none")),
         "population": (
-            f"open, non-draft PRs authored by {author!r}"
-            if author else "open, non-draft PRs (all authors)"
+            (f"open, non-draft PRs authored by {author!r}, PLUS open non-draft peer "
+             "PRs without an open CHANGES_REQUESTED")
+            if (author and peer_ok)
+            else (f"open, non-draft PRs authored by {author!r}"
+                  if author else "open, non-draft PRs (all authors)")
         ),
         "excludes": excludes,
         "complete": complete,
@@ -327,16 +421,48 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
     }
 
 
-def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
+def _fetch_discovered(repo: str):  # pragma: no cover — subprocess/gh glue
+    """(ok, rows). `ok` is False on ANY failure so an outage can never be
+    serialized as a genuinely empty repository."""
+    res = subprocess.run(discovery_argv(repo), capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        print(f"pr-flag: discovery gh failed: {res.stderr[:200]}", file=sys.stderr)
+        return False, []
+    try:
+        return True, json.loads(res.stdout)
+    except json.JSONDecodeError:
+        print("pr-flag: discovery returned unparseable JSON", file=sys.stderr)
+        return False, []
+
+
+def _fetch_peer_pr(repo: str, number: int) -> dict:  # pragma: no cover — subprocess/gh glue
+    """Heavy fields for ONE peer PR. Per-PR because the repo-wide form 504s."""
+    res = subprocess.run(
+        ["gh", "pr", "view", str(number), "--repo", repo, "--json",
+         "number,title,author,baseRefName,headRefOid,mergeable,reviewDecision,"
+         "statusCheckRollup,isDraft,reviews"],
+        capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        print(f"pr-flag: peer #{number} gh failed: {res.stderr[:120]}", file=sys.stderr)
+        return {}
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _fetch_prs(repo: str, owner_login: str):  # pragma: no cover — subprocess/gh glue
+    """(ok, rows) — same contract as _fetch_discovered."""
     cmd = fetch_argv(repo, owner_login)
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
         print(f"pr-flag: gh failed: {res.stderr[:200]}", file=sys.stderr)
-        return []
+        return False, []
     try:
-        return json.loads(res.stdout)
+        return True, json.loads(res.stdout)
     except json.JSONDecodeError:
-        return []
+        print("pr-flag: owner fetch returned unparseable JSON", file=sys.stderr)
+        return False, []
 
 
 
@@ -428,9 +554,21 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
 
     # Bound separately so the PRE-filter size is available to scope_descriptor:
     # the `--limit` ceiling applies here, before raw_state() drops drafts.
-    fetched = _attach_commits(args.repo, _fetch_prs(args.repo, args.owner))
+    own_ok, own = _fetch_prs(args.repo, args.owner)
+    disc_ok, discovered = _fetch_discovered(args.repo)
+    candidates = peer_candidates(discovered, args.owner)
+    peers, peer_failures = [], 0
+    for number in candidates:
+        pr = _fetch_peer_pr(args.repo, number)
+        if pr:
+            peers.append(pr)
+        else:
+            peer_failures += 1
+    if not disc_ok:
+        print("pr-flag: discovery FAILED — the peer half is unknown, not empty; "
+              "population is uncertified this fire", file=sys.stderr)
+    fetched = _attach_commits(args.repo, own + peers)
     state = raw_state(fetched, args.owner, args.stand)
-    h = state_hash(state)
 
     # dedup: resolve the stored-hash file the same way every reader does
     sf = Path(args.state_file) if args.state_file else None
@@ -442,13 +580,33 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
         except Exception:
             ws = ""
         sf = Path(ws) / "state" / "pr-flag-state.json" if ws else Path("state/pr-flag-state.json")
+
+    prior = read_prior_mergeable(sf)
+    state = carry_unknown_mergeable(state, prior)
+    h = state_hash(state)
+    # Fetch success is not completeness: a stage on its ceiling is truncated,
+    # and certifying it persists a partial hash the next such run reads as NO_CHANGE.
+    scope = scope_descriptor(args.repo, args.owner, record_count=len(state),
+                             peer_stage={"discovered": len(discovered),
+                                         "candidates": len(candidates),
+                                         "fetched": len(peers),
+                                         "failed": peer_failures,
+                                         "discovery_ok": disc_ok,
+                                         "owner_ok": own_ok},
+                             # OWNER-stage size: the owner ceiling applies here.
+                             fetched_count=len(own))
+    certified = (own_ok and disc_ok and peer_failures == 0
+                 and scope.get("complete") is True)
+
     prev = ""
     try:
         prev = json.loads(sf.read_text()).get("hash", "")
     except Exception:
         prev = ""
 
-    if h == prev and not args.force:
+    # Gated on `certified`: an uncertified or TRUNCATED run whose surviving rows
+    # hash to the last healthy state would otherwise exit silently.
+    if h == prev and certified and not args.force:
         print("NO_CHANGE")
         return 0
 
@@ -456,15 +614,18 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     print(json.dumps({
         "hash": h,
         "changed": True,
-        # fetched_count is the PRE-filter size: the ceiling applies to the fetch,
-        # not to what survives raw_state(). See scope_descriptor().
-        "scope": scope_descriptor(args.repo, args.owner, record_count=len(state),
-                                  fetched_count=len(fetched)),
+        "scope": scope,
         "prs": state,
     }, indent=2))
     try:
         sf.parent.mkdir(parents=True, exist_ok=True)
-        sf.write_text(json.dumps({"hash": h, "count": len(state)}))
+        if certified:
+            sf.write_text(json.dumps({"hash": h, "count": len(state),
+                                      "mergeable": mergeable_map(state)}))
+        else:
+            print("pr-flag: population uncertified or truncated — hash NOT "
+                  "recorded, so the next healthy fire still emits",
+                  file=sys.stderr)
     except Exception as e:
         print(f"pr-flag: state write failed: {e}", file=sys.stderr)
     return 0

@@ -525,14 +525,17 @@ def main() -> int:
           "newline in field cannot forge a second access_tier line")
     check("collaborator: true" not in flines,
           "newline in field cannot forge collaborator access")
-    # Minor — no-send / deduped markers are archived, never POSTed to the gateway
+    # Skip markers still POST to close the lease; the server suppresses their
+    # user-facing delivery.
     _before = len(STATE["results"])
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (rtc.RESULTS_DIR / "task-MARK.txt").write_text("[no-send]\n")
     rtc._post_ready_results({"task-MARK"})
-    check(len(STATE["results"]) == _before
-          and not (rtc.RESULTS_DIR / "task-MARK.txt").exists(),
-          "[no-send] marker archived, not POSTed to gateway")
+    _posted = STATE["results"][_before:]
+    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-MARK.txt").exists(),
+          "[no-send] marker POSTed (closes the lease) and archived")
+    check(bool(_posted) and "[no-send]" in (_posted[0].get("body") or ""),
+          "[no-send] body keeps its marker so the server suppresses delivery")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -578,10 +581,13 @@ def main() -> int:
     # 3. result file → POST back + archive
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (rtc.RESULTS_DIR / "task-MOCK1.txt").write_text("the reply\n")
+    # Delta, not an absolute count: marker results now POST too, so earlier
+    # cases legitimately leave entries in STATE["results"].
+    _rb3 = len(STATE["results"])
     rtc._post_ready_results({"task-MOCK1"})
-    check(len(STATE["results"]) == 1, "result POSTed")
-    if STATE["results"]:
-        r = STATE["results"][0]
+    check(len(STATE["results"]) == _rb3 + 1, "result POSTed")
+    if len(STATE["results"]) > _rb3:
+        r = STATE["results"][_rb3]
         check(r.get("id") == "task-MOCK1" and r.get("body") == "the reply",
               "result payload correct (id + body)")
     check(not (rtc.RESULTS_DIR / "task-MOCK1.txt").exists(), "result file archived after POST")
@@ -1053,8 +1059,19 @@ def main() -> int:
     # _reload_rotated_token: no TOKEN_FILE configured → False (FATAL path kept)
     rtc.TOKEN_FILE = ""
     check(rtc._reload_rotated_token() is False, "no TOKEN_FILE → no rotation")
+    # FATAL survives ONLY where recovery is impossible: with reenroll enabled
+    # and a live token, _recover_auth now ENTERS the recheck loop instead
+    # (#2925) — so pin the False contract with the token gone / reenroll off.
+    _tok = rtc.TOKEN
+    rtc.TOKEN = ""
     check(rtc._recover_auth(401) is False,
-          "_recover_auth without TOKEN_FILE → False (caller keeps FATAL exit)")
+          "_recover_auth without TOKEN_FILE and no token → False (FATAL kept)")
+    rtc.TOKEN = _tok
+    _ree = rtc.REENROLL_ENABLED
+    rtc.REENROLL_ENABLED = False
+    check(rtc._recover_auth(401) is False,
+          "_recover_auth without TOKEN_FILE, reenroll off → False (FATAL kept)")
+    rtc.REENROLL_ENABLED = _ree
     # same secret as the running one → no rotation
     rtc.TOKEN_FILE = str(tok_file)
     tok_file.write_text(f"REMOTE_TASK_TOKEN={rtc.TOKEN}\n")

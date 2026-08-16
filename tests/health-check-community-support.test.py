@@ -62,7 +62,7 @@ check("BEFORE (clean run): summary shows NO Discord support line",
 # AFTER: an issue present → the Discord line appears under the issue list.
 out_issue = _run_main_capture([{"name": "voice-agent", "status": "down", "detail": "not running"}])
 check("AFTER (issue present): summary shows the Discord support line",
-      "discord.gg/uZHWXXmrCS" in out_issue and "issue(s) found" in out_issue)
+      "discord.gg/uZHWXXmrCS" in out_issue and "ISSUE(S): voice-agent" in out_issue)
 
 print()
 if failures:
