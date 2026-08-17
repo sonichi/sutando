@@ -51,18 +51,12 @@ and loads whichever repo it reviews.
    Sutando's users from this PR, and how do we mitigate it?"** (Chi 2026-07-25.) Concretely
    check: opt-in vs always-on; on-disk state-format/migration compatibility across the
    rolling-upgrade window; new hard-required config that breaks current installs;
-   process-global patches with wide blast radius; and — per #1898 — for any auto-action,
+   removal or rename of a path, command or flag that something outside the repo invokes —
+   a registered cron, plist or saved prompt holds its own copy, so an in-repo grep answers
+   about the wrong population (#3005); process-global patches with wide blast radius;
+   and — per #1898 — for any auto-action,
    *what code or state does it act on* (does it verify the target is canonical, or run
    whatever's there?). A PR is not merge-ready until that worst case is named and mitigated.
-   **Removing or renaming a path, command, or flag: the callers that break are often not in
-   the repo.** A registered cron, a saved prompt, a launchd plist, an external config — each
-   holds its own copy of the invocation, and no diff reaches it. So "grep finds no caller" is
-   an answer about the wrong population; name where the invocation is *stored*, not only where
-   it is written. A one-release shim that forwards and warns is the cheap mitigation.
-   *Grounded by:* #3005 — deleting `scripts/pr_flag.py` after the implementation moved to a
-   skill. The in-repo grep was clean and the author (me) treated that as the answer; a host
-   whose cron was registered against the old path keeps invoking it until someone re-runs
-   `/schedule-crons`, and the failure is silent — the hourly digest simply stops.
    *Grounded by:* #1898 itself — the live test verified the claimed behavior, but the
    latent bug sat in exactly this un-asked worst-case question and surfaced 2026-07-25.
    The full reported-breakage corpus grounding these lessons lives in
