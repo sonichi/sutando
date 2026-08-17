@@ -18,6 +18,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REF=""
 WT=""
+WTPARENT=""
 
 usage() { sed -n '2,12p' "$0"; exit "${1:-0}"; }
 
@@ -32,8 +33,17 @@ while [[ $# -gt 0 ]]; do
 done
 [[ $# -gt 0 ]] || { echo "pr-evidence: no commands given" >&2; usage 2; }
 
+# Failures are reported, not swallowed: a stranded worktree holds a pinned
+# config, and silence is how it stays on disk unnoticed.
 cleanup() {
-    [[ -n "$WT" && -d "$WT" ]] && git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1
+    if [[ -n "$WT" && -d "$WT" ]]; then
+        git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 \
+            || echo "pr-evidence: WARNING — could not remove worktree $WT" >&2
+    fi
+    if [[ -n "$WTPARENT" && -d "$WTPARENT" ]]; then
+        rm -rf "$WTPARENT" \
+            || echo "pr-evidence: WARNING — left $WTPARENT on disk" >&2
+    fi
     return 0
 }
 trap cleanup EXIT
@@ -42,33 +52,36 @@ RUNDIR="$REPO"
 if [[ -n "$REF" ]]; then
     git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" >/dev/null \
         || { echo "pr-evidence: '$REF' is not a commit in this repo" >&2; exit 2; }
-    WT="$(mktemp -d "${TMPDIR:-/tmp}/pr-evidence-XXXXXX")"
-    rmdir "$WT"
+
+    # Resolve BEFORE the worktree exists, and unconditionally — not only when a
+    # local config file happens to be present. An unpinned worktree resolves its
+    # own empty workspace/ and reports clean whatever the code does.
+    LIVE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+    [[ -n "$LIVE_WS" ]] || {
+        echo "pr-evidence: cannot resolve the live workspace — refusing --at rather than" >&2
+        echo "pr-evidence: emitting evidence from an empty one." >&2
+        exit 2
+    }
+
+    # mktemp gives 0700; `git worktree add` makes its own dir 0755, so the
+    # worktree goes INSIDE the private parent rather than being it.
+    WTPARENT="$(mktemp -d "${TMPDIR:-/tmp}/pr-evidence-XXXXXX")"
+    WT="$WTPARENT/wt"
     git -C "$REPO" worktree add --detach --quiet "$WT" "$REF" \
         || { echo "pr-evidence: could not create a worktree at '$REF'" >&2; exit 2; }
     RUNDIR="$WT"
-    # Pin the worktree at the live workspace, or its probes answer about an
-    # empty directory and report clean regardless of the code.
-    if [[ -f "$REPO/sutando.config.local.json" ]]; then
-        LIVE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
-        cp "$REPO/sutando.config.local.json" "$WT/" 2>/dev/null
-        if [[ -n "$LIVE_WS" ]]; then
-            python3 - "$WT/sutando.config.local.json" "$LIVE_WS" <<'PY' || true
+
+    # Write a MINIMAL config — never copy the real one. It carries unrelated
+    # local settings (vault, migrate) that this tool has no need to duplicate.
+    ( umask 077
+      python3 - "$WT/sutando.config.local.json" "$LIVE_WS" <<'PY'
 import json, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-try:
-    cfg = json.loads(p.read_text())
-except Exception:
-    cfg = {}
-cfg["workspace"] = {"path": sys.argv[2]}
-p.write_text(json.dumps(cfg, indent=2) + "\n")
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps({"workspace": {"path": sys.argv[2]}}, indent=2) + "\n")
 PY
-            echo "pr-evidence: worktree at $REF pinned to workspace $LIVE_WS" >&2
-        else
-            echo "pr-evidence: WARNING — could not resolve the live workspace; probes in this" >&2
-            echo "pr-evidence: worktree may report clean against an empty directory." >&2
-        fi
-    fi
+    ) || { echo "pr-evidence: could not pin the worktree's workspace" >&2; exit 2; }
+    chmod 600 "$WT/sutando.config.local.json"
+    echo "pr-evidence: worktree at $REF pinned to workspace $LIVE_WS" >&2
 fi
 
 SHA="$(git -C "$RUNDIR" rev-parse HEAD)"

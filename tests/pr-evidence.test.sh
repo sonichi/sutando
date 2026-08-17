@@ -65,6 +65,33 @@ rc_ref=0
 bash "$GEN" --at not-a-real-ref 'echo x' >/dev/null 2>&1 || rc_ref=$?
 nonzero "$rc_ref" "refuses an unknown ref instead of silently running at HEAD"
 
+# ---- --at must pin the workspace even with NO local config file -------------
+# The pinning used to run only when sutando.config.local.json existed, so in the
+# default configuration the worktree resolved its own empty workspace/ and every
+# workspace-reading probe reported clean regardless of the code. That is the
+# false-clean evidence this tool exists to prevent, so it is a blocking case.
+live_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
+ws_out="$(bash "$GEN" --at HEAD~1 'bash scripts/sutando-config.sh workspace' 2>/dev/null)"
+has "$ws_out" "$live_ws" "--at reports the LIVE workspace with no local config present"
+lacks "$ws_out" "pr-evidence-" "--at does NOT report a workspace under its own temp dir"
+
+# ---- the pinned config is minimal and private ------------------------------
+# It used to be a copy of the whole local config (vault, migrate, …) dropped
+# into a 0755 worktree, where a failed cleanup strands it world-readable.
+perm_out="$(bash "$GEN" --at HEAD~1 \
+    'pwd' \
+    'stat -f "%Sp" sutando.config.local.json' \
+    'stat -f "%Sp" ..' \
+    'python3 -c "import json;print(sorted(json.load(open(\"sutando.config.local.json\")).keys()))"' \
+    2>/dev/null)"
+has "$perm_out" '-rw-------' "the pinned config is mode 600"
+# `..` alone is not discriminating: with no wrapper the parent is the system
+# TMPDIR, which is ALSO 0700, so the mode matches for the wrong reason. The
+# wrapper's existence is what the path shape proves.
+has "$perm_out" '/wt' "the worktree lives inside a wrapper dir, not directly in TMPDIR"
+has "$perm_out" 'drwx------' "that wrapper is private (0700)"
+has "$perm_out" "['workspace']" "the pinned config carries ONLY workspace, not the real one"
+
 if [[ "$fail" -ne 0 ]]; then
     echo "FAIL: pr-evidence generator"
     exit 1
