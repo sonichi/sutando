@@ -51,10 +51,8 @@ else
   bad "installer call must be guarded (if/||) or set -e takes the core down with it"
 fi
 
-# 4. DISPATCH, EXECUTED. Everything above is structural: a reviewer mutated the
-#    guard to `if true` and every check still passed. This runs the shipped block.
-# Anchor on the INSTALLER CALL and take its enclosing if-block, never on the
-# guard's literal text — else mutating the guard breaks extraction, not behavior.
+# 4. DISPATCH, EXECUTED — the structural checks above all survived an `if true`
+# mutation. Anchored on the installer CALL, so mutating the guard breaks behavior.
 dispatch="$(python3 - "$S" <<'EXTRACT'
 import re, sys
 lines = open(sys.argv[1]).read().splitlines()
