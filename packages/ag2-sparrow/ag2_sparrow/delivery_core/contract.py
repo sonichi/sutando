@@ -15,6 +15,12 @@ Identity model (three types, never conflated):
 Guarantee wording (normative): effectively-once within the provider's
 idempotency and receipt-retention contract — never unqualified
 "exactly-once".
+
+Retirement authority (normative, from the #3018 cross-consumer defect):
+the consumer that DISPATCHED a work item is the only one that may retire
+its result (archive / ack / skip-mark). A consumer sweeping a shared
+results namespace must filter to its own dispatches before acting —
+retiring another consumer's bookkeeping strands the replies behind it.
 """
 from __future__ import annotations
 
