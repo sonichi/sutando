@@ -221,10 +221,8 @@ class ClaimDriver:
         for _ in range(n):
             if not self.busy[actor]:
                 return
-            # Not at a gate within the timeout = blocked on the flock;
-            # granting blind would desynchronize the schedule. Bounds cap the
-            # SLOW path only (instrumented CI runners); fast machines exit
-            # the instant the worker moves, so local runtime is unchanged.
+            # No gate within 1s = flock-blocked. Bounds cap the slow path
+            # only (instrumented CI); fast machines exit as the worker moves.
             if not self.gate.at_gate[actor].wait(timeout=1.0):
                 return
             self.gate.at_gate[actor].clear()
