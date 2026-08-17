@@ -1353,9 +1353,12 @@ echo ""
 # placed after it never executes. Failure is non-fatal by design — the app is
 # opt-in, so its installer must never take the core down with it (`set -e` is on).
 if [ "$WITH_APP" -eq 1 ]; then
-    echo "→ menu-bar app (--with-app): building + supervising" >&2
-    if bash "$REPO/scripts/install-menu-bar-app.sh" --supervise; then
-        echo "  ✓ menu-bar app supervised" >&2
+    # --launch, not --supervise: this flag means "run the app", and installing a
+    # login-persistent launchd job is a separate decision the user should make.
+    echo "→ menu-bar app (--with-app): building + launching" >&2
+    if bash "$REPO/scripts/install-menu-bar-app.sh" --launch; then
+        echo "  ✓ menu-bar app launched" >&2
+        echo "    auto-start at login is opt-in: bash scripts/install-menu-bar-app.sh --supervise" >&2
     else
         echo "  ✗ menu-bar app setup failed (exit $?) — the core is unaffected and still starting." >&2
     fi

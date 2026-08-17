@@ -162,16 +162,29 @@ cd sutando
 cp .env.example .env
 # Add GEMINI_API_KEY only if you want voice
 
-# Start everything (headless core)
+# Start everything — core, menu-bar app, and the dashboard in your browser
+./start.sh
+```
+
+That is the whole first run. `start.sh` is a thin front door: it delegates to `src/startup.sh --with-app` and opens the dashboard once it answers. Extra arguments pass straight through (`./start.sh --runtime codex`). Set `SUTANDO_OPEN_DASHBOARD=0` to skip the browser, or `SUTANDO_DASHBOARD_URL` to point it elsewhere. If the dashboard never comes up the core still starts — the browser open is backgrounded and can never gate it.
+
+`src/startup.sh` remains the supported lower-level entry, and is what you want when there is no desktop to open things on:
+
+```bash
+# Headless core only — no app, no browser
 bash src/startup.sh
 
-# …or the core plus the opt-in macOS menu-bar app
+# Core plus the macOS menu-bar app, still no browser
 bash src/startup.sh --with-app
 ```
 
-This starts the headless core services (voice agent, phone conversation server, web client, dashboard, and API). Open http://localhost:8080 when you want the browser UI; startup never opens a browser for you. The autonomous loop starts automatically.
+Either path starts the core services (voice agent, phone conversation server, web client, dashboard, and API) and the autonomous loop. The browser UI is at http://localhost:8080 and the dashboard at http://localhost:7844; `src/startup.sh` never opens a browser for you.
 
-**The macOS menu-bar app is opt-in and separate.** Plain `bash src/startup.sh` never launches it, so the core stays headless. `--with-app` builds and signs the bundle and installs a launchd supervisor so it returns at login; a failure there is reported and never stops the core. To manage the app on its own — build only, launch once, or supervise — use its installer directly:
+**The macOS menu-bar app is opt-in and separate.** Plain `bash src/startup.sh` never touches it, so the core stays headless. `--with-app` builds, signs, and **launches** the bundle; a failure there is reported and never stops the core.
+
+**Auto-start at login is a further, explicit opt-in.** Neither `./start.sh` nor `--with-app` installs a launchd job — running the app and having macOS resurrect it forever are different decisions. When you do want it, run the installer from the checkout you actually use: it records that path in the LaunchAgent, so installing from a temporary worktree leaves you with a login job pointing at a directory that will be deleted.
+
+To manage the app on its own — build only, launch once, or supervise — use its installer directly:
 
 ```bash
 bash scripts/install-menu-bar-app.sh              # build + sign, print next steps

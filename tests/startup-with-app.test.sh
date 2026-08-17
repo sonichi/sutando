@@ -29,7 +29,13 @@ probe() { # args... -> prints resulting WITH_APP
 
 # 2. ORDER: the block must precede the final exec. After `exec` the process is
 #    replaced, so a block moved below it is dead code that still reads as present.
-app_line=$(grep -n 'install-menu-bar-app.sh" --supervise' "$S" | head -1 | cut -d: -f1)
+app_line=$(grep -n 'install-menu-bar-app.sh" --launch' "$S" | head -1 | cut -d: -f1)
+
+# --with-app means "run the app". Installing a login-persistent launchd job is a
+# separate decision, and it is what bakes an install-time path into a LaunchAgent.
+grep -q 'install-menu-bar-app.sh" --supervise' "$S" \
+  && bad "--with-app must not install the launchd supervisor" \
+  || ok "--with-app launches without installing the launchd supervisor"
 exec_line=$(grep -n '^exec bash "\$REPO/src/agent/start-cli.sh"' "$S" | head -1 | cut -d: -f1)
 if [ -n "$app_line" ] && [ -n "$exec_line" ] && [ "$app_line" -lt "$exec_line" ]; then
   ok "installer invoked at line $app_line, before the exec at $exec_line"
