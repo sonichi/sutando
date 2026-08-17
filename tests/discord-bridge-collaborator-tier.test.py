@@ -242,6 +242,12 @@ def structural() -> list:
             fails.append("team-collaborator rulebook must reassert the owner-only authority boundary")
         if not re.search(r"commit|push|merge|irreversible|system-mutating", body):
             fails.append("team-collaborator rulebook must enumerate the owner-only (no-mutation) constraint")
+        # The subagent is offered as a processing SHAPE, never as a wider grant:
+        # isolating the context must not read as relaxing the boundary above it.
+        if "SUBAGENT" not in body:
+            fails.append("team-collaborator rulebook must offer the subagent processing option")
+        elif not re.search(r"not widen", body):
+            fails.append("subagent option must state it does not widen collaborator authority")
 
     return fails
 
