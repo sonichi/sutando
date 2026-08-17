@@ -93,6 +93,41 @@ class ContractCase(unittest.TestCase):
         t = self.backend.claim(ITEM, "w1")
         self.assertTrue(self.backend.complete(t, DeliveryOutcome.CONFIRMED))
 
+    def test_incarnation_identifies_its_owner(self):
+        """The owner check in complete() reads as a second, independent
+        validation. It is not: this incarnation format embeds drainer_id,
+        so incarnation equality already implies owner equality, and
+        deleting the owner check leaves the suite green.
+
+        Pin the coupling rather than the check. If a future incarnation
+        stops naming its owner, this fails and says so — at which point
+        the owner check becomes load-bearing instead of redundant."""
+        self.backend.publish(ITEM, b"x")
+        t = self.backend.claim(ITEM, "w1")
+        self.assertIsNotNone(t)
+        self.assertIn("w1", t.incarnation,
+                      "incarnation no longer identifies its owner — the "
+                      "owner check in complete() is now the only thing "
+                      "separating two workers, so give it its own control")
+
+    def test_a_foreign_worker_cannot_complete_a_live_claim(self):
+        """Defense in depth for the branch above: a token naming another
+        worker must be refused even when its incarnation is current. Only
+        constructible by hand — claim() cannot emit an inconsistent token,
+        which is exactly why the branch needs a control of its own."""
+        import ag2_sparrow.outbox as outbox
+        self.backend.publish(ITEM, b"x")
+        live = self.backend.claim(ITEM, "w1")
+        forged = ClaimToken(item_id=live.item_id, worker="w2",
+                            incarnation=live.incarnation)
+        before = outbox._read_item(self.backend.root, ITEM).get("status")
+        self.assertFalse(self.backend.complete(forged, DeliveryOutcome.CONFIRMED),
+                         "a foreign worker completed another worker's claim")
+        self.assertEqual(outbox._read_item(self.backend.root, ITEM).get("status"),
+                         before, "a refused completion must change nothing")
+        self.assertTrue(self.backend.complete(live, DeliveryOutcome.CONFIRMED),
+                        "the real owner must still be able to complete")
+
     def test_stale_incarnation_completes_nothing(self):
         """Owner review finding 1+2: a token that outlived its claim must
         change NOTHING. Validating after mutating lets a dead incarnation
