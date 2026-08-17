@@ -1,0 +1,157 @@
+"""Delivery Core contract: the channel-neutral seam between local ownership
+(ClaimBackend), the external side effect (DeliveryProvider), and the drain
+loop (DeliveryCore in core.py).
+
+Identity model (three types, never conflated):
+- item_id: stable logical message identity, assigned at publish.
+- ClaimToken: one local-ownership incarnation; OPAQUE above the backend and
+  NEVER exported as delivery identity — claim material (worker/pid/birth)
+  changes across incarnations, and a key derived from it turns provider
+  dedup into a fresh send.
+- delivery idempotency key: stable per logical external side effect, minted
+  by DeliveryCore from item_id (+ deliberate re-send epoch), passed to the
+  provider, and REUSED on every retry and across re-claim/restart.
+
+Guarantee wording (normative): effectively-once within the provider's
+idempotency and receipt-retention contract — never unqualified
+"exactly-once".
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional, Protocol, runtime_checkable
+
+
+class DeliveryOutcome(str, Enum):
+    CONFIRMED = "confirmed"
+    NOT_DELIVERED = "not_delivered"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+@dataclass(frozen=True)
+class DeliveryReceipt:
+    """Outcome of one deliver/reconcile call. `provider_ref` is the
+    provider's own reference for the side effect; confirmed-by-provider is
+    never inferred from accepted-by-transport, so CONFIRMED without a
+    provider_ref is legal only where the provider's contract says accept
+    IS confirmation."""
+    outcome: DeliveryOutcome
+    provider_ref: Optional[str] = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """Declared, suite-read; decides post-UNKNOWN behavior. Channel code
+    never does."""
+    reconcile_capable: bool = False   # receipt queryable after UNKNOWN
+    idempotent_send: bool = False     # key-deduped; safe-resend on UNKNOWN
+
+
+@dataclass(frozen=True)
+class BackendCapabilities:
+    """Declared, suite-read (never hasattr-sniffed). What is optional is
+    the OPERATION, not the liveness guarantee it serves: "a dead owner's
+    claim is eventually recoverable" holds for every backend — force
+    release is one mechanism (A), a requeue-layer path is another (B)."""
+    supports_force_release: bool = False
+
+
+@dataclass(frozen=True)
+class ClaimToken:
+    """Opaque above the backend: `opaque` is backend-private claim material.
+    item_id rides along so the core can route outcomes without parsing."""
+    item_id: str
+    opaque: str
+
+
+@dataclass
+class CleanupReport:
+    pruned: int = 0
+    detail: str = ""
+
+
+@dataclass
+class DrainReport:
+    claimed: int = 0
+    confirmed: int = 0
+    retried: int = 0
+    parked: int = 0
+    errors: list = field(default_factory=list)
+
+
+@dataclass
+class RecoverReport:
+    recovered: list = field(default_factory=list)   # item_ids re-claimable
+    quarantined: list = field(default_factory=list)
+
+
+@runtime_checkable
+class ClaimBackend(Protocol):
+    """Local ownership of published outbound items. Invariants the contract
+    suite enforces on EVERY implementation (see the seam doc for the full
+    instrument mapping):
+      1. at most one local owner per item at any time — including under the
+         publish-during-inflight schedule (CE-1);
+      2. a stale incarnation can never destroy a successful claimant;
+      3. crash at any syscall boundary leaves the item in exactly one
+         deliverable state or with a terminal record;
+      4. protocol metadata is bounded (cleanup);
+      5. a dead owner's claim is eventually recoverable (mechanism per
+         capabilities);
+      6. lost races are protocol outcomes; config errors raise loudly."""
+
+    @property
+    def capabilities(self) -> BackendCapabilities: ...
+
+    def publish(self, item_id: str, payload: bytes) -> bool:
+        """True = newly published; False = this id is already live."""
+        ...
+
+    def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:
+        """Acquire exclusive local ownership, or None on a lost race."""
+        ...
+
+    def complete(self, token: ClaimToken, outcome: DeliveryOutcome) -> bool:
+        """Retire own ownership with the delivery outcome. Only the token's
+        owner may complete; True = retired."""
+        ...
+
+    def recover(self) -> RecoverReport:
+        """Return DEAD owners' items to claimable. ALIVE/UNKNOWN owners are
+        never touched; a dead token whose key has another live holder is
+        quarantined, never re-armed (CE-2/CE-1 class)."""
+        ...
+
+    def cleanup(self) -> CleanupReport:
+        """Bound on-disk protocol state."""
+        ...
+
+    def force_release(self, item_id: str) -> bool:
+        """ADMINISTRATIVE DESTRUCTION, not a release (contract: #3008).
+        Only for backends declaring supports_force_release; others raise
+        NotImplementedError — never a silent no-op."""
+        ...
+
+
+@runtime_checkable
+class DeliveryProvider(Protocol):
+    """The external side effect. Adapters keep provider-specific mechanics
+    (AG2 Space lease/ACK/finalize, Discord API + rate limits); the core
+    reads only capabilities and receipts. Adapter contract tests must
+    export a finalize-observable where the provider has a server-side
+    finalize, so provider-confirmed and server-finalized stay independently
+    observable (invariant 9)."""
+
+    @property
+    def capabilities(self) -> ProviderCapabilities: ...
+
+    def deliver(self, item_id: str, payload: bytes,
+                idempotency_key: str) -> DeliveryReceipt: ...
+
+    def reconcile(self, item_id: str,
+                  idempotency_key: str) -> Optional[DeliveryReceipt]:
+        """Resolve an OUTCOME_UNKNOWN via the provider's receipt store;
+        None where the provider cannot answer (capability-gated)."""
+        ...
