@@ -65,7 +65,8 @@ class DesignAClaimBackend:
             return ClaimToken(item_id=item_id, worker=worker,
                               incarnation=incarnation)
 
-    def complete(self, token: ClaimToken, outcome: DeliveryOutcome) -> bool:
+    def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
+                 park_at_attempts: Optional[int] = None) -> bool:
         item_id = token.item_id
         # Validate -> transition -> retire, all under the item lock: a stale
         # incarnation must not mutate or park its successor's item.
@@ -81,7 +82,9 @@ class DesignAClaimBackend:
             elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                 outbox.park_item(self.root, item_id, "outcome-unknown")
             else:
-                outbox.note_attempt(self.root, item_id)
+                attempts = outbox.note_attempt(self.root, item_id)
+                if park_at_attempts is not None and attempts >= park_at_attempts:
+                    outbox.park_item(self.root, item_id, "max-attempts")
             return outbox._release_locked(self.root, item_id, token.worker)
 
     def attempts(self, item_id: str) -> int:

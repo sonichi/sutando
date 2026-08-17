@@ -158,12 +158,17 @@ class ClaimBackend(Protocol):
         """Acquire exclusive local ownership, or None on a lost race."""
         ...
 
-    def complete(self, token: ClaimToken, outcome: DeliveryOutcome) -> bool:
+    def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
+                 park_at_attempts: Optional[int] = None) -> bool:
         """Validate the exact incarnation, apply the outcome transition, and
         retire the claim — ALL inside one backend critical section, in that
         order. A stale token must change nothing: validating after mutating
         lets a dead incarnation park or advance its successor's item, which
         is the concurrency defect this seam exists to stop propagating.
+        `park_at_attempts` makes the retry CEILING part of the same atomic
+        step: recording the attempt and parking at the ceiling must not be
+        two transactions, or a successor can claim and confirm between them
+        and the stale caller's park overwrites its DELIVERED state.
         True = this incarnation owned the claim and it is now retired."""
         ...
 

@@ -69,10 +69,10 @@ class DeliveryCore:
                     outcome = resolved.outcome
             elif caps.idempotent_send:
                 outcome = self._attempt(item_id, payload, key)
-        self.backend.complete(token, outcome)
-        if (outcome is DeliveryOutcome.NOT_DELIVERED
-                and self.backend.attempts(item_id) >= self.policy.max_attempts):
-            self.backend.park(item_id, "max-attempts")
+        # The ceiling rides WITH the completion: parking after the claim
+        # is released lets a successor confirm in the gap.
+        self.backend.complete(token, outcome,
+                              park_at_attempts=self.policy.max_attempts)
         return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome)
 
     def recover(self) -> RecoverReport:

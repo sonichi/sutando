@@ -295,6 +295,39 @@ class CorePolicy(unittest.TestCase):
                             f"claim returned a token for {a.worker!r} carrying "
                             f"another incarnation: {a.incarnation!r}")
 
+    def test_successor_confirmation_survives_a_stale_ceiling_park(self):
+        """The ceiling transition must ride WITH the completion. Parked
+        after the claim is released, a successor can claim and CONFIRM in
+        the gap and the stale caller's park then overwrites DELIVERED —
+        losing delivery evidence and making a requeue duplicate the send."""
+        import ag2_sparrow.outbox as outbox
+        core = DeliveryCore(self.backend, _Recorder([DeliveryOutcome.NOT_DELIVERED]),
+                            RetryPolicy(max_attempts=1))
+        real_complete, fired, confirmed = self.backend.complete, [], []
+
+        def racing_complete(token, outcome, park_at_attempts=None):
+            ok = real_complete(token, outcome, park_at_attempts)
+            if not fired:                     # the gap: successor gets in
+                fired.append(True)
+                t2 = self.backend.claim(ITEM, "successor")
+                if t2 is not None:
+                    confirmed.append(real_complete(t2, DeliveryOutcome.CONFIRMED))
+            return ok
+
+        self.backend.complete = racing_complete
+        try:
+            core.deliver_one(ITEM, b"x")
+        finally:
+            self.backend.complete = real_complete
+        self.assertTrue(fired, "the interleave never ran — test is vacuous")
+        # Under the fix the ceiling park is atomic, so the successor cannot
+        # claim at all; the defect is a confirmation that is then ERASED.
+        if any(confirmed):
+            self.assertEqual(
+                outbox._read_item(self.backend.root, ITEM).get("status"),
+                "DELIVERED",
+                "a stale ceiling park overwrote the successor's confirmed delivery")
+
     def test_key_never_contains_claim_material(self):
         self.assertEqual(idempotency_key(ITEM), idempotency_key(ITEM),
                          "stable across calls")
