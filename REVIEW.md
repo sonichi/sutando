@@ -147,6 +147,25 @@ and loads whichever repo it reviews.
     The tell that you are in this pattern: your test suite grows by exactly one case per
     round, and each new case is the previous one with a single field changed.
 
+11. **A change that removes a capability must relocate it, not just delete it — and one
+    deployment's requirement is never a global default.** If a PR turns behaviour off for
+    everyone to satisfy one environment, ask for the flag instead: the environment that
+    wants the change carries it, and every other install is untouched. Then check the
+    *teardown* side — code that stops, kills, or cleans up the removed thing usually
+    survives the deletion and becomes a one-way operation. And check whether any existing
+    opt-in path depended on the deleted code to produce its inputs.
+    *Grounded by:* #2677 — "keep the open-source core headless" deleted the menu-bar app's
+    build and launch from `startup.sh` (−100 lines) and shipped no replacement script, so
+    every OSS install silently lost the app and the documented alternative became "run
+    `swiftc` by hand". Three knock-on effects, none visible in the diff: `restart.sh:73`
+    still `pkill`s the app while nothing starts it, making a restart a permanent stop;
+    `install-sutando-app-launchd.sh` (#1294) still points at
+    `src/Sutando/Sutando.app/Contents/MacOS/Sutando`, a bundle `startup.sh` was the only
+    thing that built, so the pre-existing opt-in supervisor was silently disabled; and the
+    PR's own new test asserted the removed strings appear *nowhere* in `startup.sh`, which
+    made the previous default unrestorable without deleting the guard. Pin behaviour under
+    the flag, never the absence of a string.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
