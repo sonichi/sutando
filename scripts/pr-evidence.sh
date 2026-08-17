@@ -73,8 +73,16 @@ if [[ -n "$REF" ]]; then
 
     # Write a MINIMAL config — never copy the real one. It carries unrelated
     # local settings (vault, migrate) that this tool has no need to duplicate.
+    # Bare python3 is the Xcode-CLT stub on a Mac without developer tools — the
+    # exact modal this resolver exists to avoid.
+    . "$REPO/scripts/python-binary.sh"
+    PY_BIN="$(resolve_python "$REPO")"
+    [[ -n "$PY_BIN" ]] || {
+        echo "pr-evidence: no runnable python3 — cannot pin the worktree's workspace" >&2
+        exit 2
+    }
     ( umask 077
-      python3 - "$WT/sutando.config.local.json" "$LIVE_WS" <<'PY'
+      "$PY_BIN" - "$WT/sutando.config.local.json" "$LIVE_WS" <<'PY'
 import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(
     json.dumps({"workspace": {"path": sys.argv[2]}}, indent=2) + "\n")
