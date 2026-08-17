@@ -246,22 +246,32 @@ class ClaimDriver:
         if not self.busy[actor]:
             self._submit(actor, "release_force", self._op_release_force())
 
+    # Instrumented/loaded runners (coverage trace, 2-core CI) can delay gate
+    # arrival past 1s; the bound only burns time when arrival is genuinely slow.
+    ARRIVAL_BOUND = float(os.environ.get("CLAIM_MACHINE_ARRIVAL_BOUND", "5.0"))
+
     def step(self, actor, n):
         for _ in range(n):
             if not self.busy[actor]:
                 return
-            # Two-phase arrival wait: 50ms fast path, then skip instantly if
-            # the worker announced a flock wait, else allow a slow-CI second.
+            # 50ms fast path, then skip instantly if the worker announced a
+            # flock wait, else poll up to ARRIVAL_BOUND with early exits.
             if not self.gate.at_gate[actor].wait(timeout=0.05):
                 if self.in_flock.get(actor):
                     return
-                if not self.gate.at_gate[actor].wait(timeout=0.95):
-                    return
+                deadline = time.time() + self.ARRIVAL_BOUND
+                while True:
+                    if self.gate.at_gate[actor].wait(timeout=0.1):
+                        break
+                    if (time.time() >= deadline or not self.busy[actor]
+                            or self.in_flock.get(actor)):
+                        return
             self.gate.at_gate[actor].clear()
             self.gate.go[actor].release()
-            deadline = time.time() + 1.0
+            deadline = time.time() + self.ARRIVAL_BOUND
             while (time.time() < deadline and self.busy[actor]
-                   and not self.gate.at_gate[actor].is_set()):
+                   and not self.gate.at_gate[actor].is_set()
+                   and not self.in_flock.get(actor)):
                 time.sleep(0.0005)
 
     def plant_dead_claim(self):
