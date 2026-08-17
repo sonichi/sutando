@@ -36,6 +36,9 @@ NOT_BLOCKED_S = 3.0
 # Teardown is the one place the bound IS the assertion: a worker that outlives
 # shutdown must fail, so this stays short and separate from the settling polls.
 WORKER_EXIT_S = 2.0
+# Must actually exist: a missing binary raises before any assertion, so a guard
+# under test would look enforced by the spawn failing rather than by the guard.
+NOOP_COMMAND = [sys.executable, "-c", "pass"]
 WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 spec = importlib.util.spec_from_file_location("workstream_session_worker", WORKER)
 worker = importlib.util.module_from_spec(spec)
@@ -343,6 +346,46 @@ def test_closes_pipes_then_stalls_still_hits_the_deadline() -> None:
             assert elapsed < 2, f"post-EOF wait blocked on the stalled child ({elapsed:.2f}s)"
 
 
+def test_bounded_runtime_helper_edges() -> None:
+    """The non-Team half of the mixed edge test the Team removal deleted.
+
+    Both helpers outlive that path and had no other coverage: dropping the whole
+    test would leave the escalation ladder and the timeout guard unexercised.
+    """
+    already_done = mock.Mock(pid=4242)
+    already_done.poll.return_value = 0
+    with mock.patch.object(worker.os, "killpg") as never_killed:
+        worker._terminate_process_group(already_done)
+    never_killed.assert_not_called()
+    already_done.wait.assert_not_called()
+
+    # SIGTERM times out, so it must escalate to SIGKILL -- and a process that dies
+    # in between (ProcessLookupError on the second signal) is success, not an error.
+    stubborn = mock.Mock(pid=12345)
+    stubborn.poll.return_value = None
+    stubborn.wait.side_effect = [subprocess.TimeoutExpired("provider", 2), 0]
+    with mock.patch.object(
+        worker.os, "killpg", side_effect=[None, ProcessLookupError]
+    ) as killed:
+        worker._terminate_process_group(stubborn)
+    assert killed.call_count == 2, f"expected TERM then KILL, got {killed.call_count} signal(s)"
+    assert [c.args[1] for c in killed.call_args_list] == [signal.SIGTERM, signal.SIGKILL]
+
+    # A non-positive deadline must fail closed: accepted, it would disable the
+    # bound entirely and every later timeout assertion would pass vacuously.
+    for bad in ("0", "-1"):
+        with mock.patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": bad}, clear=False):
+            try:
+                worker._run_process_bounded(NOOP_COMMAND, REPO)
+                raise AssertionError(f"hard timeout {bad!r} must be rejected")
+            except ValueError:
+                pass
+        with mock.patch.dict(os.environ, {"SUTANDO_TIER_STALL_TIMEOUT": bad}, clear=False):
+            try:
+                worker._run_process_bounded(NOOP_COMMAND, REPO)
+                raise AssertionError(f"stall timeout {bad!r} must be rejected")
+            except ValueError:
+                pass
 
 
 
@@ -1380,6 +1423,7 @@ if __name__ == "__main__":
     test_handle_never_invokes_a_runtime_for_team()
     test_partial_output_then_stall_still_hits_the_deadline()
     test_closes_pipes_then_stalls_still_hits_the_deadline()
+    test_bounded_runtime_helper_edges()
     test_claude_creates_then_resumes_the_same_durable_session()
     test_nonzero_provider_stdout_is_never_written_as_a_result()
     test_archived_result_is_not_replayed_on_restart_scan()
