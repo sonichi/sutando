@@ -187,6 +187,8 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .outbox import DeliveryOutcome
+from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
@@ -2366,9 +2368,11 @@ def _post_proactive() -> None:
             # a failed send: the claim is renamed back and retried next pass,
             # loudly, so a misconfigured room is visible instead of silently
             # eating nudges.
-            delivered = isinstance(resp, dict) and (
-                bool(resp.get("event_id"))
-                or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
+            # event_id is pinned: the gateway answers HTTP 200 with an error
+            # envelope, and ts/id/message_id in one are not delivery receipts.
+            receipt = classify_response(200, resp, id_keys=("event_id",))
+            delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
+                PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True
             )
             if not delivered:
                 # Accepted but unconfirmed. It may ALSO have been delivered, so
