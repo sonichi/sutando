@@ -23,6 +23,19 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+
+# Hermetic channel config: the gateway bridge resolves access.json at import,
+# so isolate BEFORE any test can import it (module-level, per the lint).
+import json  # noqa: E402
+import os  # noqa: E402
+_CFG = tempfile.mkdtemp(prefix="env-test-cfg-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+os.makedirs(os.path.join(_CFG, "channels", "ag2space"), exist_ok=True)
+os.makedirs(os.path.join(_CFG, "channels", "discord"), exist_ok=True)
+(Path(_CFG) / "channels" / "ag2space" / "access.json").write_text(
+    json.dumps({"allowFrom": ["@qingyun:ag2.space"]}))
+(Path(_CFG) / "channels" / "discord" / "access.json").write_text(
+    json.dumps({"allowFrom": []}))
 import task_envelope as E  # noqa: E402
 
 TASK = ("id: task-42\n"
@@ -233,22 +246,10 @@ class WriterWiring(unittest.TestCase):
     def test_live_gateway_write_task_output_is_stamped(self):
         """Review P1-1: pin the REAL _write_task, not a surrogate helper."""
         import importlib
-        import json as _json
-        import os as _os
         sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
         with tempfile.TemporaryDirectory(prefix="env-gw-") as td:
             ws = Path(td); (ws / "state" / "auth").mkdir(parents=True)
             tasks = ws / "tasks"; tasks.mkdir()
-            # Isolate channel config: the bridge resolves it at import.
-            cfg = ws / "claude-config"
-            (cfg / "channels" / "ag2space").mkdir(parents=True)
-            (cfg / "channels" / "ag2space" / "access.json").write_text(
-                _json.dumps({"allowFrom": ["@qingyun:ag2.space"]}))
-            saved_cfg = _os.environ.get("CLAUDE_CONFIG_DIR")
-            _os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
-            self.addCleanup(lambda: _os.environ.update(
-                {"CLAUDE_CONFIG_DIR": saved_cfg}) if saved_cfg else
-                _os.environ.pop("CLAUDE_CONFIG_DIR", None))
             import ag2_sparrow._dirs as dirs
             dirs.set_dirs(task_dir=tasks, result_dir=ws / "results",
                           state_dir=ws / "state")
