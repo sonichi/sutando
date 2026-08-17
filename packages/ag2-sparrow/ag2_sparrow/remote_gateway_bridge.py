@@ -188,7 +188,7 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
-from .team_guardrail import team_guardrail_lines
+from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROVENANCE
 from .outbox import DeliveryOutcome
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -1918,7 +1918,10 @@ def _write_task(task: dict) -> str | None:
     # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
     # closing the Team session route removed the only thing that used to deliver it.
     if sender_tier == "team":
-        lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
+        if collaborator_enabled:
+            lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
+        else:
+            lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
     if sender_tier == "guest":
         lines.extend([
             "",
