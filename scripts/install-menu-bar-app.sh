@@ -122,6 +122,14 @@ stop_unmanaged() {
   return 1
 }
 
+# Gate the SIDE EFFECTS, not just the footer: supervising or launching an
+# unsigned bundle is the outcome the signing check exists to prevent.
+if [ "$SIGNED" -eq 0 ] && { [ "$SUPERVISE" -eq 1 ] || [ "$LAUNCH" -eq 1 ]; }; then
+  echo "  ✗ refusing to launch or supervise an UNSIGNED bundle." >&2
+  echo "    bundle: $APP" >&2
+  exit 1
+fi
+
 if [ "$SUPERVISE" -eq 1 ]; then
   stop_unmanaged || {
     echo "  ✗ the running menu-bar app did not exit — launchd would install a" >&2

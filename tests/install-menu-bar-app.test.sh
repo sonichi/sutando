@@ -160,6 +160,49 @@ else
     flunk "control failed: succeeding codesign did not report signed (rc=$rc_ok)"
 fi
 
+# ---- 4b-ii. an unsigned bundle must not be launched OR supervised -----------
+# The SIGNED report alone is not enough: the gate has to precede the side effect,
+# or the app is already open / the LaunchAgent already installed when it fires.
+for disp in --launch --supervise; do
+    STUB_D="$WORK/stub-unsigned${disp}"
+    mkstub "$STUB_D" xcode-select 'exit 0'
+    mkstub "$STUB_D" swiftc 'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && { shift; touch "$1"; }; shift; done; exit 0'
+    mkstub "$STUB_D" security 'echo "  1) ABC \"Other\""; exit 0'
+    mkstub "$STUB_D" codesign 'exit 1'
+    mkstub "$STUB_D" open "touch '$WORK/OPENED$disp'; exit 0"
+    mkstub "$STUB_D" launchctl 'exit 0'
+    rm -f "$WORK/OPENED$disp"
+    out_u="$(PATH="$STUB_D:$PATH" HOME="$WORK/home-unsigned" bash "$SCRIPT" "$disp" 2>&1)"; rc_u=$?
+    if [ "$rc_u" -ne 0 ]; then
+        pass "$disp with a failed codesign exits nonzero"
+    else
+        flunk "$disp with a failed codesign exited 0"
+    fi
+    if [ -f "$WORK/OPENED$disp" ]; then
+        flunk "$disp OPENED an unsigned bundle before failing"
+    else
+        pass "$disp never reached the side effect on an unsigned bundle"
+    fi
+    case "$out_u" in
+        *UNSIGNED*) pass "$disp names the unsigned state" ;;
+        *)          flunk "$disp did not name the unsigned state" ;;
+    esac
+done
+# Control: the SAME dispositions must still reach the side effect when signing works.
+STUB_S="$WORK/stub-signed-launch"
+mkstub "$STUB_S" xcode-select 'exit 0'
+mkstub "$STUB_S" swiftc 'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && { shift; touch "$1"; }; shift; done; exit 0'
+mkstub "$STUB_S" security 'echo "  1) ABC \"Other\""; exit 0'
+mkstub "$STUB_S" codesign 'exit 0'
+mkstub "$STUB_S" open "touch '$WORK/OPENED_SIGNED'; exit 0"
+rm -f "$WORK/OPENED_SIGNED"
+PATH="$STUB_S:$PATH" bash "$SCRIPT" --launch >/dev/null 2>&1
+if [ -f "$WORK/OPENED_SIGNED" ]; then
+    pass "control: a SIGNED bundle still reaches --launch (the gate does not over-fire)"
+else
+    flunk "control failed: a signed bundle no longer reaches --launch"
+fi
+
 # ---- 4c. the probe must be LITERAL, not a regex over the checkout path ------
 # `pgrep -f` matches an ERE, so a checkout path holding regex metacharacters
 # makes the probe miss a live process and stop_unmanaged report "nothing to do".
