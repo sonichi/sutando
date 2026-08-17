@@ -150,6 +150,51 @@ def ce2b_dead_only_holder_is_deterministic() -> str | None:
     return None
 
 
+def ce4_recover_rearm_while_owned() -> str | None:
+    """Found by full-budget BClaimMachine run 3/3 (800x60, 2026-08-17):
+    'drainer-A owns the item AND a ready copy is claimable'.
+
+    recover's live-holder check is check-then-act. Unlike claim/complete —
+    whose destinations cannot pre-exist, so each is one atomic rename and a
+    single linearization point — re-arming the stable ready/<key> slot must
+    be create-if-absent, so a claim can land between the check and the move.
+    Reproduced deterministically by claiming inside _move (no Maildir
+    counterpart: Maildir never moves a message back to new/)."""
+    import tempfile
+    from claim_machine_harness import DEAD_PID, ITEM
+    with tempfile.TemporaryDirectory(prefix="ce4-") as td:
+        key = B.safe_key(ITEM)
+        B.publish(td, ITEM, "payload")
+        d = B.Path(td) / B.INFLIGHT
+        d.mkdir(parents=True, exist_ok=True)
+        ghost = d / B.SEP.join((key, "ghost", str(DEAD_PID), "1"))
+        ghost.write_text("{}", encoding="utf-8")
+
+        real_move, fired = B._move, []
+
+        def racing_move(src, dst):
+            # the window: a claimant takes the ready copy after the
+            # live-holder check has already read an empty set
+            if not fired and B.READY in str(dst):
+                fired.append(B.claim(td, ITEM, "drainer-A"))
+            return real_move(src, dst)
+
+        B._move = racing_move
+        try:
+            B.recover(td)
+        finally:
+            B._move = real_move
+        if not fired or fired[0] is None:
+            return "harness did not reach the window (claim never landed)"
+        owned = [t for t in B._inflight_tokens(td, key)
+                 if t.name.split(B.SEP)[1] == "drainer-A"]
+        ready_copy = (B.Path(td) / B.READY / key).exists()
+        if owned and ready_copy:
+            return ("drainer-A owns the item AND a ready copy is claimable "
+                    "(recover re-armed a slot for an owned item)")
+    return None
+
+
 def _naive_holder_adversarial(root, item_id):
     """Pre-fix holder semantics: iterdir gives no ordering guarantee, so any
     order is a legal old behavior — this instantiates the adversarial one."""
@@ -189,7 +234,8 @@ def main() -> int:
     for name, fn in (("CE-1 publish-while-inflight", ce1_publish_while_inflight),
                      ("CE-2 holder-names-live-owner", ce2_holder_names_the_live_owner),
                      ("CE-2b dead-only holder deterministic", ce2b_dead_only_holder_is_deterministic),
-                     ("CE-3 recover-to-claim handoff accepted", ce3_recover_to_claim_handoff_is_legal)):
+                     ("CE-3 recover-to-claim handoff accepted", ce3_recover_to_claim_handoff_is_legal),
+                     ("CE-4 recover re-arm while owned", ce4_recover_rearm_while_owned)):
         v = fn()
         if v is not None:
             print(f"FAIL: {name}: {v}")

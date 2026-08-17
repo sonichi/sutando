@@ -186,12 +186,29 @@ def recover(root):
         if others:
             _quarantine(f, root, key, "live-holder", pid_s)
             continue
+        # Re-arming ready/ is create-if-absent, so unlike claim/complete it is
+        # NOT a single linearization point: a claim can land between the check
+        # above and the move below. Re-check after, and undo our own link if a
+        # holder appeared while the slot was still ours to withdraw.
+        def _withdraw_if_owned() -> bool:
+            live = [t for t in _inflight_tokens(root, key) if t.name != f.name]
+            if not live:
+                return False
+            slot = _d(root, READY) / key
+            try:
+                slot.unlink()
+            except FileNotFoundError:
+                return False          # claimed from the slot: legitimate handoff
+            return True
         # ready/<key> must be create-if-absent (a re-publish may occupy it),
         # so this one transition is link+unlink. Its crash window (linked, not
         # yet unlinked) resolves on the NEXT recover pass: the dead token hits
         # EEXIST against its own earlier link and is quarantined — identical
         # content, never deliverable twice.
         if _move(f, _d(root, READY) / key):
+            if _withdraw_if_owned():
+                _quarantine(f, root, key, "live-holder", pid_s)
+                continue
             moved.append(key)
         elif f.exists():                        # ready/ occupied
             _quarantine(f, root, key, "collision", pid_s)
