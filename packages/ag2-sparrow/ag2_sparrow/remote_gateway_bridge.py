@@ -2825,9 +2825,9 @@ def main() -> None:
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
-            except TimeoutError:
-                # Read timeout only — a connect failure arrives as URLError and
-                # still takes the outage path below.
+            except (TimeoutError, socket.timeout):
+                # Read timeout only (URLError takes the outage path below).
+                # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
                 if not _poll_timeout_is_empty(last_poll_ok, time.time()):
                     raise
                 resp = {"tasks": []}

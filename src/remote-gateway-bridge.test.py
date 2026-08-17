@@ -1816,8 +1816,26 @@ def main() -> int:
     _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1][:400]
     check("_poll_timeout_is_empty" in _poll_call,
           "poll-timeout: the poll call site consults the policy")
-    check("except TimeoutError" in _poll_call,
+    check("except (TimeoutError, socket.timeout)" in _poll_call,
           "poll-timeout: the catch is scoped to the poll, not the whole iteration")
+    # Py3.9 portability: socket.timeout aliases TimeoutError only on 3.10+.
+    # On stock macOS /usr/bin/python3 (3.9.6, a supported runtime) it is a bare
+    # OSError subclass, so a catch spelled `except TimeoutError` misroutes a
+    # held long poll to the unexpected-error backoff. CI interpreters are all
+    # 3.10+, where an execution probe cannot go red (the alias makes any
+    # socket.timeout injection pass) — so pin the catch tuple itself via AST:
+    # both names must appear in the poll call's except clause.
+    import ast
+    _clause = _poll_call.split("except ", 1)[-1].split(":", 1)[0]
+    _t = ast.parse(_clause, mode="eval").body
+    _caught = {
+        e.id if isinstance(e, ast.Name)
+        else f"{e.value.id}.{e.attr}" if isinstance(e, ast.Attribute)
+        else "?"
+        for e in (_t.elts if isinstance(_t, ast.Tuple) else [_t])}
+    check(_caught >= {"TimeoutError", "socket.timeout"},
+          "poll-timeout: catch tuple names BOTH TimeoutError and socket.timeout "
+          f"(py3.9 shape) — got {sorted(_caught)}")
     check("raise" in _poll_call,
           "poll-timeout: past the grace it re-raises into the existing outage path")
 
