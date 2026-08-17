@@ -151,7 +151,7 @@ class EnvelopeContract(unittest.TestCase):
             f.write("id: task-cli\ntask: cli check\naccess_tier: owner\n")
             path = f.name
         real_resolve = E.resolve_workspace
-        E.resolve_workspace = lambda: self.ws
+        E.resolve_workspace = lambda *a, **kw: self.ws
         try:
             self.assertEqual(E.main(["x", "verify", path]), 3)
             self.assertEqual(E.main(["x", "stamp", path]), 0)
