@@ -160,6 +160,7 @@ One entry per agent-facing module.
 - **`voice-config-switch.ts`** — Voice tool: switch voice-agent's model + googleSearch preset at runtime.
 - **`voice-config.ts`** — Per-surface voice configuration loader.
 - **`voice-connect-resolver.ts`** — Transparent voice-connection tier resolution — picks the best reachable endpoint for "call your agent" so the user never chooses a tier.
+- **`voice-connect-watchdog.ts`** — Stuck-CONNECTING recovery policy for the voice health monitor (#2963).
 - **`voice-context.ts`** — Builds a system prompt for the Claude Code subprocess that injects Sutando identity and user context from the memory system.
 - **`voice-continuity.ts`** — voice-continuity — P7 D7.3 continuity helpers (Tranche A engine-side): the stale-repeat goodbye guard and the centralized conversation-clear.
 - **`voice-error-classifier.ts`** — Classify Gemini Live transport close events into actionable categories.
