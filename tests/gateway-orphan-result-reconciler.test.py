@@ -216,6 +216,20 @@ class FlatBareConvention(_Base):
             f"{TID}-*-late-duplicate.txt"))), 1)
 
 
+class WriteTaskSharedPredicate(_Base):
+    def test_month_partitioned_delivered_copy_dedups_redelivery(self):
+        # _write_task and the sweep must read the archive through ONE
+        # predicate: a month-nested delivered copy dedups relay redelivery.
+        d = gw.ARCHIVE_RESULTS_DIR / "2026-08"
+        d.mkdir(parents=True)
+        (d / f"{TID}.txt").write_text("the reply")
+        tid = gw._write_task({"id": TID, "task": "hi", "source": "ag2space"})
+        self.assertEqual(tid, TID)
+        self.assertFalse((gw.TASKS_DIR / f"{TID}.txt").exists(),
+                         "already-handled redelivery must not re-queue")
+        self.assertIn("[no-send]", (gw.RESULTS_DIR / f"{TID}.txt").read_text())
+
+
 class QuarantineCollision(_Base):
     def test_prior_evidence_never_replaced(self):
         gw.UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True)

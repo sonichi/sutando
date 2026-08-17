@@ -1750,9 +1750,7 @@ def _write_task(task: dict) -> str | None:
         # exact task id — cheap (one stat per month dir, not a full tree walk).
         or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
     )
-    if (task_archived
-            or (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists()
-            or next(ARCHIVE_RESULTS_DIR.glob(f"{tid}-[0-9]*.txt"), None)):
+    if task_archived or _delivered_copy_exists(tid):
         rfile = RESULTS_DIR / f"{tid}.txt"
         if not rfile.exists():
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
