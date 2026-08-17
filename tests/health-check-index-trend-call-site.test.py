@@ -91,6 +91,10 @@ with tempfile.TemporaryDirectory() as td:
     check("a small index is ok", (clean or {}).get("status"), "ok")
     check("...and its detail does NOT carry the marker",
           MARK in (clean or {}).get("detail", ""), False)
+    # `not in` alone is satisfied by an ok branch that renders NOTHING, so the
+    # clean line is pinned positively too — absence must mean absence-of-marker.
+    check("...because the clean line says its own thing, not nothing",
+          "all memory files reachable" in (clean or {}).get("detail", ""), True)
 
 if fails:
     print(f"\n{len(fails)} FAILED: {', '.join(fails)}")
