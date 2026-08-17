@@ -2542,8 +2542,8 @@ def _post_ready_results(inflight: set[str]) -> None:
             continue
         # Non-owner output is scanned BEFORE any marker is interpreted:
         # redirect/attach below are side effects on collaborator text.
-        # Captured BEFORE the guard: the guard rewrites the body, so afterwards
-        # a recovered control is indistinguishable from any other withheld text.
+
+        # Captured BEFORE the guard, which rewrites the body.
         was_redelivery_control = _is_redelivery_control(body)
         body, _withheld = _guarded_result_body(tid, body)
         if body is None:
