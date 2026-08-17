@@ -1,6 +1,6 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -79,15 +79,30 @@ describe('_claimedElsewhere reads other consumers\' durable in-flight ledgers', 
 			'an operator-set label the list cannot enumerate is still caught by the claim');
 	});
 
-	it('is total — a failure never escapes into the drain loop', () => {
-		// This runs inside the result-scan for-loop, whose catch inspects
-		// err.code; a ReferenceError has none, so the guard is false, nothing
-		// is logged, and the pass aborts for every later-sorting file. It then
-		// repeats every tick, because the file it stops on is one this PR
-		// deliberately leaves resident. The directory resolution therefore has
-		// to be inside the try, not just the reads.
+	it('a failing directory read is contained, not propagated', () => {
+		// Honest scope: readdirSync throws ERR_INVALID_ARG_VALUE on a NUL-bearing
+		// path, and that call was ALREADY inside the per-directory try. This pins
+		// containment; it does NOT exercise the outer wrap, which guards the
+		// directory-list construction instead. Asserted separately below.
 		process.env.AGENT_CONNECT_STATE_DIR = '\0not-a-path';
 		assert.doesNotThrow(() => _claimedElsewhere('task-a'));
+		assert.equal(_claimedElsewhere('task-a'), true, 'the readable ledger is still read');
 		delete process.env.AGENT_CONNECT_STATE_DIR;
+	});
+
+	it('the whole body is guarded, including directory resolution', () => {
+		// The outer try covers homedir() and join(REPO_DIR, …), which run BEFORE
+		// the per-directory try. Neither is injectable from here — REPO_DIR is
+		// captured at module load — so this asserts the structural property the
+		// runtime guarantee rests on rather than simulating the throw. Removing
+		// the wrap fails this; a scratch harness with an unset REPO_DIR confirms
+		// the behaviour it stands for. Known weakness: a structural pin can also
+		// break on a safe refactor, and it never executes the guarded path.
+		const src = readFileSync(new URL('../src/task-bridge.ts', import.meta.url), 'utf-8');
+		const fn = src.slice(src.indexOf('export function _claimedElsewhere'));
+		const body = fn.slice(fn.indexOf('{') + 1, fn.indexOf('\n}\n'));
+		const firstStmt = body.split('\n').find(l => l.trim() && !l.trim().startsWith('//'));
+		assert.match(firstStmt ?? '', /^\s*try \{/,
+			'directory resolution must be inside the try, not above it');
 	});
 });
