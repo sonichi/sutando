@@ -5771,9 +5771,8 @@ def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
         return
     for i, chunk in enumerate(chunks, 1):
         payload = {"content": chunk}
-        # FIRST chunk only, matching the gateway path: a reference on every chunk
-        # renders N reply-headers for one answer. fail_if_not_exists=False so a
-        # deleted target degrades to a plain message instead of losing the send.
+        # First chunk only: on every chunk it renders N reply-headers for one
+        # answer. fail_if_not_exists=False -> deleted target degrades to plain.
         if reply_to and i == 1:
             payload["message_reference"] = {"message_id": str(reply_to),
                                             "fail_if_not_exists": False}
