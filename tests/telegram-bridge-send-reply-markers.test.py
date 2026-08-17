@@ -89,7 +89,7 @@ class SendReplyMarkerAdoption(unittest.TestCase):
             self.sent.append({"method": method, **kw})
             return {"ok": True}
 
-        def fake_send_file(chat_id, path):
+        def fake_send_file(chat_id, path, message_thread_id=None):
             self.files.append(path)
             return {"ok": True}
 

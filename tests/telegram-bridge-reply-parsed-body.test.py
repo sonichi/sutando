@@ -44,9 +44,10 @@ class TestTelegramBridgeReplyParsedBody(unittest.TestCase):
         start = SRC.find("for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):")
         self.assertGreater(start, 0, "pending_replies loop not found in telegram-bridge.py")
         # Grab a generous window covering the whole loop body (now includes the
-        # per-reply channel.telegram.out obs emit, so the confirmation print sits
-        # ~3.6k chars in). Still ends well before any unrelated code.
-        return SRC[start : start + 4500]
+        # per-reply channel.telegram.out obs emit and the dedup-recovery +
+        # message_thread_id handling, so the confirmation print sits ~4.6k
+        # chars in). Still ends well before any unrelated code.
+        return SRC[start : start + 5200]
 
     def test_send_reply_uses_parsed_body_not_reply_text(self):
         """send_reply() must receive parsed.body, not the raw reply_text.
