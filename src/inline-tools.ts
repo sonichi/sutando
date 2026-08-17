@@ -438,14 +438,20 @@ export const volumeTool: ToolDefinition = {
 	},
 };
 
-// Drives the built-in display through DisplayServices. Reads back after the
-// smooth ramp settles so the caller reports the measured level, not the request.
+// Identifies the target display before choosing a mechanism: DisplayServices
+// drives the built-in panel only, and external panels need DDC over I2C. Prints
+// "<kind> <level>" so the caller can report which path ran; exits 2 for an
+// external display, which it cannot drive itself.
 const BRIGHTNESS_PY = `
 import ctypes, ctypes.util, sys, time
 cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
-ds = ctypes.CDLL("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices")
 cg.CGMainDisplayID.restype = ctypes.c_uint32
+cg.CGDisplayIsBuiltin.argtypes = [ctypes.c_uint32]
 did = cg.CGMainDisplayID()
+if not cg.CGDisplayIsBuiltin(did):
+    print("external 0")
+    sys.exit(2)
+ds = ctypes.CDLL("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices")
 ds.DisplayServicesGetBrightness.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
 ds.DisplayServicesSetBrightnessSmooth.argtypes = [ctypes.c_uint32, ctypes.c_float]
 cur = ctypes.c_float()
@@ -455,8 +461,22 @@ ds.DisplayServicesSetBrightnessSmooth(did, ctypes.c_float(float(sys.argv[1]) - c
 time.sleep(0.6)
 if ds.DisplayServicesGetBrightness(did, ctypes.byref(cur)) != 0:
     sys.exit(1)
-print(cur.value)
+print("builtin", cur.value)
 `;
+
+/** DDC brightness for an external panel, 0-100. First tool present wins. */
+function setExternalBrightness(level: number): string | null {
+	for (const [bin, args] of [
+		['m1ddc', ['set', 'luminance', String(level)]],
+		['ddcctl', ['-d', '1', '-b', String(level)]],
+	] as const) {
+		try {
+			execFileSync(bin, [...args], { timeout: 5_000, stdio: 'ignore' });
+			return bin;
+		} catch {}
+	}
+	return null;
+}
 
 export const brightnessTool: ToolDefinition = {
 	name: 'brightness',
@@ -476,18 +496,27 @@ export const brightnessTool: ToolDefinition = {
 			// DisplayServicesSetBrightnessSmooth takes a RELATIVE delta and persists;
 			// the absolute setter is reverted by the display daemon within ~30s.
 			const out = execFileSync('python3', ['-c', BRIGHTNESS_PY, bLevel], { timeout: 5_000, encoding: 'utf8' });
-			const actual = Math.round(parseFloat(out) * 100);
+			const actual = Math.round(parseFloat(out.trim().split(/\s+/)[1]) * 100);
 			if (!Number.isFinite(actual)) throw new Error(`unreadable brightness: ${out.trim()}`);
-			console.log(`${ts()} [Brightness] requested ${level}%, display reads ${actual}%`);
-			return { status: 'set', level: actual, requested: level };
-		} catch {
-			// Fallback for displays DisplayServices cannot drive (externals need DDC).
+			console.log(`${ts()} [Brightness] builtin: requested ${level}%, display reads ${actual}%`);
+			return { status: 'set', level: actual, requested: level, display: 'builtin' };
+		} catch (err) {
+			// Exit 2 means the probe identified an EXTERNAL main display, which
+			// DisplayServices cannot drive at all — route to DDC rather than retrying.
+			if ((err as { status?: number })?.status === 2) {
+				const tool = setExternalBrightness(level);
+				if (tool) {
+					console.log(`${ts()} [Brightness] external: set to ${level}% via ${tool}`);
+					return { status: 'set', level, display: 'external', method: tool };
+				}
+				return { error: 'External display needs a DDC tool. Install one with: brew install m1ddc' };
+			}
 			try {
 				execFileSync('brightness', [bLevel], { timeout: 5_000 });
 				console.log(`${ts()} [Brightness] set to ${level}% via brightness CLI`);
 				return { status: 'set', level, method: 'cli' };
-			} catch (err) {
-				return { error: `Brightness failed: ${err instanceof Error ? err.message : err}` };
+			} catch (e) {
+				return { error: `Brightness failed: ${e instanceof Error ? e.message : e}` };
 			}
 		}
 	},
