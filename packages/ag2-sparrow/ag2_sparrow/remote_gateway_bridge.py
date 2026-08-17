@@ -2650,16 +2650,25 @@ _last_orphan_sweep = 0.0
 _orphan_quarantine_logged: set = set()
 
 
+# Suffixes this writer owns after `{tid}-`: an epoch, optionally tagged.
+_ARCHIVE_SUFFIX = re.compile(r"-\d+(?:-\d+)?(?:-late-duplicate)?\.txt\Z")
+
+
 def _delivered_copy_exists(tid: str) -> bool:
     """Both archive conventions: flat `<tid>-<ts>.txt` AND month-partitioned
     `YYYY-MM/<tid>.txt` (bare name) — a flat-only probe mis-routes real
     replies to re-delivery (peer-measured 4/50 on a live corpus)."""
-    if any(ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
+    # The id boundary must be unambiguous: a bare `{tid}-*` glob also matches
+    # a LONGER valid id's archive entry, so `task-a` reads as delivered.
+    if any(_ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):])
+           for p in ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
         return True
     if (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists():   # flat bare: retired writer
         return True
-    return any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}.txt")) or \
-        any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
+    if any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}.txt")):
+        return True
+    return any(_ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):])
+               for p in ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
 
 
 def _move_no_clobber(src, dst) -> bool:

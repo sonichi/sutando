@@ -291,6 +291,31 @@ class AtomicNoClobber(_Base):
                           f"{prior} was replaced by the quarantine writer")
 
 
+class AdjacentIdBoundary(_Base):
+    def test_a_longer_ids_archive_does_not_satisfy_a_shorter_id(self):
+        """`{tid}-*` also matches a LONGER valid id's entry, so `task-a`
+        reads as delivered because `task-a-b-<epoch>.txt` exists."""
+        short, longer = "task-a", "task-a-b"
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{longer}-1786940000.txt").write_text("b's reply")
+        self.assertTrue(gw._delivered_copy_exists(longer),
+                        "the id that WAS delivered must read delivered")
+        self.assertFalse(gw._delivered_copy_exists(short),
+                         "a neighbouring longer id satisfied a shorter one")
+
+    def test_month_partitioned_arm_has_the_same_boundary(self):
+        d = gw.ARCHIVE_RESULTS_DIR / "2026-08"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "task-a-b-1786940000.txt").write_text("b's reply")
+        self.assertFalse(gw._delivered_copy_exists("task-a"))
+
+    def test_the_writers_own_suffixes_still_count(self):
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000-late-duplicate.txt").write_text("x")
+        self.assertTrue(gw._delivered_copy_exists(TID),
+                        "the boundary must not reject this writer's own names")
+
+
 class QuarantineCollision(_Base):
     def test_prior_evidence_never_replaced(self):
         gw.UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True)
