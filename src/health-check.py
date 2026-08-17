@@ -4432,6 +4432,19 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     exhausted = status == "rejected" or data.get("available") is False
     if not exhausted:
         check["detail"] = f"core quota not exhausted (status={status})"
+        # The freshness guard below gates only the exhausted branch, so the
+        # REASSURING reading was stated as current at any age. Hedge, don't warn.
+        try:
+            age_sec = time.time() - path.stat().st_mtime
+        except OSError:
+            age_sec = None
+        if age_sec is None:
+            check["detail"] += " — file age unreadable, so its currency is unknown"
+        elif age_sec > fresh_sec:
+            check["detail"] += (
+                f" — but the reading is {int(age_sec / 60)}m old, so it describes "
+                "whenever the proxy last saw traffic, not the core running now"
+            )
         return check
 
     # Explicit exhaustion. Only alert if the reading is FRESH — a stale OR
