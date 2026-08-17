@@ -575,10 +575,14 @@ export const brightnessTool: ToolDefinition = {
 				console.log(`${ts()} [Brightness] external: requested ${level}% via ${outcome.method} — ${outcome.verified ? `display reads ${outcome.level}%` : 'NOT verified (no readback)'}`);
 				return { ...outcome, display: 'external' };
 			}
+			// Last resort when the probe itself could not run. nriley/brightness has no
+			// readback we use here, so this reports `requested`, never `set` — the same
+			// rule the external path follows, and the reason the review found this
+			// class in the first place.
 			try {
 				execFileSync('brightness', [bLevel], { timeout: 5_000 });
-				console.log(`${ts()} [Brightness] set to ${level}% via brightness CLI`);
-				return { status: 'set', level, method: 'cli' };
+				console.log(`${ts()} [Brightness] requested ${level}% via brightness CLI — NOT verified`);
+				return { status: 'requested', level, requested: level, method: 'cli', verified: false };
 			} catch (e) {
 				return { error: `Brightness failed: ${e instanceof Error ? e.message : e}` };
 			}
