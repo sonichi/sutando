@@ -79,7 +79,12 @@ class TestSlackPendingRecovery(unittest.TestCase):
             task_file.parent.mkdir(exist_ok=True)
 
             bridge._write_routed_task(task_file, "task body", task_id, route)
-            self.assertEqual(task_file.read_text(), "task body")
+            written = task_file.read_text()
+            # The route write now carries the #3014 envelope, so exact-equality
+            # would pin the absence of a stamp. Body intact + verifies is stronger.
+            from task_envelope import verify_text
+            self.assertIn("task body", written)
+            self.assertEqual(verify_text(written, workspace)["verdict"], "verified")
             self.assertIn(task_id, bridge.pending_replies)
 
             failing_id = f"task-{int(time.time() * 1000) + 1}"
