@@ -230,6 +230,67 @@ class WriteTaskSharedPredicate(_Base):
         self.assertIn("[no-send]", (gw.RESULTS_DIR / f"{TID}.txt").read_text())
 
 
+class MaxAge(_Base):
+    def test_ancient_orphan_is_quarantined_not_replayed(self):
+        """A minimum age alone lets the automatic sweep replay an unbounded
+        historical backlog into live rooms."""
+        d = gw.TASKS_DIR / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        t = d / f"{TID}.txt"
+        t.write_text(f"id: {TID}\ntask: hi\n")
+        _age(t, 200000.0)
+        self._result("the reply", age=200000.0)   # ~2.3 days old, resolvable
+        self._sweep()
+        self.assertEqual(self.posted, [],
+                         "an ancient orphan must never be re-delivered")
+        self.assertEqual(len(list(gw.UNDELIVERABLE_RESULTS_DIR.glob(
+            f"{TID}.too-old.*"))), 1)
+
+
+class DedupedOrphan(_Base):
+    def test_deduped_orphan_is_not_posted_on_the_holders_behalf(self):
+        """The normal path routes dedup through _dedup_plan, which reports or
+        requeues when the holder delivered nothing; the sweep must not retire
+        the ask by posting it blind."""
+        d = gw.TASKS_DIR / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\n")
+        _age(d / f"{TID}.txt", OLD)
+        self._result("[deduped: task-00000000000000000b]\n")
+        self._sweep()
+        self.assertEqual(self.posted, [],
+                         "a dedup orphan must not be posted by the sweep")
+        self.assertEqual(len(list(gw.UNDELIVERABLE_RESULTS_DIR.glob(
+            f"{TID}.deduped-orphan.*"))), 1)
+
+
+class AtomicNoClobber(_Base):
+    def test_preloaded_destinations_never_replace_evidence(self):
+        """exists-then-rename is check-then-act, and rename CLOBBERS: with
+        both predicted names taken, the fallback silently replaced prior
+        evidence. Pinning time_ns makes the second name predictable, which
+        is what lets this control reach the window at all — preloading only
+        the first name leaves the fallback free and proves nothing."""
+        gw.UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        pinned = 1786950000000000000
+        real_ns, gw.time.time_ns = gw.time.time_ns, lambda: pinned
+        try:
+            base = f"{TID}.no-task.{int(time.time())}"
+            (gw.UNDELIVERABLE_RESULTS_DIR / f"{base}.txt").write_text("evidence A")
+            (gw.UNDELIVERABLE_RESULTS_DIR / f"{base}.{pinned}.txt").write_text("evidence B")
+            (gw.UNDELIVERABLE_RESULTS_DIR /
+             f"{TID}.no-task.{pinned}.txt").write_text("evidence C")
+            self._result("new orphan")
+            self._sweep()
+        finally:
+            gw.time.time_ns = real_ns
+        surviving = [p.read_text() for p in
+                     gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.no-task.*")]
+        for prior in ("evidence A", "evidence B", "evidence C"):
+            self.assertIn(prior, surviving,
+                          f"{prior} was replaced by the quarantine writer")
+
+
 class QuarantineCollision(_Base):
     def test_prior_evidence_never_replaced(self):
         gw.UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True)

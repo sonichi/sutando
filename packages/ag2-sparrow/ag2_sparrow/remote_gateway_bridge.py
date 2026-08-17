@@ -2644,6 +2644,8 @@ def _task_archived_recently(tid: str) -> bool:
 # Results whose tid left the in-flight ledger have no consumer.
 ORPHAN_SWEEP_EVERY_S = 600.0
 ORPHAN_GRACE_S = 600.0
+# Beyond this, an automatic sweep must not replay into a live room.
+ORPHAN_MAX_AGE_S = 86400.0
 _last_orphan_sweep = 0.0
 _orphan_quarantine_logged: set = set()
 
@@ -2660,17 +2662,30 @@ def _delivered_copy_exists(tid: str) -> bool:
         any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
 
 
+def _move_no_clobber(src, dst) -> bool:
+    """Move src to dst, or to a uniquified sibling — never over an existing
+    file. os.link fails EEXIST atomically; exists-then-rename does not, and
+    rename silently replaces the loser's evidence."""
+    for candidate in (dst, dst.with_name(f"{dst.stem}.{time.time_ns()}{dst.suffix}")):
+        try:
+            os.link(str(src), str(candidate))
+        except FileExistsError:
+            continue
+        except OSError:
+            return False
+        try:
+            src.unlink()
+        except OSError:
+            pass
+        return True
+    return False
+
+
 def _quarantine_orphan(rfile, tid: str, reason: str) -> bool:
-    """Collision-safe: never replace prior quarantined evidence."""
+    """Never replaces prior quarantined evidence, under collision."""
     UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     dst = UNDELIVERABLE_RESULTS_DIR / f"{tid}.{reason}.{int(time.time())}.txt"
-    if dst.exists():
-        dst = dst.with_name(f"{tid}.{reason}.{time.time_ns()}.txt")
-    try:
-        rfile.rename(dst)
-        return True
-    except OSError:
-        return False
+    return _move_no_clobber(rfile, dst)
 
 
 def _reconcile_orphan_results(inflight: "set[str]") -> None:
@@ -2688,22 +2703,29 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         if not _valid_local_tid(tid) or tid in inflight:
             continue
         try:
-            if now - rfile.stat().st_mtime < ORPHAN_GRACE_S:
-                continue                        # young: normal path may claim it
+            age = now - rfile.stat().st_mtime
         except OSError:
+            continue
+        if age < ORPHAN_GRACE_S:
+            continue                            # young: normal path may claim it
+        if age > ORPHAN_MAX_AGE_S:
+            # A minimum age alone lets an automatic sweep replay an unbounded
+            # historical backlog into live rooms. Old results are quarantined
+            # for a human; backfill must be a deliberate one-shot, not a
+            # side effect of starting up.
+            if _quarantine_orphan(rfile, tid, "too-old"):
+                if tid not in _orphan_quarantine_logged:
+                    _orphan_quarantine_logged.add(tid)
+                    _log(f"orphan sweep: {tid} is {int(age)}s old (>{int(ORPHAN_MAX_AGE_S)}s) "
+                         "— quarantined rather than replayed")
             continue
         # Delivered copy = double-write. NEVER re-deliver: the sweep would
         # post agent narration about having answered into the room.
         if _delivered_copy_exists(tid):
             ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
             dst = ARCHIVE_RESULTS_DIR / f"{tid}-{int(now)}-late-duplicate.txt"
-            if dst.exists():
-                dst = dst.with_name(f"{tid}-{time.time_ns()}-late-duplicate.txt")
-            try:
-                rfile.rename(dst)
+            if _move_no_clobber(rfile, dst):
                 _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
-            except OSError:
-                pass
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
@@ -2731,6 +2753,13 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                 _log(f"orphan sweep: {tid} carries attachments — quarantined")
             continue
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip and skip.value == "deduped":
+            # The normal path routes dedup through _dedup_plan, which reports
+            # or requeues when the holder delivered nothing. Posting it here
+            # would retire the ask on the holder's behalf without that check.
+            if _quarantine_orphan(rfile, tid, "deduped-orphan"):
+                _log(f"orphan sweep: {tid} defers to its dedup holder — quarantined")
+            continue
         if skip:
             # Marker parity with _post_ready_results: original body goes up;
             # the server suppresses user delivery and still closes the lease.
