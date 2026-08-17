@@ -535,6 +535,75 @@ def _c17():
         assert holder is not None and holder.drainer_id == "R"
 
 
+# 18 --------------------------------------------------------------------------
+@contract("the lock namespace is bounded: N items never leave more than LOCK_STRIPES files")
+def _c18():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    stripes = need(m, "LOCK_STRIPES")
+    locks_dir = need(m, "LOCKS_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for i in range(256):
+            item = f"task-bound-{i:04d}"
+            assert acquire(root, item, "D1") is True
+            assert release(root, item, "D1") is True
+        locks = list((root / locks_dir).glob("*.lock"))
+        assert len(locks) <= stripes, (
+            f"{len(locks)} lock files after 256 items — ids are perpetually unique, "
+            "so an unbounded lock namespace grows one inode per item forever")
+        assert all(f.name.startswith("stripe-") for f in locks)
+
+
+# 19 --------------------------------------------------------------------------
+@contract("upgrading sweeps the legacy per-item lock files a pre-striping build left")
+def _c19():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    locks_dir = need(m, "LOCKS_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        d = root / locks_dir
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            (d / f"old-item-{i}.deadbeefdeadbeef.lock").touch()
+        swept = getattr(m._HELD, "swept_roots", None)
+        if swept is not None:
+            swept.discard(str(root))
+        assert acquire(root, "task-x", "D1") is True
+        leftovers = [f for f in d.glob("*.lock") if not f.name.startswith("stripe-")]
+        assert leftovers == [], f"legacy lock files survived the sweep: {leftovers}"
+        assert release(root, "task-x", "D1") is True
+
+
+# 20 --------------------------------------------------------------------------
+@contract("nesting two stripe-mates on one thread raises instead of self-deadlocking")
+def _c20():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    item_lock = need(m, "_item_lock")
+    stripe_of = need(m, "_lock_stripe")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        base = "task-mate-0"
+        mate = next(f"task-mate-{i}" for i in range(1, 100000)
+                    if stripe_of(f"task-mate-{i}") == stripe_of(base))
+        raised = False
+        with item_lock(root, base):
+            try:
+                with item_lock(root, mate):
+                    pass
+            except RuntimeError:
+                raised = True
+        assert raised, ("two items on one stripe nested in one thread must raise "
+                        "loudly — blocking silently here is a self-deadlock")
+        assert acquire(root, mate, "D1") is True, "stripe usable after unwinding"
+        assert release(root, mate, "D1") is True
+
+
 def main() -> int:
     print(f"  target: src/outbox.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)

@@ -218,6 +218,26 @@ def _claim_path(root: Path, item_id: str) -> Path:
 
 _HELD = threading.local()
 
+# Item ids are perpetually unique, so per-item lock files grow one inode per
+# item forever; a fixed stripe set bounds the namespace at LOCK_STRIPES.
+LOCK_STRIPES = 64
+
+
+def _lock_stripe(item_id: str) -> int:
+    return int(hashlib.sha256(item_id.encode("utf-8")).hexdigest(), 16) % LOCK_STRIPES
+
+
+def _sweep_legacy_locks(d: Path) -> None:
+    """One-shot upgrade sweep: pre-striping code left one `<key>.lock` per item.
+    Safe only because no pre-striping process runs against this root (the
+    workspace singleton enforces one consumer, and deploys restart it)."""
+    try:
+        for f in d.iterdir():
+            if f.name.endswith(".lock") and not f.name.startswith("stripe-"):
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass
+
 
 @contextlib.contextmanager
 def _item_lock(root: Path, item_id: str):
@@ -227,20 +247,32 @@ def _item_lock(root: Path, item_id: str):
     can be rebound between the check and the act. flock closes the window
     outright, and the kernel drops it when the holder dies, so a crash cannot
     leave the item locked.
+
+    Locks are STRIPED: item -> stripe file, so the lock namespace is bounded at
+    LOCK_STRIPES inodes instead of one per item ever handled. Two items sharing
+    a stripe serialize against each other — a contention cost, never a
+    correctness one, because the stripe lock strictly contains the item lock.
     """
-    key = (str(root), item_id)
+    stripe = _lock_stripe(item_id)
+    key = (str(root), stripe)
     held = getattr(_HELD, "keys", None)
     if held is None:
         held = _HELD.keys = set()
     if key in held:
-        # Re-entry would have to bypass the lock to avoid self-deadlock, and a
-        # bypass is exactly the hole this primitive exists to close.
-        raise RuntimeError(f"re-entrant claim operation on {item_id!r}")
+        # Re-entry (same item, or a stripe-mate) would have to bypass the lock
+        # to avoid self-deadlock, and a bypass is the hole this primitive closes.
+        raise RuntimeError(
+            f"re-entrant claim operation on {item_id!r} (stripe {stripe})")
     # Locks live outside the claims directory: a lock file sharing that
     # namespace is picked up by anything globbing claim names.
     d = Path(root) / LOCKS_DIR
     d.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(d / f"{_safe_key(item_id)}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    if not getattr(_HELD, "swept_roots", None):
+        _HELD.swept_roots = set()
+    if str(root) not in _HELD.swept_roots:
+        _HELD.swept_roots.add(str(root))
+        _sweep_legacy_locks(d)
+    fd = os.open(str(d / f"stripe-{stripe:02d}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
     held.add(key)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
