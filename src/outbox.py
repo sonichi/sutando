@@ -430,7 +430,25 @@ def _reclaim_locked(root: Path, item_id: str, ttl_seconds: float,
 
 def release_delivery_claim(root: Path, item_id: str, drainer_id: Optional[str] = None,
                            *, force: bool = False) -> bool:
-    """Release a claim; True if one was removed."""
+    """Release a claim; True if one was removed.
+
+    Two modes with DIFFERENT concurrency contracts — oracles and tests must
+    model them separately, never as one "release" op:
+
+    - Ownership-safe (default, `drainer_id` given): removes only an instance
+      this drainer verified at the same serialization point as the removal
+      (both under `_item_lock`). May never destroy a peer's live claim.
+    - `force=True` is ADMINISTRATIVE DESTRUCTION, not a release: it removes
+      whatever claim instance occupies the slot at its own unlink instant,
+      a live peer's included — that is its entitlement, not a defect — and
+      never one created after it completes. It carries no ownership claim,
+      so "force succeeded" tells an oracle the slot was cleared, nothing
+      about who owned it.
+
+    A verify-then-unlink whose verification happened at an earlier
+    serialization point than its unlink belongs to NEITHER mode; that gap is
+    the reclaim-after-preemption defect class the per-item lock closes.
+    """
     with _item_lock(root, item_id):
         return _release_locked(root, item_id, drainer_id, force=force)
 
@@ -578,6 +596,12 @@ def requeue_item(root: Path, item_id: str) -> None:
 
     Carrying the old count forward makes a re-queued item park again instantly,
     which is indistinguishable from a broken destination and hides the recovery.
+
+    Uses force-release (administrative destruction — see
+    `release_delivery_claim`): a concurrent live delivery of this item may be
+    interrupted and the item re-delivered after re-queue. At-least-once on this
+    administrative path is accepted by design; operators invoke it exactly
+    because normal ownership state can no longer be trusted.
     """
     d = _read_item(Path(root), item_id)
     d["status"] = "QUEUED"
