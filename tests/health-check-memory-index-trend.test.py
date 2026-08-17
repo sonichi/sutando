@@ -81,9 +81,8 @@ class OverCapIsNamedAsLoss(unittest.TestCase):
 
 
 class FailsOpen(unittest.TestCase):
-    """Fails open — but SAYS SO (#2958). These paths used to return "", which
-    made "could not measure" indistinguishable from "measured, unremarkable"."""
-    """A trend is a nicety; suppressing the level would be a regression."""
+    """Fails open — but SAYS SO (#2958). A trend is a nicety and suppressing the
+    level would be a regression; returning "" hid WHY there was no trend."""
 
     def test_not_a_git_repo_says_unavailable(self):
         m = _hc()
@@ -233,7 +232,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            # both objects skipped -> 0 points -> ""
+            # both objects skipped -> 0 points -> the unavailable marker
             self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_a_failing_batch_says_unavailable(self):

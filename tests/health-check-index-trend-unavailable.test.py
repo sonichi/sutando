@@ -90,13 +90,13 @@ check("a real history yields an actual measurement", "over the last" in n3, True
 check("...and never claims unavailable", MARK in n3, False)
 
 # 4. The marker is a clause on an existing detail line, not a standalone
-#    sentence — it is appended to `memory-index`'s ok detail, so it must start
-#    with the same separator the real note uses.
+#    sentence — it is appended inside memory-index's NEAR-LIMIT WARN detail
+#    (health-check.py:2245), so it must start with the real note's separator.
 check("the marker is a ';' clause, matching the real note's shape",
       n.lstrip().startswith(";"), True)
 
-# 5. It must not read as a failure. This rides an `ok`; wording that looks like
-#    an error would train operators to ignore a genuinely healthy line.
+# 5. It must not read as a failure. The line it rides already warns about size;
+#    failure vocabulary there would misdescribe a measurable-trend gap as a fault.
 check("the marker contains no failure vocabulary",
       any(w in n.lower() for w in ("error", "fail", "broken", "warn")), False)
 
