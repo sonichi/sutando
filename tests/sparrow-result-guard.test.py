@@ -30,9 +30,7 @@ def check(cond, label):
 
 # Absence must read as a failed contract, not a traceback: at the parent commit
 # the symbol is simply missing and a crash hides which guarantee was lost.
-for _sym in ("_guarded_result_body", "_team_guard_fns",
-             "_is_redelivery_control", "_park_unprovenanced_control",
-             "_PARKED_UNPROVENANCED"):
+for _sym in ("_guarded_result_body", "_team_guard_fns", "_is_redelivery_control"):
     if not hasattr(m, _sym):
         print(f"FAIL: gateway drain has no {_sym} — a guarantee below cannot be checked")
         fail = 1
@@ -203,7 +201,7 @@ check(not m._is_redelivery_control("[no-send] something else"),
 def drain_once(tids, provenance=()):
     """Run the real _post_ready_results over on-disk result files.
 
-    Returns (posted_bodies, parked, remaining_inflight).
+    Returns (posted_bodies, remaining_inflight).
     """
     td = tempfile.mkdtemp()
     root = pathlib.Path(td)
@@ -213,8 +211,6 @@ def drain_once(tids, provenance=()):
     m.RESULTS_DIR = results
     m.ARCHIVE_RESULTS_DIR = results / "archive"
     m._REDELIVERED.clear()
-    m._PARKED_UNPROVENANCED.clear()
-    m._PARKED_ALERT_SENT = False
     for tid in tids:
         write_task(tasks, tid, "team")
         (results / f"{tid}.txt").write_text(m.GATEWAY_REDELIVERY_RESULT)
@@ -228,38 +224,28 @@ def drain_once(tids, provenance=()):
     try:
         inflight = set(tids)
         m._post_ready_results(inflight)
-        return posted, set(m._PARKED_UNPROVENANCED), inflight
+        return posted, inflight
     finally:
         m._req = real_req
 
 
-# The reviewer's P1: a restart empties _REDELIVERED, so recovered controls
-# arrive unprovenanced. Withholding is right; DELIVERING the notice is the flood.
-ids = [f"task-restart-{i}" for i in range(3)]
-posted, parked, inflight = drain_once(ids)
-leaks = [p for p in posted if "withheld" in (p or {}).get("body", "")]
-check(leaks == [],
-      f"3 recovered controls deliver ZERO owner-visible notices (got {len(leaks)})")
-check(len(posted) == 3 and all("[no-send]" in p["body"] for p in posted),
-      "each still POSTs our own [no-send] constant, so the server lease CLOSES "
-      "— parking must not trade a flood for a stuck lease")
-check(parked == set(ids),
-      "all three are parked, so the count is inspectable")
-check(inflight == set(),
-      "and each lease is retired rather than retried forever")
-check(m._PARKED_ALERT_SENT is True,
-      "exactly one alert fired for the batch, not one per item")
+# THE security property. A Team runtime controls its own result bytes, so an
+# unprovenanced control must NOT buy a silent close — it stays withheld.
+posted, inflight = drain_once(["task-forged"])
+bodies = [p.get("body", "") for p in posted]
+check(all("[no-send]" not in b for b in bodies),
+      "a collaborator-producible control body does NOT close the lease silently")
+check(any("withheld" in b for b in bodies),
+      "it takes the guard's withheld notice instead — the safe failure")
 
-# A real in-process redelivery still closes silently — the fix must not turn the
-# provenanced path into a park.
-posted2, parked2, inflight2 = drain_once(["task-real"], provenance=["task-real"])
-check(parked2 == set(),
-      "a provenanced redelivery is NOT parked — it takes the normal silent close")
+# The PROVENANCED path is this process's own record, which a collaborator cannot
+# forge, so it still closes silently. Same bytes, opposite verdict.
+posted2, inflight2 = drain_once(["task-real"], provenance=["task-real"])
 check(len(posted2) == 1 and "[no-send]" in posted2[0]["body"],
-      "and closes its lease with the control body, delivering nothing")
-check(inflight2 == set(), "and its lease is retired")
+      "the same bytes WITH this process's record still close the lease silently")
+check(inflight2 == set(), "and that lease is retired")
 
 if fail:
     print("FAIL: sparrow result guard")
     sys.exit(1)
-print("PASS: recovered redelivery controls are bounded, not flooded.")
+print("PASS: an ambiguous redelivery control stays withheld.")
