@@ -8,7 +8,7 @@
  * injects the result into the Gemini conversation.
  */
 
-import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, appendFileSync, renameSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -240,13 +240,49 @@ export function _isVoiceTask(taskId: string): boolean {
 	return headerLines.some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
 }
 
+const CLAIM_LEDGERS = 'remote-task-inflight';
+
+// Durable in-flight sets other consumers publish. Cached on (mtime, size) so a
+// drain does not re-parse per result; a claim added mid-drain is picked up on
+// the next change rather than needing a restart.
+let _ledgerCache: { key: string; ids: Set<string> } | null = null;
+
+export function _claimedElsewhere(taskId: string): boolean {
+	const dir = join(REPO_DIR, 'state');
+	let files: string[];
+	try {
+		files = readdirSync(dir).filter(f => f.startsWith(CLAIM_LEDGERS) && f.endsWith('.json')).sort();
+	} catch { return false; }
+	const stamps: string[] = [];
+	for (const f of files) {
+		try { const st = statSync(join(dir, f)); stamps.push(`${f}:${st.mtimeMs}:${st.size}`); } catch {}
+	}
+	const key = stamps.join('|');
+	if (_ledgerCache?.key !== key) {
+		const ids = new Set<string>();
+		for (const f of files) {
+			try {
+				const parsed = JSON.parse(readFileSync(join(dir, f), 'utf-8'));
+				// An unreadable or reshaped ledger yields no claims rather than
+				// throwing; the source-label net still covers those consumers.
+				if (Array.isArray(parsed)) for (const id of parsed) if (typeof id === 'string') ids.add(id);
+			} catch {}
+		}
+		_ledgerCache = { key, ids };
+	}
+	return _ledgerCache.ids.has(taskId);
+}
+
 /** Origin of a task for the retirement decision, read through the same
  *  delimiter-honoring header reader `_isVoiceTask` uses. */
 export function _taskOrigin(taskId: string): TaskOrigin | null {
 	const headerLines = _readTaskHeader(taskId);
 	if (headerLines === null) return null;
 	const line = headerLines.find(l => l.startsWith('source:'));
-	return { source: line ? line.slice('source:'.length).trim() : null };
+	return {
+		source: line ? line.slice('source:'.length).trim() : null,
+		claimedElsewhere: _claimedElsewhere(taskId),
+	};
 }
 
 /** Belt-suspenders guard for the result-watcher's unconditional fallthrough

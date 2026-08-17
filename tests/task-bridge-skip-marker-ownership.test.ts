@@ -137,3 +137,51 @@ describe('retirement is scoped by the CLOSED foreign set, not a local allowlist'
 		assert.equal(hasNetworkConsumer({ source: '  Discord ' }), true);
 	});
 });
+
+describe('a durable claim outranks the source label', () => {
+	// The label set is not closed: remote_gateway_bridge writes
+	// `source: {task.source or PROVIDER}` with PROVIDER from
+	// $REMOTE_TASK_PROVIDER, so an operator can emit a label no list
+	// anticipates. Extending the list on each new label observed is the
+	// failure mode, not the fix.
+	it('claimed wins even when the label is unknown', () => {
+		assert.equal(hasNetworkConsumer({ source: 'acme-corp-relay', claimedElsewhere: true }), true);
+		assert.equal(
+			mayRetireSkipMarked(`${FOREIGN}.txt`, '[no-send]', noneOwned,
+				() => ({ source: 'acme-corp-relay', claimedElsewhere: true })),
+			false, 'a claimed result was retired because its label was not on a list');
+	});
+
+	it('the default gateway label with no explicit source is covered', () => {
+		// PROVIDER falls back to the literal 'remote'.
+		assert.equal(hasNetworkConsumer({ source: 'remote' }), true);
+	});
+
+	it('an unknown label with NO claim stays local', () => {
+		// The ledger is authoritative-positive only. Absence of a claim is not
+		// proof of absence of a consumer, so the label net still applies —
+		// but an unrecognised label with no claim is treated as local, which
+		// is what keeps every local family retirable without being named.
+		assert.equal(hasNetworkConsumer({ source: 'events-promotion', claimedElsewhere: false }), false);
+		assert.equal(
+			mayRetireSkipMarked('task-taskify-1.txt', '[no-send]', noneOwned,
+				() => ({ source: 'events-promotion', claimedElsewhere: false })),
+			true);
+	});
+
+	it('a claim on a LOCAL-looking source is still foreign', () => {
+		assert.equal(hasNetworkConsumer({ source: 'cron', claimedElsewhere: true }), true);
+	});
+
+	it('a claim outranks a MISSING source line — this pins the order', () => {
+		// The only input that distinguishes the two orderings. Checking the
+		// label first returns local for (source: null, claimed), retiring a
+		// result its claimant is about to deliver. Without this case the
+		// ordering is unpinned and a reader cannot tell it is deliberate.
+		assert.equal(hasNetworkConsumer({ source: null, claimedElsewhere: true }), true);
+		assert.equal(
+			mayRetireSkipMarked(`${FOREIGN}.txt`, '[no-send]', noneOwned,
+				() => ({ source: null, claimedElsewhere: true })),
+			false, 'a claimed result with no source line was retired');
+	});
+});

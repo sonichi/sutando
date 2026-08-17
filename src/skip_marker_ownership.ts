@@ -9,18 +9,29 @@ export function isSkipMarked(file: string, result: string): boolean {
 	return file.startsWith('task-') && SKIP_MARKER_RE.test(result);
 }
 
-// Sources whose own bridge polls results/ and archives what it dispatched.
-// Closed set: a transport is added here only when its bridge gains that loop.
-// The complement — every local source — is open-ended and host-dependent, so
-// enumerating IT cannot stay correct: measured on two hosts the same day, the
-// missing local families did not overlap at all.
+// Evidence that some OTHER consumer will deliver and archive this result.
+// Two kinds, and the order matters.
+//
+// 1. Ledger membership — authoritative. A consumer that persists its in-flight
+//    set has already told us, as a fact about claiming, that the result is
+//    spoken for. It does not depend on any label.
+// 2. Source label — a residual net for bridges whose in-flight set is only
+//    in-memory, so nothing durable can be consulted for them.
+//
+// The label list is NOT a closed set and must not be read as one: the gateway
+// writes `source: {task.source or PROVIDER}` where PROVIDER comes from
+// $REMOTE_TASK_PROVIDER, so an operator can emit a label no list anticipates.
+// That is precisely why the ledger check has to come first rather than this
+// list being extended each time a new label is observed.
 export const NETWORK_CONSUMER_SOURCES = [
-	'discord', 'ag2space', 'telegram', 'slack', 'whatsapp',
+	'discord', 'ag2space', 'remote', 'telegram', 'slack', 'whatsapp',
 ];
 
-/** Header fields a retirement decision may read. `null` = task file gone. */
+/** What a retirement decision may read about a task's origin. */
 export interface TaskOrigin {
 	source: string | null;
+	/** Present in another consumer's durable in-flight ledger. */
+	claimedElsewhere?: boolean;
 }
 
 export function hasNetworkConsumer(origin: TaskOrigin | null): boolean {
@@ -28,6 +39,7 @@ export function hasNetworkConsumer(origin: TaskOrigin | null): boolean {
 	// owner reply; wrongly keeping only accumulates a file, and suppression
 	// is universal either way — so the unknown case fails toward keeping.
 	if (origin === null) return true;
+	if (origin.claimedElsewhere) return true;
 	if (origin.source === null) return false;
 	return NETWORK_CONSUMER_SOURCES.includes(origin.source.trim().toLowerCase());
 }
