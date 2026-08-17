@@ -71,5 +71,93 @@ class CensusContract(unittest.TestCase):
         self.assertFalse(key.exists(), "census must never create the key")
 
 
+class CensusCliAndFallbacks(unittest.TestCase):
+    """In-process CLI + parser-fallback coverage (subprocess runs are
+    invisible to the coverage gate — same lesson as the envelope CLI)."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory(prefix="census-cli-")
+        self.ws = Path(self._tmp.name)
+        (self.ws / "state" / "auth").mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_timestamp_header_fallback_for_hex_ids(self):
+        old_iso = "2026-01-01T00:00:00Z"
+        _write(self.ws, "task-deadbeefcafe.txt",
+               f"id: task-deadbeefcafe\ntimestamp: {old_iso}\ntask: t\n"
+               "source: slack\n")
+        r = C.census(self.ws, days=7)
+        self.assertEqual(r["scanned"], 0,
+                         "hex id must fall back to the timestamp header, "
+                         "which is far outside the window")
+        r = C.census(self.ws, days=10 * 365)
+        self.assertEqual(r["scanned"], 1)
+
+    def test_bad_timestamp_header_falls_back_to_mtime(self):
+        _write(self.ws, "task-cafebabe.txt",
+               "id: task-cafebabe\ntimestamp: not-a-date\ntask: t\n")
+        r = C.census(self.ws, days=7)
+        self.assertEqual(r["scanned"], 1, "fresh mtime keeps it in-window")
+        self.assertEqual(r["unsigned_sources"], ["(none)"])
+
+    def test_unreadable_file_is_skipped(self):
+        p = _write(self.ws, f"task-{int(time.time()*1000)}u.txt",
+                   "id: task-u\ntask: t\nsource: x\n")
+        real_read = Path.read_text
+
+        def deny(self_p, *a, **kw):
+            if self_p == p:
+                raise OSError("denied")
+            return real_read(self_p, *a, **kw)
+        Path.read_text = deny
+        try:
+            r = C.census(self.ws)
+        finally:
+            Path.read_text = real_read
+        self.assertEqual(r["scanned"], 0)
+
+    def test_main_text_and_json_paths(self):
+        import contextlib
+        import io
+        import json as _json
+        signed = E.stamp_text(
+            "id: task-1\ntask: t\nsource: gateway\naccess_tier: owner\n",
+            self.ws)
+        _write(self.ws, self._now_id("m"), signed)
+        _write(self.ws, self._now_id("n"),
+               "id: task-2\ntask: t\nsource: voice\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = C.main(["x", "--workspace", str(self.ws)])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("UNSIGNED writers still live", text)
+        self.assertIn("voice", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = C.main(["x", "--json", "--workspace", str(self.ws)])
+        self.assertEqual(rc, 0)
+        j = _json.loads(out.getvalue())
+        self.assertEqual(j["verdicts"]["verified"], 1)
+        self.assertEqual(j["unsigned_sources"], ["voice"])
+
+    def test_main_gate_met_message_when_all_verified(self):
+        import contextlib
+        import io
+        signed = E.stamp_text("id: task-3\ntask: t\nsource: gateway\n",
+                              self.ws)
+        _write(self.ws, self._now_id("v"), signed)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(C.main(["x", "--workspace", str(self.ws)]), 0)
+        self.assertIn("census gate MET", out.getvalue())
+
+    def _now_id(self, suffix: str) -> str:
+        return f"task-{int(time.time()*1000)}{suffix}.txt"
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
