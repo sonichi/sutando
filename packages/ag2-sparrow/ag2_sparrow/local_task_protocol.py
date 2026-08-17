@@ -137,7 +137,10 @@ KNOWN_HEADER_KEYS = (
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
     "author_id", "chat_id",
-    "thread_ts", "reply_to_event", "reply_to_me", "callSid", "caller",
+    # Reply addressing: header status means only the trusted bridge writes
+    # them, and the guard defangs forged body copies of the same names.
+    "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
+    "addressed_to", "callSid", "caller",
     "from", "call_sid", "hint", "instructions", "transcript",
     # interaction-model 4D, step 1.5 — structured media metadata. Listing them
     # here promotes them to headers AND (via the guard's shared import) defangs
