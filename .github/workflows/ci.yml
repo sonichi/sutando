@@ -71,6 +71,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Invalidate before fetching: a survivor from an earlier run would be
+          # indistinguishable from a good fetch if a later attempt half-wrote it.
+          rm -f /tmp/review-pr.diff
           for attempt in 1 2 3; do
             if gh pr diff ${{ github.event.pull_request.number }} > /tmp/review-pr.diff; then
               exit 0
