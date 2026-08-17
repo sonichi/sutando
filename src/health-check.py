@@ -2136,6 +2136,25 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             note += (f"; +{grew:,} B over the last {hours:.1f}h"
                      + (f", which is ~{left / rate:.1f}h of remaining headroom at that rate"
                         if rate > 0 and left > 0 else ""))
+            # The max above is deliberately the WORST window, so a compaction
+            # cannot hide a climb. The cost is that `gain <= 0` skips every
+            # flat-or-shrinking window, so once growth STOPS the only surviving
+            # evidence is the old climb -- and the note keeps quoting a deadline
+            # from a regime that has ended. Measured 2026-08-17: writes were
+            # frozen at 09:5xZ and the index then FELL 273 B, while this note
+            # still read "+643 B over the last 10.9h, ~15.3h of headroom" off a
+            # window starting 05:39Z. An agent acting on that urgency would pre-
+            # empt a curation decision that was explicitly the owner's to make.
+            # So report the most recent window too, including when it is <= 0.
+            recent = next(((at, sz) for at, sz in reversed(points)
+                           if (newest_at - at) / 3600.0 >= 0.5), None)
+            if recent is not None:
+                r_span = (newest_at - recent[0]) / 3600.0
+                r_gain = effective_bytes - recent[1]
+                if r_gain <= 0:
+                    note += (f"; but the last {r_span:.1f}h show {r_gain:+,} B — flat or "
+                             f"shrinking, so the figure above spans a change in write rate "
+                             f"and its deadline is stale; re-measure before acting on it")
         return note
     except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
         return _TREND_UNAVAILABLE
