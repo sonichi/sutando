@@ -59,10 +59,12 @@ def census(workspace: Path | None = None, days: float = 7.0) -> dict:
     verdicts: Counter = Counter()
     by_source: dict = defaultdict(Counter)
     scanned = 0
-    for d in (ws / "tasks", ws / "tasks" / "archive"):
+    # rglob: the archiver nests monthly dirs (tasks/archive/YYYY-MM/) — a
+    # flat glob silently drops those writers from the census (review blocker).
+    for d in (ws / "tasks",):
         if not d.is_dir():
             continue
-        for p in d.glob("task-*.txt"):
+        for p in sorted(d.rglob("task-*.txt")):
             try:
                 text = p.read_text(encoding="utf-8")
             except OSError:

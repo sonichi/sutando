@@ -61,6 +61,16 @@ class CensusContract(unittest.TestCase):
         self.assertEqual(r["scanned"], 0,
                          "fresh mtime must not resurrect an old task id")
 
+    def test_monthly_archive_subdirs_are_counted(self):
+        """Review blocker: task_archive.py nests tasks/archive/YYYY-MM/ —
+        a writer whose tasks were archived there must still be named."""
+        _write(self.ws, self._now_id("a"),
+               "id: task-m\ntask: t\nsource: voice\n",
+               sub="tasks/archive/2026-08")
+        r = C.census(self.ws)
+        self.assertEqual(r["scanned"], 1)
+        self.assertEqual(r["unsigned_sources"], ["voice"])
+
     def test_keyless_host_reports_unverifiable_and_mints_nothing(self):
         signed = E.stamp_text("id: task-9\ntask: t\nsource: x\n", self.ws)
         key = E.key_path(self.ws)
