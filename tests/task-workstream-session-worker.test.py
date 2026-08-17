@@ -1209,6 +1209,40 @@ def test_required_team_handler_failure_never_emits_live_core_event() -> None:
         assert not (workspace / "state" / "task-event-handler-claims" / task.name).exists()
 
 
+def test_hang_report_is_exercised_without_a_hang() -> None:
+    """The `except TimeoutExpired` branch only runs on a failing run, so a green
+    suite proves nothing about the payload. Call the builder directly instead."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        starts = root / "starts"
+        starts.mkdir()
+        before, after = starts / "task-before.txt", starts / "task-after.txt"
+        before.touch()
+        terminated_at = time.time()
+        # mtime, not creation order, is what the report reads — set both explicitly
+        # so the assertion cannot pass on filesystem timestamp granularity.
+        os.utime(before, (terminated_at - 5, terminated_at - 5))
+        after.touch()
+        os.utime(after, (terminated_at + 5, terminated_at + 5))
+
+        report = _hang_report(starts, terminated_at)
+        assert "after_signal=['task-after.txt']" in report, report
+        assert "task-before.txt" in report, "started_at must list every marker"
+        assert str(SHUTDOWN_DRAIN_TIMEOUT_S) in report, "the bound belongs in the payload"
+
+        calls = root / "calls"
+        calls.write_text("task-before.txt\ntask-after.txt\n")
+        with_calls = _hang_report(starts, terminated_at, calls=calls)
+        assert "handler_calls=['task-before.txt', 'task-after.txt']" in with_calls, with_calls
+        assert "handler_calls" not in report, "calls= is opt-in, not always present"
+
+        # A hang can leave the temp tree torn down; the diagnostic must not raise
+        # from inside the diagnostic.
+        shutil.rmtree(starts)
+        gone = _hang_report(starts, terminated_at)
+        assert "starts dir unreadable" in gone, gone
+
+
 def test_required_team_handler_shutdown_never_falls_through() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -1902,6 +1936,7 @@ if __name__ == "__main__":
     test_cli_main_delegates_parsed_paths()
     test_watcher_provider_failure_falls_back_without_leaking_stdout()
     test_required_team_handler_failure_never_emits_live_core_event()
+    test_hang_report_is_exercised_without_a_hang()
     test_required_team_handler_shutdown_never_falls_through()
     test_slow_handler_does_not_block_the_next_task_event()
     test_watcher_bounds_provider_backlog_and_drains_every_receipt_once()
