@@ -202,9 +202,8 @@ class FailOpenArms(unittest.TestCase):
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "envtest_bridge_probe", REPO / "src" / "discord-bridge.py")
-        # Importing the full bridge needs discord deps; pin the shipped
-        # fail-open SHAPE instead: the stamp call sits inside its own
-        # try/except-pass so a raising stamper cannot lose the write.
+        # Full bridge import needs discord deps; pin the fail-open SHAPE
+        # (execution lives in discord-bridge-task-write-instrument).
         src = (REPO / "src" / "discord-bridge.py").read_text()
         import re as _re
         m = _re.search(r"try:\n(\s+)content = stamp_text\(content\)\n"
@@ -234,10 +233,22 @@ class WriterWiring(unittest.TestCase):
     def test_live_gateway_write_task_output_is_stamped(self):
         """Review P1-1: pin the REAL _write_task, not a surrogate helper."""
         import importlib
+        import json as _json
+        import os as _os
         sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
         with tempfile.TemporaryDirectory(prefix="env-gw-") as td:
             ws = Path(td); (ws / "state" / "auth").mkdir(parents=True)
             tasks = ws / "tasks"; tasks.mkdir()
+            # Isolate channel config: the bridge resolves it at import.
+            cfg = ws / "claude-config"
+            (cfg / "channels" / "ag2space").mkdir(parents=True)
+            (cfg / "channels" / "ag2space" / "access.json").write_text(
+                _json.dumps({"allowFrom": ["@qingyun:ag2.space"]}))
+            saved_cfg = _os.environ.get("CLAUDE_CONFIG_DIR")
+            _os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
+            self.addCleanup(lambda: _os.environ.update(
+                {"CLAUDE_CONFIG_DIR": saved_cfg}) if saved_cfg else
+                _os.environ.pop("CLAUDE_CONFIG_DIR", None))
             import ag2_sparrow._dirs as dirs
             dirs.set_dirs(task_dir=tasks, result_dir=ws / "results",
                           state_dir=ws / "state")
