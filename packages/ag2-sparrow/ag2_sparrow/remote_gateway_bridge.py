@@ -2643,14 +2643,35 @@ def _task_archived_recently(tid: str) -> bool:
 
 
 # ── orphan-result reconciler (sonichi/sutando#3009) ─────────────────────────
-# _post_ready_results reads ONLY the in-flight ledger, so a result whose tid
-# left the ledger (id dropped ahead of a slow result, or a post-delivery
-# double-write) has no consumer and strands forever. Two-host measurement:
-# ~89% of the orphan load is double-writes (a delivered archive copy exists).
+# Results whose tid left the in-flight ledger have no consumer; most are
+# post-delivery double-writes (a delivered archive copy exists).
 ORPHAN_SWEEP_EVERY_S = 600.0
 ORPHAN_GRACE_S = 600.0
 _last_orphan_sweep = 0.0
 _orphan_quarantine_logged: set = set()
+
+
+def _delivered_copy_exists(tid: str) -> bool:
+    """Both archive conventions: flat `<tid>-<ts>.txt` AND month-partitioned
+    `YYYY-MM/<tid>.txt` (bare name) — a flat-only probe mis-routes real
+    replies to re-delivery (peer-measured 4/50 on a live corpus)."""
+    if any(ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
+        return True
+    return any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}.txt")) or \
+        any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
+
+
+def _quarantine_orphan(rfile, tid: str, reason: str) -> bool:
+    """Collision-safe: never replace prior quarantined evidence."""
+    UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    dst = UNDELIVERABLE_RESULTS_DIR / f"{tid}.{reason}.{int(time.time())}.txt"
+    if dst.exists():
+        dst = dst.with_name(f"{tid}.{reason}.{time.time_ns()}.txt")
+    try:
+        rfile.rename(dst)
+        return True
+    except OSError:
+        return False
 
 
 def _reconcile_orphan_results(inflight: "set[str]") -> None:
@@ -2672,10 +2693,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                 continue                        # young: normal path may claim it
         except OSError:
             continue
-        # Disposition 1 — a delivered archive copy exists: this is a
-        # post-delivery double-write. Move aside; NEVER re-deliver (the sweep
-        # would post agent narration about having answered into the room).
-        if any(ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
+        # Delivered copy = double-write. NEVER re-deliver: the sweep would
+        # post agent narration about having answered into the room.
+        if _delivered_copy_exists(tid):
             ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
             try:
                 rfile.rename(ARCHIVE_RESULTS_DIR
@@ -2684,44 +2704,50 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             except OSError:
                 pass
             continue
-        # Disposition 3 — no task anywhere: nothing resolves a destination.
-        # Quarantine; a labeled re-delivery here would be a permanent sweep
-        # error masquerading as a predicate bug on every pass.
+        # No task anywhere: nothing resolves a destination — quarantine,
+        # never a labeled re-delivery (permanent sweep error otherwise).
         task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is None:
-            UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            try:
-                rfile.rename(UNDELIVERABLE_RESULTS_DIR / f"{tid}.no-task.txt")
-            except OSError:
+            if not _quarantine_orphan(rfile, tid, "no-task"):
                 continue
             if tid not in _orphan_quarantine_logged:
                 _orphan_quarantine_logged.add(tid)
                 _log(f"orphan sweep: {tid} has no task file — quarantined")
             continue
-        # Disposition 2 — genuinely undelivered: one labeled delivery attempt.
-        # Archive-absence is the strongest local evidence of non-delivery; the
-        # POST-succeeded-crash-before-archive window makes this at-least-once,
-        # and the label makes the rare duplicate self-explaining.
+        # Genuinely undelivered: ONE labeled attempt — at-least-once by
+        # design; the label makes the rare duplicate self-explaining.
         body = read_ready_result(rfile)
         if body is None:
             continue
         delivery = _delivery_tid(tid)
         if delivery is None:
             continue                            # alias ledger unreadable: retry later
-        labeled = "(recovered result — original delivery was lost)\n" +             parse_markers(body).body
+        parsed = parse_markers(body)
+        if [a for a in parsed.actions if a.kind == "attach"]:
+            # Delivering without the files would silently drop them — park
+            # for a human instead of composing a partial delivery.
+            if _quarantine_orphan(rfile, tid, "has-attachments"):
+                _log(f"orphan sweep: {tid} carries attachments — quarantined")
+            continue
+        skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip:
+            # Marker parity with _post_ready_results: original body goes up;
+            # the server suppresses user delivery and still closes the lease.
+            labeled = body
+        else:
+            labeled = ("(recovered result — original delivery was lost)\n"
+                       + parsed.body)
+            _r = next((a for a in parsed.actions if a.kind == "redirect"), None)
+            if _r:
+                labeled = f"[channel: {_r.value}]\n{labeled}"
         try:
             _req("POST", "/v1/results",
                  {"id": _broker_tid(delivery), "body": labeled})
         except urllib.error.HTTPError as e:
             if 400 <= e.code < 500:
                 # Lease long gone: no consumer will ever accept this POST.
-                UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-                try:
-                    rfile.rename(UNDELIVERABLE_RESULTS_DIR
-                                 / f"{tid}.lease-gone.txt")
+                if _quarantine_orphan(rfile, tid, "lease-gone"):
                     _log(f"orphan sweep: {tid} lease gone (HTTP {e.code}) — quarantined")
-                except OSError:
-                    pass
             else:
                 _log(f"orphan sweep: {tid} POST failed HTTP {e.code} — will retry")
             continue

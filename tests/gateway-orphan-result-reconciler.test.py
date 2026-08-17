@@ -112,8 +112,8 @@ class GenuinelyUndelivered(_Base):
             raise urllib.error.HTTPError(path, 410, "gone", {}, None)
         gw._req = gone
         self._sweep()
-        q = gw.UNDELIVERABLE_RESULTS_DIR / f"{TID}.lease-gone.txt"
-        self.assertTrue(q.exists(), "permanent 4xx quarantines, never retries forever")
+        q = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.lease-gone.*"))
+        self.assertEqual(len(q), 1, "permanent 4xx quarantines, never retries forever")
 
     def test_network_error_leaves_for_next_sweep(self):
         self._archived_task()
@@ -131,7 +131,7 @@ class NoTask(_Base):
     def test_quarantine_and_log_once(self):
         self._result()
         self._sweep()
-        self.assertTrue((gw.UNDELIVERABLE_RESULTS_DIR / f"{TID}.no-task.txt").exists())
+        self.assertEqual(len(list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.no-task.*"))), 1)
         first = sum("no task file" in l for l in self.logs)
         self.assertEqual(first, 1)
 
@@ -151,6 +151,71 @@ class InflightUntouched(_Base):
         gw._reconcile_orphan_results({TID})
         self.assertTrue((gw.RESULTS_DIR / f"{TID}.txt").exists())
         self.assertEqual(self.posted, [])
+
+
+class MarkerParity(_Base):
+    def _archived_task(self):
+        d = gw.TASKS_DIR / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        t = d / f"{TID}.txt"
+        t.write_text(f"id: {TID}\ntask: hi\n")
+        _age(t, OLD)
+
+    def test_no_send_orphan_posts_verbatim_so_server_suppresses(self):
+        self._archived_task()
+        self._result("[no-send]\ninternal only")
+        self._sweep()
+        self.assertEqual(len(self.posted), 1, "lease still closes via POST")
+        body = self.posted[0][2]["body"]
+        self.assertIn("[no-send]", body, "marker must reach the server intact")
+        self.assertNotIn("recovered result", body,
+                         "a suppressed result gets no user-facing label")
+
+    def test_redirect_is_restitched(self):
+        self._archived_task()
+        self._result("[channel: C123ABC]\nthe reply")
+        self._sweep()
+        body = self.posted[0][2]["body"]
+        self.assertTrue(body.startswith("[channel: C123ABC]"),
+                        f"redirect must be first line, got {body[:40]!r}")
+        self.assertIn("recovered result", body)
+
+    def test_attachment_orphan_quarantines_for_manual_handling(self):
+        self._archived_task()
+        self._result("see file [file: /tmp/x.png]")
+        self._sweep()
+        self.assertEqual(self.posted, [], "never deliver without the files")
+        q = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.has-attachments.*"))
+        self.assertEqual(len(q), 1)
+
+
+class ArchiveConventions(_Base):
+    def test_month_partitioned_bare_name_counts_as_delivered(self):
+        d = gw.ARCHIVE_RESULTS_DIR / "2026-08"
+        d.mkdir(parents=True)
+        (d / f"{TID}.txt").write_text("the reply")
+        self._result("Replied in room — completion note.")
+        self._sweep()
+        self.assertEqual(self.posted, [],
+                         "month-nested bare-name copy IS a delivered copy")
+        self.assertEqual(len(list(gw.ARCHIVE_RESULTS_DIR.glob(
+            f"{TID}-*-late-duplicate.txt"))), 1)
+
+
+class QuarantineCollision(_Base):
+    def test_prior_evidence_never_replaced(self):
+        gw.UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True)
+        self._result("new orphan")
+        self._sweep()                            # no task -> quarantine #1
+        first = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.no-task.*"))
+        self.assertEqual(len(first), 1)
+        self._result("second orphan, same tid")
+        gw._orphan_quarantine_logged.clear()
+        self._sweep()                            # quarantine #2, same tid
+        both = sorted(f.read_text() for f in
+                      gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.no-task.*"))
+        self.assertEqual(both, ["new orphan", "second orphan, same tid"],
+                         "both quarantined bodies must survive")
 
 
 class AbandonedHardening(_Base):
