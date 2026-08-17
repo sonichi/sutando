@@ -57,14 +57,9 @@ jobs:
       # the guide's lessons gate EVERY PR — not just reviews that use the codex
       # tool. `gh pr diff` needs no history/fetch-depth. PR events only (a push to
       # main has no PR diff). See docs + scripts/review-checks.sh.
-      # A PRECONDITION gets its own named step. Bundled into the step named after
-      # the assertion, a fetch failure reports as "Review checks (REVIEW.md)" —
-      # loud, but pointing at the wrong thing. Measured 2026-08-17 on #3049: a
-      # GitHub 503 on `gh pr diff` surfaced as `tsc + tests (clean install)`
-      # failing on a PR whose checks passed locally. Fail-closed kept its value;
-      # the LABEL cost the diagnosis. Retry first, because a non-zero exit on the
-      # first transient of a backend failing ~40% of calls trains re-run-without-
-      # reading, which is the attention this gate needs when it is right.
+
+      # Own step so a fetch failure is not reported as a review-checks finding.
+      # Retries first: a transient must not train re-run-without-reading.
       - name: Fetch PR diff (precondition)
         if: github.event_name == 'pull_request'
         env:
@@ -85,10 +80,8 @@ jobs:
           echo "This is NOT a review-checks finding — nothing was scanned." >&2
           exit 1
 
-      # Runs the machine-readable `checks:` block from REVIEW.md (today: the
-      # hardcoded-path scan) over the diff the step above materialized, so the
-      # guide's lessons gate EVERY PR. The runner exits 2 on an empty diff, so a
-      # PR whose diff is genuinely empty fails here rather than passing unscanned.
+      # REVIEW.md's machine-readable `checks:` block over the materialized diff.
+      # The runner exits 2 on an empty diff, so nothing passes unscanned.
       - name: Review checks (REVIEW.md)
         if: github.event_name == 'pull_request'
         run: bash scripts/review-checks.sh --diff /tmp/review-pr.diff
