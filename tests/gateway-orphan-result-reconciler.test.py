@@ -303,6 +303,30 @@ class AdjacentIdBoundary(_Base):
         self.assertFalse(gw._delivered_copy_exists(short),
                          "a neighbouring longer id satisfied a shorter one")
 
+    def test_a_numeric_adjacent_longer_id_does_not_satisfy_the_shorter(self):
+        """The adjacent input the `task-a-b` fixture cannot reach: when the
+        longer id's extra segment is NUMERIC it looks like this writer's own
+        epoch suffix, so a permissive grammar re-admits the alias."""
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (gw.ARCHIVE_RESULTS_DIR / "task-a-123-1786940000.txt").write_text("123's reply")
+        self.assertTrue(gw._delivered_copy_exists("task-a-123"),
+                        "the id that WAS delivered must read delivered")
+        self.assertFalse(gw._delivered_copy_exists("task-a"),
+                         "a numeric-adjacent longer id satisfied a shorter one")
+
+    def test_numeric_adjacent_boundary_holds_month_partitioned(self):
+        d = gw.ARCHIVE_RESULTS_DIR / "2026-08"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "task-a-123-1786940000.txt").write_text("123's reply")
+        self.assertTrue(gw._delivered_copy_exists("task-a-123"))
+        self.assertFalse(gw._delivered_copy_exists("task-a"))
+
+    def test_uniquified_and_tagged_names_still_count(self):
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000-late-duplicate.999.txt").write_text("x")
+        self.assertTrue(gw._delivered_copy_exists(TID),
+                        "the collision-uniquified name is this writer's own")
+
     def test_month_partitioned_arm_has_the_same_boundary(self):
         d = gw.ARCHIVE_RESULTS_DIR / "2026-08"
         d.mkdir(parents=True, exist_ok=True)

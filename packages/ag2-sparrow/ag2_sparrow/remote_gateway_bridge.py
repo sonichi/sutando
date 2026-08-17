@@ -2650,8 +2650,9 @@ _last_orphan_sweep = 0.0
 _orphan_quarantine_logged: set = set()
 
 
-# Suffixes this writer owns after `{tid}-`: an epoch, optionally tagged.
-_ARCHIVE_SUFFIX = re.compile(r"-\d+(?:-\d+)?(?:-late-duplicate)?\.txt\Z")
+# Exactly what the writers emit after `{tid}`: ONE epoch, optionally tagged,
+# optionally uniquified. A second `-\d+` would re-admit a longer id's entry.
+_ARCHIVE_SUFFIX = re.compile(r"-\d+(?:-late-duplicate)?(?:\.\d+)?\.txt\Z")
 
 
 def _delivered_copy_exists(tid: str) -> bool:
