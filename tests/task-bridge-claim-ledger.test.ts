@@ -58,13 +58,17 @@ describe('_claimedElsewhere reads other consumers\' durable in-flight ledgers', 
 		assert.equal(_claimedElsewhere('task-wrong-shape'), false);
 	});
 
-	it('finds a ledger the WRITER placed outside the injected dir', () => {
-		// _dirs.state_dir() resolves injected -> $AGENT_CONNECT_STATE_DIR ->
-		// ~/.ag2-sparrow/state. Globbing only the injected dir reports "no
-		// claim" for a whole deployment shape, silently.
-		ledger(EXT, 'remote-task-inflight.json', ['task-external-client']);
+	it('a ledger outside this workspace is NOT ownership of a file inside it', () => {
+		// _dirs.py resolves task/result/state independently and sutando injects
+		// all three together, so a consumer pointed at another tree writes its
+		// RESULTS there too. Its claims describe files that are not in the
+		// results/ scanned here — counting them would mistake a foreign
+		// namespace's claim for ownership of this file.
 		process.env.AGENT_CONNECT_STATE_DIR = join(EXT, 'state');
-		assert.equal(_claimedElsewhere('task-external-client'), true);
+		ledger(EXT, 'remote-task-inflight.json', ['task-elsewhere']);
+		assert.equal(_claimedElsewhere('task-elsewhere'), false,
+			'a claim from another tree must not count as ownership here');
+		assert.equal(_claimedElsewhere('task-a'), true, 'this workspace still reads');
 		delete process.env.AGENT_CONNECT_STATE_DIR;
 	});
 
