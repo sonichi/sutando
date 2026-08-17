@@ -99,6 +99,9 @@ class KeyIdentityAcrossIncarnations(unittest.TestCase):
             DeliveryCore(backend, p1, worker="w1.1.1").deliver_one(ITEM, b"x")
             p2 = _KeyRecorder([DeliveryOutcome.CONFIRMED])
             DeliveryCore(backend, p2, worker="w2.2.2").deliver_one(ITEM, b"x")
+            self.assertTrue(p1.keys and p2.keys,
+                            "neither provider was called — the comparison "
+                            "below would pass on two empty lists")
             self.assertEqual(p1.keys, p2.keys,
                              "park -> re-drive changed the idempotency key")
 
@@ -143,9 +146,17 @@ class StaticKeyScan(unittest.TestCase):
                 if isinstance(node, ast.Call) and \
                         isinstance(node.func, ast.Attribute) and \
                         node.func.attr in ("deliver", "reconcile"):
-                    if len(node.args) < 2:
+                    # Keywords count: `deliver(idempotency_key=...)` has no
+                    # positional args, and skipping it exempted exactly the
+                    # call shape a refactor would produce.
+                    kw = {k.arg: k.value for k in node.keywords if k.arg}
+                    key_arg = kw.get("idempotency_key")
+                    if key_arg is None and node.args:
+                        key_arg = node.args[-1]
+                    if key_arg is None:
+                        # Unrecognised shape: fail closed, never `continue`.
+                        bad.append(f"{src.name}:{node.lineno} (no key arg found)")
                         continue
-                    key_arg = node.args[-1]
                     ok = (isinstance(key_arg, ast.Name)
                           and key_arg.id in derived) or \
                          (isinstance(key_arg, ast.Call)
@@ -251,15 +262,22 @@ class FenceFaults(unittest.TestCase):
                                           self._is_converted, fault=fault)
         return convert
 
-    def _states(self, root, items):
+    def _states(self, root, items, crashed=True):
+        """State per item, asserting the two properties that actually
+        distinguish an atomic replace from a copy: the item path holds one
+        INTACT format (never torn), and on a clean pass no second visible
+        name survives (os.replace consumes the temp; a copy does not)."""
         out = {}
         for it in items:
-            self.assertFalse((root / (it + ".tmp")).exists() and
-                             self._is_converted(
-                                 (root / it).read_bytes()) is None,
-                             "impossible")
-            out[it] = "new" if self._is_converted(
-                (root / it).read_bytes()) else "old"
+            raw = (root / it).read_bytes()
+            self.assertIn(raw, (self.OLD, self._render(self.OLD)),
+                          f"{it}: item path holds torn or foreign content")
+            if not crashed:
+                self.assertFalse(
+                    (root / (it + ".tmp")).exists(),
+                    f"{it}: a second visible name survived a completed "
+                    "conversion — the replace was not atomic")
+            out[it] = "new" if self._is_converted(raw) else "old"
         return out
 
     def test_crash_at_every_step_never_leaves_both_visible(self):
@@ -285,9 +303,10 @@ class FenceFaults(unittest.TestCase):
                         crashed = False
                     except RuntimeError:
                         crashed = True
-                    for it, state in self._states(root, items).items():
-                        self.assertIn(state, ("old", "new"),
-                                      f"{it} in mixed state")
+                    states = self._states(root, items, crashed=crashed)
+                    if not crashed:
+                        self.assertEqual(set(states.values()), {"new"},
+                                         "a completed pass converts every item")
                     if crashed:
                         self.assertEqual(migration.read_epoch(root), "A",
                                          "fence must stay OLD after crash")
@@ -310,13 +329,13 @@ class FenceFaults(unittest.TestCase):
                                         self._convert_one(root), "B",
                                         crash_after=2)
             self.assertEqual(migration.read_epoch(root), "A")
-            states = self._states(root, items)
+            states = self._states(root, items, crashed=True)
             self.assertEqual(sorted(states.values()),
                              ["new", "new", "old", "old"])
             migration.convert_epoch(root, items, self._convert_one(root),
                                     "B")
             self.assertEqual(migration.read_epoch(root), "B")
-            self.assertEqual(set(self._states(root, items).values()),
+            self.assertEqual(set(self._states(root, items, crashed=False).values()),
                              {"new"})
 
     def test_fence_write_is_atomic_and_last(self):
