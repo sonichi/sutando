@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
-Only the PURE shared utilities (task_archive/local_task_protocol/result_markers) are
-bundled verbatim from sonichi/sutando `src/` (option A). The transport-specific
-modules (remote_gateway_bridge, _dirs, send_allowlist) are package-canonical and
+MAP below is the authority for what is bundled — src-canonical modules are copied
+verbatim from sonichi/sutando `src/` (option A). Package-canonical modules
+(remote_gateway_bridge, _dirs, send_allowlist) are absent from MAP and
 intentionally diverge from src (dir-interface, no workspace-resolution).
 
 The relay client lives canonically in sonichi/sutando `src/` (the core
