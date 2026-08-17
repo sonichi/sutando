@@ -641,9 +641,8 @@ def _c22():
     safe = need(m, "_safe_key")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        # rolling-upgrade control: an origin/main process flocks the per-item
-        # file directly; the new build (fence absent) must contend on the SAME
-        # inode, or the two versions do not mutually exclude.
+        # An origin/main process flocks the per-item file directly; without
+        # the fence the new build must contend on the SAME inode.
         with item_lock(root, "task-mixed"):
             legacy = root / locks_dir / f"{safe('task-mixed')}.lock"
             assert legacy.exists(), (
@@ -668,8 +667,21 @@ def _c22():
         assert (root / locks_dir / "survivor-item.aaaabbbbccccdddd.lock").exists(), (
             "legacy lock file swept without the fence — the sweep ran while "
             "old writers could still hold these files")
-        # fence error arms are loud, never a silent mode guess
+        # One namespace per process lifetime: a fence appearing under a live
+        # root must NOT flip it mid-flight (the memoized read is the guard)
         fence = root / locks_dir / need(m, "STRIPES_FENCE")
+        fence.write_text('{"stripes": %d}' % need(m, "LOCK_STRIPES"))
+        assert acquire(root, "task-late-fence", "D1") is True
+        assert (root / locks_dir / f"{safe('task-late-fence')}.lock").exists(), (
+            "a fence written under a live process flipped its namespace "
+            "mid-flight — the memoized mode read must hold for process life")
+        assert release(root, "task-late-fence", "D1") is True
+    # fence error arms are loud on FRESH roots (first read, nothing cached)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        d = root / locks_dir
+        d.mkdir(parents=True, exist_ok=True)
+        fence = d / need(m, "STRIPES_FENCE")
         fence.write_text('{"stripes": 128}')
         for fn, args in ((acquire, (root, "task-m", "D1")),
                          (need(m, "activate_lock_striping"), (root,))):
@@ -678,7 +690,11 @@ def _c22():
             except RuntimeError as e:
                 ok = "migration required" in str(e)
             assert ok, f"{fn.__name__} guessed a mode on a mismatched fence"
-        fence.write_text("not json")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        d = root / locks_dir
+        d.mkdir(parents=True, exist_ok=True)
+        (d / need(m, "STRIPES_FENCE")).write_text("not json")
         try:
             acquire(root, "task-m", "D1"); ok = False
         except RuntimeError as e:
