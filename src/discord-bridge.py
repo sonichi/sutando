@@ -203,6 +203,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
 
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
@@ -2858,6 +2859,10 @@ def _write_task_file(task_file: Path, content, username: str,
     try:
         if callable(content):
             content = content()
+        try:
+            content = stamp_text(content)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception as _tw_exc:
         print(f"  [task-write] FAILED for @{username} in #{channel_name} "
@@ -4798,25 +4803,10 @@ async def poll_results():
                     reply_to_id = int(reply_match.group(1)) if reply_match else None
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
-                    # Auto-thread: if the agent didn't pick an explicit
-                    # [reply: <id>], default to the triggering message so the
-                    # reply appears quoted under what it's answering. Skip
-                    # when the channel is already a Discord thread — thread
-                    # context anchors the reply implicitly, no extra quote
-                    # needed.
-                    #
-                    # getattr instead of bare `discord.Thread` so the
-                    # test-stub discord module (tests/discord-bridge-*.test.py)
-                    # — which intentionally omits Thread to keep the stub
-                    # surface small — doesn't AttributeError here. Production
-                    # discord.py always provides Thread; the getattr fallback
-                    # only matters under test, where treating "no Thread
-                    # class" as "channel isn't a thread" is correct.
+                    # Default to quoting the triggering message. Threads too:
+                    # interleaved exchanges make position stop identifying it.
                     if reply_to_id is None:
-                        _thread_cls = getattr(discord, 'Thread', None)
-                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
-                        if not is_thread:
-                            reply_to_id = source_message_anchor
+                        reply_to_id = source_message_anchor
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different

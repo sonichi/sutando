@@ -188,6 +188,8 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .outbox import DeliveryOutcome
+from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
@@ -816,7 +818,8 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # names + reply reference. Serialized only when the gateway sends
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
-                "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
+                "addressed_to",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
@@ -1934,6 +1937,16 @@ def _write_task(task: dict) -> str | None:
         _chan_q = shlex.quote(_chan)
         _step = 1
         _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+        _addr = _one_line(task.get("addressed_to") or "")
+        if _addr:
+            # Addressing gate (#649): the broker resolved this reply's target to a
+            # peer agent. State it in-band so the check cannot fail to retrieve.
+            _skill.append(
+                f"{_step}. ADDRESSING: this message replies to {_addr}'s message and "
+                f"does not mention you — it is {_addr}'s to claim. Do not process it "
+                "unless a later message hands it to you explicitly; close your copy "
+                "with [no-send].")
+            _step += 1
         if _chan:
             _skill.append(
                 f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
@@ -1956,7 +1969,8 @@ def _write_task(task: dict) -> str | None:
         _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
         lines.extend(_skill)
     tmp = dest.with_suffix(".txt.tmp")
-    tmp.write_text("\n".join(lines) + "\n")
+    from .local_task_protocol import apply_task_stamper
+    tmp.write_text(apply_task_stamper("\n".join(lines) + "\n"))
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
     # #2274 parity: one task_processed per NEWLY queued task (idempotent early
@@ -2414,9 +2428,11 @@ def _post_proactive() -> None:
             # a failed send: the claim is renamed back and retried next pass,
             # loudly, so a misconfigured room is visible instead of silently
             # eating nudges.
-            delivered = isinstance(resp, dict) and (
-                bool(resp.get("event_id"))
-                or (PROACTIVE_TRUST_OK and resp.get("ok") is True)
+            # event_id is pinned: the gateway answers HTTP 200 with an error
+            # envelope, and ts/id/message_id in one are not delivery receipts.
+            receipt = classify_response(200, resp, id_keys=("event_id",))
+            delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
+                PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True
             )
             if not delivered:
                 # Accepted but unconfirmed. It may ALSO have been delivered, so

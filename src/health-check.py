@@ -842,20 +842,42 @@ def check_cron_runner(
         return {"name": name, "status": "ok", "detail": "no launchd-owned schedules"}
 
     probe = (launchd_check or check_launchd)("com.sutando.cron-runner")
-    if probe["status"] != "ok":
-        return {
-            "name": name,
-            "status": "down",
-            "detail": f"{launchd_count} schedule(s) configured but launchd is {probe['status']}",
-        }
-
     state_file = workspace / "state" / "cron-runner-state.json"
     try:
         age = (float(time.time() if now is None else now) - state_file.stat().st_mtime)
+        age_err = None
+        # A negative age is a clock step or a bad write, never freshness. Discard
+        # it here so no branch below can read it as proof that work is happening.
+        if age < 0:
+            age, age_err = None, f"state is future-dated by {int(-age)}s"
     except FileNotFoundError:
-        return {"name": name, "status": "down", "detail": "runner loaded but state file is missing"}
+        age, age_err = None, "state file is missing"
     except OSError as exc:
-        return {"name": name, "status": "down", "detail": f"runner state unreadable ({exc})"}
+        age, age_err = None, f"state unreadable ({exc})"
+
+    if probe["status"] != "ok":
+        # `check_launchd` reports the LAST invocation. A killed one with a fresh
+        # state file means later ones complete, so the schedules still fire.
+        if age is not None and age <= 180:
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (f"{launchd_count} schedule(s); launchd reports {probe['status']} "
+                           f"({probe.get('detail', '')}) but the runner wrote state "
+                           f"{int(age)}s ago — invocations are being killed and "
+                           "relaunched, schedules still fire"),
+            }
+        # Name why freshness could not vouch for it; a clock step here is exactly
+        # the neighbour of whatever else has gone wrong.
+        return {
+            "name": name,
+            "status": "down",
+            "detail": (f"{launchd_count} schedule(s) configured but launchd is "
+                       f"{probe['status']}" + (f"; {age_err}" if age_err else "")),
+        }
+
+    if age_err is not None:
+        return {"name": name, "status": "down", "detail": f"runner loaded but {age_err}"}
     if age > 180:
         return {
             "name": name,
@@ -865,7 +887,7 @@ def check_cron_runner(
     return {
         "name": name,
         "status": "ok",
-        "detail": f"{launchd_count} durable schedule(s), state {int(max(age, 0))}s old",
+        "detail": f"{launchd_count} durable schedule(s), state {int(age)}s old",
     }
 
 
@@ -1992,6 +2014,11 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
 
+# Said instead of "" when the trend cannot be computed: silence made "no history
+# to read" indistinguishable from "read it, nothing to report".
+_TREND_UNAVAILABLE = "; growth trend unavailable (no readable index history on this host)"
+
+
 def _index_growth_note(index: Path, effective_bytes: int) -> str:
     """A trend for the memory-index warning, or "" when it cannot be measured.
 
@@ -2020,7 +2047,7 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             capture_output=True, text=True, timeout=10,
         )
         if proc.returncode != 0 or not proc.stdout.strip():
-            return ""
+            return _TREND_UNAVAILABLE
         # One `cat-file --batch` instead of a `git show` per commit. The first
         # draft spawned 1 + N processes (13 here) on a path that runs EVERY
         # proactive pass for as long as the warning stands — 658 ms on
@@ -2045,14 +2072,14 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
                 continue
             stamps.append((sha, int(at)))
         if not stamps:
-            return ""
+            return _TREND_UNAVAILABLE
         batch = subprocess.run(
             git_argv("-C", str(repo), "cat-file", "--batch"),
             input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
             capture_output=True, timeout=20,
         )
         if batch.returncode != 0:
-            return ""
+            return _TREND_UNAVAILABLE
         points: "list[tuple[int, int]]" = []
         buf, idx = batch.stdout, 0
         for sha, at in stamps:
@@ -2072,7 +2099,7 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             eff = _index_effective_text(body.decode("utf-8", "ignore"))
             points.append((at, len(eff.encode("utf-8"))))
         if len(points) < 2:
-            return ""
+            return _TREND_UNAVAILABLE
         points.sort()
         # Closest the index has come to the cut in the recorded window. This is
         # the number that makes the warning land, and no point reading has it.
@@ -2111,7 +2138,7 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
                         if rate > 0 and left > 0 else ""))
         return note
     except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
-        return ""
+        return _TREND_UNAVAILABLE
 
 
 def check_memory_index_integrity() -> "dict | None":
@@ -5067,6 +5094,14 @@ def check_gateway_bridge() -> "dict | None":
         # WITHOUT the duration this line is byte-identical at minute one and at
         # hour thirteen, so a reader cannot tell a blip from a standing outage.
         age_h = _gateway_last_ok_age_h()
+        # A negative age means a clock step or a bad sidecar write, not freshness.
+        if age_h is not None and 0 <= age_h * 3600 < GATEWAY_TRANSIENT_OUTAGE_S:
+            return {
+                "name": "gateway-bridge",
+                "status": "ok",
+                "detail": f"running; last poll did not succeed, last one that did "
+                          f"was {age_h * 3600:.0f}s ago (transient)",
+            }
         since = ("last successful poll UNKNOWN" if age_h is None
                  else f"last successful poll {age_h:.1f}h ago")
         return {
@@ -5081,6 +5116,9 @@ def check_gateway_bridge() -> "dict | None":
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
+# Mirrors POLL_TIMEOUT_GRACE_S in ag2_sparrow/remote_gateway_bridge.py — the same
+# env read, so a host that retunes POLL_WAIT moves both together.
+GATEWAY_TRANSIENT_OUTAGE_S = 3 * (float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25) + 10)
 
 
 def _gateway_last_ok_age_h(path: "Path | None" = None,
