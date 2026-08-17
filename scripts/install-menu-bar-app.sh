@@ -86,14 +86,25 @@ fi
 # NAME, so `pkill -x Sutando` would also kill the user's UI (#2038).
 APP_BIN="$APP/Contents/MacOS/Sutando"
 
+# `pgrep -f` matches an EXTENDED REGEX, so metacharacters in the checkout path
+# silently retarget the probe; compare the full argv literally instead.
+app_pids() {
+  ps -axww -o pid=,command= 2>/dev/null | awk -v want="$APP_BIN" '
+    { pid = $1; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); if ($0 == want) print pid }'
+}
+
 stop_unmanaged() {
   # An unmanaged copy left running defeats BOTH callers: --launch stacks a second
   # menu-bar icon, and --supervise leaves launchd's copy to exit under the
   # singleton guard, which KeepAlive does not restart.
-  pgrep -f "^$APP_BIN$" >/dev/null 2>&1 || return 0
-  pkill -f "^$APP_BIN$" 2>/dev/null || true
+  local pids
+  pids="$(app_pids)" || return 1        # a failed probe is UNKNOWN, never "absent"
+  [ -n "$pids" ] || return 0
+  # shellcheck disable=SC2086  # deliberate word-split: one pid per line
+  kill $pids 2>/dev/null || true
   for _ in $(seq 1 50); do
-    pgrep -f "^$APP_BIN$" >/dev/null 2>&1 || return 0
+    pids="$(app_pids)" || return 1
+    [ -n "$pids" ] || return 0
     sleep 0.1
   done
   return 1
@@ -113,10 +124,10 @@ elif [ "$LAUNCH" -eq 1 ]; then
   }
   open "$APP"
   for _ in $(seq 1 50); do
-    pgrep -f "^$APP_BIN$" >/dev/null 2>&1 && break
+    [ -n "$(app_pids)" ] && break
     sleep 0.1
   done
-  if pgrep -f "^$APP_BIN$" >/dev/null 2>&1; then
+  if [ -n "$(app_pids)" ]; then
     echo "  ✓ launched"
   else
     echo "  ✗ open returned but no menu-bar process is running — not launched" >&2

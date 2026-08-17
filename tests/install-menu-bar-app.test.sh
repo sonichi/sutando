@@ -123,6 +123,36 @@ else
     flunk "one stop_unmanaged definition, called by both (defs=$defs calls=$calls)"
 fi
 
+# ---- 4c. the probe must be LITERAL, not a regex over the checkout path ------
+# `pgrep -f` matches an ERE, so a checkout path holding regex metacharacters
+# makes the probe miss a live process and stop_unmanaged report "nothing to do".
+METADIR="$WORK/ex[re]po.d"
+mkdir -p "$METADIR"
+ln -s /bin/sleep "$METADIR/Sutando" 2>/dev/null
+"$METADIR/Sutando" 400 & META_PID=$!
+sleep 0.5
+if ! kill -0 "$META_PID" 2>/dev/null; then
+    flunk "metacharacter-path fixture did not stay alive (fixture broken, not the probe)"
+else
+    APP_BIN="$METADIR/Sutando 400"
+    # Drive the PRODUCTION function body, not a copy of its recipe.
+    eval "$(sed -n '/^app_pids() {/,/^}/p' "$SCRIPT")"
+    found="$(app_pids | tr -d '[:space:]')"
+    pgrep -f "^$APP_BIN$" >/dev/null 2>&1; pg_rc=$?
+    if [ "$found" = "$META_PID" ]; then
+        pass "the probe finds a live process whose path holds regex metacharacters"
+    else
+        flunk "probe missed a live metacharacter-path process (got '$found', want $META_PID)"
+    fi
+    # Control: the old regex probe must actually FAIL here, or this proves nothing.
+    if [ "$pg_rc" -ne 0 ]; then
+        pass "control: the regex probe does miss it, so the literal compare is load-bearing"
+    else
+        flunk "control failed: pgrep -f also matched, so this fixture cannot detect the bug"
+    fi
+fi
+kill "$META_PID" 2>/dev/null
+
 # The guard must precede the installer call, or it cannot prevent anything.
 gi="$(grep -n '^  stop_unmanaged ||' "$SCRIPT" | head -1 | cut -d: -f1)"
 ii="$(grep -n 'bash "\$REPO/src/install-sutando-app-launchd.sh"' "$SCRIPT" | head -1 | cut -d: -f1)"
