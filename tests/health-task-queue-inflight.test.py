@@ -66,9 +66,8 @@ check("inflight == len(files)" in body,
 check("not stalled" in body, "the all-held case says so explicitly")
 
 # --- BEHAVIOURAL: the STATUS, and whether it alerts ------------------------
-# Wording assertions cannot see this. The first version of this fix reworded
-# the detail and left status="warn"; every warn is alertable, so the false
-# alert still fired. @qingyun-wu caught it. These call the probe.
+# Wording assertions cannot see this: a reworded detail with status="warn"
+# still alerts. These call the probe and assert what the notifier reads.
 import os
 import tempfile
 import time as _time
