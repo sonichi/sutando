@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import time
@@ -1802,8 +1803,9 @@ def main() -> int:
                 _r.read()
         except Exception as e:  # noqa: BLE001 — the type IS the assertion
             raised = e
-        check(isinstance(raised, TimeoutError),
-              "poll-timeout: a held long poll raises TimeoutError (the type the bridge catches)")
+        check(isinstance(raised, (TimeoutError, socket.timeout)),
+              "poll-timeout: a held long poll raises a caught timeout type "
+              "(socket.timeout on 3.9, TimeoutError via the alias on 3.10+)")
         check(not isinstance(raised, urllib.error.URLError),
               "poll-timeout: it is NOT a URLError, so connect failures stay on the outage path")
     finally:
