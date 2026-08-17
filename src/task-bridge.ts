@@ -895,8 +895,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				if (isSkipMarked(file, result)) {
 					// Ownership must survive a restart (_pendingTasks is in-memory)
 					// and the timeout sweep; suppression applies either way.
-					const owns = (id: string) => _pendingTasks.has(id)
-						|| _isVoiceTask(id) || id.startsWith('task-chat-');
+					const owns = (id: string) => _pendingTasks.has(id) || _isVoiceTask(id);
 					if (!mayRetireSkipMarked(file, result, owns)) {
 						continue;   // another consumer's: leave the files for its owner
 					}

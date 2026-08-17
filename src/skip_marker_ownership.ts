@@ -18,8 +18,30 @@ export function isSkipMarked(file: string, result: string): boolean {
 	return file.startsWith('task-') && SKIP_MARKER_RE.test(result);
 }
 
+/**
+ * Task families with no network consumer: nothing else will ever archive
+ * them, so this bridge is their archiver of last resort. Cron depends on
+ * it explicitly — codex-scheduler writes [no-send] "so this scheduled task
+ * is archived" — and discord-bridge's skip handling is already scoped to
+ * its own pending map, so scoping this one without the allowlist would
+ * leave them with no archiver at all. A NEW local family must be added
+ * here or its results accumulate forever.
+ */
+export const LOCAL_ONLY_PREFIXES = [
+	'task-cron-', 'task-chat-',
+	'task-workstream-grouping-', 'task-project-grouping-',
+];
+
+export function isLocalOnlyTask(taskId: string): boolean {
+	return LOCAL_ONLY_PREFIXES.some(p => taskId.startsWith(p));
+}
+
 /** Ownership-scoped: may THIS bridge archive it and retire its task row? */
 export function mayRetireSkipMarked(file: string, result: string,
 	isOwn: (taskId: string) => boolean): boolean {
-	return isSkipMarked(file, result) && isOwn(file.replace(/\.txt$/, ''));
+	if (!isSkipMarked(file, result)) return false;
+	const taskId = file.replace(/\.txt$/, '');
+	// The whole rule lives here so it is testable; the caller supplies only
+	// the dynamic signals (dispatched-by-me, is-a-voice-task).
+	return isLocalOnlyTask(taskId) || isOwn(taskId);
 }

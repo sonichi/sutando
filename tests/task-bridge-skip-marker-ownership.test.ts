@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { isSkipMarked, mayRetireSkipMarked } from '../src/skip_marker_ownership.js';
+import { isLocalOnlyTask, isSkipMarked, mayRetireSkipMarked } from '../src/skip_marker_ownership.js';
 
 // results/ is shared by every consumer. Matching `task-*` plus a skip marker
 // retired results this bridge never dispatched: the gateway's bookkeeping
@@ -66,5 +66,24 @@ describe('task-bridge — only retire skip-marked results this bridge owns', () 
 		// the entry; ownership must not evaporate with it.
 		const durable = (id: string) => id === OWN || id.startsWith('task-chat-');
 		assert.equal(mayRetireSkipMarked('task-chat-123.txt', '[no-send]', durable), true);
+	});
+
+	it('local-only families keep an archiver — cron depends on it explicitly', () => {
+		// codex-scheduler writes [no-send] "so this scheduled task is
+		// archived"; cron never enters _pendingTasks and discord-bridge's
+		// skip handling is scoped to its own pending map.
+		const notDispatched = () => false;
+		for (const id of ['task-cron-nightly-123', 'task-chat-9',
+			'task-workstream-grouping-1', 'task-project-grouping-1']) {
+			assert.equal(isLocalOnlyTask(id), true, id);
+			assert.equal(mayRetireSkipMarked(`${id}.txt`, '[no-send]', notDispatched),
+				true, `${id} would have no archiver in any bridge`);
+		}
+	});
+
+	it('a network consumer\'s task is NOT local-only', () => {
+		// The whole point: gateway/discord/telegram ids stay foreign.
+		assert.equal(isLocalOnlyTask('task-0000000000000000bb'), false);
+		assert.equal(mayRetireSkipMarked(`${OTHERS}.txt`, '[no-send]', () => false), false);
 	});
 });
