@@ -252,7 +252,7 @@ finish_handler_task() {
         1)
           printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
           echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-          printf 'TASK_FILE: %s\n' "$filename" || true
+          emit_fallback_task_file "$filename"
           ;;
         *)
           echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
