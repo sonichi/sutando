@@ -65,9 +65,8 @@ check("inflight == len(files)" in body,
       "the stuck wording is suppressed only when EVERY queued task is held")
 check("not stalled" in body, "the all-held case says so explicitly")
 
-# --- BEHAVIOURAL: the STATUS, and whether it alerts ------------------------
-# Wording assertions cannot see this: a reworded detail with status="warn"
-# still alerts. These call the probe and assert what the notifier reads.
+# BEHAVIOURAL: a reworded detail with status="warn" still alerts, which no
+# wording assertion can see. These call the probe and read what the notifier does.
 import os
 import tempfile
 import time as _time
