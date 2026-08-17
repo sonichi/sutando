@@ -1,6 +1,14 @@
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { pauseKeywordGuard, KEYWORD_BLOCK_RETRY_MS } from '../src/recording-tools.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import {
+	pauseKeywordGuard,
+	pauseRetryAuthorization,
+	endPlaybackAuthorization,
+	KEYWORD_BLOCK_RETRY_MS,
+} from '../src/recording-tools.js';
 
 /**
  * Regression guard for pause_video refusing a real pause request.
@@ -9,66 +17,100 @@ import { pauseKeywordGuard, KEYWORD_BLOCK_RETRY_MS } from '../src/recording-tool
  * from pausing on its own. But it reads a rolling ASR transcript, and ASR is
  * least reliable on short commands repeated in frustration — so it failed closed
  * against the user exactly when he needed it. Observed live, four consecutive
- * refusals while the user said "pause it" and then "stop it":
+ * refusals while the user said "pause it" and then "stop it", 13-20s apart:
  *
  *   [PauseVideo] BLOCKED — no pause keyword in recent user speech:
  *     "user: i saw you already played it. [15:13:49] user: <noise>"
  *     "[15:13:49] user: <noise> [15:14:13] user: พยายาม"
  *     "user: พยายาม [15:14:22] user: خاص <noise>"
  *
- * The policy keeps the first block (a stray call still cannot pause) and honours
- * a repeat inside the retry window.
+ * An earlier version of this file simulated the elapsed time arithmetically and
+ * therefore passed against a build with every reset call site deleted. These
+ * tests drive the real `pauseRetryAuthorization` instead.
  */
 const GARBLED = 'user: <noise> [15:14:13] user: พยายาม [15:14:22] user: خاص <noise>';
-const FRESH_BLOCK = KEYWORD_BLOCK_RETRY_MS + 1;
+const GARBLED_LATER = 'user: พยายาม [15:14:22] user: خاص <noise> [15:14:31] user: <noise>';
+const T0 = 1_000_000;
 
-describe('pauseKeywordGuard', () => {
+beforeEach(() => pauseRetryAuthorization.clear());
+
+describe('pauseKeywordGuard — pure policy', () => {
 	it('allows a pause when the user plainly said it', () => {
-		assert.equal(pauseKeywordGuard('user: stop it', FRESH_BLOCK), 'allow');
-		assert.equal(pauseKeywordGuard('user: can you pause it?', FRESH_BLOCK), 'allow');
+		assert.equal(pauseKeywordGuard('user: stop it', 0), 'allow');
+		assert.equal(pauseKeywordGuard('user: can you pause it?', 0), 'allow');
 	});
 
 	it('fails open when there is no recent speech at all', () => {
-		// Matches the documented behaviour: no fresh transcript is not evidence
-		// against the user, so the guard must not block on it.
-		assert.equal(pauseKeywordGuard('', FRESH_BLOCK), 'allow');
+		// No fresh transcript is not evidence against the user.
+		assert.equal(pauseKeywordGuard('', 0), 'allow');
 	});
 
-	it('blocks a keyword-less pause on its first occurrence', () => {
-		assert.equal(pauseKeywordGuard(GARBLED, FRESH_BLOCK), 'block');
+	it('blocks a keyword-less pause once the retry window has lapsed', () => {
+		assert.equal(pauseKeywordGuard(GARBLED, KEYWORD_BLOCK_RETRY_MS + 1, GARBLED), 'block');
 	});
 
-	it('honours the repeat when the same keyword-less pause recurs in the window', () => {
-		assert.equal(pauseKeywordGuard(GARBLED, 5_000), 'allow');
+	it('blocks an immediate re-call against the SAME transcript', () => {
+		// The hallucinating caller retries at once, still hearing the same audio,
+		// so its speech window has not moved. This is Susan's 2026-04-16 report.
+		assert.equal(pauseKeywordGuard(GARBLED, 0, GARBLED), 'block');
+		assert.equal(pauseKeywordGuard(GARBLED, 1_000, GARBLED), 'block');
 	});
 
-	it('blocks again once the retry window has lapsed', () => {
-		// Otherwise one stale block would license every later stray call.
-		assert.equal(pauseKeywordGuard(GARBLED, KEYWORD_BLOCK_RETRY_MS + 1), 'block');
+	it('honours a repeat once the transcript has moved on', () => {
+		// The user asking again always produces new ASR text.
+		assert.equal(pauseKeywordGuard(GARBLED_LATER, 5_000, GARBLED), 'allow');
 	});
 });
 
-/**
- * Review finding (#3064): the retry authorization is module-global and was only
- * cleared when a pause was ALLOWED. A block earned on one video therefore
- * authorized the first keyword-less pause on the NEXT playback inside the
- * window — exactly the single stray call the guard exists to stop. Every
- * playback lifecycle transition (play / resume / replay / close) now clears it.
- */
-describe('pauseKeywordGuard across a playback boundary', () => {
-	it('a block on one video must not authorize a keyword-less pause on the next', () => {
-		// Block earned at t=0 on video A.
-		assert.equal(pauseKeywordGuard(GARBLED, FRESH_BLOCK), 'block');
-		// Video B starts 5s later; the lifecycle reset zeroes the stamp, which the
-		// guard reads as "no recent block" -> a stray call is blocked again.
-		const afterReset = Date.now() - 0; // endPlaybackAuthorization() sets it to 0
-		assert.ok(afterReset > KEYWORD_BLOCK_RETRY_MS, 'a zeroed stamp must read as outside the window');
-		assert.equal(pauseKeywordGuard(GARBLED, afterReset), 'block');
+describe('pauseRetryAuthorization — real state machine', () => {
+	it('a block on one video does not authorize a keyword-less pause on the next', () => {
+		// Video A: keyword-less pause is blocked and the stamp is recorded.
+		assert.equal(
+			pauseKeywordGuard(GARBLED, pauseRetryAuthorization.msSinceBlock(T0), pauseRetryAuthorization.transcript),
+			'block',
+		);
+		pauseRetryAuthorization.recordBlock(T0, GARBLED);
+
+		// Same video, 5s later, new speech: the repeat is honoured.
+		assert.equal(
+			pauseKeywordGuard(GARBLED_LATER, pauseRetryAuthorization.msSinceBlock(T0 + 5_000), pauseRetryAuthorization.transcript),
+			'allow',
+		);
+
+		// A playback lifecycle transition clears it — the SAME call is now blocked.
+		// This assertion fails if endPlaybackAuthorization() stops resetting.
+		endPlaybackAuthorization();
+		assert.equal(
+			pauseKeywordGuard(GARBLED_LATER, pauseRetryAuthorization.msSinceBlock(T0 + 5_000), pauseRetryAuthorization.transcript),
+			'block',
+		);
 	});
 
-	it('without the reset, the stale block would have allowed it', () => {
-		// Pins the defect itself: 5s since a block is inside the window, so absent
-		// the lifecycle reset this same call returns "allow" on the new video.
-		assert.equal(pauseKeywordGuard(GARBLED, 5_000), 'allow');
+	it('a cleared stamp reads as far outside the window, not as zero elapsed', () => {
+		// Guards the subtle bug: `now - 0` is enormous and happens to block, but
+		// only by accident of the epoch. Make the intent explicit.
+		pauseRetryAuthorization.clear();
+		assert.ok(pauseRetryAuthorization.msSinceBlock(T0) > KEYWORD_BLOCK_RETRY_MS);
 	});
+});
+
+describe('playback lifecycle wiring', () => {
+	// The behavioural tests above cannot see the CALL SITES. A reviewer deleted all
+	// four and the previous suite still passed 7/7, so this pins them directly.
+	const src = readFileSync(
+		join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'recording-tools.ts'),
+		'utf8',
+	);
+
+	for (const tool of ['playVideoTool', 'resumeVideoTool', 'replayVideoTool', 'closeVideoTool']) {
+		it(`${tool} clears the pause-retry authorization`, () => {
+			const start = src.indexOf(`export const ${tool}`);
+			assert.ok(start > 0, `${tool} not found`);
+			const body = src.slice(start, src.indexOf('\n};', start));
+			assert.ok(
+				body.includes('endPlaybackAuthorization()'),
+				`${tool} must call endPlaybackAuthorization() — a block on one playback must not authorize a pause on the next`,
+			);
+		});
+	}
 });

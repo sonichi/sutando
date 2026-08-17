@@ -628,8 +628,24 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 }
 
 let lastResumeTime = 0;
-// A pause blocked for want of a keyword; a repeat within this window is honoured.
-let lastKeywordBlockTime = 0;
+
+/**
+ * Pause-retry authorization. Exported so tests drive the real state machine
+ * instead of simulating its arithmetic — a test that recomputes the elapsed time
+ * by hand passes against a build with every reset deleted.
+ *
+ * `transcript` is the speech window that was current when the block was taken.
+ * A user asking again produces NEW ASR text; a model retrying because it is
+ * still hearing the video produces the same window, so comparing them separates
+ * the two callers without a timing heuristic.
+ */
+export const pauseRetryAuthorization = {
+	stamp: 0,
+	transcript: '',
+	recordBlock(now: number, recent: string): void { this.stamp = now; this.transcript = recent; },
+	clear(): void { this.stamp = 0; this.transcript = ''; },
+	msSinceBlock(now: number): number { return this.stamp === 0 ? Number.MAX_SAFE_INTEGER : now - this.stamp; },
+};
 
 /**
  * Clear the pause-retry authorization. A block earned on one video must not
@@ -637,7 +653,7 @@ let lastKeywordBlockTime = 0;
  * the retry window after ANY earlier block would pass, which is the single
  * hallucinated pause the guard exists to stop.
  */
-function endPlaybackAuthorization(): void { lastKeywordBlockTime = 0; }
+export function endPlaybackAuthorization(): void { pauseRetryAuthorization.clear(); }
 export const KEYWORD_BLOCK_RETRY_MS = 60_000;
 const PAUSE_KEYWORDS = /\b(pause|stop|hold|wait)\b/;
 
@@ -649,9 +665,18 @@ const PAUSE_KEYWORDS = /\b(pause|stop|hold|wait)\b/;
  * on its FIRST occurrence and honoured if it recurs inside the retry window: one
  * stray call still cannot pause, a persistent request gets through.
  */
-export function pauseKeywordGuard(recent: string, msSinceLastBlock: number): 'allow' | 'block' {
+export function pauseKeywordGuard(
+	recent: string,
+	msSinceLastBlock: number,
+	transcriptAtBlock = '',
+): 'allow' | 'block' {
 	if (!recent || PAUSE_KEYWORDS.test(recent)) return 'allow';
-	return msSinceLastBlock > KEYWORD_BLOCK_RETRY_MS ? 'block' : 'allow';
+	if (msSinceLastBlock > KEYWORD_BLOCK_RETRY_MS) return 'block';
+	// Inside the window, honour the repeat ONLY if the speech window moved on.
+	// An immediate re-call against the identical transcript is the hallucinating
+	// caller this guard exists to stop; it retries at once, while the user's own
+	// repeats were 13-20s apart and always carried new text.
+	return recent === transcriptAtBlock ? 'block' : 'allow';
 }
 
 export const playVideoTool: ToolDefinition = {
@@ -738,16 +763,16 @@ export const pauseVideoTool: ToolDefinition = {
 		// outside the 8s cooldown still fires (Susan's 2026-04-16 report).
 		// Picks freshest of voice-agent vs phone transcript; fail-open if neither is fresh.
 		const recent = getRecentUserSpeech();
-		const sinceBlock = Date.now() - lastKeywordBlockTime;
-		if (pauseKeywordGuard(recent, sinceBlock) === 'block') {
-			lastKeywordBlockTime = Date.now();
+		const sinceBlock = pauseRetryAuthorization.msSinceBlock(Date.now());
+		if (pauseKeywordGuard(recent, sinceBlock, pauseRetryAuthorization.transcript) === 'block') {
+			pauseRetryAuthorization.recordBlock(Date.now(), recent);
 			console.log(`${ts()} [PauseVideo] BLOCKED — no pause keyword in recent user speech: "${recent.slice(-80)}"`);
 			return { status: 'playing', instruction: 'Video is still playing. Only pause when user explicitly says "pause" or "stop".' };
 		}
 		if (recent && !PAUSE_KEYWORDS.test(recent)) {
 			console.log(`${ts()} [PauseVideo] keyword guard overridden — repeat call ${sinceBlock}ms after a block: "${recent.slice(-80)}"`);
 		}
-		lastKeywordBlockTime = 0;
+		pauseRetryAuthorization.clear();
 		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'if (count of documents) > 0 then', '-e', 'pause document 1', '-e', 'end if', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
