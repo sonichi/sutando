@@ -27,7 +27,7 @@ Key: `<workspace>/state/auth/task-hmac.key` (0600, auto-generated) —
 per-host durable install state, exempt from transient-state cleanup.
 
 CLI: `task_envelope.py stamp <file>` (in place) | `verify <file>`
-(prints verdict, exit 0 verified / 3 unsigned / 4 invalid).
+(exit 0 verified / 3 unsigned / 4 invalid / 5 unverifiable-no-key).
 """
 from __future__ import annotations
 
@@ -47,6 +47,17 @@ _KEY_RELPATH = Path("state") / "auth" / "task-hmac.key"
 
 def key_path(workspace: Path | None = None) -> Path:
     return (workspace or resolve_workspace()) / _KEY_RELPATH
+
+
+def load_key(workspace: Path | None = None) -> "bytes | None":
+    """Read-only: None when no key exists. Verification MUST use this —
+    minting a key from a verify path turns a fresh/restored host's first
+    verification of a good file into a false `invalid` (review finding)."""
+    try:
+        return bytes.fromhex(
+            key_path(workspace).read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        return None
 
 
 def load_or_create_key(workspace: Path | None = None) -> bytes:
@@ -107,7 +118,10 @@ def verify_text(text: str, workspace: Path | None = None) -> dict:
     stripped, mac = _strip_stamp(text)
     if mac is None:
         return {"verdict": "unsigned", "reason": "no stamp line"}
-    key = load_or_create_key(workspace)
+    key = load_key(workspace)
+    if key is None:
+        return {"verdict": "unverifiable",
+                "reason": "no local key — cannot judge; treat as warn"}
     want = _mac(stripped, key)
     if hmac.compare_digest(mac, want):
         return {"verdict": "verified", "reason": ""}
@@ -127,7 +141,8 @@ def main(argv: list[str]) -> int:
         return 0
     v = verify_text(text)
     print(f"{v['verdict']}" + (f": {v['reason']}" if v["reason"] else ""))
-    return {"verified": 0, "unsigned": 3, "invalid": 4}[v["verdict"]]
+    return {"verified": 0, "unsigned": 3, "invalid": 4,
+            "unverifiable": 5}[v["verdict"]]
 
 
 if __name__ == "__main__":

@@ -68,6 +68,18 @@ class EnvelopeContract(unittest.TestCase):
         self.assertEqual(E.load_or_create_key(self.ws),
                          E.load_or_create_key(self.ws))
 
+    def test_verify_never_mints_a_key(self):
+        """Review finding: a keyless host verifying a stamped file must get
+        `unverifiable` (warn), never `invalid`, and no key may be created
+        as a side effect of the read path."""
+        s = E.stamp_text(TASK, self.ws)
+        with tempfile.TemporaryDirectory(prefix="env-fresh-") as td2:
+            fresh = Path(td2); (fresh / "state" / "auth").mkdir(parents=True)
+            v = E.verify_text(s, fresh)
+            self.assertEqual(v["verdict"], "unverifiable")
+            self.assertFalse(E.key_path(fresh).exists(),
+                             "verify minted a key on a fresh host")
+
     def test_falsifier_tier_flip(self):
         s = E.stamp_text(TASK, self.ws)
         forged = s.replace("access_tier: owner", "access_tier: team")
@@ -89,6 +101,7 @@ class EnvelopeContract(unittest.TestCase):
 
     def test_falsifier_forged_without_key_cannot_verify(self):
         import hashlib
+        E.load_or_create_key(self.ws)   # keyed host judges the forgery
         body = TASK
         fake = ("id: task-42\n" + E.STAMP_PREFIX
                 + hashlib.sha256(body.encode()).hexdigest() + "\n"
