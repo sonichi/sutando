@@ -48,15 +48,13 @@ out = promote(SECRET)
 check("the raw token is not persisted", "sk-proj-AbCdEf123456SUPERSECRET7890" in out, False)
 check("the line is still promoted (not dropped)", "message.created" in out, True)
 
-# 2. PARITY with the route that already filters — assert against the filter's
-#    own output at runtime, not a hardcoded placeholder, so a change to the
-#    redaction vocabulary cannot make the two routes silently diverge.
+# 2. PARITY: assert against the filter's own runtime output, never a literal, so
+#    a change to the redaction vocabulary cannot let the two routes diverge.
 check("the taskify route matches what the delivery route would write",
       filter_chat_secrets(SECRET).text in out, True)
 
-# 3. ORDERING. Redaction must run BEFORE the 120-char cut. Truncating first can
-#    split a token so no pattern matches, persisting a recognisable partial —
-#    which is why placing the filter after the existing truncation is not a fix.
+# 3. ORDERING: redact BEFORE the 120-char cut — truncating first can split a
+#    token so no pattern matches, persisting a recognisable partial.
 LONG = ("please rotate this for me when you get a sec, it is the prod one and "
         "I want it swapped today ok thanks -- sk-proj-AbCdEf123456SUPERSECRET7890abcdefghij")
 assert len(LONG.splitlines()[0][:120]) == 120, "fixture must exceed the cut"
