@@ -99,9 +99,23 @@ def _quarantine(src: Path, root, item_key: str, reason: str, token: str) -> None
         _move(src, dst.with_name(dst.name + f"{SEP}{time.time_ns()}"))
 
 
+def _inflight_tokens(root, key: str):
+    d = Path(root) / INFLIGHT
+    if not d.exists():
+        return []
+    return [f for f in d.iterdir() if f.name.split(SEP)[0] == key]
+
+
 def publish(root, item_id: str, body: str = "") -> bool:
-    """True = published. False = an item with this id is already in ready/."""
+    """True = published. False = this id is already live (ready/ OR in
+    flight): a same-id publish while a token holds the item would create a
+    second live copy — the machine-found double-delivery (round 2 fix).
+    Check-then-act on inflight/ is deliberate and its residual window is a
+    concurrent publish-vs-claim of the SAME id, which the one-writer-per-id
+    publisher contract already excludes."""
     key = safe_key(item_id)
+    if _inflight_tokens(root, key):
+        return False
     tmp = _d(root, TMP) / f"{key}{SEP}{os.getpid()}{SEP}{time.time_ns()}"
     tmp.write_text(body, encoding="utf-8")
     dst = _d(root, READY) / key
@@ -165,6 +179,12 @@ def recover(root):
         if ident.state is not ob.OwnerState.DEAD:
             continue
         if ident.start_usec is not None and str(ident.start_usec) != birth:
+            continue
+        # Round 2: never re-arm past a LIVE same-key token — a dup copy
+        # (pre-fix publish, or any future path) must quarantine, not deliver.
+        others = [t for t in _inflight_tokens(root, key) if t.name != f.name]
+        if others:
+            _quarantine(f, root, key, "live-holder", pid_s)
             continue
         # ready/<key> must be create-if-absent (a re-publish may occupy it),
         # so this one transition is link+unlink. Its crash window (linked, not
