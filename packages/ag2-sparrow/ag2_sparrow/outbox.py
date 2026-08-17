@@ -218,8 +218,8 @@ def _claim_path(root: Path, item_id: str) -> Path:
 
 _HELD = threading.local()
 
-# Item ids are perpetually unique, so per-item lock files grow one inode per
-# item forever; a fixed stripe set bounds the namespace at LOCK_STRIPES.
+# Bounds the lock namespace. Changing it remaps item->stripe, so mixed-value
+# processes would not mutually exclude: a migration (restart world), not tuning.
 LOCK_STRIPES = 64
 
 

@@ -604,6 +604,28 @@ def _c20():
         assert release(root, mate, "D1") is True
 
 
+# 21 --------------------------------------------------------------------------
+@contract("a failed legacy-lock sweep is swallowed and never takes down the consumer")
+def _c21():
+    m = outbox()
+    sweep = need(m, "_sweep_legacy_locks")
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sweep(root / "does-not-exist")          # iterdir -> FileNotFoundError
+        ro = root / "unreadable"
+        ro.mkdir()
+        os.chmod(ro, 0o000)                     # iterdir -> PermissionError
+        try:
+            sweep(ro)
+        finally:
+            os.chmod(ro, 0o755)
+        # the whole point of the swallow: claiming still works after a bad sweep
+        assert acquire(root, "task-after-bad-sweep", "D1") is True
+        assert release(root, "task-after-bad-sweep", "D1") is True
+
+
 def main() -> int:
     print(f"  target: src/outbox.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)
