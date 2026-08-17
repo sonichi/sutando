@@ -87,6 +87,16 @@ describe('_claimedElsewhere reads other consumers\' durable in-flight ledgers', 
 		delete process.env.AGENT_CONNECT_STATE_DIR;
 	});
 
+	it('a bare JSON string is not a list of claims', () => {
+		// A JSON string is ITERABLE, so `for (const id of parsed)` walks its
+		// characters instead of throwing — the shape check is what stops them
+		// entering the id set, not the surrounding catch.
+		raw(TMP, 'remote-task-inflight-str.json', JSON.stringify('x'));
+		assert.equal(_claimedElsewhere('x'), false,
+			'characters of a JSON string must not read as claims');
+		assert.equal(_claimedElsewhere('task-a'), true, 'the real ledger still reads');
+	});
+
 	it('a claim reaches the origin record the decision actually reads', () => {
 		// The wiring: _taskOrigin must carry the claim through, or the
 		// ledger is read and then discarded.
