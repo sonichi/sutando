@@ -29,7 +29,8 @@ def _target() -> "pathlib.Path | None":
     seen = []
     if cfg:
         seen.append(pathlib.Path(cfg) / "skills/pr-triage/scripts/pr_flag.py")
-    seen.append(pathlib.Path(__file__).resolve().parent.parent / _REL)
+    # Resolves the REPO root to find the skill checkout, never the workspace.
+    seen.append(pathlib.Path(__file__).resolve().parent.parent / _REL)  # lint-workspace-resolution: allow-repo-root
     for p in seen:
         if p.is_file():
             return p
