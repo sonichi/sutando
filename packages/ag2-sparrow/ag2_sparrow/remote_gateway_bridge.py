@@ -571,11 +571,10 @@ def _guarded_result_body(tid: str, body: str):
     honouring redirect/attach actions on unscanned collaborator output.
     """
     # Body equality is NOT provenance — a Team runtime can emit these bytes. Only
-    # this process's own record is, and it is consumed exactly once.
-    if tid in _REDELIVERED:
-        _REDELIVERED.discard(tid)
-        if _is_redelivery_control(body):
-            return body, None
+    # this process's own record is, and reading must NOT consume it: a deferred
+    # POST leaves the file for retry, and the retry needs the same provenance.
+    if tid in _REDELIVERED and _is_redelivery_control(body):
+        return body, None
     try:
         guard, resolve = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
@@ -2583,6 +2582,9 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _log(f"result POST network error for {tid}: {e} — will retry")
                 continue
             _archive_result(rfile, tid)
+            # Retire the provenance WITH the result, never at read: this line is
+            # only reached once the lease-closing POST has actually succeeded.
+            _REDELIVERED.discard(tid)
             inflight.discard(tid)
             _forget_task_room(tid)
             changed = True

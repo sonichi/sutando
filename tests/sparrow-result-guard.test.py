@@ -13,6 +13,7 @@ import importlib
 import pathlib
 import sys
 import tempfile
+import urllib.error
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
@@ -128,13 +129,16 @@ with tempfile.TemporaryDirectory() as td:
           "the same bytes WITH this process's own record pass untouched")
     check(any(a.kind == "skip" for a in m.parse_markers(real).actions),
           "so the lease still closes silently on a real replay")
-    check("task-replay" not in m._REDELIVERED,
-          "the record is consumed exactly once, so it cannot be replayed")
+    check("task-replay" in m._REDELIVERED,
+          "READING does not consume the record — a deferred POST leaves the file "
+          "for retry, and the retry needs the same provenance")
 
     again, again_withheld = m._guarded_result_body(
         "task-replay", m.GATEWAY_REDELIVERY_RESULT)
-    check(again_withheld is not None,
-          "a second use of the same bytes is withheld again")
+    check(again_withheld is None and again == m.GATEWAY_REDELIVERY_RESULT,
+          "so a second read of the SAME tid still passes, rather than degrading "
+          "into a visible withheld notice on the retry")
+    m._REDELIVERED.discard("task-replay")
 
     # An agent-produced [no-send] on a Team task stays forbidden.
     write_task(tasks, "task-mark", "team")
@@ -244,6 +248,57 @@ posted2, inflight2 = drain_once(["task-real"], provenance=["task-real"])
 check(len(posted2) == 1 and "[no-send]" in posted2[0]["body"],
       "the same bytes WITH this process's record still close the lease silently")
 check(inflight2 == set(), "and that lease is retired")
+
+# The reviewer's P1: a transient POST failure must not burn the provenance.
+# First attempt fails, second succeeds; neither may emit an owner-visible notice.
+def drain_two_pass():
+    td = tempfile.mkdtemp()
+    root = pathlib.Path(td)
+    tasks = root / "tasks"; tasks.mkdir()
+    results = root / "results"; results.mkdir()
+    m.TASKS_DIR = tasks
+    m.RESULTS_DIR = results
+    m.ARCHIVE_RESULTS_DIR = results / "archive"
+    m._REDELIVERED.clear()
+    tid = "task-retry"
+    write_task(tasks, tid, "team")
+    (results / f"{tid}.txt").write_text(m.GATEWAY_REDELIVERY_RESULT)
+    m._REDELIVERED.add(tid)
+
+    posted = []
+    real_req = m._req
+    attempts = {"n": 0}
+
+    def flaky(meth, path, payload=None, **kw):
+        if path != "/v1/results":
+            return {}
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise urllib.error.URLError("transient")
+        posted.append(payload)
+        return {}
+
+    m._req = flaky
+    try:
+        inflight = {tid}
+        m._post_ready_results(inflight)      # pass 1: POST raises
+        first = (tid in m._REDELIVERED, tid in inflight, list(posted))
+        m._post_ready_results(inflight)      # pass 2: POST succeeds
+        second = (tid in m._REDELIVERED, tid in inflight, list(posted))
+        return first, second
+    finally:
+        m._req = real_req
+
+
+first, second = drain_two_pass()
+check(first[0] is True and first[1] is True and first[2] == [],
+      "after a FAILED lease POST the provenance and the in-flight id both survive")
+check(all("withheld" not in (p or {}).get("body", "") for p in second[2]),
+      "and no owner-visible withheld notice is emitted on either attempt")
+check(len(second[2]) == 1 and "[no-send]" in second[2][0]["body"],
+      "the retry posts the bridge's OWN control, not the guard's notice")
+check(second[0] is False and second[1] is False,
+      "the record retires only WITH the result, once the POST actually succeeds")
 
 if fail:
     print("FAIL: sparrow result guard")
