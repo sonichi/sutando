@@ -5618,17 +5618,19 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
-            "status": "warn",
+            # ok, not warn: every `warn` is alertable (emit_task_for_failures /
+            # notify_for_failures), so rewording alone still fires the false alert.
+            "status": "ok" if inflight == len(files) else "warn",
             "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
-                       + ("" if inflight == len(files)
-                          else " — watcher or core may be stuck")),
+                       + (" — all held by a live worker, not stalled"
+                          if inflight == len(files) else " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
     # message could sit indefinitely while this probe printed its age under "ok".
     if oldest_age > stuck_age_sec:
         return {
             "name": name,
-            "status": "warn",
+            "status": "ok" if inflight == len(files) else "warn",
             "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
                        + (" — all held by a live worker, not stalled" if inflight == len(files)
                           else f" — undrained past {stuck_age_sec}s")),

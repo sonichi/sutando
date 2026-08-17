@@ -65,6 +65,58 @@ check("inflight == len(files)" in body,
       "the stuck wording is suppressed only when EVERY queued task is held")
 check("not stalled" in body, "the all-held case says so explicitly")
 
+# --- BEHAVIOURAL: the STATUS, and whether it alerts ------------------------
+# Wording assertions cannot see this. The first version of this fix reworded
+# the detail and left status="warn"; every warn is alertable, so the false
+# alert still fired. @qingyun-wu caught it. These call the probe.
+import os
+import tempfile
+import time as _time
+
+ALERTABLE = ("down", "missing", "not_loaded", "fail", "stale", "warn")
+
+
+def probe(n_tasks, n_held, age_sec):
+    """Run the real check_task_queue against a temp workspace."""
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "tasks").mkdir()
+    names = []
+    for i in range(n_tasks):
+        f = tmp / "tasks" / f"task-{i:03d}.txt"
+        f.write_text("id: x\n")
+        old_t = _time.time() - age_sec
+        os.utime(f, (old_t, old_t))
+        names.append(f.name)
+    held = set(names[:n_held])
+    orig_ws, orig_held = hc.WORKSPACE_DIR, hc._tasks_held_by_a_worker
+    hc.WORKSPACE_DIR = tmp
+    hc._tasks_held_by_a_worker = lambda ps_output=None: held
+    try:
+        return hc.check_task_queue()
+    finally:
+        hc.WORKSPACE_DIR, hc._tasks_held_by_a_worker = orig_ws, orig_held
+
+# The exact shape from the review: one task, 1000s old, held by a worker.
+r = probe(1, 1, 1000)
+check(r["status"] == "ok", f"all-held + past stuck age -> ok (got {r['status']!r})")
+check(r["status"] not in ALERTABLE,
+      "all-held does NOT reach emit_task_for_failures / notify_for_failures")
+check("not stalled" in r["detail"], "the detail still explains why it is quiet")
+
+# A genuinely stalled queue must be unchanged — this is the probe's real job.
+r = probe(1, 0, 1000)
+check(r["status"] == "warn", f"unheld + past stuck age -> warn (got {r['status']!r})")
+check(r["status"] in ALERTABLE, "a real stall still alerts")
+
+# Mixed: partial accounting must NOT buy silence.
+r = probe(4, 2, 400)
+check(r["status"] == "warn", f"mixed queue -> warn (got {r['status']!r})")
+check("2 in flight with a worker" in r["detail"], "mixed reports how many are accounted for")
+
+# Count+age branch, fully held.
+r = probe(4, 4, 400)
+check(r["status"] == "ok", f"count+age branch, all held -> ok (got {r['status']!r})")
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: " + "; ".join(failures))
