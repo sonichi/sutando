@@ -842,20 +842,42 @@ def check_cron_runner(
         return {"name": name, "status": "ok", "detail": "no launchd-owned schedules"}
 
     probe = (launchd_check or check_launchd)("com.sutando.cron-runner")
-    if probe["status"] != "ok":
-        return {
-            "name": name,
-            "status": "down",
-            "detail": f"{launchd_count} schedule(s) configured but launchd is {probe['status']}",
-        }
-
     state_file = workspace / "state" / "cron-runner-state.json"
     try:
         age = (float(time.time() if now is None else now) - state_file.stat().st_mtime)
+        age_err = None
+        # A negative age is a clock step or a bad write, never freshness. Discard
+        # it here so no branch below can read it as proof that work is happening.
+        if age < 0:
+            age, age_err = None, f"state is future-dated by {int(-age)}s"
     except FileNotFoundError:
-        return {"name": name, "status": "down", "detail": "runner loaded but state file is missing"}
+        age, age_err = None, "state file is missing"
     except OSError as exc:
-        return {"name": name, "status": "down", "detail": f"runner state unreadable ({exc})"}
+        age, age_err = None, f"state unreadable ({exc})"
+
+    if probe["status"] != "ok":
+        # `check_launchd` reports the LAST invocation. A killed one with a fresh
+        # state file means later ones complete, so the schedules still fire.
+        if age is not None and age <= 180:
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (f"{launchd_count} schedule(s); launchd reports {probe['status']} "
+                           f"({probe.get('detail', '')}) but the runner wrote state "
+                           f"{int(age)}s ago — invocations are being killed and "
+                           "relaunched, schedules still fire"),
+            }
+        # Name why freshness could not vouch for it; a clock step here is exactly
+        # the neighbour of whatever else has gone wrong.
+        return {
+            "name": name,
+            "status": "down",
+            "detail": (f"{launchd_count} schedule(s) configured but launchd is "
+                       f"{probe['status']}" + (f"; {age_err}" if age_err else "")),
+        }
+
+    if age_err is not None:
+        return {"name": name, "status": "down", "detail": f"runner loaded but {age_err}"}
     if age > 180:
         return {
             "name": name,
@@ -865,7 +887,7 @@ def check_cron_runner(
     return {
         "name": name,
         "status": "ok",
-        "detail": f"{launchd_count} durable schedule(s), state {int(max(age, 0))}s old",
+        "detail": f"{launchd_count} durable schedule(s), state {int(age)}s old",
     }
 
 
@@ -1265,7 +1287,29 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "pending-questions.md",  # same
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
+    ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    # The two lock guards that legitimately sit at the ROOT, by name. Exempt
+    # until they migrate to state/locks/ the way workspace_lock.py already
+    # writes <workspace>/state/locks/<role>.lock.guard.
+    ".voice-agent.lock.guard",
+    ".backend-supervisor.lock.guard",
 })
+
+#: Why those two guards are named rather than matched by `*.lock.guard`:
+#: `state/locks/<role>.lock.guard` (workspace_lock.py) is where this artifact
+#: type belongs, and this probe only lists ROOT files — so a role guard that
+#: appears at the root is a workspace-resolution bug, exactly the class the
+#: probe exists to catch. A glob would have hidden it.
+#:
+#: `.voice-agent.lock.guard` stays because six sites resolve it at the root
+#: (voice-lock.ts, startup-runtime.sh, restart.sh, restart-voice-agent.sh,
+#: voice-agent.ts, tests/voice-lock.test.py) and a half-applied move leaves two
+#: processes disagreeing about where the lock is — a double-started voice agent.
+#: `.backend-supervisor.lock.guard` is written by the desktop app, whose source
+#: is not in this repo (`backend-supervisor.lock.guard`: 0 hits here).
+#:
+#: `.voice-agent.pid` is deliberately NOT exempt: state/locks/ is a real
+#: destination that exists in-tree, so its warn names somewhere to go (#2722).
 
 #: Migration sentinels are production-owned and DELIBERATELY retained at the
 #: workspace root — `workspace_default.py` writes `.notes-migrated`,
@@ -5050,6 +5094,14 @@ def check_gateway_bridge() -> "dict | None":
         # WITHOUT the duration this line is byte-identical at minute one and at
         # hour thirteen, so a reader cannot tell a blip from a standing outage.
         age_h = _gateway_last_ok_age_h()
+        # A negative age means a clock step or a bad sidecar write, not freshness.
+        if age_h is not None and 0 <= age_h * 3600 < GATEWAY_TRANSIENT_OUTAGE_S:
+            return {
+                "name": "gateway-bridge",
+                "status": "ok",
+                "detail": f"running; last poll did not succeed, last one that did "
+                          f"was {age_h * 3600:.0f}s ago (transient)",
+            }
         since = ("last successful poll UNKNOWN" if age_h is None
                  else f"last successful poll {age_h:.1f}h ago")
         return {
@@ -5064,6 +5116,9 @@ def check_gateway_bridge() -> "dict | None":
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
+# Mirrors POLL_TIMEOUT_GRACE_S in ag2_sparrow/remote_gateway_bridge.py — the same
+# env read, so a host that retunes POLL_WAIT moves both together.
+GATEWAY_TRANSIENT_OUTAGE_S = 3 * (float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25) + 10)
 
 
 def _gateway_last_ok_age_h(path: "Path | None" = None,
