@@ -227,10 +227,59 @@ def _lock_stripe(item_id: str) -> int:
     return int(hashlib.sha256(item_id.encode("utf-8")).hexdigest(), 16) % LOCK_STRIPES
 
 
+STRIPES_FENCE = "stripes-active.json"
+
+
+def _fence_path(root: Path) -> Path:
+    return Path(root) / LOCKS_DIR / STRIPES_FENCE
+
+
+def _stripe_mode(root: Path) -> bool:
+    """True iff this root has been migrated to striped locking.
+
+    The fence is the enforceable exclusivity proof: pre-striping processes
+    lock per-item files, striped ones lock stripe files, and the two cannot
+    exclude each other — so stripe mode is entered only via a fence written
+    under whole-engine quiescence (activate_lock_striping). No fence = the
+    pre-striping namespace, byte-compatible with older writers.
+    """
+    fp = _fence_path(root)
+    try:
+        data = json.loads(fp.read_text())
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"unreadable stripes fence {fp}: {e}") from e
+    if data.get("stripes") != LOCK_STRIPES:
+        # Mixed stripe counts are the same defect class as mixed namespaces.
+        raise RuntimeError(
+            f"stripes fence {fp} declares {data.get('stripes')!r}, this build "
+            f"uses {LOCK_STRIPES}: migration required, refusing to guess")
+    return True
+
+
+def activate_lock_striping(root: Path) -> bool:
+    """Migrate this root to striped locking. True if this call activated it.
+
+    CONTRACT: call ONLY while no other consumer of `root` runs (the deploy
+    restart window) — the fence asserts that pre-striping lock holders are
+    gone for good, which no runtime probe can prove. Idempotent; a fence
+    declaring a different stripe count raises instead of being overwritten.
+    """
+    if _stripe_mode(root):                     # raises on count mismatch
+        return False
+    d = Path(root) / LOCKS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".{STRIPES_FENCE}.{os.getpid()}"
+    tmp.write_text(json.dumps({"stripes": LOCK_STRIPES}))
+    os.replace(str(tmp), str(_fence_path(root)))
+    return True
+
+
 def _sweep_legacy_locks(d: Path) -> None:
     """One-shot upgrade sweep: pre-striping code left one `<key>.lock` per item.
-    Safe only because no pre-striping process runs against this root (the
-    workspace singleton enforces one consumer, and deploys restart it)."""
+    Runs only in stripe mode, whose fence contract guarantees no pre-striping
+    process can still hold (or ever re-open) these files."""
     try:
         for f in d.iterdir():
             if f.name.endswith(".lock") and not f.name.startswith("stripe-"):
@@ -248,31 +297,42 @@ def _item_lock(root: Path, item_id: str):
     outright, and the kernel drops it when the holder dies, so a crash cannot
     leave the item locked.
 
-    Locks are STRIPED: item -> stripe file, so the lock namespace is bounded at
-    LOCK_STRIPES inodes instead of one per item ever handled. Two items sharing
-    a stripe serialize against each other — a contention cost, never a
-    correctness one, because the stripe lock strictly contains the item lock.
+    Two namespaces, fence-selected: before activate_lock_striping runs, the
+    pre-striping per-item files are used (cross-version safe during rolling
+    upgrades); after, item -> stripe file bounds the namespace at LOCK_STRIPES
+    inodes. Two items sharing a stripe serialize against each other — a
+    contention cost, never a correctness one, because the stripe lock strictly
+    contains the item lock.
     """
-    stripe = _lock_stripe(item_id)
-    key = (str(root), stripe)
+    striped = _stripe_mode(root)
+    if striped:
+        stripe = _lock_stripe(item_id)
+        key = (str(root), "stripe", stripe)
+        lock_name = f"stripe-{stripe:02d}.lock"
+    else:
+        # Pre-migration namespace: identical to pre-striping builds, so a
+        # rolling-upgrade mix of old and new processes contends on the SAME
+        # per-item inode. Unbounded until activate_lock_striping runs.
+        key = (str(root), "item", item_id)
+        lock_name = f"{_safe_key(item_id)}.lock"
     held = getattr(_HELD, "keys", None)
     if held is None:
         held = _HELD.keys = set()
     if key in held:
         # Re-entry (same item, or a stripe-mate) would have to bypass the lock
         # to avoid self-deadlock, and a bypass is the hole this primitive closes.
-        raise RuntimeError(
-            f"re-entrant claim operation on {item_id!r} (stripe {stripe})")
+        raise RuntimeError(f"re-entrant claim operation on {item_id!r} ({key[1]})")
     # Locks live outside the claims directory: a lock file sharing that
     # namespace is picked up by anything globbing claim names.
     d = Path(root) / LOCKS_DIR
     d.mkdir(parents=True, exist_ok=True)
-    if not getattr(_HELD, "swept_roots", None):
-        _HELD.swept_roots = set()
-    if str(root) not in _HELD.swept_roots:
-        _HELD.swept_roots.add(str(root))
-        _sweep_legacy_locks(d)
-    fd = os.open(str(d / f"stripe-{stripe:02d}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    if striped:
+        if not getattr(_HELD, "swept_roots", None):
+            _HELD.swept_roots = set()
+        if str(root) not in _HELD.swept_roots:
+            _HELD.swept_roots.add(str(root))
+            _sweep_legacy_locks(d)
+    fd = os.open(str(d / lock_name), os.O_CREAT | os.O_RDWR, 0o644)
     held.add(key)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)

@@ -51,6 +51,7 @@ Run: python3 tests/sparrow-outbox-claim-protocol.test.py
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sys
@@ -545,6 +546,7 @@ def _c18():
     locks_dir = need(m, "LOCKS_DIR")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        need(m, "activate_lock_striping")(root)
         for i in range(256):
             item = f"task-bound-{i:04d}"
             assert acquire(root, item, "D1") is True
@@ -569,6 +571,7 @@ def _c19():
         d.mkdir(parents=True, exist_ok=True)
         for i in range(5):
             (d / f"old-item-{i}.deadbeefdeadbeef.lock").touch()
+        m.activate_lock_striping(root)          # deploy step after old files exist
         swept = getattr(m._HELD, "swept_roots", None)
         if swept is not None:
             swept.discard(str(root))
@@ -588,6 +591,7 @@ def _c20():
     stripe_of = need(m, "_lock_stripe")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        need(m, "activate_lock_striping")(root)
         base = "task-mate-0"
         mate = next(f"task-mate-{i}" for i in range(1, 100000)
                     if stripe_of(f"task-mate-{i}") == stripe_of(base))
@@ -624,6 +628,62 @@ def _c21():
         # the whole point of the swallow: claiming still works after a bad sweep
         assert acquire(root, "task-after-bad-sweep", "D1") is True
         assert release(root, "task-after-bad-sweep", "D1") is True
+
+
+# 22 --------------------------------------------------------------------------
+@contract("without the fence, locking is byte-compatible with pre-striping builds")
+def _c22():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    item_lock = need(m, "_item_lock")
+    locks_dir = need(m, "LOCKS_DIR")
+    safe = need(m, "_safe_key")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # rolling-upgrade control: an origin/main process flocks the per-item
+        # file directly; the new build (fence absent) must contend on the SAME
+        # inode, or the two versions do not mutually exclude.
+        with item_lock(root, "task-mixed"):
+            legacy = root / locks_dir / f"{safe('task-mixed')}.lock"
+            assert legacy.exists(), (
+                "fence absent yet no per-item lock file — the new build moved "
+                "namespaces without a migration, old writers cannot see it")
+            fd = os.open(str(legacy), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                blocked = False
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    blocked = True
+                assert blocked, ("an old-version flock on the per-item file "
+                                 "succeeded while the new build held the item "
+                                 "lock — no cross-version mutual exclusion")
+            finally:
+                os.close(fd)
+        # and no fence means NO sweep: a legacy file must survive an acquire
+        (root / locks_dir / "survivor-item.aaaabbbbccccdddd.lock").touch()
+        assert acquire(root, "task-other", "D1") is True
+        assert release(root, "task-other", "D1") is True
+        assert (root / locks_dir / "survivor-item.aaaabbbbccccdddd.lock").exists(), (
+            "legacy lock file swept without the fence — the sweep ran while "
+            "old writers could still hold these files")
+        # fence error arms are loud, never a silent mode guess
+        fence = root / locks_dir / need(m, "STRIPES_FENCE")
+        fence.write_text('{"stripes": 128}')
+        for fn, args in ((acquire, (root, "task-m", "D1")),
+                         (need(m, "activate_lock_striping"), (root,))):
+            try:
+                fn(*args); ok = False
+            except RuntimeError as e:
+                ok = "migration required" in str(e)
+            assert ok, f"{fn.__name__} guessed a mode on a mismatched fence"
+        fence.write_text("not json")
+        try:
+            acquire(root, "task-m", "D1"); ok = False
+        except RuntimeError as e:
+            ok = "unreadable" in str(e)
+        assert ok, "unreadable fence must raise, not fall back silently"
 
 
 def main() -> int:
