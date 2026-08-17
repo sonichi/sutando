@@ -153,6 +153,26 @@ class SendReplyMarkerAdoption(unittest.TestCase):
         self.assertEqual(r["files_sent"], 0)
         self.assertTrue(r["ok"])
 
+    # ---- long text: plain transport must deliver byte-identical content ---
+
+    def test_long_reply_delivery_is_byte_identical(self):
+        """Telegram sends plain text (no parse_mode), so chunking must never
+        mutate content: the concatenation of the delivered sendMessage bodies
+        must equal the input exactly. The fence-aware chunker fails this — its
+        synthetic close/re-open fences are literal extra bytes here."""
+        code = "\n".join(f"line {i} of a long listing" for i in range(300))
+        text = f"intro\n```python\n{code}\n```\ntail"
+        r = TB.send_reply(123, text)
+        sends = [c.get("text", "") for c in self.sent if c["method"] == "sendMessage"]
+        assert len(sends) >= 2, "test needs the body to span a boundary"
+        assert all(0 < len(c) <= 4000 for c in sends)
+        assert "".join(sends) == text, (
+            f"delivered {sum(map(len, sends))} chars for a {len(text)}-char body — "
+            "the transport inserted or dropped bytes")
+        assert r["text_chunks"] == len(sends), (
+            "the reported chunk count must come from the actual chunks, "
+            "not the naive ceil-divide formula")
+
     # ---- idempotence: the task path passes an ALREADY-parsed body ---------
 
     def test_double_parsing_cannot_double_send(self):

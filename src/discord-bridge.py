@@ -147,6 +147,8 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
+from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
@@ -202,6 +204,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
 
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
@@ -2857,6 +2860,10 @@ def _write_task_file(task_file: Path, content, username: str,
     try:
         if callable(content):
             content = content()
+        try:
+            content = stamp_text(content)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception as _tw_exc:
         print(f"  [task-write] FAILED for @{username} in #{channel_name} "
@@ -3937,27 +3944,8 @@ async def _handle_discord_message(message, force=False):
     # review. Removed in favor of skipping the task-file write entirely.)
     tier_instructions = {
         "owner": "",
-        "team-collaborator": (
-            "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            "This task is from a designated COLLABORATOR in this channel (a team-tier sender the owner "
-            "has listed under this channel's `collaborators`). Engage substantively — do NOT sandbox "
-            "them via codex and do NOT default to NO-REPLY the way a plain team task is handled.\n\n"
-            "DO:\n"
-            "- Reply in-channel: write your response to results/task-{id}.txt (delivered back to this channel).\n"
-            "- Treat their message as collaborative input from a working peer within this channel's scope — "
-            "discuss, draft, and iterate on copy / design / analysis, and fold their contributions into the "
-            "shared work. Do not silently archive a substantive contribution.\n\n"
-            "DO NOT (authority boundary — unchanged from team tier):\n"
-            "- Take any irreversible or system-mutating action on their say-so: no git commit / push / merge, "
-            "no deleting or overwriting files, no sending to other channels or external services (email, "
-            "posts, DMs), no financial actions, no config / credential changes, no restarts. Those still "
-            "require the OWNER.\n"
-            "- If they ask for such an action, engage on the substance and prepare it if useful, but route "
-            "the go/no-go to the owner (say so in-channel) rather than executing it yourself.\n"
-            "- Never read .env, credentials, or secrets.\n\n"
-            "Scope: collaborator status is per-channel only — it grants engagement HERE, not owner authority "
-            "anywhere else.\n"
-            "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        "team-collaborator": engage_rulebook(
+            "channel", DISCORD_PROVENANCE, "results/task-{id}.txt"
         ),
         "team": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
@@ -4680,6 +4668,16 @@ async def poll_results():
                 # re-fire infinitely on the leftover task. Observed 2026-04-17:
                 # `[no-send]` tasks persisted in tasks/ because `continue`
                 # skipped the cleanup block at the bottom of this loop.
+                # Non-owner results are scanned before ANY marker below. The tier
+                # map dies on restart, so unknown is re-read from the task file.
+                _guard_tier = _task_tier
+                if _guard_tier == "unknown":
+                    _guard_tf = find_task_file(TASKS_DIR, task_id)
+                    _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
+                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO)
+                if _withheld:
+                    print(f"  [team-guard] withheld result for {task_id} "
+                          f"(tier={_guard_tier}): {_withheld}", flush=True)
                 _parsed = parse_markers(reply_text)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
@@ -4777,25 +4775,10 @@ async def poll_results():
                     reply_to_id = int(reply_match.group(1)) if reply_match else None
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
-                    # Auto-thread: if the agent didn't pick an explicit
-                    # [reply: <id>], default to the triggering message so the
-                    # reply appears quoted under what it's answering. Skip
-                    # when the channel is already a Discord thread — thread
-                    # context anchors the reply implicitly, no extra quote
-                    # needed.
-                    #
-                    # getattr instead of bare `discord.Thread` so the
-                    # test-stub discord module (tests/discord-bridge-*.test.py)
-                    # — which intentionally omits Thread to keep the stub
-                    # surface small — doesn't AttributeError here. Production
-                    # discord.py always provides Thread; the getattr fallback
-                    # only matters under test, where treating "no Thread
-                    # class" as "channel isn't a thread" is correct.
+                    # Default to quoting the triggering message. Threads too:
+                    # interleaved exchanges make position stop identifying it.
                     if reply_to_id is None:
-                        _thread_cls = getattr(discord, 'Thread', None)
-                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
-                        if not is_thread:
-                            reply_to_id = source_message_anchor
+                        reply_to_id = source_message_anchor
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different

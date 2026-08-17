@@ -49,14 +49,19 @@ def _task(
     tier: str = "owner",
     *,
     collaborator: bool | None = None,
+    source: str | None = None,
 ) -> Path:
     path = workspace / "tasks" / f"{task_id}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     if collaborator is None:
         collaborator = tier == "team"
+    # Collaborator trust is broker-attested, so a collaborator fixture defaults to
+    # the attested source; everything else keeps the original discord default.
+    if source is None:
+        source = "ag2space" if collaborator else "discord"
     runtime_stamp = "collaborator: true\n" if collaborator else ""
     path.write_text(
-        f"{runtime_stamp}id: {task_id}\nsource: discord\n"
+        f"{runtime_stamp}id: {task_id}\nsource: {source}\n"
         f"access_tier: {tier}\ntask: do the thing\n",
         encoding="utf-8",
     )
@@ -103,7 +108,7 @@ def test_resolution_routes_bounded_tiers_before_owner_workstreams() -> None:
         assert worker.resolve_workstream(workspace, team) is None
         assert worker.resolve_workstream(workspace, _task(workspace, "task-ungrouped")) is None
         assert worker.probe("claude", workspace, owner) == 0
-        assert worker.probe("claude", workspace, team) == worker.MUST_HANDLE
+        assert worker.probe("claude", workspace, team) == worker.UNHANDLED
         assert worker.probe("claude", workspace, _task(workspace, "task-guest", "guest")) == worker.UNHANDLED
 
 
@@ -137,6 +142,24 @@ def test_team_keeps_the_sandboxed_path_until_an_operator_opts_in() -> None:
 
         assert not (results / team.name).exists(), \
             "a declined team task must not publish a result"
+
+
+def test_collaborator_stamp_is_trusted_only_from_the_attested_source() -> None:
+    """A Discord channel `collaborators` entry writes the same stamp with no broker
+    behind it, so the stamp alone must not reach the owner-configured runtime."""
+    with tempfile.TemporaryDirectory() as td:
+        workspace = Path(td)
+        attested = _task(workspace, "task-ag2", "team", source="ag2space")
+        assert worker.team_collaborator_enabled(attested) is True
+        # Attested: no provider session, and the direct-core path is allowed.
+        assert worker.probe("claude", workspace, attested) == worker.UNHANDLED
+        for unattested in ("discord", "telegram", "slack", ""):
+            local = _task(
+                workspace, f"task-{unattested or 'none'}", "team", source=unattested)
+            assert worker.team_collaborator_enabled(local) is False
+            # Dispatch no longer distinguishes them: the capability grant is the
+            # bridge's rulebook choice, which this suite does not reach.
+            assert worker.probe("claude", workspace, local) == worker.UNHANDLED
 
 
 def test_team_collaborator_requires_one_exact_pre_body_stamp() -> None:
@@ -214,9 +237,17 @@ print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
         guest = _task(workspace, "task-guest-runtime", "guest")
         scanner = types.SimpleNamespace(filter_chat_secrets=lambda body: types.SimpleNamespace(
             detected=False, secret_types=(), text=body))
-        with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
-            assert _run("claude", workspace, team, env).returncode == 0
+        # Team no longer routes to a provider session, so handle() must decline it and
+        # publish nothing; the runtime itself is still exercised directly below.
+        assert _run("claude", workspace, team, env).returncode == worker.UNHANDLED
+        assert not (workspace / "results" / team.name).exists()
         assert _run("claude", workspace, guest, env).returncode == worker.UNHANDLED
+
+        with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
+            with mock.patch.dict(os.environ, env, clear=False):
+                body = worker._run_team(
+                    "claude", worker._team_prompt(team), REPO, workspace)
+        assert body == "safe claude result"
 
         [call] = [json.loads(line) for line in log.read_text().splitlines()]
         team_args = call["args"]
@@ -234,8 +265,9 @@ print(json.dumps({'type': 'result', 'result': 'safe claude result'}))
         assert "normal configured workspace, tools, integrations, and network" in prompt
         assert "access_tier: team" in json.loads(
             prompt.split("--- BEGIN TEAM REQUEST JSON ---\n", 1)[1].splitlines()[0])
+        assert "irreversible or external actions at all" in prompt
+        assert "unless the request explicitly requires them" not in prompt
         assert (project / "claude-work.txt").read_text() == "normal work\n"
-        assert (workspace / "results" / team.name).read_text() == "safe claude result"
         assert not (workspace / "results" / guest.name).exists()
 
 
@@ -305,9 +337,15 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('safe codex result\\n')
         guest = _task(workspace, "task-guest-codex", "guest")
         scanner = types.SimpleNamespace(filter_chat_secrets=lambda body: types.SimpleNamespace(
             detected=False, secret_types=(), text=body))
-        with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
-            assert _run("codex", workspace, team, env).returncode == 0
+        # Team no longer routes to a provider session; the runtime is exercised directly.
+        assert _run("codex", workspace, team, env).returncode == worker.UNHANDLED
+        assert not (workspace / "results" / team.name).exists()
         assert _run("codex", workspace, guest, env).returncode == worker.UNHANDLED
+        with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
+            with mock.patch.dict(os.environ, env, clear=False):
+                body = worker._run_team(
+                    "codex", worker._team_prompt(team), REPO, workspace)
+        assert body.strip() == "safe codex result"
         [team_args] = [json.loads(line) for line in log.read_text().splitlines()]
         assert team_args[:3] == ["--search", "exec", "--ephemeral"]
         assert "--dangerously-bypass-approvals-and-sandbox" in team_args
@@ -316,7 +354,6 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('safe codex result\\n')
         assert "--ignore-user-config" not in team_args and "--ignore-rules" not in team_args
         assert "--sandbox" not in team_args
         assert (project / "codex-work.txt").read_text() == "normal work\n"
-        assert (workspace / "results" / team.name).read_text() == "safe codex result\n"
 
 
 def test_provider_launches_do_not_inherit_an_open_parent_fifo() -> None:
@@ -348,8 +385,9 @@ assert sys.stdin.read() == ''
 print('safe claude fifo result')
 """)
 
+        # Team no longer launches a provider, so the fd-hygiene cases are the owner
+        # workstream launches; Team is asserted separately to publish nothing.
         for runtime, task, expected in (
-            ("codex", team, "safe codex fifo result\n"),
             ("claude", claude_owner, "safe claude fifo result\n"),
             ("codex", codex_owner, "safe codex fifo result\n"),
         ):
@@ -386,8 +424,11 @@ print('safe claude fifo result')
             assert process.returncode == 0, (runtime, task.name, stdout, stderr)
             assert (results / task.name).read_text() == expected
 
+        assert worker.probe("codex", workspace, team) == worker.UNHANDLED
+        assert not (results / team.name).exists()
 
-def test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end() -> None:
+
+def test_ag2space_team_room_stamp_is_written_but_no_longer_buys_a_guarded_runtime() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         workspace = root / "workspace"
@@ -443,14 +484,17 @@ print(json.dumps({'type': 'result', 'result': 'room Team task complete'}))
             scanner = types.SimpleNamespace(
                 filter_chat_secrets=lambda body: types.SimpleNamespace(
                     detected=False, secret_types=(), text=body))
+            # The room stamp is still written and still parses; what changed is that it
+            # no longer buys a provider session. Team falls through to the selected core.
+            assert worker.team_collaborator_enabled(team_task) is True
             with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
                 run = _run("claude", workspace, team_task, {
                     "PATH": f"{root}:{os.environ['PATH']}",
                     "SUTANDO_ISOLATED_WORKING_DIR": str(project),
                 })
-            assert run.returncode == 0
-            assert (project / "room-team-work.txt").read_text() == "completed by Team\n"
-            assert (results / team_task.name).read_text() == "room Team task complete"
+            assert run.returncode == worker.UNHANDLED
+            assert not (project / "room-team-work.txt").exists()
+            assert not (results / team_task.name).exists()
 
             # A node-side owner→Team cap is a safety downgrade, not room consent.
             gateway.LOCAL_TIER = "team"
@@ -470,7 +514,7 @@ print(json.dumps({'type': 'result', 'result': 'room Team task complete'}))
                 setattr(gateway, name, value)
 
 
-def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
+def test_team_never_reaches_a_runtime_so_a_failing_provider_is_not_consulted() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         workspace = root / "workspace"
@@ -479,16 +523,16 @@ def test_bounded_runtime_failure_never_falls_back_to_owner_core() -> None:
             "#!/bin/sh\nprintf 'provider unavailable\\n' >&2\nexit 9\n",
         )
         task = _task(workspace, "task-team-fail-closed", "team")
+        # The provider on PATH exits 9. Team is declined before any launch, so the
+        # failing binary is never consulted and nothing is published either way.
         result = _run("claude", workspace, task, {
             "PATH": f"{root}:{os.environ['PATH']}",
         })
-        assert result.returncode == 0
-        body = (workspace / "results" / task.name).read_text()
-        assert "configured runtime was unavailable" in body
-        assert "No owner-core fallback was used" in body
+        assert result.returncode == worker.UNHANDLED
+        assert not (workspace / "results" / task.name).exists()
 
 
-def test_stalled_team_runtime_is_killed_and_publishes_safe_result() -> None:
+def test_team_is_declined_before_a_stalling_provider_can_be_launched() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         workspace = root / "workspace"
@@ -503,10 +547,11 @@ def test_stalled_team_runtime_is_killed_and_publishes_safe_result() -> None:
             "SUTANDO_TIER_STALL_TIMEOUT": "0.15",
             "SUTANDO_TIER_HARD_TIMEOUT": "1",
         })
+        # Declined at probe, so the sleeping provider is never launched: the decline
+        # must be immediate and publish nothing, rather than ride the stall timeout.
         assert time.monotonic() - started < 2
-        assert result.returncode == 0
-        assert "No owner-core fallback was used" in (
-            workspace / "results" / task.name).read_text()
+        assert result.returncode == worker.UNHANDLED
+        assert not (workspace / "results" / task.name).exists()
 
 
 def test_partial_output_then_stall_still_hits_the_deadline() -> None:
@@ -560,18 +605,21 @@ print(json.dumps({{'type': 'result', 'result': 'token={secret}'}}))
         task = _task(workspace, "task-team-leak", "team")
         scanner = types.SimpleNamespace(filter_chat_secrets=lambda body: types.SimpleNamespace(
             detected=True, secret_types=("GitHub Token",), text="[REDACTED]"))
+        # Team no longer routes through handle(), so the scan is exercised at the
+        # runtime itself — the secret must never reach the raised message.
         with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
-            result = _run(
-                "claude", workspace, task,
-                {"PATH": f"{root}:{os.environ['PATH']}"},
-            )
-        assert result.returncode == 0
-        published = (workspace / "results" / task.name).read_text()
-        assert published == worker.TEAM_LEAK_RESULT
-        assert secret not in published
-        assert secret not in result.stdout
-        assert secret not in result.stderr
-        assert "GitHub Token" in result.stderr
+            with mock.patch.dict(os.environ, {"PATH": f"{root}:{os.environ['PATH']}"},
+                                 clear=False):
+                try:
+                    worker._run_team("claude", "prompt", REPO, workspace)
+                except worker.TeamResultLeakError as exc:
+                    detected = str(exc)
+                else:
+                    raise AssertionError("a leaking result must raise TeamResultLeakError")
+        assert "GitHub Token" in detected
+        assert secret not in detected
+        assert worker.TEAM_LEAK_RESULT
+        assert not (workspace / "results" / task.name).exists()
 
 
 def test_team_result_scanner_failure_fails_closed() -> None:
@@ -585,15 +633,18 @@ print(json.dumps({'type': 'result', 'result': 'ordinary result'}))
         task = _task(workspace, "task-team-scan-failure", "team")
         scanner = types.SimpleNamespace(filter_chat_secrets=mock.Mock(
             side_effect=RuntimeError("scanner broke")))
+        # Exercised at the runtime: a broken scanner must raise rather than return an
+        # unscanned body, and must not carry its own error text outward.
         with mock.patch.dict(sys.modules, {"chat_secret_filter": scanner}):
-            result = _run(
-                "claude", workspace, task,
-                {"PATH": f"{root}:{os.environ['PATH']}"},
-            )
-        published = (workspace / "results" / task.name).read_text()
-        assert "configured runtime was unavailable" in published
-        assert "No owner-core fallback was used" in published
-        assert "scanner broke" not in published
+            with mock.patch.dict(os.environ, {"PATH": f"{root}:{os.environ['PATH']}"},
+                                 clear=False):
+                try:
+                    body = worker._run_team("claude", "prompt", REPO, workspace)
+                except Exception as exc:
+                    body = None
+                    assert "ordinary result" not in str(exc)
+                assert body is None, "a failing scanner must not return an unscanned body"
+        assert not (workspace / "results" / task.name).exists()
 
         with mock.patch.dict(sys.modules, {"chat_secret_filter": None}):
             try:
@@ -802,26 +853,22 @@ def test_team_output_injection_cannot_control_bridge_delivery() -> None:
             assert str(exc) == "result delivery control marker"
 
 
-def test_team_empty_results_and_duplicate_claims_fail_safely() -> None:
+def test_handle_never_invokes_a_runtime_for_team() -> None:
+    """The point of removing the Team session: no provider is launched for Team, on
+    either runtime, and no result is published in its name."""
     with tempfile.TemporaryDirectory() as td:
         workspace = Path(td)
         results = workspace / "results"
         results.mkdir()
-        task = _task(workspace, "task-team-empty", "team")
-        with (
-            mock.patch.object(worker, "_run_team", return_value="   "),
-            redirect_stderr(io.StringIO()),
-        ):
-            assert worker.handle("codex", workspace, task, results, REPO) == 0
-        assert "configured runtime was unavailable" in (results / task.name).read_text()
-
-        duplicate = _task(workspace, "task-team-duplicate", "team")
-        with (
-            mock.patch.object(worker, "_completed_result_exists", side_effect=[False, True]),
-            mock.patch.object(worker, "_run_team") as run_team,
-        ):
-            assert worker.handle("codex", workspace, duplicate, results, REPO) == 0
-        run_team.assert_not_called()
+        for runtime in ("codex", "claude"):
+            task = _task(workspace, f"task-team-{runtime}-nospawn", "team")
+            with (
+                mock.patch.object(worker, "_run_team") as run_team,
+                redirect_stderr(io.StringIO()),
+            ):
+                assert worker.handle(runtime, workspace, task, results, REPO) == worker.UNHANDLED
+            run_team.assert_not_called()
+            assert not (results / task.name).exists()
 
 
 def test_bounded_runtime_helper_edges() -> None:
@@ -1504,8 +1551,11 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             "done\n"
             "[ \"$probe\" = 1 ] && exit 0\n"
             "basename \"$task_file\" >> \"$HANDLER_CALLS\"\n"
+            ": > \"$HANDLER_STARTS/$(basename \"$task_file\")\"\n"
             "sleep 10\n",
         )
+        starts = root / "starts"
+        starts.mkdir()
         bin_dir = root / "bin"
         bin_dir.mkdir()
         _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 10\n")
@@ -1515,6 +1565,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
                 **os.environ,
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
                 "HANDLER_CALLS": str(calls),
+                "HANDLER_STARTS": str(starts),
                 "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
                 "SUTANDO_TASK_EVENT_HANDLER": str(handler),
                 "SUTANDO_CORE_RUNTIME": "claude",
@@ -1533,6 +1584,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
                 time.sleep(0.01)
             assert sorted(path.name for path in claims.glob("task-*.txt")) == names
 
+            terminated_at = time.time()
             os.killpg(process.pid, signal.SIGTERM)
             stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             process = None
@@ -1551,9 +1603,17 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             assert not remaining_claims
             assert fallback_names == names
             handler_calls = calls.read_text().splitlines()
-            # The cap is a concurrency bound; without the contents a breach
-            # reports a bare AssertionError and says nothing about which ran.
-            assert len(handler_calls) <= 2, handler_calls
+            started_at = {
+                path.name: path.stat().st_mtime for path in starts.iterdir()
+            }
+            # Contents alone cannot say whether the cap over-dispatched or
+            # shutdown failed to stop dispatching; the signal instant can.
+            after_signal = sorted(
+                name for name, at in started_at.items() if at > terminated_at
+            )
+            assert len(handler_calls) <= 2, (
+                handler_calls, started_at, terminated_at, after_signal, repr(stderr)
+            )
             deadline = time.monotonic() + WORKER_EXIT_S
             while time.monotonic() < deadline:
                 try:
@@ -1797,6 +1857,7 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
 if __name__ == "__main__":
     test_resolution_routes_bounded_tiers_before_owner_workstreams()
     test_team_keeps_the_sandboxed_path_until_an_operator_opts_in()
+    test_collaborator_stamp_is_trusted_only_from_the_attested_source()
     test_team_collaborator_requires_one_exact_pre_body_stamp()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan()
@@ -1804,9 +1865,9 @@ if __name__ == "__main__":
     test_owner_session_handoff_does_not_accept_the_team_bypass_by_default()
     test_team_codex_uses_normal_workspace_and_owner_configuration()
     test_provider_launches_do_not_inherit_an_open_parent_fifo()
-    test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end()
-    test_bounded_runtime_failure_never_falls_back_to_owner_core()
-    test_stalled_team_runtime_is_killed_and_publishes_safe_result()
+    test_ag2space_team_room_stamp_is_written_but_no_longer_buys_a_guarded_runtime()
+    test_team_never_reaches_a_runtime_so_a_failing_provider_is_not_consulted()
+    test_team_is_declined_before_a_stalling_provider_can_be_launched()
     test_team_result_leaks_are_withheld_without_logging_secret_values()
     test_team_result_scanner_failure_fails_closed()
     test_team_provider_cannot_rewrite_the_scanner_used_for_its_result()
@@ -1815,7 +1876,7 @@ if __name__ == "__main__":
     test_team_request_injection_stays_inside_json_boundary()
     test_team_result_filter_uses_runtime_fallback_patterns()
     test_team_output_injection_cannot_control_bridge_delivery()
-    test_team_empty_results_and_duplicate_claims_fail_safely()
+    test_handle_never_invokes_a_runtime_for_team()
     test_partial_output_then_stall_still_hits_the_deadline()
     test_closes_pipes_then_stalls_still_hits_the_deadline()
     test_bounded_runtime_helper_edges()
