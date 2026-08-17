@@ -28,8 +28,13 @@ export function isSkipMarked(file: string, result: string): boolean {
  * here or its results accumulate forever.
  */
 export const LOCAL_ONLY_PREFIXES = [
-	'task-cron-', 'task-chat-',
-	'task-workstream-grouping-', 'task-project-grouping-',
+	// Machine-generated families, also enumerated by web-client.ts's
+	// isOwnerVisibleTask. That list answers "is this owner work to display";
+	// this one answers "will anything else archive it" — task-chat- is on
+	// this list and owner-VISIBLE there, so the two must not be collapsed.
+	'task-cron-', 'task-health-', 'task-smoke-', 'task-discord-e2e-',
+	// Locally originated, no network consumer.
+	'task-chat-', 'task-workstream-grouping-', 'task-project-grouping-',
 ];
 
 export function isLocalOnlyTask(taskId: string): boolean {

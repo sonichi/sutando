@@ -74,7 +74,8 @@ describe('task-bridge — only retire skip-marked results this bridge owns', () 
 		// skip handling is scoped to its own pending map.
 		const notDispatched = () => false;
 		for (const id of ['task-cron-nightly-123', 'task-chat-9',
-			'task-workstream-grouping-1', 'task-project-grouping-1']) {
+			'task-workstream-grouping-1', 'task-project-grouping-1',
+			'task-health-1786958480', 'task-smoke-1', 'task-discord-e2e-1']) {
 			assert.equal(isLocalOnlyTask(id), true, id);
 			assert.equal(mayRetireSkipMarked(`${id}.txt`, '[no-send]', notDispatched),
 				true, `${id} would have no archiver in any bridge`);
@@ -85,5 +86,14 @@ describe('task-bridge — only retire skip-marked results this bridge owns', () 
 		// The whole point: gateway/discord/telegram ids stay foreign.
 		assert.equal(isLocalOnlyTask('task-0000000000000000bb'), false);
 		assert.equal(mayRetireSkipMarked(`${OTHERS}.txt`, '[no-send]', () => false), false);
+	});
+
+	it('covers every machine family web-client.ts already enumerates', () => {
+		// isOwnerVisibleTask lists the durable-scheduler/health families; each
+		// has no network consumer, so each needs an archiver here too.
+		for (const id of ['task-cron-x', 'task-health-x', 'task-smoke-x',
+			'task-discord-e2e-x']) {
+			assert.equal(isLocalOnlyTask(id), true, `${id} has no archiver`);
+		}
 	});
 });
