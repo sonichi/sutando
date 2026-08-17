@@ -34,9 +34,8 @@ class Shim(unittest.TestCase):
             tgt = Path(cfg_dir) / "skills/pr-triage/scripts/pr_flag.py"
             tgt.parent.mkdir(parents=True, exist_ok=True)
             tgt.write_text(plant)
-        # The shim only ever runs as a child process, so without this the diff
-        # gate measures it at 0% while every test here passes. Same seam as
-        # tests/voice-lock.test.py.
+        # The shim only runs as a child, so without this seam the diff gate
+        # measures 0% while every test passes. Same as tests/voice-lock.test.py.
         cmd = [sys.executable]
         if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
             cmd += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
@@ -75,9 +74,8 @@ class Shim(unittest.TestCase):
         self.assertIn("DEPRECATED", r.stderr)
 
     def test_target_prefers_the_config_dir_over_the_repo_fallback(self):
-        # In-process, so the resolution order is asserted directly rather than
-        # inferred from which child happened to run. Every subprocess test ends
-        # in os.execv, which is why this path is otherwise unobservable.
+        # In-process: asserts resolution order directly instead of inferring it
+        # from which child ran. Every subprocess test ends in os.execv.
         spec = importlib.util.spec_from_file_location("_prflag_shim", SHIM)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)

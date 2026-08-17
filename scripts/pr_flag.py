@@ -47,9 +47,7 @@ def main() -> int:
             f"is not installed.\nLooked in:\n{searched}\n{_MIGRATE}\n")
         # Loud and non-zero: a silent success here is the digest going missing.
         return 2
-    # execv replaces the process image, so coverage never writes its data file
-    # for these lines. They ARE exercised — test_forwards_to_the_skill_when_it_is
-    # _installed asserts the child ran with argv intact — just not observably.
+    # execv replaces the process image before coverage flushes: unobservable.
     sys.stderr.write(  # pragma: no cover
         f"pr_flag.py: DEPRECATED path; forwarding to {tgt}. {_MIGRATE}\n")
     os.execv(sys.executable, [sys.executable, str(tgt), *sys.argv[1:]])  # pragma: no cover
