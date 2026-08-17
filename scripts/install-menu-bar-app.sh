@@ -27,10 +27,16 @@ for arg in "$@"; do
 done
 
 [ "$(uname -s)" = "Darwin" ] || { echo "macOS only — nothing to do."; exit 0; }
-command -v swiftc >/dev/null 2>&1 || {
-  echo "swiftc not found — install Xcode Command Line Tools: xcode-select --install" >&2
+# `command -v swiftc` passes against the Xcode-CLT stub on a clean Mac, and the
+# next bare swiftc then raises the install dialog instead of this diagnostic.
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo "No developer tools — install them first: xcode-select --install" >&2
   exit 1
-}
+fi
+if ! swiftc --version >/dev/null 2>&1; then
+  echo "swiftc is present but not runnable — try: xcode-select --install" >&2
+  exit 1
+fi
 
 echo "Building menu-bar binary…"
 ( cd "$SRC_DIR" && swiftc -O -o Sutando main.swift SutandoConfig.swift \
@@ -79,9 +85,34 @@ fi
 if [ "$SUPERVISE" -eq 1 ]; then
   bash "$REPO/src/install-sutando-app-launchd.sh"
 elif [ "$LAUNCH" -eq 1 ]; then
-  pkill -x Sutando 2>/dev/null || true
+  # Scope to THIS bundle's path. The Electron desktop app shares the executable
+  # NAME, so `pkill -x Sutando` would also kill the user's UI (#2038).
+  APP_BIN="$APP/Contents/MacOS/Sutando"
+  if pgrep -f "^$APP_BIN$" >/dev/null 2>&1; then
+    pkill -f "^$APP_BIN$" 2>/dev/null || true
+    gone=0
+    for _ in $(seq 1 50); do
+      pgrep -f "^$APP_BIN$" >/dev/null 2>&1 || { gone=1; break; }
+      sleep 0.1
+    done
+    # Opening a second copy while the first is alive is how you get two menu-bar
+    # icons and a confused TCC grant, so stop rather than stack them.
+    [ "$gone" -eq 1 ] || {
+      echo "  ✗ the running menu-bar app did not exit — not launching another" >&2
+      exit 1
+    }
+  fi
   open "$APP"
-  echo "  ✓ launched"
+  for _ in $(seq 1 50); do
+    pgrep -f "^$APP_BIN$" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  if pgrep -f "^$APP_BIN$" >/dev/null 2>&1; then
+    echo "  ✓ launched"
+  else
+    echo "  ✗ open returned but no menu-bar process is running — not launched" >&2
+    exit 1
+  fi
 fi
 
 cat <<EOF
