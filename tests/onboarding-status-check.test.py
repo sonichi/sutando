@@ -89,5 +89,25 @@ class OnboardingStatusCheckTest(unittest.TestCase):
         self.assertIn("unreadable", out["detail"])
 
 
+    def test_a_todo_row_carries_its_own_detail(self):
+        """`gateway` alone cannot distinguish "not running" from a reconnect —
+        the writer populates `detail` to say which, and it was being dropped."""
+        self._with_workspace(
+            {
+                "updated_at": 0,
+                "rows": {
+                    "gateway": {"state": "todo",
+                                "detail": "gateway process up, relay not connected"},
+                    "core": {"state": "todo"},
+                },
+            }
+        )
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("gateway (gateway process up, relay not connected)", out["detail"])
+        # A row with no detail still renders as the bare name.
+        self.assertIn("core", out["detail"])
+        self.assertNotIn("core (", out["detail"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

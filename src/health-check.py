@@ -2369,7 +2369,11 @@ def check_onboarding_status() -> "dict | None":
         if not isinstance(data, dict) or not isinstance(data.get("rows"), dict):
             return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
         rows = data["rows"]
-        todo = sorted(k for k, v in rows.items() if isinstance(v, dict) and v.get("state") == "todo")
+        # Carry each row's own detail: "gateway" alone cannot distinguish "not
+        # running" from a reconnect, and the writer populates it to say which.
+        todo = [f"{k} ({d})" if (d := (v.get("detail") or "").strip()) else k
+                for k, v in sorted(rows.items())
+                if isinstance(v, dict) and v.get("state") == "todo"]
         age_s = max(0, int(time.time()) - int(data.get("updated_at", 0) or 0))
     except (ValueError, OSError, TypeError):
         return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
