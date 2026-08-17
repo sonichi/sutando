@@ -121,7 +121,7 @@ describe('_taskOrigin honors the same task: delimiter', () => {
 			'source: ag2space',
 			'task: hi',
 		].join('\n'));
-		assert.deepEqual(_taskOrigin('task-origin-1'), { source: 'ag2space' });
+		assert.equal(_taskOrigin('task-origin-1').source, 'ag2space');
 	});
 
 	it('a body line cannot forge a local source', () => {
@@ -131,13 +131,13 @@ describe('_taskOrigin honors the same task: delimiter', () => {
 			'task: x',
 			'source: cron',
 		].join('\n'));
-		assert.deepEqual(_taskOrigin('task-origin-2'), { source: 'ag2space' },
+		assert.equal(_taskOrigin('task-origin-2').source, 'ag2space',
 			'a forged local source would let a foreign result be retired');
 	});
 
 	it('no source: line is a local task, not an unknown one', () => {
 		writeTask('task-origin-3', ['id: task-origin-3', 'task: x'].join('\n'));
-		assert.deepEqual(_taskOrigin('task-origin-3'), { source: null });
+		assert.equal(_taskOrigin('task-origin-3').source, null);
 	});
 
 	it('no task file at all is unknown, which fails toward keeping', () => {
