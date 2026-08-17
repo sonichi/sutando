@@ -52,6 +52,10 @@ WS = resolve_workspace()
 from ag2_sparrow._dirs import set_dirs  # noqa: E402
 
 set_dirs(task_dir=WS / "tasks", result_dir=WS / "results", state_dir=WS / "state")
+
+from task_envelope import stamp_text  # noqa: E402  (adapter-edge stamper)
+from ag2_sparrow.local_task_protocol import set_task_stamper  # noqa: E402
+set_task_stamper(stamp_text)
 os.environ.setdefault("REMOTE_MEDIA_DIR", str(WS / "data" / "remote-media"))
 
 from ag2_sparrow import send_allowlist as _send_allowlist  # noqa: E402
