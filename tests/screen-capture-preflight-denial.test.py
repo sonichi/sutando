@@ -43,10 +43,8 @@ class _Recorder:
         self.sent.append((status, payload))
 
 
-# The gate is an unbound method on the handler class; bind it to the recorder so
-# the real implementation runs against a fake responder. Absent at the merge-base
-# — resolved leniently so the control reports which behaviours differ instead of
-# dying on an AttributeError at import time.
+# Bind the unbound gate to the recorder so the real implementation runs against a
+# fake responder. Resolved leniently: absent at the merge-base, so the control reports.
 GATE = getattr(m.Handler, "_require_screen_permission", None)
 
 
@@ -84,9 +82,8 @@ allowed, sent = run_gate(True)
 check("a granted permission allows the capture", allowed, True)
 check("...and emits no response of its own", sent, [])
 
-# 3. UNKNOWABLE -> allow. Failing closed here would turn a working capture into
-#    a hard failure wherever the preflight symbol cannot be resolved, which is a
-#    worse regression than the bug being fixed.
+# 3. UNKNOWABLE -> allow. Failing closed turns a working capture into a hard
+#    failure wherever the symbol cannot resolve — worse than the bug being fixed.
 allowed, sent = run_gate(None)
 check("an unknowable preflight does NOT block", allowed, True)
 check("...and emits no response of its own", sent, [])
@@ -97,10 +94,8 @@ _probe = getattr(m, "screen_capture_permitted", None)
 real = _probe() if _probe else "<no probe>"
 check("the real preflight returns True/False/None", real in (True, False, None), True)
 
-# 5. The PROMPTING variant must never be INVOKED: it raises a system dialog,
-#    which would make an internal capture user-visible. Checked over identifiers
-#    rather than raw text — the name legitimately appears in a docstring saying
-#    not to use it, and a substring test cannot tell that from a call.
+# 5. The PROMPTING variant must never be INVOKED — it raises a user-visible dialog.
+#    Checked over identifiers, not raw text: the name also appears in a docstring.
 import ast
 
 src = MOD.read_text()
@@ -131,11 +126,8 @@ class _SkipSection(Exception):
     """Raised to skip section 7 wholesale when the probe does not exist."""
 
 
-# 7. THE FAIL-SAFE BRANCHES. Each `except` in the probe decides what happens
-#    when the platform will not answer, and an untested fail-safe is
-#    indistinguishable from one that never runs. Drive all three.
-# Absent at the merge-base — skip rather than crash, so the control still
-# reports every other behaviour instead of dying here.
+# 7. THE FAIL-SAFE BRANCHES. An untested `except` is indistinguishable from one
+#    that never runs; drive all three. Absent at the merge-base -> skip, not crash.
 _HAS_PROBE = hasattr(m, "_PREFLIGHT") and hasattr(m, "screen_capture_permitted")
 _saved = m._PREFLIGHT if _HAS_PROBE else None
 try:
@@ -171,10 +163,8 @@ finally:
     if _HAS_PROBE:
         m._PREFLIGHT = _saved
 
-# 8. THE LOAD SUCCESS PATH, deterministically. On a Linux CI runner
-#    find_library("CoreGraphics") returns None and the load raises, so the
-#    success branch is unreachable there — it was covered locally only because
-#    this host is macOS. Inject a fake library so the path runs anywhere.
+# 8. THE LOAD SUCCESS PATH, deterministically. On Linux CI find_library returns
+#    None and the load raises, so inject a fake library to reach the branch.
 if _HAS_PROBE:
     import ctypes
     import ctypes.util
@@ -203,9 +193,8 @@ if _HAS_PROBE:
         ctypes.util.find_library, ctypes.cdll.LoadLibrary = _of, _ol
         m._PREFLIGHT = _saved2
 
-# 9. THE HANDLER CALL SITES. Binding the gate directly never executes the two
-#    `if not self._require_screen_permission(): return` lines in the handlers,
-#    so a gate wired into neither would still pass every check above.
+# 9. THE HANDLER CALL SITES. Binding the gate directly never runs the two guard
+#    lines, so a gate wired into neither handler would still pass everything above.
 if _HAS_PROBE:
     class _FakeReq:
         def __init__(self, path):
