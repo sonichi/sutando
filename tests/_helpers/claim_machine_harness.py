@@ -180,6 +180,8 @@ class ClaimDriver:
                 self.gate.pause()
                 return _orig(p, item_id)
             ob._read_claim_at = gated_read
+        self.stats = {"granted": 0, "arrival_timeout": 0, "flock_skip": 0,
+                      "idle_skip": 0}
         self.done_log = []                       # (seq, actor, op, result)
         self._seq_lock = threading.Lock()
         self._seq = 0
@@ -253,19 +255,28 @@ class ClaimDriver:
     def step(self, actor, n):
         for _ in range(n):
             if not self.busy[actor]:
+                self.stats["idle_skip"] += 1
                 return
             # 50ms fast path, then skip instantly if the worker announced a
             # flock wait, else poll up to ARRIVAL_BOUND with early exits.
             if not self.gate.at_gate[actor].wait(timeout=0.05):
                 if self.in_flock.get(actor):
+                    self.stats["flock_skip"] += 1
                     return
                 deadline = time.time() + self.ARRIVAL_BOUND
                 while True:
                     if self.gate.at_gate[actor].wait(timeout=0.1):
                         break
-                    if (time.time() >= deadline or not self.busy[actor]
-                            or self.in_flock.get(actor)):
+                    if not self.busy[actor]:
+                        self.stats["idle_skip"] += 1
                         return
+                    if self.in_flock.get(actor):
+                        self.stats["flock_skip"] += 1
+                        return
+                    if time.time() >= deadline:
+                        self.stats["arrival_timeout"] += 1
+                        return
+            self.stats["granted"] += 1
             self.gate.at_gate[actor].clear()
             self.gate.go[actor].release()
             deadline = time.time() + self.ARRIVAL_BOUND

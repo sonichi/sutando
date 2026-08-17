@@ -128,7 +128,10 @@ SCRIPTS = {
 }
 
 
-def replay(ops, check=True):
+LAST_DIAG = {}
+
+
+def replay(ops, check=True, diag_key=None):
     d = H.ClaimDriver()
     try:
         for op in ops:
@@ -139,6 +142,11 @@ def replay(ops, check=True):
         with contextlib.suppress(BaseException):
             d.finish(check=False)
         return str(e)
+    finally:
+        if diag_key is not None:
+            LAST_DIAG[diag_key] = (dict(d.stats),
+                                   [(a, o, repr(r)) for _s, a, o, r
+                                    in sorted(d.done_log)])
 
 
 def main():
@@ -161,7 +169,7 @@ def main():
         bit = False
         for _attempt in range(10):
             for name, ops in SCRIPTS.items():
-                if replay(ops) is not None:
+                if replay(ops, diag_key=name) is not None:
                     print(f"  ok   positive control: {name} violates without the lock")
                     bit = True
                     break
@@ -170,6 +178,17 @@ def main():
         if not bit:
             print("  FAIL positive control: no schedule violates with _item_lock "
                   "neutered — the harness has lost its teeth")
+            import sys as _sys
+            trace = (_sys.gettrace() is not None,
+                     [i for i in range(6)
+                      if getattr(_sys, "monitoring", None)
+                      and _sys.monitoring.get_tool(i)])
+            print(f"  diag python={_sys.version.split()[0]} "
+                  f"settrace={trace[0]} monitoring_tools={trace[1]} "
+                  f"arrival_bound={H.ClaimDriver.ARRIVAL_BOUND}")
+            for name, (stats, log) in LAST_DIAG.items():
+                print(f"  diag {name} stats={stats}")
+                print(f"  diag {name} log={log}")
             failures += 1
     finally:
         H.ob._item_lock = saved
