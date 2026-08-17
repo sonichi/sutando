@@ -17,6 +17,7 @@ import os
 
 from _gateway import gate_allows, load_gate, gateway, http_json, degrade_reason, HTTPError, URLError
 from resolve import resolve_user
+import receipt as _receipt
 
 
 def _result(ok, *, room_id=None, mxid=None, event_id=None, candidates=None, reason=None):
@@ -78,5 +79,6 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         return _result(False, room_id=room_id, mxid=mxid, reason=degrade_reason(e.code))
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, mxid=mxid, reason=f"network error: {e}")
-    event_id = parsed.get("event_id") if isinstance(parsed, dict) else None
+    # Same envelope as `say`, so the same reading — see receipt.py.
+    _state, event_id, _reason = _receipt.classify(parsed)
     return _result(True, room_id=room_id, mxid=mxid, event_id=event_id)

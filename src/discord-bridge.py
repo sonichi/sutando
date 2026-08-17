@@ -5767,14 +5767,59 @@ def _send_via_rest(channel_id: str, message: str):
     for i, chunk in enumerate(chunks, 1):
         data = json.dumps({"content": chunk}).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
+        # Transport only: once urlopen returns, the message is committed, so
+        # read() belongs below. Not a `with` — doubles are plain objects.
         try:
-            urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
             sys.exit(1)
+        # Best-effort, and emitted per chunk: buffering until every chunk lands
+        # leaves an earlier delivered chunk unaddressable when a later one fails.
+        try:
+            body = json.loads(resp.read().decode())
+            mid = body.get("id") if isinstance(body, dict) else None
+            mid = str(mid) if isinstance(mid, (str, int)) and str(mid) else None
+        except Exception:
+            mid = None
+        if mid:
+            print(f"message_id {mid}")
+        else:
+            print(f"message_id unavailable (chunk {i}/{len(chunks)}) — sent, not addressable")
     suffix = "..." if len(message) > 80 else ""
     chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
     print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
+
+
+def _edit_via_rest(channel_id: str, message_id: str, message: str):
+    """Replace an already-sent message's content via Discord REST PATCH.
+
+    Refuses a body the chunker would split: an edit addresses ONE message, so a
+    multi-chunk body cannot be applied without silently dropping the remainder.
+    """
+    import urllib.request
+    if not message.strip():
+        print("ERROR: refusing to edit to an empty body")
+        sys.exit(1)
+    if len(list(_chunk_for_discord_unbounded(message))) > 1:
+        # Derived from the chunker, not a second copy of its limit.
+        print(f"ERROR: body is {len(message)} chars — too long for one message. "
+              "An edit cannot chunk; shorten it or send a new message.")
+        sys.exit(1)
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
+    data = json.dumps({"content": message}).encode()
+    req = urllib.request.Request(url, data=data, method="PATCH", headers={
+        "Authorization": f"Bot {TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "DiscordBot (sutando, 1.0)",
+    })
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"Edit failed: {e}")
+        sys.exit(1)
+    suffix = "..." if len(message) > 80 else ""
+    print(f"Edited {channel_id}/{message_id}: {message[:80]}{suffix}")
 
 
 from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402  — shared owner of the --body-file bounds
@@ -5798,6 +5843,13 @@ def _send_cli_body(argv: list) -> str:
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
         _send_via_rest(sys.argv[2], _send_cli_body(sys.argv[3:]))
+    elif sys.argv[1:2] == ["edit"]:
+        # Arity is checked here rather than by the `>= 5` guard the send branch
+        # uses: falling through on a short `edit` would boot the whole bridge.
+        if len(sys.argv) < 5:
+            raise SystemExit("usage: discord-bridge.py edit <channel_id> <message_id> "
+                             "<body|--body-file PATH>")
+        _edit_via_rest(sys.argv[2], sys.argv[3], _send_cli_body(sys.argv[4:]))
     else:
         _single_instance_acquire("discord-bridge")
         client.run(TOKEN, log_handler=None)
