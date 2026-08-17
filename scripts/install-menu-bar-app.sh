@@ -82,26 +82,35 @@ else
   echo "  ✓ signed (ad-hoc — install a \"Sutando Dev\" cert for a TCC grant that survives rebuilds)"
 fi
 
+# Scope to THIS bundle's path. The Electron desktop app shares the executable
+# NAME, so `pkill -x Sutando` would also kill the user's UI (#2038).
+APP_BIN="$APP/Contents/MacOS/Sutando"
+
+stop_unmanaged() {
+  # An unmanaged copy left running defeats BOTH callers: --launch stacks a second
+  # menu-bar icon, and --supervise leaves launchd's copy to exit under the
+  # singleton guard, which KeepAlive does not restart.
+  pgrep -f "^$APP_BIN$" >/dev/null 2>&1 || return 0
+  pkill -f "^$APP_BIN$" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    pgrep -f "^$APP_BIN$" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 if [ "$SUPERVISE" -eq 1 ]; then
+  stop_unmanaged || {
+    echo "  ✗ the running menu-bar app did not exit — launchd would install a" >&2
+    echo "    supervisor whose copy exits under the singleton guard" >&2
+    exit 1
+  }
   bash "$REPO/src/install-sutando-app-launchd.sh"
 elif [ "$LAUNCH" -eq 1 ]; then
-  # Scope to THIS bundle's path. The Electron desktop app shares the executable
-  # NAME, so `pkill -x Sutando` would also kill the user's UI (#2038).
-  APP_BIN="$APP/Contents/MacOS/Sutando"
-  if pgrep -f "^$APP_BIN$" >/dev/null 2>&1; then
-    pkill -f "^$APP_BIN$" 2>/dev/null || true
-    gone=0
-    for _ in $(seq 1 50); do
-      pgrep -f "^$APP_BIN$" >/dev/null 2>&1 || { gone=1; break; }
-      sleep 0.1
-    done
-    # Opening a second copy while the first is alive is how you get two menu-bar
-    # icons and a confused TCC grant, so stop rather than stack them.
-    [ "$gone" -eq 1 ] || {
-      echo "  ✗ the running menu-bar app did not exit — not launching another" >&2
-      exit 1
-    }
-  fi
+  stop_unmanaged || {
+    echo "  ✗ the running menu-bar app did not exit — not launching another" >&2
+    exit 1
+  }
   open "$APP"
   for _ in $(seq 1 50); do
     pgrep -f "^$APP_BIN$" >/dev/null 2>&1 && break

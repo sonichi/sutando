@@ -108,6 +108,30 @@ esac
 if [ "$rc4" -ne 0 ]; then pass "exits nonzero when the launch cannot be confirmed"
 else flunk "exits nonzero when the launch cannot be confirmed (exited $rc4)"; fi
 
+# ---- 4b. --supervise must not install a supervisor over a live unmanaged copy --
+# launchd's copy would exit under the singleton guard, and KeepAlive does not
+# restart a clean exit — so the supervisor supervises nothing.
+# NOTE: do NOT drive --supervise here. It reaches the real
+# src/install-sutando-app-launchd.sh, which writes a live LaunchAgent plist
+# pointing at this worktree's temp paths. Asserted structurally instead.
+# Structural: BOTH dispositions must call it, and the definition must exist once.
+defs="$(grep -c '^stop_unmanaged()' "$SCRIPT")"
+calls="$(grep -c '^  stop_unmanaged ||' "$SCRIPT")"
+if [ "$defs" = "1" ] && [ "$calls" = "2" ]; then
+    pass "one stop_unmanaged definition, called by both --supervise and --launch"
+else
+    flunk "one stop_unmanaged definition, called by both (defs=$defs calls=$calls)"
+fi
+
+# The guard must precede the installer call, or it cannot prevent anything.
+gi="$(grep -n '^  stop_unmanaged ||' "$SCRIPT" | head -1 | cut -d: -f1)"
+ii="$(grep -n 'bash "\$REPO/src/install-sutando-app-launchd.sh"' "$SCRIPT" | head -1 | cut -d: -f1)"
+if [ -n "$gi" ] && [ -n "$ii" ] && [ "$gi" -lt "$ii" ]; then
+    pass "the stop guard runs BEFORE the launchd installer"
+else
+    flunk "the stop guard runs BEFORE the launchd installer (guard=$gi installer=$ii)"
+fi
+
 # ---- 5. the retired probes must not come back -------------------------------
 # Strip comments first: the script explains WHY each probe was retired and names
 # it, so a whole-file grep matches the explanation and reports the bug it fixed.
