@@ -77,6 +77,17 @@ class TasksView:
                    f"priority: {priority}\n"
                    + (f"instance_id: {_one_line(self.instance)}\n"
                       if self.instance else ""))
+        # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+        # fail-open so a stamping error costs the stamp, never the submit.
+        try:
+            import sys as _sys
+            _src = str(Path(__file__).resolve().parent.parent)
+            if _src not in _sys.path:
+                _sys.path.insert(0, _src)
+            from task_envelope import stamp_text
+            content = stamp_text(content, self.tasks_dir.parent)
+        except Exception:
+            pass
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.tasks_dir / f".{task_id}.tmp"
         tmp.write_text(content)

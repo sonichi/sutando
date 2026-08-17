@@ -28,6 +28,7 @@ import { z } from 'zod';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
+import { tryStampText } from './task_envelope.js';
 
 const PORT = Number(process.env.SUTANDO_VOICE_HOST_PORT || 8788);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -96,7 +97,7 @@ function buildWorkTool(device: { deviceId?: string; label?: string },
 			if (route.kind === 'gateway') {
 				await submitViaGateway(route, id, body);
 			} else {
-				writeFileSync(join(resolveWorkspace(), 'tasks', `${id}.txt`), body);
+				writeFileSync(join(resolveWorkspace(), 'tasks', `${id}.txt`), tryStampText(body));
 			}
 			console.log(`${ts()} [work] delegated ${id} via ${route.kind}`
 				+ `${route.agentId ? ' for ' + route.agentId : ''}: ${task.slice(0, 80)}`);
