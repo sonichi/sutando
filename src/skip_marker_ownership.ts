@@ -1,52 +1,45 @@
-/**
- * Skip markers separate TWO decisions that a single guard used to conflate.
- *
- * Suppression is universal: a [no-send]/[REPLIED] body must never be
- * narrated or delivered by anyone, whoever dispatched it. Retirement is
- * ownership-scoped: results/ is shared, so only the dispatching consumer may
- * archive. Gating both on one predicate makes a foreign marked result fall
- * through and be SPOKEN — worse than the mis-archive it replaced.
- *
- * Dependency-light and standalone so it is testable without the bridge's
- * runtime deps (task-bridge.ts pulls the whole voice stack).
- */
+// Two decisions the result-watcher used to make with one predicate:
+// suppression (universal — a marked body must never be spoken or sent) and
+// retirement authority (scoped — only the consumer that dispatched a task may
+// archive its result). Narrowing one silently narrowed both.
 
 export const SKIP_MARKER_RE = /^\s*\[(?:no-send|REPLIED)\]/i;
 
-/** Universal: this result must not be narrated, delivered, or forwarded. */
 export function isSkipMarked(file: string, result: string): boolean {
 	return file.startsWith('task-') && SKIP_MARKER_RE.test(result);
 }
 
-/**
- * Task families with no network consumer: nothing else will ever archive
- * them, so this bridge is their archiver of last resort. Cron depends on
- * it explicitly — codex-scheduler writes [no-send] "so this scheduled task
- * is archived" — and discord-bridge's skip handling is already scoped to
- * its own pending map, so scoping this one without the allowlist would
- * leave them with no archiver at all. A NEW local family must be added
- * here or its results accumulate forever.
- */
-export const LOCAL_ONLY_PREFIXES = [
-	// Machine-generated families, also enumerated by web-client.ts's
-	// isOwnerVisibleTask. That list answers "is this owner work to display";
-	// this one answers "will anything else archive it" — task-chat- is on
-	// this list and owner-VISIBLE there, so the two must not be collapsed.
-	'task-cron-', 'task-health-', 'task-smoke-', 'task-discord-e2e-',
-	// Locally originated, no network consumer.
-	'task-chat-', 'task-workstream-grouping-', 'task-project-grouping-',
+// Sources whose own bridge polls results/ and archives what it dispatched.
+// Closed set: a transport is added here only when its bridge gains that loop.
+// The complement — every local source — is open-ended and host-dependent, so
+// enumerating IT cannot stay correct: measured on two hosts the same day, the
+// missing local families did not overlap at all.
+export const NETWORK_CONSUMER_SOURCES = [
+	'discord', 'ag2space', 'telegram', 'slack', 'whatsapp',
 ];
 
-export function isLocalOnlyTask(taskId: string): boolean {
-	return LOCAL_ONLY_PREFIXES.some(p => taskId.startsWith(p));
+/** Header fields a retirement decision may read. `null` = task file gone. */
+export interface TaskOrigin {
+	source: string | null;
 }
 
-/** Ownership-scoped: may THIS bridge archive it and retire its task row? */
-export function mayRetireSkipMarked(file: string, result: string,
-	isOwn: (taskId: string) => boolean): boolean {
+export function hasNetworkConsumer(origin: TaskOrigin | null): boolean {
+	// Unreadable origin is treated as foreign. Wrongly retiring strands an
+	// owner reply; wrongly keeping only accumulates a file, and suppression
+	// is universal either way — so the unknown case fails toward keeping.
+	if (origin === null) return true;
+	if (origin.source === null) return false;
+	return NETWORK_CONSUMER_SOURCES.includes(origin.source.trim().toLowerCase());
+}
+
+export function mayRetireSkipMarked(
+	file: string,
+	result: string,
+	isOwn: (taskId: string) => boolean,
+	originOf: (taskId: string) => TaskOrigin | null,
+): boolean {
 	if (!isSkipMarked(file, result)) return false;
 	const taskId = file.replace(/\.txt$/, '');
-	// The whole rule lives here so it is testable; the caller supplies only
-	// the dynamic signals (dispatched-by-me, is-a-voice-task).
-	return isLocalOnlyTask(taskId) || isOwn(taskId);
+	// Dispatched by this bridge, or belongs to no other consumer.
+	return isOwn(taskId) || !hasNetworkConsumer(originOf(taskId));
 }

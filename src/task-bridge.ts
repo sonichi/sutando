@@ -14,7 +14,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
 	emitTaskProcessed,
@@ -187,7 +187,9 @@ const normalizeTask = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim()
  * offline. Returns false on missing file or parse error — bias toward not
  * forwarding to keep Susan-rejected always-DM behavior off by default for
  * non-voice tasks. */
-export function _isVoiceTask(taskId: string): boolean {
+/** Header lines of a task, located across every archive layout. Returns null
+ *  when no copy of the task survives. */
+export function _readTaskHeader(taskId: string): string[] | null {
 	const candidates: string[] = [
 		join(TASK_DIR, `${taskId}.txt`),
 		join(TASK_DIR, 'processed', `${taskId}.txt`),
@@ -226,10 +228,25 @@ export function _isVoiceTask(taskId: string): boolean {
 				if (l.startsWith('task:')) break;
 				headerLines.push(l);
 			}
-			return headerLines.some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
+			return headerLines;
 		} catch {}
 	}
-	return false;
+	return null;
+}
+
+export function _isVoiceTask(taskId: string): boolean {
+	const headerLines = _readTaskHeader(taskId);
+	if (headerLines === null) return false;
+	return headerLines.some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
+}
+
+/** Origin of a task for the retirement decision, read through the same
+ *  delimiter-honoring header reader `_isVoiceTask` uses. */
+export function _taskOrigin(taskId: string): TaskOrigin | null {
+	const headerLines = _readTaskHeader(taskId);
+	if (headerLines === null) return null;
+	const line = headerLines.find(l => l.startsWith('source:'));
+	return { source: line ? line.slice('source:'.length).trim() : null };
 }
 
 /** Belt-suspenders guard for the result-watcher's unconditional fallthrough
@@ -896,7 +913,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					// Ownership must survive a restart (_pendingTasks is in-memory)
 					// and the timeout sweep; suppression applies either way.
 					const owns = (id: string) => _pendingTasks.has(id) || _isVoiceTask(id);
-					if (!mayRetireSkipMarked(file, result, owns)) {
+					if (!mayRetireSkipMarked(file, result, owns, _taskOrigin)) {
 						continue;   // another consumer's: leave the files for its owner
 					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
