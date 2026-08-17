@@ -76,6 +76,11 @@ try:
     foreign = results / "proactive-foreign.txt"
     foreign.write_text("[channel: !PrxhizfLysTYrYDcnw:ag2.space]\nroom body\n")
 
+    # D7 header form: parse_markers peels `**[core: N]**` before the marker, so a
+    # raw first-line regex misses it and Discord claims another bridge's file.
+    d7 = results / "proactive-d7.txt"
+    d7.write_text("**[core: 2]**\n[channel: !PrxhizfLysTYrYDcnw:ag2.space]\nroom body\n")
+
     async def one_pass():
         try:
             await asyncio.wait_for(bridge.poll_proactive(), timeout=2.0)
@@ -90,6 +95,8 @@ try:
           "it is NOT parked in undelivered/")
     check(not list(results.glob("proactive-foreign.sending*")),
           "no .sending claim is left behind")
+    check(d7.exists(),
+          "a D7 `**[core: N]**` header before the marker is ALSO released")
 
     # Positive control: the check must not over-fire on a real Discord target.
     native = results / "proactive-native.txt"
