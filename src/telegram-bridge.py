@@ -57,7 +57,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
-from message_chunking import chunk_message  # shared fence-aware chunker (same as discord/slack)  # noqa: E402
+from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -410,7 +410,7 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     clean_text = parsed.body
     # Fence-aware chunks via the shared chunker — naive [i:i+4000] slicing tore
     # code fences at the boundary and re-declared policy discord/slack share.
-    chunks = list(chunk_message(clean_text, 4000)) if clean_text else []
+    chunks = chunk_plain_text(clean_text, 4000) if clean_text else []
     text_chunks = len(chunks)
     delivered_ok = True
     files_sent = 0

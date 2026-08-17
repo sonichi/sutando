@@ -153,26 +153,22 @@ class SendReplyMarkerAdoption(unittest.TestCase):
         self.assertEqual(r["files_sent"], 0)
         self.assertTrue(r["ok"])
 
-    # ---- long text uses the SHARED fence-aware chunker --------------------
+    # ---- long text: plain transport must deliver byte-identical content ---
 
-    def test_long_code_fence_is_not_split_mid_fence(self):
-        """A code block spanning the 4000-char boundary must not be broken:
-        naive [i:i+4000] slicing leaves chunk 1 with an unclosed fence and
-        chunk 2 opening mid-block. The shared chunker (message_chunking, the
-        same one discord and slack already use) re-opens fences per chunk."""
+    def test_long_reply_delivery_is_byte_identical(self):
+        """Telegram sends plain text (no parse_mode), so chunking must never
+        mutate content: the concatenation of the delivered sendMessage bodies
+        must equal the input exactly. The fence-aware chunker fails this — its
+        synthetic close/re-open fences are literal extra bytes here."""
         code = "\n".join(f"line {i} of a long listing" for i in range(300))
         text = f"intro\n```python\n{code}\n```\ntail"
         r = TB.send_reply(123, text)
         sends = [c.get("text", "") for c in self.sent if c["method"] == "sendMessage"]
-        assert len(sends) >= 2, "test needs the fence to span a boundary"
-        for i, chunk in enumerate(sends):
-            assert len(chunk) <= 4000
-            # every chunk must be fence-balanced: an odd count of ``` lines
-            # means a fence was torn at the boundary
-            opens = sum(1 for ln in chunk.splitlines() if ln.startswith("```"))
-            assert opens % 2 == 0, (
-                f"chunk {i} tore a code fence (odd ``` count {opens}) — "
-                "naive slicing, not the shared chunker")
+        assert len(sends) >= 2, "test needs the body to span a boundary"
+        assert all(0 < len(c) <= 4000 for c in sends)
+        assert "".join(sends) == text, (
+            f"delivered {sum(map(len, sends))} chars for a {len(text)}-char body — "
+            "the transport inserted or dropped bytes")
         assert r["text_chunks"] == len(sends), (
             "the reported chunk count must come from the actual chunks, "
             "not the naive ceil-divide formula")

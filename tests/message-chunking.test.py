@@ -164,6 +164,22 @@ check("_closes_fence: ``` closes ```python", mc._closes_fence("```", "```python"
 check("_closes_fence: ~~~ does NOT close ```", not mc._closes_fence("~~~", "```"))
 check("_fence_run: counts leading run", mc._fence_run("````md") == 4 and mc._fence_run("~~~") == 3)
 
+# chunk_plain_text: the plain-transport contract is byte-identity — nothing
+# inserted (no synthetic fences), nothing dropped, every chunk bounded.
+run9k = "x" * 9000
+pc = mc.chunk_plain_text(run9k, 4000)
+check("plain: unbreakable 9k run hard-cuts within bound",
+      "".join(pc) == run9k and max(map(len, pc)) <= 4000, str(list(map(len, pc))))
+body = "intro\n```python\n" + "\n".join(f"line {i} of a long listing" for i in range(300)) + "\n```\ntail"
+pc2 = mc.chunk_plain_text(body, 4000)
+check("plain: fenced body reassembles byte-identical (no fence bytes added)",
+      "".join(pc2) == body and len(pc2) > 1, f"{sum(map(len, pc2))} vs {len(body)}")
+check("plain: splits land after newlines when available",
+      all(c.endswith("\n") for c in pc2[:-1]))
+check("plain: empty input -> no chunks", mc.chunk_plain_text("", 4000) == [])
+check("plain: exact-limit input is one chunk",
+      mc.chunk_plain_text("y" * 4000, 4000) == ["y" * 4000])
+
 if failures:
     print(f"\nFAIL — {len(failures)} check(s) failed: {failures}")
     raise SystemExit(1)
