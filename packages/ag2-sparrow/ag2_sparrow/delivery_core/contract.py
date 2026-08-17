@@ -24,9 +24,44 @@ from typing import Optional, Protocol, runtime_checkable
 
 
 class DeliveryOutcome(str, Enum):
+    """Describes an ATTEMPTED external delivery, and nothing else. A drain
+    that never called the provider has no DeliveryOutcome — see DrainResult
+    — or telemetry and recovery policy read local bookkeeping as external
+    ambiguity."""
     CONFIRMED = "confirmed"
     NOT_DELIVERED = "not_delivered"
     OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+class DrainStatus(str, Enum):
+    """Why a drain attempt ended, locally. NOT_CLAIMED means another worker
+    owns the item: no provider call was made, so nothing external is
+    ambiguous."""
+    NOT_CLAIMED = "not_claimed"
+    ATTEMPTED = "attempted"
+
+
+@dataclass(frozen=True)
+class DrainResult:
+    status: DrainStatus
+    outcome: Optional[DeliveryOutcome] = None   # set iff status is ATTEMPTED
+
+    def __post_init__(self):
+        attempted = self.status is DrainStatus.ATTEMPTED
+        if attempted != (self.outcome is not None):
+            raise ValueError(
+                "an outcome exists exactly when a delivery was attempted")
+
+
+class ProviderIndeterminate(Exception):
+    """The call MAY have crossed the external side-effect boundary (timeout
+    after send, connection reset mid-request, ambiguous 5xx). This is the
+    ONLY exception class that maps to OUTCOME_UNKNOWN."""
+
+
+class ProviderRefused(Exception):
+    """The provider definitely did not perform the side effect (validation
+    rejection, refusal before dispatch). Maps to NOT_DELIVERED."""
 
 
 @dataclass(frozen=True)
@@ -60,10 +95,14 @@ class BackendCapabilities:
 
 @dataclass(frozen=True)
 class ClaimToken:
-    """Opaque above the backend: `opaque` is backend-private claim material.
-    item_id rides along so the core can route outcomes without parsing."""
+    """ONE ownership incarnation, not a drainer identity. `incarnation` is
+    backend-private material that a later incarnation of the same worker
+    cannot reproduce (pid + process birth + claim stamp), so a token that
+    outlived its claim is rejected instead of matching by worker name.
+    Opaque above the backend; item_id rides along for routing only."""
     item_id: str
-    opaque: str
+    worker: str
+    incarnation: str
 
 
 @dataclass
@@ -114,8 +153,20 @@ class ClaimBackend(Protocol):
         ...
 
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome) -> bool:
-        """Retire own ownership with the delivery outcome. Only the token's
-        owner may complete; True = retired."""
+        """Validate the exact incarnation, apply the outcome transition, and
+        retire the claim — ALL inside one backend critical section, in that
+        order. A stale token must change nothing: validating after mutating
+        lets a dead incarnation park or advance its successor's item, which
+        is the concurrency defect this seam exists to stop propagating.
+        True = this incarnation owned the claim and it is now retired."""
+        ...
+
+    def attempts(self, item_id: str) -> int:
+        """Delivery attempts recorded for this item (retry accounting)."""
+        ...
+
+    def park(self, item_id: str, reason: str) -> None:
+        """Remove the item from the drainable set pending operator action."""
         ...
 
     def recover(self) -> RecoverReport:

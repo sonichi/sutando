@@ -23,7 +23,8 @@ if str(_PKG) not in sys.path:
 
 from ag2_sparrow.delivery_core import (  # noqa: E402
     BackendCapabilities, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
-    DesignAClaimBackend, ProviderCapabilities, idempotency_key)
+    DesignAClaimBackend, DrainStatus, ProviderCapabilities,
+    ProviderIndeterminate, ProviderRefused, RetryPolicy, idempotency_key)
 
 ITEM = "room-evt-1"
 
@@ -92,6 +93,31 @@ class ContractCase(unittest.TestCase):
         t = self.backend.claim(ITEM, "w1")
         self.assertTrue(self.backend.complete(t, DeliveryOutcome.CONFIRMED))
 
+    def test_stale_incarnation_completes_nothing(self):
+        """Owner review finding 1+2: a token that outlived its claim must
+        change NOTHING. Validating after mutating lets a dead incarnation
+        park or advance its successor's item."""
+        self.backend.publish(ITEM, b"x")
+        stale = self.backend.claim(ITEM, "w1")
+        self.backend.force_release(ITEM)          # w1's claim is gone
+        successor = self.backend.claim(ITEM, "w2")
+        self.assertIsNotNone(successor)
+        self.assertNotEqual(stale.incarnation, successor.incarnation,
+                            "incarnation must not be reproducible by name")
+        import ag2_sparrow.outbox as outbox
+        before = outbox._read_item(self.backend.root, ITEM).get("status")
+        self.assertFalse(
+            self.backend.complete(stale, DeliveryOutcome.OUTCOME_UNKNOWN),
+            "stale token must not complete")
+        # The transition each outcome performs is the observable, not the
+        # return value: parking is what a stale UNKNOWN would inflict.
+        self.assertEqual(
+            outbox._read_item(self.backend.root, ITEM).get("status"), before,
+            "stale token parked the successor's item")
+        self.assertTrue(
+            self.backend.complete(successor, DeliveryOutcome.CONFIRMED),
+            "the live incarnation still owns the claim")
+
     def test_force_release_is_capability_gated(self):
         caps = self.backend.capabilities
         if caps.supports_force_release:
@@ -121,32 +147,72 @@ class CorePolicy(unittest.TestCase):
 
     def test_confirmed_is_terminal(self):
         p = _Recorder([DeliveryOutcome.CONFIRMED])
-        out = self._core(p).deliver_one(ITEM, b"x")
-        self.assertIs(out, DeliveryOutcome.CONFIRMED)
+        r = self._core(p).deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.CONFIRMED)
+        self.assertIs(r.status, DrainStatus.ATTEMPTED)
         self.assertEqual(len(p.deliver_calls), 1)
 
     def test_unknown_parks_without_capabilities(self):
-        p = _Recorder([RuntimeError("wire died")])
-        out = self._core(p).deliver_one(ITEM, b"x")
-        self.assertIs(out, DeliveryOutcome.OUTCOME_UNKNOWN,
+        p = _Recorder([ProviderIndeterminate("timeout after send")])
+        r = self._core(p).deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.OUTCOME_UNKNOWN,
                       "UNKNOWN must never be relabeled NOT_DELIVERED")
         self.assertEqual(len(p.deliver_calls), 1, "no blind resend")
 
     def test_unknown_reconciles_when_capable(self):
-        p = _Recorder([RuntimeError("wire died")],
+        p = _Recorder([ProviderIndeterminate("timeout after send")],
                       ProviderCapabilities(reconcile_capable=True))
-        out = self._core(p).deliver_one(ITEM, b"x")
-        self.assertIs(out, DeliveryOutcome.CONFIRMED)
+        r = self._core(p).deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.CONFIRMED)
         self.assertEqual(len(p.reconcile_calls), 1)
 
     def test_unknown_resends_only_with_idempotent_send(self):
-        p = _Recorder([RuntimeError("wire died"), DeliveryOutcome.CONFIRMED],
+        p = _Recorder([ProviderIndeterminate("timeout after send"),
+                       DeliveryOutcome.CONFIRMED],
                       ProviderCapabilities(idempotent_send=True))
-        out = self._core(p).deliver_one(ITEM, b"x")
-        self.assertIs(out, DeliveryOutcome.CONFIRMED)
+        r = self._core(p).deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.CONFIRMED)
         self.assertEqual(len(p.deliver_calls), 2)
         self.assertEqual(p.deliver_calls[0][1], p.deliver_calls[1][1],
                          "retry must reuse the SAME idempotency key")
+
+    def test_lost_race_is_not_a_delivery_outcome(self):
+        """Owner review finding 3: no provider call was made, so nothing
+        external is ambiguous — reporting UNKNOWN pollutes telemetry and
+        recovery policy."""
+        self.backend.claim(ITEM, "someone-else")   # item already owned
+        p = _Recorder([])
+        r = self._core(p).deliver_one(ITEM, b"x")
+        self.assertIs(r.status, DrainStatus.NOT_CLAIMED)
+        self.assertIsNone(r.outcome, "a lost race has no delivery outcome")
+        self.assertEqual(p.deliver_calls, [], "provider must not be called")
+
+    def test_refusal_is_not_delivered_not_unknown(self):
+        """Owner review finding 5: only boundary-crossing failures are
+        UNKNOWN. A refusal before dispatch is a definite non-delivery."""
+        p = _Recorder([ProviderRefused("rejected before dispatch")])
+        r = self._core(p).deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.NOT_DELIVERED)
+
+    def test_programming_error_propagates(self):
+        """Owner review finding 5, the other half: a bare Exception is a
+        bug or a config error, not evidence the side effect may have run.
+        Swallowing it as UNKNOWN parks the item and hides the defect."""
+        p = _Recorder([TypeError("payload is not bytes")])
+        with self.assertRaises(TypeError):
+            self._core(p).deliver_one(ITEM, b"x")
+
+    def test_retry_policy_parks_at_the_ceiling(self):
+        """Owner review finding 4: RetryPolicy was declared but unread."""
+        core = DeliveryCore(self.backend, _Recorder([]),
+                            RetryPolicy(max_attempts=2))
+        for _ in range(2):
+            core.provider = _Recorder([DeliveryOutcome.NOT_DELIVERED])
+            core.deliver_one(ITEM, b"x")
+        import ag2_sparrow.outbox as outbox
+        self.assertEqual(
+            outbox._read_item(self.backend.root, ITEM).get("status"), "PARKED",
+            "at max_attempts the core must park, not retry forever")
 
     def test_key_never_contains_claim_material(self):
         self.assertEqual(idempotency_key(ITEM), idempotency_key(ITEM),

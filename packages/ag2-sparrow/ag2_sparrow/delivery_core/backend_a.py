@@ -35,27 +35,51 @@ class DesignAClaimBackend:
         })
         return True
 
+    def _incarnation_of(self, item_id: str) -> Optional[str]:
+        """The claim record's non-reusable identity: pid + process birth +
+        claim stamp. A restarted worker of the same name cannot reproduce
+        it, which is what makes a stale token detectable."""
+        rec = outbox.read_delivery_claim(self.root, item_id)
+        if rec is None or rec.state == "UNKNOWN":
+            return None
+        return f"{rec.drainer_id}:{rec.pid}:{rec.start_usec}:{rec.claimed_at}"
+
     def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:
         if not outbox._item_path(self.root, item_id).exists():
             return None
-        if outbox.acquire_delivery_claim(self.root, item_id, worker):
-            return ClaimToken(item_id=item_id, opaque=worker)
-        if outbox.reclaim_delivery_claim(self.root, item_id,
-                                         self.reclaim_ttl_s, worker):
-            return ClaimToken(item_id=item_id, opaque=worker)
-        return None
+        took = (outbox.acquire_delivery_claim(self.root, item_id, worker)
+                or outbox.reclaim_delivery_claim(self.root, item_id,
+                                                 self.reclaim_ttl_s, worker))
+        if not took:
+            return None
+        incarnation = self._incarnation_of(item_id)
+        if incarnation is None:                 # record vanished under us
+            return None
+        return ClaimToken(item_id=item_id, worker=worker,
+                          incarnation=incarnation)
 
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome) -> bool:
-        if outcome is DeliveryOutcome.CONFIRMED:
-            d = outbox._read_item(self.root, token.item_id)
-            d["status"] = "DELIVERED"
-            outbox._write_item(self.root, token.item_id, d)
-        elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
-            outbox.park_item(self.root, token.item_id, "outcome-unknown")
-        else:
-            outbox.note_attempt(self.root, token.item_id)
-        return outbox.release_delivery_claim(self.root, token.item_id,
-                                             token.opaque)
+        item_id = token.item_id
+        # Validate -> transition -> retire, all under the item lock: a stale
+        # incarnation must not mutate or park its successor's item.
+        with outbox._item_lock(self.root, item_id):
+            if self._incarnation_of(item_id) != token.incarnation:
+                return False
+            if outcome is DeliveryOutcome.CONFIRMED:
+                d = outbox._read_item(self.root, item_id)
+                d["status"] = "DELIVERED"
+                outbox._write_item(self.root, item_id, d)
+            elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
+                outbox.park_item(self.root, item_id, "outcome-unknown")
+            else:
+                outbox.note_attempt(self.root, item_id)
+            return outbox._release_locked(self.root, item_id, token.worker)
+
+    def attempts(self, item_id: str) -> int:
+        return outbox.attempts_for(self.root, item_id)
+
+    def park(self, item_id: str, reason: str) -> None:
+        outbox.park_item(self.root, item_id, reason)
 
     def recover(self) -> RecoverReport:
         """A recovers lazily at claim time (reclaim TTL); this pass reports

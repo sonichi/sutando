@@ -14,8 +14,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contract import (BackendCapabilities, ClaimBackend, DeliveryOutcome,
-                       DeliveryProvider, DrainReport, RecoverReport)
+from .contract import (ClaimBackend, DeliveryOutcome, DeliveryProvider,
+                       DrainResult, DrainStatus, ProviderIndeterminate,
+                       ProviderRefused, RecoverReport)
 
 
 @dataclass(frozen=True)
@@ -38,21 +39,28 @@ class DeliveryCore:
         self.policy = policy or RetryPolicy()
         self.worker = worker
 
-    def deliver_one(self, item_id: str, payload: bytes) -> DeliveryOutcome:
-        """Claim -> deliver -> classify -> complete/park. Returns the final
-        outcome recorded for this pass (OUTCOME_UNKNOWN when parked)."""
+    def _attempt(self, item_id: str, payload: bytes,
+                 key: str) -> DeliveryOutcome:
+        """One provider call, classified by the typed failure taxonomy.
+        Only a boundary-crossing failure is UNKNOWN; a refusal is
+        NOT_DELIVERED; anything else (programming, config, capability
+        violation) propagates rather than masquerading as ambiguity."""
+        try:
+            return self.provider.deliver(item_id, payload, key).outcome
+        except ProviderIndeterminate:
+            return DeliveryOutcome.OUTCOME_UNKNOWN
+        except ProviderRefused:
+            return DeliveryOutcome.NOT_DELIVERED
+
+    def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
+        """Claim -> deliver -> classify -> complete, with retry accounting."""
         token = self.backend.claim(item_id, self.worker)
         if token is None:
-            return DeliveryOutcome.OUTCOME_UNKNOWN     # lost race: not ours
+            # Another worker owns it. No provider call was made, so there is
+            # no external ambiguity to report — this is not an outcome.
+            return DrainResult(status=DrainStatus.NOT_CLAIMED)
         key = idempotency_key(item_id)
-        try:
-            receipt = self.provider.deliver(item_id, payload, key)
-        except Exception:
-            # transport indeterminacy: the local call and the remote effect
-            # are never one transaction — UNKNOWN is irreducible locally
-            receipt = None
-        outcome = receipt.outcome if receipt is not None \
-            else DeliveryOutcome.OUTCOME_UNKNOWN
+        outcome = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
@@ -60,13 +68,12 @@ class DeliveryCore:
                 if resolved is not None:
                     outcome = resolved.outcome
             elif caps.idempotent_send:
-                try:
-                    retry = self.provider.deliver(item_id, payload, key)
-                    outcome = retry.outcome
-                except Exception:
-                    outcome = DeliveryOutcome.OUTCOME_UNKNOWN
+                outcome = self._attempt(item_id, payload, key)
         self.backend.complete(token, outcome)
-        return outcome
+        if (outcome is DeliveryOutcome.NOT_DELIVERED
+                and self.backend.attempts(item_id) >= self.policy.max_attempts):
+            self.backend.park(item_id, "max-attempts")
+        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome)
 
     def recover(self) -> RecoverReport:
         return self.backend.recover()

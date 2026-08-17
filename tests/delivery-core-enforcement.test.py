@@ -37,7 +37,7 @@ if str(_PKG) not in sys.path:
 
 from ag2_sparrow.delivery_core import (  # noqa: E402
     DeliveryCore, DeliveryOutcome, DeliveryReceipt, DesignAClaimBackend,
-    ProviderCapabilities, idempotency_key)
+    ProviderCapabilities, ProviderIndeterminate, idempotency_key)
 from ag2_sparrow.delivery_core import migration  # noqa: E402
 
 ITEM = "room-evt-1"
@@ -84,7 +84,7 @@ class KeyIdentityAcrossIncarnations(unittest.TestCase):
             provider = _KeyRecorder([DeliveryOutcome.CONFIRMED])
             core2 = DeliveryCore(backend, provider, worker="w2.222.b2")
             out = core2.deliver_one(ITEM, b"x")
-            self.assertIs(out, DeliveryOutcome.CONFIRMED)
+            self.assertIs(out.outcome, DeliveryOutcome.CONFIRMED)
             self.assertEqual(provider.keys, [idempotency_key(ITEM)],
                              "second incarnation must reuse the item key")
             for material in ("w1", "w2", "111", "222", "b1", "b2"):
@@ -95,7 +95,7 @@ class KeyIdentityAcrossIncarnations(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="enf-key2-") as td:
             backend = DesignAClaimBackend(Path(td), reclaim_ttl_s=0.0)
             backend.publish(ITEM, b"x")
-            p1 = _KeyRecorder([RuntimeError("wire died")])
+            p1 = _KeyRecorder([ProviderIndeterminate("timeout after send")])
             DeliveryCore(backend, p1, worker="w1.1.1").deliver_one(ITEM, b"x")
             p2 = _KeyRecorder([DeliveryOutcome.CONFIRMED])
             DeliveryCore(backend, p2, worker="w2.2.2").deliver_one(ITEM, b"x")
@@ -208,7 +208,7 @@ class LeaseLocalSeamOracle(unittest.TestCase):
             provider = _LeaseProvider()
             backend.publish(ITEM, b"x")
             out = DeliveryCore(backend, provider).deliver_one(ITEM, b"x")
-            self.assertIs(out, DeliveryOutcome.CONFIRMED)
+            self.assertIs(out.outcome, DeliveryOutcome.CONFIRMED)
             self.assertTrue(provider.provider_confirmed)
             self.assertFalse(provider.server_finalized,
                              "CONFIRMED must not imply server-finalized")
