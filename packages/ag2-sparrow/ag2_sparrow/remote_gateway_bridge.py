@@ -188,6 +188,7 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .team_guardrail import team_guardrail_lines
 from .outbox import DeliveryOutcome
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -1914,9 +1915,10 @@ def _write_task(task: dict) -> str | None:
     # The fixed prose notice follows access_tier without introducing recognized headers.
     if _secret_types:
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
-    # Guest retains the established read-only Codex path. Team is deliberately
-    # absent here: the runtime handler launches the owner's selected core in its
-    # native sandbox, so a Claude owner does not depend on Codex quota.
+    # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
+    # closing the Team session route removed the only thing that used to deliver it.
+    if sender_tier == "team":
+        lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
     if sender_tier == "guest":
         lines.extend([
             "",
