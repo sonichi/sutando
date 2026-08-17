@@ -22,7 +22,7 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 from ag2_sparrow.delivery_core import (  # noqa: E402
-    BackendCapabilities, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
+    BackendCapabilities, ClaimToken, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
     DesignAClaimBackend, DrainStatus, ProviderCapabilities,
     ProviderIndeterminate, ProviderRefused, RetryPolicy, idempotency_key)
 
@@ -117,6 +117,21 @@ class ContractCase(unittest.TestCase):
         self.assertTrue(
             self.backend.complete(successor, DeliveryOutcome.CONFIRMED),
             "the live incarnation still owns the claim")
+
+    def test_a_foreign_item_is_never_retired(self):
+        """Retirement authority belongs to the dispatching consumer: a
+        backend must not complete an item it never issued a token for.
+        results/ is shared, so filename shape is not ownership (#3018)."""
+        self.backend.publish(ITEM, b"x")
+        foreign = ClaimToken(item_id=ITEM, worker="another-consumer",
+                             incarnation="another-consumer:1:1:1")
+        self.assertFalse(self.backend.complete(foreign,
+                                               DeliveryOutcome.CONFIRMED),
+                         "a token this backend never issued retired the item")
+        import ag2_sparrow.outbox as outbox
+        self.assertNotEqual(
+            outbox._read_item(self.backend.root, ITEM).get("status"),
+            "DELIVERED", "a foreign token marked the item delivered")
 
     def test_force_release_is_capability_gated(self):
         caps = self.backend.capabilities
