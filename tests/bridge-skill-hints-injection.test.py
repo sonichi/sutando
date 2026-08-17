@@ -124,9 +124,8 @@ check(
     "telegram: audio transcription command uses audio-transcribe skill",
     "audio-transcribe/scripts/transcribe.py" in telegram_src,
 )
-# The telegram body is assembled into `_task_content` so the #3014 envelope can
-# stamp it before the write, so the hints must land in that variable, not in the
-# write_text() argument list.
+# The body is assembled into `_task_content` so the envelope can stamp it before
+# the write, so the hints must land there, not in write_text()'s argument list.
 _tg_assign = telegram_src.find("_task_content = (")
 _tg_hints_use = telegram_src.find('f"{tg_skill_hints}"')
 _tg_write = telegram_src.find("task_file.write_text(_task_content)")
