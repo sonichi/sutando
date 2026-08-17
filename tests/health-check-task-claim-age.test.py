@@ -56,6 +56,32 @@ class TestTaskClaimAge(unittest.TestCase):
         self.assertEqual(out["status"], "down")
         self.assertIn("31.2h", out["detail"])
 
+    def test_a_leaked_claim_never_renders_an_unknown_age_as_zero(self):
+        """`age or 0.0` turned an untrusted ledger into "oldest 0.0h" inside a
+        `down` verdict — the sibling branches count `age_unknown` for a reason."""
+        tasks = self.ws / "tasks"; tasks.mkdir(parents=True, exist_ok=True)
+        self.claims.mkdir(parents=True, exist_ok=True)
+        (self.claims / "task-leaked.txt").write_text(
+            "999999\nwatcher-id\n%s\nmust-handle\n" % (tasks / "task-gone.txt"))
+        with mock.patch.object(self.hc, "_claim_ages", return_value=({}, False)):
+            out = self.hc.check_task_claim_age(workspace_dir=self.ws)
+        self.assertEqual(out["status"], "down", out["detail"])
+        self.assertIn("age unknown", out["detail"])
+        self.assertNotIn("0.0h", out["detail"])
+
+    def test_a_fresh_leak_reads_in_seconds_not_zero_hours(self):
+        """Leak detection is age-INDEPENDENT — the owner pid is gone — so a
+        seconds-old leak is the common case, not a corner. `_claim` uses a LIVE
+        pid, which takes the grace-gated branch instead; this needs a dead one."""
+        tasks = self.ws / "tasks"; tasks.mkdir(parents=True, exist_ok=True)
+        self.claims.mkdir(parents=True, exist_ok=True)
+        (self.claims / "task-fresh.txt").write_text(
+            "999999\nwatcher-id\n%s\nmust-handle\n" % (tasks / "task-gone.txt"))
+        out = self.hc.check_task_claim_age(workspace_dir=self.ws)
+        self.assertEqual(out["status"], "down", out["detail"])
+        self.assertNotIn("0.0h", out["detail"])
+        self.assertRegex(out["detail"], r"oldest \d+s")
+
     def test_aging_claim_reports_warn(self):
         """Past any bounded handler run (codex-bounded caps at 240s) but not yet
         `down`: the window where the leak is still cheap to catch."""

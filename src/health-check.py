@@ -6095,7 +6095,7 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         # Age-INDEPENDENT and definitive, so it is checked FIRST: nothing can
         # release a claim whose owner is gone, whatever the ledger says.
         if pid is not None and not _pid_alive(pid):
-            leaked.append((age or 0.0, entry.name, "owner process gone"))
+            leaked.append((age, entry.name, "owner process gone"))
         elif not task_live:
             # Archival and claim release are ASYNCHRONOUS; only past that window
             # is an absent task evidence that nothing will release the claim.
@@ -6117,11 +6117,15 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no held task-handler claims"}
 
     if leaked:
-        leaked.sort(reverse=True)
+        # An unknown age sorts oldest-first: it is the one nothing can vouch for.
+        leaked.sort(key=lambda r: (r[0] is not None, r[0]))
         age, who, why = leaked[0]
+        oldest = ("age unknown" if age is None
+                  else f"oldest {age:.0f}s" if age < 3600
+                  else f"oldest {age / 3600:.1f}h")
         return {"name": name, "status": "down",
                 "detail": f"{len(leaked)} of {held} held claim(s) leaked — {why}, "
-                          f"oldest {age / 3600:.1f}h ({who}); nothing will release "
+                          f"{oldest} ({who}); nothing will release "
                           "them, and each publishes a user-visible failure when the "
                           "watcher next exits"}
     if bounded:
