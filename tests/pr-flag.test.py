@@ -70,9 +70,7 @@ def _peer_cases():
     # PRs as 1. Assert we did not reintroduce it.
     assert 2 in got, "an APPROVED peer PR must survive pruning"
 
-    # Each prune must be COUNTED, not only described: a reader who sees
-    # `complete: true` beside a record count has no other way to learn that a
-    # larger set was dropped. Measured live: 26 reported, 50 dropped.
+    # Prose cannot be compared to record_count; only a number can.
     tally = {}
     pf.peer_candidates(disc, "sonichi", tally=tally)
     assert tally == {"draft": 1, "changes_requested": 1}, \
@@ -83,9 +81,8 @@ def _peer_cases():
                     "discovery_ok": True, "owner_ok": True, "excluded": tally})
     assert scope["excluded_counts"] == {"draft": 1, "changes_requested": 1}, \
         f"scope must carry the counts, got {scope.get('excluded_counts')}"
-    # An owner PR carrying CHANGES_REQUESTED is NOT pruned -- it is mine to fix,
-    # and counting it would overstate the drop. Live: 56 non-draft CR total,
-    # 44 pruned, because 12 are the owner's own.
+    # An owner PR carrying CHANGES_REQUESTED stays in the population, so
+    # counting it as a prune would overstate the drop.
     t2 = {}
     kept = pf.peer_candidates(
         [{"number": 9, "author": {"login": "sonichi"}, "isDraft": False,
