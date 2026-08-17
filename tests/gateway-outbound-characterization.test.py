@@ -52,10 +52,8 @@ class _Base(unittest.TestCase):
         self.tmp.cleanup()
 
     def _result(self, body: str, tier: str = "owner") -> Path:
-        # The drain's guard resolves tier from the TASK file and fails closed
-        # to guest when it is absent — a result without provenance must never
-        # pass markers through. Owner provenance is therefore part of the
-        # fixture, not an accident of the pre-#2983 gateway.
+        # The drain resolves tier from the TASK file, failing closed to guest —
+        # so owner provenance must be explicit in the fixture, never an accident.
         (gw.TASKS_DIR / f"{TID}.txt").write_text(
             f"id: {TID}\ntask: characterization fixture\naccess_tier: {tier}\n")
         f = gw.RESULTS_DIR / f"{TID}.txt"
