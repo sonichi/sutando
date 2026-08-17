@@ -210,6 +210,10 @@ class FlatBareConvention(_Base):
         self._sweep()
         self.assertEqual(self.posted, [],
                          "flat bare-name copy (retired writer) IS delivered")
+        # The disposition, not the non-delivery, separates fixed from broken:
+        # without the clause this fixture quarantines (also posting nothing).
+        self.assertEqual(len(list(gw.ARCHIVE_RESULTS_DIR.glob(
+            f"{TID}-*-late-duplicate.txt"))), 1)
 
 
 class QuarantineCollision(_Base):
