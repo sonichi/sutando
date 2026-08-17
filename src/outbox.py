@@ -450,8 +450,9 @@ def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
         taken = _read_claim_at(tomb, item_id)
         if taken is None or not _same_claim(taken, observed):
             return False                  # never ours; the slot is left untouched
-        # Same inode both sides proves the slot did not turn over under us, so the
-        # unlink cannot remove a successor's claim.
+
+        # Same inode proves the slot did not turn over, so the unlink below
+        # cannot remove a successor's claim.
         if not _same_inode(p, tomb):
             return False
         try:
