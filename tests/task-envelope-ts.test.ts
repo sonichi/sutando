@@ -7,7 +7,7 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,6 +62,26 @@ describe('task_envelope.ts', () => {
 	it('key created by TS is 0600 hex and reused by Python (one shared key)', () => {
 		const raw = readFileSync(keyPath(WS), 'utf-8').trim();
 		assert.match(raw, /^[0-9a-f]{64}$/);
+	});
+
+	it('corrupt key file: never stamps under a short key, fails open instead', () => {
+		// Buffer.from(x,'hex') never throws — before the length guard, an
+		// empty or malformed key file stamped under a ZERO-LENGTH key and
+		// emitted a well-formed envelope no verifier accepts.
+		for (const bad of ['', 'zzzz', 'deadbeef', 'a'.repeat(63)]) {
+			const ws = mkdtempSync(join(tmpdir(), 'envelope-ts-badkey-'));
+			try {
+				mkdirSync(dirname(keyPath(ws)), { recursive: true });
+				writeFileSync(keyPath(ws), bad);
+				assert.throws(() => stampText(BODY, ws),
+					/invalid task-hmac key/,
+					`stampText must reject key file ${JSON.stringify(bad)}`);
+				assert.equal(tryStampText(BODY, ws), BODY,
+					`tryStampText must fail open on key file ${JSON.stringify(bad)}`);
+			} finally {
+				rmSync(ws, { recursive: true, force: true });
+			}
+		}
 	});
 
 	it('tryStampText fails open when the key location is unwritable', () => {
