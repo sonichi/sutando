@@ -200,15 +200,16 @@ TASKS_DIR = _task_dir()
 GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled task\n"
 
 
-def _replay_marker(tid: str):
-    """Sidecar proving THIS bridge authored a replay control for `tid`."""
-    return RESULTS_DIR / f"{tid}.replay"
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
 # retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
 _PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
+# tids THIS process redelivered. Must not be a file: the collaborator path is the
+# direct core with full workspace write, so any on-disk sidecar it can create is
+# provenance it can forge. Consumed once; resets on restart like the tier map.
+_REDELIVERED: "set[str]" = set()
 try:  # pragma: no cover - exercised by whichever context imports it
     from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
 except ImportError:  # pragma: no cover - flat src/ import path
@@ -564,14 +565,10 @@ def _guarded_result_body(tid: str, body: str):
     cannot be loaded — the caller leaves the file for retry rather than
     honouring redirect/attach actions on unscanned collaborator output.
     """
-    # Body equality is NOT provenance — a Team runtime can emit these bytes. The
-    # sidecar is what this bridge wrote, and it is consumed exactly once.
-    marker = _replay_marker(tid)
-    if marker.exists():
-        try:
-            marker.unlink()
-        except OSError:
-            pass
+    # Body equality is NOT provenance — a Team runtime can emit these bytes. Only
+    # this process's own record is, and it is consumed exactly once.
+    if tid in _REDELIVERED:
+        _REDELIVERED.discard(tid)
         if body == GATEWAY_REDELIVERY_RESULT:
             return body, None
     try:
@@ -1801,8 +1798,8 @@ def _write_task(task: dict) -> str | None:
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
             rfile.write_text(GATEWAY_REDELIVERY_RESULT)
             # Provenance the result BODY cannot carry: a Team runtime controls
-            # the body and can emit these exact bytes, but not this sidecar.
-            _replay_marker(tid).write_text("")
+            # the body and can emit these exact bytes, but not this process's set.
+            _REDELIVERED.add(tid)
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)

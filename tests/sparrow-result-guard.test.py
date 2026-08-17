@@ -98,7 +98,8 @@ with tempfile.TemporaryDirectory() as td:
     check(aowner == BODY_WITH_MARKERS and aowner_withheld is None,
           "a MONTH-ARCHIVED owner task still passes through byte-identical")
 
-    # Provenance is the SIDECAR, not the bytes. Same body, opposite verdicts.
+    # Provenance is THIS PROCESS'S RECORD, not the bytes and not a file. Same
+    # body, opposite verdicts.
     write_task(tasks, "task-replay", "team")
     m.RESULTS_DIR = results = pathlib.Path(td) / "results"
     results.mkdir(exist_ok=True)
@@ -106,19 +107,30 @@ with tempfile.TemporaryDirectory() as td:
     forged, forged_withheld = m._guarded_result_body(
         "task-replay", m.GATEWAY_REDELIVERY_RESULT)
     check(forged_withheld is not None,
-          "a TEAM result emitting the replay bytes WITHOUT the sidecar is withheld")
+          "a TEAM result emitting the replay bytes WITHOUT the record is withheld")
     check(not any(a.kind == "skip" for a in m.parse_markers(forged).actions),
           "and it cannot close its own lease")
 
-    m._replay_marker("task-replay").write_text("")
+    # The reason this moved off disk: the collaborator path is the direct core
+    # with full workspace write, so it can create any sidecar the guard reads.
+    # Writing the OLD sidecar by hand must no longer buy anything.
+    (results / "task-replay.replay").write_text("")
+    spoof, spoof_withheld = m._guarded_result_body(
+        "task-replay", m.GATEWAY_REDELIVERY_RESULT)
+    check(spoof_withheld is not None,
+          "a collaborator-written .replay sidecar does NOT flip the verdict")
+    check(not any(a.kind == "skip" for a in m.parse_markers(spoof).actions),
+          "so a forged sidecar still cannot close the lease")
+
+    m._REDELIVERED.add("task-replay")
     real, real_withheld = m._guarded_result_body(
         "task-replay", m.GATEWAY_REDELIVERY_RESULT)
     check(real == m.GATEWAY_REDELIVERY_RESULT and real_withheld is None,
-          "the same bytes WITH the bridge's sidecar pass untouched")
+          "the same bytes WITH this process's own record pass untouched")
     check(any(a.kind == "skip" for a in m.parse_markers(real).actions),
           "so the lease still closes silently on a real replay")
-    check(not m._replay_marker("task-replay").exists(),
-          "the sidecar is consumed exactly once, so it cannot be replayed")
+    check("task-replay" not in m._REDELIVERED,
+          "the record is consumed exactly once, so it cannot be replayed")
 
     again, again_withheld = m._guarded_result_body(
         "task-replay", m.GATEWAY_REDELIVERY_RESULT)
