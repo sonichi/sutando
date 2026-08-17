@@ -115,10 +115,10 @@ def _socket_path() -> str:
 
 def core_session() -> str:
     """The tmux session the core runs in, per the env/default contract.
-    NOT authoritative: the Claude launcher hardcodes SESSION="sutando-core"
-    (claude/cli/start-cli.sh:52) and never forwards SUTANDO_TMUX_SESSION, so an
-    exported value can name a session that does not exist. Prefer
-    _observed_session() for anything recorded."""
+    NOT authoritative: this is an unverified claim from the environment, not a
+    confirmed live session (the Claude launcher honors SUTANDO_TMUX_SESSION as
+    of claude/cli/start-cli.sh, but an exported value can still name a session
+    that never started). Prefer _observed_session() for anything recorded."""
     return os.environ.get("SUTANDO_TMUX_SESSION", "sutando-core")
 
 

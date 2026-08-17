@@ -10,10 +10,13 @@ Slack and Telegram each hand-rolled a naive `range(0, len, N)` byte-slice, so:
   contains a ```-fenced block was split mid-fence → the first message rendered a
   half-open code block and the second leaked the trailing backticks. **This is
   the user-visible bug S3 fixes** — Slack now shares this chunker.
-- **Telegram** sends plain text (no `parse_mode`), so a mid-fence split is only
-  cosmetic there; it is intentionally NOT wired here (nothing to render). If
-  Telegram ever adopts MarkdownV2, route it through `chunk_message` too — the
-  same fence-safety then becomes correctness (unbalanced entities would 400).
+- **Telegram** sends plain text (no `parse_mode`): there is nothing to render,
+  so it must NOT use `chunk_message` — the synthetic close/re-open fences that
+  transport inserts are formatting for Discord/Slack but literal extra bytes on
+  a plain-text surface. Telegram uses `chunk_plain_text`, whose contract is
+  byte-identity: the concatenation of the chunks IS the input. If Telegram ever
+  adopts MarkdownV2, switch it to `chunk_message` + real escaping — fence
+  safety then becomes correctness (unbalanced entities would 400).
 
 Pure functions only — no I/O, no bridge state — so any delivery path can adopt
 it without coupling. `chunk_message` is the single source of truth; the Discord
@@ -190,3 +193,25 @@ def chunk_message(text: str, max_len: int = 1900):
     chunk = flush()
     if chunk is not None:
         yield chunk
+
+
+def chunk_plain_text(text: str, max_len: int) -> list[str]:
+    """Split for a plain-text transport. Contract: ``"".join(result) == text``
+    (nothing inserted, nothing dropped), every chunk is 1..max_len chars, and
+    splits prefer the last newline in the window, then the last space, then a
+    hard cut for unbreakable runs."""
+    if max_len < 1:
+        raise ValueError("max_len must be >= 1")
+    chunks: list[str] = []
+    rest = text
+    while len(rest) > max_len:
+        window = rest[:max_len]
+        cut = window.rfind("\n")
+        if cut <= 0:
+            cut = window.rfind(" ")
+        cut = max_len if cut <= 0 else cut + 1   # boundary char stays left
+        chunks.append(rest[:cut])
+        rest = rest[cut:]
+    if rest:
+        chunks.append(rest)
+    return chunks
