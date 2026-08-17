@@ -198,6 +198,11 @@ TASKS_DIR = _task_dir()
 # Written by THIS bridge on replay, not by an agent — the guard must not
 # mistake its own dedup control for collaborator output.
 GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled task\n"
+
+
+def _replay_marker(tid: str):
+    """Sidecar proving THIS bridge authored a replay control for `tid`."""
+    return RESULTS_DIR / f"{tid}.replay"
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
@@ -559,10 +564,16 @@ def _guarded_result_body(tid: str, body: str):
     cannot be loaded — the caller leaves the file for retry rather than
     honouring redirect/attach actions on unscanned collaborator output.
     """
-    # Written by THIS bridge on replay, never by an agent. A replay can span
-    # hundreds of tasks, each becoming a posted "withheld" warning if scanned.
-    if body == GATEWAY_REDELIVERY_RESULT:
-        return body, None
+    # Body equality is NOT provenance — a Team runtime can emit these bytes. The
+    # sidecar is what this bridge wrote, and it is consumed exactly once.
+    marker = _replay_marker(tid)
+    if marker.exists():
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        if body == GATEWAY_REDELIVERY_RESULT:
+            return body, None
     try:
         guard, resolve = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
@@ -1789,6 +1800,9 @@ def _write_task(task: dict) -> str | None:
         if not rfile.exists():
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
             rfile.write_text(GATEWAY_REDELIVERY_RESULT)
+            # Provenance the result BODY cannot carry: a Team runtime controls
+            # the body and can emit these exact bytes, but not this sidecar.
+            _replay_marker(tid).write_text("")
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)

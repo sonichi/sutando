@@ -98,15 +98,32 @@ with tempfile.TemporaryDirectory() as td:
     check(aowner == BODY_WITH_MARKERS and aowner_withheld is None,
           "a MONTH-ARCHIVED owner task still passes through byte-identical")
 
-    # The bridge writes this control ITSELF on replay. Scanning it turned a silent
-    # dedup into a posted warning — and a replay can span hundreds of tasks.
+    # Provenance is the SIDECAR, not the bytes. Same body, opposite verdicts.
     write_task(tasks, "task-replay", "team")
-    redeliv, redeliv_withheld = m._guarded_result_body(
+    m.RESULTS_DIR = results = pathlib.Path(td) / "results"
+    results.mkdir(exist_ok=True)
+
+    forged, forged_withheld = m._guarded_result_body(
         "task-replay", m.GATEWAY_REDELIVERY_RESULT)
-    check(redeliv == m.GATEWAY_REDELIVERY_RESULT and redeliv_withheld is None,
-          "the gateway's OWN redelivery control is not scanned as agent output")
-    check(any(a.kind == "skip" for a in m.parse_markers(redeliv).actions),
-          "and it still parses as a skip, so the lease closes silently")
+    check(forged_withheld is not None,
+          "a TEAM result emitting the replay bytes WITHOUT the sidecar is withheld")
+    check(not any(a.kind == "skip" for a in m.parse_markers(forged).actions),
+          "and it cannot close its own lease")
+
+    m._replay_marker("task-replay").write_text("")
+    real, real_withheld = m._guarded_result_body(
+        "task-replay", m.GATEWAY_REDELIVERY_RESULT)
+    check(real == m.GATEWAY_REDELIVERY_RESULT and real_withheld is None,
+          "the same bytes WITH the bridge's sidecar pass untouched")
+    check(any(a.kind == "skip" for a in m.parse_markers(real).actions),
+          "so the lease still closes silently on a real replay")
+    check(not m._replay_marker("task-replay").exists(),
+          "the sidecar is consumed exactly once, so it cannot be replayed")
+
+    again, again_withheld = m._guarded_result_body(
+        "task-replay", m.GATEWAY_REDELIVERY_RESULT)
+    check(again_withheld is not None,
+          "a second use of the same bytes is withheld again")
 
     # An agent-produced [no-send] on a Team task stays forbidden.
     write_task(tasks, "task-mark", "team")
