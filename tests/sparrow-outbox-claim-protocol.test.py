@@ -728,6 +728,13 @@ def _c23():
         assert legacy_after == [], (
             f"alias spelling still uses legacy locks after activation "
             f"({legacy_after}) — root cache keyed on raw path, namespaces straddled")
+        assert activate(canonical) is False, "second activation must be a no-op"
+        # a FRESH process reads the fence from disk, not from this one's cache
+        need(m, "_STRIPE_MODE").clear()
+        assert acquire(canonical, "task-fresh-proc", "D1") is True
+        assert release(canonical, "task-fresh-proc", "D1") is True
+        stripes = [f.name for f in (canonical / locks_dir).glob("stripe-*.lock")]
+        assert stripes, "fresh-process disk read of a valid fence must stripe"
 
 
 def main() -> int:
