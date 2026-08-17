@@ -82,6 +82,38 @@ class TestTaskClaimAge(unittest.TestCase):
         self.assertNotIn("0.0h", out["detail"])
         self.assertRegex(out["detail"], r"oldest \d+s")
 
+    def test_the_named_leak_is_the_OLDEST_not_the_youngest(self):
+        """Review finding on the first draft: sorting ascending to put `None`
+        first also reversed the known ages, so the line named the youngest leak
+        "oldest". A single-claim fixture cannot see it — every ordering agrees."""
+        tasks = self.ws / "tasks"; tasks.mkdir(parents=True, exist_ok=True)
+        self.claims.mkdir(parents=True, exist_ok=True)
+        for name in ("task-old.txt", "task-new.txt"):
+            (self.claims / name).write_text(
+                "999999\nwatcher-id\n%s\nmust-handle\n" % (tasks / "task-gone.txt"))
+        ages = {"task-old.txt": 6 * 3600.0, "task-new.txt": 60.0}
+        with mock.patch.object(self.hc, "_claim_ages", return_value=(ages, True)):
+            out = self.hc.check_task_claim_age(workspace_dir=self.ws)
+        self.assertEqual(out["status"], "down", out["detail"])
+        self.assertIn("oldest 6.0h", out["detail"])
+        self.assertIn("task-old.txt", out["detail"])
+        self.assertNotIn("task-new.txt", out["detail"])
+
+    def test_an_unknown_age_still_outranks_a_known_one(self):
+        """Unknown sorts first even against an older known age: nothing can
+        vouch for it, so it is the one the operator must look at."""
+        tasks = self.ws / "tasks"; tasks.mkdir(parents=True, exist_ok=True)
+        self.claims.mkdir(parents=True, exist_ok=True)
+        for name in ("task-known.txt", "task-unknown.txt"):
+            (self.claims / name).write_text(
+                "999999\nwatcher-id\n%s\nmust-handle\n" % (tasks / "task-gone.txt"))
+        with mock.patch.object(self.hc, "_claim_ages",
+                               return_value=({"task-known.txt": 9 * 3600.0}, False)):
+            out = self.hc.check_task_claim_age(workspace_dir=self.ws)
+        self.assertEqual(out["status"], "down", out["detail"])
+        self.assertIn("age unknown", out["detail"])
+        self.assertIn("task-unknown.txt", out["detail"])
+
     def test_aging_claim_reports_warn(self):
         """Past any bounded handler run (codex-bounded caps at 240s) but not yet
         `down`: the window where the leak is still cheap to catch."""

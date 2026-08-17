@@ -6117,8 +6117,9 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no held task-handler claims"}
 
     if leaked:
-        # An unknown age sorts oldest-first: it is the one nothing can vouch for.
-        leaked.sort(key=lambda r: (r[0] is not None, r[0]))
+        # Unknown first — nothing can vouch for it — then genuinely oldest. The
+        # negation matters: a plain ascending key names the YOUNGEST leak "oldest".
+        leaked.sort(key=lambda r: (r[0] is not None, -(r[0] or 0.0)))
         age, who, why = leaked[0]
         oldest = ("age unknown" if age is None
                   else f"oldest {age:.0f}s" if age < 3600
