@@ -212,9 +212,8 @@ def _integer_ids_are_proof():
     classify = need(m, "classify_response")
     from outbox import DeliveryOutcome as O  # noqa: PLC0415
 
-    # skills/agent-room-ops/receipt.py answers the same question about the same
-    # gateway envelope and accepts (str, int). A str-only rule here means one
-    # reader archives an integer-id reply while the other re-sends it.
+    # receipt.py answers this for the same envelope and accepts (str, int); a
+    # str-only rule here means one reader archives what the other re-sends.
     r = classify(200, {"event_id": 12345})
     assert r.outcome == O.CONFIRMED and r.receipt_id == "12345", (
         f"got {r.outcome} / {r.receipt_id!r}; an integer event_id is the same "
@@ -235,9 +234,8 @@ def _ts_is_not_a_receipt():
     classify = need(m, "classify_response")
     from outbox import DeliveryOutcome as O  # noqa: PLC0415
 
-    # The default's job is to be safe for the caller who forgot to pin. `ts` is a
-    # Slack idiom; on this envelope it is a send time, so confirming on it would
-    # archive an item the provider never proved it delivered.
+    # `ts` is a Slack idiom; here it is a send time, so confirming on it would
+    # archive an item nothing proved was delivered.
     r = classify(200, {"ok": True, "ts": "1699.000"})
     assert r.outcome == O.OUTCOME_UNKNOWN and r.receipt_id is None, (
         f"got {r.outcome} / {r.receipt_id!r}; `ts` must not be in the default "

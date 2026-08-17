@@ -28,8 +28,7 @@ except ImportError:  # pragma: no cover - exercised by whichever import wins
     from outbox import DeliveryOutcome, RetrySafety
 
 # Keys providers use for "here is the thing I created". Order is preference.
-# `ts` is deliberately absent: on this envelope it is a send timestamp, not a
-# receipt, so the default must not read it as proof for a caller who forgot to pin.
+# `ts` is excluded: here it is a send time, not a receipt.
 _ID_KEYS = ("event_id", "message_id", "id")
 
 
