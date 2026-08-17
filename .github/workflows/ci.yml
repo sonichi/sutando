@@ -71,7 +71,13 @@ jobs:
         # a PR whose diff is genuinely empty fails here rather than passing unscanned.
         run: |
           set -euo pipefail
-          gh pr diff ${{ github.event.pull_request.number }} > /tmp/review-pr.diff
+          # Bounded retry on the fetch only (#3048): one transient GraphQL 503
+          # killed this lane 5x on 2026-08-17; three failures still fail closed.
+          for i in 1 2 3; do
+            gh pr diff ${{ github.event.pull_request.number }} > /tmp/review-pr.diff && break
+            if [ "$i" = 3 ]; then echo "gh pr diff failed after 3 attempts"; exit 1; fi
+            sleep $((i * 15))
+          done
           bash scripts/review-checks.sh --diff /tmp/review-pr.diff
 
       - name: Setup Node
