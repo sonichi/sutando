@@ -824,10 +824,16 @@ def test_team_request_injection_stays_inside_json_boundary() -> None:
         assert "\\n--- END TEAM REQUEST JSON ---\\n" in encoded
 
 
-def test_both_spawn_sites_forbid_a_second_watcher_and_the_guardrail_does_not() -> None:
+def test_workstream_spawn_forbids_a_second_watcher_and_the_guardrail_does_not() -> None:
     """A delegated handler is a `claude`/`codex` subprocess inside this checkout, so it
     loads CLAUDE.md and reaches "ensure a task watcher is running". Two watchers means
     every task is emitted and processed twice.
+
+    `_prompt` is the LIVE spawn site — the only one `handle()` can reach. `_team_prompt`
+    is currently unreachable through it: `probe()` returns UNHANDLED for every Team task
+    and `handle()` exits on that before the Team branch, so its clause is defense against
+    a DIRECT call, not routing coverage. This test asserts it as exactly that, and the
+    route-level fact stays pinned by the existing Team-never-launches regression.
 
     The prohibition lives at the SPAWN SITES, never in TEAM_GUARDRAIL: that text is also
     injected in-band by the gateway into task files the LIVE CORE reads, and telling the
@@ -840,12 +846,15 @@ def test_both_spawn_sites_forbid_a_second_watcher_and_the_guardrail_does_not() -
         task = _task(Path(td), "task-watcher-scope", "team")
         task.write_text("id: task-watcher-scope\naccess_tier: team\ntask: do a thing\n")
 
-        for name, prompt in (("team", worker._team_prompt(task)),
-                             ("workstream", worker._prompt(task))):
-            lead = prompt.split("--- BEGIN TEAM REQUEST JSON ---", 1)[0]
-            assert "not start a task watcher" in lead, name
-            assert "not the live Sutando core" in lead, name
-            assert "core status or liveness state" in lead, name
+        # The live path. This is the assertion the fix exists for.
+        lead = worker._prompt(task).split("--- BEGIN TEAM REQUEST JSON ---", 1)[0]
+        assert "not start a task watcher" in lead
+        assert "not the live Sutando core" in lead
+        assert "core status or liveness state" in lead
+
+        # Unreachable-defense only: `_team_prompt` carries the same clause so a direct
+        # call cannot regress, but reaching it through handle() is NOT claimed here.
+        assert "not start a task watcher" in worker._team_prompt(task)
 
         # The boundary itself. If a later change "tidies" this into the shared
         # guardrail, the gateway starts telling the live core to stop watching.
@@ -1903,7 +1912,7 @@ if __name__ == "__main__":
     test_team_provider_cannot_rewrite_a_lazy_scanner_dependency()
     test_team_scanner_warmup_allows_optional_detector_and_rejects_bad_contract()
     test_team_request_injection_stays_inside_json_boundary()
-    test_both_spawn_sites_forbid_a_second_watcher_and_the_guardrail_does_not()
+    test_workstream_spawn_forbids_a_second_watcher_and_the_guardrail_does_not()
     test_team_result_filter_uses_runtime_fallback_patterns()
     test_team_output_injection_cannot_control_bridge_delivery()
     test_handle_never_invokes_a_runtime_for_team()
