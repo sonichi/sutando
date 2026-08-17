@@ -717,7 +717,7 @@ def _c23():
         # prime the alias spelling BEFORE activation (caches legacy mode)
         assert acquire(alias, "task-alias", "D1") is True
         assert release(alias, "task-alias", "D1") is True
-        activate(canonical)                        # deploy step, canonical spelling
+        activate(canonical)
         # the alias must see stripe mode too — a raw-string cache leaves it
         # on legacy locks, straddling namespaces within one process
         assert acquire(alias, "task-alias-2", "D1") is True
