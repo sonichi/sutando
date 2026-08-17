@@ -249,17 +249,55 @@ class RuntimeServer:
         tls_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(tls_dir, 0o700)
         cert, key = tls_dir / "cert.pem", tls_dir / "key.pem"
-        if not (cert.exists() and key.exists()):
+        san = self._tls_san_list()
+        if not (cert.exists() and key.exists()) \
+                or not self._cert_covers(cert, san):
             subprocess.run(
                 ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                  "-keyout", str(key), "-out", str(cert), "-days", "825",
-                 "-subj", "/CN=sutando-server"],
+                 "-subj", "/CN=sutando-server",
+                 "-addext", "subjectAltName=" + ",".join(san)],
                 check=True, capture_output=True)
             os.chmod(key, stat.S_IRUSR | stat.S_IWUSR)
-            _log(f"generated self-signed TLS cert at {tls_dir}")
+            _log(f"generated self-signed TLS cert at {tls_dir} "
+                 f"(SAN: {', '.join(san)})")
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(cert), str(key))
         return ctx
+
+    @staticmethod
+    def _tls_san_list() -> "list[str]":
+        """SAN entries for the self-signed cert. Browsers reject SAN-less
+        certs outright (CN is ignored since ~2017), so the cert must name
+        every way a phone reaches this host: the mDNS .local name (stable
+        across DHCP), localhost, and current non-loopback IPv4s."""
+        import socket
+        names = {"DNS:localhost", "IP:127.0.0.1"}
+        host = socket.gethostname().split(".")[0]
+        if host:
+            names.add(f"DNS:{host}.local")
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None,
+                                           socket.AF_INET):
+                addr = info[4][0]
+                if not addr.startswith("127."):
+                    names.add(f"IP:{addr}")
+        except OSError:
+            pass
+        return sorted(names)
+
+    @staticmethod
+    def _cert_covers(cert: Path, san: "list[str]") -> bool:
+        """True iff every wanted SAN entry already appears in the cert —
+        a DHCP-moved LAN IP or renamed host triggers regeneration."""
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["openssl", "x509", "-in", str(cert), "-noout", "-text"],
+                check=True, capture_output=True, text=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            return False
+        return all(e.split(":", 1)[1] in out for e in san)
 
     def _start_advertiser(self, agent: "str | None", port: int):
         """mDNS-announce the SCP listener (_sutando-scp._tcp) as a CHILD of this
