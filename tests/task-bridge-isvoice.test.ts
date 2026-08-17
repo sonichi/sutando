@@ -14,15 +14,8 @@ import { join, dirname } from 'node:path';
 // archive lookup all surface a voice task; non-voice content stays false; missing
 // task files stay false.
 
-// Fixtures go to a per-run tmp workspace, NEVER the live queue (#3035): the
-// old form wrote owner-tier task files into `resolveWorkspace()/tasks/`, where
-// a running core's watcher claims them — writeFileSync → (watcher emit,
-// dispatcher claim) → unlinkSync is a race the live core can win. Same
-// redirect the delimiter suite uses: SUTANDO_TEST_MODE=1 makes
-// resolveWorkspace() honor SUTANDO_WORKSPACE (sutando_config.ts test-only
-// hatch), and the top-level `await import` below runs in source order —
-// AFTER these lines — where a hoisted static import of task-bridge.js would
-// capture the ambient workspace before the env-set executed.
+// Fixtures use a tmp workspace, never the live queue (#3035): SUTANDO_TEST_MODE=1
+// must be set before the source-ordered `await import` binds the bridge's paths.
 const TMP = mkdtempSync(join(tmpdir(), 'sutando-isvoice-archive-test-'));
 process.env.SUTANDO_WORKSPACE = TMP;
 process.env.SUTANDO_TEST_MODE = '1';
@@ -80,10 +73,8 @@ describe('_isVoiceTask — archive-path coverage', () => {
 	});
 
 	it('resolves against the redirected tmp workspace, not the live queue (#3035)', () => {
-		// The redirect above is what keeps every fixture in this file out of
-		// the live queue; assert it held, so a future resolver change that
-		// silently drops the test-mode hatch fails HERE instead of leaking
-		// owner-tier fixtures back into a running core's watcher.
+		// If the resolver ever drops the test-mode hatch, fail HERE instead of
+		// silently leaking owner-tier fixtures back into a live core's watcher.
 		const id = 'task-isvoice-test-redirect-aaa';
 		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY);
 		assert.equal(_isVoiceTask(id), true,
@@ -129,9 +120,8 @@ describe('_isVoiceTask — archive-path coverage', () => {
 	});
 
 	it('ignores non-month-shaped subdirs (e.g. "done", "tmp")', () => {
-		// Stray subdirs under tasks/archive/ shouldn't trip the regex; they
-		// won't be scanned. Negative-control: a voice task placed under a
-		// non-month-shaped subdir is NOT found, confirming the regex gate.
+		// Negative-control: a voice task under a non-month-shaped subdir is
+		// NOT found, confirming the YYYY-MM regex gate.
 		const id = 'task-isvoice-test-stray-subdir-aaa';
 		writeTask(join(ARCHIVE_DIR, 'done', `${id}.txt`), VOICE_BODY);
 		assert.equal(_isVoiceTask(id), false);
