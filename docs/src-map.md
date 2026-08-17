@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-237 modules indexed.
+238 modules indexed.
 
 ## `src/`
 
@@ -84,6 +84,8 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
 - **`orphan_result_routes.py`** — Routes for results whose task a bridge never saw.
+- **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
+- **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
@@ -260,7 +262,6 @@ and re-run `python3 scripts/gen-src-map.py`.
 ## `src/runtime-api/`
 
 - **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
-- **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
 - **`device_store.py`** — device_store.py — per-device SCP credentials + pairing (opaque-bearer v0).
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
