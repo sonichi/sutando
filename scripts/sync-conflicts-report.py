@@ -16,6 +16,10 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
 
+# Distinct from None: None means the live path is absent, this means it exists
+# and is not a file, so no line-level comparison is possible either way.
+NOT_A_FILE = "not-a-file"
+
 
 def _by_section(text: str):
     """Yield (heading, line) for every line, heading = nearest one ABOVE it."""
@@ -129,6 +133,11 @@ def unmerged(workspace: pathlib.Path):
             if not live.exists():
                 out.append((batch.name, rel, None))
                 continue
+            # A saved path can resolve to a directory, which read_text() cannot
+            # read. Non-comparable is not reconciled, so the row stays.
+            if not live.is_file():
+                out.append((batch.name, rel, NOT_A_FILE))
+                continue
             live_text = live.read_text(errors="replace")
             extra = _new_content(saved_text, live_text)
             if extra:
@@ -226,6 +235,8 @@ def main() -> int:
     for batch, rel, n in rows:
         if n is None:
             where = "live file MISSING"
+        elif n == NOT_A_FILE:
+            where = "live path is NOT A FILE — not comparable, not reconciled"
         else:
             total, absent, resectioned = n
             # Name WHICH kind: `absent` may be real loss, `under another
