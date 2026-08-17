@@ -628,6 +628,23 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 }
 
 let lastResumeTime = 0;
+// A pause blocked for want of a keyword; a repeat within this window is honoured.
+let lastKeywordBlockTime = 0;
+export const KEYWORD_BLOCK_RETRY_MS = 60_000;
+const PAUSE_KEYWORDS = /\b(pause|stop|hold|wait)\b/;
+
+/**
+ * Pause-guard policy. The keyword check exists so a Gemini hallucination outside
+ * the 8s audio cooldown cannot pause on its own. It fails closed against the user
+ * instead when ASR mangles the command — which is likeliest precisely when he is
+ * repeating a request that was already ignored. So a keyword-less pause is blocked
+ * on its FIRST occurrence and honoured if it recurs inside the retry window: one
+ * stray call still cannot pause, a persistent request gets through.
+ */
+export function pauseKeywordGuard(recent: string, msSinceLastBlock: number): 'allow' | 'block' {
+	if (!recent || PAUSE_KEYWORDS.test(recent)) return 'allow';
+	return msSinceLastBlock > KEYWORD_BLOCK_RETRY_MS ? 'block' : 'allow';
+}
 
 export const playVideoTool: ToolDefinition = {
 	name: 'play_video',
@@ -710,10 +727,16 @@ export const pauseVideoTool: ToolDefinition = {
 		// outside the 8s cooldown still fires (Susan's 2026-04-16 report).
 		// Picks freshest of voice-agent vs phone transcript; fail-open if neither is fresh.
 		const recent = getRecentUserSpeech();
-		if (recent && !/\b(pause|stop|hold|wait)\b/.test(recent)) {
+		const sinceBlock = Date.now() - lastKeywordBlockTime;
+		if (pauseKeywordGuard(recent, sinceBlock) === 'block') {
+			lastKeywordBlockTime = Date.now();
 			console.log(`${ts()} [PauseVideo] BLOCKED — no pause keyword in recent user speech: "${recent.slice(-80)}"`);
 			return { status: 'playing', instruction: 'Video is still playing. Only pause when user explicitly says "pause" or "stop".' };
 		}
+		if (recent && !PAUSE_KEYWORDS.test(recent)) {
+			console.log(`${ts()} [PauseVideo] keyword guard overridden — repeat call ${sinceBlock}ms after a block: "${recent.slice(-80)}"`);
+		}
+		lastKeywordBlockTime = 0;
 		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'if (count of documents) > 0 then', '-e', 'pause document 1', '-e', 'end if', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
