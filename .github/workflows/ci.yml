@@ -57,22 +57,38 @@ jobs:
       # the guide's lessons gate EVERY PR — not just reviews that use the codex
       # tool. `gh pr diff` needs no history/fetch-depth. PR events only (a push to
       # main has no PR diff). See docs + scripts/review-checks.sh.
-      - name: Review checks (REVIEW.md)
+      # A PRECONDITION gets its own named step. Bundled into the step named after
+      # the assertion, a fetch failure reports as "Review checks (REVIEW.md)" —
+      # loud, but pointing at the wrong thing. Measured 2026-08-17 on #3049: a
+      # GitHub 503 on `gh pr diff` surfaced as `tsc + tests (clean install)`
+      # failing on a PR whose checks passed locally. Fail-closed kept its value;
+      # the LABEL cost the diagnosis. Retry first, because a non-zero exit on the
+      # first transient of a backend failing ~40% of calls trains re-run-without-
+      # reading, which is the attention this gate needs when it is right.
+      - name: Fetch PR diff (precondition)
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-        # Materialize the diff BEFORE scanning and fail closed if `gh pr diff`
-        # errors (#2281, Qingyun review). The old `gh pr diff … | review-checks.sh`
-        # pipe reported the pipeline's LAST exit status, so a failed `gh pr diff`
-        # (auth/rate-limit/network) sent an empty diff to the scanner, which
-        # printed "empty diff — nothing to check" and exited 0 → the gate passed
-        # WITHOUT scanning the PR. `set -euo pipefail` + `--diff` closes that.
-        # The runner now also exits 2 on an empty diff, so both ends fail closed;
-        # a PR whose diff is genuinely empty fails here rather than passing unscanned.
         run: |
           set -euo pipefail
-          gh pr diff ${{ github.event.pull_request.number }} > /tmp/review-pr.diff
-          bash scripts/review-checks.sh --diff /tmp/review-pr.diff
+          for attempt in 1 2 3; do
+            if gh pr diff ${{ github.event.pull_request.number }} > /tmp/review-pr.diff; then
+              exit 0
+            fi
+            echo "gh pr diff failed (attempt $attempt/3); retrying" >&2
+            sleep $((attempt * 5))
+          done
+          echo "PRECONDITION FAILED: could not fetch the PR diff after 3 attempts." >&2
+          echo "This is NOT a review-checks finding — nothing was scanned." >&2
+          exit 1
+
+      # Runs the machine-readable `checks:` block from REVIEW.md (today: the
+      # hardcoded-path scan) over the diff the step above materialized, so the
+      # guide's lessons gate EVERY PR. The runner exits 2 on an empty diff, so a
+      # PR whose diff is genuinely empty fails here rather than passing unscanned.
+      - name: Review checks (REVIEW.md)
+        if: github.event_name == 'pull_request'
+        run: bash scripts/review-checks.sh --diff /tmp/review-pr.diff
 
       - name: Setup Node
         uses: actions/setup-node@v4
