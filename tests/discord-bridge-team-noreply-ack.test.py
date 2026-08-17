@@ -57,10 +57,8 @@ check("EVEN WHEN it restates technical detail" in noreply,
 check("not whether the content" in noreply and "looks technical" in noreply,
       "NO-REPLY states the discriminator, not just examples")
 
-# The scoping is what makes the assertions above able to fail. Prove the
-# extraction is really narrower than the file, using a token unique to action 1:
-# "RUN CODEX" is NOT such a token — action 3's own first bullet routes prose
-# there by name, so excluding it failed against a correct fix.
+# Token must be unique to action 1: bare "RUN CODEX" is not, since action 3's
+# own first bullet routes prose there by name.
 check("1. RUN CODEX" not in noreply and "codex-bounded.sh" not in noreply,
       "extraction is scoped — action 1's body is outside the NO-REPLY slice")
 check("ASKS FOR NOTHING" in team,
