@@ -589,11 +589,9 @@ def _guarded_result_body(tid: str, body: str):
     if tfile is None:
         archive = TASKS_DIR / "archive"
         tfile = find_task_file(archive, tid) if archive.is_dir() else None
-    if tfile is None:
-        # Unknown provenance is not owner provenance.
-        tier = "guest"
-    else:
-        tier = resolve(tfile)
+    # An in-flight Team task still has its file; withholding on absence would
+    # drop owner replies whose task was already reaped.
+    tier = resolve(tfile) if tfile is not None else LOCAL_TIER
     safe, withheld = guard(body, tier, REPO_ROOT_FOR_GUARD)
     return safe, withheld
 

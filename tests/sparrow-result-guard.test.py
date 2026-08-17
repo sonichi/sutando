@@ -74,10 +74,18 @@ with tempfile.TemporaryDirectory() as td:
         check("redirect" not in kinds and "attach" not in kinds,
               "a WITHHELD team body yields no redirect and no attach action")
 
-    # --- unknown provenance is not owner provenance
+    # No task file falls back to the baseline tier, not to guarded: an in-flight
+    # Team task still has its file, so the threat keeps its guard either way.
+    m.LOCAL_TIER = "owner"
     body_nofile, _ = m._guarded_result_body("task-doesnotexist", BODY_WITH_MARKERS)
-    check(body_nofile != BODY_WITH_MARKERS,
-          "a result whose task file is GONE is treated as guarded, not owner")
+    check(body_nofile == BODY_WITH_MARKERS,
+          "no task file + owner baseline delivers (a reaped task is not a Team task)")
+
+    m.LOCAL_TIER = "team"
+    body_teamhost, _ = m._guarded_result_body("task-doesnotexist", BODY_WITH_MARKERS)
+    check(body_teamhost != BODY_WITH_MARKERS,
+          "no task file on a TEAM-baseline host is still guarded")
+    m.LOCAL_TIER = "owner"
 
     # --- guard unavailable fails CLOSED: the caller gets None and retries
     m._TEAM_GUARD_FNS = (None, None)
