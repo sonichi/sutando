@@ -21,6 +21,8 @@ import json
 import os
 import time
 
+from .chat_secret_filter import filter_chat_secrets
+
 MEANINGFUL_TYPES = frozenset({
     "message.created", "message.edited", "reaction.added",
     "member.joined", "member.left",
@@ -129,6 +131,9 @@ class TaskifyHandler:
         for ev in batch[:20]:
             content = ev.get("content") or {}
             text = str(content.get("body") or content.get("text") or "")
+            # Redact BEFORE the 120-char cut: truncating first can split a token
+            # so no pattern matches it, persisting a recognisable partial secret.
+            text = filter_chat_secrets(text).text if text else ""
             text = text.splitlines()[0][:120] if text else ""
             summaries.append(f"- [{ev.get('type')}] {ev.get('actor_id') or '?'}"
                              + (f": {text}" if text else ""))
