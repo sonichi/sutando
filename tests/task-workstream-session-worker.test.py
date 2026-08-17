@@ -1504,8 +1504,11 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             "done\n"
             "[ \"$probe\" = 1 ] && exit 0\n"
             "basename \"$task_file\" >> \"$HANDLER_CALLS\"\n"
+            ": > \"$HANDLER_STARTS/$(basename \"$task_file\")\"\n"
             "sleep 10\n",
         )
+        starts = root / "starts"
+        starts.mkdir()
         bin_dir = root / "bin"
         bin_dir.mkdir()
         _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 10\n")
@@ -1515,6 +1518,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
                 **os.environ,
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
                 "HANDLER_CALLS": str(calls),
+                "HANDLER_STARTS": str(starts),
                 "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
                 "SUTANDO_TASK_EVENT_HANDLER": str(handler),
                 "SUTANDO_CORE_RUNTIME": "claude",
@@ -1533,6 +1537,7 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
                 time.sleep(0.01)
             assert sorted(path.name for path in claims.glob("task-*.txt")) == names
 
+            terminated_at = time.time()
             os.killpg(process.pid, signal.SIGTERM)
             stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
             process = None
@@ -1551,9 +1556,17 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
             assert not remaining_claims
             assert fallback_names == names
             handler_calls = calls.read_text().splitlines()
-            # The cap is a concurrency bound; without the contents a breach
-            # reports a bare AssertionError and says nothing about which ran.
-            assert len(handler_calls) <= 2, handler_calls
+            started_at = {
+                path.name: path.stat().st_mtime for path in starts.iterdir()
+            }
+            # Contents alone cannot say whether the cap over-dispatched or
+            # shutdown failed to stop dispatching; the signal instant can.
+            after_signal = sorted(
+                name for name, at in started_at.items() if at > terminated_at
+            )
+            assert len(handler_calls) <= 2, (
+                handler_calls, started_at, terminated_at, after_signal, repr(stderr)
+            )
             deadline = time.monotonic() + WORKER_EXIT_S
             while time.monotonic() < deadline:
                 try:
