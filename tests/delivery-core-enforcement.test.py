@@ -347,5 +347,44 @@ class FenceFaults(unittest.TestCase):
                              "no fence temp file may survive")
 
 
+class CreateExclusive(unittest.TestCase):
+    """Shared no-clobber primitive: the CE-4 / quarantine-writer class.
+    Two racing creators -> exactly one True; the loser's bytes are never
+    visible at the destination at any point."""
+
+    def test_single_winner_and_no_clobber(self):
+        from ag2_sparrow.delivery_core.fsutil import create_exclusive
+        with tempfile.TemporaryDirectory(prefix="enf-cx-") as td:
+            dst = Path(td) / "slot"
+            self.assertTrue(create_exclusive(dst, b"winner"))
+            self.assertFalse(create_exclusive(dst, b"loser"))
+            self.assertEqual(dst.read_bytes(), b"winner")
+            self.assertEqual([p.name for p in Path(td).iterdir()], ["slot"],
+                             "loser must leave no temp debris")
+
+    def test_falsifier_racing_creators_exactly_one_wins(self):
+        import threading
+        from ag2_sparrow.delivery_core.fsutil import create_exclusive
+        for _round in range(20):
+            with tempfile.TemporaryDirectory(prefix="enf-cx-r-") as td:
+                dst = Path(td) / "slot"
+                results = {}
+                gate = threading.Barrier(4)
+
+                def racer(name):
+                    gate.wait()
+                    results[name] = create_exclusive(dst, name.encode())
+                ts = [threading.Thread(target=racer, args=(f"w{i}",))
+                      for i in range(4)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join()
+                winners = [n for n, ok in results.items() if ok]
+                self.assertEqual(len(winners), 1, f"winners={winners}")
+                self.assertEqual(dst.read_bytes(), winners[0].encode(),
+                                 "destination must hold the winner's bytes")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
