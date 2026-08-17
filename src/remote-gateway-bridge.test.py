@@ -529,6 +529,11 @@ def main() -> int:
     # user-facing delivery.
     _before = len(STATE["results"])
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    rtc.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    # Explicit owner provenance: this control proves owner marker
+    # compatibility, so it must not rely on absence meaning owner.
+    (rtc.TASKS_DIR / "task-MARK.txt").write_text(
+        "id: task-MARK\naccess_tier: owner\ntask: fixture\n")
     (rtc.RESULTS_DIR / "task-MARK.txt").write_text("[no-send]\n")
     rtc._post_ready_results({"task-MARK"})
     _posted = STATE["results"][_before:]

@@ -185,6 +185,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
+from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -194,8 +195,6 @@ from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
 TASKS_DIR = _task_dir()
-# Guard scans load the repo's scanner; resolve the root once, from this file.
-REPO_ROOT_FOR_GUARD = Path(__file__).resolve().parents[3]
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
@@ -543,58 +542,30 @@ def _token_from_vault_ag2space(vault_get=None):
     return tok
 
 
-_TEAM_GUARD_FNS: "tuple | None" = None
-
-
 def _team_guard_fns():
-    """Lazily locate the monorepo `src/team_result_guard.py`; memoized.
-    Returns (None, None) on failure — callers MUST withhold, never deliver."""
-    global _TEAM_GUARD_FNS
-    if _TEAM_GUARD_FNS is not None:
-        return _TEAM_GUARD_FNS
-    try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "team_result_guard.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
-        if not src:
-            _TEAM_GUARD_FNS = (None, None)
-            return _TEAM_GUARD_FNS
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from team_result_guard import guard_result_for_tier, resolve_access_tier
-        _TEAM_GUARD_FNS = (guard_result_for_tier, resolve_access_tier)
-    except Exception:
-        _TEAM_GUARD_FNS = (None, None)
-    return _TEAM_GUARD_FNS
+    """Return (guard_result_for_tier, resolve_access_tier) from the BUNDLED module.
+    Sibling import only — an installed wheel has no monorepo `src/` to walk to."""
+    from .team_result_guard import guard_result_for_tier, resolve_access_tier
+    return guard_result_for_tier, resolve_access_tier
 
 
 def _guarded_result_body(tid: str, body: str):
     """Scan a non-owner result BEFORE any marker is interpreted.
 
-    Returns (safe_body, withheld_reason), or (None, reason) when the shared
-    guard cannot be loaded — the caller leaves the file for retry rather than
+    Returns (safe_body, withheld_reason), or (None, reason) when the guard
+    cannot be loaded — the caller leaves the file for retry rather than
     honouring redirect/attach actions on unscanned collaborator output.
     """
-    guard, resolve = _team_guard_fns()
-    if guard is None or resolve is None:
-        return None, "team_result_guard unavailable"
-    tfile = find_task_file(TASKS_DIR, tid)
-    if tfile is None:
-        archive = TASKS_DIR / "archive"
-        tfile = find_task_file(archive, tid) if archive.is_dir() else None
-    if tfile is None:
-        # The threat is a Team task, which is in flight and has its file. Scanning
-        # results we cannot attribute withholds owner mail for no added coverage.
-        return body, None
-    safe, withheld = guard(body, resolve(tfile), REPO_ROOT_FOR_GUARD)
-    return safe, withheld
+    try:
+        guard, resolve = _team_guard_fns()
+        from .chat_secret_filter import filter_chat_secrets
+    except Exception as exc:
+        return None, f"team_result_guard unavailable: {exc}"
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    # Absence is not owner provenance: a month-archived Team task is exactly the
+    # case that would otherwise fall open.
+    tier = resolve(tfile) if tfile is not None else "guest"
+    return guard(body, tier, None, secret_filter=filter_chat_secrets)
 
 
 _VAULT_INTERCEPT_FNS: "tuple | None" = None
