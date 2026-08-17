@@ -57,10 +57,44 @@ check(hc.bridge_log_content_status("slack-bridge", "ok", ok_tail, slack_enrolled
 check(hc.bridge_log_content_status("telegram-bridge", "ok", TAIL, slack_enrolled=False) is None,
       "the slack branch does not fire for telegram")
 
-# Default path: omitting the flag must still work (it reads the real resolver).
-r = hc.bridge_log_content_status("slack-bridge", "ok", TAIL)
-check(r is not None and r[0] == "warn" and "Event Subscriptions" in r[1],
-      "default (uninjected) call still returns a warn with a remedy")
+# Default path: omitting the flag must still work. Patch the resolver so this
+# case is hermetic — the ambient host config would otherwise decide the branch.
+import tempfile
+import pathlib
+_orig_cap = hc.channel_access_path
+with tempfile.TemporaryDirectory() as _td:
+    hc.channel_access_path = lambda ch: pathlib.Path(_td) / ch / "access.json"
+    try:
+        r = hc.bridge_log_content_status("slack-bridge", "ok", TAIL)
+    finally:
+        hc.channel_access_path = _orig_cap
+check(r is not None and r[0] == "warn" and "DM the bot" in r[1],
+      "default (uninjected) call resolves enrollment itself: absent access.json -> TOFU remedy")
+
+# The fail-safe: a resolver that RAISES must not fail the check, and must
+# degrade to the enrolled remedy (the quieter of the two), never to TOFU.
+def _raises(_ch):
+    raise OSError("resolver unavailable")
+hc.channel_access_path = _raises
+try:
+    r = hc.bridge_log_content_status("slack-bridge", "ok", TAIL)
+finally:
+    hc.channel_access_path = _orig_cap
+check(r is not None and r[0] == "warn", "a raising resolver does not fail the check")
+check("DM the bot" not in r[1],
+      "a raising resolver degrades to the enrolled remedy, not the TOFU one")
+
+# The remedy must name the log THIS check read, not a literal workspace path.
+custom = pathlib.Path("/srv/some where/ws/logs/slack-bridge.log")
+r = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_enrolled=False,
+                                 log_path=custom)
+check("/srv/some where/ws/logs/slack-bridge.log" in r[1].replace("'", ""),
+      "remedy names the RESOLVED log path on a custom workspace")
+check("'/srv/some where/ws/logs/slack-bridge.log'" in r[1],
+      "the path is shell-quoted, so a space cannot split the grep argument")
+check("workspace/logs/slack-bridge.log" not in r[1].replace(
+          "/srv/some where/ws/logs/slack-bridge.log", ""),
+      "the hardcoded literal is gone")
 
 print()
 if failures:

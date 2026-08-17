@@ -6921,7 +6921,8 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
 
 def bridge_log_content_status(name: str, status: str, tail: list[str],
                               detail: str = "",
-                              slack_enrolled: "bool | None" = None) -> Optional[tuple[str, str]]:
+                              slack_enrolled: "bool | None" = None,
+                              log_path: Optional[Path] = None) -> Optional[tuple[str, str]]:
     """Check a bridge's recent log lines for known failure-mode signatures.
 
     Returns an (status, detail) override, or None if nothing to override.
@@ -6971,10 +6972,14 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
                 if slack_enrolled:
                     return "warn", ("connected but events not arriving — enable Event "
                                     "Subscriptions at api.slack.com/apps")
+                # Name the log this check actually read — the workspace is
+                # configurable, so a literal path can point at no such file.
+                resolved = Path(log_path) if log_path else (
+                    WORKSPACE_DIR / "logs" / "slack-bridge.log")
                 return "warn", ("connected but events not arriving, and no owner is enrolled "
                                 "(access.json absent) — BOTH are needed: enable Event "
                                 "Subscriptions at api.slack.com/apps, then DM the bot the code "
-                                "from `grep -i \"enrollment code\" workspace/logs/slack-bridge.log "
+                                f"from `grep -i \"enrollment code\" {shlex.quote(str(resolved))} "
                                 "| tail -1` (regenerated on every bridge start)")
     return None
 
@@ -8259,7 +8264,8 @@ def run_all_checks() -> list[dict]:
                 and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                override = bridge_log_content_status(name, status, tail, detail)
+                override = bridge_log_content_status(name, status, tail, detail,
+                                                     log_path=log_file)
                 if override is not None:
                     status, detail = override
             except OSError:
