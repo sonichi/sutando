@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -190,26 +191,36 @@ def main() -> int:
 
         with tempfile.TemporaryDirectory() as t4:
             r2 = Path(t4)
-            # release: the rename arm, and both reinstate arms.
+            # release: the swap arm. The swap is a LINK, not a rename — the slot
+            # is never moved, so a failed swap leaves the holder untouched.
             ob.acquire_delivery_claim(r2, "vanish2", "d1")
-            real_rename = os.rename
-            os.rename = lambda s, d: (_ for _ in ()).throw(OSError("gone"))
+            real_link = os.link
+            os.link = lambda s, d: (_ for _ in ()).throw(OSError("gone"))
             try:
                 out = ob.release_delivery_claim(r2, "vanish2", "d1")
             finally:
-                os.rename = real_rename
+                os.link = real_link
             check("a release whose swap fails reports False", out is False,
                   "reporting True would tell the caller the slot is free when it is not")
+            check("and the holder's claim survives that failed swap",
+                  (lambda c: c is not None and c.drainer_id == "d1")(
+                      ob.read_delivery_claim(r2, "vanish2")),
+                  "a failed release must not consume the claim it could not prove it owned")
 
-            ob.acquire_delivery_claim(r2, "reins", "A")
-            p = ob._claim_path(r2, "reins")
-            tomb = p.with_name(p.name + ".release-deadbeef")
-            tomb.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
-            ob._reinstate(p, tomb)          # slot still occupied -> drop the copy
-            check("reinstate never overwrites a slot that is occupied again",
-                  ob.read_delivery_claim(r2, "reins").drainer_id == "A" and not tomb.exists())
-            ob._reinstate(p, p.with_name(p.name + ".release-absent"))
-            check("reinstate of an absent tomb is a no-op", True)
+            # A swap token whose owner died is swept only after the grace period.
+            ob.acquire_delivery_claim(r2, "grace", "A")
+            gp = ob._claim_path(r2, "grace")
+            tok = gp.with_name(gp.name + ".reclaim-deadbeef")
+            tok.write_text("x", encoding="utf-8")
+            check("a fresh swap token is left alone", ob._sweep_if_abandoned(tok) is False
+                  and tok.exists(), "sweeping a live peer's token re-opens double-reclaim")
+            old_t = time.time() - 120
+            os.utime(str(tok), (old_t, old_t))
+            check("an abandoned swap token is swept",
+                  ob._sweep_if_abandoned(tok) is True and not tok.exists(),
+                  "a token nobody will ever consume wedges the item forever")
+            check("sweeping an absent token is a no-op that permits the retry",
+                  ob._sweep_if_abandoned(gp.with_name(gp.name + ".reclaim-gone")) is True)
 
         # --- adapter: the paths the contract suite skipped -------------------
         import outbox_adapter as oa

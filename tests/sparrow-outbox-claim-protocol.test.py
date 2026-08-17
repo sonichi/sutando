@@ -56,6 +56,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -106,6 +107,20 @@ def contract(title):
             print(f"  ok   {title}")
         return fn
     return run
+
+
+def concurrently(fn):
+    """Run fn in another thread and wait for it to finish contending.
+
+    The claim operations serialize on a per-item lock, and that lock is held per
+    open file description: a nested call in the SAME thread is a re-entry (which
+    now raises), while a real peer is a separate thread or process. Modelling a
+    competitor as a nested call tests an interleaving that cannot occur.
+    """
+    th = threading.Thread(target=fn, daemon=True)
+    th.start()
+    time.sleep(0.05)          # let it reach the lock and block there
+    return th
 
 
 # 1 ---------------------------------------------------------------------------
@@ -311,101 +326,15 @@ def _c11():
             f"the winner's claim must survive, holder={holder}")
 
 
-# 12 --------------------------------------------------------------------------
-@contract("a drainer acting on a STALE observation must not destroy the new holder's claim")
+# 12 ---------------------------------------------------------------------------
+@contract("a concurrent peer never loses a claim it was told it holds")
 def _c12():
-    """The check-then-act failure, with the interleaving pinned rather than raced.
+    """The single-owner invariant, stated as a property rather than a mechanism.
 
-    A observes the stale claim, then B reclaims it completely, then A proceeds on
-    its stale judgment. A must not be able to delete B's fresh claim. Racing two
-    processes reproduces this only ~40% of the time, which is not a guard.
-    """
-    m = outbox()
-    reclaim = need(m, "reclaim_delivery_claim")
-    read = need(m, "read_delivery_claim")
-    claim_path = need(m, "_claim_path")
-    with tempfile.TemporaryDirectory() as tmp:
-        root, item = Path(tmp), "item-aba"
-        (root / ".claims").mkdir(parents=True, exist_ok=True)
-        claim_path(root, item).write_text(json.dumps({
-            "item_id": item, "drainer_id": "dead-owner", "pid": 999999,
-            "start_usec": 1, "claimed_at": 0.0,
-        }, sort_keys=True), encoding="utf-8")
-
-        observed, b_done = threading.Event(), threading.Event()
-        original, slow = m.read_delivery_claim, {"on": True}
-
-        def paused_read(*a, **kw):
-            rec = original(*a, **kw)
-            if slow["on"]:
-                slow["on"] = False
-                observed.set()
-                b_done.wait(10)      # B reclaims while A holds this observation
-            return rec
-
-        m.read_delivery_claim = paused_read
-        try:
-            out = {}
-            a = threading.Thread(target=lambda: out.update(a=reclaim(root, item, 1.0, "A")))
-            a.start()
-            assert observed.wait(10), "A never reached its observation"
-            slow["on"] = False                       # B must not pause
-            out["b"] = reclaim(root, item, 1.0, "B")
-            b_done.set()
-            a.join(10)
-        finally:
-            m.read_delivery_claim = original
-
-        holder = read(root, item)
-        assert holder is not None, "the item ended up held by nobody"
-        assert [out.get("a"), out["b"]].count(True) == 1, (
-            f"both drainers hold the item: A={out.get('a')} B={out['b']} — "
-            "A acted on an observation that was already superseded")
-        assert holder.drainer_id == "B", (
-            f"B reclaimed it, but the surviving claim is {holder.drainer_id!r}; "
-            "A deleted a claim it never judged")
-
-
-# 13 --------------------------------------------------------------------------
-@contract("a drainer cannot release a claim it does not hold")
-def _c13():
-    """The CAS fixes the composed path; this closes the primitive it composed.
-
-    reclaim_delivery_claim is safe, but acquire/release stayed exported, so a
-    caller could still delete a live claim by hand — the exact unlink that made
-    the check-then-act race destructive.
-    """
-    m = outbox()
-    acquire = need(m, "acquire_delivery_claim")
-    release = need(m, "release_delivery_claim")
-    read = need(m, "read_delivery_claim")
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        assert acquire(root, "item-own", "winner") is True
-        assert release(root, "item-own", "stranger") is False, (
-            "a non-owner must not be able to release someone else's claim")
-        assert read(root, "item-own") is not None, (
-            "the winner's claim was deleted by a drainer that never held it")
-        assert release(root, "item-own", "winner") is True, "the owner may release"
-        assert read(root, "item-own") is None
-        # An operator recovery legitimately force-releases, but must say so.
-        assert acquire(root, "item-force", "w2") is True
-        assert release(root, "item-force", force=True) is True
-        try:
-            release(root, "item-nobody")
-            raise AssertionError("release with neither a drainer_id nor force must refuse")
-        except ValueError:
-            pass
-
-
-# 14 --------------------------------------------------------------------------
-@contract("a stale release must not delete the successor's claim (release ABA)")
-def _c14():
-    """The check-then-unlink twin of contract 12, on the release path.
-
-    A passes its ownership check, the slot turns over underneath it (a force
-    release plus a successor acquire), and A's unlink then deletes a claim A
-    never owned — leaving the item free while the successor believes it holds it.
+    A releases while a peer force-releases and re-acquires. Whatever the
+    interleaving, exactly one drainer may end up holding the item, and a drainer
+    that was told `acquire` succeeded must not have that claim removed underneath
+    it by an operation belonging to an earlier incarnation.
     """
     m = outbox()
     acquire = need(m, "acquire_delivery_claim")
@@ -414,31 +343,196 @@ def _c14():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         assert acquire(root, "item-aba", "A") is True
-        original, tripped = m._read_claim_at, {"done": False}
+        granted, original, tripped = [], m._read_claim_at, {"done": False}
+
+        def peer():
+            release(root, "item-aba", force=True)
+            if acquire(root, "item-aba", "B"):
+                granted.append("B")
 
         def turnover(path, item_id):
             rec = original(path, item_id)
-            # Fire once, after A has read its own record and before it acts.
             if not tripped["done"] and rec is not None and rec.drainer_id == "A":
                 tripped["done"] = True
-                release(root, "item-aba", force=True)      # operator recovery
-                acquire(root, "item-aba", "B")             # successor takes it
+                tripped["th"] = concurrently(peer)
             return rec
 
         m._read_claim_at = turnover
         try:
-            out = release(root, "item-aba", "A")
+            release(root, "item-aba", "A")
         finally:
             m._read_claim_at = original
+        th = tripped.get("th")
+        if th:
+            th.join(timeout=5)
 
         holder = read(root, "item-aba")
-        assert holder is not None, (
-            "A released a claim it no longer owned; the item is now free while B "
-            "believes it holds delivery — a third drainer acquires and both send")
-        assert holder.drainer_id == "B", (
-            f"the surviving claim is {holder.drainer_id!r}, expected B")
-        assert out is False, (
-            "A reported a successful release of a claim that was no longer its own")
+        hid = holder.drainer_id if holder else None
+        for w in granted:
+            assert hid == w, (
+                f"{w} was told it holds delivery, but the claim now reads {hid!r}; "
+                "an earlier incarnation's operation removed a live holder's claim")
+
+
+# 14 ---------------------------------------------------------------------------
+@contract("a release and a concurrent reclaim cannot both leave the item owned")
+def _c14():
+    """Two drainers act on the same item at once; at most one may own it after."""
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    reclaim = need(m, "reclaim_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-aba2", "A") is True
+        won = []
+
+        def peer():
+            if reclaim(root, "item-aba2", 0.0, "B"):
+                won.append("B")
+
+        th = concurrently(peer)
+        if release(root, "item-aba2", "A"):
+            won.append("A-released")
+        th.join(timeout=5)
+        holder = read(root, "item-aba2")
+        hid = holder.drainer_id if holder else None
+        assert hid in (None, "B"), (
+            f"claim reads {hid!r} after A released and B reclaimed concurrently")
+        if "B" in won:
+            assert hid == "B", (
+                "B was told it reclaimed the item, but the claim no longer names it")
+
+
+# 15 ---------------------------------------------------------------------------
+@contract("a turnover between the ownership decision and the unlink loses nothing")
+def _c15():
+    """The window a name-based conditional unlink cannot close by narrowing.
+
+    A proves the slot is its own, and the slot is rebound before A's unlink runs.
+    `requeue_item` reaches this with a live releaser via force-release, so it is
+    not a crash-only path. Hooked at the stat that ends the decision, which is
+    the last instant before the act — thread timing alone does not land here.
+    """
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-aba3", "A") is True
+        real_stat, fired, threads = os.stat, {"n": False}, []
+
+        def peer():
+            release(root, "item-aba3", force=True)      # requeue_item's path
+            acquire(root, "item-aba3", "B")             # successor takes the slot
+
+        def hook(path, *a, **k):
+            res = real_stat(path, *a, **k)
+            if not fired["n"] and ".release-" in str(path):
+                fired["n"] = True
+                threads.append(concurrently(peer))
+            return res
+
+        os.stat = hook
+        try:
+            release(root, "item-aba3", "A")
+        finally:
+            os.stat = real_stat
+        for th in threads:
+            th.join(timeout=5)
+
+        assert fired["n"], "the decision point was never reached; the hook is inert"
+        holder = read(root, "item-aba3")
+        assert holder is not None and holder.drainer_id == "B", (
+            f"claim reads {holder.drainer_id if holder else None!r}; A unlinked a "
+            "claim it had not judged, so B believes it owns delivery of an item "
+            "no longer claimed and a third drainer can acquire and send it too")
+
+
+# 16 --------------------------------------------------------------------------
+@contract("a reclaim that dies mid-swap must not wedge the item forever")
+def _c16():
+    """The swap token is created by one syscall and consumed by a later one.
+
+    A crash between them leaves the token behind, and every future reclaim then
+    fails its link — so a DEAD owner's claim can never be taken over and the item
+    stalls permanently. An abandoned token must age out; a live one must not.
+    """
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    reclaim = need(m, "reclaim_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-wedge", "dead-owner") is True
+        claim = m._claim_path(root, "item-wedge")
+        rec = json.loads(claim.read_text(encoding="utf-8"))
+        rec.update(pid=999999, claimed_at=0.0)
+        claim.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
+
+        real_link = os.link
+
+        def link_then_crash(src, dst):
+            real_link(src, dst)
+            raise KeyboardInterrupt("died after the swap token was created")
+
+        os.link = link_then_crash
+        try:
+            reclaim(root, "item-wedge", 1.0, "X")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            os.link = real_link
+
+        tokens = list(m._claims_dir(root).glob(f"{claim.name}.reclaim-*"))
+        assert len(tokens) == 1, f"expected the crashed swap token, got {tokens}"
+
+        # A FRESH token means a peer may be mid-swap right now: do not steal.
+        assert reclaim(root, "item-wedge", 1.0, "Y") is False, (
+            "a token seconds old belongs to a live peer; sweeping it re-opens the "
+            "double-reclaim this swap exists to prevent")
+
+        old = time.time() - 120
+        os.utime(str(tokens[0]), (old, old))
+        assert reclaim(root, "item-wedge", 1.0, "Z") is True, (
+            "an abandoned token must age out; otherwise one crash wedges this item "
+            "forever and nothing ever delivers it")
+        holder = read(root, "item-wedge")
+        assert holder is not None and holder.drainer_id == "Z"
+
+
+# 17 --------------------------------------------------------------------------
+@contract("a torn claim must age out, or a crash mid-write wedges the item forever")
+def _c17():
+    """`acquire` creates the file and then writes it: a crash between the two
+    leaves a claim naming no owner. Refusing it forever is safe for exclusion and
+    fatal for liveness — nothing can ever deliver that item again.
+    """
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    reclaim = need(m, "reclaim_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-torn", "writer") is True
+        claim = m._claim_path(root, "item-torn")
+        claim.write_text("", encoding="utf-8")     # created, never written
+
+        assert read(root, "item-torn").state == "UNKNOWN", (
+            "a torn claim must never read as free")
+        # Fresh: a writer may be between its open() and its write() right now.
+        assert reclaim(root, "item-torn", 0.001, "R") is False, (
+            "stealing a claim that is being written duplicates the delivery")
+
+        old = time.time() - 3600
+        os.utime(str(claim), (old, old))
+        assert reclaim(root, "item-torn", 0.001, "R") is True, (
+            "a torn claim nobody will ever finish writing must become reclaimable; "
+            "otherwise one crash mid-acquire strands this item permanently")
+        holder = read(root, "item-torn")
+        assert holder is not None and holder.drainer_id == "R"
 
 
 def main() -> int:

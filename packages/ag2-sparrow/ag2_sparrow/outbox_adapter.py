@@ -28,7 +28,8 @@ except ImportError:  # pragma: no cover - exercised by whichever import wins
     from outbox import DeliveryOutcome, RetrySafety
 
 # Keys providers use for "here is the thing I created". Order is preference.
-_ID_KEYS = ("event_id", "message_id", "id", "ts")
+# `ts` is excluded: here it is a send time, not a receipt.
+_ID_KEYS = ("event_id", "message_id", "id")
 
 
 @dataclass(frozen=True)
@@ -62,8 +63,11 @@ def classify_response(status: Optional[int], body: Any,
     if isinstance(body, dict):
         for k in id_keys:
             v = body.get(k)
-            if isinstance(v, str) and v:
-                rid = v
+            # bool is an int subclass; `True` is a flag, never an identifier.
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (str, int)) and str(v).strip():
+                rid = str(v)
                 break
     if rid:
         return DeliveryReceipt(DeliveryOutcome.CONFIRMED, receipt_id=rid,

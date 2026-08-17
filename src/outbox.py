@@ -19,12 +19,15 @@ Contracts: tests/sparrow-outbox-claim-protocol.test.py, tests/outbox-race-check.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
 import errno
+import fcntl
 import hashlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -32,6 +35,7 @@ from pathlib import Path
 from typing import Optional
 
 CLAIMS_DIR = ".claims"
+LOCKS_DIR = ".claim-locks"
 ITEMS_DIR = ".items"
 
 
@@ -212,7 +216,47 @@ def _claim_path(root: Path, item_id: str) -> Path:
     return _claims_dir(root) / f"{_safe_key(item_id)}.claim"
 
 
+_HELD = threading.local()
+
+
+@contextlib.contextmanager
+def _item_lock(root: Path, item_id: str):
+    """Serialize every mutation of one item's claim on a single primitive.
+
+    A compare-then-act on a PATH cannot be made safe by narrowing it: the name
+    can be rebound between the check and the act. flock closes the window
+    outright, and the kernel drops it when the holder dies, so a crash cannot
+    leave the item locked.
+    """
+    key = (str(root), item_id)
+    held = getattr(_HELD, "keys", None)
+    if held is None:
+        held = _HELD.keys = set()
+    if key in held:
+        # Re-entry would have to bypass the lock to avoid self-deadlock, and a
+        # bypass is exactly the hole this primitive exists to close.
+        raise RuntimeError(f"re-entrant claim operation on {item_id!r}")
+    # Locks live outside the claims directory: a lock file sharing that
+    # namespace is picked up by anything globbing claim names.
+    d = Path(root) / LOCKS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(d / f"{_safe_key(item_id)}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    held.add(key)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        held.discard(key)
+        os.close(fd)                      # closing releases the flock
+
+
 def acquire_delivery_claim(root: Path, item_id: str, drainer_id: str) -> bool:
+    """Take the delivery claim for an item; True only for the caller that won it."""
+    with _item_lock(root, item_id):
+        return _acquire_locked(root, item_id, drainer_id)
+
+
+def _acquire_locked(root: Path, item_id: str, drainer_id: str) -> bool:
     """Exactly one drainer wins, via O_CREAT|O_EXCL on one canonical key.
 
     Local drainer exclusion ONLY. Lifting this to the room layer would make one
@@ -333,6 +377,13 @@ def _claim_stamp(rec: ClaimRecord) -> str:
 
 def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
                            drainer_id: str) -> bool:
+    """Take over a reclaimable claim; True if THIS caller now holds it."""
+    with _item_lock(root, item_id):
+        return _reclaim_locked(root, item_id, ttl_seconds, drainer_id)
+
+
+def _reclaim_locked(root: Path, item_id: str, ttl_seconds: float,
+                    drainer_id: str) -> bool:
     """Atomically take over a reclaimable claim; True if THIS caller now holds it.
 
     `may_reclaim_delivery` + release + acquire is check-then-act: two drainers
@@ -343,7 +394,13 @@ def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
     root = Path(root)
     observed = read_delivery_claim(root, item_id)
     if observed is None:
-        return acquire_delivery_claim(root, item_id, drainer_id)
+        return _acquire_locked(root, item_id, drainer_id)
+    if observed.state == "UNKNOWN":
+        # A torn claim names no owner, so no age of it condemns a live writer —
+        # but past the grace period its writer is gone and it would wedge forever.
+        if not _sweep_if_abandoned(_claim_path(root, item_id)):
+            return False
+        return _acquire_locked(root, item_id, drainer_id)
     if not _record_is_reclaimable(observed, ttl_seconds):
         return False
     src = _claim_path(root, item_id)
@@ -353,7 +410,14 @@ def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
     try:
         os.link(str(src), str(tomb))
     except OSError:
-        return False                      # another drainer judged this same record
+        # An honest swap finishes in microseconds, so a token older than the grace
+        # period is a crashed reclaim; leaving it would wedge the item forever.
+        if not _sweep_if_abandoned(tomb):
+            return False                  # another drainer judged this same record
+        try:
+            os.link(str(src), str(tomb))
+        except OSError:
+            return False
     taken = _read_claim_at(src, item_id)
     if taken is None or not _same_claim(taken, observed):
         return False                      # it moved on; our observation is stale
@@ -361,11 +425,18 @@ def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
         os.unlink(str(src))
     except FileNotFoundError:
         return False
-    return acquire_delivery_claim(root, item_id, drainer_id)
+    return _acquire_locked(root, item_id, drainer_id)
 
 
 def release_delivery_claim(root: Path, item_id: str, drainer_id: Optional[str] = None,
                            *, force: bool = False) -> bool:
+    """Release a claim; True if one was removed."""
+    with _item_lock(root, item_id):
+        return _release_locked(root, item_id, drainer_id, force=force)
+
+
+def _release_locked(root: Path, item_id: str, drainer_id: Optional[str] = None,
+                    *, force: bool = False) -> bool:
     """Release a claim; True if one was removed.
 
     Ownership-checked by default. An unconditional unlink is exactly what let a
@@ -391,6 +462,25 @@ def _discard(p: Path) -> None:
         pass
 
 
+# A swap token is held across two syscalls; anything older outlived its process.
+SWAP_GRACE_S = 30.0
+
+
+def _sweep_if_abandoned(tomb: Path, grace_s: float = SWAP_GRACE_S) -> bool:
+    """Remove a swap token whose owner died mid-swap; True if one was removed."""
+    try:
+        age = time.time() - os.stat(str(tomb)).st_mtime
+    except OSError:
+        return True                       # already gone: the retry is free
+    if age < grace_s:
+        return False                      # a live peer is mid-swap right now
+    try:
+        os.unlink(str(tomb))
+    except FileNotFoundError:
+        pass
+    return True
+
+
 def _force_release(p: Path) -> bool:
     try:
         p.unlink()
@@ -402,9 +492,8 @@ def _force_release(p: Path) -> bool:
 def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
     """Release only the claim INSTANCE this caller inspected.
 
-    Read-then-unlink deletes whatever occupies the slot by the time it runs — a
-    successor included. The rename is atomic, so there is no gap between the
-    decision and the act for a turnover to land in.
+    Link-then-verify, never rename: a rename moves whatever occupies the slot, so
+    a stale observation evicts a successor and no later step can undo that.
     """
     observed = _read_claim_at(p, item_id)
     # A torn claim has no readable owner, so nobody can prove they hold it.
@@ -412,35 +501,33 @@ def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
         return False
     tomb = p.with_name(f"{p.name}.release-{_claim_stamp(observed)}")
     try:
-        os.rename(str(p), str(tomb))
+        os.link(str(p), str(tomb))
     except OSError:
-        return False
-    taken = _read_claim_at(tomb, item_id)
-    if taken is not None and _same_claim(taken, observed):
-        _discard(tomb)
+        return False                      # a peer holds this same observation
+    try:
+        taken = _read_claim_at(tomb, item_id)
+        if taken is None or not _same_claim(taken, observed):
+            return False                  # never ours; the slot is left untouched
+
+        # Same inode proves the slot did not turn over, so the unlink below
+        # cannot remove a successor's claim.
+        if not _same_inode(p, tomb):
+            return False
+        try:
+            os.unlink(str(p))
+        except FileNotFoundError:
+            return False
         return True
-    _reinstate(p, tomb)
-    return False
-
-
-def _reinstate(p: Path, tomb: Path) -> None:
-    """Put back a claim this caller took but did not own.
-
-    O_EXCL rather than rename: if the slot is occupied again, that newer claim is
-    the valid one and this copy must be dropped instead of overwriting it.
-    """
-    try:
-        payload = tomb.read_bytes()
-    except FileNotFoundError:
-        return
-    try:
-        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(payload)
-    except FileExistsError:
-        pass
     finally:
         _discard(tomb)
+
+
+def _same_inode(a: Path, b: Path) -> bool:
+    try:
+        sa, sb = os.stat(str(a)), os.stat(str(b))
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
 
 
 # -- item lifecycle -----------------------------------------------------------
