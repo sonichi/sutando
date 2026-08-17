@@ -24,8 +24,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-# Hermetic channel config: the gateway bridge resolves access.json at import,
-# so isolate BEFORE any test can import it (module-level, per the lint).
+# Hermetic: bridges resolve channel config at import — isolate first.
+
 import json  # noqa: E402
 import os  # noqa: E402
 _CFG = tempfile.mkdtemp(prefix="env-test-cfg-")
