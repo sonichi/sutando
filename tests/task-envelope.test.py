@@ -122,6 +122,29 @@ class EnvelopeContract(unittest.TestCase):
                        if l.startswith("task:"))
         self.assertLess(1, task_at, "stamp must precede the task: line")
 
+    def test_key_is_0600_at_creation_without_chmod(self):
+        """The key must be born 0600 (O_CREAT mode), not narrowed after the
+        fact: with chmod disabled, any write-then-chmod recipe leaves the
+        umask-default (world-readable) mode and this goes red."""
+        real_chmod = E.os.chmod
+        E.os.chmod = lambda *a, **kw: None
+        try:
+            E.load_or_create_key(self.ws)
+        finally:
+            E.os.chmod = real_chmod
+        mode = E.key_path(self.ws).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600,
+                         "key readable beyond owner at creation time")
+
+    def test_displaced_stamp_reads_unsigned_not_invalid(self):
+        """Docstring contract: an edit that pushes the stamp out of its
+        canonical slot downgrades to 'unsigned' (tamper is not always
+        loud); enforcement must fail closed on unsigned too."""
+        s = E.stamp_text(TASK, self.ws)
+        displaced = "x-injected: 1\n" + s
+        self.assertEqual(E.verify_text(displaced, self.ws)["verdict"],
+                         "unsigned")
+
     def test_key_creation_race_first_writer_wins(self):
         """Two creators race; os.link refuses to clobber, both readers end
         with the SAME key (covers the FileExistsError arm)."""

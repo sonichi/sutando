@@ -71,8 +71,11 @@ def load_or_create_key(workspace: Path | None = None) -> bytes:
         pass
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + f".tmp{os.getpid()}")
-    tmp.write_text(secrets.token_hex(32), encoding="utf-8")
-    os.chmod(tmp, 0o600)
+    # 0600 at open: write_text-then-chmod leaves a umask-default (0644)
+    # window in which any local process can read the durable key.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(secrets.token_hex(32))
     # First writer wins across concurrent bridges: link() refuses to clobber.
     try:
         os.link(tmp, p)
@@ -115,9 +118,12 @@ def stamp_text(text: str, workspace: Path | None = None) -> str:
 
 
 def verify_text(text: str, workspace: Path | None = None) -> dict:
-    """Verdicts: 'verified' | 'unsigned' | 'invalid'. Consumers gate
-    owner-tier processing on this — soak-first: 'unsigned' warns, only
-    'invalid' is a proven forgery/tamper signal."""
+    """Verdicts: 'verified' | 'unsigned' | 'invalid' | 'unverifiable'
+    (keyless host — cannot judge). Soak-first: only 'verified' is proof.
+    'invalid' means content changed under an in-place stamp; an edit that
+    DISPLACES the stamp out of its canonical slot reads 'unsigned', so
+    tamper is not always loud — enforcement must fail closed on
+    'unsigned'/'unverifiable', not treat 'invalid' as the only bad case."""
     stripped, mac = _strip_stamp(text)
     if mac is None:
         return {"verdict": "unsigned", "reason": "no stamp line"}
