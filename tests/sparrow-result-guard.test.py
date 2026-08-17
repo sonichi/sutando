@@ -111,9 +111,8 @@ with tempfile.TemporaryDirectory() as td:
     check(not any(a.kind == "skip" for a in m.parse_markers(forged).actions),
           "and it cannot close its own lease")
 
-    # The reason this moved off disk: the collaborator path is the direct core
-    # with full workspace write, so it can create any sidecar the guard reads.
-    # Writing the OLD sidecar by hand must no longer buy anything.
+    # The collaborator path has full workspace write, so it can create any
+    # sidecar the guard reads: the OLD one must no longer buy anything.
     (results / "task-replay.replay").write_text("")
     spoof, spoof_withheld = m._guarded_result_body(
         "task-replay", m.GATEWAY_REDELIVERY_RESULT)

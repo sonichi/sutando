@@ -206,9 +206,8 @@ ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
 # retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
 _PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
-# tids THIS process redelivered. Must not be a file: the collaborator path is the
-# direct core with full workspace write, so any on-disk sidecar it can create is
-# provenance it can forge. Consumed once; resets on restart like the tier map.
+# tids THIS process redelivered. Not a file: the collaborator path has full
+# workspace write, so any sidecar it can create is provenance it can forge.
 _REDELIVERED: "set[str]" = set()
 try:  # pragma: no cover - exercised by whichever context imports it
     from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
