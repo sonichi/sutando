@@ -53,7 +53,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
@@ -6920,7 +6920,8 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
 
 
 def bridge_log_content_status(name: str, status: str, tail: list[str],
-                              detail: str = "") -> Optional[tuple[str, str]]:
+                              detail: str = "",
+                              slack_enrolled: "bool | None" = None) -> Optional[tuple[str, str]]:
     """Check a bridge's recent log lines for known failure-mode signatures.
 
     Returns an (status, detail) override, or None if nothing to override.
@@ -6960,7 +6961,21 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
         if warn_idxs:
             events_after = any("Wrote task-" in ln for ln in tail[warn_idxs[-1] + 1:])
             if not events_after:
-                return "warn", "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+                # Event Subscriptions alone is the whole fix ONLY when an owner
+                # is already enrolled; in TOFU state the code gate also blocks.
+                if slack_enrolled is None:
+                    try:
+                        slack_enrolled = channel_access_path("slack").exists()
+                    except Exception:  # noqa: BLE001 — a probe must not fail the check
+                        slack_enrolled = True
+                if slack_enrolled:
+                    return "warn", ("connected but events not arriving — enable Event "
+                                    "Subscriptions at api.slack.com/apps")
+                return "warn", ("connected but events not arriving, and no owner is enrolled "
+                                "(access.json absent) — BOTH are needed: enable Event "
+                                "Subscriptions at api.slack.com/apps, then DM the bot the code "
+                                "from `grep -i \"enrollment code\" workspace/logs/slack-bridge.log "
+                                "| tail -1` (regenerated on every bridge start)")
     return None
 
 
