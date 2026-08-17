@@ -13,8 +13,9 @@ export function isSkipMarked(file: string, result: string): boolean {
 // 1. Ledger membership — authoritative. A consumer that persists its in-flight
 //    set has already told us, as a fact about claiming, that the result is
 //    spoken for. It does not depend on any label.
-// 2. Source label — a residual net for bridges whose in-flight set is only
-//    in-memory, so nothing durable can be consulted for them.
+// 2. Source label — for bridges whose in-flight set is only in-memory, AND
+//    for any ledger the reader cannot reach. A miss reads as "no claim", not
+//    "cannot tell", so on that path the label is the whole decision.
 //
 // The label list is NOT a closed set and must not be read as one: the gateway
 // writes `source: {task.source or PROVIDER}` where PROVIDER comes from
