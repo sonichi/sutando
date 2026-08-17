@@ -51,7 +51,13 @@ class _Base(unittest.TestCase):
             setattr(gw, n, v)
         self.tmp.cleanup()
 
-    def _result(self, body: str) -> Path:
+    def _result(self, body: str, tier: str = "owner") -> Path:
+        # The drain's guard resolves tier from the TASK file and fails closed
+        # to guest when it is absent — a result without provenance must never
+        # pass markers through. Owner provenance is therefore part of the
+        # fixture, not an accident of the pre-#2983 gateway.
+        (gw.TASKS_DIR / f"{TID}.txt").write_text(
+            f"id: {TID}\ntask: characterization fixture\naccess_tier: {tier}\n")
         f = gw.RESULTS_DIR / f"{TID}.txt"
         f.write_text(body)
         return f
@@ -112,6 +118,15 @@ class MarkerHandling(_Base):
         gw._post_ready_results({TID})
         self.assertIn("[channel: C123ABC]", self.posted[0][2]["body"])
 
+
+    def test_missing_task_provenance_withholds_markers(self):
+        """Absence is not owner provenance: with no task file the guard
+        resolves guest and marker bodies are withheld, not honoured."""
+        f = gw.RESULTS_DIR / f"{TID}.txt"
+        f.write_text("[channel: C123ABC]\nthe reply")
+        gw._post_ready_results({TID})
+        self.assertEqual(len(self.posted), 1)
+        self.assertNotIn("[channel: C123ABC]", self.posted[0][2]["body"])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
