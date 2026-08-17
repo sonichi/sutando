@@ -74,8 +74,11 @@ import time as _time
 ALERTABLE = ("down", "missing", "not_loaded", "fail", "stale", "warn")
 
 
-def probe(n_tasks, n_held, age_sec):
-    """Run the real check_task_queue against a temp workspace."""
+def probe(n_tasks, n_held, age_sec, real_lookup=False):
+    """Run the real check_task_queue against a temp workspace.
+
+    real_lookup keeps the shipped worker lookup so a broken `ps` is exercised.
+    """
     tmp = Path(tempfile.mkdtemp())
     (tmp / "tasks").mkdir()
     names = []
@@ -88,7 +91,8 @@ def probe(n_tasks, n_held, age_sec):
     held = set(names[:n_held])
     orig_ws, orig_held = hc.WORKSPACE_DIR, hc._tasks_held_by_a_worker
     hc.WORKSPACE_DIR = tmp
-    hc._tasks_held_by_a_worker = lambda ps_output=None: held
+    if not real_lookup:
+        hc._tasks_held_by_a_worker = lambda ps_output=None: held
     try:
         return hc.check_task_queue()
     finally:
@@ -114,6 +118,22 @@ check("2 in flight with a worker" in r["detail"], "mixed reports how many are ac
 # Count+age branch, fully held.
 r = probe(4, 4, 400)
 check(r["status"] == "ok", f"count+age branch, all held -> ok (got {r['status']!r})")
+
+# A broken `ps` is two questions, not one: does it stay quiet, and does the
+# silence it buys disable the probe? Both are asserted; the second is the point.
+def _raising_run(*_a, **_kw):
+    raise OSError("ps unavailable")
+
+_orig_run = hc.subprocess.run
+hc.subprocess.run = _raising_run
+try:
+    check(hc._tasks_held_by_a_worker() == set(),
+          "a `ps` that raises yields no held set instead of propagating")
+    r = probe(1, 0, 1000, real_lookup=True)
+    check(r["status"] == "warn",
+          f"with `ps` broken a real stall STILL warns (got {r['status']!r})")
+finally:
+    hc.subprocess.run = _orig_run
 
 print()
 if failures:
