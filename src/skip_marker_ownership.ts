@@ -1,7 +1,5 @@
-// Two decisions the result-watcher used to make with one predicate:
-// suppression (universal — a marked body must never be spoken or sent) and
-// retirement authority (scoped — only the consumer that dispatched a task may
-// archive its result). Narrowing one silently narrowed both.
+// Suppression is universal; retirement authority is scoped to the consumer
+// that dispatched the task. One predicate for both narrowed both.
 
 export const SKIP_MARKER_RE = /^\s*\[(?:no-send|REPLIED)\]/i;
 
@@ -35,9 +33,9 @@ export interface TaskOrigin {
 }
 
 export function hasNetworkConsumer(origin: TaskOrigin | null): boolean {
-	// Unreadable origin is treated as foreign. Wrongly retiring strands an
-	// owner reply; wrongly keeping only accumulates a file, and suppression
-	// is universal either way — so the unknown case fails toward keeping.
+	// Two nulls, opposite polarity. No task file = unknown, so keep (wrongly
+	// retiring strands a reply; wrongly keeping costs a file). A readable
+	// header with no `source:` is positive evidence of a local writer.
 	if (origin === null) return true;
 	if (origin.claimedElsewhere) return true;
 	if (origin.source === null) return false;
