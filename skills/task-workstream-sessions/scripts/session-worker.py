@@ -168,6 +168,36 @@ def resolve_access_tier(task_file: Path) -> str:
     return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
+# Collaborator trust is broker-attested. A Discord channel `collaborators` entry
+# writes an identical stamp with no broker behind it, so the origin is checked too.
+COLLABORATOR_ATTESTED_SOURCES = frozenset({"ag2space"})
+
+
+def resolve_task_source(task_file: Path) -> str:
+    """Read a task's trusted source with the same task-mid rule as the tier.
+
+    Task-last writers put it before ``task:``; the remote gateway is task-mid,
+    so with no pre-task value its final source line is the trusted one.
+    """
+    try:
+        content = task_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    before_task = content.split("\ntask:", 1)[0]
+    candidates = [
+        line.partition(":")[2].strip().lower()
+        for line in before_task.splitlines()
+        if line.startswith("source:")
+    ]
+    if not candidates:
+        candidates = [
+            line.partition(":")[2].strip().lower()
+            for line in content.splitlines()
+            if line.startswith("source:")
+        ]
+    return candidates[-1] if candidates else ""
+
+
 def team_collaborator_enabled(task_file: Path) -> bool:
     """Accept only the gateway's exact pre-body collaborator stamp."""
     try:
@@ -181,7 +211,9 @@ def team_collaborator_enabled(task_file: Path) -> bool:
         if line.startswith("collaborator:")
     ]
     # Exactly one allow-listed value: duplicates and malformed values fail closed.
-    return values == ["true"]
+    if values != ["true"]:
+        return False
+    return resolve_task_source(task_file) in COLLABORATOR_ATTESTED_SOURCES
 
 
 def _team_prompt(task_file: Path) -> str:

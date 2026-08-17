@@ -49,14 +49,19 @@ def _task(
     tier: str = "owner",
     *,
     collaborator: bool | None = None,
+    source: str | None = None,
 ) -> Path:
     path = workspace / "tasks" / f"{task_id}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     if collaborator is None:
         collaborator = tier == "team"
+    # Collaborator trust is broker-attested, so a collaborator fixture defaults to
+    # the attested source; everything else keeps the original discord default.
+    if source is None:
+        source = "ag2space" if collaborator else "discord"
     runtime_stamp = "collaborator: true\n" if collaborator else ""
     path.write_text(
-        f"{runtime_stamp}id: {task_id}\nsource: discord\n"
+        f"{runtime_stamp}id: {task_id}\nsource: {source}\n"
         f"access_tier: {tier}\ntask: do the thing\n",
         encoding="utf-8",
     )
@@ -137,6 +142,21 @@ def test_team_keeps_the_sandboxed_path_until_an_operator_opts_in() -> None:
 
         assert not (results / team.name).exists(), \
             "a declined team task must not publish a result"
+
+
+def test_collaborator_stamp_is_trusted_only_from_the_attested_source() -> None:
+    """A Discord channel `collaborators` entry writes the same stamp with no broker
+    behind it, so the stamp alone must not reach the owner-configured runtime."""
+    with tempfile.TemporaryDirectory() as td:
+        workspace = Path(td)
+        attested = _task(workspace, "task-ag2", "team", source="ag2space")
+        assert worker.team_collaborator_enabled(attested) is True
+        assert worker.probe("claude", workspace, attested) == worker.MUST_HANDLE
+        for unattested in ("discord", "telegram", "slack", ""):
+            local = _task(
+                workspace, f"task-{unattested or 'none'}", "team", source=unattested)
+            assert worker.team_collaborator_enabled(local) is False
+            assert worker.probe("claude", workspace, local) == worker.UNHANDLED
 
 
 def test_team_collaborator_requires_one_exact_pre_body_stamp() -> None:
@@ -1810,6 +1830,7 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
 if __name__ == "__main__":
     test_resolution_routes_bounded_tiers_before_owner_workstreams()
     test_team_keeps_the_sandboxed_path_until_an_operator_opts_in()
+    test_collaborator_stamp_is_trusted_only_from_the_attested_source()
     test_team_collaborator_requires_one_exact_pre_body_stamp()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan()
