@@ -1,10 +1,17 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh
+# Usage: bash src/startup.sh [--with-app]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job).
 
 set -e
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# --with-app is opt-in and parsed here so an unknown flag cannot silently do
+# nothing: every other argument is still ignored exactly as before.
+WITH_APP=0
+for _arg in "$@"; do
+    case "$_arg" in --with-app) WITH_APP=1 ;; esac
+done
 
 # Resolve python3 ONCE, refusing Apple's Xcode-CLT stub. On a Mac without the
 # developer tools `/usr/bin/python3` exists but raises a modal install dialog
@@ -1370,6 +1377,20 @@ echo ""
 # must stay detached. Restoring /dev/tty there makes the runtime launcher try
 # to attach to sutando-core from inside tmux, which blocks startup forever and
 # leaves the old core running without completing recovery.
+# --with-app runs BEFORE the exec below (which replaces this process) and is
+# guarded: its installer must never take the core down (`set -e` is on).
+if [ "$WITH_APP" -eq 1 ]; then
+    # --launch, not --supervise: a login-persistent launchd job is a separate
+    # decision the user makes explicitly.
+    echo "→ menu-bar app (--with-app): building + launching" >&2
+    if bash "$REPO/scripts/install-menu-bar-app.sh" --launch; then
+        echo "  ✓ menu-bar app launched" >&2
+        echo "    auto-start at login is opt-in: bash scripts/install-menu-bar-app.sh --supervise" >&2
+    else
+        echo "  ✗ menu-bar app setup failed (exit $?) — the core is unaffected and still starting." >&2
+    fi
+fi
+
 if [ -t 0 ] && [ -z "${TMUX:-}" ]; then
     exec >/dev/tty 2>&1
 fi
