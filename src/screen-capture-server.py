@@ -205,8 +205,14 @@ def _notify_capture():
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
+    _permission_verdict: "str | None" = None
+
     def _send_json(self, status: int, payload: dict) -> None:
         """Emit the shared JSON response contract for capture routes."""
+        # Stamped here, not at the five 200-sites, so no success path can drift
+        # out of carrying it. Errors keep their own shape.
+        if 200 <= status < 300 and self._permission_verdict and "permission" not in payload:
+            payload = {**payload, "permission": self._permission_verdict}
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -216,7 +222,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Fail closed ONLY on an explicit denial. `screencapture` exits 0 under
         TCC denial and writes a desktop-only frame, so success and denial are
         otherwise byte-identical to every caller."""
-        if screen_capture_permitted() is False:
+        verdict = screen_capture_permitted()
+        # `None` = unknowable (non-macOS, probe failed). Fail open, but say so:
+        # otherwise a verified grant and an unknowable one are byte-identical.
+        self._permission_verdict = {True: "granted", False: "denied"}.get(verdict, "unknown")
+        if verdict is False:
             self._send_json(503, {
                 "status": "denied",
                 "error": "screen recording permission not granted",

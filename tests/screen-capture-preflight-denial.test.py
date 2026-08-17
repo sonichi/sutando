@@ -7,6 +7,7 @@ exit, so the success path ran normally and the agent narrated a wallpaper back
 as "your screen". Denial and success were byte-identical to every caller.
 """
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -231,6 +232,44 @@ if _HAS_PROBE:
                   any("path" in pl for _, pl in r.sent), False)
     finally:
         m.screen_capture_permitted = _orig
+
+# A VERIFIED grant and an UNKNOWABLE one must not be byte-identical (#2961 review):
+# the gate fails open on `None`, which is right, but a caller could not tell.
+class _Probe:
+    def __init__(self): self.sent = []
+    def _send_json(self, st, pl): m.Handler._send_json(self, st, pl)
+    def send_response(self, st): self._st = st
+    def send_header(self, *a): pass
+    def end_headers(self): pass
+    @property
+    def wfile(self):
+        outer = self
+        class _W:
+            def write(self, b): outer.sent.append((outer._st, json.loads(b.decode())))
+        return _W()
+
+_orig = m.screen_capture_permitted
+_bodies = {}
+try:
+    for verdict, expected in ((True, "granted"), (None, "unknown")):
+        m.screen_capture_permitted = lambda v=verdict: v
+        r = _Probe()
+        check(f"gate passes when permission is {verdict!r}",
+              m.Handler._require_screen_permission(r), True)
+        r._send_json(200, {"status": "ok", "path": "/tmp/x.png"})
+        _bodies[expected] = r.sent[-1][1]
+        check(f"a 200 carries permission={expected!r}",
+              _bodies[expected].get("permission"), expected)
+    # The actual defect: these two were byte-identical before this change.
+    check("granted and unknown success bodies now DIFFER",
+          _bodies["granted"] != _bodies["unknown"], True)
+    # An error body keeps its own shape — no stamp.
+    m.screen_capture_permitted = lambda: False
+    r = _Probe()
+    m.Handler._require_screen_permission(r)
+    check("a 503 denial body is not stamped", "permission" in r.sent[-1][1], False)
+finally:
+    m.screen_capture_permitted = _orig
 
 print(("FAILED: " + ", ".join(fails)) if fails else "screen-capture preflight: all checks passed")
 sys.exit(1 if fails else 0)
