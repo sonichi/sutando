@@ -140,6 +140,7 @@ One entry per agent-facing module.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
 - **`task_envelope.py`** — Task-envelope authentication: an HMAC stamp that makes access_tier a verified claim instead of an honor-system header.
+- **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`team_guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
