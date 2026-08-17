@@ -773,7 +773,8 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # names + reply reference. Serialized only when the gateway sends
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
-                "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
+                "addressed_to",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
@@ -1888,6 +1889,16 @@ def _write_task(task: dict) -> str | None:
         _chan_q = shlex.quote(_chan)
         _step = 1
         _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+        _addr = _one_line(task.get("addressed_to") or "")
+        if _addr:
+            # Addressing gate (#649): the broker resolved this reply's target to a
+            # peer agent. State it in-band so the check cannot fail to retrieve.
+            _skill.append(
+                f"{_step}. ADDRESSING: this message replies to {_addr}'s message and "
+                f"does not mention you — it is {_addr}'s to claim. Do not process it "
+                "unless a later message hands it to you explicitly; close your copy "
+                "with [no-send].")
+            _step += 1
         if _chan:
             _skill.append(
                 f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
