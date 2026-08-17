@@ -1265,7 +1265,29 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "pending-questions.md",  # same
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
+    ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    # The two lock guards that legitimately sit at the ROOT, by name. Exempt
+    # until they migrate to state/locks/ the way workspace_lock.py already
+    # writes <workspace>/state/locks/<role>.lock.guard.
+    ".voice-agent.lock.guard",
+    ".backend-supervisor.lock.guard",
 })
+
+#: Why those two guards are named rather than matched by `*.lock.guard`:
+#: `state/locks/<role>.lock.guard` (workspace_lock.py) is where this artifact
+#: type belongs, and this probe only lists ROOT files — so a role guard that
+#: appears at the root is a workspace-resolution bug, exactly the class the
+#: probe exists to catch. A glob would have hidden it.
+#:
+#: `.voice-agent.lock.guard` stays because six sites resolve it at the root
+#: (voice-lock.ts, startup-runtime.sh, restart.sh, restart-voice-agent.sh,
+#: voice-agent.ts, tests/voice-lock.test.py) and a half-applied move leaves two
+#: processes disagreeing about where the lock is — a double-started voice agent.
+#: `.backend-supervisor.lock.guard` is written by the desktop app, whose source
+#: is not in this repo (`backend-supervisor.lock.guard`: 0 hits here).
+#:
+#: `.voice-agent.pid` is deliberately NOT exempt: state/locks/ is a real
+#: destination that exists in-tree, so its warn names somewhere to go (#2722).
 
 #: Migration sentinels are production-owned and DELIBERATELY retained at the
 #: workspace root — `workspace_default.py` writes `.notes-migrated`,
@@ -2055,10 +2077,19 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
         # Closest the index has come to the cut in the recorded window. This is
         # the number that makes the warning land, and no point reading has it.
         peak = max(sz for _, sz in points)
-        oldest_at, oldest_sz = points[0]
+        # FASTEST sustained climb to now, over every start point: a single anchor
+        # can be undercut by a compaction or by 1-byte jitter, a max cannot.
         newest_at, _ = points[-1]
-        hours = (newest_at - oldest_at) / 3600.0
-        grew = effective_bytes - oldest_sz
+        hours = grew = 0.0
+        best_rate = 0.0
+        for at, sz in points:
+            span = (newest_at - at) / 3600.0
+            gain = effective_bytes - sz
+            if span < 0.5 or gain <= 0:
+                continue
+            if gain / span > best_rate:
+                best_rate, hours, grew = gain / span, span, gain
+        grew = int(grew)
         note = ""
         if peak > MEMORY_INDEX_LOAD_BYTES:
             # Not "nearly" — it was OVER, so the tail was genuinely unread for as
@@ -4360,6 +4391,23 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
     return None
 
 
+def _plist_via_plutil(path: "Path") -> "dict | None":
+    """Parse a plist without `plistlib`. None on any failure, which keeps the
+    caller's existing warn wherever plutil is absent or unusable."""
+    try:
+        out = subprocess.run(["/usr/bin/plutil", "-convert", "json", "-o", "-", str(path)],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(out.stdout)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
     """Does the proxy resolve THIS core's login, or a different account's?
 
@@ -4463,15 +4511,21 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     try:
         import plistlib
     except ImportError as exc:
-        return {"name": name, "status": "warn",
-                "detail": (f"cannot parse the credential-proxy plist — this Python "
-                           f"cannot import plistlib ({exc.__class__.__name__}: {exc}). "
-                           f"Every other check is unaffected.")}
-    try:
-        rendered = plistlib.loads(plist.read_bytes())
-    except (OSError, ValueError) as exc:
-        return {"name": name, "status": "warn",
-                "detail": f"cannot read the credential-proxy plist ({exc})"}
+        # plutil needs no expat, so the comparison stays answerable on exactly
+        # the hosts where this import fails.
+        rendered = _plist_via_plutil(plist)
+        if rendered is None:
+            return {"name": name, "status": "warn",
+                    "detail": (f"cannot parse the credential-proxy plist — this Python "
+                               f"cannot import plistlib ({exc.__class__.__name__}: {exc}) "
+                               f"and plutil could not read it either. "
+                               f"Every other check is unaffected.")}
+    else:
+        try:
+            rendered = plistlib.loads(plist.read_bytes())
+        except (OSError, ValueError) as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"cannot read the credential-proxy plist ({exc})"}
     # A plist can PARSE and still be the wrong shape — `EnvironmentVariables`
     # encoded as a string, say. `.get` on that raises AttributeError, which is
     # not caught above and would abort the whole health run, taking every later
@@ -5013,6 +5067,14 @@ def check_gateway_bridge() -> "dict | None":
         # WITHOUT the duration this line is byte-identical at minute one and at
         # hour thirteen, so a reader cannot tell a blip from a standing outage.
         age_h = _gateway_last_ok_age_h()
+        # A negative age means a clock step or a bad sidecar write, not freshness.
+        if age_h is not None and 0 <= age_h * 3600 < GATEWAY_TRANSIENT_OUTAGE_S:
+            return {
+                "name": "gateway-bridge",
+                "status": "ok",
+                "detail": f"running; last poll did not succeed, last one that did "
+                          f"was {age_h * 3600:.0f}s ago (transient)",
+            }
         since = ("last successful poll UNKNOWN" if age_h is None
                  else f"last successful poll {age_h:.1f}h ago")
         return {
@@ -5027,6 +5089,9 @@ def check_gateway_bridge() -> "dict | None":
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
+# Mirrors POLL_TIMEOUT_GRACE_S in ag2_sparrow/remote_gateway_bridge.py — the same
+# env read, so a host that retunes POLL_WAIT moves both together.
+GATEWAY_TRANSIENT_OUTAGE_S = 3 * (float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25) + 10)
 
 
 def _gateway_last_ok_age_h(path: "Path | None" = None,
