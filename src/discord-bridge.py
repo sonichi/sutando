@@ -202,6 +202,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
 
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
@@ -2857,6 +2858,10 @@ def _write_task_file(task_file: Path, content, username: str,
     try:
         if callable(content):
             content = content()
+        try:
+            content = stamp_text(content)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception as _tw_exc:
         print(f"  [task-write] FAILED for @{username} in #{channel_name} "

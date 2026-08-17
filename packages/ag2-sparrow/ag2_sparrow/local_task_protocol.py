@@ -649,6 +649,18 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
     return "\n".join(lines) + "\n"
 
 
+_TASK_STAMPER = None
+
+
+def set_task_stamper(fn) -> None:
+    """Host-injected transform applied to the serialized task text just
+    before persist (e.g. Sutando's HMAC envelope stamp). Provider-neutral
+    seam: sparrow never names a concrete stamper; the adapter edge does.
+    Fail-open by contract — a raising stamper must not lose the task."""
+    global _TASK_STAMPER
+    _TASK_STAMPER = fn
+
+
 def write_task_file(tasks_dir: "Path | str", task_id: str,
                     headers: "Iterable[tuple[str, str]]", task_body: str) -> Path:
     """Write `<tasks_dir>/<task_id>.txt` in the task-last shape. The task
@@ -666,5 +678,11 @@ def write_task_file(tasks_dir: "Path | str", task_id: str,
     d = Path(tasks_dir)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{task_id}.txt"
-    path.write_text(serialize_task_last(hdrs, task_body))
+    text = serialize_task_last(hdrs, task_body)
+    if _TASK_STAMPER is not None:
+        try:
+            text = _TASK_STAMPER(text)
+        except Exception:
+            pass
+    path.write_text(text)
     return path
