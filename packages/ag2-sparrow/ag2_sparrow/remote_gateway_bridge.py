@@ -589,10 +589,11 @@ def _guarded_result_body(tid: str, body: str):
     if tfile is None:
         archive = TASKS_DIR / "archive"
         tfile = find_task_file(archive, tid) if archive.is_dir() else None
-    # An in-flight Team task still has its file; withholding on absence would
-    # drop owner replies whose task was already reaped.
-    tier = resolve(tfile) if tfile is not None else LOCAL_TIER
-    safe, withheld = guard(body, tier, REPO_ROOT_FOR_GUARD)
+    if tfile is None:
+        # The threat is a Team task, which is in flight and has its file. Scanning
+        # results we cannot attribute withholds owner mail for no added coverage.
+        return body, None
+    safe, withheld = guard(body, resolve(tfile), REPO_ROOT_FOR_GUARD)
     return safe, withheld
 
 

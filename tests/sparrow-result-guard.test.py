@@ -74,18 +74,21 @@ with tempfile.TemporaryDirectory() as td:
         check("redirect" not in kinds and "attach" not in kinds,
               "a WITHHELD team body yields no redirect and no attach action")
 
-    # No task file falls back to the baseline tier, not to guarded: an in-flight
-    # Team task still has its file, so the threat keeps its guard either way.
+    # An unattributable result passes through: the threat is a Team task, which is
+    # in flight and has its file. Scanning these withholds owner mail for nothing.
+    for _baseline in ("owner", "team"):
+        m.LOCAL_TIER = _baseline
+        body_nofile, _ = m._guarded_result_body("task-doesnotexist", BODY_WITH_MARKERS)
+        check(body_nofile == BODY_WITH_MARKERS,
+              f"no task file passes through regardless of host baseline ({_baseline})")
     m.LOCAL_TIER = "owner"
-    body_nofile, _ = m._guarded_result_body("task-doesnotexist", BODY_WITH_MARKERS)
-    check(body_nofile == BODY_WITH_MARKERS,
-          "no task file + owner baseline delivers (a reaped task is not a Team task)")
 
-    m.LOCAL_TIER = "team"
-    body_teamhost, _ = m._guarded_result_body("task-doesnotexist", BODY_WITH_MARKERS)
-    check(body_teamhost != BODY_WITH_MARKERS,
-          "no task file on a TEAM-baseline host is still guarded")
-    m.LOCAL_TIER = "owner"
+    # KNOWN INTERACTION, pinned rather than changed: TEAM_RESULT_CONTROL lists
+    # no-send, so a Team task's control-only body is withheld and then delivered.
+    write_task(tasks, "task-mark", "team")
+    ctrl, ctrl_withheld = m._guarded_result_body("task-mark", "[no-send]\n")
+    check(ctrl_withheld is not None and "[no-send]" not in (ctrl or ""),
+          "PINNED: a TEAM [no-send] is withheld — silent archive becomes a delivered notice")
 
     # --- guard unavailable fails CLOSED: the caller gets None and retries
     m._TEAM_GUARD_FNS = (None, None)
