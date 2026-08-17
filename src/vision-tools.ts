@@ -16,10 +16,12 @@
  * realtime_input.video slot accepts single-frame images.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, mkdirSync, openSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { readCaptureToken } from './util_paths.js';
+import { findRepoRoot } from './sutando_config.js';
+import { readBodyCapped } from './http-body-limit.js';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, type Server } from 'node:http';
@@ -30,10 +32,15 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 
 const execFileAsync = promisify(execFile);
-const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+// UTC, matching voice-agent's ts() — these logs interleave in the same file,
+// and a local-time subsystem next to UTC subsystems made incident timelines
+// off-by-timezone (field report 2026-08-14: 09:48:04 [Vision] and 16:48:04
+// [VoiceSession] were the same instant).
+const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
-const MAX_FPS = 2;
+export const VISION_MIN_SEND_INTERVAL_MS = 900;
+const MAX_FPS = 1000 / VISION_MIN_SEND_INTERVAL_MS;
 const MIN_INTERVAL_MS = 250;
 // TODO(roadmap §5 Now: cost posture): A 720p JPEG q=0.6 ≈ 80–150KB. At 1 fps
 // continuous that's ~6–9MB/min into Gemini Live's video slot, plus context-
@@ -81,15 +88,43 @@ function _portListening(port: number): Promise<boolean> {
 	});
 }
 
+/**
+ * Where screen-capture-server.py actually lives, as candidate paths in
+ * probe order. The old single answer — "next to this module" — was only true
+ * in dev (`tsx src/voice-agent.ts`): the bundled app runs
+ * `dist/voice-agent.js`, and build-bundle.mjs ships no .py files, so the
+ * module-relative path resolved to a nonexistent dist/screen-capture-server.py
+ * and every Watch attempt died as a silent 8s port timeout (field report
+ * 2026-08-14). The bundle DOES ship src/*.py as a sibling of dist/, so the
+ * canonical answer is `<sutando root>/src/…` via findRepoRoot (the same
+ * helper python-binary.ts uses), with the module-sibling kept as the dev/
+ * exotic-layout fallback. Exported for tests.
+ */
+export function _captureServerScriptCandidates(moduleDir: string): string[] {
+	const candidates: string[] = [];
+	const root = findRepoRoot(moduleDir);
+	if (root) candidates.push(join(root, 'src', 'screen-capture-server.py'));
+	const sibling = join(moduleDir, 'screen-capture-server.py');
+	if (!candidates.includes(sibling)) candidates.push(sibling);
+	return candidates;
+}
+
 /** Ensure the screen-capture-server is up on :7845, spawning it if absent.
- *  Reuses a running server (startup.sh's, or a prior lazy spawn); memoizes the
- *  in-flight spawn so concurrent captures don't double-start it. */
+ *  Reuses a running server (startup.sh's, the supervisor's, or a prior lazy
+ *  spawn); memoizes the in-flight spawn so concurrent captures don't
+ *  double-start it. */
 export async function ensureScreenCaptureServer(): Promise<void> {
 	if (await _portListening(SCREEN_CAPTURE_PORT)) return; // reuse a running server
 	if (_screenCaptureStarting) return _screenCaptureStarting; // join an in-flight spawn
 	const start = (async () => {
-		// screen-capture-server.py sits next to this module in src/.
-		const script = join(dirname(fileURLToPath(import.meta.url)), 'screen-capture-server.py');
+		const moduleDir = dirname(fileURLToPath(import.meta.url));
+		const candidates = _captureServerScriptCandidates(moduleDir);
+		const script = candidates.find((c) => existsSync(c));
+		if (!script) {
+			// Fail FAST and say why — the old path burned 8s per attempt on a
+			// port that could never open, with the real cause discarded.
+			throw new Error(`screen-capture-server.py not found (tried: ${candidates.join(', ')})`);
+		}
 		// The bundled .app's voice-agent runs under a MINIMAL launchd PATH (no
 		// /opt/homebrew/bin etc. — same class as the claude-on-PATH gotcha, desktop
 		// PR #50). A bare `python3` would ENOENT there — Watch would still silently
@@ -100,17 +135,55 @@ export async function ensureScreenCaptureServer(): Promise<void> {
 		const augmentedPath = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/usr/sbin', '/bin', process.env.PATH]
 			.filter(Boolean)
 			.join(':');
+		// Observability + process shape (field report 2026-08-14): the old
+		// spawn was detached with stdio 'ignore' and no handlers, so a child
+		// that died instantly (missing script, python error, bind failure) was
+		// indistinguishable from a slow boot. Now: NOT detached — the server
+		// stays a non-disclaimed child of the voice agent, the same shape the
+		// supervisor deliberately uses for screen-capture so TCC attributes the
+		// Screen Recording grant to the app lineage — stderr/stdout go to a log
+		// file, the pid is logged, and an early exit fails the wait immediately
+		// with the code + log path instead of a ghost timeout. unref() still
+		// keeps the child from holding the event loop open.
+		let logPath = '/dev/null';
+		let logfd: number | undefined;
+		try {
+			const logDir = join(resolveWorkspace(), 'logs');
+			mkdirSync(logDir, { recursive: true });
+			logPath = join(logDir, 'screen-capture-server.lazy.log');
+			logfd = openSync(logPath, 'a');
+		} catch {
+			logfd = undefined; // fall back to ignore — logging must not block the spawn
+		}
+		let exited: { code: number | null; signal: string | null } | null = null;
+		let spawnError: Error | null = null;
 		const child = spawn('python3', [script], {
-			detached: true,
-			stdio: 'ignore',
+			detached: false,
+			stdio: logfd !== undefined ? ['ignore', logfd, logfd] : 'ignore',
 			env: { ...process.env, PATH: augmentedPath },
 		});
 		child.unref();
+		child.on('error', (err) => {
+			spawnError = err;
+		});
+		child.on('exit', (code, signal) => {
+			exited = { code, signal };
+		});
+		console.log(`${ts()} [Vision] spawned screen-capture-server pid=${child.pid} script=${script} log=${logPath}`);
 		for (let i = 0; i < 40; i++) {
 			if (await _portListening(SCREEN_CAPTURE_PORT)) return;
+			if (spawnError) {
+				throw new Error(`screen-capture-server spawn failed: ${(spawnError as Error).message}`);
+			}
+			if (exited) {
+				const e = exited as { code: number | null; signal: string | null };
+				throw new Error(
+					`screen-capture-server exited before listening (code=${e.code} signal=${e.signal}) — see ${logPath}`,
+				);
+			}
 			await new Promise((r) => setTimeout(r, 200));
 		}
-		throw new Error('screen-capture-server did not come up on :7845 within 8s');
+		throw new Error(`screen-capture-server did not come up on :7845 within 8s — see ${logPath}`);
 	})();
 	_screenCaptureStarting = start;
 	try {
@@ -136,9 +209,14 @@ const screenSource: VisionSource = {
 		await ensureScreenCaptureServer();
 		// silent=true skips the menu-bar flash + macOS notification, which would
 		// otherwise fire on every frame during a stream. format=jpeg keeps
-		// frames small (~50–150KB).
+		// frames small; maxdim/quality make the CAPTURE SERVER resize in its
+		// own process (P7 D7.4: compression never competes with this event
+		// loop) to the ~720p/q0.6 budget before the file comes back.
 		const _capTok = readCaptureToken();
-		const res = await fetch('http://localhost:7845/capture?format=jpeg&silent=true', _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
+		const res = await fetch(
+			`http://localhost:7845/capture?format=jpeg&silent=true&maxdim=${VISION_FRAME_MAX_DIM}&quality=${VISION_FRAME_JPEG_QUALITY}`,
+			_capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {},
+		);
 		const data = (await res.json()) as { status: string; path?: string; error?: string };
 		if (data.status !== 'ok' || !data.path) {
 			throw new Error(`screen-capture-server: ${data.error || 'no path'}`);
@@ -348,6 +426,10 @@ function getSendFile(): ((b64: string, mime: string) => void) | null {
 // --- Streaming controller -------------------------------------------------
 
 let ticker: NodeJS.Timeout | null = null;
+/** Bumped on every stream start/stop: an in-flight pull capture from a
+ *  stopped stream must not send its stale frame after stopStream() (P7
+ *  round-3 #8 — stop semantics beat a slow source.capture()). */
+let streamGen = 0;
 let activeSource: VisionSource | null = null;
 let inFlight = false;
 let frameCount = 0;
@@ -378,6 +460,207 @@ export function isStreaming(): boolean {
 	return ticker !== null || pushMode;
 }
 
+// --- P7 D7.4 vision egress controls ---------------------------------------
+// The FE-1 controls: EVERY frame — pull tick, browser push, external
+// sources — passes one central gate + token bucket before sendFile. Deferral
+// is a latest-frame-only slot, never a backlog: a queued burst draining after
+// speech would re-create FE-1 under a different name.
+
+/** Token bucket for vision egress on the shared upstream socket. The burst
+ *  ceiling is 2 s of budget; a 720p/q0.6 frame is ~80–150 KB. */
+export const VISION_BUCKET_BYTES_PER_SEC = 300 * 1024;
+export const VISION_BUCKET_MAX_BYTES = 600 * 1024;
+const VISION_DRAIN_INTERVAL_MS = 250;
+/** Downscale budget requested from the capture server (which resizes in ITS
+ *  process — compression never competes with this event loop). ~720p-class. */
+export const VISION_FRAME_MAX_DIM = 1280;
+export const VISION_FRAME_JPEG_QUALITY = 60;
+
+let speechEvidenceFn: (() => { active: boolean }) | null = null;
+/** Voice-agent injects the engine ledger's getSpeechEvidence — the CANONICAL
+ *  speech signal (D7.1) — so vision defers while the user is speaking. */
+export function setVisionSpeechEvidence(fn: (() => { active: boolean }) | null): void {
+	speechEvidenceFn = fn;
+}
+
+let bucketBytes = VISION_BUCKET_MAX_BYTES;
+let bucketRefillAt = Date.now();
+let lastFrameSentAt = 0;
+let deferredSlot: { data: Buffer; mimeType: string; fireHooks: boolean } | null = null;
+let drainTimer: NodeJS.Timeout | null = null;
+const egressStats = { sent: 0, deferredGate: 0, deferredBudget: 0, displaced: 0, droppedOversize: 0 };
+
+/** Read-only egress diagnostics (drop counters are cumulative per process). */
+export function getVisionEgressStats(): {
+	sent: number;
+	deferredGate: number;
+	deferredBudget: number;
+	displaced: number;
+	droppedOversize: number;
+	slotOccupied: boolean;
+} {
+	return { ...egressStats, slotOccupied: deferredSlot !== null };
+}
+
+/** TEST-ONLY: reset the egress gate/bucket/slot state between test cases
+ *  (module state is process-wide; production never calls this). */
+export function resetVisionEgressForTests(): void {
+	deferredSlot = null;
+	stopDrainTimer();
+	bucketBytes = VISION_BUCKET_MAX_BYTES;
+	bucketRefillAt = Date.now();
+	lastFrameSentAt = 0;
+	egressStats.sent = 0;
+	egressStats.deferredGate = 0;
+	egressStats.deferredBudget = 0;
+	egressStats.displaced = 0;
+	egressStats.droppedOversize = 0;
+}
+
+function refillBucket(now: number): void {
+	const elapsed = Math.max(0, now - bucketRefillAt);
+	bucketRefillAt = now;
+	bucketBytes = Math.min(
+		VISION_BUCKET_MAX_BYTES,
+		bucketBytes + (elapsed / 1000) * VISION_BUCKET_BYTES_PER_SEC,
+	);
+}
+
+/**
+ * Tranche-A gate: ACTIVE ∧ ¬speechActive. Bodhi's buffering/replaying flags
+ * are not observable pre-pin — that blind spot is NAMED (D7.4): until the
+ * bodhi tranche, vision can still slip into the window where buffered speech
+ * awaits reconnect replay.
+ */
+function visionGate(): { open: boolean; reason: string } {
+	// Same trust contract as getSendFile's isConnected: if the session
+	// exposes a state and it is not ACTIVE, gate; a session object without a
+	// sessionManager (integration fakes/bridges) is trusted.
+	const sm = (sessionRef as unknown as { sessionManager?: { state?: string } } | null)
+		?.sessionManager;
+	if (sm && sm.state !== 'ACTIVE') return { open: false, reason: `session=${sm.state ?? '?'}` };
+	if (speechEvidenceFn) {
+		try {
+			if (speechEvidenceFn().active) return { open: false, reason: 'speech-active' };
+		} catch {
+			/* evidence source failure never blocks vision */
+		}
+	}
+	return { open: true, reason: '' };
+}
+
+function stopDrainTimer(): void {
+	if (drainTimer) {
+		clearInterval(drainTimer);
+		drainTimer = null;
+	}
+}
+
+function parkFrame(
+	data: Buffer,
+	mimeType: string,
+	fireHooks: boolean,
+	why: 'gate' | 'budget',
+	fromDrain: boolean,
+): void {
+	if (!fromDrain) {
+		// A drain retry re-parks the SAME frame — that is neither a new
+		// deferral nor a displacement.
+		if (deferredSlot) egressStats.displaced++; // the old frame is dropped forever
+		if (why === 'gate') egressStats.deferredGate++;
+		else egressStats.deferredBudget++;
+	}
+	deferredSlot = { data, mimeType, fireHooks };
+	if (!drainTimer) {
+		drainTimer = setInterval(drainDeferredFrame, VISION_DRAIN_INTERVAL_MS);
+		drainTimer.unref?.();
+	}
+}
+
+function drainDeferredFrame(): void {
+	if (!deferredSlot) {
+		stopDrainTimer();
+		return;
+	}
+	const slot = deferredSlot;
+	// Take the frame OUT before retrying — a re-defer re-parks it without a
+	// self-displacement, and a fresh frame arriving mid-retry wins the slot.
+	deferredSlot = null;
+	const r = sendFrameGated(slot.data, slot.mimeType, slot.fireHooks, true);
+	if (!r.ok) {
+		// Session gone — a stale frame must not survive to the next session.
+		stopDrainTimer();
+		return;
+	}
+	if (!r.deferred && !deferredSlot) stopDrainTimer();
+}
+
+/** The ONE vision egress path (gate → bucket → send). All sources call this. */
+function sendFrameGated(
+	data: Buffer,
+	mimeType: string,
+	fireHooks: boolean,
+	fromDrain = false,
+): { ok: boolean; deferred?: boolean; reason?: string; error?: string } {
+	const sendFile = getSendFile();
+	if (!sendFile) return { ok: false, error: 'no active voice session' };
+	const now = Date.now();
+	refillBucket(now);
+	// A frame larger than the bucket burst can never drain; reject it instead.
+	const wireBytes = Math.ceil((data.byteLength * 4) / 3);
+	if (wireBytes > VISION_BUCKET_MAX_BYTES) {
+		egressStats.droppedOversize++;
+		return {
+			ok: false,
+			reason: 'frame-too-large',
+			error: `frame exceeds the ${VISION_BUCKET_MAX_BYTES}-byte vision egress budget`,
+		};
+	}
+	const gate = visionGate();
+	if (!gate.open) {
+		parkFrame(data, mimeType, fireHooks, 'gate', fromDrain);
+		return { ok: true, deferred: true, reason: gate.reason };
+	}
+	// The wire carries base64, so the bucket charges encoded bytes rather than raw.
+	if (now - lastFrameSentAt < VISION_MIN_SEND_INTERVAL_MS || wireBytes > bucketBytes) {
+		parkFrame(data, mimeType, fireHooks, 'budget', fromDrain);
+		return { ok: true, deferred: true, reason: 'budget' };
+	}
+	// The residual voice-loop cost — base64 + the SDK's synchronous
+	// JSON.stringify (~1-3 ms per 720p frame at ≤1 fps) — is named in D7.4,
+	// bounded by the capture-server downscale, and covered by the budget test.
+	try {
+		sendFile(data.toString('base64'), mimeType);
+	} catch (err) {
+		return { ok: false, error: (err as Error)?.message ?? 'sendFile threw' };
+	}
+	bucketBytes = Math.max(0, bucketBytes - wireBytes);
+	lastFrameSentAt = now;
+	egressStats.sent++;
+	frameCount++;
+	if (frameCount === 1 || frameCount % 10 === 0) {
+		console.log(`${ts()} [Vision] sent frame #${frameCount} (${Math.round(data.byteLength / 1024)}KB ${mimeType})`);
+	}
+	if (fireHooks && visionFrameHooks.length > 0) {
+		const transport = sessionRef?.transport;
+		if (transport && typeof transport.sendContent === 'function') {
+			const sendUserCtx = (text: string): void => {
+				try {
+					transport.sendContent!([{ role: 'user', text }], false);
+				} catch {}
+			};
+			for (const hook of visionFrameHooks) {
+				try {
+					hook(sendUserCtx);
+				} catch (err) {
+					console.warn(`${ts()} [Vision] frame hook threw: ${(err as Error)?.message}`);
+				}
+			}
+		}
+	}
+	return { ok: true };
+}
+
 export interface VisionState {
 	streaming: boolean;
 	source: string | null;
@@ -385,6 +668,15 @@ export interface VisionState {
 	frames: number;
 	durationMs: number;
 	sessionReady: boolean;
+	/** P7 D7.4 egress diagnostics: real sends vs gate/budget deferrals and
+	 *  displaced (dropped) slot frames. */
+	egress: {
+		sent: number;
+		deferredGate: number;
+		deferredBudget: number;
+		displaced: number;
+		slotOccupied: boolean;
+	};
 }
 
 /** Public read-only view of vision streaming state.
@@ -400,6 +692,7 @@ export function getVisionState(): VisionState {
 		frames: frameCount,
 		durationMs: streaming && startedAt ? Date.now() - startedAt : 0,
 		sessionReady: getSendFile() !== null,
+		egress: getVisionEgressStats(),
 	};
 }
 
@@ -499,9 +792,14 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 	if (wasRunning) {
 		console.log(`${ts()} [Vision] stopped ${sourceName}${wasPush ? ' (push)' : ''} — ${frames} frame(s) in ${(durationMs / 1000).toFixed(1)}s`);
 	}
+	streamGen++; // fence any in-flight pull capture (see captureAndSend)
 	activeSource = null;
 	frameCount = 0;
 	startedAt = 0;
+	// P7 D7.4: a parked frame must not outlive its stream — a stale deferred
+	// frame draining into a later session is exactly the backlog rule's target.
+	deferredSlot = null;
+	stopDrainTimer();
 	// Push-mode frames accumulate in Gemini Live's conversation context.
 	// Without this hint, "what do you see?" after the user stops sharing
 	// gets answered from the last frame still in context (model recalls
@@ -532,9 +830,8 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 /** Inject a frame from an external pusher (the web-client's
  *  getDisplayMedia loop). Push-mode must be active — caller should have
  *  hit /vision/start with source='browser' first. */
-export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok: boolean; error?: string } {
-	const sendFile = getSendFile();
-	if (!sendFile) {
+export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok: boolean; deferred?: boolean; reason?: string; error?: string } {
+	if (!getSendFile()) {
 		console.warn(`${ts()} [Vision] frame dropped: no active voice session (sessionRef=${!!sessionRef}, transport=${!!sessionRef?.transport})`);
 		return { ok: false, error: 'no active voice session' };
 	}
@@ -542,41 +839,31 @@ export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok
 		console.warn(`${ts()} [Vision] frame dropped: push mode inactive — call /vision/start with source=browser first`);
 		return { ok: false, error: 'not in push mode — call /vision/start with source=browser first' };
 	}
-	try {
-		sendFile(data.toString('base64'), mimeType);
-		frameCount++;
-		// Log first frame so the user can confirm vision is wired end-to-end,
-		// and every 10th to keep tail noise low.
-		if (frameCount === 1 || frameCount % 10 === 0) {
-			console.log(`${ts()} [Vision] sent frame #${frameCount} (${Math.round(data.byteLength / 1024)}KB ${mimeType})`);
-		}
-		return { ok: true };
-	} catch (err) {
-		console.error(`${ts()} [Vision] sendFile threw: ${(err as Error)?.message ?? err}`);
-		return { ok: false, error: 'submitFrame failed' };
+	// P7 D7.4: browser push was the ungated FE-1 hole — it rides the same
+	// central gate + token bucket + latest-frame slot as every other source.
+	const r = sendFrameGated(data, mimeType, false);
+	if (!r.ok) {
+		console.error(`${ts()} [Vision] sendFile failed: ${r.error}`);
+		return { ok: false, reason: r.reason, error: r.error ?? 'submitFrame failed' };
 	}
+	return r;
 }
 
-async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; error?: string }> {
-	const sendFile = getSendFile();
-	if (!sendFile) return { ok: false, error: 'no active voice session' };
+async function captureAndSend(
+	source: VisionSource,
+	fenceGen?: number,
+): Promise<{ ok: boolean; deferred?: boolean; error?: string }> {
+	if (!getSendFile()) return { ok: false, error: 'no active voice session' };
 	const frame = await source.capture();
-	sendFile(frame.data.toString('base64'), frame.mimeType);
-	// Fire post-send hooks (e.g. screen-companion injects selection text).
-	if (visionFrameHooks.length > 0) {
-		const transport = sessionRef?.transport;
-		if (transport && typeof transport.sendContent === 'function') {
-			const sendUserCtx = (text: string): void => {
-				try { transport.sendContent!([{ role: 'user', text }], false); } catch {}
-			};
-			for (const hook of visionFrameHooks) {
-				try { hook(sendUserCtx); } catch (err) {
-					console.warn(`${ts()} [Vision] frame hook threw: ${(err as Error)?.message}`);
-				}
-			}
-		}
+	if (fenceGen !== undefined && fenceGen !== streamGen) {
+		// The stream this capture belonged to was stopped (or replaced) while
+		// the source was capturing — the stale frame is dropped, not sent.
+		return { ok: true, deferred: false };
 	}
-	return { ok: true };
+	// P7 D7.4: the central gate + bucket own the egress decision; post-send
+	// hooks (screen-companion selection text) fire only when the frame
+	// actually sends — including a later drain of the deferred slot.
+	return sendFrameGated(frame.data, frame.mimeType, true);
 }
 
 /** Capture a single frame from `sourceName` (default 'screen') and send it to
@@ -597,9 +884,11 @@ async function tick(): Promise<void> {
 	if (inFlight || !activeSource) return; // skip overlap — slow camera or slow disk
 	inFlight = true;
 	try {
-		const r = await captureAndSend(activeSource);
+		const r = await captureAndSend(activeSource, streamGen);
 		if (r.ok) {
-			frameCount++;
+			// Deferred counts as healthy: the gate/bucket parked the frame
+			// deliberately (frameCount advances only on real sends, inside
+			// sendFrameGated).
 			if (consecutiveFrameErrors > 0) {
 				console.log(`${ts()} [Vision] frame capture recovered after ${consecutiveFrameErrors} failure(s)`);
 				consecutiveFrameErrors = 0;
@@ -648,6 +937,7 @@ function startStream(source: VisionSource, fps: number): { fps: number; interval
 	const clamped = Math.max(0.5, Math.min(MAX_FPS, fps));
 	const intervalMs = Math.max(MIN_INTERVAL_MS, Math.round(1000 / clamped));
 	if (ticker) clearInterval(ticker);
+	streamGen++;
 	activeSource = source;
 	frameCount = 0;
 	startedAt = Date.now();
@@ -804,15 +1094,15 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 			return respond(200, stopStreaming());
 		}
 		if (url.pathname === '/vision/frame' && req.method === 'POST') {
-			const chunks: Buffer[] = [];
-			req.on('data', (c: Buffer) => chunks.push(c));
-			req.on('end', () => {
-				const buf = Buffer.concat(chunks);
+			// Cap the body BEFORE buffering it. The egress gate rejects an
+			// oversized frame, but only after the whole request is already in
+			// memory — and this listener binds 0.0.0.0 by default.
+			void readBodyCapped(req).then((buf) => {
+				if (!buf) return respond(413, { status: 'failed', error: 'frame body too large' });
 				const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
 				const r = submitFrame(buf, mime);
-				respond(r.ok ? 200 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
+				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
 			});
-			req.on('error', () => respond(500, { status: 'failed', error: 'request error' }));
 			return;
 		}
 		respond(404, { error: 'not found' });
