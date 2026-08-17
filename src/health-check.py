@@ -56,7 +56,7 @@ from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
-from sutando_config import resolve_core_runtime  # noqa: E402
+from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 
@@ -3142,41 +3142,117 @@ def fix_screen_capture() -> str:
         f"restart attempted but port check says {after['status']} — see {log_path}")
 
 
-def fix_down_bridges(checks: list) -> list:
-    """Restart configured-but-not-running channel bridges.
+def _checkout_is_canonical(repo_dir) -> tuple:
+    """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?"""
+    try:
+        # Route through git_argv, never a bare "git": a bare-string PATH lookup resolves to
+        # the /usr/bin/git SHIM on a macOS host without the Xcode command line tools, which
+        branch_proc = subprocess.run(
+            git_argv("-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"),
+            capture_output=True, text=True, timeout=10,
+        )
+        dirty_proc = subprocess.run(
+            git_argv("-C", str(repo_dir), "status", "--porcelain"),
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001 — any git failure → fail closed
+        return (False, f"git state unreadable ({e})")
+    # A nonzero git exit means the (possibly empty) stdout can't be trusted — an empty
+    # `status --porcelain` from a FAILED call must not read as "clean" and green-light an
+    if branch_proc.returncode != 0 or dirty_proc.returncode != 0:
+        rc = branch_proc.returncode or dirty_proc.returncode
+        return (False, f"git state unreadable (git exit {rc})")
+    branch = branch_proc.stdout.strip()
+    dirty = dirty_proc.stdout.strip()
+    if branch != "main":
+        return (False, f"checkout on '{branch or 'detached HEAD'}', not main")
+    if dirty:
+        return (False, "checkout has uncommitted changes")
+    return (True, "clean + on main")
 
-    A dead bridge reports status "warn" (optional channels don't page), which
-    keeps it out of `issues` — so main()'s fix loop never reaches it, and
-    owner DMs silently queue channel-side until someone notices (2026-07-02:
-    discord-bridge died at boot with nothing logged; --fix left it down and 8
-    DMs sat undelivered). The exact-detail match excludes every other bridge
-    warn (multiple PIDs, token invalid, stale log), each of which needs
-    different handling than a plain start.
 
-    Returns the list of bridge names restarted.
+# Printed when an owner alert could not be delivered
+ALERT_UNDELIVERED_MARKER = "ALERT-UNDELIVERED"
 
-    Launch parity with startup.sh (per PR #1898 review): a naive
-    `sys.executable src/<bridge>.py` skips the bootstrapping startup.sh does and
-    crash-loops for two bridges:
-      - discord-bridge needs an interpreter that can `import discord`;
-        sys.executable (whatever launched health-check) frequently can't.
-      - slack-bridge needs SLACK_BOT_TOKEN/SLACK_APP_TOKEN, which startup.sh
-        sources from channels/slack/.env before launch — without them the
-        bridge exits immediately.
-    So mirror startup.sh: probe the same interpreter candidates for the
-    bridge's import, and inject the slack channel .env into the child's env.
-    Fail-safe: if no capable interpreter is found (or the required env is
-    missing), skip that bridge rather than spawn a guaranteed crash-loop.
-    """
+
+def _default_local_notifier(msg: str) -> bool:
+    """Owner surface that does not depend on any Sutando bridge. True only on a
+    zero exit, so a missing osascript reads as undelivered rather than success."""
+    safe = str(msg).replace('"', "").replace("\\", "")
+    try:
+        return subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{safe}" with title "Sutando — bridge down"'],
+            check=False, timeout=10).returncode == 0
+    except Exception:  # noqa: BLE001 — alerting must never break the check
+        return False
+
+
+def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
+                     notifier=None) -> list:
+    """Restart or alert on configured-but-not-running channel bridges."""
+    if action is None:
+        action = resolve_down_bridge_action()
+    if action == "off":
+        return []
+    send = sender or _default_slack_sender
+    notify = notifier if notifier is not None else _default_local_notifier
+    guard = guard or _checkout_is_canonical
+
+    def _alert(msg: str) -> None:
+        print(f"  {msg}")
+        # The sender reports failure by RETURNING False, not by raising, so a
+        # discarded return makes the whole alert path a silent no-op.
+        try:
+            delivered = bool(send(msg))
+        except Exception:  # noqa: BLE001 — alerting must never break the check
+            delivered = False
+        if not delivered:
+            # A down bridge is exactly when a bridge-borne alert cannot arrive, so
+            # the fallback must not be another bridge: osascript runs at OS level.
+            try:
+                delivered = bool(notify(msg))
+            except Exception:  # noqa: BLE001 — alerting must never break the check
+                delivered = False
+            if delivered:
+                print("  alert delivered via local notification "
+                      "(primary sender reported failure)")
+        if not delivered:
+            print(f"  {ALERT_UNDELIVERED_MARKER}: owner was NOT alerted — {msg}")
+
     restarted = []
     for c in checks:
-        if (
+        if not (
             c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge")
             and c["status"] == "warn"
             and c.get("detail") == "configured but not running"
         ):
-            if _launch_bridge(c["name"]):
-                restarted.append(c["name"])
+            continue
+        name = c["name"]
+
+        # Decide restart vs. alert. "restart" only restarts from a canonical
+        # checkout; otherwise it downgrades to an alert.
+        if action == "restart":
+            ok, why = guard(REPO_DIR)
+            if not ok:
+                _alert(f"⚠️ health-check: {name} is DOWN — NOT auto-restarted "
+                       f"({why}). Start it via startup.sh once the checkout is clean/on main.")
+                continue
+        else:  # action == "alert"
+            _alert(f"⚠️ health-check: {name} is DOWN — alert-only "
+                   f"(down_bridge_action=alert). Start it via startup.sh.")
+            continue
+
+
+        # #2905 moved the spawn behind the shared launch policy; this PR's
+        # contribution is the decision ABOVE it, so defer rather than keep a copy.
+        if _launch_bridge(name):
+            restarted.append(name)
+            _alert(f"♻️ health-check auto-restarted **{name}** (was down). "
+                   f"If this repeats, it's crash-looping — check logs/{name}.log.")
+        else:
+            _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted "
+                   f"(no launch plan — see _bridge_launch_plan). Start it via startup.sh.")
     return restarted
 
 
@@ -4356,6 +4432,19 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     exhausted = status == "rejected" or data.get("available") is False
     if not exhausted:
         check["detail"] = f"core quota not exhausted (status={status})"
+        # The freshness guard below gates only the exhausted branch, so the
+        # REASSURING reading was stated as current at any age. Hedge, don't warn.
+        try:
+            age_sec = time.time() - path.stat().st_mtime
+        except OSError:
+            age_sec = None
+        if age_sec is None:
+            check["detail"] += " — file age unreadable, so its currency is unknown"
+        elif age_sec > fresh_sec:
+            check["detail"] += (
+                f" — but the reading is {int(age_sec / 60)}m old, so it describes "
+                "whenever the proxy last saw traffic, not the core running now"
+            )
         return check
 
     # Explicit exhaustion. Only alert if the reading is FRESH — a stale OR
