@@ -120,6 +120,31 @@ class GatedPath(type(Path())):
         return super().stat(*a, **k)
 
 
+class FcntlProxy:
+    """fcntl facade: a worker announces entry into a flock wait so the
+    scheduler can skip its steps instead of burning the arrival window."""
+
+    def __init__(self, real, driver):
+        self._real, self._driver = real, driver
+
+    def __getattr__(self, name):
+        val = getattr(self._real, name)
+        if name != "flock" or not callable(val):
+            return val
+
+        def wrapped(fd, op):
+            d = self._driver
+            actor = d.gate.actor_of.get(threading.get_ident())
+            if actor is not None:
+                d.in_flock[actor] = True
+            try:
+                return val(fd, op)
+            finally:
+                if actor is not None:
+                    d.in_flock[actor] = False
+        return wrapped
+
+
 def _dead_pid():
     """A pid that is genuinely dead: spawn-and-reap a child."""
     p = subprocess.Popen(["/usr/bin/true"])
@@ -141,6 +166,10 @@ class ClaimDriver:
         self._root_holder = {"root": str(self.root)}
         self._saved_os = ob.os
         ob.os = OsProxy(os, self.gate, self._root_holder)
+        self.in_flock = {a: False for a in ACTORS}
+        self._saved_fcntl = getattr(ob, "fcntl", None)
+        if self._saved_fcntl is not None:
+            ob.fcntl = FcntlProxy(self._saved_fcntl, self)
         self._saved_path = ob.Path
         GatedPath._gate = self.gate
         GatedPath._root = str(self.root)
@@ -221,10 +250,13 @@ class ClaimDriver:
         for _ in range(n):
             if not self.busy[actor]:
                 return
-            # No gate within 1s = flock-blocked. Bounds cap the slow path
-            # only (instrumented CI); fast machines exit as the worker moves.
-            if not self.gate.at_gate[actor].wait(timeout=1.0):
-                return
+            # Two-phase arrival wait: 50ms fast path, then skip instantly if
+            # the worker announced a flock wait, else allow a slow-CI second.
+            if not self.gate.at_gate[actor].wait(timeout=0.05):
+                if self.in_flock.get(actor):
+                    return
+                if not self.gate.at_gate[actor].wait(timeout=0.95):
+                    return
             self.gate.at_gate[actor].clear()
             self.gate.go[actor].release()
             deadline = time.time() + 1.0
@@ -300,6 +332,8 @@ class ClaimDriver:
             for t in self.threads.values():
                 t.join(timeout=2)
             ob.os = self._saved_os
+            if self._saved_fcntl is not None:
+                ob.fcntl = self._saved_fcntl
             ob.Path = self._saved_path
             GatedPath._gate = None
             if self._saved_read is not None:
