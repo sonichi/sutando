@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh [--with-app]
-#   --with-app  also build/supervise the opt-in menu-bar app (#2987's installer)
+# Usage: bash src/startup.sh [--with-app]        (./start.sh is the front door)
+#   --with-app  also build + launch the opt-in menu-bar app (no launchd job)
 
 set -e
 

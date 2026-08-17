@@ -36,6 +36,12 @@ app_line=$(grep -n 'install-menu-bar-app.sh" --launch' "$S" | head -1 | cut -d: 
 grep -q 'install-menu-bar-app.sh" --supervise' "$S" \
   && bad "--with-app must not install the launchd supervisor" \
   || ok "--with-app launches without installing the launchd supervisor"
+
+# The usage header is the only description most readers see, and it drifted from
+# the call it documents in exactly this way once already.
+grep -qiE '^#.*--with-app.*supervis' "$S" \
+  && bad "the --with-app usage comment still promises supervision" \
+  || ok "usage comment matches what --with-app actually does"
 exec_line=$(grep -n '^exec bash "\$REPO/src/agent/start-cli.sh"' "$S" | head -1 | cut -d: -f1)
 if [ -n "$app_line" ] && [ -n "$exec_line" ] && [ "$app_line" -lt "$exec_line" ]; then
   ok "installer invoked at line $app_line, before the exec at $exec_line"
