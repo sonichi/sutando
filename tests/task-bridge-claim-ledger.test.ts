@@ -1,6 +1,6 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -84,14 +84,23 @@ describe('_claimedElsewhere reads other consumers\' durable in-flight ledgers', 
 	});
 
 	it('a failing directory read is contained, not propagated', () => {
-		// Honest scope: readdirSync throws ERR_INVALID_ARG_VALUE on a NUL-bearing
-		// path, and that call was ALREADY inside the per-directory try. This pins
-		// containment; it does NOT exercise the outer wrap, which guards the
-		// directory-list construction instead. Asserted separately below.
-		process.env.AGENT_CONNECT_STATE_DIR = '\0not-a-path';
-		assert.doesNotThrow(() => _claimedElsewhere('task-a'));
-		assert.equal(_claimedElsewhere('task-a'), true, 'the readable ledger is still read');
-		delete process.env.AGENT_CONNECT_STATE_DIR;
+		// Inject through the dir src ACTUALLY reads. Driving this through
+		// AGENT_CONNECT_STATE_DIR passed for an unrelated reason once the
+		// boundary fix stopped reading that variable: readdirSync was never
+		// called with the bad path at all.
+		// Note the guards are redundant, so removing either one alone still
+		// passes; this pins that containment EXISTS, not which guard supplies it.
+		const state = join(TMP, 'state');
+		const stash = join(TMP, 'state-stashed');
+		renameSync(state, stash);              // readdirSync now throws ENOENT
+		try {
+			assert.doesNotThrow(() => _claimedElsewhere('task-a'));
+			assert.equal(_claimedElsewhere('task-a'), false,
+				'an unreadable state dir yields no claims, it does not propagate');
+		} finally {
+			renameSync(stash, state);
+		}
+		assert.equal(_claimedElsewhere('task-a'), true, 'and it recovers once readable');
 	});
 
 });
