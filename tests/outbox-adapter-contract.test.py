@@ -195,7 +195,7 @@ def _id_keys_are_pinnable():
 
     # Status-first does not help a caller whose transport reports failure INSIDE
     # a 200 body; only narrowing the key set can, so the seam must allow it.
-    body = {"ok": True, "ts": "170099"}
+    body = {"ok": True, "id": "170099"}
     assert classify(200, body).outcome == O.CONFIRMED, (
         "the default key set is deliberately broad, and that default is what "
         "makes pinning necessary rather than optional")
@@ -203,6 +203,48 @@ def _id_keys_are_pinnable():
     assert r.outcome == O.OUTCOME_UNKNOWN and r.receipt_id is None, (
         f"got {r.outcome} / {r.receipt_id!r}; a caller that knows its provider "
         "proves delivery only with event_id must be able to say so")
+
+
+# 9 ---------------------------------------------------------------------------
+@contract("an integer identifier is proof, exactly as a string one is")
+def _integer_ids_are_proof():
+    m = adapter_mod()
+    classify = need(m, "classify_response")
+    from outbox import DeliveryOutcome as O  # noqa: PLC0415
+
+    # skills/agent-room-ops/receipt.py answers the same question about the same
+    # gateway envelope and accepts (str, int). A str-only rule here means one
+    # reader archives an integer-id reply while the other re-sends it.
+    r = classify(200, {"event_id": 12345})
+    assert r.outcome == O.CONFIRMED and r.receipt_id == "12345", (
+        f"got {r.outcome} / {r.receipt_id!r}; an integer event_id is the same "
+        "proof as a string one, and must be normalised to str")
+
+    # bool is an int subclass. `True` is a flag, never an identifier — this is a
+    # deliberate divergence from receipt.py, which confirms on {"event_id": True}.
+    assert classify(200, {"event_id": True}).outcome == O.OUTCOME_UNKNOWN, (
+        "a boolean must never be read as an identifier")
+    assert classify(200, {"event_id": "   "}).outcome == O.OUTCOME_UNKNOWN, (
+        "a whitespace-only id proves nothing")
+
+
+# 10 --------------------------------------------------------------------------
+@contract("`ts` is a timestamp, not a receipt, and is not proof by default")
+def _ts_is_not_a_receipt():
+    m = adapter_mod()
+    classify = need(m, "classify_response")
+    from outbox import DeliveryOutcome as O  # noqa: PLC0415
+
+    # The default's job is to be safe for the caller who forgot to pin. `ts` is a
+    # Slack idiom; on this envelope it is a send time, so confirming on it would
+    # archive an item the provider never proved it delivered.
+    r = classify(200, {"ok": True, "ts": "1699.000"})
+    assert r.outcome == O.OUTCOME_UNKNOWN and r.receipt_id is None, (
+        f"got {r.outcome} / {r.receipt_id!r}; `ts` must not be in the default "
+        "id keys")
+    # A caller whose provider really does name its receipt `ts` can still say so.
+    assert classify(200, {"ts": "1699.000"}, id_keys=("ts",)).outcome == O.CONFIRMED, (
+        "pinning must still be able to opt IN to a key the default drops")
 
 
 def main() -> int:

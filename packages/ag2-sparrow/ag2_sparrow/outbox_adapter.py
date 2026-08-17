@@ -28,7 +28,9 @@ except ImportError:  # pragma: no cover - exercised by whichever import wins
     from outbox import DeliveryOutcome, RetrySafety
 
 # Keys providers use for "here is the thing I created". Order is preference.
-_ID_KEYS = ("event_id", "message_id", "id", "ts")
+# `ts` is deliberately absent: on this envelope it is a send timestamp, not a
+# receipt, so the default must not read it as proof for a caller who forgot to pin.
+_ID_KEYS = ("event_id", "message_id", "id")
 
 
 @dataclass(frozen=True)
@@ -62,8 +64,11 @@ def classify_response(status: Optional[int], body: Any,
     if isinstance(body, dict):
         for k in id_keys:
             v = body.get(k)
-            if isinstance(v, str) and v:
-                rid = v
+            # bool is an int subclass; `True` is a flag, never an identifier.
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (str, int)) and str(v).strip():
+                rid = str(v)
                 break
     if rid:
         return DeliveryReceipt(DeliveryOutcome.CONFIRMED, receipt_id=rid,
