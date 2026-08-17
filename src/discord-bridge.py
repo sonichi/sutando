@@ -5227,6 +5227,18 @@ async def poll_proactive():
                         # parse_markers strips all markers from .body and
                         # surfaces them as typed actions — no hand-rolled regex.
                         _pp = parse_markers(text)
+
+                        # A non-Discord [channel:] target is another bridge's
+                        # file; slack/telegram already gate on \d{17,20} here.
+                        _fr = next((a for a in _pp.actions if a.kind == "redirect"), None)
+                        if _fr is not None and not re.fullmatch(r"\d{17,20}", str(_fr.value).strip()):
+                            print(
+                                f"  [proactive] {f.name} targets {_fr.value!r} — not a Discord "
+                                f"channel id; releasing for its own bridge",
+                                flush=True,
+                            )
+                            release_claim(f)
+                            continue
                         clean_text = _pp.body
                         files = [a.value for a in _pp.actions if a.kind == "attach"]
 
