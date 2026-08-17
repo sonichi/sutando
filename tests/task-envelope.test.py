@@ -144,11 +144,14 @@ class EnvelopeContract(unittest.TestCase):
 
     def test_cli_stamp_and_verify_paths(self):
         """CLI main(): stamp in place -> verify 0; tamper -> 4; unsigned
-        -> 3 (uses the real host workspace key; content is throwaway)."""
+        -> 3. The workspace resolver is patched to this test's temp dir so
+        the suite never creates the checkout's durable task-hmac.key."""
         with tempfile.NamedTemporaryFile("w", suffix=".txt",
                                          delete=False) as f:
             f.write("id: task-cli\ntask: cli check\naccess_tier: owner\n")
             path = f.name
+        real_resolve = E.resolve_workspace
+        E.resolve_workspace = lambda: self.ws
         try:
             self.assertEqual(E.main(["x", "verify", path]), 3)
             self.assertEqual(E.main(["x", "stamp", path]), 0)
@@ -156,7 +159,11 @@ class EnvelopeContract(unittest.TestCase):
             t = Path(path).read_text().replace("cli check", "tampered")
             Path(path).write_text(t)
             self.assertEqual(E.main(["x", "verify", path]), 4)
+            self.assertTrue((self.ws / "state" / "auth"
+                             / "task-hmac.key").exists(),
+                            "stamp must have used the patched workspace")
         finally:
+            E.resolve_workspace = real_resolve
             Path(path).unlink()
 
     def test_cli_exit_codes(self):
