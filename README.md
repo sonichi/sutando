@@ -162,11 +162,24 @@ cd sutando
 cp .env.example .env
 # Add GEMINI_API_KEY only if you want voice
 
-# Start everything
+# Start everything (headless core)
 bash src/startup.sh
+
+# …or the core plus the opt-in macOS menu-bar app
+bash src/startup.sh --with-app
 ```
 
-This starts the headless core services (voice agent, phone conversation server, web client, dashboard, and API). Open http://localhost:8080 when you want the browser UI; startup never opens a browser or launches a macOS app for you. The autonomous loop starts automatically.
+This starts the headless core services (voice agent, phone conversation server, web client, dashboard, and API). Open http://localhost:8080 when you want the browser UI; startup never opens a browser for you. The autonomous loop starts automatically.
+
+**The macOS menu-bar app is opt-in and separate.** Plain `bash src/startup.sh` never launches it, so the core stays headless. `--with-app` builds and signs the bundle and installs a launchd supervisor so it returns at login; a failure there is reported and never stops the core. To manage the app on its own — build only, launch once, or supervise — use its installer directly:
+
+```bash
+bash scripts/install-menu-bar-app.sh              # build + sign, print next steps
+bash scripts/install-menu-bar-app.sh --launch     # …and open it now
+bash scripts/install-menu-bar-app.sh --supervise  # …and auto-start it at login
+```
+
+First run needs Accessibility granted in System Settings → Privacy & Security. Run the installer from the checkout you actually use: it records that path in the launchd job, so running it from a temporary worktree pins the app to a directory that will be deleted.
 
 > **Why Sutando runs with elevated permissions.** Autonomous voice-driven work means `startup.sh` launches the selected core CLI with unattended approvals and full local access — permission prompts would otherwise break the voice-in / answer-out flow. In exchange:
 >
