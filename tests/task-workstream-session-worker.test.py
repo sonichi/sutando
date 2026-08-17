@@ -1791,8 +1791,18 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
         task.write_text("access_tier: team\ntask: protected\n")
         handler = _executable(
             root / "handler",
-            "#!/bin/sh\ncase \" $* \" in *\" --probe \"*) exit 4;; esac\nsleep 30\n",
+            "#!/bin/sh\n"
+            "probe=0\ntask_file=\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  case \"$1\" in --probe) probe=1;; --task-file) shift; task_file=$1;; esac\n"
+            "  shift\n"
+            "done\n"
+            "[ \"$probe\" = 1 ] && exit 4\n"
+            "[ -n \"$task_file\" ] && : > \"$HANDLER_STARTS/$(basename \"$task_file\")\"\n"
+            "sleep 30\n",
         )
+        starts = root / "starts"
+        starts.mkdir()
         bin_dir = root / "bin"
         bin_dir.mkdir()
         _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 30\n")
@@ -1801,6 +1811,7 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
             env={
                 **os.environ,
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "HANDLER_STARTS": str(starts),
                 "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
                 "SUTANDO_TASK_EVENT_HANDLER": str(handler),
                 "SUTANDO_CORE_RUNTIME": "claude",
@@ -1822,8 +1833,12 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
             # Neither written token: the watcher must not read this as optional.
             lines[3] = "must-handl"
             claim.write_text("\n".join(lines) + "\n")
+            terminated_at = time.time()
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
+            try:
+                stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError(_hang_report(starts, terminated_at)) from exc
             assert "TASK_FILE:" not in stdout, (
                 "an unrecognised disposition was published to the unrestricted core")
             assert "no recognised disposition" in stderr
