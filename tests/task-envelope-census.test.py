@@ -166,6 +166,28 @@ class CensusCliAndFallbacks(unittest.TestCase):
         self.assertEqual(j["verdicts"]["verified"], 1)
         self.assertEqual(j["unsigned_sources"], ["voice"])
 
+    def test_file_vanishing_between_read_and_stat_is_skipped(self):
+        # Archiver interleaving: the file is readable, then moved before
+        # stat(). The census must skip the claimed file, not abort.
+        from unittest import mock
+        signed = E.stamp_text("id: task-s\ntask: t\nsource: gateway\n",
+                              self.ws)
+        _write(self.ws, self._now_id("s"), signed)
+        victim = _write(self.ws, self._now_id("gone"),
+                        "id: task-g\ntask: t\nsource: voice\n")
+        real_read = Path.read_text
+
+        def read_then_archive(p, *a, **kw):
+            text = real_read(p, *a, **kw)
+            if p.name == victim.name:
+                p.unlink()
+            return text
+
+        with mock.patch.object(Path, "read_text", read_then_archive):
+            result = C.census(self.ws)
+        self.assertEqual(result["scanned"], 1)
+        self.assertNotIn("voice", result["by_source"])
+
     def test_main_gate_met_message_when_all_verified(self):
         import contextlib
         import io
