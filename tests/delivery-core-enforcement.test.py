@@ -233,45 +233,91 @@ class FenceFaults(unittest.TestCase):
         self.assertIs(migration.classify_legacy_sentinel("rcpt-9"),
                       DeliveryOutcome.CONFIRMED)
 
-    def _convert_one(self, root):
+    OLD = json.dumps({"fmt": "legacy"}).encode()
+
+    @staticmethod
+    def _render(data):
+        return json.dumps({"fmt": "v2", "outcome":
+                           migration.classify_legacy_sentinel(None).value
+                           }).encode()
+
+    @staticmethod
+    def _is_converted(data):
+        return json.loads(data).get("fmt") == "v2"
+
+    def _convert_one(self, root, fault=None):
         def convert(item):
-            src = root / f"{item}.old"
-            dst = root / f"{item}.new"
-            tmp = root / f"{item}.tmp"
-            tmp.write_text(json.dumps(
-                {"item": item,
-                 "outcome": migration.classify_legacy_sentinel(None).value}))
-            tmp.rename(dst)
-            src.unlink()
+            migration.convert_item_atomic(root / item, self._render,
+                                          self._is_converted, fault=fault)
         return convert
 
+    def _states(self, root, items):
+        out = {}
+        for it in items:
+            self.assertFalse((root / (it + ".tmp")).exists() and
+                             self._is_converted(
+                                 (root / it).read_bytes()) is None,
+                             "impossible")
+            out[it] = "new" if self._is_converted(
+                (root / it).read_bytes()) else "old"
+        return out
+
     def test_crash_at_every_step_never_leaves_both_visible(self):
-        items = [f"it-{i}" for i in range(4)]
+        """Between-item AND intra-item crash points: at every one, each
+        item reads back as exactly old-format or new-format (one path, one
+        replace — a both-visible state has no filesystem representation)."""
+        items = [f"it-{i}" for i in range(3)]
+        intra = [None, "pre-write-tmp", "pre-replace", "post-replace"]
         for crash_after in range(len(items) + 1):
-            with tempfile.TemporaryDirectory(prefix="enf-fence-") as td:
-                root = Path(td)
-                for it in items:
-                    (root / f"{it}.old").write_text("{}")
-                try:
-                    migration.convert_epoch(root, items,
-                                            self._convert_one(root), "B",
-                                            crash_after=crash_after)
-                    crashed = False
-                except RuntimeError:
-                    crashed = True
-                self.assertEqual(crashed, crash_after < len(items))
-                for it in items:
-                    old = (root / f"{it}.old").exists()
-                    new = (root / f"{it}.new").exists()
-                    self.assertNotEqual(
-                        old, new, f"{it}: converted XOR untouched violated "
-                                  f"(old={old} new={new})")
-                epoch = migration.read_epoch(root)
-                if crashed:
-                    self.assertEqual(epoch, "A",
-                                     "fence must stay OLD after a crash")
-                else:
-                    self.assertEqual(epoch, "B")
+            for crash_step in intra:
+                with tempfile.TemporaryDirectory(prefix="enf-fence-") as td:
+                    root = Path(td)
+                    for it in items:
+                        (root / it).write_bytes(self.OLD)
+
+                    def fault(step, _cs=crash_step):
+                        if _cs is not None and step == _cs:
+                            raise RuntimeError(f"crash at {step}")
+                    try:
+                        migration.convert_epoch(
+                            root, items, self._convert_one(root, fault),
+                            "B", crash_after=crash_after)
+                        crashed = False
+                    except RuntimeError:
+                        crashed = True
+                    for it, state in self._states(root, items).items():
+                        self.assertIn(state, ("old", "new"),
+                                      f"{it} in mixed state")
+                    if crashed:
+                        self.assertEqual(migration.read_epoch(root), "A",
+                                         "fence must stay OLD after crash")
+                    else:
+                        self.assertEqual(migration.read_epoch(root), "B")
+
+    def test_restarted_migrator_completes_before_any_drainer(self):
+        """Crash mid-pass, then re-run the SAME conversion: idempotent
+        convert skips already-new items, finishes the stragglers, and only
+        then flips the fence — until that instant read_epoch names the old
+        protocol, so no new-epoch drainer may start and old-epoch items
+        were never half-interpreted."""
+        items = [f"it-{i}" for i in range(4)]
+        with tempfile.TemporaryDirectory(prefix="enf-fence-r-") as td:
+            root = Path(td)
+            for it in items:
+                (root / it).write_bytes(self.OLD)
+            with self.assertRaises(RuntimeError):
+                migration.convert_epoch(root, items,
+                                        self._convert_one(root), "B",
+                                        crash_after=2)
+            self.assertEqual(migration.read_epoch(root), "A")
+            states = self._states(root, items)
+            self.assertEqual(sorted(states.values()),
+                             ["new", "new", "old", "old"])
+            migration.convert_epoch(root, items, self._convert_one(root),
+                                    "B")
+            self.assertEqual(migration.read_epoch(root), "B")
+            self.assertEqual(set(self._states(root, items).values()),
+                             {"new"})
 
     def test_fence_write_is_atomic_and_last(self):
         with tempfile.TemporaryDirectory(prefix="enf-fence2-") as td:

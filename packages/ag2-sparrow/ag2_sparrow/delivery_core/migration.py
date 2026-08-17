@@ -50,15 +50,42 @@ def classify_legacy_sentinel(
     return DeliveryOutcome.OUTCOME_UNKNOWN
 
 
+def convert_item_atomic(path: Path, render: Callable[[bytes], bytes],
+                        is_converted: Callable[[bytes], bool],
+                        fault: Optional[Callable[[str], None]] = None) -> bool:
+    """The per-item conversion primitive: read -> write temp -> ONE
+    os.replace over the SAME path. There is no unlink step and no second
+    visible name, so no crash point can leave old and new both visible.
+    Idempotent: an already-converted item is left untouched (False), which
+    is what lets a restarted migrator resume mid-pass. `fault` is the
+    fault-injection hook — called before each internal mutation with a
+    step label; tests raise from it to crash INSIDE the item."""
+    data = path.read_bytes()
+    if is_converted(data):
+        return False
+    tmp = path.with_name(path.name + ".tmp")
+    if fault:
+        fault("pre-write-tmp")
+    tmp.write_bytes(render(data))
+    if fault:
+        fault("pre-replace")
+    os.replace(tmp, path)
+    if fault:
+        fault("post-replace")
+    return True
+
+
 def convert_epoch(root: Path, items: Iterable[str],
                   convert_one: Callable[[str], None], target_epoch: str,
                   crash_after: Optional[int] = None) -> int:
     """One-shot conversion pass. convert_one(item) must be per-item atomic
-    (write-temp + rename); this function sequences items and writes the
-    fence only after ALL converted. crash_after=N simulates a crash before
-    the (N+1)th item for the fault-injection suite: the fence must then
-    still read the OLD epoch and every item be converted or untouched,
-    never both-visible."""
+    over a single path (use convert_item_atomic — one os.replace, no
+    unlink, no second visible name) and idempotent, so a restarted pass
+    resumes over the same item list and completes BEFORE any drainer
+    starts: the fence is written only after ALL items converted, and until
+    then read_epoch still names the old protocol. crash_after=N simulates
+    a crash before the (N+1)th item; intra-item crash points are the
+    convert_item_atomic fault hook."""
     done = 0
     for item in items:
         if crash_after is not None and done >= crash_after:
