@@ -4,6 +4,7 @@ Run: python3 tests/health-check-gateway-transient-outage.test.py"""
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -44,12 +45,31 @@ def _probe(age_s, *, last_ok=True):
 
 class TestTransientIsNotAnOutage(unittest.TestCase):
     def test_the_line_no_longer_contradicts_itself(self):
-        # Measured live 2026-08-16: connected:false with a 148s-old last success,
-        # and the next poll succeeded 39s later.
-        res = _probe(148)
+        # Measured live 2026-08-16: connected:false while last_ok_age never
+        # exceeded 35s across three samples, and the flag returned to True.
+        res = _probe(35)
         self.assertEqual(res["status"], "ok", res["detail"])
-        self.assertIn("148s ago", res["detail"])
+        self.assertIn("35s ago", res["detail"])
         self.assertNotIn("not being delivered", res["detail"])
+
+    def test_the_bound_is_the_bridge_s_own_grace_not_a_local_guess(self):
+        """Review finding: a literal cannot track an env-tuned bridge constant."""
+        self.assertEqual(HC.GATEWAY_TRANSIENT_OUTAGE_S, 3 * (25 + 10))
+        with mock.patch.dict(os.environ, {"REMOTE_TASK_POLL_WAIT": "50"}):
+            reloaded = _load()
+        self.assertEqual(reloaded.GATEWAY_TRANSIENT_OUTAGE_S, 3 * (50 + 10))
+
+    def test_past_the_grace_the_bridge_and_the_probe_agree_it_is_an_outage(self):
+        # Between the old 300s literal and the bridge's 105s the two disagreed:
+        # the bridge called it an outage and this probe still said "transient".
+        self.assertEqual(_probe(106)["status"], "warn")
+        self.assertEqual(_probe(299)["status"], "warn")
+
+    def test_a_negative_age_is_not_freshness(self):
+        """Review finding: a clock step must not read as a 'transient' ok."""
+        res = _probe(-600)
+        self.assertEqual(res["status"], "warn", res["detail"])
+        self.assertNotIn("-600s", res["detail"])
 
     def test_a_real_outage_still_warns(self):
         res = _probe(13.5 * 3600)

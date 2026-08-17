@@ -5067,7 +5067,8 @@ def check_gateway_bridge() -> "dict | None":
         # WITHOUT the duration this line is byte-identical at minute one and at
         # hour thirteen, so a reader cannot tell a blip from a standing outage.
         age_h = _gateway_last_ok_age_h()
-        if age_h is not None and age_h * 3600 < GATEWAY_TRANSIENT_OUTAGE_S:
+        # A negative age means a clock step or a bad sidecar write, not freshness.
+        if age_h is not None and 0 <= age_h * 3600 < GATEWAY_TRANSIENT_OUTAGE_S:
             return {
                 "name": "gateway-bridge",
                 "status": "ok",
@@ -5088,9 +5089,9 @@ def check_gateway_bridge() -> "dict | None":
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
-# The bridge only drops `connected` after ~3 missed hold windows, so a fresher
-# last-success is a retry in progress — not evidence that delivery has stopped.
-GATEWAY_TRANSIENT_OUTAGE_S = 300.0
+# Mirrors POLL_TIMEOUT_GRACE_S in ag2_sparrow/remote_gateway_bridge.py — the same
+# env read, so a host that retunes POLL_WAIT moves both together.
+GATEWAY_TRANSIENT_OUTAGE_S = 3 * (float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25) + 10)
 
 
 def _gateway_last_ok_age_h(path: "Path | None" = None,
