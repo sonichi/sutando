@@ -171,6 +171,20 @@ def resolve_task_source(task_file: Path) -> str:
     return candidates[-1] if candidates else ""
 
 
+def _claims_collaborator(task_file: Path) -> bool:
+    """True if the task carries a pre-body collaborator stamp, attested or not."""
+    try:
+        content = task_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    before_task = content.split("\ntask:", 1)[0]
+    return any(
+        line.partition(":")[2].strip().lower() == "true"
+        for line in before_task.splitlines()
+        if line.startswith("collaborator:")
+    )
+
+
 def team_collaborator_enabled(task_file: Path) -> bool:
     """Accept only the gateway's exact pre-body collaborator stamp."""
     try:
@@ -559,8 +573,10 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
         return UNHANDLED
     tier = resolve_access_tier(task_file)
     if tier == "team":
-        # Team never spawns a provider session; it stays on the restricted path the
-        # selected core already applies via the bridge in-band tier instructions.
+        # Only a broker-attested collaborator may take the direct-core path. An
+        # unattested producer stamping collaborator goes to the restricted handler.
+        if _claims_collaborator(task_file) and not team_collaborator_enabled(task_file):
+            return MUST_HANDLE
         return UNHANDLED
     if tier == "guest":
         return UNHANDLED
