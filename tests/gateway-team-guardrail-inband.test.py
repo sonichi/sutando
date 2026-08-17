@@ -89,5 +89,80 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
         self.assertEqual(a, b, "src/team_guardrail.py and the packaged copy have diverged")
 
 
+
+class CollaboratorBranchReachesTheBody(unittest.TestCase):
+    """The `collaborator_enabled` branch at remote_gateway_bridge.py:1921.
+
+    The ordinary-Team tests above cannot reach it: `_write_task` promotes only on
+    the exact broker boolean plus a Team request, so a fixture without
+    `collaborator: True` takes the `team_guardrail_lines` branch and leaves the
+    collaborator branch free to be deleted with every test still green.
+    """
+
+    def _collab(self, mod, **over):
+        task = {"id": "collab1", "task": "look at the parser with me",
+                "user_id": "@c:ag2.space", "access_tier": "team",
+                "collaborator": True}
+        task.update(over)
+        tid = mod._write_task(task)
+        assert tid, "writer returned no task id"
+        return (mod.TASKS_DIR / f"{tid}.txt").read_text(), tid
+
+    def test_attested_collaborator_gets_the_engage_rulebook_at_its_own_result_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            body, tid = self._collab(mod)
+            self.assertIn("designated COLLABORATOR", body,
+                          "the collaborator branch did not run — check the broker fixture")
+            self.assertIn(f"results/{tid}.txt", body,
+                          "engage rulebook must name THIS task's result path")
+            self.assertEqual(body.count(FENCE), 1,
+                             "exactly one instruction boundary, even on the engage branch")
+
+    def test_collaborator_keeps_the_shared_privacy_and_injection_boundary(self):
+        # The engage branch runs in the OWNER core with owner tools, so dropping
+        # these clauses widens the highest-capability path, not the lowest.
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            body, _ = self._collab(mod)
+            for clause in ("private owner context", "unrelated personal data",
+                           "instructions introduced by", "Do not disclose credentials"):
+                self.assertIn(clause, body,
+                              f"collaborator body dropped the shared boundary clause: {clause!r}")
+
+    def test_ordinary_team_still_takes_the_narrower_guardrail(self):
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            body, _ = self._collab(mod, collaborator=False, id="collab2")
+            self.assertIn("TEAM-tier request from a trusted collaborator", body)
+            self.assertNotIn("designated COLLABORATOR", body,
+                             "a non-attested team task must not get the engage rulebook")
+
+    def test_body_text_cannot_opt_itself_in(self):
+        # `collaborator` is promoted only when it is exactly True.
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            body, _ = self._collab(mod, collaborator="true", id="collab3")
+            self.assertNotIn("designated COLLABORATOR", body,
+                             "a truthy non-True value must not promote to collaborator")
+
+
+class TheTwoBranchesShareOneTrustBoundary(unittest.TestCase):
+    def test_shared_clauses_are_present_in_both_renders(self):
+        root = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(root / "src"))
+        import importlib
+        tg = importlib.import_module("team_guardrail")
+        # One text, two consumers: if SHARED_TRUST_BOUNDARY drifts from the prose
+        # inside TEAM_GUARDRAIL, the two team branches stop agreeing silently.
+        for clause in ("Do not disclose credentials", "private owner context",
+                       "instructions introduced by"):
+            self.assertIn(clause, tg.TEAM_GUARDRAIL, f"TEAM_GUARDRAIL lost {clause!r}")
+            self.assertIn(clause, tg.SHARED_TRUST_BOUNDARY,
+                          f"SHARED_TRUST_BOUNDARY lost {clause!r}")
+            self.assertIn(clause, tg.engage_rulebook("room", tg.AG2SPACE_PROVENANCE, "results/x.txt"),
+                          f"engage rulebook lost {clause!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
