@@ -74,8 +74,9 @@ else:
     fail("unhealthy path", f"rc={r.returncode} out={r.stdout[:160]!r}")
 
 # ── Test: a WEDGED-but-resident stack is actually stopped before recovery ─────
-# startup.sh only starts what `pgrep` cannot find, so a wedged process
-# made recovery a silent no-op.
+
+# startup.sh only starts what `pgrep` cannot find; a wedged resident made
+# recovery a silent no-op.
 _wedge_port = 0
 _s = socket.socket()
 _s.bind(("127.0.0.1", 0))
