@@ -53,9 +53,8 @@ check(explicit_target("plain proactive body, no marker") is None,
 check(can_route(None, DISCORD) and can_route(None, SLACK) and can_route(None, AG2SPACE),
       "no target -> every bridge still routable (behavior unchanged)")
 
-# The dm-only privacy guard suppresses the redirect entirely. A suppressed
-# redirect must read as 'no explicit target', never as an unroutable one --
-# otherwise the guard would make every bridge decline and strand the body.
+# dm-only suppresses the redirect: it must read as 'no target', never as an
+# unroutable one, or the privacy guard would strand the body everywhere.
 DM = "[dm-only]\n[channel: !PrxhizfLysTYrYDcnw:ag2.space]\nprivate calendar contents"
 check(explicit_target(DM) is None,
       "dm-only suppresses the redirect, so no target is reported")
@@ -67,8 +66,7 @@ check(not can_route("!abc1530802402603700415:ag2.space", DISCORD),
       "match is anchored — an embedded snowflake does not make it Discord's")
 
 # --- WIRING: the helper passing proves nothing if Discord never calls it ------
-# ORDER is the invariant. Declining AFTER the claim-by-rename would still
-# quarantine, which is the defect; the check must precede the rename.
+# ORDER is the invariant: declining after the rename still quarantines.
 _src = (REPO / "src" / "discord-bridge.py").read_text()
 check("can_route" in _src and "explicit_target" in _src,
       "discord-bridge imports the shared routability policy")

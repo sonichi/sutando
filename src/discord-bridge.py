@@ -5166,9 +5166,8 @@ async def poll_proactive():
                 continue
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
-                    # Decline a destination this bridge cannot address, BEFORE
-                    # claiming it: claiming then failing quarantines the file out
-                    # of results/, where the gateway's takeover can never see it.
+                    # Decline BEFORE claiming: claiming then failing quarantines
+                    # the file out of results/, where no takeover can see it.
                     try:
                         _target = explicit_target(f.read_text(encoding="utf-8"))
                     except OSError:
