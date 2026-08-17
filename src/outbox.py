@@ -353,7 +353,14 @@ def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
     try:
         os.link(str(src), str(tomb))
     except OSError:
-        return False                      # another drainer judged this same record
+        # An honest swap finishes in microseconds, so a token older than the grace
+        # period is a crashed reclaim; leaving it would wedge the item forever.
+        if not _sweep_if_abandoned(tomb):
+            return False                  # another drainer judged this same record
+        try:
+            os.link(str(src), str(tomb))
+        except OSError:
+            return False
     taken = _read_claim_at(src, item_id)
     if taken is None or not _same_claim(taken, observed):
         return False                      # it moved on; our observation is stale
@@ -391,6 +398,25 @@ def _discard(p: Path) -> None:
         pass
 
 
+# A swap token is held across two syscalls; anything older outlived its process.
+SWAP_GRACE_S = 30.0
+
+
+def _sweep_if_abandoned(tomb: Path, grace_s: float = SWAP_GRACE_S) -> bool:
+    """Remove a swap token whose owner died mid-swap; True if one was removed."""
+    try:
+        age = time.time() - os.stat(str(tomb)).st_mtime
+    except OSError:
+        return True                       # already gone: the retry is free
+    if age < grace_s:
+        return False                      # a live peer is mid-swap right now
+    try:
+        os.unlink(str(tomb))
+    except FileNotFoundError:
+        pass
+    return True
+
+
 def _force_release(p: Path) -> bool:
     try:
         p.unlink()
@@ -402,9 +428,8 @@ def _force_release(p: Path) -> bool:
 def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
     """Release only the claim INSTANCE this caller inspected.
 
-    Read-then-unlink deletes whatever occupies the slot by the time it runs — a
-    successor included. The rename is atomic, so there is no gap between the
-    decision and the act for a turnover to land in.
+    Link-then-verify, never rename: a rename moves whatever occupies the slot, so
+    a stale observation evicts a successor and no later step can undo that.
     """
     observed = _read_claim_at(p, item_id)
     # A torn claim has no readable owner, so nobody can prove they hold it.
@@ -412,35 +437,32 @@ def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
         return False
     tomb = p.with_name(f"{p.name}.release-{_claim_stamp(observed)}")
     try:
-        os.rename(str(p), str(tomb))
+        os.link(str(p), str(tomb))
     except OSError:
-        return False
-    taken = _read_claim_at(tomb, item_id)
-    if taken is not None and _same_claim(taken, observed):
-        _discard(tomb)
+        return False                      # a peer holds this same observation
+    try:
+        taken = _read_claim_at(tomb, item_id)
+        if taken is None or not _same_claim(taken, observed):
+            return False                  # never ours; the slot is left untouched
+        # Same inode both sides proves the slot did not turn over under us, so the
+        # unlink cannot remove a successor's claim.
+        if not _same_inode(p, tomb):
+            return False
+        try:
+            os.unlink(str(p))
+        except FileNotFoundError:
+            return False
         return True
-    _reinstate(p, tomb)
-    return False
-
-
-def _reinstate(p: Path, tomb: Path) -> None:
-    """Put back a claim this caller took but did not own.
-
-    O_EXCL rather than rename: if the slot is occupied again, that newer claim is
-    the valid one and this copy must be dropped instead of overwriting it.
-    """
-    try:
-        payload = tomb.read_bytes()
-    except FileNotFoundError:
-        return
-    try:
-        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(payload)
-    except FileExistsError:
-        pass
     finally:
         _discard(tomb)
+
+
+def _same_inode(a: Path, b: Path) -> bool:
+    try:
+        sa, sb = os.stat(str(a)), os.stat(str(b))
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
 
 
 # -- item lifecycle -----------------------------------------------------------

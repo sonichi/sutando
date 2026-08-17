@@ -56,6 +56,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -439,6 +440,108 @@ def _c14():
             f"the surviving claim is {holder.drainer_id!r}, expected B")
         assert out is False, (
             "A reported a successful release of a claim that was no longer its own")
+
+
+# 15 --------------------------------------------------------------------------
+@contract("a stale release must not evict a successor for a THIRD party to take")
+def _c15():
+    """Contract 14 with three parties, which is where a rename-based release fails.
+
+    A renames the slot away believing it is its own; the file it moves is B's.
+    C then takes the vacated slot, and A's put-back finds it occupied and drops
+    B — so B believes it holds delivery while C actually does, and both send.
+    """
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-aba3", "A") is True
+        claim = m._claim_path(root, "item-aba3")
+        real_link, real_read = os.link, m._read_claim_at
+        st = {"moved": False, "c": False}
+
+        def racing_link(src, dst):
+            # B turns the slot over after A's ownership read, before A moves it.
+            if not st["moved"] and str(src) == str(claim):
+                st["moved"] = True
+                os.unlink(str(claim))
+                acquire(root, "item-aba3", "B")
+            return real_link(src, dst)
+
+        def racing_read(path, item_id):
+            rec = real_read(path, item_id)
+            # C claims the slot in the window A's put-back would land in.
+            if st["moved"] and not st["c"] and ".release-" in str(path):
+                st["c"] = True
+                acquire(root, "item-aba3", "C")
+            return rec
+
+        os.link, m._read_claim_at = racing_link, racing_read
+        try:
+            out = release(root, "item-aba3", "A")
+        finally:
+            os.link, m._read_claim_at = real_link, real_read
+
+        holder = read(root, "item-aba3")
+        assert out is False, "A released a claim that was never its own"
+        assert holder is not None and holder.drainer_id == "B", (
+            f"holder is {holder.drainer_id if holder else None}, not B; A's stale "
+            "release evicted the real holder and a third drainer took the slot, so "
+            "two drainers now believe they own delivery of the same item")
+
+
+# 16 --------------------------------------------------------------------------
+@contract("a reclaim that dies mid-swap must not wedge the item forever")
+def _c16():
+    """The swap token is created by one syscall and consumed by a later one.
+
+    A crash between them leaves the token behind, and every future reclaim then
+    fails its link — so a DEAD owner's claim can never be taken over and the item
+    stalls permanently. An abandoned token must age out; a live one must not.
+    """
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    reclaim = need(m, "reclaim_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-wedge", "dead-owner") is True
+        claim = m._claim_path(root, "item-wedge")
+        rec = json.loads(claim.read_text(encoding="utf-8"))
+        rec.update(pid=999999, claimed_at=0.0)
+        claim.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
+
+        real_link = os.link
+
+        def link_then_crash(src, dst):
+            real_link(src, dst)
+            raise KeyboardInterrupt("died after the swap token was created")
+
+        os.link = link_then_crash
+        try:
+            reclaim(root, "item-wedge", 1.0, "X")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            os.link = real_link
+
+        tokens = list(m._claims_dir(root).glob(f"{claim.name}.reclaim-*"))
+        assert len(tokens) == 1, f"expected the crashed swap token, got {tokens}"
+
+        # A FRESH token means a peer may be mid-swap right now: do not steal.
+        assert reclaim(root, "item-wedge", 1.0, "Y") is False, (
+            "a token seconds old belongs to a live peer; sweeping it re-opens the "
+            "double-reclaim this swap exists to prevent")
+
+        old = time.time() - 120
+        os.utime(str(tokens[0]), (old, old))
+        assert reclaim(root, "item-wedge", 1.0, "Z") is True, (
+            "an abandoned token must age out; otherwise one crash wedges this item "
+            "forever and nothing ever delivers it")
+        holder = read(root, "item-wedge")
+        assert holder is not None and holder.drainer_id == "Z"
 
 
 def main() -> int:
