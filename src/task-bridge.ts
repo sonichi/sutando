@@ -248,8 +248,8 @@ const CLAIM_LEDGERS = 'remote-task-inflight';
 let _ledgerCache: { key: string; ids: Set<string> } | null = null;
 
 export function _claimedElsewhere(taskId: string): boolean {
-	// Total by construction: this runs inside the result-drain loop, and a
-	// throw here aborts the pass for every later-sorting file, invisibly.
+	// Defence in depth: this runs inside the result-drain loop, where a throw
+	// aborts the pass for every later-sorting file without logging.
 	try {
 		// ONLY this workspace's state dir. A consumer configured against another
 		// tree writes its results there too, so its claims describe files that

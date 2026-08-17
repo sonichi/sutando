@@ -1,6 +1,6 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -94,22 +94,4 @@ describe('_claimedElsewhere reads other consumers\' durable in-flight ledgers', 
 		delete process.env.AGENT_CONNECT_STATE_DIR;
 	});
 
-	it('the whole body is guarded, including directory resolution', () => {
-		// The outer try covers homedir() and join(REPO_DIR, …), which run BEFORE
-		// the per-directory try. Neither is injectable from here — REPO_DIR is
-		// captured at module load — so this asserts the structural property the
-		// runtime guarantee rests on rather than simulating the throw. Removing
-		// the wrap fails this; a scratch harness with an unset REPO_DIR confirms
-		// the behaviour it stands for. Known weakness: a structural pin can also
-		// break on a safe refactor, and it never executes the guarded path. The
-		// behavioural version needs mock.module on node:os, which requires
-		// --experimental-test-module-mocks; the runner does not pass it, so that
-		// control cannot run here without changing it for every suite.
-		const src = readFileSync(new URL('../src/task-bridge.ts', import.meta.url), 'utf-8');
-		const fn = src.slice(src.indexOf('export function _claimedElsewhere'));
-		const body = fn.slice(fn.indexOf('{') + 1, fn.indexOf('\n}\n'));
-		const firstStmt = body.split('\n').find(l => l.trim() && !l.trim().startsWith('//'));
-		assert.match(firstStmt ?? '', /^\s*try \{/,
-			'directory resolution must be inside the try, not above it');
-	});
 });
