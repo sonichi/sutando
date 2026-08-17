@@ -570,9 +570,8 @@ def _guarded_result_body(tid: str, body: str):
     cannot be loaded — the caller leaves the file for retry rather than
     honouring redirect/attach actions on unscanned collaborator output.
     """
-    # Body equality is NOT provenance — a Team runtime can emit these bytes. Only
-    # this process's own record is, and reading must NOT consume it: a deferred
-    # POST leaves the file for retry, and the retry needs the same provenance.
+    # Body equality is NOT provenance; only this process's record is. Reading must
+    # not consume it — a deferred POST retries and needs the same provenance.
     if tid in _REDELIVERED and _is_redelivery_control(body):
         return body, None
     try:
