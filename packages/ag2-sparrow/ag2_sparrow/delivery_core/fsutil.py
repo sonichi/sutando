@@ -14,6 +14,7 @@ transiently; the destination is never truncated or overwritten.
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -23,12 +24,18 @@ def create_exclusive(path: Path, data: bytes) -> bool:
     at the destination). Temp is written beside the destination (same fs)
     and linked in — link(2) refuses to clobber, which IS the exclusivity."""
     path = Path(path)
-    tmp = path.with_name(f".{path.name}.cx{os.getpid()}.{id(data) & 0xffff}")
-    tmp.write_bytes(data)
+    # mkstemp: O_EXCL under an unpredictable name. A derived name collides
+    # in-process and the loser writes through the winner's inode.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent),
+                                    prefix=f".{path.name}.cx")
+    tmp = Path(tmp_name)
     try:
-        os.link(tmp, path)
-        return True
-    except FileExistsError:
-        return False
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        try:
+            os.link(tmp, path)
+            return True
+        except FileExistsError:
+            return False
     finally:
         tmp.unlink(missing_ok=True)

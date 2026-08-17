@@ -44,26 +44,35 @@ class DesignAClaimBackend:
             return None
         return f"{rec.drainer_id}:{rec.pid}:{rec.start_usec}:{rec.claimed_at}"
 
+    TERMINAL = {"DELIVERED", "PARKED"}
+
     def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:
-        if not outbox._item_path(self.root, item_id).exists():
-            return None
-        took = (outbox.acquire_delivery_claim(self.root, item_id, worker)
-                or outbox.reclaim_delivery_claim(self.root, item_id,
-                                                 self.reclaim_ttl_s, worker))
-        if not took:
-            return None
-        incarnation = self._incarnation_of(item_id)
-        if incarnation is None:                 # record vanished under us
-            return None
-        return ClaimToken(item_id=item_id, worker=worker,
-                          incarnation=incarnation)
+        # Eligibility, acquisition and capture in ONE critical section: a
+        # later capture can adopt a successor's incarnation.
+        with outbox._item_lock(self.root, item_id):
+            if not outbox._item_path(self.root, item_id).exists():
+                return None
+            if outbox._read_item(self.root, item_id).get("status") in self.TERMINAL:
+                return None
+            took = (outbox._acquire_locked(self.root, item_id, worker)
+                    or outbox._reclaim_locked(self.root, item_id,
+                                              self.reclaim_ttl_s, worker))
+            if not took:
+                return None
+            incarnation = self._incarnation_of(item_id)
+            if incarnation is None:             # record vanished under us
+                return None
+            return ClaimToken(item_id=item_id, worker=worker,
+                              incarnation=incarnation)
 
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome) -> bool:
         item_id = token.item_id
         # Validate -> transition -> retire, all under the item lock: a stale
         # incarnation must not mutate or park its successor's item.
         with outbox._item_lock(self.root, item_id):
-            if self._incarnation_of(item_id) != token.incarnation:
+            rec = outbox.read_delivery_claim(self.root, item_id)
+            if rec is None or rec.drainer_id != token.worker or \
+                    self._incarnation_of(item_id) != token.incarnation:
                 return False
             if outcome is DeliveryOutcome.CONFIRMED:
                 d = outbox._read_item(self.root, item_id)

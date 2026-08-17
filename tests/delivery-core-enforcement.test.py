@@ -39,6 +39,7 @@ from ag2_sparrow.delivery_core import (  # noqa: E402
     DeliveryCore, DeliveryOutcome, DeliveryReceipt, DesignAClaimBackend,
     ProviderCapabilities, ProviderIndeterminate, idempotency_key)
 from ag2_sparrow.delivery_core import migration  # noqa: E402
+from ag2_sparrow import outbox  # noqa: E402
 
 ITEM = "room-evt-1"
 CORE_DIR = _PKG / "ag2_sparrow" / "delivery_core"
@@ -97,6 +98,13 @@ class KeyIdentityAcrossIncarnations(unittest.TestCase):
             backend.publish(ITEM, b"x")
             p1 = _KeyRecorder([ProviderIndeterminate("timeout after send")])
             DeliveryCore(backend, p1, worker="w1.1.1").deliver_one(ITEM, b"x")
+            # A parked item is not automatically re-drivable: requeue is
+            # an explicit act.
+            p_auto = _KeyRecorder([DeliveryOutcome.CONFIRMED])
+            DeliveryCore(backend, p_auto, worker="w2.2.2").deliver_one(ITEM, b"x")
+            self.assertEqual(p_auto.keys, [],
+                             "a PARKED item must not be claimed automatically")
+            outbox.requeue_item(Path(td), ITEM)
             p2 = _KeyRecorder([DeliveryOutcome.CONFIRMED])
             DeliveryCore(backend, p2, worker="w2.2.2").deliver_one(ITEM, b"x")
             self.assertTrue(p1.keys and p2.keys,
@@ -361,6 +369,33 @@ class CreateExclusive(unittest.TestCase):
             self.assertEqual(dst.read_bytes(), b"winner")
             self.assertEqual([p.name for p in Path(td).iterdir()], ["slot"],
                              "loser must leave no temp debris")
+
+    def test_same_bytes_object_callers_do_not_share_a_staging_inode(self):
+        """A staging name derived from (pid, id(data)) collides in-process,
+        letting the loser write through the winner's inode."""
+        from ag2_sparrow.delivery_core import fsutil
+        with tempfile.TemporaryDirectory(prefix="enf-cx3-") as td:
+            dst = Path(td) / "slot"
+            shared = b"AAAA"
+            # Observe the staging path: a thread race only sometimes hits
+            # the window, so racing and passing proves nothing.
+            staged, real_link = [], fsutil.os.link
+
+            def spy(src, dst_):
+                staged.append(str(src))
+                return real_link(src, dst_)
+
+            fsutil.os.link = spy
+            try:
+                fsutil.create_exclusive(dst, shared)
+                fsutil.create_exclusive(dst, shared)
+            finally:
+                fsutil.os.link = real_link
+            self.assertEqual(len(staged), 2, "both calls must stage")
+            self.assertNotEqual(staged[0], staged[1],
+                                "two callers shared one staging inode — the "
+                                "loser can write through the winner's file")
+            self.assertEqual(dst.read_bytes(), b"AAAA")
 
     def test_falsifier_racing_creators_exactly_one_wins(self):
         import threading

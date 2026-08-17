@@ -214,6 +214,72 @@ class CorePolicy(unittest.TestCase):
             outbox._read_item(self.backend.root, ITEM).get("status"), "PARKED",
             "at max_attempts the core must park, not retry forever")
 
+    def _second_drain_calls(self, first_outcome, policy=None):
+        """Drive once to `first_outcome`, then again; return the SECOND
+        drain's provider-call count. Terminal states must make it zero."""
+        core = DeliveryCore(self.backend, _Recorder([first_outcome]),
+                            policy or RetryPolicy())
+        core.deliver_one(ITEM, b"x")
+        second = _Recorder([DeliveryOutcome.CONFIRMED])
+        core.provider = second
+        core.deliver_one(ITEM, b"x")
+        return len(second.deliver_calls)
+
+    def test_delivered_item_is_not_delivered_again(self):
+        self.assertEqual(self._second_drain_calls(DeliveryOutcome.CONFIRMED), 0,
+                         "a DELIVERED item was delivered twice")
+
+    def test_parked_unknown_is_not_redriven(self):
+        p = _Recorder([ProviderIndeterminate("timeout after send")])
+        core = DeliveryCore(self.backend, p)
+        core.deliver_one(ITEM, b"x")
+        second = _Recorder([DeliveryOutcome.CONFIRMED])
+        core.provider = second
+        core.deliver_one(ITEM, b"x")
+        self.assertEqual(len(second.deliver_calls), 0,
+                         "an OUTCOME_UNKNOWN item parked for reconcile was "
+                         "immediately re-driven")
+
+    def test_item_parked_at_the_ceiling_is_not_attempted_again(self):
+        self.assertEqual(
+            self._second_drain_calls(DeliveryOutcome.NOT_DELIVERED,
+                                     RetryPolicy(max_attempts=1)), 0,
+            "an item parked at the retry ceiling was attempted again")
+
+    def test_stale_claimant_cannot_adopt_a_successors_incarnation(self):
+        """Acquisition and capture must be one critical section, or A
+        returns a token carrying B's incarnation."""
+        import ag2_sparrow.outbox as outbox
+        self.backend.publish(ITEM, b"x")
+        # Interleave a successor between acquisition and capture; one
+        # critical section makes this impossible.
+        real_incarnation_of = self.backend._incarnation_of
+        fired = []
+
+        def interleave(item_id):
+            if not fired:
+                fired.append(True)
+                try:
+                    # Blocked under the fix: the lock is still held.
+                    self.backend.force_release(item_id)
+                    self.backend.claim(item_id, "B")
+                except Exception:
+                    pass
+            return real_incarnation_of(item_id)
+
+        self.backend._incarnation_of = interleave
+        try:
+            a = self.backend.claim(ITEM, "A")
+        finally:
+            self.backend._incarnation_of = real_incarnation_of
+        self.assertTrue(fired, "the interleave never ran — test is vacuous")
+        if a is not None:
+            # Discriminator: a token must name its own worker's
+            # incarnation; the racy structure gives A the successor's.
+            self.assertTrue(a.incarnation.startswith(f"{a.worker}:"),
+                            f"claim returned a token for {a.worker!r} carrying "
+                            f"another incarnation: {a.incarnation!r}")
+
     def test_key_never_contains_claim_material(self):
         self.assertEqual(idempotency_key(ITEM), idempotency_key(ITEM),
                          "stable across calls")
