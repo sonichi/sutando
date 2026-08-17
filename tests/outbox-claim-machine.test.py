@@ -2,7 +2,7 @@
 """Hypothesis ClaimMachine explorer: stateful search over the outbox
 delivery-claim protocol's interleavings.
 
-Drives the shared ClaimDriver (tests/claim_machine_harness.py — the REAL
+Drives the shared ClaimDriver (tests/_helpers/claim_machine_harness.py — the REAL
 src/outbox.py under gated concurrent drainers) with Hypothesis choosing the
 op sequence and per-boundary schedule. Invariants live in the driver's
 oracle: at most one believing holder; a believer's claim file exists and
@@ -37,7 +37,7 @@ except ImportError:
     print("SKIP: hypothesis not installed")
     sys.exit(0)
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "_helpers"))
 from claim_machine_harness import ClaimDriver, ACTORS  # noqa: E402
 
 

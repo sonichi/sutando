@@ -22,7 +22,7 @@ import contextlib
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "_helpers"))
 import claim_machine_harness as H
 
 SCRIPTS = {
