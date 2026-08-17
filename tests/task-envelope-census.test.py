@@ -106,6 +106,18 @@ class CensusCliAndFallbacks(unittest.TestCase):
         r = C.census(self.ws, days=10 * 365)
         self.assertEqual(r["scanned"], 1)
 
+    def test_long_digit_id_is_not_an_epoch(self):
+        """Live bug (2026-08-17 census run): an 18-digit gateway id's first 13
+        digits parse as a 2057 epoch, pinning July archive files in-window."""
+        old_iso = "2026-01-01T00:00:00Z"
+        _write(self.ws, "task-274606259064310678.txt",
+               f"id: task-274606259064310678\ntimestamp: {old_iso}\n"
+               "task: t\nsource: ag2space\n", sub="tasks/archive/2026-01")
+        r = C.census(self.ws, days=7)
+        self.assertEqual(r["scanned"], 0,
+                         "an over-long digit id must fall back to the "
+                         "timestamp header, not parse a future epoch")
+
     def test_bad_timestamp_header_falls_back_to_mtime(self):
         _write(self.ws, "task-cafebabe.txt",
                "id: task-cafebabe\ntimestamp: not-a-date\ntask: t\n")

@@ -27,7 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_envelope import verify_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
-_ID_MS = re.compile(r"task-(\d{13})")
+# (?!\d): an id with MORE digits (e.g. an 18-digit gateway id) is not an
+# epoch — its first 13 digits parse as a far-future date, pinning it in-window.
+_ID_MS = re.compile(r"task-(\d{13})(?!\d)")
 
 
 def _task_epoch(name: str, text: str, mtime: float) -> float:
