@@ -68,6 +68,14 @@ def age_all_tokens(root, item):
     """
     p = ob._claim_path(root, item)
     old = time.time() - 3600
+    # A claim's age is its `claimed_at` FIELD, not its mtime; touching files
+    # alone leaves it freshly taken and recovery refuses on TTL.
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        rec["claimed_at"] = old
+        p.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
     targets = list(ob._claims_dir(root).glob(f"{p.name}.*"))
     if p.exists():
         targets.append(p)
