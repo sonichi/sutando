@@ -70,10 +70,14 @@ def load_or_create_key(workspace: Path | None = None) -> bytes:
 
 
 def _strip_stamp(text: str) -> tuple[str, str | None]:
+    """Recognize a stamp ONLY in its canonical header slot (line 0, or line 1
+    after `id:`). A stamp-shaped line anywhere else is user CONTENT and must
+    survive byte-identically — deleting it would authenticate altered bytes."""
     lines = text.split("\n")
-    for i, line in enumerate(lines):
-        if line.startswith(STAMP_PREFIX):
-            mac = line[len(STAMP_PREFIX):].strip()
+    for i in (0, 1):
+        if i < len(lines) and lines[i].startswith(STAMP_PREFIX) and \
+                (i == 0 or lines[0].startswith("id:")):
+            mac = lines[i][len(STAMP_PREFIX):].strip()
             return "\n".join(lines[:i] + lines[i + 1:]), mac
     return text, None
 

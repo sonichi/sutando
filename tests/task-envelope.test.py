@@ -110,6 +110,37 @@ class EnvelopeContract(unittest.TestCase):
         Path(path).unlink()
 
 
+class BodyStampCollision(unittest.TestCase):
+    """Review P1-2: a stamp-shaped line in USER CONTENT must survive
+    byte-identically and never be consumed as the envelope."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="env-bc-")
+        self.ws = Path(self._tmp.name)
+        (self.ws / "state" / "auth").mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_body_collision_preserved_and_verified(self):
+        body_line = E.STAMP_PREFIX + "deadbeef" * 8
+        task = ("id: task-77\ntask: quote follows\n" + body_line +
+                "\nsource: discord\naccess_tier: owner\n")
+        stamped = E.stamp_text(task, self.ws)
+        self.assertIn(body_line, stamped,
+                      "user content deleted before signing")
+        self.assertEqual(E.verify_text(stamped, self.ws)["verdict"],
+                         "verified")
+        self.assertEqual(stamped.count(E.STAMP_PREFIX), 2,
+                         "canonical stamp + untouched body line")
+
+    def test_unstamped_file_with_body_collision_is_unsigned_not_invalid(self):
+        task = ("id: task-78\ntask: x\n" + E.STAMP_PREFIX + "00" * 32 +
+                "\naccess_tier: owner\n")
+        self.assertEqual(E.verify_text(task, self.ws)["verdict"], "unsigned",
+                         "a body-slot stamp line is content, not an envelope")
+
+
 class WriterWiring(unittest.TestCase):
     """The two phase-1 writers must import and call stamp_task on the text
     they persist; a regex pin so the call cannot silently vanish."""
@@ -128,6 +159,33 @@ class WriterWiring(unittest.TestCase):
         self.assertIn("from task_envelope import stamp_text", src)
         self.assertIn("set_task_stamper(stamp_text)", src,
                       "wrapper must inject the stamper at the adapter edge")
+
+    def test_live_gateway_write_task_output_is_stamped(self):
+        """Review P1-1: pin the REAL _write_task, not a surrogate helper."""
+        import importlib
+        sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+        with tempfile.TemporaryDirectory(prefix="env-gw-") as td:
+            ws = Path(td); (ws / "state" / "auth").mkdir(parents=True)
+            tasks = ws / "tasks"; tasks.mkdir()
+            import ag2_sparrow._dirs as dirs
+            dirs.set_dirs(task_dir=tasks, result_dir=ws / "results",
+                          state_dir=ws / "state")
+            ltp = importlib.import_module("ag2_sparrow.local_task_protocol")
+            gw = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+            ltp.set_task_stamper(lambda t: E.stamp_text(t, ws))
+            try:
+                tid = gw._write_task({
+                    "task": "hello from the wire",
+                    "source": "ag2space", "channel_id": "!room:x",
+                    "user_id": "@qingyun:ag2.space", "id": "task-991"})
+                self.assertIsNotNone(tid)
+                out = (tasks / f"{tid}.txt").read_text()
+                self.assertEqual(E.verify_text(out, ws)["verdict"],
+                                 "verified",
+                                 "the LIVE gateway writer must emit stamped "
+                                 "tasks")
+            finally:
+                ltp.set_task_stamper(None)
 
     def test_sparrow_write_path_applies_stamper(self):
         import importlib

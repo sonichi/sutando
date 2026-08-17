@@ -147,7 +147,16 @@ class TestWriteTaskFile(unittest.TestCase):
             bridge._write_task_file, p, lambda: "built: hello", "frank", "chan6", "owner", 205
         )
         self.assertTrue(ok)
-        self.assertEqual(p.read_text(), "built: hello")
+        # Envelope stamping (task_envelope) prepends its header line; the
+        # built content must survive byte-identically and the file verify.
+        import sys as _s
+        _s.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+        import task_envelope as _E
+        written = p.read_text()
+        stripped, mac = _E._strip_stamp(written)
+        self.assertEqual(stripped, "built: hello",
+                         "stamping must not alter the built content")
+        self.assertIsNotNone(mac, "bridge writes must be stamped")
         self.assertIn("[task-write] wrote", out)
 
     def test_builder_failure_returns_false_and_logs(self):
