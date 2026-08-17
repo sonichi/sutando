@@ -78,4 +78,16 @@ describe('_claimedElsewhere reads other consumers\' durable in-flight ledgers', 
 		assert.equal(o!.claimedElsewhere, true,
 			'an operator-set label the list cannot enumerate is still caught by the claim');
 	});
+
+	it('is total — a failure never escapes into the drain loop', () => {
+		// This runs inside the result-scan for-loop, whose catch inspects
+		// err.code; a ReferenceError has none, so the guard is false, nothing
+		// is logged, and the pass aborts for every later-sorting file. It then
+		// repeats every tick, because the file it stops on is one this PR
+		// deliberately leaves resident. The directory resolution therefore has
+		// to be inside the try, not just the reads.
+		process.env.AGENT_CONNECT_STATE_DIR = '\0not-a-path';
+		assert.doesNotThrow(() => _claimedElsewhere('task-a'));
+		delete process.env.AGENT_CONNECT_STATE_DIR;
+	});
 });

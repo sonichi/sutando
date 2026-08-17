@@ -249,42 +249,46 @@ const CLAIM_LEDGERS = 'remote-task-inflight';
 let _ledgerCache: { key: string; ids: Set<string> } | null = null;
 
 export function _claimedElsewhere(taskId: string): boolean {
-	// Look everywhere the WRITER may resolve, not just the injected dir:
-	// _dirs.state_dir() is injected -> $AGENT_CONNECT_STATE_DIR -> ~/.ag2-sparrow/state,
-	// and a ledger outside the globbed dir reads as "no claim", not "cannot tell".
-	const dirs = [join(REPO_DIR, 'state'), process.env.AGENT_CONNECT_STATE_DIR,
-		join(homedir(), '.ag2-sparrow', 'state')]
-		.filter((d): d is string => !!d);
-	const seen = new Set<string>();
-	const found: string[] = [];
-	const stamps: string[] = [];
-	for (const dir of dirs) {
-		if (seen.has(dir)) continue;
-		seen.add(dir);
-		let names: string[];
-		try {
-			names = readdirSync(dir).filter(f => f.startsWith(CLAIM_LEDGERS) && f.endsWith('.json')).sort();
-		} catch { continue; }
-		for (const f of names) {
-			const full = join(dir, f);
-			found.push(full);
-			try { const st = statSync(full); stamps.push(`${full}:${st.mtimeMs}:${st.size}`); } catch {}
-		}
-	}
-	const key = stamps.join('|');
-	if (_ledgerCache?.key !== key) {
-		const ids = new Set<string>();
-		for (const full of found) {
+	// Total by construction: this runs inside the result-drain loop, and a
+	// throw here aborts the pass for every later-sorting file, invisibly.
+	try {
+		// Look everywhere the WRITER may resolve, not just the injected dir:
+		// _dirs.state_dir() is injected -> $AGENT_CONNECT_STATE_DIR -> ~/.ag2-sparrow/state,
+		// and a ledger outside the globbed dir reads as "no claim", not "cannot tell".
+		const dirs = [join(REPO_DIR, 'state'), process.env.AGENT_CONNECT_STATE_DIR,
+			join(homedir(), '.ag2-sparrow', 'state')]
+			.filter((d): d is string => !!d);
+		const seen = new Set<string>();
+		const found: string[] = [];
+		const stamps: string[] = [];
+		for (const dir of dirs) {
+			if (seen.has(dir)) continue;
+			seen.add(dir);
+			let names: string[];
 			try {
-				const parsed = JSON.parse(readFileSync(full, 'utf-8'));
-				// An unreadable or reshaped ledger yields no claims rather than
-				// throwing; the source-label net still covers those consumers.
-				if (Array.isArray(parsed)) for (const id of parsed) if (typeof id === 'string') ids.add(id);
-			} catch {}
+				names = readdirSync(dir).filter(f => f.startsWith(CLAIM_LEDGERS) && f.endsWith('.json')).sort();
+			} catch { continue; }
+			for (const f of names) {
+				const full = join(dir, f);
+				found.push(full);
+				try { const st = statSync(full); stamps.push(`${full}:${st.mtimeMs}:${st.size}`); } catch {}
+			}
 		}
-		_ledgerCache = { key, ids };
-	}
-	return _ledgerCache.ids.has(taskId);
+		const key = stamps.join('|');
+		if (_ledgerCache?.key !== key) {
+			const ids = new Set<string>();
+			for (const full of found) {
+				try {
+					const parsed = JSON.parse(readFileSync(full, 'utf-8'));
+					// An unreadable or reshaped ledger yields no claims rather than
+					// throwing; the source-label net still covers those consumers.
+					if (Array.isArray(parsed)) for (const id of parsed) if (typeof id === 'string') ids.add(id);
+				} catch {}
+			}
+			_ledgerCache = { key, ids };
+		}
+		return _ledgerCache.ids.has(taskId);
+	} catch { return false; }
 }
 
 /** Origin of a task for the retirement decision, read through the same
