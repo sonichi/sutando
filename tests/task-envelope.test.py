@@ -96,6 +96,43 @@ class EnvelopeContract(unittest.TestCase):
                        if l.startswith("task:"))
         self.assertLess(1, task_at, "stamp must precede the task: line")
 
+    def test_key_creation_race_first_writer_wins(self):
+        """Two creators race; os.link refuses to clobber, both readers end
+        with the SAME key (covers the FileExistsError arm)."""
+        real_link = E.os.link
+        raced = {}
+
+        def racing_link(src, dst, *a, **k):
+            if "task-hmac.key" in str(dst) and not raced.get("done"):
+                raced["done"] = True
+                Path(dst).write_text("ab" * 32, encoding="utf-8")
+            return real_link(src, dst, *a, **k)
+        E.os.link = racing_link
+        try:
+            k1 = E.load_or_create_key(self.ws)
+        finally:
+            E.os.link = real_link
+        self.assertEqual(k1, bytes.fromhex("ab" * 32),
+                         "loser must adopt the winner's key, not clobber")
+        self.assertEqual(E.load_or_create_key(self.ws), k1)
+
+    def test_cli_stamp_and_verify_paths(self):
+        """CLI main(): stamp in place -> verify 0; tamper -> 4; unsigned
+        -> 3 (uses the real host workspace key; content is throwaway)."""
+        with tempfile.NamedTemporaryFile("w", suffix=".txt",
+                                         delete=False) as f:
+            f.write("id: task-cli\ntask: cli check\naccess_tier: owner\n")
+            path = f.name
+        try:
+            self.assertEqual(E.main(["x", "verify", path]), 3)
+            self.assertEqual(E.main(["x", "stamp", path]), 0)
+            self.assertEqual(E.main(["x", "verify", path]), 0)
+            t = Path(path).read_text().replace("cli check", "tampered")
+            Path(path).write_text(t)
+            self.assertEqual(E.main(["x", "verify", path]), 4)
+        finally:
+            Path(path).unlink()
+
     def test_cli_exit_codes(self):
         with tempfile.NamedTemporaryFile("w", suffix=".txt",
                                          delete=False) as f:
