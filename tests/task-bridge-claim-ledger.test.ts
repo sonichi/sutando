@@ -97,7 +97,10 @@ describe('_claimedElsewhere reads other consumers\' durable in-flight ledgers', 
 		// runtime guarantee rests on rather than simulating the throw. Removing
 		// the wrap fails this; a scratch harness with an unset REPO_DIR confirms
 		// the behaviour it stands for. Known weakness: a structural pin can also
-		// break on a safe refactor, and it never executes the guarded path.
+		// break on a safe refactor, and it never executes the guarded path. The
+		// behavioural version needs mock.module on node:os, which requires
+		// --experimental-test-module-mocks; the runner does not pass it, so that
+		// control cannot run here without changing it for every suite.
 		const src = readFileSync(new URL('../src/task-bridge.ts', import.meta.url), 'utf-8');
 		const fn = src.slice(src.indexOf('export function _claimedElsewhere'));
 		const body = fn.slice(fn.indexOf('{') + 1, fn.indexOf('\n}\n'));
