@@ -146,9 +146,8 @@ class StaticKeyScan(unittest.TestCase):
                 if isinstance(node, ast.Call) and \
                         isinstance(node.func, ast.Attribute) and \
                         node.func.attr in ("deliver", "reconcile"):
-                    # Keywords count: `deliver(idempotency_key=...)` has no
-                    # positional args, and skipping it exempted exactly the
-                    # call shape a refactor would produce.
+                    # Keywords count: a keyword-only call has no positional
+                    # args, and skipping it exempted that whole call shape.
                     kw = {k.arg: k.value for k in node.keywords if k.arg}
                     key_arg = kw.get("idempotency_key")
                     if key_arg is None and node.args:
