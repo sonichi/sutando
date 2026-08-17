@@ -1,0 +1,42 @@
+# Nightly ClaimMachine exploration over the outbox claim protocol.
+# Owner-ratified shape (2026-08-17): hypothesis is REQUIRED here — a missing
+# dependency FAILS the job (CLAIM_MACHINE_REQUIRED=1), never a silent pass.
+# The deterministic PR-blocking regressions live in
+# tests/outbox-claim-regressions.test.py (plain CI, no hypothesis); this job's
+# value is finding NEW interleavings and alarming if _item_lock is weakened.
+# Green-forever is the design intent post-flock, not a lack of coverage.
+name: claim-machine-nightly
+
+on:
+  schedule:
+    - cron: '43 9 * * *'
+  workflow_dispatch:
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install hypothesis (required — absence fails the run)
+        run: python3 -m pip install hypothesis
+      - name: Deterministic frozen-schedule regressions (sanity)
+        run: python3 tests/outbox-claim-regressions.test.py
+      - name: ClaimMachine exploration
+        env:
+          CLAIM_MACHINE_REQUIRED: '1'
+          CLAIM_MACHINE_EXAMPLES: '2000'
+          CLAIM_MACHINE_STEPS: '60'
+          CLAIM_MACHINE_DB: 'tests/.claim-machine-db'
+        run: python3 tests/outbox-claim-machine.test.py
+      - name: Upload failure traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claim-machine-failure-${{ github.run_id }}
+          path: |
+            tests/.claim-machine-db
+          if-no-files-found: ignore
