@@ -544,6 +544,38 @@ def _c16():
         assert holder is not None and holder.drainer_id == "Z"
 
 
+# 17 --------------------------------------------------------------------------
+@contract("a torn claim must age out, or a crash mid-write wedges the item forever")
+def _c17():
+    """`acquire` creates the file and then writes it: a crash between the two
+    leaves a claim naming no owner. Refusing it forever is safe for exclusion and
+    fatal for liveness — nothing can ever deliver that item again.
+    """
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    reclaim = need(m, "reclaim_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert acquire(root, "item-torn", "writer") is True
+        claim = m._claim_path(root, "item-torn")
+        claim.write_text("", encoding="utf-8")     # created, never written
+
+        assert read(root, "item-torn").state == "UNKNOWN", (
+            "a torn claim must never read as free")
+        # Fresh: a writer may be between its open() and its write() right now.
+        assert reclaim(root, "item-torn", 0.001, "R") is False, (
+            "stealing a claim that is being written duplicates the delivery")
+
+        old = time.time() - 3600
+        os.utime(str(claim), (old, old))
+        assert reclaim(root, "item-torn", 0.001, "R") is True, (
+            "a torn claim nobody will ever finish writing must become reclaimable; "
+            "otherwise one crash mid-acquire strands this item permanently")
+        holder = read(root, "item-torn")
+        assert holder is not None and holder.drainer_id == "R"
+
+
 def main() -> int:
     print(f"  target: src/outbox.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)

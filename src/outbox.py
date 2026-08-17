@@ -344,6 +344,12 @@ def reclaim_delivery_claim(root: Path, item_id: str, ttl_seconds: float,
     observed = read_delivery_claim(root, item_id)
     if observed is None:
         return acquire_delivery_claim(root, item_id, drainer_id)
+    if observed.state == "UNKNOWN":
+        # A torn claim names no owner, so no age of it condemns a live writer —
+        # but past the grace period its writer is gone and it would wedge forever.
+        if not _sweep_if_abandoned(_claim_path(root, item_id)):
+            return False
+        return acquire_delivery_claim(root, item_id, drainer_id)
     if not _record_is_reclaimable(observed, ttl_seconds):
         return False
     src = _claim_path(root, item_id)
