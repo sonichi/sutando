@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
+import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
@@ -581,11 +582,12 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 						`access_tier: owner\n` +
 						`priority: normal\n` +
 						`task: User dropped context via hotkey. Process this:\n${confineUserContent(content)}\n`;
+					const stampedContent = tryStampText(taskContent);
 					writeFileSync(
 						join(TASK_DIR, `${taskId}.txt`),
-						taskContent,
+						stampedContent,
 					);
-					emitTaskProcessed(taskContent);
+					emitTaskProcessed(stampedContent);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
 					onContextDrop(content);
