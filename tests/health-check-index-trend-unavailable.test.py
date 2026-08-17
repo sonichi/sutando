@@ -82,16 +82,14 @@ check("...and does not return an empty string", n == "", False)
 n1 = note_for(size=16000, gitted=True, revisions=1)
 check("a single-revision history also reports unavailable", MARK in n1, True)
 
-# 3. CONTROL — a real multi-revision history must produce a REAL trend and must
-#    NOT carry the marker. Without this, returning the marker unconditionally
-#    would satisfy every assertion above.
+# 3. CONTROL — a real multi-revision history must produce a REAL trend and NOT
+#    the marker; without it, returning the marker always satisfies everything above.
 n3 = note_for(size=16000, gitted=True, revisions=3)
 check("a real history yields an actual measurement", "over the last" in n3, True)
 check("...and never claims unavailable", MARK in n3, False)
 
-# 4. The marker is a clause on an existing detail line, not a standalone
-#    sentence — it is appended inside memory-index's NEAR-LIMIT WARN detail
-#    (health-check.py:2245), so it must start with the real note's separator.
+# 4. A clause, not a sentence: appended inside memory-index's NEAR-LIMIT WARN
+#    detail (health-check.py:2245), so it must start with the real separator.
 check("the marker is a ';' clause, matching the real note's shape",
       n.lstrip().startswith(";"), True)
 
@@ -100,9 +98,8 @@ check("the marker is a ';' clause, matching the real note's shape",
 check("the marker contains no failure vocabulary",
       any(w in n.lower() for w in ("error", "fail", "broken", "warn")), False)
 
-# 6. THE REMAINING FAIL-SAFE BRANCHES. Each decides what happens when git
-#    answers but unusably, and an untested fail-safe is indistinguishable from
-#    one that never runs. Drive them by making the subprocess answer badly.
+# 6. THE REMAINING FAIL-SAFE BRANCHES — git answering unusably. An untested
+#    fail-safe is indistinguishable from one that never runs; make git answer badly.
 class _Res:
     def __init__(self, rc=0, out=""):
         self.returncode, self.stdout = rc, out

@@ -1970,9 +1970,8 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
 
-# Said instead of "" when the trend cannot be computed. Silence made "no history
-# to read" indistinguishable from "read it, nothing to report" — the projection
-# that warns about approaching the cut simply never ran, and nothing said so.
+# Said instead of "" when the trend cannot be computed: silence made "no history
+# to read" indistinguishable from "read it, nothing to report".
 _TREND_UNAVAILABLE = "; growth trend unavailable (no readable index history on this host)"
 
 
