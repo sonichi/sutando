@@ -91,6 +91,9 @@ WORKSPACE_SURFACE_DIRS=(
     "docs"
     "email-drafts"
     "agent-inbox"
+    # Owner-custom tooling surface (report c8310df7): <workspace>/scripts is
+    # DATA. The repo's own scripts/ is code — excluded via SOURCE_A_EXCLUDE.
+    "scripts"
 )
 
 # Per `feedback_per_source_surface_lists` 2026-06-02: dirs in Mini's #7
@@ -105,6 +108,7 @@ SOURCE_A_EXCLUDE=(
     "docs"
     "email-drafts"
     "agent-inbox"
+    "scripts"
 )
 WORKSPACE_SURFACE_FILES=(
     "build_log.md"
@@ -240,6 +244,7 @@ CLASS_RULES=(
     "docs/*|structural"
     "email-drafts/*|structural"
     "agent-inbox/*|structural"
+    "scripts/*|collision-keep-both"  # owner-custom tools: user content, never drop a version
     # Catchall — per Lucy #design 2026-06-02 + owner direction: workspace
     # sources B+C may have user-custom dirs/files (experiments/, obsidian-vault/,
     # personal-src/, repro-*.ts, etc.) outside the canonical surface. Anything
