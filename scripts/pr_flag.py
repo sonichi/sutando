@@ -266,17 +266,25 @@ def discovery_argv(repo: str) -> list:
     ]
 
 
-def peer_candidates(discovered: list, owner_login: str) -> list:
+def peer_candidates(discovered: list, owner_login: str, tally: dict = None) -> list:
     """Peer PRs whose merge the owner could still unblock -- stage 2's input.
-    Prunes drafts and CHANGES_REQUESTED; never prunes on APPROVED."""
+    Prunes drafts and CHANGES_REQUESTED; never prunes on APPROVED.
+
+    `tally` counts each prune BY REASON. The pruning rule stays in this one
+    loop: a separate counter would restate it and the two would drift.
+    """
     out = []
     for pr in discovered:
         if pr.get("isDraft"):
+            if tally is not None:
+                tally["draft"] = tally.get("draft", 0) + 1
             continue
         author = ((pr.get("author") or {}).get("login") or "")
         if author == owner_login:
             continue                       # fetch_argv already covers these
         if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+            if tally is not None:
+                tally["changes_requested"] = tally.get("changes_requested", 0) + 1
             continue
         out.append(pr["number"])
     return out
@@ -413,6 +421,9 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
                   if author else "open, non-draft PRs (all authors)")
         ),
         "excludes": excludes,
+        # Prose cannot be read as a number. `complete: true` next to a record
+        # count reads as "this is every open PR" unless the drops are counted.
+        "excluded_counts": dict((peer_stage or {}).get("excluded") or {}),
         "complete": complete,
         "complete_reason": why,
         "record_count": record_count,
@@ -556,7 +567,8 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     # the `--limit` ceiling applies here, before raw_state() drops drafts.
     own_ok, own = _fetch_prs(args.repo, args.owner)
     disc_ok, discovered = _fetch_discovered(args.repo)
-    candidates = peer_candidates(discovered, args.owner)
+    pruned = {}
+    candidates = peer_candidates(discovered, args.owner, tally=pruned)
     peers, peer_failures = [], 0
     for number in candidates:
         pr = _fetch_peer_pr(args.repo, number)
@@ -592,7 +604,8 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
                                          "fetched": len(peers),
                                          "failed": peer_failures,
                                          "discovery_ok": disc_ok,
-                                         "owner_ok": own_ok},
+                                         "owner_ok": own_ok,
+                                         "excluded": pruned},
                              # OWNER-stage size: the owner ceiling applies here.
                              fetched_count=len(own))
     certified = (own_ok and disc_ok and peer_failures == 0

@@ -70,6 +70,29 @@ def _peer_cases():
     # PRs as 1. Assert we did not reintroduce it.
     assert 2 in got, "an APPROVED peer PR must survive pruning"
 
+    # Each prune must be COUNTED, not only described: a reader who sees
+    # `complete: true` beside a record count has no other way to learn that a
+    # larger set was dropped. Measured live: 26 reported, 50 dropped.
+    tally = {}
+    pf.peer_candidates(disc, "sonichi", tally=tally)
+    assert tally == {"draft": 1, "changes_requested": 1}, \
+        f"prunes must be counted by reason, got {tally}"
+    scope = pf.scope_descriptor(
+        "r/r", "sonichi", record_count=3,
+        peer_stage={"discovered": 6, "candidates": 3, "fetched": 3, "failed": 0,
+                    "discovery_ok": True, "owner_ok": True, "excluded": tally})
+    assert scope["excluded_counts"] == {"draft": 1, "changes_requested": 1}, \
+        f"scope must carry the counts, got {scope.get('excluded_counts')}"
+    # An owner PR carrying CHANGES_REQUESTED is NOT pruned -- it is mine to fix,
+    # and counting it would overstate the drop. Live: 56 non-draft CR total,
+    # 44 pruned, because 12 are the owner's own.
+    t2 = {}
+    kept = pf.peer_candidates(
+        [{"number": 9, "author": {"login": "sonichi"}, "isDraft": False,
+          "reviewDecision": "CHANGES_REQUESTED"}], "sonichi", tally=t2)
+    assert kept == [] and t2 == {}, \
+        f"an owner CR is in-population, not a prune; got kept={kept} tally={t2}"
+
 
 def _discovery_is_light():
     """Stage 1 must omit the two fields that 504 repo-wide, or it IS stage 2."""
