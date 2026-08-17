@@ -98,12 +98,30 @@ with tempfile.TemporaryDirectory() as td:
     check(aowner == BODY_WITH_MARKERS and aowner_withheld is None,
           "a MONTH-ARCHIVED owner task still passes through byte-identical")
 
-    # KNOWN INTERACTION, pinned rather than changed: TEAM_RESULT_CONTROL lists
-    # no-send, so a Team task's control-only body is withheld and then delivered.
+    # The bridge writes this control ITSELF on replay. Scanning it turned a silent
+    # dedup into a posted warning — and a replay can span hundreds of tasks.
+    write_task(tasks, "task-replay", "team")
+    redeliv, redeliv_withheld = m._guarded_result_body(
+        "task-replay", m.GATEWAY_REDELIVERY_RESULT)
+    check(redeliv == m.GATEWAY_REDELIVERY_RESULT and redeliv_withheld is None,
+          "the gateway's OWN redelivery control is not scanned as agent output")
+    check(any(a.kind == "skip" for a in m.parse_markers(redeliv).actions),
+          "and it still parses as a skip, so the lease closes silently")
+
+    # An agent-produced [no-send] on a Team task stays forbidden.
     write_task(tasks, "task-mark", "team")
     ctrl, ctrl_withheld = m._guarded_result_body("task-mark", "[no-send]\n")
-    check(ctrl_withheld is not None and "[no-send]" not in (ctrl or ""),
-          "PINNED: a TEAM [no-send] is withheld — silent archive becomes a delivered notice")
+    check(ctrl_withheld is not None,
+          "an AGENT-produced [no-send] on a Team task is still withheld")
+
+    # Named instances emit `task-<inst>~<broker-id>`, which the archive lookup
+    # rejected — so an archived owner task read as guest and got withheld.
+    inst_dir = tasks / "archive" / "2026-05"
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    write_task(inst_dir, "task-dev~task-OWNER1", "owner")
+    inst, inst_withheld = m._guarded_result_body("task-dev~task-OWNER1", BODY_WITH_MARKERS)
+    check(inst == BODY_WITH_MARKERS and inst_withheld is None,
+          "a NAMED-INSTANCE archived owner task is found, not treated as guest")
 
     # --- guard unavailable fails CLOSED: the caller gets None and retries
     def _boom():
