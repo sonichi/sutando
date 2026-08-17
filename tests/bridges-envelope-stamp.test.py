@@ -3,105 +3,49 @@
 
 Both write with a bare `write_text` rather than sparrow's `write_task_file`, so
 the `set_task_stamper()` seam never reaches them — they need an edge stamp, the
-shape discord-bridge and cron-runner use.
+shape discord-bridge and cron-runner (#3041) use.
 
-Slack is tested through its real central writer (`_write_routed_task`).
-Telegram's write sits inside the long-polling message handler with no existing
-harness, so its wiring is pinned at source level and the SEMANTICS (stamp +
-fail-open) are covered behaviourally by the slack cases — the same split #3014
-used for its own gateway wrapper.
+WIRING pins only, and deliberately so: importing either bridge would make this
+the 27th offender of `lint-hermetic-bridge-tests` (they resolve channel config at
+MODULE level, so an unisolated CLAUDE_CONFIG_DIR reads a real allowlist). The
+SEMANTICS this wiring delivers — a stamped file that verifies, and fail-open when
+stamping raises — are covered behaviourally by #3041's cron-runner tests, against a
+writer that needs no bridge import. That PR is not merged yet, so until it lands the
+behavioural proof for this shape lives there and not in this tree.
+
+What each pin refuses: a stamp applied to something other than the bytes written,
+a write that bypasses the stamped value, and stamping placed after the write.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import os
-import sys
-import tempfile
-import time
-import types
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _load_slack(workspace: Path):
-    os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-token"
-    os.environ["SLACK_APP_TOKEN"] = "xapp-test-token"
-    os.environ["SUTANDO_WORKSPACE"] = str(workspace)
-    os.environ["SUTANDO_TEST_MODE"] = "1"
+class SlackEdgeStampWiring(unittest.TestCase):
+    def test_central_writer_stamps_the_content_it_writes(self):
+        src = (REPO / "src" / "slack-bridge.py").read_text()
+        self.assertIn("from task_envelope import stamp_text", src)
+        self.assertIn("content = stamp_text(content, REPO)", src,
+                      "the stamp must be applied to the variable that is written")
+        self.assertIn("task_file.write_text(content)", src)
+        self.assertLess(src.index("content = stamp_text(content, REPO)"),
+                        src.index("task_file.write_text(content)"),
+                        "stamping must precede the write")
 
-    class _StubApp:
-        def __init__(self, *a, **k):
-            self.client = types.SimpleNamespace()
-
-        def event(self, _name):
-            return lambda fn: fn
-
-    slack_bolt = types.ModuleType("slack_bolt")
-    slack_bolt.App = _StubApp
-    sys.modules["slack_bolt"] = slack_bolt
-    sys.modules["slack_bolt.adapter"] = types.ModuleType("slack_bolt.adapter")
-    sm = types.ModuleType("slack_bolt.adapter.socket_mode")
-    sm.SocketModeHandler = object
-    sys.modules["slack_bolt.adapter.socket_mode"] = sm
-    sys.path.insert(0, str(REPO / "src"))
-    spec = importlib.util.spec_from_file_location(
-        f"slack_env_{time.time_ns()}", REPO / "src" / "slack-bridge.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-class SlackEdgeStamp(unittest.TestCase):
-    def test_route_write_is_stamped_and_verifies(self):
-        with tempfile.TemporaryDirectory(prefix="slack-stamp-") as raw:
-            ws = Path(raw)
-            bridge = _load_slack(ws)
-            from task_envelope import verify_text
-            tid = f"task-{int(time.time() * 1000)}"
-            tf = ws / "tasks" / f"{tid}.txt"
-            tf.parent.mkdir(parents=True, exist_ok=True)
-            bridge._write_routed_task(tf, f"id: {tid}\ntask: hello\n", tid,
-                                      {"channel": "D1", "thread_ts": None})
-            written = tf.read_text()
-            self.assertEqual(verify_text(written, ws)["verdict"], "verified")
-            self.assertTrue(written.splitlines()[0].startswith("id:"),
-                            "the stamp goes AFTER id:, so task-last readers see a header")
-            self.assertTrue(written.rstrip().endswith("task: hello"),
-                            "task: stays last and the body is unchanged")
-            # The key must land beside the tasks it signs, not via a second
-            # independent workspace resolution inside task_envelope.
-            self.assertTrue((ws / "state" / "auth" / "task-hmac.key").is_file())
-
-    def test_write_survives_a_raising_stamper(self):
-        """Fail-open is the contract: a stamping error costs the stamp, not the task."""
-        with tempfile.TemporaryDirectory(prefix="slack-stamp-open-") as raw:
-            ws = Path(raw)
-            bridge = _load_slack(ws)
-            import task_envelope
-            orig = task_envelope.stamp_text
-            try:
-                task_envelope.stamp_text = lambda *a, **k: (_ for _ in ()).throw(
-                    RuntimeError("keychain on fire"))
-                tid = f"task-{int(time.time() * 1000)}"
-                tf = ws / "tasks" / f"{tid}.txt"
-                tf.parent.mkdir(parents=True, exist_ok=True)
-                bridge._write_routed_task(tf, "task: hello\n", tid,
-                                          {"channel": "D1", "thread_ts": None})
-                body = tf.read_text()
-                self.assertIn("task: hello", body)
-                self.assertNotIn("envelope_hmac:", body, "no partial stamp left behind")
-                self.assertIn(tid, bridge.pending_replies,
-                              "the route is still registered when stamping fails")
-            finally:
-                task_envelope.stamp_text = orig
+    def test_stamp_is_fail_open(self):
+        """A stamping error must cost the stamp, never the task."""
+        src = (REPO / "src" / "slack-bridge.py").read_text()
+        i = src.index("content = stamp_text(content, REPO)")
+        window = src[max(0, i - 200):i + 120]
+        self.assertIn("except Exception:", window,
+                      "the stamp call must sit inside its own except-guard")
 
 
 class TelegramEdgeStampWiring(unittest.TestCase):
-    """Source-level WIRING pin only — semantics are covered by the slack cases."""
-
     def test_stamps_the_content_it_then_writes(self):
         src = (REPO / "src" / "telegram-bridge.py").read_text()
         self.assertIn("from task_envelope import stamp_text", src)
@@ -109,9 +53,15 @@ class TelegramEdgeStampWiring(unittest.TestCase):
                       "the stamp must be applied to the variable that is written")
         self.assertIn("task_file.write_text(_task_content)", src,
                       "the write must consume the stamped variable, not a fresh f-string")
-        stamp_at = src.index("_task_content = stamp_text(")
-        write_at = src.index("task_file.write_text(_task_content)")
-        self.assertLess(stamp_at, write_at, "stamping must precede the write")
+        self.assertLess(src.index("_task_content = stamp_text(_task_content, REPO)"),
+                        src.index("task_file.write_text(_task_content)"),
+                        "stamping must precede the write")
+
+    def test_stamp_is_fail_open(self):
+        src = (REPO / "src" / "telegram-bridge.py").read_text()
+        i = src.index("_task_content = stamp_text(_task_content, REPO)")
+        self.assertIn("except Exception:", src[i:i + 140],
+                      "the stamp call must sit inside its own except-guard")
 
 
 if __name__ == "__main__":
