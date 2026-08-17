@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mayRetireSkipMarked } from '../src/skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked } from '../src/skip_marker_ownership.js';
 
 // results/ is shared by every consumer. Matching `task-*` plus a skip marker
 // retired results this bridge never dispatched: the gateway's bookkeeping
@@ -40,5 +40,31 @@ describe('task-bridge — only retire skip-marked results this bridge owns', () 
 
 	it('matches the marker case-insensitively and after leading space', () => {
 		assert.equal(mayRetireSkipMarked(`${OWN}.txt`, '  [NO-SEND] x', owns), true);
+	});
+
+	it('suppression is UNIVERSAL — a foreign marked result is still marked', () => {
+		// The regression the ownership gate alone would introduce: a foreign
+		// [no-send] that falls through gets NARRATED aloud, which is worse
+		// than the silent mis-archive it replaced.
+		assert.equal(isSkipMarked(`${OTHERS}.txt`, '[no-send]\nbookkeeping'), true);
+		assert.equal(isSkipMarked(`${OWN}.txt`, '[REPLIED]'), true);
+	});
+
+	it('suppression and retirement disagree exactly on foreign items', () => {
+		const foreign = `${OTHERS}.txt`, body = '[no-send]\nx';
+		assert.equal(isSkipMarked(foreign, body), true, 'must be suppressed');
+		assert.equal(mayRetireSkipMarked(foreign, body, owns), false, 'must not be retired');
+	});
+
+	it('unmarked results are neither suppressed nor retired', () => {
+		assert.equal(isSkipMarked(`${OWN}.txt`, 'the actual reply'), false);
+		assert.equal(mayRetireSkipMarked(`${OWN}.txt`, 'the actual reply', owns), false);
+	});
+
+	it('durable ownership: a task no longer in the in-memory map is still ours', () => {
+		// _pendingTasks is in-memory, so a restart or the timeout sweep drops
+		// the entry; ownership must not evaporate with it.
+		const durable = (id: string) => id === OWN || id.startsWith('task-chat-');
+		assert.equal(mayRetireSkipMarked('task-chat-123.txt', '[no-send]', durable), true);
 	});
 });

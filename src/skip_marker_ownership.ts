@@ -1,11 +1,11 @@
 /**
- * Who may retire a skip-marked result.
+ * Skip markers separate TWO decisions that a single guard used to conflate.
  *
- * `results/` is shared by every consumer, so "task-* plus a marker" retires
- * results a bridge never dispatched: the gateway's bookkeeping `[no-send]`
- * gets archived by the voice bridge, its tid leaves the OWNING bridge's
- * in-flight ledger, and a substantive reply written to that path afterwards
- * is read by nobody. Ownership is the discriminator.
+ * Suppression is universal: a [no-send]/[REPLIED] body must never be
+ * narrated or delivered by anyone, whoever dispatched it. Retirement is
+ * ownership-scoped: results/ is shared, so only the dispatching consumer may
+ * archive. Gating both on one predicate makes a foreign marked result fall
+ * through and be SPOKEN — worse than the mis-archive it replaced.
  *
  * Dependency-light and standalone so it is testable without the bridge's
  * runtime deps (task-bridge.ts pulls the whole voice stack).
@@ -13,8 +13,13 @@
 
 export const SKIP_MARKER_RE = /^\s*\[(?:no-send|REPLIED)\]/i;
 
+/** Universal: this result must not be narrated, delivered, or forwarded. */
+export function isSkipMarked(file: string, result: string): boolean {
+	return file.startsWith('task-') && SKIP_MARKER_RE.test(result);
+}
+
+/** Ownership-scoped: may THIS bridge archive it and retire its task row? */
 export function mayRetireSkipMarked(file: string, result: string,
 	isOwn: (taskId: string) => boolean): boolean {
-	if (!file.startsWith('task-') || !SKIP_MARKER_RE.test(result)) return false;
-	return isOwn(file.replace(/\.txt$/, ''));
+	return isSkipMarked(file, result) && isOwn(file.replace(/\.txt$/, ''));
 }

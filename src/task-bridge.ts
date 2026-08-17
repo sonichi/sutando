@@ -14,7 +14,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { claudeHomePath } from './util_paths.js';
-import { mayRetireSkipMarked } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
 	emitTaskProcessed,
@@ -892,7 +892,14 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
 				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor
 				// these via parse_markers(); task-bridge.ts must too (issue #1381).
-				if (mayRetireSkipMarked(file, result, (id) => _pendingTasks.has(id))) {
+				if (isSkipMarked(file, result)) {
+					// Ownership must survive a restart (_pendingTasks is in-memory)
+					// and the timeout sweep; suppression applies either way.
+					const owns = (id: string) => _pendingTasks.has(id)
+						|| _isVoiceTask(id) || id.startsWith('task-chat-');
+					if (!mayRetireSkipMarked(file, result, owns)) {
+						continue;   // another consumer's: leave the files for its owner
+					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
