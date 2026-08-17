@@ -149,6 +149,47 @@ def replay(ops, check=True, diag_key=None):
                                     in sorted(d.done_log)])
 
 
+def steal_sweep(max_k=12):
+    """cb2f59f1-class schedule swept over every pause offset k: reclaim
+    parks after its k-th boundary while force+acquire turn the slot over,
+    then resumes its tail. Version-robust where frozen index-based replays
+    are not — some k lands in the read/act window on ANY python's syscall
+    sequence. Returns (k, err) for the first violating offset, else None."""
+    for k in range(1, max_k + 1):
+        d = H.ClaimDriver()
+        err = None
+        try:
+            d.plant_dead_claim()
+            d.start_reclaim("drainer-B")
+            d.step("drainer-B", k)
+            d.start_release_force("drainer-A")
+            for _ in range(30):
+                if not d.busy["drainer-A"]:
+                    break
+                d.step("drainer-A", 1)
+            d.start_acquire("drainer-A")
+            for _ in range(30):
+                if not d.busy["drainer-A"]:
+                    break
+                d.step("drainer-A", 1)
+            for _ in range(80):
+                if not (d.busy["drainer-A"] or d.busy["drainer-B"]):
+                    break
+                d.step("drainer-B", 1)
+                d.step("drainer-A", 1)
+            try:
+                d.finish(check=True)
+            except AssertionError as e:
+                err = str(e)
+        except AssertionError as e:
+            err = str(e)
+            with contextlib.suppress(BaseException):
+                d.finish(check=False)
+        if err is not None:
+            return k, err
+    return None
+
+
 def main():
     failures = 0
 
@@ -159,6 +200,15 @@ def main():
         print(f"  {status} frozen schedule {name}" + (f"  -> {err}" if err else ""))
         failures += 0 if err is None else 1
 
+    # Arm 1b: the sweep against the REAL protocol — no offset may violate.
+    hit = steal_sweep()
+    if hit is None:
+        print("  ok   steal sweep holds on current code (all offsets)")
+    else:
+        print(f"  FAIL steal sweep k={hit[0]} violates on current code "
+              f"-> {hit[1]}")
+        failures += 1
+
     # Arm 2: neuter the lock; the schedules must still be able to bite.
     @contextlib.contextmanager
     def no_lock(root, item_id):
@@ -167,14 +217,19 @@ def main():
     H.ob._item_lock = no_lock
     try:
         bit = False
-        for _attempt in range(10):
-            for name, ops in SCRIPTS.items():
-                if replay(ops, diag_key=name) is not None:
-                    print(f"  ok   positive control: {name} violates without the lock")
-                    bit = True
-                    break
-            if bit:
+        for name, ops in SCRIPTS.items():
+            if replay(ops, diag_key=name) is not None:
+                print(f"  ok   positive control: {name} violates without the lock")
+                bit = True
                 break
+        if not bit:
+            # Frozen indices are version-sensitive (syscall-sequence drift,
+            # measured CI 2026-08-17); the semantic sweep is the real arm.
+            hit = steal_sweep()
+            if hit is not None:
+                print(f"  ok   positive control: steal sweep bites at "
+                      f"k={hit[0]} without the lock -> {hit[1]}")
+                bit = True
         if not bit:
             print("  FAIL positive control: no schedule violates with _item_lock "
                   "neutered — the harness has lost its teeth")
