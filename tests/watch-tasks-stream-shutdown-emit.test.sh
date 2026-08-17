@@ -41,6 +41,14 @@ check "both shutdown call sites go through the shutdown emitter" \
 check "the handler-fallback site goes through its own emitter" \
       "1" "$(grep -cE '^\s+emit_fallback_task_file "\$filename"' "$WATCHER" || true)"
 
+# The call sites above are worthless if the definitions never load. There is no
+# `set -e` here, so a missing function is rc=127 and NON-FATAL: the watcher would
+# drain on and silently emit nothing — the exact drop this suite exists to catch.
+check "the watcher actually sources the emitters" \
+      "1" "$(grep -c 'source "\$__SCRIPT_DIR/task-emit.sh"' "$WATCHER" || true)"
+check "...and the file it sources defines both of them" \
+      "2" "$(grep -cE '^(emit_task_file|emit_fallback_task_file)\(\)' "$EMITTERS" || true)"
+
 # fd 9 must still be the stable dup of real stdout the shutdown emitter writes to.
 grep -q '^exec 9>&1' "$WATCHER" \
     || { echo "  FAIL fd 9 is no longer a dup of stdout"; fail=1; }
