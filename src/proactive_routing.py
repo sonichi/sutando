@@ -30,6 +30,7 @@ duplicate to every configured bridge.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 # Channels whose bridges actually deliver `proactive-*.txt` files.
@@ -103,3 +104,32 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     # most recently interacted on a surface that doesn't deliver DMs.
     # Default Discord rather than strand the proactive file.
     return this_channel == "discord"
+
+
+# Discord ids are 17-20 digits; Slack's are [CDG][A-Z0-9]+; ag2.space rooms are
+# !opaque:domain. A bridge passes its own grammar — this module names none.
+def explicit_target(body: str) -> "str | None":
+    """The destination the body addresses, or None when it addresses none.
+
+    Grammar comes from result_markers, never a local regex (CLAUDE.md: a result
+    consumer must not re-declare marker syntax).
+    """
+    try:
+        from result_markers import parse_markers
+    except ImportError:  # pragma: no cover - flat src/ import path
+        from .result_markers import parse_markers  # type: ignore[no-redef]
+    for action in parse_markers(body).actions:
+        if action.kind == "redirect":
+            return action.value
+    return None
+
+
+def can_route(target: "str | None", id_pattern: str) -> bool:
+    """Whether a bridge whose ids match `id_pattern` can address `target`.
+
+    A body with no explicit target is routable by whoever routing picks, so
+    None is True: this narrows nothing that worked before.
+    """
+    if target is None:
+        return True
+    return re.fullmatch(id_pattern, target) is not None

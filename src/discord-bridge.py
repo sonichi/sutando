@@ -348,6 +348,10 @@ if not TOKEN:
 
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
+
+# Discord snowflakes. A body addressed to anything else belongs to another
+# bridge, and taking it is what strands it in results/undelivered/.
+DISCORD_CHANNEL_ID_RE = r"\d{17,20}"
 STATE_DIR = REPO / "state"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
@@ -5150,7 +5154,11 @@ async def poll_proactive():
             # decision rule (last-active channel from
             # state/last-owner-activity.json; default discord on missing
             # state).
-            from proactive_routing import should_claim_proactive  # noqa: E402
+            from proactive_routing import (  # noqa: E402
+                can_route,
+                explicit_target,
+                should_claim_proactive,
+            )
             if not should_claim_proactive(
                 STATE_DIR / "last-owner-activity.json", "discord"
             ):
@@ -5158,6 +5166,15 @@ async def poll_proactive():
                 continue
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
+                    # Decline a destination this bridge cannot address, BEFORE
+                    # claiming it: claiming then failing quarantines the file out
+                    # of results/, where the gateway's takeover can never see it.
+                    try:
+                        _target = explicit_target(f.read_text(encoding="utf-8"))
+                    except OSError:
+                        continue  # racing consumer already claimed it
+                    if not can_route(_target, DISCORD_CHANNEL_ID_RE):
+                        continue
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram
