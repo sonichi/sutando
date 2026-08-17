@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # One-command entry point: menu bar app + core + dashboard in the browser.
-#
-# Deliberately thin. src/startup.sh remains the supported low-level entry and
-# owns every prerequisite check; this only adds the two conveniences a desktop
-# user wants and a headless/CI caller does not. Extra args pass straight through.
+# Thin by design — src/startup.sh stays the supported low-level entry.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

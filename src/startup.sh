@@ -1,7 +1,6 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh [--with-app]        (./start.sh is the front door)
-#   --with-app  also build + launch the opt-in menu-bar app (no launchd job)
+# Usage: bash src/startup.sh [--with-app]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job).
 
 set -e
 
@@ -1349,12 +1348,11 @@ echo ""
 # must stay detached. Restoring /dev/tty there makes the runtime launcher try
 # to attach to sutando-core from inside tmux, which blocks startup forever and
 # leaves the old core running without completing recovery.
-# --with-app runs BEFORE the exec below, which replaces this process: anything
-# placed after it never executes. Failure is non-fatal by design — the app is
-# opt-in, so its installer must never take the core down with it (`set -e` is on).
+# --with-app runs BEFORE the exec below (which replaces this process) and is
+# guarded: its installer must never take the core down (`set -e` is on).
 if [ "$WITH_APP" -eq 1 ]; then
-    # --launch, not --supervise: this flag means "run the app", and installing a
-    # login-persistent launchd job is a separate decision the user should make.
+    # --launch, not --supervise: a login-persistent launchd job is a separate
+    # decision the user makes explicitly.
     echo "→ menu-bar app (--with-app): building + launching" >&2
     if bash "$REPO/scripts/install-menu-bar-app.sh" --launch; then
         echo "  ✓ menu-bar app launched" >&2

@@ -27,11 +27,10 @@ out="$(SUTANDO_OPEN_DASHBOARD=0 bash "$TMP/start.sh" --runtime codex 2>&1)"
 out="$(cd / && SUTANDO_OPEN_DASHBOARD=0 bash "$TMP/start.sh" 2>&1)"
 [ "$out" = "STARTUP_ARGS: --with-app" ]; check $? "works when invoked from an unrelated cwd"
 
-# The browser open must never gate the core: with a URL that never answers and
-# the opt-out unset, startup still runs immediately rather than after the poll.
-# Redirect to a file rather than a command substitution: the backgrounded poller
-# inherits stdout, so $(...) would block on ITS fd for the whole poll window and
-# measure the harness instead of the script. `timeout` is not present on macOS.
+# The browser open must never gate the core: an unreachable URL must not delay it.
+
+# Redirect to a file, not $(...): the backgrounded poller inherits stdout and
+# would block the substitution for the whole poll window.
 start=$(date +%s)
 SUTANDO_DASHBOARD_URL=http://127.0.0.1:1 bash "$TMP/start.sh" > "$TMP/out.txt" 2>&1 &
 runner=$!

@@ -1,12 +1,6 @@
 #!/bin/bash
-# `--with-app` is one entry point over two opt-in steps. The three properties that
-# can actually break it are ORDER, GUARD and BLAST RADIUS — not the flag string.
-#
-# startup.sh ends in `exec`, orchestrates ~15 services and resolves a workspace,
-# so a full execution test would need a fixture larger than the change. Instead
-# this EXECUTES the shipped parse loop (extracted from the real file at run time,
-# never retyped) and asserts the two structural invariants that make the block
-# reachable and non-fatal. Stated plainly so the evidence is not oversold.
+# `--with-app` must GUARD the installer, run BEFORE the final exec, and never
+# take the core down. All three are executed here against the shipped file.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 S="$REPO/src/startup.sh"
@@ -56,6 +50,52 @@ if awk -v n="$app_line" 'NR==n' "$S" | grep -q '^\s*if bash '; then
 else
   bad "installer call must be guarded (if/||) or set -e takes the core down with it"
 fi
+
+# 4. DISPATCH, EXECUTED. Everything above is structural: a reviewer mutated the
+#    guard to `if true` and every check still passed. This runs the shipped block.
+# Anchor on the INSTALLER CALL and take its enclosing if-block, never on the
+# guard's literal text — else mutating the guard breaks extraction, not behavior.
+dispatch="$(python3 - "$S" <<'EXTRACT'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+call = next(i for i, l in enumerate(lines) if "install-menu-bar-app.sh" in l and l.strip().startswith("if bash"))
+start = max(i for i in range(call) if re.match(r"^if .*; then$", lines[i]))
+depth, end = 0, None
+for i in range(start, len(lines)):
+    s = lines[i].strip()
+    if re.match(r"^if .*; then$", s): depth += 1
+    elif s == "fi":
+        depth -= 1
+        if depth == 0: end = i; break
+print("\n".join(lines[start:end + 1]))
+EXTRACT
+)"
+[ -n "$dispatch" ] || bad "could not extract the app-dispatch block from startup.sh"
+
+run_dispatch() { # $1 = WITH_APP value; echoes whatever the stub installer recorded
+  tmp="$(mktemp -d)"
+  mkdir -p "$tmp/scripts"
+  printf '#!/bin/bash\necho "CALLED $*" >> "%s/calls.log"\n' "$tmp" > "$tmp/scripts/install-menu-bar-app.sh"
+  chmod +x "$tmp/scripts/install-menu-bar-app.sh"
+  : > "$tmp/calls.log"
+  ( set -e; REPO="$tmp"; WITH_APP="$1"; eval "$dispatch" ) >/dev/null 2>&1
+  cat "$tmp/calls.log"
+  rm -rf "$tmp"
+}
+
+off="$(run_dispatch 0)"
+if [ -z "$off" ]; then ok "WITH_APP=0 -> installer called ZERO times"
+else bad "WITH_APP=0 must not call the installer, got: $off"; fi
+
+on="$(run_dispatch 1)"
+if [ "$(printf '%s' "$on" | grep -c CALLED)" = "1" ]; then ok "WITH_APP=1 -> installer called exactly once"
+else bad "WITH_APP=1 must call the installer exactly once, got: $on"; fi
+
+if printf '%s' "$on" | grep -q -- '--launch'; then ok "the single call passes --launch"
+else bad "the call must pass --launch, got: $on"; fi
+
+if printf '%s' "$on" | grep -q -- '--supervise'; then bad "the call must NOT pass --supervise, got: $on"
+else ok "the call does not pass --supervise"; fi
 
 [ "$fail" -eq 0 ] && echo "startup-with-app: PASS" || echo "startup-with-app: FAIL"
 exit "$fail"
