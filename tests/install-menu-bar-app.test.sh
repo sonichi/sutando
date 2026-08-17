@@ -123,6 +123,43 @@ else
     flunk "one stop_unmanaged definition, called by both (defs=$defs calls=$calls)"
 fi
 
+# ---- 4bis. a FAILING codesign must not print a signed checkmark -------------
+# Both signing arms used to end in `|| true` under an unconditional "✓ signed".
+STUB_CS="$WORK/stub-codesign-fails"
+mkstub "$STUB_CS" xcode-select 'exit 0'
+mkstub "$STUB_CS" swiftc 'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && { shift; touch "$1"; }; shift; done; exit 0'
+mkstub "$STUB_CS" security 'exit 1'          # no "Sutando Dev" identity
+mkstub "$STUB_CS" codesign 'exit 1'          # every signing attempt fails
+mkstub "$STUB_CS" open 'exit 0'
+out_cs="$(PATH="$STUB_CS:$PATH" bash "$SCRIPT" 2>&1)"; rc_cs=$?
+case "$out_cs" in
+    *"✓ signed"*) flunk "prints '✓ signed' when every codesign attempt failed" ;;
+    *)            pass "never prints '✓ signed' when every codesign attempt failed" ;;
+esac
+case "$out_cs" in
+    *UNSIGNED*) pass "names the bundle as UNSIGNED so the state is reported, not hidden" ;;
+    *)          flunk "failing codesign did not report the unsigned state (out: ${out_cs%%$'\n'*})" ;;
+esac
+if [ "$rc_cs" -ne 0 ]; then
+    pass "exits nonzero when the bundle could not be signed"
+else
+    flunk "exited 0 with an unsigned bundle (rc=$rc_cs)"
+fi
+# Control: with codesign succeeding, the SAME path must still report success —
+# or the assertions above would pass simply by the script being broken.
+STUB_OK="$WORK/stub-codesign-ok"
+mkstub "$STUB_OK" xcode-select 'exit 0'
+mkstub "$STUB_OK" swiftc 'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && { shift; touch "$1"; }; shift; done; exit 0'
+mkstub "$STUB_OK" security 'exit 1'
+mkstub "$STUB_OK" codesign 'exit 0'
+mkstub "$STUB_OK" open 'exit 0'
+out_ok="$(PATH="$STUB_OK:$PATH" bash "$SCRIPT" 2>&1)"; rc_ok=$?
+if [ "$rc_ok" -eq 0 ] && [ "${out_ok#*✓ signed}" != "$out_ok" ]; then
+    pass "control: a SUCCEEDING codesign still reports signed and exits 0"
+else
+    flunk "control failed: succeeding codesign did not report signed (rc=$rc_ok)"
+fi
+
 # ---- 4c. the probe must be LITERAL, not a regex over the checkout path ------
 # `pgrep -f` matches an ERE, so a checkout path holding regex metacharacters
 # makes the probe miss a live process and stop_unmanaged report "nothing to do".

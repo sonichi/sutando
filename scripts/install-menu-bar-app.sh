@@ -71,16 +71,28 @@ echo "  ✓ $APP"
 
 # Prefer a stable identity so the Accessibility grant survives rebuilds (cdhash
 # churn); the designated requirement is identifier-only for the same reason.
-SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Sutando Dev"/{print $2; exit}')"
-if [ -n "$SIGN_ID" ]; then
-  codesign --force --sign "$SIGN_ID" --identifier com.sutando.menubar \
-    --requirements '=designated => identifier "com.sutando.menubar"' "$APP" 2>/dev/null \
-    || codesign --force --sign - "$APP" 2>/dev/null || true
-  echo "  ✓ signed (Sutando Dev + identifier-only designated requirement)"
-else
-  codesign --force --sign - "$APP" 2>/dev/null || true
-  echo "  ✓ signed (ad-hoc — install a \"Sutando Dev\" cert for a TCC grant that survives rebuilds)"
-fi
+# An absent keychain identity is the NORMAL case; without `|| true` its nonzero
+# status reaches set -e through pipefail and kills the install with no message.
+SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Sutando Dev"/{print $2; exit}' || true)"
+# Both arms used to end in `|| true` under an unconditional "✓ signed", so a
+# total codesign failure still reported success on a bundle that cannot hold TCC.
+sign_app() {
+  if [ -n "$SIGN_ID" ] && codesign --force --sign "$SIGN_ID" --identifier com.sutando.menubar \
+       --requirements '=designated => identifier "com.sutando.menubar"' "$APP" 2>/dev/null; then
+    echo "  ✓ signed (Sutando Dev + identifier-only designated requirement)"
+  elif codesign --force --sign - "$APP" 2>/dev/null; then
+    [ -n "$SIGN_ID" ] && echo "  ⚠ 'Sutando Dev' signing failed; fell back to ad-hoc — the Accessibility grant will NOT survive rebuilds" >&2
+    echo "  ✓ signed (ad-hoc — install a \"Sutando Dev\" cert for a TCC grant that survives rebuilds)"
+  else
+    echo "  ✗ codesign FAILED — the bundle is UNSIGNED and cannot hold an Accessibility grant" >&2
+    return 1
+  fi
+  codesign --verify --strict "$APP" 2>/dev/null && return 0
+  echo "  ✗ codesign --verify rejected the bundle after signing — treating as unsigned" >&2
+  return 1
+}
+SIGNED=1
+sign_app || SIGNED=0
 
 # Scope to THIS bundle's path. The Electron desktop app shares the executable
 # NAME, so `pkill -x Sutando` would also kill the user's UI (#2038).
@@ -133,6 +145,14 @@ elif [ "$LAUNCH" -eq 1 ]; then
     echo "  ✗ open returned but no menu-bar process is running — not launched" >&2
     exit 1
   fi
+fi
+
+# The footer reads as unqualified success, so it must not follow a failed signing.
+if [ "$SIGNED" -eq 0 ]; then
+  echo "" >&2
+  echo "Built, but UNSIGNED — Accessibility cannot be granted to this bundle." >&2
+  echo "  bundle: $APP" >&2
+  exit 1
 fi
 
 cat <<EOF
