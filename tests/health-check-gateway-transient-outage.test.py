@@ -66,10 +66,15 @@ class TestTransientIsNotAnOutage(unittest.TestCase):
         self.assertEqual(_probe(299)["status"], "warn")
 
     def test_a_negative_age_is_not_freshness(self):
-        """Review finding: a clock step must not read as a 'transient' ok."""
+        """Review finding: a clock step must not read as a 'transient' ok.
+
+        `assertNotIn` alone is satisfiable by an implementation that renders
+        nothing at all, so the line is pinned positively too.
+        """
         res = _probe(-600)
         self.assertEqual(res["status"], "warn", res["detail"])
         self.assertNotIn("-600s", res["detail"])
+        self.assertIn("last successful poll UNKNOWN", res["detail"])
 
     def test_the_warn_line_reads_in_seconds_below_an_hour(self):
         """`{age_h:.1f}h` rendered a 106s age as "0.0h ago" — the same
