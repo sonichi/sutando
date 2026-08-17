@@ -2606,7 +2606,8 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
             if _valid_local_tid(tid)
             and not (TASKS_DIR / f"{tid}.txt").exists()
             and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
-            and not (RESULTS_DIR / f"{tid}.txt").exists()}
+            and not (RESULTS_DIR / f"{tid}.txt").exists()
+            and not _task_archived_recently(tid)}
     confirmed = gone & suspects
     if confirmed:
         for tid in sorted(confirmed):
@@ -2614,6 +2615,121 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
             _log(f"dropped abandoned in-flight id {tid} (no task/result file — completed elsewhere)")
         _save_inflight(inflight)
     return gone - confirmed
+
+
+# A task archived here minutes ago was completed HERE, not elsewhere — its
+# result may still be seconds away (measured 7-minute gap, sonichi/sutando#3009).
+ARCHIVE_COMPLETION_GRACE_S = 1800.0
+
+
+def _archived_task_file(tid: str):
+    """The archived task file for tid, or None — flat and month-partitioned."""
+    base = TASKS_DIR / "archive"
+    flat = base / f"{tid}.txt"
+    if flat.exists():
+        return flat
+    hits = sorted(base.glob(f"*/{tid}.txt"))
+    return hits[-1] if hits else None
+
+
+def _task_archived_recently(tid: str) -> bool:
+    f = _archived_task_file(tid)
+    if f is None:
+        return False
+    try:
+        return (time.time() - f.stat().st_mtime) < ARCHIVE_COMPLETION_GRACE_S
+    except OSError:
+        return False
+
+
+# ── orphan-result reconciler (sonichi/sutando#3009) ─────────────────────────
+# _post_ready_results reads ONLY the in-flight ledger, so a result whose tid
+# left the ledger (id dropped ahead of a slow result, or a post-delivery
+# double-write) has no consumer and strands forever. Two-host measurement:
+# ~89% of the orphan load is double-writes (a delivered archive copy exists).
+ORPHAN_SWEEP_EVERY_S = 600.0
+ORPHAN_GRACE_S = 600.0
+_last_orphan_sweep = 0.0
+_orphan_quarantine_logged: set = set()
+
+
+def _reconcile_orphan_results(inflight: "set[str]") -> None:
+    global _last_orphan_sweep
+    now = time.time()
+    if now - _last_orphan_sweep < ORPHAN_SWEEP_EVERY_S:
+        return
+    _last_orphan_sweep = now
+    try:
+        candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
+    except OSError:
+        return
+    for rfile in candidates:
+        tid = rfile.stem
+        if not _valid_local_tid(tid) or tid in inflight:
+            continue
+        try:
+            if now - rfile.stat().st_mtime < ORPHAN_GRACE_S:
+                continue                        # young: normal path may claim it
+        except OSError:
+            continue
+        # Disposition 1 — a delivered archive copy exists: this is a
+        # post-delivery double-write. Move aside; NEVER re-deliver (the sweep
+        # would post agent narration about having answered into the room).
+        if any(ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
+            ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                rfile.rename(ARCHIVE_RESULTS_DIR
+                             / f"{tid}-{int(now)}-late-duplicate.txt")
+                _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
+            except OSError:
+                pass
+            continue
+        # Disposition 3 — no task anywhere: nothing resolves a destination.
+        # Quarantine; a labeled re-delivery here would be a permanent sweep
+        # error masquerading as a predicate bug on every pass.
+        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
+        if task is None:
+            UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                rfile.rename(UNDELIVERABLE_RESULTS_DIR / f"{tid}.no-task.txt")
+            except OSError:
+                continue
+            if tid not in _orphan_quarantine_logged:
+                _orphan_quarantine_logged.add(tid)
+                _log(f"orphan sweep: {tid} has no task file — quarantined")
+            continue
+        # Disposition 2 — genuinely undelivered: one labeled delivery attempt.
+        # Archive-absence is the strongest local evidence of non-delivery; the
+        # POST-succeeded-crash-before-archive window makes this at-least-once,
+        # and the label makes the rare duplicate self-explaining.
+        body = read_ready_result(rfile)
+        if body is None:
+            continue
+        delivery = _delivery_tid(tid)
+        if delivery is None:
+            continue                            # alias ledger unreadable: retry later
+        labeled = "(recovered result — original delivery was lost)\n" +             parse_markers(body).body
+        try:
+            _req("POST", "/v1/results",
+                 {"id": _broker_tid(delivery), "body": labeled})
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                # Lease long gone: no consumer will ever accept this POST.
+                UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                try:
+                    rfile.rename(UNDELIVERABLE_RESULTS_DIR
+                                 / f"{tid}.lease-gone.txt")
+                    _log(f"orphan sweep: {tid} lease gone (HTTP {e.code}) — quarantined")
+                except OSError:
+                    pass
+            else:
+                _log(f"orphan sweep: {tid} POST failed HTTP {e.code} — will retry")
+            continue
+        except (urllib.error.URLError, TimeoutError) as e:
+            _log(f"orphan sweep: {tid} network error {e} — will retry")
+            continue
+        _archive_result(rfile, tid)
+        _log(f"orphan sweep: recovered + delivered {tid}")
 
 
 # ── MC1 per-workspace singleton (dual-poller guard) ─────────────────────────
@@ -2838,6 +2954,7 @@ def main() -> None:
             _post_ready_results(inflight)
             _post_proactive()
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
+            _reconcile_orphan_results(inflight)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
             _emit_gateway_status(True)
