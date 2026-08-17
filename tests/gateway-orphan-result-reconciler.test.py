@@ -202,6 +202,16 @@ class ArchiveConventions(_Base):
             f"{TID}-*-late-duplicate.txt"))), 1)
 
 
+class FlatBareConvention(_Base):
+    def test_flat_bare_name_counts_as_delivered(self):
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{TID}.txt").write_text("the reply")
+        self._result("completion note")
+        self._sweep()
+        self.assertEqual(self.posted, [],
+                         "flat bare-name copy (retired writer) IS delivered")
+
+
 class QuarantineCollision(_Base):
     def test_prior_evidence_never_replaced(self):
         gw.UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True)

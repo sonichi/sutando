@@ -2643,8 +2643,7 @@ def _task_archived_recently(tid: str) -> bool:
 
 
 # ── orphan-result reconciler (sonichi/sutando#3009) ─────────────────────────
-# Results whose tid left the in-flight ledger have no consumer; most are
-# post-delivery double-writes (a delivered archive copy exists).
+# Results whose tid left the in-flight ledger have no consumer.
 ORPHAN_SWEEP_EVERY_S = 600.0
 ORPHAN_GRACE_S = 600.0
 _last_orphan_sweep = 0.0
@@ -2656,6 +2655,8 @@ def _delivered_copy_exists(tid: str) -> bool:
     `YYYY-MM/<tid>.txt` (bare name) — a flat-only probe mis-routes real
     replies to re-delivery (peer-measured 4/50 on a live corpus)."""
     if any(ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
+        return True
+    if (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists():   # flat bare: retired writer
         return True
     return any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}.txt")) or \
         any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
@@ -2697,9 +2698,11 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # post agent narration about having answered into the room.
         if _delivered_copy_exists(tid):
             ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            dst = ARCHIVE_RESULTS_DIR / f"{tid}-{int(now)}-late-duplicate.txt"
+            if dst.exists():
+                dst = dst.with_name(f"{tid}-{time.time_ns()}-late-duplicate.txt")
             try:
-                rfile.rename(ARCHIVE_RESULTS_DIR
-                             / f"{tid}-{int(now)}-late-duplicate.txt")
+                rfile.rename(dst)
                 _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
             except OSError:
                 pass
