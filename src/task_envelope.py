@@ -3,20 +3,23 @@
 verified claim instead of an honor-system header.
 
 Threat model (attack class 2 of the 2026-08-17 mailbox-security design):
-any same-user process can write `tasks/*.txt` and claim `access_tier:
-owner`, and the consumer grants full processing on the header's word (the
+today the consumer grants owner-tier processing on the header's word (the
 2026-07-11 self-written-task incident was the benign instance). The stamp
-closes exactly that: a writer holding the per-host key MACs the WHOLE file
-(headers + body), so a forger without the key cannot mint a verified
-owner-tier task, and tampering with a stamped one (tier flip, body swap)
-is detected.
+is INTEGRITY TELEMETRY, not an authorization boundary: a writer holding
+the per-host key MACs the WHOLE file (headers + body), so a forger who
+can reach the drop directory but NOT read the key (cross-host/synced
+writers, processes with a narrow write grant, network-delivered files)
+cannot mint a `verified` owner-tier task, and tampering with a stamped
+one (tier flip, body swap) is detected.
 
 Deliberately NOT covered in this phase, per the recorded design's phasing:
+- a same-user attacker with key-read access — same uid can read the 0600
+  key (or pre-create it) and mint valid envelopes; making the tier
+  authoritative against that attacker requires moving key possession
+  behind a separately enforced principal (Keychain-ACL/XPC phase); the
+  S2 policy seam stays the second line regardless;
 - freshness/replay of a verbatim old stamped file (nonce/expiry are the
-  envelope v2 fields);
-- an attacker with full user compromise (can read the key) — that tier of
-  isolation belongs to Keychain-ACL/XPC later; the S2 policy seam stays
-  the second line regardless.
+  envelope v2 fields).
 
 Rollout is SOAK-FIRST: `verify_text` reports `unsigned` for legacy files;
 consumers must treat that as a warning (log/telemetry), not a rejection,
