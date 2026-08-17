@@ -26,6 +26,8 @@ MAP = {
     "dedup_recovery.py": "dedup_recovery.py",
     "workspace_lock.py": "workspace_lock.py",
     "chat_secret_filter.py": "chat_secret_filter.py",
+    "team_result_guard.py": "team_result_guard.py",
+    "team_guardrail.py": "team_guardrail.py",
     "vault_set_grammar.py": "vault_set_grammar.py",
     "send_failure_policy.py": "send_failure_policy.py",
     # send_failure_policy.resolve_failed_send imports it; vendoring one without
