@@ -142,6 +142,8 @@ One entry per agent-facing module.
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
+- **`team_guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
+- **`team_result_guard.py`** — Final scan applied to a Team-tier result before any router reads its markers.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
