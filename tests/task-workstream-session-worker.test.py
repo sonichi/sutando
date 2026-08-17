@@ -157,9 +157,9 @@ def test_collaborator_stamp_is_trusted_only_from_the_attested_source() -> None:
             local = _task(
                 workspace, f"task-{unattested or 'none'}", "team", source=unattested)
             assert worker.team_collaborator_enabled(local) is False
-            # An unattested stamp is routed to the restricted handler, never to
-            # the owner-configured runtime this test's docstring describes.
-            assert worker.probe("claude", workspace, local) == worker.MUST_HANDLE
+            # Dispatch no longer distinguishes them: the capability grant is the
+            # bridge's rulebook choice, which this suite does not reach.
+            assert worker.probe("claude", workspace, local) == worker.UNHANDLED
 
 
 def test_team_collaborator_requires_one_exact_pre_body_stamp() -> None:
