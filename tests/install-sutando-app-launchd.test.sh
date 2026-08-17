@@ -12,6 +12,10 @@
 # worktree got installed on a developer machine.
 set -uo pipefail
 
+# launchctl, ~/Library/LaunchAgents and codesign are macOS-only; the sibling
+# installer test carries this same guard, and omitting it broke CI on ubuntu.
+[ "$(uname -s)" = "Darwin" ] || { echo "SKIP: macOS-only installer"; exit 0; }
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$REPO/src/install-sutando-app-launchd.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/launchd-test-XXXXXX")"
