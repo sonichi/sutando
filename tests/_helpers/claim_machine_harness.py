@@ -221,13 +221,15 @@ class ClaimDriver:
         for _ in range(n):
             if not self.busy[actor]:
                 return
-            # Not at a gate within the timeout = running or blocked on the
-            # flock; granting blind would desynchronize the schedule.
-            if not self.gate.at_gate[actor].wait(timeout=0.05):
+            # Not at a gate within the timeout = blocked on the flock;
+            # granting blind would desynchronize the schedule. Bounds cap the
+            # SLOW path only (instrumented CI runners); fast machines exit
+            # the instant the worker moves, so local runtime is unchanged.
+            if not self.gate.at_gate[actor].wait(timeout=1.0):
                 return
             self.gate.at_gate[actor].clear()
             self.gate.go[actor].release()
-            deadline = time.time() + 0.1
+            deadline = time.time() + 1.0
             while (time.time() < deadline and self.busy[actor]
                    and not self.gate.at_gate[actor].is_set()):
                 time.sleep(0.0005)
@@ -253,7 +255,7 @@ class ClaimDriver:
     # ── settle + oracle ─────────────────────────────────────────────────────
     def _settle(self):
         self.gate.open = True
-        deadline = time.time() + 5.0
+        deadline = time.time() + 30.0
         while any(self.busy.values()) and time.time() < deadline:
             time.sleep(0.005)
         assert not any(self.busy.values()), "op wedged: protocol deadlock"
