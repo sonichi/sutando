@@ -237,6 +237,13 @@ def _fence_path(root: Path) -> Path:
 _STRIPE_MODE: dict[str, bool] = {}
 
 
+def _root_key(root: Path) -> str:
+    """Canonical identity for a root. Every cache/guard keyed by root uses
+    this: raw path spellings (dot-dot, symlinks) of one directory must never
+    occupy separate entries, or aliases straddle lock namespaces."""
+    return os.path.realpath(str(root))
+
+
 def _stripe_mode(root: Path) -> bool:
     """True iff this root has been migrated to striped locking.
 
@@ -252,14 +259,14 @@ def _stripe_mode(root: Path) -> bool:
     free of per-call fence I/O. Only successful reads are cached; a corrupt
     fence keeps raising until it is fixed.
     """
-    cached = _STRIPE_MODE.get(str(root))
+    cached = _STRIPE_MODE.get(_root_key(root))
     if cached is not None:
         return cached
     fp = _fence_path(root)
     try:
         data = json.loads(fp.read_text())
     except FileNotFoundError:
-        _STRIPE_MODE[str(root)] = False
+        _STRIPE_MODE[_root_key(root)] = False
         return False
     except (OSError, ValueError) as e:
         raise RuntimeError(f"unreadable stripes fence {fp}: {e}") from e
@@ -268,7 +275,7 @@ def _stripe_mode(root: Path) -> bool:
         raise RuntimeError(
             f"stripes fence {fp} declares {data.get('stripes')!r}, this build "
             f"uses {LOCK_STRIPES}: migration required, refusing to guess")
-    _STRIPE_MODE[str(root)] = True
+    _STRIPE_MODE[_root_key(root)] = True
     return True
 
 
@@ -287,7 +294,7 @@ def activate_lock_striping(root: Path) -> bool:
     tmp = d / f".{STRIPES_FENCE}.{os.getpid()}"
     tmp.write_text(json.dumps({"stripes": LOCK_STRIPES}))
     os.replace(str(tmp), str(_fence_path(root)))
-    _STRIPE_MODE[str(root)] = True
+    _STRIPE_MODE[_root_key(root)] = True
     return True
 
 
@@ -322,12 +329,12 @@ def _item_lock(root: Path, item_id: str):
     striped = _stripe_mode(root)
     if striped:
         stripe = _lock_stripe(item_id)
-        key = (str(root), "stripe", stripe)
+        key = (_root_key(root), "stripe", stripe)
         lock_name = f"stripe-{stripe:02d}.lock"
     else:
         # Pre-migration: same per-item inode as pre-striping builds, so a
         # rolling-upgrade mix still mutually excludes. Unbounded until fenced.
-        key = (str(root), "item", item_id)
+        key = (_root_key(root), "item", item_id)
         lock_name = f"{_safe_key(item_id)}.lock"
     held = getattr(_HELD, "keys", None)
     if held is None:
@@ -343,8 +350,8 @@ def _item_lock(root: Path, item_id: str):
     if striped:
         if not getattr(_HELD, "swept_roots", None):
             _HELD.swept_roots = set()
-        if str(root) not in _HELD.swept_roots:
-            _HELD.swept_roots.add(str(root))
+        if _root_key(root) not in _HELD.swept_roots:
+            _HELD.swept_roots.add(_root_key(root))
             _sweep_legacy_locks(d)
     fd = os.open(str(d / lock_name), os.O_CREAT | os.O_RDWR, 0o644)
     held.add(key)

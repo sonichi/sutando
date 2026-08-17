@@ -702,6 +702,34 @@ def _c22():
         assert ok, "unreadable fence must raise, not fall back silently"
 
 
+# 23 --------------------------------------------------------------------------
+@contract("path aliases of one root share one lock namespace across activation")
+def _c23():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    activate = need(m, "activate_lock_striping")
+    locks_dir = need(m, "LOCKS_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        canonical = Path(tmp) / "root"
+        (canonical / "sub").mkdir(parents=True)
+        alias = canonical / "sub" / ".."          # same directory, second spelling
+        # prime the alias spelling BEFORE activation (caches legacy mode)
+        assert acquire(alias, "task-alias", "D1") is True
+        assert release(alias, "task-alias", "D1") is True
+        activate(canonical)                        # deploy step, canonical spelling
+        # the alias must see stripe mode too — a raw-string cache leaves it
+        # on legacy locks, straddling namespaces within one process
+        assert acquire(alias, "task-alias-2", "D1") is True
+        assert release(alias, "task-alias-2", "D1") is True
+        legacy_after = [f.name for f in (canonical / locks_dir).glob("*.lock")
+                        if not f.name.startswith("stripe-")
+                        and "task-alias-2" in f.name]
+        assert legacy_after == [], (
+            f"alias spelling still uses legacy locks after activation "
+            f"({legacy_after}) — root cache keyed on raw path, namespaces straddled")
+
+
 def main() -> int:
     print(f"  target: src/outbox.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)
