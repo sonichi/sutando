@@ -159,6 +159,26 @@ class TestWriteTaskFile(unittest.TestCase):
         self.assertIsNotNone(mac, "bridge writes must be stamped")
         self.assertIn("[task-write] wrote", out)
 
+    def test_raising_stamper_is_fail_open(self):
+        """A stamping error must never lose the message: content is written
+        unstamped and the call still succeeds (envelope fail-open arm)."""
+        p = Path(_tmp) / "tasks" / "task-test-stamper-boom.txt"
+        real = bridge.stamp_text
+
+        def boom(_):
+            raise RuntimeError("stamper exploded")
+        bridge.stamp_text = boom
+        try:
+            ok, out = self._capture(
+                bridge._write_task_file, p, "raw content", "gail", "chan9",
+                "owner", 208)
+        finally:
+            bridge.stamp_text = real
+        self.assertTrue(ok)
+        self.assertEqual(p.read_text(), "raw content",
+                         "unstamped passthrough on stamper failure")
+        self.assertIn("[task-write] wrote", out)
+
     def test_builder_failure_returns_false_and_logs(self):
         """A raising builder (f-string build failure) must be caught + logged FAILED."""
         p = Path(_tmp) / "tasks" / "task-test-builder-fail.txt"

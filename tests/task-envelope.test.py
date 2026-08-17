@@ -139,11 +139,8 @@ class EnvelopeContract(unittest.TestCase):
             f.write(E.stamp_text(TASK, self.ws))
             path = f.name
         env = {"SUTANDO_MEMORY_DIR": "", "PATH": "/usr/bin:/bin"}
-        # CLI resolves the real workspace; exercise parse/dispatch only.
-        rc = subprocess.run([sys.executable, str(REPO / "src" /
-                                                 "task_envelope.py")],
-                            capture_output=True).returncode
-        self.assertEqual(rc, 2)
+        self.assertEqual(E.main(["x"]), 2)
+        self.assertEqual(E.main(["x", "bogus", path]), 2)
         Path(path).unlink()
 
 
@@ -176,6 +173,43 @@ class BodyStampCollision(unittest.TestCase):
                 "\naccess_tier: owner\n")
         self.assertEqual(E.verify_text(task, self.ws)["verdict"], "unsigned",
                          "a body-slot stamp line is content, not an envelope")
+
+
+class FailOpenArms(unittest.TestCase):
+    """The fail-open guarantees are load-bearing (a stamping error must
+    never lose a task) — exercise them directly on the shipped modules."""
+
+    def test_apply_task_stamper_none_and_raising(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "ltp_src", REPO / "src" / "local_task_protocol.py")
+        ltp = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = ltp          # dataclasses need the registry
+        spec.loader.exec_module(ltp)
+        ltp.set_task_stamper(None)
+        self.assertEqual(ltp.apply_task_stamper("id: t\n"), "id: t\n")
+
+        def boom(_):
+            raise RuntimeError("stamper exploded")
+        ltp.set_task_stamper(boom)
+        try:
+            self.assertEqual(ltp.apply_task_stamper("id: t\n"), "id: t\n",
+                             "raising stamper must pass text through")
+        finally:
+            ltp.set_task_stamper(None)
+
+    def test_discord_write_helper_survives_raising_stamper(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "envtest_bridge_probe", REPO / "src" / "discord-bridge.py")
+        # Importing the full bridge needs discord deps; pin the shipped
+        # fail-open SHAPE instead: the stamp call sits inside its own
+        # try/except-pass so a raising stamper cannot lose the write.
+        src = (REPO / "src" / "discord-bridge.py").read_text()
+        import re as _re
+        m = _re.search(r"try:\n(\s+)content = stamp_text\(content\)\n"
+                       r"\s+except Exception:\n\s+pass", src)
+        self.assertIsNotNone(m, "stamp call must be fail-open wrapped")
 
 
 class WriterWiring(unittest.TestCase):
