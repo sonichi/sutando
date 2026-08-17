@@ -109,8 +109,8 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # How much of MEMORY.md a session actually loads. These are the RUNTIME's
 # documented numbers, not this repo's guess:
 #
-#   "Claude Code reads the first 200 lines or 25KB of a memory file, whichever
-#    comes first" — content BEYOND that point is dropped; the prefix still
+#   "The first 200 lines of MEMORY.md, or the first 25KB, whichever comes
+#    first" — and ONLY MEMORY.md. Content beyond it is dropped; the prefix still
 #    loads. YAML frontmatter and block-level HTML comments are stripped before
 #    those limits are measured.
 #   https://code.claude.com/docs/en/memory#how-it-works
