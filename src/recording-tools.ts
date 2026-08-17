@@ -630,6 +630,14 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 let lastResumeTime = 0;
 // A pause blocked for want of a keyword; a repeat within this window is honoured.
 let lastKeywordBlockTime = 0;
+
+/**
+ * Clear the pause-retry authorization. A block earned on one video must not
+ * authorize a keyword-less pause on the next: without this, a stray call within
+ * the retry window after ANY earlier block would pass, which is the single
+ * hallucinated pause the guard exists to stop.
+ */
+function endPlaybackAuthorization(): void { lastKeywordBlockTime = 0; }
 export const KEYWORD_BLOCK_RETRY_MS = 60_000;
 const PAUSE_KEYWORDS = /\b(pause|stop|hold|wait)\b/;
 
@@ -654,6 +662,7 @@ export const playVideoTool: ToolDefinition = {
 	async execute() {
 		console.log(`${ts()} [PlayVideo] called`);
 		lastResumeTime = Date.now(); // Set cooldown on play to prevent auto-pause
+		endPlaybackAuthorization();
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
 	},
 };
@@ -675,6 +684,7 @@ export const resumeVideoTool: ToolDefinition = {
 		try {
 			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 			lastResumeTime = Date.now();
+			endPlaybackAuthorization();
 			try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'play document 1', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 			// Restart audio stream to phone at current position
 			let seekSec = 0;
@@ -702,6 +712,7 @@ export const replayVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [ReplayVideo] called`);
+		endPlaybackAuthorization();
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
 	},
 };
@@ -751,6 +762,7 @@ export const closeVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [CloseVideo] called`);
+		endPlaybackAuthorization();
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'end tell', '-e', 'delay 0.3', '-e', 'tell application "System Events" to keystroke "w" using command down'], { timeout: 5_000 }); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}

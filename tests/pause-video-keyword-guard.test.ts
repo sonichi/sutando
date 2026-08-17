@@ -47,3 +47,28 @@ describe('pauseKeywordGuard', () => {
 		assert.equal(pauseKeywordGuard(GARBLED, KEYWORD_BLOCK_RETRY_MS + 1), 'block');
 	});
 });
+
+/**
+ * Review finding (#3064): the retry authorization is module-global and was only
+ * cleared when a pause was ALLOWED. A block earned on one video therefore
+ * authorized the first keyword-less pause on the NEXT playback inside the
+ * window — exactly the single stray call the guard exists to stop. Every
+ * playback lifecycle transition (play / resume / replay / close) now clears it.
+ */
+describe('pauseKeywordGuard across a playback boundary', () => {
+	it('a block on one video must not authorize a keyword-less pause on the next', () => {
+		// Block earned at t=0 on video A.
+		assert.equal(pauseKeywordGuard(GARBLED, FRESH_BLOCK), 'block');
+		// Video B starts 5s later; the lifecycle reset zeroes the stamp, which the
+		// guard reads as "no recent block" -> a stray call is blocked again.
+		const afterReset = Date.now() - 0; // endPlaybackAuthorization() sets it to 0
+		assert.ok(afterReset > KEYWORD_BLOCK_RETRY_MS, 'a zeroed stamp must read as outside the window');
+		assert.equal(pauseKeywordGuard(GARBLED, afterReset), 'block');
+	});
+
+	it('without the reset, the stale block would have allowed it', () => {
+		// Pins the defect itself: 5s since a block is inside the window, so absent
+		// the lifecycle reset this same call returns "allow" on the new video.
+		assert.equal(pauseKeywordGuard(GARBLED, 5_000), 'allow');
+	});
+});
