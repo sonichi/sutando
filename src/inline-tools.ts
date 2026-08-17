@@ -438,6 +438,26 @@ export const volumeTool: ToolDefinition = {
 	},
 };
 
+// Drives the built-in display through DisplayServices. Reads back after the
+// smooth ramp settles so the caller reports the measured level, not the request.
+const BRIGHTNESS_PY = `
+import ctypes, ctypes.util, sys, time
+cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+ds = ctypes.CDLL("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices")
+cg.CGMainDisplayID.restype = ctypes.c_uint32
+did = cg.CGMainDisplayID()
+ds.DisplayServicesGetBrightness.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
+ds.DisplayServicesSetBrightnessSmooth.argtypes = [ctypes.c_uint32, ctypes.c_float]
+cur = ctypes.c_float()
+if ds.DisplayServicesGetBrightness(did, ctypes.byref(cur)) != 0:
+    sys.exit(1)
+ds.DisplayServicesSetBrightnessSmooth(did, ctypes.c_float(float(sys.argv[1]) - cur.value))
+time.sleep(0.6)
+if ds.DisplayServicesGetBrightness(did, ctypes.byref(cur)) != 0:
+    sys.exit(1)
+print(cur.value)
+`;
+
 export const brightnessTool: ToolDefinition = {
 	name: 'brightness',
 	description:
@@ -450,20 +470,22 @@ export const brightnessTool: ToolDefinition = {
 		let { level } = args as { level: number };
 		// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 		if (level <= 1 && level > 0) level = Math.round(level * 100);
+		level = Math.max(0, Math.min(100, level));
 		const bLevel = (level / 100).toFixed(2);
 		try {
-			execFileSync('brightness', [bLevel], { timeout: 5_000 });
-			console.log(`${ts()} [Brightness] set to ${level}%`);
-			return { status: 'set', level };
+			// DisplayServicesSetBrightnessSmooth takes a RELATIVE delta and persists;
+			// the absolute setter is reverted by the display daemon within ~30s.
+			const out = execFileSync('python3', ['-c', BRIGHTNESS_PY, bLevel], { timeout: 5_000, encoding: 'utf8' });
+			const actual = Math.round(parseFloat(out) * 100);
+			if (!Number.isFinite(actual)) throw new Error(`unreadable brightness: ${out.trim()}`);
+			console.log(`${ts()} [Brightness] requested ${level}%, display reads ${actual}%`);
+			return { status: 'set', level: actual, requested: level };
 		} catch {
-			// Fallback: use AppleScript key codes
+			// Fallback for displays DisplayServices cannot drive (externals need DDC).
 			try {
-				const steps = Math.round(level / 100 * 16);
-				// Reset to 0 then go up
-				for (let i = 0; i < 16; i++) execFileSync('osascript', ['-e', 'tell application "System Events" to key code 107'], { timeout: 1_000 }); // brightness down
-				for (let i = 0; i < steps; i++) execFileSync('osascript', ['-e', 'tell application "System Events" to key code 113'], { timeout: 1_000 }); // brightness up
-				console.log(`${ts()} [Brightness] set to ~${level}% via key codes`);
-				return { status: 'set', level, method: 'key_codes' };
+				execFileSync('brightness', [bLevel], { timeout: 5_000 });
+				console.log(`${ts()} [Brightness] set to ${level}% via brightness CLI`);
+				return { status: 'set', level, method: 'cli' };
 			} catch (err) {
 				return { error: `Brightness failed: ${err instanceof Error ? err.message : err}` };
 			}
