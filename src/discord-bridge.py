@@ -5727,7 +5727,23 @@ async def poll_dm_fallback():
         await asyncio.sleep(30)
 
 
-def _send_via_rest(channel_id: str, message: str):
+def _parse_send_argv(argv):
+    """Split `send`'s post-channel argv into (reply_to, body_argv).
+
+    `--reply-to <id>` threads the post onto an existing message, giving the CLI
+    the reach the results path already has by default. Leading position only, so
+    a body word that happens to read `--reply-to` cannot be eaten mid-text.
+    """
+    reply_to = ""
+    if len(argv) >= 2 and argv[0] == "--reply-to":
+        reply_to, argv = argv[1], argv[2:]
+    if not argv:
+        raise SystemExit("usage: discord-bridge.py send <channel_id> "
+                         "[--reply-to <message_id>] <body|--body-file PATH>")
+    return reply_to, argv
+
+
+def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
     """Send a message via Discord REST API (no gateway connection).
 
     Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
@@ -5747,7 +5763,13 @@ def _send_via_rest(channel_id: str, message: str):
         # Empty message — nothing to send. Treat as no-op rather than error.
         return
     for i, chunk in enumerate(chunks, 1):
-        data = json.dumps({"content": chunk}).encode()
+        payload = {"content": chunk}
+        # First chunk only: on every chunk it renders N reply-headers for one
+        # answer. fail_if_not_exists=False -> deleted target degrades to plain.
+        if reply_to and i == 1:
+            payload["message_reference"] = {"message_id": str(reply_to),
+                                            "fail_if_not_exists": False}
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
         # Transport only: once urlopen returns, the message is committed, so
         # read() belongs below. Not a `with` — doubles are plain objects.
@@ -5824,7 +5846,8 @@ def _send_cli_body(argv: list) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
-        _send_via_rest(sys.argv[2], _send_cli_body(sys.argv[3:]))
+        reply_to, body_argv = _parse_send_argv(sys.argv[3:])
+        _send_via_rest(sys.argv[2], _send_cli_body(body_argv), reply_to)
     elif sys.argv[1:2] == ["edit"]:
         # Arity is checked here rather than by the `>= 5` guard the send branch
         # uses: falling through on a short `edit` would boot the whole bridge.
