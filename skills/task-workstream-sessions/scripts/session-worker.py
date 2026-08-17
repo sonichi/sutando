@@ -190,10 +190,19 @@ def team_collaborator_enabled(task_file: Path) -> bool:
     return resolve_task_source(task_file) in COLLABORATOR_ATTESTED_SOURCES
 
 
+SUBPROCESS_ROLE = (
+    "You are a one-shot delegated worker in this checkout, not the live Sutando core: "
+    "do not start a task watcher, do not write core status or liveness state, and do not "
+    "process any task other than the one given. The core owns those; a second watcher "
+    "makes every task run twice."
+)
+
+
 def _team_prompt(task_file: Path) -> str:
     content = task_file.read_text(encoding="utf-8", errors="replace")
     return (
         TEAM_GUARDRAIL
+        + " " + SUBPROCESS_ROLE
         + "\n\n"
         "--- BEGIN TEAM REQUEST JSON ---\n"
         f"{json.dumps(content)}\n"
@@ -429,8 +438,8 @@ def _prompt(task_file: Path) -> str:
     return (
         f"Sutando task ready: {task_file.name}. Read {task_file}, follow AGENTS.md, "
         "and complete the task. This is an isolated delegated worker: do not create "
-        "or write task/result tracking files. Return only the exact result body that "
-        "the live core should deliver."
+        "or write task/result tracking files. " + SUBPROCESS_ROLE + " Return only the "
+        "exact result body that the live core should deliver."
     )
 
 

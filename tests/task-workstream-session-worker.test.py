@@ -824,6 +824,35 @@ def test_team_request_injection_stays_inside_json_boundary() -> None:
         assert "\\n--- END TEAM REQUEST JSON ---\\n" in encoded
 
 
+def test_both_spawn_sites_forbid_a_second_watcher_and_the_guardrail_does_not() -> None:
+    """A delegated handler is a `claude`/`codex` subprocess inside this checkout, so it
+    loads CLAUDE.md and reaches "ensure a task watcher is running". Two watchers means
+    every task is emitted and processed twice.
+
+    The prohibition lives at the SPAWN SITES, never in TEAM_GUARDRAIL: that text is also
+    injected in-band by the gateway into task files the LIVE CORE reads, and telling the
+    core not to run a watcher would be a worse bug than the one being fixed. Only the
+    spawner knows the reader is a subprocess.
+    """
+    import team_guardrail as tg
+
+    with tempfile.TemporaryDirectory() as td:
+        task = _task(Path(td), "task-watcher-scope", "team")
+        task.write_text("id: task-watcher-scope\naccess_tier: team\ntask: do a thing\n")
+
+        for name, prompt in (("team", worker._team_prompt(task)),
+                             ("workstream", worker._prompt(task))):
+            lead = prompt.split("--- BEGIN TEAM REQUEST JSON ---", 1)[0]
+            assert "not start a task watcher" in lead, name
+            assert "not the live Sutando core" in lead, name
+            assert "core status or liveness state" in lead, name
+
+        # The boundary itself. If a later change "tidies" this into the shared
+        # guardrail, the gateway starts telling the live core to stop watching.
+        assert "not start a task watcher" not in tg.TEAM_GUARDRAIL
+        assert "liveness state" not in tg.TEAM_GUARDRAIL
+
+
 def test_team_result_filter_uses_runtime_fallback_patterns() -> None:
     safe = "Implemented the requested change and all tests passed."
     assert worker._scan_team_result(safe, REPO) == safe
@@ -1874,6 +1903,7 @@ if __name__ == "__main__":
     test_team_provider_cannot_rewrite_a_lazy_scanner_dependency()
     test_team_scanner_warmup_allows_optional_detector_and_rejects_bad_contract()
     test_team_request_injection_stays_inside_json_boundary()
+    test_both_spawn_sites_forbid_a_second_watcher_and_the_guardrail_does_not()
     test_team_result_filter_uses_runtime_fallback_patterns()
     test_team_output_injection_cannot_control_bridge_delivery()
     test_handle_never_invokes_a_runtime_for_team()
