@@ -773,7 +773,7 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # names + reply reference. Serialized only when the gateway sends
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
-                "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
