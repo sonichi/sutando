@@ -4382,13 +4382,8 @@ def _update_dm_checkpoint(channel_id: int, message_id: int) -> None:
     _atomic_write_dm_checkpoint(current)
 
 
-# Serializes reconnect catch-up vs the periodic reconciliation pass. Created
-# LAZILY (on first use, inside the running Discord loop) — NOT at import time: on
-# Python 3.9 asyncio.Lock() binds the current event loop at construction, so a
-# module-scope lock binds the pre-run default loop, and a CONTENDED acquire under
-# asyncio.run() then raises "Future ... attached to a different loop". Contention
-# is exactly this lock's job (reconnect catch-up racing the 60s reconciliation),
-# so the failure is on the load-bearing path (qingyun/sonichi CR #2655).
+# Created lazily inside the running loop: py3.9 asyncio.Lock() binds its event
+# loop at construction, so a module-scope lock raises on contended acquire.
 _dm_catchup_lock = None
 
 
