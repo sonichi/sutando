@@ -194,6 +194,8 @@ from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
 TASKS_DIR = _task_dir()
+# Guard scans load the repo's scanner; resolve the root once, from this file.
+REPO_ROOT_FOR_GUARD = Path(__file__).resolve().parents[3]
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
@@ -539,6 +541,61 @@ def _token_from_vault_ag2space(vault_get=None):
         print("[remote-gateway-bridge] token not in env or .env; loaded from vault",
               file=sys.stderr, flush=True)
     return tok
+
+
+_TEAM_GUARD_FNS: "tuple | None" = None
+
+
+def _team_guard_fns():
+    """Lazily locate the monorepo `src/team_result_guard.py`; memoized.
+    Returns (None, None) on failure — callers MUST withhold, never deliver."""
+    global _TEAM_GUARD_FNS
+    if _TEAM_GUARD_FNS is not None:
+        return _TEAM_GUARD_FNS
+    try:
+        cur = os.path.dirname(os.path.abspath(__file__))
+        src = ""
+        while True:
+            if os.path.isfile(os.path.join(cur, "src", "team_result_guard.py")):
+                src = os.path.join(cur, "src")
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        if not src:
+            _TEAM_GUARD_FNS = (None, None)
+            return _TEAM_GUARD_FNS
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from team_result_guard import guard_result_for_tier, resolve_access_tier
+        _TEAM_GUARD_FNS = (guard_result_for_tier, resolve_access_tier)
+    except Exception:
+        _TEAM_GUARD_FNS = (None, None)
+    return _TEAM_GUARD_FNS
+
+
+def _guarded_result_body(tid: str, body: str):
+    """Scan a non-owner result BEFORE any marker is interpreted.
+
+    Returns (safe_body, withheld_reason), or (None, reason) when the shared
+    guard cannot be loaded — the caller leaves the file for retry rather than
+    honouring redirect/attach actions on unscanned collaborator output.
+    """
+    guard, resolve = _team_guard_fns()
+    if guard is None or resolve is None:
+        return None, "team_result_guard unavailable"
+    tfile = find_task_file(TASKS_DIR, tid)
+    if tfile is None:
+        archive = TASKS_DIR / "archive"
+        tfile = find_task_file(archive, tid) if archive.is_dir() else None
+    if tfile is None:
+        # Unknown provenance is not owner provenance.
+        tier = "guest"
+    else:
+        tier = resolve(tfile)
+    safe, withheld = guard(body, tier, REPO_ROOT_FOR_GUARD)
+    return safe, withheld
 
 
 _VAULT_INTERCEPT_FNS: "tuple | None" = None
@@ -2471,6 +2528,14 @@ def _post_ready_results(inflight: set[str]) -> None:
         body = read_ready_result(rfile)
         if body is None:
             continue
+        # Non-owner output is scanned BEFORE any marker is interpreted:
+        # redirect/attach below are side effects on collaborator text.
+        body, _withheld = _guarded_result_body(tid, body)
+        if body is None:
+            _log(f"result guard unavailable for {tid} — leaving for retry")
+            continue
+        if _withheld:
+            _log(f"withheld non-owner result for {tid}: {_withheld}")
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
