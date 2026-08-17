@@ -5571,6 +5571,29 @@ def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | 
         return True
 
 
+def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
+    """Task filenames a running delegated worker is currently processing.
+
+    A team task stays in tasks/ for the whole run — the worker only removes it
+    when it publishes a result — so an in-flight task and an abandoned one are
+    byte-identical on disk. Only the worker's argv separates them.
+    """
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(["ps", "-Ao", "args="], capture_output=True,
+                                       text=True, timeout=5).stdout
+        except Exception:  # noqa: BLE001 — a probe failure must not fail the check
+            return set()
+    held = set()
+    for line in (ps_output or "").splitlines():
+        if "session-worker.py" not in line:
+            continue
+        for tok in line.split():
+            if tok.endswith(".txt") and "/tasks/" in tok:
+                held.add(Path(tok).name)
+    return held
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -5585,13 +5608,20 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
     now = time.time()
+    # An in-flight task looks exactly like a stalled one on disk; the worker's
+    # argv is the only thing that tells them apart.
+    held = _tasks_held_by_a_worker()
+    inflight = sum(1 for f in files if f.name in held)
+    held_note = f", {inflight} in flight with a worker" if inflight else ""
     oldest = min(files, key=lambda p: p.stat().st_mtime)
     oldest_age = int(now - oldest.stat().st_mtime)
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
             "status": "warn",
-            "detail": f"{len(files)} tasks queued, oldest {oldest_age}s — watcher or core may be stuck",
+            "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
+                       + ("" if inflight == len(files)
+                          else " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
     # message could sit indefinitely while this probe printed its age under "ok".
@@ -5599,9 +5629,12 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
         return {
             "name": name,
             "status": "warn",
-            "detail": f"{len(files)} task(s) queued, oldest {oldest_age}s — undrained past {stuck_age_sec}s",
+            "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
+                       + (" — all held by a live worker, not stalled" if inflight == len(files)
+                          else f" — undrained past {stuck_age_sec}s")),
         }
-    return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(files)} task(s){held_note}, oldest {oldest_age}s"}
 
 
 def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
