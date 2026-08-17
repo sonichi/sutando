@@ -37,13 +37,31 @@ has "$out" 'No such file or directory' "captures STDERR — asserts on OS text, 
 has "$out" '[exit 1]' "records the ACTUAL nonzero exit, not just 'failed'"
 has "$out" '[exit 0]' "records the zero exit too"
 has "$out" '$ echo alpha-marker' "echoes each command it ran"
-has "$out" "<!-- pr-evidence HEAD $sha -->" "stamps the block with the sha it was generated at"
+has "$out" "<!-- pr-evidence HEAD $sha" "stamps the block with the sha it was generated at"
 
 # A block naming no sha cannot be told from a stale or hand-written one, and a
 # stamp buried mid-block survives a partial paste that drops the evidence.
 first="$(printf '%s' "$out" | head -1)"
-same "$first" "<!-- pr-evidence HEAD $sha -->" \
-    "stamp is the FIRST line, so a truncated paste loses it visibly"
+case "$first" in
+    "<!-- pr-evidence HEAD $sha"*) pass "stamp is the FIRST line, so a truncated paste loses it visibly" ;;
+    *) flunk "stamp is the FIRST line (got: $first)" ;;
+esac
+
+# The sha names a COMMIT while commands run against the working TREE. A stamp
+# that hides that asserts exact-commit provenance for output the commit lacks.
+dirtymark="UNCOMMITTED_EVIDENCE_PROBE"
+touch "$REPO/$dirtymark"
+dout="$(bash "$GEN" "test -f $dirtymark && echo probe-present" 2>/dev/null)"
+rm -f "$REPO/$dirtymark"
+has "$dout" "$sha+dirty" "a DIRTY tree is stamped +dirty, not as the bare commit"
+has "$dout" "does not" "and the block says so in prose, not only in the marker"
+has "$dout" "probe-present" "the uncommitted content is still exercised and shown"
+
+# A command that dirties the tree WHILE producing the stamped output is the case
+# a before-only check cannot see.
+mout="$(bash "$GEN" "touch $dirtymark" 'echo made-a-file' 2>/dev/null)"
+rm -f "$REPO/$dirtymark"
+has "$mout" "DURING the run" "a tree dirtied BY the commands is called out as mid-run"
 
 # --at is the "before" half: it must run at the named ref, not at HEAD.
 if ! git -C "$REPO" rev-parse --verify --quiet 'HEAD~1^{commit}' >/dev/null; then
