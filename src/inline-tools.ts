@@ -481,21 +481,54 @@ print("builtin", after.value, before.value)
  * display by their own index, which no CoreGraphics id maps onto, so this
  * refuses when more than one display is attached rather than guessing which
  * panel `display 1` denotes.
+ *
+ * Reads the level back where the tool supports it. DDC is widely half-implemented
+ * in monitor firmware, so a command can be accepted and ignored — reporting the
+ * REQUESTED level here would reproduce the silent-success bug this file exists to
+ * fix, on the one path that cannot be hardware-tested. When no readback is
+ * available the result says `requested`, never `set`.
  */
-function setExternalBrightness(level: number, displayCount: number): string | { error: string } {
+type ExternalResult =
+	| { status: 'set' | 'partial' | 'requested'; method: string; level: number; requested: number; verified: boolean }
+	| { error: string };
+
+function setExternalBrightness(level: number, displayCount: number): ExternalResult {
 	if (displayCount > 1) {
 		return { error: `${displayCount} displays attached — refusing to guess which external panel to dim. Set it on the monitor, or attach one display.` };
 	}
-	for (const [bin, args] of [
-		['m1ddc', ['display', '1', 'set', 'luminance', String(level)]],
-		['ddcctl', ['-d', '1', '-b', String(level)]],
+	const failures: string[] = [];
+	for (const [bin, setArgs, getArgs] of [
+		['m1ddc', ['display', '1', 'set', 'luminance', String(level)], ['display', '1', 'get', 'luminance']],
+		['ddcctl', ['-d', '1', '-b', String(level)], null],
 	] as const) {
 		try {
-			execFileSync(bin, [...args], { timeout: 5_000, stdio: 'ignore' });
-			return bin;
-		} catch {}
+			execFileSync(bin, [...setArgs], { timeout: 5_000, stdio: ['ignore', 'ignore', 'pipe'] });
+		} catch (err) {
+			// ENOENT (absent) and a non-zero exit (present but refused) are different
+			// diagnoses; collapsing them tells a user who HAS the tool to install it.
+			const e = err as { code?: string; stderr?: Buffer; status?: number };
+			if (e?.code === 'ENOENT') continue;
+			failures.push(`${bin} exited ${e?.status ?? '?'}: ${String(e?.stderr ?? '').trim() || 'no stderr'}`);
+			continue;
+		}
+		if (getArgs) {
+			try {
+				const out = execFileSync(bin, [...getArgs], { timeout: 5_000, encoding: 'utf8' });
+				const actual = parseInt(out.trim(), 10);
+				if (Number.isFinite(actual)) {
+					return Math.abs(actual - level) <= BRIGHTNESS_TOLERANCE_PCT
+						? { status: 'set', method: bin, level: actual, requested: level, verified: true }
+						: { status: 'partial', method: bin, level: actual, requested: level, verified: true };
+				}
+			} catch { /* readback unsupported by this panel — fall through unverified */ }
+		}
+		return { status: 'requested', method: bin, level, requested: level, verified: false };
 	}
-	return { error: 'External display needs a DDC tool. Install one with: brew install m1ddc' };
+	return {
+		error: failures.length
+			? `External display: DDC command failed — ${failures.join('; ')}`
+			: 'External display needs a DDC tool. Install one with: brew install m1ddc',
+	};
 }
 
 export const brightnessTool: ToolDefinition = {
@@ -538,11 +571,9 @@ export const brightnessTool: ToolDefinition = {
 			if ((err as { status?: number })?.status === 2) {
 				const count = parseInt(String((err as { stdout?: string }).stdout ?? '').trim().split(/\s+/)[1] ?? '1', 10);
 				const outcome = setExternalBrightness(level, Number.isFinite(count) ? count : 1);
-				if (typeof outcome === 'string') {
-					console.log(`${ts()} [Brightness] external: set to ${level}% via ${outcome}`);
-					return { status: 'set', level, display: 'external', method: outcome };
-				}
-				return outcome;
+				if ('error' in outcome) return outcome;
+				console.log(`${ts()} [Brightness] external: requested ${level}% via ${outcome.method} — ${outcome.verified ? `display reads ${outcome.level}%` : 'NOT verified (no readback)'}`);
+				return { ...outcome, display: 'external' };
 			}
 			try {
 				execFileSync('brightness', [bLevel], { timeout: 5_000 });
