@@ -13,6 +13,7 @@ shim is a bridge rather than a silencer:
 
 Run: python3 tests/pr-flag-shim.test.py
 """
+import importlib.util
 import os
 import subprocess
 import sys
@@ -33,7 +34,13 @@ class Shim(unittest.TestCase):
             tgt = Path(cfg_dir) / "skills/pr-triage/scripts/pr_flag.py"
             tgt.parent.mkdir(parents=True, exist_ok=True)
             tgt.write_text(plant)
-        return subprocess.run([sys.executable, str(SHIM), *args],
+        # The shim only ever runs as a child process, so without this the diff
+        # gate measures it at 0% while every test here passes. Same seam as
+        # tests/voice-lock.test.py.
+        cmd = [sys.executable]
+        if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+            cmd += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+        return subprocess.run([*cmd, str(SHIM), *args],
                               capture_output=True, text=True, env=env, timeout=60)
 
     def test_forwards_to_the_skill_when_it_is_installed(self):
@@ -66,6 +73,24 @@ class Shim(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             r = self._run(d, plant="import sys; sys.exit(0)")
         self.assertIn("DEPRECATED", r.stderr)
+
+    def test_target_prefers_the_config_dir_over_the_repo_fallback(self):
+        # In-process, so the resolution order is asserted directly rather than
+        # inferred from which child happened to run. Every subprocess test ends
+        # in os.execv, which is why this path is otherwise unobservable.
+        spec = importlib.util.spec_from_file_location("_prflag_shim", SHIM)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as d:
+            tgt = Path(d) / "skills/pr-triage/scripts/pr_flag.py"
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            tgt.write_text("import sys; sys.exit(0)")
+            os.environ["CLAUDE_CONFIG_DIR"] = d
+            try:
+                self.assertEqual(mod._target(), tgt)
+            finally:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertIsNone(mod._target(), "no skill anywhere must resolve to None")
 
     def test_the_shim_carries_no_logic(self):
         # The vendored copy drifted because it held the implementation. This
