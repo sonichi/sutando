@@ -2663,9 +2663,8 @@ def _delivered_copy_exists(tid: str) -> bool:
 
 
 def _move_no_clobber(src, dst) -> bool:
-    """Move src to dst, or to a uniquified sibling — never over an existing
-    file. os.link fails EEXIST atomically; exists-then-rename does not, and
-    rename silently replaces the loser's evidence."""
+    """Move src to dst or a uniquified sibling, never over an existing file:
+    os.link fails EEXIST atomically, where exists-then-rename clobbers."""
     for candidate in (dst, dst.with_name(f"{dst.stem}.{time.time_ns()}{dst.suffix}")):
         try:
             os.link(str(src), str(candidate))
@@ -2709,10 +2708,8 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         if age < ORPHAN_GRACE_S:
             continue                            # young: normal path may claim it
         if age > ORPHAN_MAX_AGE_S:
-            # A minimum age alone lets an automatic sweep replay an unbounded
-            # historical backlog into live rooms. Old results are quarantined
-            # for a human; backfill must be a deliberate one-shot, not a
-            # side effect of starting up.
+            # A minimum age alone lets an automatic pass replay an unbounded
+            # historical backlog into live rooms; backfill must be deliberate.
             if _quarantine_orphan(rfile, tid, "too-old"):
                 if tid not in _orphan_quarantine_logged:
                     _orphan_quarantine_logged.add(tid)
@@ -2754,9 +2751,8 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
         if skip and skip.value == "deduped":
-            # The normal path routes dedup through _dedup_plan, which reports
-            # or requeues when the holder delivered nothing. Posting it here
-            # would retire the ask on the holder's behalf without that check.
+            # _dedup_plan reports or requeues when the holder delivered
+            # nothing; posting here would retire the ask without that check.
             if _quarantine_orphan(rfile, tid, "deduped-orphan"):
                 _log(f"orphan sweep: {tid} defers to its dedup holder — quarantined")
             continue
