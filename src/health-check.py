@@ -6244,9 +6244,11 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
                           f"claim AGE is unavailable for {age_unknown} of them (no "
                           "trusted observation store), so stale cannot be told from "
                           "fresh for those"}
+    # Reaching here with a bounded claim means it is inside its handler bound, so
+    # it is running; counting only in_flight renders working claims as "0 running".
     return {"name": name, "status": "ok",
-            "detail": f"{held} held claim(s), {in_flight} still queued or running; "
-                      "none leaked and none past its own execution contract"}
+            "detail": f"{held} held claim(s), {in_flight + len(bounded)} still queued "
+                      "or running; none leaked and none past its own execution contract"}
 
 
 def fix_task_watcher_sentinel(check: dict) -> str:
