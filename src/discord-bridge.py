@@ -5180,6 +5180,15 @@ async def poll_proactive():
                     if text is None:
                         release_claim(f)
                         continue
+                    # A non-Discord [channel:] target is another bridge's file;
+                    # slack/telegram peek for \d{17,20} the same way before claiming.
+                    _peek = re.match(r"\s*\[channel:\s*([^\]]+)\]", text)
+                    if _peek and not re.fullmatch(r"\d{17,20}", _peek.group(1).strip()):
+                        print(f"  [proactive] {f.name} targets "
+                              f"{_peek.group(1).strip()!r} — not a Discord channel id; "
+                              f"releasing for its own bridge", flush=True)
+                        release_claim(f)
+                        continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
                     # workspace `state/discord-config.json` (Sutando's owned config
@@ -5228,17 +5237,6 @@ async def poll_proactive():
                         # surfaces them as typed actions — no hand-rolled regex.
                         _pp = parse_markers(text)
 
-                        # A non-Discord [channel:] target is another bridge's
-                        # file; slack/telegram already gate on \d{17,20} here.
-                        _fr = next((a for a in _pp.actions if a.kind == "redirect"), None)
-                        if _fr is not None and not re.fullmatch(r"\d{17,20}", str(_fr.value).strip()):
-                            print(
-                                f"  [proactive] {f.name} targets {_fr.value!r} — not a Discord "
-                                f"channel id; releasing for its own bridge",
-                                flush=True,
-                            )
-                            release_claim(f)
-                            continue
                         clean_text = _pp.body
                         files = [a.value for a in _pp.actions if a.kind == "attach"]
 

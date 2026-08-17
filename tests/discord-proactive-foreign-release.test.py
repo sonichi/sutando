@@ -18,6 +18,16 @@ import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
+
+# Isolate BEFORE any bridge import: channel_access_path() falls back to the real
+# home, so a test that loads a bridge first reads the developer's own allowlist.
+prior = os.environ.get("CLAUDE_CONFIG_DIR")
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-foreign-release-")
+_cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / ".env").write_text("DISCORD_BOT_TOKEN=test-stub-token\n")
+(_cfg / "access.json").write_text('{"allowFrom": [], "groups": {}}\n')
+tmp = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"])
 BRIDGE = REPO / "src" / "discord-bridge.py"
 fail = 0
 
@@ -53,9 +63,6 @@ def load_bridge(config_root: pathlib.Path):
     return b
 
 
-tmp = pathlib.Path(tempfile.mkdtemp())
-prior = os.environ.get("CLAUDE_CONFIG_DIR")
-os.environ["CLAUDE_CONFIG_DIR"] = str(tmp)
 try:
     bridge = load_bridge(tmp)
 
