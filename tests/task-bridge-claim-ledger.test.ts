@@ -53,6 +53,21 @@ describe('_claimedElsewhere reads other consumers\' durable in-flight ledgers', 
 		assert.equal(_claimedElsewhere('task-ghost'), false);
 	});
 
+	it('reads ONLY ledger-named files, not every JSON in state/', () => {
+		// <workspace>/state also holds core-status.json, voice-state.json,
+		// quota-state.json and friends. Without the name+suffix filter, any of
+		// them that happens to be a JSON array of strings injects false claims
+		// and wrongly suppresses retirement of a local result.
+		const decoys = ['core-status.json', 'voice-state.json', 'quota-state.json'];
+		for (const name of decoys) raw(TMP, name, JSON.stringify(['task-decoy']));
+		raw(TMP, 'remote-task-inflight.txt', JSON.stringify(['task-wrong-suffix']));
+		assert.equal(_claimedElsewhere('task-decoy'), false,
+			'a non-ledger JSON array in state/ must not read as a claim');
+		assert.equal(_claimedElsewhere('task-wrong-suffix'), false,
+			'a ledger-named file without .json must not be read');
+		assert.equal(_claimedElsewhere('task-a'), true, 'the real ledger still reads');
+	});
+
 	it('a reshaped ledger yields no claims rather than throwing', () => {
 		raw(TMP, 'remote-task-inflight-shape.json', '{"tasks": ["task-wrong-shape"]}');
 		assert.equal(_claimedElsewhere('task-wrong-shape'), false);
