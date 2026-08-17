@@ -100,19 +100,22 @@ class BClaimDriver:
             job = self.inbox[actor].get()
             if job is None:
                 return
-            op, fn = job
+            op, fn, start_id = job
             try:
                 res = fn()
             except Exception as e:                # a protocol crash is a finding
                 res = e
             with self._seq_lock:
                 self._seq += 1
-                self.done_log.append((self._seq, actor, op, res))
+                self.done_log.append((self._seq, actor, op, res, start_id))
             self.busy[actor] = False
 
     def _submit(self, actor, op, fn):
         self.busy[actor] = True
-        self.inbox[actor].put((op, fn))
+        with self._seq_lock:
+            self._seq += 1
+            start_id = self._seq
+        self.inbox[actor].put((op, fn, start_id))
 
     # ── op surface ──────────────────────────────────────────────────────────
     def publish(self):
@@ -186,22 +189,34 @@ class BClaimDriver:
 
     def _replay_tokens(self):
         """Derive believers + live tokens from the log (same believer
-        semantics as the A driver: success grants, own-completion releases)."""
+        semantics as the A driver: success grants, own-completion releases).
+
+        Two oracles cover B's I2 (001 review, 2026-08-17):
+        - SCOPED order assert here: recover returning a key is a steal only
+          if a believer's claim COMPLETED before the recover STARTED — a
+          claim completing inside the recover's window consumed the
+          recovery's own ready slot (legitimate handoff, CE-3), which the
+          unscoped completion-order assert false-positived on.
+        - STATE assert in _check: believer + ready copy never coexist
+          (covers the steal-enabling state between ops, CE-1)."""
         held = {}
-        for _seq, actor, op, res in sorted(self.done_log):
+        held_done = {}                            # actor -> claim done_id
+        for done_id, actor, op, res, start_id in sorted(self.done_log):
             if isinstance(res, Exception):
                 raise AssertionError(f"{actor} {op} raised {res!r}")
             if op == "claim" and isinstance(res, str):
                 held[actor] = res
+                held_done[actor] = done_id
             elif op == "complete" and res is True:
                 held.pop(actor, None)
+                held_done.pop(actor, None)
             elif op == "recover" and res:
-                # B's I2, machine form: a live actor's believed item must
-                # never come back from recover.
                 key = B.safe_key(ITEM)
+                pre = [a for a, d in held_done.items() if d < start_id]
                 for k in res:
-                    assert not (k == key and held), \
-                        f"recover STOLE {k} from live holder {sorted(held)}"
+                    assert not (k == key and pre), \
+                        (f"recover (started {start_id}) STOLE {k} from "
+                         f"pre-existing holder {sorted(pre)}")
         self.tokens = {a: held.get(a) for a in ACTORS}
         return held
 
@@ -218,6 +233,13 @@ class BClaimDriver:
                 f"{actor} holds the claim but the inflight record is gone"
             assert rec == actor, \
                 f"inflight record names {rec!r}, holder is {sorted(held)}"
+            # B's I2 as a STATE invariant (replaces the completion-order
+            # no-steal replay assert): an owned item must not also be
+            # claimable — a ready copy alongside a believer is the
+            # double-delivery precursor CE-1 demonstrated.
+            ready = Path(self.root) / B.READY / B.safe_key(ITEM)
+            assert not ready.exists(), \
+                f"{actor} owns the item AND a ready copy is claimable"
 
     def finish(self, check=True):
         try:

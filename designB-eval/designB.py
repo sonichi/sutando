@@ -217,9 +217,26 @@ def cleanup(root, max_age_s: float, now: float | None = None) -> int:
 
 
 def holder(root, item_id: str):
+    """The LIVE owner's worker, if one exists; else the most recent dead
+    incarnation's (max (birth, token-name) — deterministic, never iteration
+    order). A dead token can legitimately coexist with a live claim
+    (recover's link+unlink crash window, resolved by quarantine on the next
+    recover pass) — the live owner is the answer when one exists."""
     key = safe_key(item_id)
+    dead = []
     for f in _d(root, INFLIGHT).iterdir():
         parts = f.name.split(SEP)
-        if len(parts) == 4 and parts[0] == key:
+        if len(parts) != 4 or parts[0] != key:
+            continue
+        try:
+            ident = ob.process_identity(int(parts[2]))
+        except ValueError:
+            continue
+        if (ident.state is not ob.OwnerState.DEAD
+                and str(ident.start_usec) == parts[3]):
             return parts[1]
+        dead.append((int(parts[3]) if parts[3].isdigit() else -1,
+                     f.name, parts[1]))
+    if dead:
+        return max(dead)[2]
     return None
