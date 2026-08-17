@@ -185,8 +185,10 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
+from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROVENANCE
 from .outbox import DeliveryOutcome
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -196,12 +198,20 @@ from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
 TASKS_DIR = _task_dir()
+# Written by THIS bridge on replay, not by an agent — the guard must not
+# mistake its own dedup control for collaborator output.
+GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled task\n"
+
+
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
 # retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
 _PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
+# tids THIS process redelivered. Not a file: the collaborator path has full
+# workspace write, so any sidecar it can create is provenance it can forge.
+_REDELIVERED: "set[str]" = set()
 try:  # pragma: no cover - exercised by whichever context imports it
     from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
 except ImportError:  # pragma: no cover - flat src/ import path
@@ -543,6 +553,42 @@ def _token_from_vault_ag2space(vault_get=None):
     return tok
 
 
+def _team_guard_fns():
+    """Return (guard_result_for_tier, resolve_access_tier) from the BUNDLED module.
+    Sibling import only — an installed wheel has no monorepo `src/` to walk to."""
+    from .team_result_guard import guard_result_for_tier, resolve_access_tier
+    return guard_result_for_tier, resolve_access_tier
+
+
+def _is_redelivery_control(body: str) -> bool:
+    """Compare on stripped text: `read_ready_result` strips, the constant ends
+    in a newline, so a raw `==` never matches a body that came off disk."""
+    return (body or "").strip() == GATEWAY_REDELIVERY_RESULT.strip()
+
+
+def _guarded_result_body(tid: str, body: str):
+    """Scan a non-owner result BEFORE any marker is interpreted.
+
+    Returns (safe_body, withheld_reason), or (None, reason) when the guard
+    cannot be loaded — the caller leaves the file for retry rather than
+    honouring redirect/attach actions on unscanned collaborator output.
+    """
+    # Body equality is NOT provenance; only this process's record is. Reading must
+    # not consume it — a deferred POST retries and needs the same provenance.
+    if tid in _REDELIVERED and _is_redelivery_control(body):
+        return body, None
+    try:
+        guard, resolve = _team_guard_fns()
+        from .chat_secret_filter import filter_chat_secrets
+    except Exception as exc:
+        return None, f"team_result_guard unavailable: {exc}"
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    # Absence is not owner provenance: a month-archived Team task is exactly the
+    # case that would otherwise fall open.
+    tier = resolve(tfile) if tfile is not None else "guest"
+    return guard(body, tier, None, secret_filter=filter_chat_secrets)
+
+
 _VAULT_INTERCEPT_FNS: "tuple | None" = None
 
 
@@ -773,7 +819,8 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # names + reply reference. Serialized only when the gateway sends
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
-                "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
+                "addressed_to",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
@@ -1754,7 +1801,10 @@ def _write_task(task: dict) -> str | None:
         rfile = RESULTS_DIR / f"{tid}.txt"
         if not rfile.exists():
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            rfile.write_text("[no-send] gateway redelivery of already-handled task\n")
+            rfile.write_text(GATEWAY_REDELIVERY_RESULT)
+            # Provenance the result BODY cannot carry: a Team runtime controls
+            # the body and can emit these exact bytes, but not this process's set.
+            _REDELIVERED.add(tid)
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1863,9 +1913,13 @@ def _write_task(task: dict) -> str | None:
     # The fixed prose notice follows access_tier without introducing recognized headers.
     if _secret_types:
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
-    # Guest retains the established read-only Codex path. Team is deliberately
-    # absent here: the runtime handler launches the owner's selected core in its
-    # native sandbox, so a Claude owner does not depend on Codex quota.
+    # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
+    # closing the Team session route removed the only thing that used to deliver it.
+    if sender_tier == "team":
+        if collaborator_enabled:
+            lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
+        else:
+            lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
     if sender_tier == "guest":
         lines.extend([
             "",
@@ -1886,6 +1940,16 @@ def _write_task(task: dict) -> str | None:
         _chan_q = shlex.quote(_chan)
         _step = 1
         _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+        _addr = _one_line(task.get("addressed_to") or "")
+        if _addr:
+            # Addressing gate (#649): the broker resolved this reply's target to a
+            # peer agent. State it in-band so the check cannot fail to retrieve.
+            _skill.append(
+                f"{_step}. ADDRESSING: this message replies to {_addr}'s message and "
+                f"does not mention you — it is {_addr}'s to claim. Do not process it "
+                "unless a later message hands it to you explicitly; close your copy "
+                "with [no-send].")
+            _step += 1
         if _chan:
             _skill.append(
                 f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
@@ -1908,7 +1972,8 @@ def _write_task(task: dict) -> str | None:
         _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
         lines.extend(_skill)
     tmp = dest.with_suffix(".txt.tmp")
-    tmp.write_text("\n".join(lines) + "\n")
+    from .local_task_protocol import apply_task_stamper
+    tmp.write_text(apply_task_stamper("\n".join(lines) + "\n"))
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
     # #2274 parity: one task_processed per NEWLY queued task (idempotent early
@@ -2473,6 +2538,15 @@ def _post_ready_results(inflight: set[str]) -> None:
         body = read_ready_result(rfile)
         if body is None:
             continue
+        # Non-owner output is scanned BEFORE any marker is interpreted:
+        # redirect/attach below are side effects on collaborator text.
+
+        body, _withheld = _guarded_result_body(tid, body)
+        if body is None:
+            _log(f"result guard unavailable for {tid} — leaving for retry")
+            continue
+        if _withheld:
+            _log(f"withheld non-owner result for {tid}: {_withheld}")
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
@@ -2526,6 +2600,9 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _log(f"result POST network error for {tid}: {e} — will retry")
                 continue
             _archive_result(rfile, tid)
+            # Retire the provenance WITH the result, never at read: this line is
+            # only reached once the lease-closing POST has actually succeeded.
+            _REDELIVERED.discard(tid)
             inflight.discard(tid)
             _forget_task_room(tid)
             changed = True
@@ -2992,9 +3069,9 @@ def main() -> None:
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
-            except TimeoutError:
-                # Read timeout only — a connect failure arrives as URLError and
-                # still takes the outage path below.
+            except (TimeoutError, socket.timeout):
+                # Read timeout only (URLError takes the outage path below).
+                # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
                 if not _poll_timeout_is_empty(last_poll_ok, time.time()):
                     raise
                 resp = {"tasks": []}
