@@ -846,6 +846,10 @@ def check_cron_runner(
     try:
         age = (float(time.time() if now is None else now) - state_file.stat().st_mtime)
         age_err = None
+        # A negative age is a clock step or a bad write, never freshness. Discard
+        # it here so no branch below can read it as proof that work is happening.
+        if age < 0:
+            age, age_err = None, f"state is future-dated by {int(-age)}s"
     except FileNotFoundError:
         age, age_err = None, "state file is missing"
     except OSError as exc:
@@ -860,13 +864,16 @@ def check_cron_runner(
                 "status": "warn",
                 "detail": (f"{launchd_count} schedule(s); launchd reports {probe['status']} "
                            f"({probe.get('detail', '')}) but the runner wrote state "
-                           f"{int(max(age, 0))}s ago — invocations are being killed and "
+                           f"{int(age)}s ago — invocations are being killed and "
                            "relaunched, schedules still fire"),
             }
+        # Name why freshness could not vouch for it; a clock step here is exactly
+        # the neighbour of whatever else has gone wrong.
         return {
             "name": name,
             "status": "down",
-            "detail": f"{launchd_count} schedule(s) configured but launchd is {probe['status']}",
+            "detail": (f"{launchd_count} schedule(s) configured but launchd is "
+                       f"{probe['status']}" + (f"; {age_err}" if age_err else "")),
         }
 
     if age_err is not None:
@@ -880,7 +887,7 @@ def check_cron_runner(
     return {
         "name": name,
         "status": "ok",
-        "detail": f"{launchd_count} durable schedule(s), state {int(max(age, 0))}s old",
+        "detail": f"{launchd_count} durable schedule(s), state {int(age)}s old",
     }
 
 
