@@ -29,7 +29,7 @@ nonzero() {
 # the command string: the command is echoed into the block, so a marker written
 # in the command itself still appears when stderr is discarded, and the check
 # passes for the wrong reason. Caught by a control that failed to fail.
-out="$(bash "$GEN" 'echo alpha-marker' 'ls /definitely-absent-xyz' 2>/dev/null)"
+out="$(bash "$GEN" 'echo alpha-marker' 'cat /definitely-absent-xyz' 2>/dev/null)"
 sha="$(git -C "$REPO" rev-parse HEAD)"
 
 has "$out" 'alpha-marker' "captures stdout of a passing command"
@@ -46,6 +46,15 @@ same "$first" "<!-- pr-evidence HEAD $sha -->" \
     "stamp is the FIRST line, so a truncated paste loses it visibly"
 
 # --at is the "before" half: it must run at the named ref, not at HEAD.
+if ! git -C "$REPO" rev-parse --verify --quiet 'HEAD~1^{commit}' >/dev/null; then
+    git -C "$REPO" fetch --deepen 2 --quiet >/dev/null 2>&1 || true
+fi
+if ! git -C "$REPO" rev-parse --verify --quiet 'HEAD~1^{commit}' >/dev/null; then
+    echo "SKIP: shallow clone with no HEAD~1 — --at assertions need two commits"
+    [[ "$fail" -ne 0 ]] && { echo "FAIL: pr-evidence generator"; exit 1; }
+    echo "PASS: pr-evidence generator (--at block skipped: shallow clone)"
+    exit 0
+fi
 prev="$(git -C "$REPO" rev-parse HEAD~1)"
 at_out="$(bash "$GEN" --at HEAD~1 'git log --oneline -1' 2>/dev/null)"
 has "$at_out" "$prev" "--at reports the requested ref's sha"
@@ -80,8 +89,8 @@ lacks "$ws_out" "pr-evidence-" "--at does NOT report a workspace under its own t
 # into a 0755 worktree, where a failed cleanup strands it world-readable.
 perm_out="$(bash "$GEN" --at HEAD~1 \
     'pwd' \
-    'stat -f "%Sp" sutando.config.local.json' \
-    'stat -f "%Sp" ..' \
+    'stat -f \"%Sp\" sutando.config.local.json 2>/dev/null || stat -c \"%A\" sutando.config.local.json' \
+    'stat -f \"%Sp\" .. 2>/dev/null || stat -c \"%A\" ..' \
     'python3 -c "import json;print(sorted(json.load(open(\"sutando.config.local.json\")).keys()))"' \
     2>/dev/null)"
 has "$perm_out" '-rw-------' "the pinned config is mode 600"
