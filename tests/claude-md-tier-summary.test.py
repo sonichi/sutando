@@ -19,9 +19,18 @@ class TierSummaryPreservesBranches(unittest.TestCase):
 
     def _check(self, s, name):
         self.assertIn("collaborator: true", s,
-                      f"{name}: the AG2 collaborator exception must live in "
+                      f"{name}: the collaborator exceptions must live in "
                       "the always-loaded rule, not only in docs/")
-        self.assertIn("normal configured workspace", s,
+        self.assertIn("broker-attested", s,
+                      f"{name}: the AG2 Space collaborator shape must be "
+                      "named distinctly")
+        self.assertIn("per-channel collaborators list", s,
+                      f"{name}: the Discord per-channel collaborator shape "
+                      "must be named distinctly (review P1 round 2 — the "
+                      "summary said ONE exception while dispatch has two)")
+        self.assertNotIn("ONE capability-changing exception", s,
+                         f"{name}: the false-ONE wording must not return")
+        self.assertIn("normal capabilities", s,
                       f"{name}: the exception must state its capability "
                       "consequence, not just name the flag")
         self.assertIn("===SUTANDO SYSTEM INSTRUCTIONS===", s,
