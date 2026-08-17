@@ -5178,6 +5178,18 @@ async def poll_proactive():
                     if text is None:
                         release_claim(f)
                         continue
+                    # Parse ONCE, here, and reuse below: a second grammar would
+                    # miss what parse_markers peels (D7 `**[core: N]**` headers).
+                    _pp = parse_markers(text)
+                    _early_redirect = next(
+                        (a for a in _pp.actions if a.kind == "redirect"), None)
+                    if _early_redirect is not None and not re.fullmatch(
+                            r"\d{17,20}", str(_early_redirect.value).strip()):
+                        print(f"  [proactive] {f.name} targets "
+                              f"{str(_early_redirect.value).strip()!r} — not a Discord "
+                              f"channel id; releasing for its own bridge", flush=True)
+                        release_claim(f)
+                        continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
                     # workspace `state/discord-config.json` (Sutando's owned config
@@ -5224,7 +5236,8 @@ async def poll_proactive():
                         # Parse protocol markers (skip / redirect / attach).
                         # parse_markers strips all markers from .body and
                         # surfaces them as typed actions — no hand-rolled regex.
-                        _pp = parse_markers(text)
+                        # already parsed once, above the owner work
+
                         clean_text = _pp.body
                         files = [a.value for a in _pp.actions if a.kind == "attach"]
 
