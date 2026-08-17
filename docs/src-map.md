@@ -138,6 +138,7 @@ One entry per agent-facing module.
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
+- **`team_result_guard.py`** — Final scan applied to a Team-tier result before any router reads its markers.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.

@@ -28,18 +28,23 @@ SESSION_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
-TEAM_LEAK_RESULT = (
-    "I completed the Team task, but the response was withheld because it may "
-    "contain sensitive information. The owner can review the work locally."
+# The guard is owned by src/team_result_guard.py so the core's direct-core path
+# and this worker enforce one policy; these names are re-exported, not redefined.
+_GUARD_ROOT = next(
+    (p for p in Path(__file__).resolve().parents
+     if (p / "src" / "team_result_guard.py").is_file()),
+    None,
 )
-TEAM_RESULT_CONTROL = re.compile(
-    r"\[(?:channel|file|send|attach|dm-only|no-send|replied|deduped)\s*(?::|\])",
-    re.IGNORECASE,
+if _GUARD_ROOT is not None and str(_GUARD_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_GUARD_ROOT / "src"))
+from team_result_guard import (  # noqa: E402
+    TEAM_LEAK_RESULT,
+    TEAM_RESULT_CONTROL,
+    TeamResultLeakError,
+    load_team_result_scanner as _load_team_result_scanner,
+    resolve_access_tier,
+    scan_team_result as _scan_team_result,
 )
-
-
-class TeamResultLeakError(RuntimeError):
-    """The Team provider result contained a likely secret."""
 
 
 def _read_json(path: Path) -> dict:
@@ -134,38 +139,6 @@ def _headers(task_file: Path) -> dict[str, str]:
             if key == "task":
                 break
     return headers
-
-
-def resolve_access_tier(task_file: Path) -> str:
-    """Read a task's effective tier without letting a task-last body escalate.
-
-    Task-last writers put the trusted tier before ``task:``; prefer that value.
-    The remote gateway is task-mid and newline-confines every wire value, so if
-    no pre-task tier exists its final tier line is the trusted value.  Missing
-    legacy tiers remain owner; malformed explicit tiers fail closed to guest.
-    """
-    try:
-        content = task_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return "guest"
-    before_task = content.split("\ntask:", 1)[0]
-    candidates = [
-        line.partition(":")[2].strip().lower()
-        for line in before_task.splitlines()
-        if line.startswith("access_tier:")
-    ]
-    if not candidates:
-        candidates = [
-            line.partition(":")[2].strip().lower()
-            for line in content.splitlines()
-            if line.startswith("access_tier:")
-        ]
-    if not candidates:
-        return "owner"
-    tier = candidates[-1]
-    if tier == "other":
-        tier = "guest"
-    return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
 # Collaborator trust is broker-attested. A Discord channel `collaborators` entry
@@ -364,45 +337,6 @@ def _claude_stream_result(stdout: str) -> str:
         if event.get("type") == "result" and isinstance(event.get("result"), str):
             return event["result"]
     raise RuntimeError("claude did not emit a terminal result event")
-
-
-def _load_team_result_scanner(repo: Path):
-    """Load and warm the full scanner graph before Team-controlled execution."""
-    source_dir = str((repo / "src").resolve())
-    if source_dir not in sys.path:
-        sys.path.insert(0, source_dir)
-    try:
-        # Warm the full scanner graph before Team runs; later source rewrites
-        # cannot replace the retained parent-process module objects.
-        from chat_secret_filter import filter_chat_secrets
-        try:
-            from secret_scanner import scan_and_redact as retained_scan_and_redact
-        except Exception:
-            # This is an optional detector dependency. The maintained curated
-            # fallback in chat_secret_filter remains valid when it is absent.
-            retained_scan_and_redact = None
-        warmup = filter_chat_secrets("Sutando Team result scanner warmup")
-        if not hasattr(warmup, "detected") or (
-            retained_scan_and_redact is not None
-            and not callable(retained_scan_and_redact)
-        ):
-            raise TypeError("invalid Team result scanner contract")
-    except Exception as exc:
-        raise RuntimeError("Team result secret scanner is unavailable") from exc
-    return filter_chat_secrets
-
-
-def _scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
-    if TEAM_RESULT_CONTROL.search(body):
-        raise TeamResultLeakError("result delivery control marker")
-    filter_chat_secrets = secret_filter or _load_team_result_scanner(repo)
-    try:
-        result = filter_chat_secrets(body)
-    except Exception as exc:
-        raise RuntimeError("Team result secret scan failed") from exc
-    if result.detected:
-        raise TeamResultLeakError(", ".join(result.secret_types))
-    return body
 
 
 def _run_team(runtime: str, prompt: str, repo: Path, workspace: Path) -> str:
