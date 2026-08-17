@@ -158,6 +158,31 @@ and loads whichever repo it reviews.
     a courtesy — and what makes `--delete-branch` on the parent dangerous while the child
     is open.
 
+12. **An unknown must not render as a value in the slot a measurement occupies.** When a
+    field can be absent, unreadable, or unmeasurable, printing a number there is worse
+    than printing nothing: the reader has no way to tell a measurement from a default, and
+    the plausible ones are never questioned. Ask of any patch that formats a quantity:
+    what does this print when the input is missing, zero-as-sentinel, or negative — and is
+    that distinguishable from a real reading? The fix is always the same shape: carry the
+    unknown (`None`) to the render site and say so there, rather than substituting a value
+    upstream.
+    *Grounded by:* five instances in one week, each found by a different reviewer and each
+    resolved identically. (a) #2991 — a negative age rendered `-0.2h ago`; impossible, but
+    it has the shape of a measurement, so nothing flags it. (b) #2994 — `age or 0.0`
+    collapsed an unknown claim age into `oldest 0.0h`, one line above a formatter that
+    cannot represent anything under 3.6 minutes anyway. (c) #3000 — a freshness guard
+    existed only on the *exhausted* branch, so the reassuring reading was stated as current
+    at any age; the guard sat where the author felt risk, and the branch without it was the
+    one that lied. (d) #3020 — `int(data.get("updated_at", 0) or 0)` made an absent
+    timestamp the whole unix epoch, printing `as of 1786962010s ago` (~56 years) on both
+    the warn line *and* the all-satisfied line, which is the one a reader is least likely
+    to question. (e) #3027 — `analyze_dev_activity` returned `None` for three distinct
+    conditions, only one documented, with `subprocess.TimeoutExpired` invisible inside a
+    generic `SubprocessError` handler; the same file already handled a sibling field
+    correctly (`if landed is None: # Cannot tell what landed, so do not use the word`).
+    The tell: the same expression supplies both the default and the measurement, usually as
+    `x or 0`, `.get(k, 0)`, or an `except` that returns the empty case.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
