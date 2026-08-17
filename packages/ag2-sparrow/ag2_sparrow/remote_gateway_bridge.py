@@ -1921,7 +1921,8 @@ def _write_task(task: dict) -> str | None:
         _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
         lines.extend(_skill)
     tmp = dest.with_suffix(".txt.tmp")
-    tmp.write_text("\n".join(lines) + "\n")
+    from .local_task_protocol import apply_task_stamper
+    tmp.write_text(apply_task_stamper("\n".join(lines) + "\n"))
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
     # #2274 parity: one task_processed per NEWLY queued task (idempotent early
