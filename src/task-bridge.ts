@@ -14,6 +14,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { claudeHomePath } from './util_paths.js';
+import { mayRetireSkipMarked } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
 	emitTaskProcessed,
@@ -250,6 +251,8 @@ export function _isVoiceTask(taskId: string): boolean {
 export function _shouldFallthrough(file: string): boolean {
 	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
 }
+
+
 
 /**
  * Whether a result file should REGISTER a row in the Task list — i.e. fire
@@ -889,7 +892,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
 				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor
 				// these via parse_markers(); task-bridge.ts must too (issue #1381).
-				if (file.startsWith('task-') && /^\s*\[(?:no-send|REPLIED)\]/i.test(result)) {
+				if (mayRetireSkipMarked(file, result, (id) => _pendingTasks.has(id))) {
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
