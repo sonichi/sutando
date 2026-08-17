@@ -28,8 +28,9 @@ import threading
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent.parent
-SRC = HERE.parent / "src" / "outbox.py"
+# CI runs tests from the repo root; derive it the way the sibling suites do.
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SRC = Path(_REPO) / "src" / "outbox.py"
 spec = importlib.util.spec_from_file_location("outbox_claim_machine_sut", SRC)
 ob = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = ob                      # dataclasses need the registry

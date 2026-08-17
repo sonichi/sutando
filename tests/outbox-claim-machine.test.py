@@ -85,9 +85,8 @@ class ClaimMachine(RuleBasedStateMachine):
 if __name__ == "__main__":
     examples = int(os.environ.get("CLAIM_MACHINE_EXAMPLES", "60"))
     steps = int(os.environ.get("CLAIM_MACHINE_STEPS", "40"))
-    # Example DB is opt-in (nightly sets it to keep failure traces as
-    # artifacts). Same-machine replay aid only — the deterministic frozen
-    # schedules carry cross-machine regression weight.
+    # Opt-in example DB (nightly): failure-trace artifacts; same-machine
+    # replay aid only — the frozen schedules carry regression weight.
     db = None
     db_dir = os.environ.get("CLAIM_MACHINE_DB")
     if db_dir:
