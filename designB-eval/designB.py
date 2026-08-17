@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mainsrc"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import outbox as ob  # reuse the ALIVE/DEAD/UNKNOWN process oracle  # noqa: E402
 
 READY, INFLIGHT, ARCHIVE, PARKED = "ready", "inflight", "archive", "undelivered"
