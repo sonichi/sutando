@@ -209,6 +209,10 @@ _PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
 # tids THIS process redelivered. Not a file: the collaborator path has full
 # workspace write, so any sidecar it can create is provenance it can forge.
 _REDELIVERED: "set[str]" = set()
+# Controls recovered after a restart emptied _REDELIVERED. Parked and counted,
+# never delivered: one alert, not one owner-visible result per recovered item.
+_PARKED_UNPROVENANCED: "set[str]" = set()
+_PARKED_ALERT_SENT = False
 try:  # pragma: no cover - exercised by whichever context imports it
     from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
 except ImportError:  # pragma: no cover - flat src/ import path
@@ -557,6 +561,27 @@ def _team_guard_fns():
     return guard_result_for_tier, resolve_access_tier
 
 
+def _is_redelivery_control(body: str) -> bool:
+    """Compare on stripped text: `read_ready_result` strips, the constant ends
+    in a newline, so a raw `==` never matches a body that came off disk."""
+    return (body or "").strip() == GATEWAY_REDELIVERY_RESULT.strip()
+
+
+def _park_unprovenanced_control(tid: str) -> None:
+    """Suppress a recovered redelivery control that lost its provenance.
+
+    Bounded by construction: the alert fires once per process, so N recovered
+    controls cost one line instead of N owner-visible results.
+    """
+    global _PARKED_ALERT_SENT
+    _PARKED_UNPROVENANCED.add(tid)
+    if not _PARKED_ALERT_SENT:
+        _PARKED_ALERT_SENT = True
+        _log(f"parked unprovenanced redelivery control {tid} — a restart cleared "
+             "this process's record. Delivering nothing; further ones are counted, "
+             "not alerted. Inspect _PARKED_UNPROVENANCED for the total.")
+
+
 def _guarded_result_body(tid: str, body: str):
     """Scan a non-owner result BEFORE any marker is interpreted.
 
@@ -568,7 +593,7 @@ def _guarded_result_body(tid: str, body: str):
     # this process's own record is, and it is consumed exactly once.
     if tid in _REDELIVERED:
         _REDELIVERED.discard(tid)
-        if body == GATEWAY_REDELIVERY_RESULT:
+        if _is_redelivery_control(body):
             return body, None
     try:
         guard, resolve = _team_guard_fns()
@@ -2517,10 +2542,18 @@ def _post_ready_results(inflight: set[str]) -> None:
             continue
         # Non-owner output is scanned BEFORE any marker is interpreted:
         # redirect/attach below are side effects on collaborator text.
+        # Captured BEFORE the guard: the guard rewrites the body, so afterwards
+        # a recovered control is indistinguishable from any other withheld text.
+        was_redelivery_control = _is_redelivery_control(body)
         body, _withheld = _guarded_result_body(tid, body)
         if body is None:
             _log(f"result guard unavailable for {tid} — leaving for retry")
             continue
+        if _withheld and was_redelivery_control:
+            # Substitute OUR constant, never the guard's notice: delivering the
+            # notice IS the flood. The skip path then closes the lease silently.
+            _park_unprovenanced_control(tid)
+            body, _withheld = GATEWAY_REDELIVERY_RESULT, None
         if _withheld:
             _log(f"withheld non-owner result for {tid}: {_withheld}")
         # Route marker decisions through the unified parser (#873) like the

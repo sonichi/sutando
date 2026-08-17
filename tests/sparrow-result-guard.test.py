@@ -30,9 +30,11 @@ def check(cond, label):
 
 # Absence must read as a failed contract, not a traceback: at the parent commit
 # the symbol is simply missing and a crash hides which guarantee was lost.
-for _sym in ("_guarded_result_body", "_team_guard_fns"):
+for _sym in ("_guarded_result_body", "_team_guard_fns",
+             "_is_redelivery_control", "_park_unprovenanced_control",
+             "_PARKED_UNPROVENANCED"):
     if not hasattr(m, _sym):
-        print(f"FAIL: gateway drain has no {_sym} — non-owner results are unguarded")
+        print(f"FAIL: gateway drain has no {_sym} — a guarantee below cannot be checked")
         fail = 1
 if fail:
     print("FAIL: sparrow result guard")
@@ -186,3 +188,78 @@ check("from .team_result_guard import" in bridge_src,
       "the bridge imports the guard as a SIBLING, not via a monorepo walk")
 check("REPO_ROOT_FOR_GUARD" not in bridge_src,
       "no monorepo-root resolution remains in the guard path")
+
+
+# The DRAIN path, which every test above bypasses: `read_ready_result` strips and
+# the constant ends in a newline, so handing the guard the constant skips that.
+check(m._is_redelivery_control(m.GATEWAY_REDELIVERY_RESULT),
+      "the control matches itself")
+check(m._is_redelivery_control(m.GATEWAY_REDELIVERY_RESULT.strip()),
+      "and STILL matches after read_ready_result strips it (the production shape)")
+check(not m._is_redelivery_control("[no-send] something else"),
+      "a different [no-send] body is not the control")
+
+
+def drain_once(tids, provenance=()):
+    """Run the real _post_ready_results over on-disk result files.
+
+    Returns (posted_bodies, parked, remaining_inflight).
+    """
+    td = tempfile.mkdtemp()
+    root = pathlib.Path(td)
+    tasks = root / "tasks"; tasks.mkdir()
+    results = root / "results"; results.mkdir()
+    m.TASKS_DIR = tasks
+    m.RESULTS_DIR = results
+    m.ARCHIVE_RESULTS_DIR = results / "archive"
+    m._REDELIVERED.clear()
+    m._PARKED_UNPROVENANCED.clear()
+    m._PARKED_ALERT_SENT = False
+    for tid in tids:
+        write_task(tasks, tid, "team")
+        (results / f"{tid}.txt").write_text(m.GATEWAY_REDELIVERY_RESULT)
+    for tid in provenance:
+        m._REDELIVERED.add(tid)
+
+    posted = []
+    real_req = m._req
+    m._req = lambda meth, path, payload=None, **kw: (
+        posted.append(payload) if path == "/v1/results" else None) or {}
+    try:
+        inflight = set(tids)
+        m._post_ready_results(inflight)
+        return posted, set(m._PARKED_UNPROVENANCED), inflight
+    finally:
+        m._req = real_req
+
+
+# The reviewer's P1: a restart empties _REDELIVERED, so recovered controls
+# arrive unprovenanced. Withholding is right; DELIVERING the notice is the flood.
+ids = [f"task-restart-{i}" for i in range(3)]
+posted, parked, inflight = drain_once(ids)
+leaks = [p for p in posted if "withheld" in (p or {}).get("body", "")]
+check(leaks == [],
+      f"3 recovered controls deliver ZERO owner-visible notices (got {len(leaks)})")
+check(len(posted) == 3 and all("[no-send]" in p["body"] for p in posted),
+      "each still POSTs our own [no-send] constant, so the server lease CLOSES "
+      "— parking must not trade a flood for a stuck lease")
+check(parked == set(ids),
+      "all three are parked, so the count is inspectable")
+check(inflight == set(),
+      "and each lease is retired rather than retried forever")
+check(m._PARKED_ALERT_SENT is True,
+      "exactly one alert fired for the batch, not one per item")
+
+# A real in-process redelivery still closes silently — the fix must not turn the
+# provenanced path into a park.
+posted2, parked2, inflight2 = drain_once(["task-real"], provenance=["task-real"])
+check(parked2 == set(),
+      "a provenanced redelivery is NOT parked — it takes the normal silent close")
+check(len(posted2) == 1 and "[no-send]" in posted2[0]["body"],
+      "and closes its lease with the control body, delivering nothing")
+check(inflight2 == set(), "and its lease is retired")
+
+if fail:
+    print("FAIL: sparrow result guard")
+    sys.exit(1)
+print("PASS: recovered redelivery controls are bounded, not flooded.")
