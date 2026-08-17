@@ -47,11 +47,12 @@ shape = re.search(r'fullmatch\(r"\\d\{17,20\}"', block) or re.search(r"\\d\{17,2
 check(shape is not None,
       "a Discord-id shape check exists in the proactive claim block")
 
-# The ordering IS the fix: a check after the int() cannot prevent the raise.
+# Ordering IS the fix: a check after owner resolution has already done work
+# for a file this bridge is not handling.
 gi = block.find(r"\d{17,20}")
-ii = block.find("int(_redirect_proactive.value)")
+ii = block.find("owner_id is None")
 check(gi != -1 and ii != -1 and gi < ii,
-      "the shape check runs BEFORE int(_redirect_proactive.value)")
+      "the shape check runs BEFORE owner resolution — a foreign file needs no owner")
 
 # The release must be reached by the foreign branch, not only by the empty-text
 # branch that already existed.
