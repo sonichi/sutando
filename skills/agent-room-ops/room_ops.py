@@ -38,6 +38,7 @@ import react as _react     # noqa: E402
 import join as _join       # noqa: E402
 import resolve as _resolve # noqa: E402
 import mention as _mention # noqa: E402
+import say as _say         # noqa: E402
 import rooms as _rooms     # noqa: E402
 import events as _events   # noqa: E402
 
@@ -168,6 +169,11 @@ def _main(argv):
     p.add_argument("room_id")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
+    p.add_argument("room_id")
+    p.add_argument("message")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
                                      "GRANTS access, overriding agents' local allowFrom (#429)")
     p.add_argument("room_id")
@@ -218,6 +224,8 @@ def _main(argv):
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
         res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid)
+    elif a.cmd == "say":
+        res = _say.say(a.message, a.room_id, a.agent_mxid)
     elif a.cmd == "grant":
         import grant as _grant
         try:
