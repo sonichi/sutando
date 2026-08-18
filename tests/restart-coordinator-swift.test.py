@@ -300,6 +300,16 @@ class TestRestartCoordinator(unittest.TestCase):
         self.assertEqual(len(set(documented)), 4, f"statuses share a message: {documented}")
         self.assertIn("Core restarted", msgs["0"])
 
+    def test_exit_4_does_not_blame_a_dry_run_for_the_lock(self):
+        """The shell path releases the lock on every exit, dry runs included. An
+        exit-4 message naming --dry-run as the holder sends debugging the wrong way,
+        and nothing pinned that string, which is how it went stale unnoticed."""
+        msgs = dict(line.split("=", 1) for line in self.run_scenario("outcome-messages"))
+        self.assertNotIn("--dry-run", msgs["4"],
+                         f"exit 4 blames a dry run for a lock dry runs release: {msgs['4']}")
+        self.assertIn("crashed run", msgs["4"],
+                      f"exit 4 must name the real holder (a crashed run): {msgs['4']}")
+
     def test_cancel_and_unknown_stay_with_the_caller(self):
         # nil means "caller decides": 143 is a silent intended cancel, and an
         # undocumented status needs the stderr preview the mapping cannot see.
