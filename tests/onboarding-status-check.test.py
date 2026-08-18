@@ -89,5 +89,48 @@ class OnboardingStatusCheckTest(unittest.TestCase):
         self.assertIn("unreadable", out["detail"])
 
 
+    def test_a_non_string_detail_warns_rather_than_raising(self):
+        """The Console (a separate repo) writes this file, which is why every
+        other shape here is guarded. `AttributeError` is not in the except tuple
+        and the call site has ZERO enclosing try blocks, so a raise here loses
+        every other check's result — one bad optional field becomes an outage."""
+        for bad in (3, {"a": 1}, ["x"], True):
+            self._with_workspace(
+                {"updated_at": 0, "rows": {"gateway": {"state": "todo", "detail": bad}}}
+            )
+            out = hc.check_onboarding_status()
+            self.assertEqual(out["status"], "warn", f"detail={bad!r}: {out}")
+            self.assertIn("gateway", out["detail"])
+
+    def test_a_verbose_detail_is_clamped(self):
+        """One chatty row must not dominate the line the owner scans."""
+        self._with_workspace(
+            {"updated_at": 0, "rows": {"gateway": {"state": "todo", "detail": "z" * 400}}}
+        )
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "warn")
+        self.assertNotIn("z" * 200, out["detail"])
+        self.assertIn("z" * 120, out["detail"])
+
+    def test_a_todo_row_carries_its_own_detail(self):
+        """`gateway` alone cannot distinguish "not running" from a reconnect —
+        the writer populates `detail` to say which, and it was being dropped."""
+        self._with_workspace(
+            {
+                "updated_at": 0,
+                "rows": {
+                    "gateway": {"state": "todo",
+                                "detail": "gateway process up, relay not connected"},
+                    "core": {"state": "todo"},
+                },
+            }
+        )
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("gateway (gateway process up, relay not connected)", out["detail"])
+        # A row with no detail still renders as the bare name.
+        self.assertIn("core", out["detail"])
+        self.assertNotIn("core (", out["detail"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
