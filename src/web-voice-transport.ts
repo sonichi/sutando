@@ -888,6 +888,14 @@ export class VoiceTransport {
     return true;
   }
 
+  /** Send a surface-owned protocol command (e.g. voice.retryUpstream), JSON-
+   *  serialized onto the open socket; false when no socket is open. */
+  sendClientCommand(msg: { type: string }): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(msg));
+    return true;
+  }
+
   /**
    * User-initiated teardown of mic + WS + playback + audio graph. Idempotent.
    *

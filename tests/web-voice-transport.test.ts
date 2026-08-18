@@ -1290,6 +1290,45 @@ describe('transport public API additions (Steps 15/16/18)', () => {
 		h.t.disconnect();
 	});
 
+	it('sendClientCommand: false when not open, JSON-serialized frame when live', async () => {
+		// A NAMED command interface (no index signature) must assign — the
+		// parameter is constrained on `type`, not on Record<string, unknown>.
+		interface RetryUpstreamCmd {
+			type: 'voice.retryUpstream';
+			version: 1;
+			voiceSessionId: string;
+			clientEpoch: number;
+			stalledAttemptEpoch: number;
+			requestId: string;
+		}
+		const h = harness();
+		const probe: RetryUpstreamCmd = {
+			type: 'voice.retryUpstream',
+			version: 1,
+			voiceSessionId: 'vs_0',
+			clientEpoch: 0,
+			stalledAttemptEpoch: 1,
+			requestId: 'req-0',
+		};
+		assert.equal(h.t.sendClientCommand(probe), false);
+		const s = await goLive(h);
+		const before = s.sent.length;
+		const msg: RetryUpstreamCmd = {
+			type: 'voice.retryUpstream',
+			version: 1,
+			voiceSessionId: 'vs_1',
+			clientEpoch: 2,
+			stalledAttemptEpoch: 7,
+			requestId: 'req-1',
+		};
+		assert.equal(h.t.sendClientCommand(msg), true);
+		const sent = s.sent[s.sent.length - 1];
+		assert.equal(typeof sent, 'string');
+		assert.deepEqual(JSON.parse(sent as string), msg);
+		assert.equal(s.sent.length, before + 1);
+		h.t.disconnect();
+	});
+
 	it('setPlaybackRate drives subsequent playback scheduling', async () => {
 		const h = harness();
 		const s = await goLive(h);
