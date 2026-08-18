@@ -205,6 +205,34 @@ and loads whichever repo it reviews.
     The tell: the same expression supplies both the default and the measurement, usually as
     `x or 0`, `.get(k, 0)`, or an `except` that returns the empty case.
 
+14. **Never assert on source text as a stand-in for a behavioral claim.** When a module
+    cannot be imported by tests (import-time side effects, heavy SDK deps), extract the
+    decision into an importable unit and test THAT — do not regex the file. A source-text
+    assertion fails in both directions: it stays green when the behavior is disabled
+    outright (guard the call with `if (false && …)` and every token the regex matches is
+    still present), and it goes red on a rename that changes nothing. Worked examples of
+    the extraction convention already in-tree: `src/channel_token.py` (token-resolution
+    policy extracted from four script consumers, tested behaviorally) and
+    `src/result_markers.py` (marker grammar extracted from per-bridge private parsers,
+    driven behaviorally by the bridge-marker-no-leak and dedup suites). When only content emitted verbatim is being pinned (an
+    instruction template, a doc line), say so explicitly — that is a data pin, and it
+    must be labeled as one, not passed off as a behavior test.
+    Second exception: a source assertion is legitimate when the property is *structural*
+    — a policy must not be duplicated, a path literal must not appear — because behavior
+    cannot observe a duplicate that currently agrees (two copies in sync pass every
+    behavioral test; the defect IS the duplication). This covers negative scans (no
+    private parser, no `json.loads` in an adapter) and positive delegation pins (the
+    adapter calls the shared owner — the form CLAUDE.md's "pin every adapter's
+    delegation" already mandates), and it is what this file's own `checks:` block does.
+    Pair it with the behavioral test of the extracted unit; never let it substitute
+    for one.
+    *Grounded by:* three independent instances across unrelated subsystems in one evening
+    (2026-08-18) — the #3088 scroll-reporting test asserted on `browser-tools.ts` source
+    text, and disabling the fix outright left its suite 5/5 green (verified via the
+    if-false control during review); the same construct had just been found blocking a
+    team-guard follow-up and in one earlier review the same night. Three authors, one
+    evening: a missing convention, not a personal habit. (Lesson: air + 001.)
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
