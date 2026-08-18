@@ -317,6 +317,21 @@ class TestReviewFindings(unittest.TestCase):
         self.assertLess(len(body), self.m.BODY_MAX,
                         f"three maximal names must still fit, got {len(body)}: {body}")
 
+    def test_f5_no_room_for_names_drops_them_rather_than_slicing_backwards(self):
+        """A budget too small for the prefix must yield no names, not a negative
+        slice: `joined[:room - 1]` at room==0 is `[:-1]`, which silently eats a char."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        original = self.m.BODY_MAX
+        try:
+            self.m.BODY_MAX = 20            # smaller than the prefix + overflow alone
+            self.m.notify_macos(26, [("q" * 60) + f"-{i}" for i in range(26)])
+        finally:
+            self.m.BODY_MAX = original
+        body = _notification_body(sent[0])
+        self.assertNotIn("qqq", body, "no name may survive a budget that cannot hold one")
+        self.assertIn("(+23 more)", body, "the count and overflow are never dropped")
+
     def test_d_written_name_matches_the_scanned_prefix(self):
         """Writer and detector must agree, or the check silently never fires."""
         src = (REPO / "src" / "check-pending-questions.py").read_text()
