@@ -128,6 +128,21 @@ def main() -> int:
     for p in paths:
         os.unlink(p)
 
+    # 5b. The retired multipart path's 30s timeout survives the migration
+    #     (the client defaults to 15; review finding on #3094).
+    real = dmr._client
+    try:
+        del dmr.__dict__["_client"]
+    except KeyError:
+        pass
+    import importlib
+    spec2 = importlib.util.spec_from_file_location("dmr_p2", SRC / "dm-result.py")
+    fresh = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(fresh)
+    check("production _client preserves the 30s upload timeout",
+          fresh._client("tok")._timeout == 30)
+    dmr._client = real
+
     # 6. The private transport is gone (no raw urllib Discord API wrapper).
     body = (SRC / "dm-result.py").read_text()
     check("no private _discord_api remains", "_discord_api" not in body)
