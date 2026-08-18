@@ -34,8 +34,12 @@ class TestDelegation(unittest.TestCase):
     def test_both_quarantine_sites_consult_the_policy(self):
         # The approval site keeps its own file (the marker IS the obligation) but must
         # still take the CAP from the policy, or it is an unbounded 3s hot loop.
-        self.assertIn("send_failure_policy.resolve_failed_send", BRIDGE)
+        # The proactive site consults it through the fence (5b), whose own
+        # consult is pinned below and behaviorally by its unit suite.
+        self.assertIn("_proactive_fence().fail", BRIDGE)
         self.assertIn("send_failure_policy.should_retry", BRIDGE)
+        fence = (REPO / "src" / "proactive_claim_fence.py").read_text()
+        self.assertIn("decide_failed_send(", fence)
 
     def test_no_site_retries_without_a_cap(self):
         # `is_transient` alone answers "could a retry work", never "how many times".
@@ -61,8 +65,8 @@ class TestDelegation(unittest.TestCase):
         # rename-to-undelivered, which is how the two copies drifted apart.
         window = BRIDGE.split("failed to DM", 1)[1][:1400]
         self.assertNotIn('/ "undelivered"', window,
-                         "the file move belongs to resolve_failed_send")
-        self.assertIn("resolve_failed_send", window)
+                         "the file move belongs to the fence executor")
+        self.assertIn("_proactive_fence().fail", window)
         self.assertIn("continue", window)
 
     def test_the_policy_module_owns_the_move(self):

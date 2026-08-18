@@ -121,11 +121,10 @@ from util_paths import channel_access_path, claude_home_path, personal_path, sha
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
 import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
 
-# Transient send failures per result body, keyed by its `.txt` name. In-memory on
-# purpose: a bridge restart re-polls the file anyway, so a fresh count is correct.
+# poll_approved's transient counter only. The proactive leg's attempts are
+# durable in the fence's outbox (5b); this stays in-memory for the marker leg.
 _transient_send_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
@@ -2543,8 +2542,9 @@ async def list_channel_members(channel_id: int) -> list[dict]:
 
 
 def _recover_orphan_sending_files() -> int:
-    """Recover this adapter's stranded proactive delivery claims."""
-    return recover_orphan_sending_files(RESULTS_DIR)
+    """Recover this adapter's stranded proactive delivery claims.
+    Via the fence: backend recover (dead-incarnation re-arm) + file sweep."""
+    return _proactive_fence().recover()
 
 
 # Guards the once-only startup of the long-lived poll loops below. `on_ready`
@@ -5130,6 +5130,23 @@ def _proactive_provider():
     return _PROACTIVE_PROVIDER
 
 
+_PROACTIVE_FENCE = None
+
+
+def _proactive_fence():
+    """Claim fence for the proactive leg (5b): outbox-backed lifecycle.
+    Lazy like the provider; the root is RESULTS_DIR-scoped so tests binding
+    RESULTS_DIR get a hermetic outbox for free."""
+    global _PROACTIVE_FENCE
+    if _PROACTIVE_FENCE is None:
+        from proactive_claim_fence import ProactiveClaimFence
+        from ag2_sparrow.delivery_core import DesignAClaimBackend
+        _PROACTIVE_FENCE = ProactiveClaimFence(
+            DesignAClaimBackend(RESULTS_DIR / ".outbox-discord-proactive"),
+            RESULTS_DIR, worker="discord-proactive")
+    return _PROACTIVE_FENCE
+
+
 async def poll_proactive():
     """Poll results/ for proactive messages and send to owner's DM.
 
@@ -5181,15 +5198,15 @@ async def poll_proactive():
                     # had no exclusive claim. Rename is atomic on POSIX
                     # same-filesystem; FileNotFoundError from the rename
                     # means another iteration already claimed it.
-                    claim = f.with_suffix(".sending")
-                    try:
-                        f.rename(claim)
-                    except FileNotFoundError:
+                    # 5b fence: file move keeps peers' globs blind; the
+                    # outbox record makes attempts durable across restarts.
+                    claim = _proactive_fence().claim(f)
+                    if claim is None:
                         continue
                     f = claim  # subsequent reads + unlink operate on the claim path
                     text = read_ready_result(f)
                     if text is None:
-                        release_claim(f)
+                        _proactive_fence().release(f)
                         continue
                     # Parse ONCE, here, and reuse below: a second grammar would
                     # miss what parse_markers peels (D7 `**[core: N]**` headers).
@@ -5201,7 +5218,7 @@ async def poll_proactive():
                         print(f"  [proactive] {f.name} targets "
                               f"{str(_early_redirect.value).strip()!r} — not a Discord "
                               f"channel id; releasing for its own bridge", flush=True)
-                        release_claim(f)
+                        _proactive_fence().release(f)
                         continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
@@ -5238,7 +5255,7 @@ async def poll_proactive():
                                 continue
                     if owner_id is None:
                         print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
-                        f.unlink(missing_ok=True)
+                        _proactive_fence().drop(f, "no human user in allowFrom")
                         continue
                     # Bound BEFORE the try: the handler reads it, so a failure in
                     # fetch_user/create_dm would raise UnboundLocalError instead.
@@ -5327,7 +5344,7 @@ async def poll_proactive():
                                         f"to channel {_target_id}",
                                         flush=True,
                                     )
-                                    f.unlink(missing_ok=True)
+                                    _proactive_fence().confirm(f)
                                     continue
                                 except Exception as _exc:
                                     print(
@@ -5369,15 +5386,14 @@ async def poll_proactive():
                                 _sent_any = True  # pragma: no cover
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
-                        f.unlink(missing_ok=True)
+                        _proactive_fence().confirm(f)
                     except Exception as e:  # pragma: no cover — live send path
                         # Quarantine rather than retry, and ONLY for a failure a retry cannot fix: a
                         # 413 never becomes a 200, a 503 does on the very next poll.
                         print(f"  [proactive] failed to DM {owner_id}: {e}")  # pragma: no cover — live send path
-                        # Glue only: the decision AND the file move are one unit in
-                        # send_failure_policy.resolve_failed_send.
-                        _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
-                            f, e, _transient_send_attempts,
+                        # decide_failed_send decides; the fence moves + records.
+                        _outcome = _proactive_fence().fail(  # pragma: no cover
+                            f, e,
                             progressed=_sent_any or bool(getattr(e, "sent_chunks", 0)))
                         print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover
                               f"{f.with_suffix('.txt').name}", flush=True)
