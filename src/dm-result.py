@@ -273,9 +273,21 @@ def send_dm(text: str) -> bool:
     for batch_start in range(0, len(sendable_files), DISCORD_FILES_PER_MESSAGE):
         batch = sendable_files[batch_start : batch_start + DISCORD_FILES_PER_MESSAGE]
         blobs = []
-        for fpath in batch:
-            with open(fpath, "rb") as fh:
-                blobs.append((os.path.basename(fpath), fh.read()))
+        try:
+            for fpath in batch:
+                with open(fpath, "rb") as fh:
+                    blobs.append((os.path.basename(fpath), fh.read()))
+        except OSError as e:
+            # Allowlisted files can vanish between the check and this read.
+            print(
+                f"dm-result: file batch "
+                f"{batch_start // DISCORD_FILES_PER_MESSAGE + 1} "
+                f"unreadable before upload ({e.__class__.__name__}: "
+                f"{os.path.basename(str(getattr(e, 'filename', '') or '?'))})"
+                f" — aborting",
+                file=sys.stderr,
+            )
+            return False
         receipt = client.upload_files(channel_id, {"content": ""}, blobs)
         if receipt.outcome is not DeliveryOutcome.CONFIRMED:
             print(
