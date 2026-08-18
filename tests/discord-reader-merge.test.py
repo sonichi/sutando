@@ -81,6 +81,27 @@ def main() -> int:
     rc = dr.main(["999", "--serving", "111"])
     check("--serving allow -> proceeds to fetch", rc == 0 and fetched == [1])
 
+    # 1b. The boundary is NOT optional: a bare read refuses (exit 3, nothing
+    #     fetched) even under an always-blocking policy that is never consulted.
+    dr.discord_context_policy = _BlockingPolicy()
+    fetched.clear()
+    rc = dr.main(["999"])
+    check("bare read -> exit 3 (serving-or-operator required)", rc == 3)
+    check("bare read -> NOTHING fetched", fetched == [])
+    rc = dr.main(["999", "--operator"])
+    check("--operator: explicit privileged fetch, gate not consulted",
+          rc == 0 and fetched == [1])
+
+    # 1c. Production callers are wired: the bridge's emitted instruction and
+    #     the repo skill doc both pass --serving. (Template/doc text is the
+    #     DATA those surfaces emit — this pins content, not behavior spelling.)
+    bridge_src = (SRC / "discord-bridge.py").read_text()
+    check("bridge instruction passes --serving",
+          "src/discord-read.py {channel_id_str} --serving {channel_id_str}" in bridge_src)
+    skill = (REPO / "skills" / "context-reconstruct" / "SKILL.md").read_text()
+    check("context-reconstruct doc passes --serving",
+          "--serving <task channel_id>" in skill)
+
     # 2. Gated reader renders forwards via the shared renderer (was blank).
     rdc._api_get = lambda path, token: [FORWARD_MSG]
     out = rdc.fetch_messages("999", 1, "tok")
