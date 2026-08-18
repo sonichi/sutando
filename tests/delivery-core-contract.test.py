@@ -25,6 +25,7 @@ from ag2_sparrow.delivery_core import (  # noqa: E402
     BackendCapabilities, ClaimToken, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
     DesignAClaimBackend, DrainStatus, ProviderCapabilities,
     ProviderIndeterminate, ProviderRefused, RetryPolicy, idempotency_key)
+from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend  # noqa: E402
 
 ITEM = "room-evt-1"
 
@@ -33,8 +34,13 @@ def _a_backend(tmp: Path):
     return DesignAClaimBackend(tmp)
 
 
+def _c_backend(tmp: Path):
+    return DesignCClaimBackend(tmp)
+
+
 BACKENDS = {
     "A": _a_backend,
+    "C": _c_backend,
     # "B": Phase-4 plug-in (exp/design-b-eval driver shape)
     # "discord-legacy": Phase-3 adapter over rename claim + sentinels
 }
