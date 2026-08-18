@@ -147,6 +147,8 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
+from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
@@ -202,6 +204,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
 
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
@@ -2857,6 +2860,10 @@ def _write_task_file(task_file: Path, content, username: str,
     try:
         if callable(content):
             content = content()
+        try:
+            content = stamp_text(content)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception as _tw_exc:
         print(f"  [task-write] FAILED for @{username} in #{channel_name} "
@@ -3937,27 +3944,8 @@ async def _handle_discord_message(message, force=False):
     # review. Removed in favor of skipping the task-file write entirely.)
     tier_instructions = {
         "owner": "",
-        "team-collaborator": (
-            "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            "This task is from a designated COLLABORATOR in this channel (a team-tier sender the owner "
-            "has listed under this channel's `collaborators`). Engage substantively — do NOT sandbox "
-            "them via codex and do NOT default to NO-REPLY the way a plain team task is handled.\n\n"
-            "DO:\n"
-            "- Reply in-channel: write your response to results/task-{id}.txt (delivered back to this channel).\n"
-            "- Treat their message as collaborative input from a working peer within this channel's scope — "
-            "discuss, draft, and iterate on copy / design / analysis, and fold their contributions into the "
-            "shared work. Do not silently archive a substantive contribution.\n\n"
-            "DO NOT (authority boundary — unchanged from team tier):\n"
-            "- Take any irreversible or system-mutating action on their say-so: no git commit / push / merge, "
-            "no deleting or overwriting files, no sending to other channels or external services (email, "
-            "posts, DMs), no financial actions, no config / credential changes, no restarts. Those still "
-            "require the OWNER.\n"
-            "- If they ask for such an action, engage on the substance and prepare it if useful, but route "
-            "the go/no-go to the owner (say so in-channel) rather than executing it yourself.\n"
-            "- Never read .env, credentials, or secrets.\n\n"
-            "Scope: collaborator status is per-channel only — it grants engagement HERE, not owner authority "
-            "anywhere else.\n"
-            "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        "team-collaborator": engage_rulebook(
+            "channel", DISCORD_PROVENANCE, "results/task-{id}.txt"
         ),
         "team": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
@@ -4680,6 +4668,16 @@ async def poll_results():
                 # re-fire infinitely on the leftover task. Observed 2026-04-17:
                 # `[no-send]` tasks persisted in tasks/ because `continue`
                 # skipped the cleanup block at the bottom of this loop.
+                # Non-owner results are scanned before ANY marker below. The tier
+                # map dies on restart, so unknown is re-read from the task file.
+                _guard_tier = _task_tier
+                if _guard_tier == "unknown":
+                    _guard_tf = find_task_file(TASKS_DIR, task_id)
+                    _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
+                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO)
+                if _withheld:
+                    print(f"  [team-guard] withheld result for {task_id} "
+                          f"(tier={_guard_tier}): {_withheld}", flush=True)
                 _parsed = parse_markers(reply_text)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
@@ -4777,25 +4775,10 @@ async def poll_results():
                     reply_to_id = int(reply_match.group(1)) if reply_match else None
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
-                    # Auto-thread: if the agent didn't pick an explicit
-                    # [reply: <id>], default to the triggering message so the
-                    # reply appears quoted under what it's answering. Skip
-                    # when the channel is already a Discord thread — thread
-                    # context anchors the reply implicitly, no extra quote
-                    # needed.
-                    #
-                    # getattr instead of bare `discord.Thread` so the
-                    # test-stub discord module (tests/discord-bridge-*.test.py)
-                    # — which intentionally omits Thread to keep the stub
-                    # surface small — doesn't AttributeError here. Production
-                    # discord.py always provides Thread; the getattr fallback
-                    # only matters under test, where treating "no Thread
-                    # class" as "channel isn't a thread" is correct.
+                    # Default to quoting the triggering message. Threads too:
+                    # interleaved exchanges make position stop identifying it.
                     if reply_to_id is None:
-                        _thread_cls = getattr(discord, 'Thread', None)
-                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
-                        if not is_thread:
-                            reply_to_id = source_message_anchor
+                        reply_to_id = source_message_anchor
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different
@@ -5195,6 +5178,18 @@ async def poll_proactive():
                     if text is None:
                         release_claim(f)
                         continue
+                    # Parse ONCE, here, and reuse below: a second grammar would
+                    # miss what parse_markers peels (D7 `**[core: N]**` headers).
+                    _pp = parse_markers(text)
+                    _early_redirect = next(
+                        (a for a in _pp.actions if a.kind == "redirect"), None)
+                    if _early_redirect is not None and not re.fullmatch(
+                            r"\d{17,20}", str(_early_redirect.value).strip()):
+                        print(f"  [proactive] {f.name} targets "
+                              f"{str(_early_redirect.value).strip()!r} — not a Discord "
+                              f"channel id; releasing for its own bridge", flush=True)
+                        release_claim(f)
+                        continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
                     # workspace `state/discord-config.json` (Sutando's owned config
@@ -5241,7 +5236,8 @@ async def poll_proactive():
                         # Parse protocol markers (skip / redirect / attach).
                         # parse_markers strips all markers from .body and
                         # surfaces them as typed actions — no hand-rolled regex.
-                        _pp = parse_markers(text)
+                        # already parsed once, above the owner work
+
                         clean_text = _pp.body
                         files = [a.value for a in _pp.actions if a.kind == "attach"]
 
@@ -5744,7 +5740,23 @@ async def poll_dm_fallback():
         await asyncio.sleep(30)
 
 
-def _send_via_rest(channel_id: str, message: str):
+def _parse_send_argv(argv):
+    """Split `send`'s post-channel argv into (reply_to, body_argv).
+
+    `--reply-to <id>` threads the post onto an existing message, giving the CLI
+    the reach the results path already has by default. Leading position only, so
+    a body word that happens to read `--reply-to` cannot be eaten mid-text.
+    """
+    reply_to = ""
+    if len(argv) >= 2 and argv[0] == "--reply-to":
+        reply_to, argv = argv[1], argv[2:]
+    if not argv:
+        raise SystemExit("usage: discord-bridge.py send <channel_id> "
+                         "[--reply-to <message_id>] <body|--body-file PATH>")
+    return reply_to, argv
+
+
+def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
     """Send a message via Discord REST API (no gateway connection).
 
     Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
@@ -5764,16 +5776,67 @@ def _send_via_rest(channel_id: str, message: str):
         # Empty message — nothing to send. Treat as no-op rather than error.
         return
     for i, chunk in enumerate(chunks, 1):
-        data = json.dumps({"content": chunk}).encode()
+        payload = {"content": chunk}
+        # First chunk only: on every chunk it renders N reply-headers for one
+        # answer. fail_if_not_exists=False -> deleted target degrades to plain.
+        if reply_to and i == 1:
+            payload["message_reference"] = {"message_id": str(reply_to),
+                                            "fail_if_not_exists": False}
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
+        # Transport only: once urlopen returns, the message is committed, so
+        # read() belongs below. Not a `with` — doubles are plain objects.
         try:
-            urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
             sys.exit(1)
+        # Best-effort, and emitted per chunk: buffering until every chunk lands
+        # leaves an earlier delivered chunk unaddressable when a later one fails.
+        try:
+            body = json.loads(resp.read().decode())
+            mid = body.get("id") if isinstance(body, dict) else None
+            mid = str(mid) if isinstance(mid, (str, int)) and str(mid) else None
+        except Exception:
+            mid = None
+        if mid:
+            print(f"message_id {mid}")
+        else:
+            print(f"message_id unavailable (chunk {i}/{len(chunks)}) — sent, not addressable")
     suffix = "..." if len(message) > 80 else ""
     chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
     print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
+
+
+def _edit_via_rest(channel_id: str, message_id: str, message: str):
+    """Replace an already-sent message's content via Discord REST PATCH.
+
+    Refuses a body the chunker would split: an edit addresses ONE message, so a
+    multi-chunk body cannot be applied without silently dropping the remainder.
+    """
+    import urllib.request
+    if not message.strip():
+        print("ERROR: refusing to edit to an empty body")
+        sys.exit(1)
+    if len(list(_chunk_for_discord_unbounded(message))) > 1:
+        # Derived from the chunker, not a second copy of its limit.
+        print(f"ERROR: body is {len(message)} chars — too long for one message. "
+              "An edit cannot chunk; shorten it or send a new message.")
+        sys.exit(1)
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
+    data = json.dumps({"content": message}).encode()
+    req = urllib.request.Request(url, data=data, method="PATCH", headers={
+        "Authorization": f"Bot {TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "DiscordBot (sutando, 1.0)",
+    })
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"Edit failed: {e}")
+        sys.exit(1)
+    suffix = "..." if len(message) > 80 else ""
+    print(f"Edited {channel_id}/{message_id}: {message[:80]}{suffix}")
 
 
 from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402  — shared owner of the --body-file bounds
@@ -5796,7 +5859,15 @@ def _send_cli_body(argv: list) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
-        _send_via_rest(sys.argv[2], _send_cli_body(sys.argv[3:]))
+        reply_to, body_argv = _parse_send_argv(sys.argv[3:])
+        _send_via_rest(sys.argv[2], _send_cli_body(body_argv), reply_to)
+    elif sys.argv[1:2] == ["edit"]:
+        # Arity is checked here rather than by the `>= 5` guard the send branch
+        # uses: falling through on a short `edit` would boot the whole bridge.
+        if len(sys.argv) < 5:
+            raise SystemExit("usage: discord-bridge.py edit <channel_id> <message_id> "
+                             "<body|--body-file PATH>")
+        _edit_via_rest(sys.argv[2], sys.argv[3], _send_cli_body(sys.argv[4:]))
     else:
         _single_instance_acquire("discord-bridge")
         client.run(TOKEN, log_handler=None)

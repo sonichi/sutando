@@ -56,7 +56,8 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 import local_task_protocol  # noqa: E402
-from result_markers import parse_markers  # noqa: E402
+from result_markers import parse_markers
+from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -407,14 +408,17 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     parsed = parse_markers(text)
     files = [a.value for a in parsed.actions if a.kind == "attach"]
     clean_text = parsed.body
-    text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
+    # Fence-aware chunks via the shared chunker — naive [i:i+4000] slicing tore
+    # code fences at the boundary and re-declared policy discord/slack share.
+    chunks = chunk_plain_text(clean_text, 4000) if clean_text else []
+    text_chunks = len(chunks)
     delivered_ok = True
     files_sent = 0
 
     # Send text (if any remains after extracting file refs)
     if clean_text:
-        for i in range(0, len(clean_text), 4000):
-            resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+        for piece in chunks:
+            resp = api("sendMessage", chat_id=chat_id, text=piece)
             if not (isinstance(resp, dict) and resp.get("ok")):
                 delivered_ok = False
         try:
@@ -940,7 +944,7 @@ def main():  # pragma: no cover
                 # body copy while these authentic ones pass through.
                 media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
                     attachment_refs, bool(text and text.strip()))
-                task_file.write_text(
+                _task_content = (
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                     f"source: telegram\n"
@@ -954,6 +958,14 @@ def main():  # pragma: no cover
                     f"{tg_skill_hints}"
                     f"{secret_notice}"
                 )
+                # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+                # fail-open so a stamping error costs the stamp and never the task.
+                try:
+                    from task_envelope import stamp_text  # sibling (src/ on sys.path)
+                    _task_content = stamp_text(_task_content, REPO)
+                except Exception:
+                    pass
+                task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 # Observability: one inbound accepted-message event. Source the

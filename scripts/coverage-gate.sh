@@ -130,6 +130,9 @@ if [ "${#fully_skipped[@]}" -gt 0 ]; then
     echo "coverage-gate: but a fully-skipped file is not a passing file. Verify that is intended."
 fi
 if [ "$failed" -ne 0 ]; then
+    # A suite that fails here but passes locally is usually an environment gap.
+    # /bin/bash is what the watcher suites spawn, so name it rather than $SHELL.
+    echo "coverage-gate: env — $(/bin/bash --version | head -1) · $(python3 -V 2>&1) · $(uname -sr)" >&2
     publish_summary "❌ **Test suite failed under instrumentation** — coverage not measurable. See the job log."
     echo "coverage-gate: suite must be green before coverage is meaningful." >&2
     exit 1
@@ -179,7 +182,7 @@ if unmeasured="$(python3 scripts/coverage_unmeasured.py "$BASE" coverage.xml)" \
         echo "Changed, but absent from \`coverage.xml\` — outside \`[run] source\` in"
         echo "\`.coveragerc\`, so **diff-cover never examined these lines**:"
         echo
-        printf '-   `%s`\n' $unmeasured
+        printf -- '-   `%s`\n' $unmeasured
     } > coverage-gate-report.md
     report="coverage-gate-report.md"
 fi

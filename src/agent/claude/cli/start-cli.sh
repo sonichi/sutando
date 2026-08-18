@@ -49,7 +49,7 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 # A tmux server inherits its GLOBAL environment from whichever process starts it,
 # and `start-server` on a serverless socket is a no-op — so unset before any tmux.
 unset SUTANDO_CORE_MODEL
-SESSION="sutando-core"
+SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 
 # Marker identifying THIS process as the long-lived sutando-core session (as
 # opposed to an ad-hoc `claude` in the same checkout — PR review, codex, etc.).
@@ -62,6 +62,8 @@ SESSION="sutando-core"
 export SUTANDO_CORE_SESSION=1
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
+[ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
+[ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
