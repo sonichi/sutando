@@ -889,10 +889,17 @@ export class VoiceTransport {
   }
 
   /** Send a surface-owned protocol command (e.g. voice.retryUpstream), JSON-
-   *  serialized onto the open socket; false when no socket is open. */
+   *  serialized onto the open socket; false when no socket is open or the
+   *  frame did not go out. */
   sendClientCommand(msg: { type: string }): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify(msg));
+    try {
+      this.ws.send(JSON.stringify(msg));
+    } catch {
+      // readyState is sampled a statement earlier; a close landing in that
+      // window throws, and callers read false — not a throw — as "not sent".
+      return false;
+    }
     return true;
   }
 
