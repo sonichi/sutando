@@ -1111,7 +1111,10 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 				if (!buf) return respond(413, { status: 'failed', error: 'frame body too large' });
 				const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
 				const r = submitFrame(buf, mime);
-				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
+				// The 409 carries stoppedReason so the client can distinguish a
+				// terminal stop from a lost flag without awaiting the 2s poll.
+				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409,
+					r.ok ? { status: 'sent' } : { status: 'failed', error: r.error, stoppedReason: lastStopReason });
 			});
 			return;
 		}
