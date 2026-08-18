@@ -145,6 +145,55 @@ def main() -> int:
     finally:
         drc.request_json = real
 
+    # Coverage for the read/control wrappers and the default transport —
+    # the seam-injected tests above never execute them.
+    real = drc.request_json
+    calls = []
+    def _rj2(req, timeout=None):
+        calls.append(req.full_url)
+        return {"id": "77"}
+    drc.request_json = _rj2
+    try:
+        c = drc.DiscordRestClient("tok")
+        c.get_user("9")
+        c.list_messages("5", limit=2)
+        dm_id = c.create_dm_channel("42")
+        check("get_user/list_messages hit their paths",
+              "/users/9" in calls[0] and "/channels/5/messages?limit=2" in calls[1])
+        check("create_dm_channel returns the id as str", dm_id == "77")
+        drc.request_json = lambda req, timeout=None: {}
+        check("create_dm_channel without id returns None",
+              drc.DiscordRestClient("tok").create_dm_channel("42") is None)
+    finally:
+        drc.request_json = real
+
+    class _Resp:
+        def __init__(self, body, status=200):
+            self._b, self.status = body, status
+        def read(self):
+            return self._b
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    real_open = drc.urllib.request.urlopen
+    try:
+        drc.urllib.request.urlopen = lambda req, timeout=None: _Resp(b'{"ok": 1}')
+        check("_default_transport parses JSON",
+              drc._default_transport(object(), 5) == (200, {"ok": 1}))
+        drc.urllib.request.urlopen = lambda req, timeout=None: _Resp(b"plain text")
+        check("_default_transport falls back to raw text",
+              drc._default_transport(object(), 5) == (200, "plain text"))
+    finally:
+        drc.urllib.request.urlopen = real_open
+
+    def _raise_httperror(req, timeout):
+        raise urllib.error.HTTPError(
+            "https://discord.com/x", 403, "err", {}, io.BytesIO(b"not json {"))
+    r = drc.DiscordRestClient("tok", transport=_raise_httperror).send_message("1", {"content": "x"})
+    check("HTTPError with unparsable body -> NOT_DELIVERED, body None survives",
+          r.outcome.name == "NOT_DELIVERED")
+
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)
         return 1
