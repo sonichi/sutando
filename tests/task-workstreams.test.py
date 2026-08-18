@@ -698,6 +698,41 @@ def test_concurrent_inheritance_keeps_every_assignment() -> None:
     assert all(child in assignments for child in children)
 
 
+def test_classifier_task_is_envelope_stamped() -> None:
+    """#3014's writer census listed task-workstream-grouping unsigned: the
+    classifier emit builds its own header block, so it needs an edge stamp."""
+    import task_envelope
+    workspace = fixture_workspace()
+    result = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert result.enqueued
+    text = (workspace / "tasks" / f"{result.task_id}.txt").read_text()
+    assert task_envelope.verify_text(text, workspace)["verdict"] == "verified"
+    assert text.splitlines()[0].startswith("id:")
+    assert text.rstrip().endswith("[no-send].")
+    assert (workspace / "state" / "auth" / "task-hmac.key").is_file()
+
+
+def test_classifier_task_survives_a_raising_stamper() -> None:
+    """Fail-open is the contract: a stamping error must cost the stamp, never
+    the maintenance tick. Without the guard this test loses the task."""
+    import task_envelope
+    workspace = fixture_workspace()
+    original = task_envelope.stamp_text
+
+    def boom(*_a, **_k):
+        raise RuntimeError("keychain on fire")
+
+    task_envelope.stamp_text = boom
+    try:
+        result = workstreams.maybe_enqueue_classifier_task(workspace)
+    finally:
+        task_envelope.stamp_text = original
+    assert result.enqueued
+    text = (workspace / "tasks" / f"{result.task_id}.txt").read_text()
+    assert "$task-workstream-grouping" in text
+    assert "envelope_hmac:" not in text
+
+
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
@@ -705,6 +740,8 @@ def main() -> None:
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
+        test_classifier_task_is_envelope_stamped,
+        test_classifier_task_survives_a_raising_stamper,
         test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
         test_stale_classifier_is_archived_before_replacement,
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,

@@ -233,9 +233,11 @@ for bad in ("", "task-", "task-../../etc", "task-a b", "task-a/b", "result-1",
             "task-" + "x" * 200, "task-.hidden"):
     check(f"id rejected: {bad[:24]!r}", not ltp.valid_task_id(bad))
 for good in ("task-1783377232367", "ask-1783379117", "sc-ask-1234",
-             "reco-skill-9999", "result-1"):
+             "reco-skill-9999", "result-1",
+             "task-dev~task-1783377232367", "x" * 128):
     check(f"archive id ok: {good}", ltp.valid_archive_lookup_id(good))
-for bad in ("", ".", "..", "task-../../etc", "task-a b", "task-a/b", "x" * 65):
+for bad in ("", ".", "..", "task-../../etc", "task-a b", "task-a/b", "x" * 129,
+            "..~/etc", "task-a~b/c"):
     check(f"archive id rejected: {bad[:24]!r}", not ltp.valid_archive_lookup_id(bad))
 
 # 8. Archive rules.
