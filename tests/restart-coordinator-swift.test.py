@@ -284,9 +284,8 @@ class TestRestartCoordinator(unittest.TestCase):
         out = self.run_scenario("invocation-rehearse-off")
         self.assertEqual(["/s/gr.sh -- --visible"], out)
 
-    # The rehearsal notification. SUTANDO_RESTART_REHEARSE=1 adds --dry-run, the
-    # script returns without killing anything, and before this the caller mapped
-    # its status to the success message — reporting a restart that never ran.
+    # A rehearsal returns without killing anything, so mapping its status to the
+    # success message reports a restart that never ran.
     def test_rehearsal_is_not_reported_as_a_restart(self):
         msgs = dict(line.split("=", 1) for line in self.run_scenario("outcome-messages"))
         self.assertNotEqual(msgs["0"], msgs["5"],
