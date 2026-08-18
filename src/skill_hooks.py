@@ -26,13 +26,10 @@ def resolve_hook_command(skill_dir: Path, command: str) -> Path | None:
     return target if root in target.parents else None
 
 
-def discover(repo_dir: Path) -> list[tuple[str, str, str]]:
-    """(event, token, command) for every declared, present, enabled skill hook.
-
-    Skips rather than raises on anything malformed: a broken manifest must not
-    abort a whole install, and a hook declared but absent is not registrable.
-    """
-    out: list[tuple[str, str, str]] = []
+def discover(repo_dir: Path) -> list[tuple[str, str, str, str]]:
+    """(event, token, command, prior_command) per declared, present, enabled hook.
+    Skips malformed entries; prior_command is emitted (not derived by splitting on `exec `)."""
+    out: list[tuple[str, str, str, str]] = []
     for manifest in sorted(Path(repo_dir).glob("skills/*/manifest.json")):
         try:
             data = json.loads(manifest.read_text())
@@ -53,11 +50,20 @@ def discover(repo_dir: Path) -> list[tuple[str, str, str]]:
             if target is None or not target.is_file():
                 continue
             runner = RUNNERS.get(target.suffix, "bash")
-            out.append((event, target.name, f"{runner} {shlex.quote(str(target))}"))
+            q = shlex.quote(str(target))
+            # The path is in the working tree, so a checkout can delete it while the
+            # registration survives; a hook that cannot start blocks the tool it gates.
+            prior = f"{runner} {q}"
+            out.append((event, target.name, f"[ -f {q} ] || exit 0; exec {prior}", prior))
     return out
 
 
 if __name__ == "__main__":
     import sys
+    # NUL-framed: two fields carry a repo path, and a path may contain any byte
+    # except NUL — including the `|` the reader would otherwise split on.
+    out = sys.stdout.buffer
     for row in discover(Path(sys.argv[1])):
-        print("|".join(row))
+        for field in row:
+            out.write(field.encode() + b"\0")
+    out.flush()
