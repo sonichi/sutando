@@ -53,9 +53,8 @@ if [[ -n "$REF" ]]; then
     git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" >/dev/null \
         || { echo "pr-evidence: '$REF' is not a commit in this repo" >&2; exit 2; }
 
-    # Resolve BEFORE the worktree exists, and unconditionally — not only when a
-    # local config file happens to be present. An unpinned worktree resolves its
-    # own empty workspace/ and reports clean whatever the code does.
+    # Resolve unconditionally, before the worktree exists: an unpinned worktree
+    # resolves its own empty workspace/ and reports clean whatever the code does.
     LIVE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
     [[ -n "$LIVE_WS" ]] || {
         echo "pr-evidence: cannot resolve the live workspace — refusing --at rather than" >&2
@@ -71,8 +70,8 @@ if [[ -n "$REF" ]]; then
         || { echo "pr-evidence: could not create a worktree at '$REF'" >&2; exit 2; }
     RUNDIR="$WT"
 
-    # Write a MINIMAL config — never copy the real one. It carries unrelated
-    # local settings (vault, migrate) that this tool has no need to duplicate.
+    # MINIMAL config, never a copy: the real one carries unrelated local
+    # settings (vault, migrate) this tool has no need to duplicate.
     # Bare python3 is the Xcode-CLT stub on a Mac without developer tools — the
     # exact modal this resolver exists to avoid.
     . "$REPO/scripts/python-binary.sh"
@@ -111,9 +110,15 @@ DIRTY_BEFORE="$(tree_state)"
 BODYFILE="$(mktemp "${TMPDIR:-/tmp}/pr-evidence-body-XXXXXX")"
 for cmd in "$@"; do
     printf '$ %s\n' "$cmd" >> "$BODYFILE"
-    out="$(cd "$RUNDIR" && eval "$cmd" 2>&1)"
+    before=$(wc -c < "$BODYFILE")
+    ( cd "$RUNDIR" && eval "$cmd" ) >> "$BODYFILE" 2>&1
     rc=$?
-    [[ -n "$out" ]] && printf '%s\n' "$out" >> "$BODYFILE"
+    # Separate the marker WITHOUT inventing a line: only when the command wrote
+    # something that is not already newline-terminated.
+    if [[ "$(wc -c < "$BODYFILE")" -gt "$before" ]] \
+       && [[ "$(tail -c1 "$BODYFILE" | wc -l)" -eq 0 ]]; then
+        printf '\n' >> "$BODYFILE"
+    fi
     printf '[exit %d]\n\n' "$rc" >> "$BODYFILE"
 done
 DIRTY_AFTER="$(tree_state)"

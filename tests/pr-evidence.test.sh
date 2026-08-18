@@ -25,10 +25,8 @@ nonzero() {
     if [[ "$1" -ne 0 ]]; then pass "$2"; else flunk "$2"; fi
 }
 
-# The stderr assertion must key on text the OS produces, NOT on anything inside
-# the command string: the command is echoed into the block, so a marker written
-# in the command itself still appears when stderr is discarded, and the check
-# passes for the wrong reason. Caught by a control that failed to fail.
+# Key on text the OS produces, never on the command string: the command is
+# echoed into the block, so a self-written marker passes for the wrong reason.
 out="$(bash "$GEN" 'echo alpha-marker' 'cat /definitely-absent-xyz' 2>/dev/null)"
 sha="$(git -C "$REPO" rev-parse HEAD)"
 
@@ -93,18 +91,16 @@ bash "$GEN" --at not-a-real-ref 'echo x' >/dev/null 2>&1 || rc_ref=$?
 nonzero "$rc_ref" "refuses an unknown ref instead of silently running at HEAD"
 
 # ---- --at must pin the workspace even with NO local config file -------------
-# The pinning used to run only when sutando.config.local.json existed, so in the
-# default configuration the worktree resolved its own empty workspace/ and every
-# workspace-reading probe reported clean regardless of the code. That is the
-# false-clean evidence this tool exists to prevent, so it is a blocking case.
+# Pinning used to require sutando.config.local.json, so by default the worktree
+# resolved its own empty workspace/ and every probe reported false-clean.
 live_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
 ws_out="$(bash "$GEN" --at HEAD~1 'bash scripts/sutando-config.sh workspace' 2>/dev/null)"
 has "$ws_out" "$live_ws" "--at reports the LIVE workspace with no local config present"
 lacks "$ws_out" "pr-evidence-" "--at does NOT report a workspace under its own temp dir"
 
 # ---- the pinned config is minimal and private ------------------------------
-# It used to be a copy of the whole local config (vault, migrate, …) dropped
-# into a 0755 worktree, where a failed cleanup strands it world-readable.
+# It used to copy the whole local config into a 0755 worktree, where a failed
+# cleanup strands it world-readable.
 perm_out="$(bash "$GEN" --at HEAD~1 \
     'pwd' \
     'stat -f \"%Sp\" sutando.config.local.json 2>/dev/null || stat -c \"%A\" sutando.config.local.json' \
@@ -112,12 +108,24 @@ perm_out="$(bash "$GEN" --at HEAD~1 \
     'python3 -c "import json;print(sorted(json.load(open(\"sutando.config.local.json\")).keys()))"' \
     2>/dev/null)"
 has "$perm_out" '-rw-------' "the pinned config is mode 600"
-# `..` alone is not discriminating: with no wrapper the parent is the system
-# TMPDIR, which is ALSO 0700, so the mode matches for the wrong reason. The
-# wrapper's existence is what the path shape proves.
+# `..` alone is not discriminating: without a wrapper the parent is TMPDIR,
+# also 0700, so the mode would match for the wrong reason.
 has "$perm_out" '/wt' "the worktree lives inside a wrapper dir, not directly in TMPDIR"
 has "$perm_out" 'drwx------' "that wrapper is private (0700)"
 has "$perm_out" "['workspace']" "the pinned config carries ONLY workspace, not the real one"
+
+# ---- verbatim: trailing newlines are NOT stripped ---------------------------
+# Compare through a FILE, never $( ): command substitution strips the exact
+# newlines under test, so a captured comparison would pass for the wrong reason.
+nl_file="$(mktemp)"
+bash "$GEN" 'printf "alpha\n\n"' > "$nl_file" 2>/dev/null
+gap="$(awk '/^alpha$/{f=1;n=0;next} f&&/^\[exit 0\]$/{print n;exit} f{n++}' "$nl_file")"
+same "$gap" "1" "a trailing blank line survives byte-for-byte (1 blank before the marker)"
+
+bash "$GEN" 'printf "beta"' > "$nl_file" 2>/dev/null
+gap0="$(awk '/^beta$/{f=1;n=0;next} f&&/^\[exit 0\]$/{print n;exit} f{n++}' "$nl_file")"
+same "$gap0" "0" "output with NO trailing newline still gets the marker on its own line"
+rm -f "$nl_file"
 
 if [[ "$fail" -ne 0 ]]; then
     echo "FAIL: pr-evidence generator"
