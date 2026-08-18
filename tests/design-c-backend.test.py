@@ -125,6 +125,25 @@ def main() -> int:
         check("attempts: parked record names max-attempts",
               any("max-attempts" in p.name for p in parked))
 
+
+    # cleanup must not reset a LIVE item's park ceiling (air's #3104 nit).
+    with tempfile.TemporaryDirectory() as td:
+        b = DesignCClaimBackend(Path(td))
+        b.publish(ITEM, b"x")
+        t = b.claim(ITEM, "w")
+        b.complete(t, DeliveryOutcome.NOT_DELIVERED, park_at_attempts=5)
+        rep = b.cleanup(max_age_s=0.0)   # everything is "old" at age 0
+        check("cleanup: live item's attempts survive age-based prune",
+              b.attempts(ITEM) == 1)
+        b.claim(ITEM, "w")   # consume ready; then archive it via CONFIRMED
+        t = b.claim(ITEM, "w") or t
+        # item now inflight-or-archived; drop the live object entirely:
+        for f in (b.root / "inflight").iterdir():
+            f.unlink()
+        b.cleanup(max_age_s=0.0)
+        check("cleanup: dead key's attempts are pruned",
+              b.attempts(ITEM) == 0)
+
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)
         return 1

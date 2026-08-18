@@ -279,9 +279,17 @@ class DesignCClaimBackend:
         for d in (ARCHIVE, PARKED, TMP, ATTEMPTS):
             for f in list(self._d(d).iterdir()):
                 try:
-                    if now - f.stat().st_mtime > max_age_s:
-                        f.unlink(missing_ok=True)
-                        pruned += 1
+                    if now - f.stat().st_mtime <= max_age_s:
+                        continue
+                    if d == ATTEMPTS:
+                        # A LIVE item's counter is its park ceiling; pruning
+                        # it by age alone lets slow failure evade the cap.
+                        key = f.name
+                        if ((self.root / READY / key).exists()
+                                or self._tokens(key)):
+                            continue
+                    f.unlink(missing_ok=True)
+                    pruned += 1
                 except FileNotFoundError:
                     pass
                 except OSError as e:
