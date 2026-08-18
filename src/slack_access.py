@@ -51,9 +51,15 @@ def read_access(access_file) -> SlackAccess:
         return SlackAccess(set(), None)
     if not isinstance(record, dict):
         return SlackAccess(set(), None)
+    # The conversion stays INSIDE the parse boundary: `allowFrom: 42` or a list
+    # of dicts is unusable, and raising here would crash the health check.
+    try:
+        allowed = set(record.get("allowFrom") or [])
+    except TypeError:
+        return SlackAccess(set(), None)
     # record is not None ONLY on a genuine parse; that is what separates a real
     # empty allowFrom (LOCKED) from an unreadable one (UNKNOWN).
-    return SlackAccess(set(record.get("allowFrom") or []), record)
+    return SlackAccess(allowed, record)
 
 
 def enrollment_state(access: SlackAccess) -> str:

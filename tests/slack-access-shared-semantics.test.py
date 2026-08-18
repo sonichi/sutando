@@ -1,30 +1,42 @@
 #!/usr/bin/env python3
 """`slack_access` must agree with the bridge's `load_allowed` on every state.
 
-health-check now reads the Slack access record through `src/slack_access.py`
-instead of a boolean `exists()`. That makes two readers of one record, and the
-risk is drift: the helper and `slack-bridge.load_allowed` could disagree after
-a later edit and nothing would notice, because they are exercised by different
-suites.
+health-check reads the Slack access record through `src/slack_access.py`. That
+makes two readers of one record, and the risk is drift: the helper and
+`slack-bridge.load_allowed` could disagree after a later edit and nothing would
+notice, because they are exercised by different suites.
 
-So this pins them together over the same fixtures. It compares the BEHAVIOUR of
-the real functions, not their source text — a source assertion cannot fail when
-the semantics change while the wording survives.
+This runs the SHIPPED `load_allowed`, extracted from the bridge's own AST. A
+mirrored copy cannot detect drift — it drifts with whoever edits the test, and
+it hid exactly that: on a malformed `allowFrom` the copy raised while the real
+function fails closed to set().
 
 Run: python3 tests/slack-access-shared-semantics.test.py
 Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+import ast
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
+
+# Isolate BEFORE anything reads channel config. This test compiles one AST node
+# rather than importing, but the isolation must not depend on that staying true.
+_CFG = tempfile.mkdtemp(prefix="slack-access-ccd-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+_cfg_slack = Path(_CFG) / "channels" / "slack"
+_cfg_slack.mkdir(parents=True, exist_ok=True)
+(_cfg_slack / "access.json").write_text(json.dumps({"allowFrom": ["U-fixture"]}))
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import slack_access  # noqa: E402
+
+BRIDGE = REPO / "src" / "slack-bridge.py"
 
 FAILS: list[str] = []
 
@@ -35,20 +47,34 @@ def check(cond: bool, msg: str) -> None:
         FAILS.append(msg)
 
 
-def _bridge_load_allowed(access_file: Path):
-    """Re-run the bridge's documented mapping against an injected path.
-
-    slack-bridge.py binds ACCESS_FILE at import and starts a client, so it
-    cannot be imported here; this mirrors load_allowed's control flow exactly
-    and the equivalence below is what keeps the mirror honest.
-    """
+def _guard(fn):
+    """Turn a propagated exception into a comparable value so the suite reports
+    it as a FAIL instead of exploding on the first fixture."""
     try:
-        data = json.loads(access_file.read_text())
-        return set(data.get("allowFrom", []))
-    except FileNotFoundError:
-        return None
-    except Exception:  # noqa: BLE001
-        return set()
+        return fn()
+    except Exception as exc:  # noqa: BLE001 — the raise IS the finding
+        return f"RAISED {type(exc).__name__}: {exc}"
+
+
+def _bridge_load_allowed(access_file: Path):
+    """Run the SHIPPED `load_allowed` against an injected path.
+
+    The module cannot be imported — `app = App(token=BOT_TOKEN)` constructs a
+    Slack client at import and the header mkdir()s into the live workspace — so
+    only its AST node is compiled, under the production filename so coverage
+    attributes it to the bridge rather than to a copy in this test.
+    """
+    src = BRIDGE.read_text()
+    tree = ast.parse(src, filename=str(BRIDGE))
+    fn_node = next(node for node in tree.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "load_allowed")
+    cached: list = []
+    ns = {"json": json, "ACCESS_FILE": access_file,
+          "_update_access_cache": cached.append}
+    module = ast.Module(body=[fn_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, str(BRIDGE), "exec"), ns)
+    return ns["load_allowed"]()
 
 
 def main() -> int:
@@ -62,6 +88,10 @@ def main() -> int:
         # Valid JSON, wrong shape: `.get()` raises, which must read as UNKNOWN
         # rather than as an empty allowFrom.
         "not a mapping": "[]",
+        # Syntactically valid records whose allowFrom is the wrong TYPE. The
+        # bridge fails closed on both; a helper that raises is not equivalent.
+        "allowFrom is a scalar": {"allowFrom": 42},
+        "allowFrom holds objects": {"allowFrom": [{"id": "U1"}]},
     }
     expected_state = {
         "absent": slack_access.UNCONFIGURED,
@@ -70,6 +100,8 @@ def main() -> int:
         "missing allowFrom key": slack_access.LOCKED,
         "unreadable": slack_access.UNKNOWN,
         "not a mapping": slack_access.UNKNOWN,
+        "allowFrom is a scalar": slack_access.UNKNOWN,
+        "allowFrom holds objects": slack_access.UNKNOWN,
     }
     for label, payload in cases.items():
         p = tmp / (label.replace(" ", "_") + ".json")
@@ -80,12 +112,15 @@ def main() -> int:
         else:
             p.write_text(json.dumps(payload))
 
-        helper = slack_access.read_access(p).allowed
-        bridge = _bridge_load_allowed(p)
+        # A raise is a RESULT here, not a crash: the bridge fails closed on every
+        # fixture, so a helper that propagates is already non-equivalent.
+        helper = _guard(lambda: slack_access.read_access(p).allowed)
+        bridge = _guard(lambda: _bridge_load_allowed(p))
         check(helper == bridge,
               f"{label}: helper {helper!r} == bridge {bridge!r}")
-        check(slack_access.access_state(p) == expected_state[label],
-              f"{label}: state is {expected_state[label]}")
+        state = _guard(lambda: slack_access.access_state(p))
+        check(state == expected_state[label],
+              f"{label}: state is {expected_state[label]} (got {state!r})")
 
     # The distinction the whole fix rests on: absent and empty are NOT the same.
     absent = slack_access.access_state(tmp / "absent.json")
@@ -94,6 +129,21 @@ def main() -> int:
           "absent record and empty allowFrom map to DIFFERENT states")
     check(slack_access.access_state(tmp / "unreadable.json") != empty,
           "unreadable is distinguishable from a real empty allowFrom")
+
+    # A malformed allowFrom is not an admin lockout: the operator must not be
+    # told "an admin locked it down" about a record nobody can classify.
+    for label in ("allowFrom is a scalar", "allowFrom holds objects"):
+        p = tmp / (label.replace(" ", "_") + ".json")
+        check(_guard(lambda: slack_access.access_state(p)) != slack_access.LOCKED,
+              f"{label}: does NOT read as a deliberate lockout")
+
+    # The extraction must be running the real thing. If the bridge ever stops
+    # defining load_allowed, every equivalence above would pass vacuously.
+    bridge_src = BRIDGE.read_text()
+    check("def load_allowed()" in bridge_src,
+          "the bridge still defines the function this test extracts")
+    check(_bridge_load_allowed(tmp / "populated_allowFrom.json") == {"U1", "U2"},
+          "the extracted function returns the bridge's real allowlist")
 
     print()
     if FAILS:
