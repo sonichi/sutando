@@ -347,9 +347,15 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
 		assert.equal(r.verdict, 'insufficient-evidence');
 		assert.ok(r.reasons.some((x) => x.includes('upstream-hop-unobserved')));
-		// At session-only the facts never claim upstream observations either.
-		assert.equal(r.facts.attemptedAudioAdvanced, false);
-		assert.equal(r.facts.losslessWindowWithSpeechQueued, false);
+		// §1.5: facts are DATA-level observations, identical under every
+		// coverage mode — only the VERDICT is coverage-gated (codex round-3 #1).
+		const shadow = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(shadow.verdict, 'post-sdk-silent');
+		assert.deepEqual(r.facts, shadow.facts, 'same input, same facts, different claim');
+		assert.equal(r.facts.losslessWindowWithSpeechQueued, true);
 	});
 
 	it('an unobserved BASELINE can never fabricate post-sdk-silent (null→observed transition)', () => {
@@ -374,8 +380,29 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 			effectiveCoverage: 'session+egress',
 		});
 		assert.equal(r.verdict, 'insufficient-evidence');
-		assert.ok(r.reasons.includes('upstream-baseline-unobserved'));
+		assert.ok(r.reasons.includes('upstream-window-unobserved'));
 		assert.equal(r.facts.losslessWindowWithSpeechQueued, false);
+
+		// The OTHER direction (codex round-3 #2): counters present but the
+		// CURRENT generation unobserved — the window is equally invalid.
+		const s2 = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 900, queued: 900, lastQueuedAt: NOW - 300 }),
+			transportGeneration: null,
+		});
+		const prev2 = baselineBefore(s2, {
+			deliveredFrames: s2.deliveredFrames - 100,
+			transportGeneration: 3,
+			audioAttempted: 100,
+			audioQueued: 100,
+		});
+		const r2 = evalWith(s2, prev2, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r2.verdict, 'insufficient-evidence');
+		assert.ok(r2.reasons.includes('upstream-window-unobserved'));
+		assert.equal(r2.facts.attemptedAudioAdvanced, false);
 	});
 
 	it('rows 4/4b need a valid window too — an unobserved baseline cannot prove a dead path', () => {
@@ -417,7 +444,7 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 		});
 	});
 
-	it('facts: a generation change is a fact; early structural returns carry all-false facts', () => {
+	it('facts: a generation change is a fact; a windowless tick carries all-false facts', () => {
 		const s = snap({
 			upstream: upstreamFix({ attempted: 40, queued: 40 }),
 			transportGeneration: 4,
@@ -427,6 +454,10 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 		assert.equal(r.verdict, 'insufficient-evidence');
 		assert.equal(r.facts.transportGenerationChanged, true);
 		assert.equal(r.facts.attemptedAudioAdvanced, false);
+		// The fact is coverage-independent: the live session-only evaluator
+		// records the same generation change (its verdict path just differs).
+		const live = evalWith(s, prev);
+		assert.deepEqual(live.facts, r.facts);
 		const first = evalWith(snap(), null);
 		assert.deepEqual(first.facts, {
 			attemptedAudioAdvanced: false,
@@ -435,6 +466,34 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 			transportGenerationChanged: false,
 			echoSuppressedAdvanced: false,
 		});
+	});
+
+	it('facts are verdict-independent: an early return carries the same data-level facts', () => {
+		// Identical diagnostics, one tick evaluated ACTIVE and one CONNECTING:
+		// the verdicts differ (reconnect-window wins row 0) but the facts are
+		// the SAME set — the watchdog must behave identically (§1.5).
+		const s = snap({
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const active = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		const connecting = evalWith(s, prev, {
+			sessionState: 'CONNECTING',
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(active.verdict, 'post-sdk-silent');
+		assert.equal(connecting.verdict, 'reconnect-window');
+		assert.deepEqual(connecting.facts, active.facts);
 	});
 });
 
