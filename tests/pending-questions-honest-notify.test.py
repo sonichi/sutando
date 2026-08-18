@@ -8,6 +8,7 @@ outcome is how a blocked decision sits unseen for a day.
 """
 import importlib.util
 import time
+import re
 import unittest
 from pathlib import Path
 
@@ -20,6 +21,16 @@ def _load(results_dir):
     spec.loader.exec_module(m)
     m.RESULTS_DIR = Path(results_dir)
     return m
+
+
+def _notification_body(applescript):
+    """The notification text inside `display notification "..." with title ...`.
+
+    The captured argv is the whole AppleScript; asserting on it measures a
+    constant ~44 chars of wrapper as if it were the body macOS truncates.
+    """
+    m = re.search(r'display notification "(.*)" with title', applescript, re.S)
+    return m.group(1) if m else applescript
 
 
 class _Capture:
@@ -279,6 +290,32 @@ class TestReviewFindings(unittest.TestCase):
                 self.assertNotIn("zzzzzzzzzz", body,
                                  "no comma exists in this shape; only the cap can bound it")
                 self.assertIn("(+23 more)", body, "the remainder must still be counted")
+
+    def test_f3_body_stays_bounded_as_the_count_widens(self):
+        """Per-name caps leave the total arithmetic: the count and the `(+N more)`
+        both widen with the queue. The assembled body is what must be bounded."""
+        for count in (26, 126, 1226, 12226):
+            with self.subTest(count=count):
+                sent = []
+                self.m.subprocess = _Capture(sent)
+                titles = [("q" * 60) + f"-{i}" for i in range(count)]
+                self.m.notify_macos(count, titles)
+                # The NOTIFICATION body, not the AppleScript around it: macOS
+                # truncates the former, and the wrapper is a constant ~44 chars.
+                body = _notification_body(sent[0])
+                self.assertLess(len(body), self.m.BODY_MAX,
+                                f"count={count} must not overrun the bound, got {len(body)}: {body}")
+                self.assertIn(f"(+{count - 3} more)", body,
+                              "the remainder must survive the cap — it is the honest part")
+
+    def test_f4_worst_case_names_stay_bounded(self):
+        """Three maximal 40-char names — the shape the other fixtures never make."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        self.m.notify_macos(26, [("z" * 90) + f"-{i}" for i in range(26)])
+        body = _notification_body(sent[0])
+        self.assertLess(len(body), self.m.BODY_MAX,
+                        f"three maximal names must still fit, got {len(body)}: {body}")
 
     def test_d_written_name_matches_the_scanned_prefix(self):
         """Writer and detector must agree, or the check silently never fires."""

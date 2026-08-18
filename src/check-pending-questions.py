@@ -253,13 +253,27 @@ def should_notify(key=None):
     return (time.time() - mtime) > UNCHANGED_REMINDER_SEC
 
 
+#: Body budget for the macOS notification. Not a hard OS limit — a chosen bound
+#: the assembled body is held under, so no count width can overrun it.
+BODY_MAX = 160
+
+
 def notify_macos(count, titles):
     """Returns True only if osascript actually accepted the notification."""
     # macOS truncates the body, so send a bounded NAME per title. The cap is the
     # bound: a title need not contain a comma, and some hosts produce none.
     names = [t.split(",", 1)[0].strip()[:40] for t in titles[:3]]
     extra = f" (+{count - len(names)} more)" if count > len(names) else ""
-    msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(names)}{extra}"
+    head = f"{count} pending question{'s' if count > 1 else ''}: "
+    # Cap the ASSEMBLED body, not just each name: the count and the overflow both
+    # widen with the queue, so per-name bounds alone leave the total arithmetic.
+    room = BODY_MAX - len(head) - len(extra) - 1
+    joined = ", ".join(names)
+    if room <= 0:
+        joined = ""
+    elif len(joined) > room:
+        joined = joined[:room - 1] + "…"
+    msg = f"{head}{joined}{extra}"
     # AppleScript string literal: backslashes and double quotes in question
     # titles must be escaped, or osascript rejects the script and the
     # notification silently reports FAILED (bit us 2026-07-26 — a title
