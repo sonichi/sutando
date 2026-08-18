@@ -67,11 +67,13 @@ property. Execution uniqueness is Phase 3.
 ## Mechanism
 
 - **Key**: 32 bytes as 64 hex chars at `<workspace>/state/auth/task-hmac.key`,
-  mode 0600. Minted once by the first writer that needs it (`O_EXCL` create +
-  `link()` first-writer-wins, so concurrent bridges cannot clobber each
-  other). Never leaves the host. Both loaders reject a present-but-corrupt
-  key loudly (exactly 64 hex chars / 32 bytes) rather than operating with a
-  truncated key.
+  mode 0600, never leaving the host. The merged Python writer mints it via
+  temp file + `link()` first-writer-wins, which publishes only complete
+  bytes. *Pending (#3058):* the TS writer creates at the final path with
+  `O_EXCL` — atomic create but not atomic content publication, a window the
+  corrupt-key guards close by rejection. *Pending (#3058 TS, #3065 Python):*
+  both loaders rejecting a present-but-corrupt key loudly (exactly 64 hex
+  chars / 32 bytes) instead of operating with a truncated key.
 - **Stamping**: HMAC-SHA256 over the entire body (any previous stamp line
   stripped first), spliced into the **canonical slot** — line 1 directly
   after `id:`, or line 0 when there is no id header. Writers fail *open*: a
@@ -125,12 +127,16 @@ coexist with v1 during a migration window.
 
 ## Current status — Phase 1 live
 
-Every known writer on both lineages stamps: the remote gateway bridge,
-discord-bridge, agent-api, voice-agent, cron-runner, the workstream
-classifier, and the TS delegation seam + context-drop writers. Stamps are
-**telemetry only** today: `src/task_envelope_census.py` counts
-verified/unsigned so the unsigned population can be watched draining during
-the soak window. No consumer changes behavior on a verdict yet.
+**Merged on main**: the Python writers stamp — remote gateway bridge,
+discord-bridge, agent-api, voice-agent, cron-runner, and the workstream
+classifier. **Pending (#3058, open)**: the TS writers — the delegation seam
+and context-drop path — stamp only once that PR lands; until then tasks
+from those writers are `unsigned`. Stamps are **telemetry only** today:
+`src/task_envelope_census.py` counts verified/unsigned so the unsigned
+population can be watched draining during the soak window. No consumer
+changes behavior on a verdict yet. (Phase 1 is complete when the PR-trail
+"open" rows land; the census's unsigned count is the live measure of the
+gap.)
 
 ## Phased plan
 
