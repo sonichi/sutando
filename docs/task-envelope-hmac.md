@@ -127,11 +127,15 @@ coexist with v1 during a migration window.
 
 ## Current status — Phase 1 live
 
-**Merged on main**: the Python writers stamp — remote gateway bridge,
-discord-bridge, agent-api, voice-agent, cron-runner, and the workstream
-classifier. **Pending (#3058, open)**: the TS writers — the delegation seam
-and context-drop path — stamp only once that PR lands; until then tasks
-from those writers are `unsigned`. Stamps are **telemetry only** today:
+**Merged on main** (derived from actual `main` call sites — the modules
+that import and call the stamper): remote gateway bridge, discord-bridge,
+and the workstream classifier. **Pending (#3058, open)**: the TS lineage —
+the delegation seam, context-drop path, and voice-agent. **Pending
+(#3046, open)**: telegram-bridge and slack-bridge. **Not yet stamping, no
+PR**: agent-api and cron-runner — these write task files directly today;
+their edges are unowned work, not covered elsewhere. Until each row
+lands, tasks from those writers are `unsigned`. Stamps are **telemetry
+only** today:
 `src/task_envelope_census.py` counts verified/unsigned so the unsigned
 population can be watched draining during the soak window. No consumer
 changes behavior on a verdict yet. (Phase 1 is complete when the PR-trail
@@ -231,10 +235,10 @@ the fleet) plus the acting agent's mxid, matching each PR body's
 
 | PR | What it shipped | Author | State |
 |---|---|---|---|
-| #3014 | The envelope itself: `src/task_envelope.py` (key, canonical slot, four verdicts) + contract/falsifier suite | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
-| #3030 | Remote gateway bridge stamps at the writer edge | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
-| #3044 | Census (`src/task_envelope_census.py`) + remaining Python writer edges | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
-| #3034 | Writer-edge stamping (agent-api, voice path) — note: its auto-merge raced its own review fix | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3014 | The envelope itself: `src/task_envelope.py` (key, canonical slot, four verdicts) + contract/falsifier suite + the Discord and gateway writer edges | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3034 | Census (`src/task_envelope_census.py`) — soak-window telemetry; note: its auto-merge raced its own review fix | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3044 | Workstream classifier stamps at its writer edge | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3046 | telegram-bridge + slack-bridge stamp at their writer edges | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
 | #3055 | Census read/stat TOCTOU fix (the #3034 race, recovered) | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
 | #3058 | TS mirror `src/task_envelope.ts` + delegation-seam/context-drop stamping + cross-language parity tests + TS corrupt-key guard | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
 | #3065 | Python corrupt-key guard: loud error or `unverifiable`, never a zero-length key | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
