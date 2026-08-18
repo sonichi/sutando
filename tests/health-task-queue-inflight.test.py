@@ -15,6 +15,7 @@ of this probe would go quiet forever.
 
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -417,7 +418,12 @@ check("wedged" not in r["detail"], "and a waiter is never called wedged")
 r = mark_probe(5000, 1200)
 check(r["status"] == "warn",
       f"provider running 1200s past a 900s deadline -> warn (got {r['status']!r})")
-check("running 1200s" in r["detail"], "and it quotes the PROVIDER's runtime")
+# int(elapsed), so a slow runner renders 1201: bound it instead of pinning a
+# second. 9999 (the process age) is far outside, so the guarantee is intact.
+_m = re.search(r"running (\d+)s", r["detail"] or "")
+check(bool(_m) and 1200 <= int(_m.group(1)) <= 1230,
+      f"and it quotes the PROVIDER's runtime, not the 9999s process age "
+      f"(got {_m.group(1) + 's' if _m else r['detail'][-60:]!r})")
 
 r = mark_probe(5000, 5)
 check(r["status"] == "ok",
