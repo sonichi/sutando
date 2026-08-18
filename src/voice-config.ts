@@ -126,10 +126,28 @@ const MEDIA_RESOLUTIONS = [
 ] as const;
 
 /** A compression threshold must be a safe positive integer — the Live API
- *  models these as int64, and a float or 0 is operator error, not tuning. */
-function parseThreshold(name: string, value: unknown): number {
-	const n = typeof value === 'string' ? Number(value) : value;
-	if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) {
+ *  models these as int64, and a float or 0 is operator error, not tuning.
+ *  FILE values must already BE numbers: a JSON string "3000" is a schema
+ *  violation and coercing it would normalize operator error (codex P2). */
+function parseFileThreshold(name: string, value: unknown): number {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+		throw new Error(
+			`[voice-config] ${name} must be a positive integer, got ${JSON.stringify(value)}`,
+		);
+	}
+	return value;
+}
+
+/** Env values are inherently strings — accept EXACTLY digits (no floats,
+ *  exponents, hex, sign, or padding), then the same safe-integer rule. */
+function parseEnvThreshold(name: string, value: unknown): number {
+	if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+		throw new Error(
+			`[voice-config] ${name} must be a positive integer, got ${JSON.stringify(value)}`,
+		);
+	}
+	const n = Number(value);
+	if (!Number.isSafeInteger(n) || n <= 0) {
 		throw new Error(
 			`[voice-config] ${name} must be a positive integer, got ${JSON.stringify(value)}`,
 		);
@@ -143,6 +161,7 @@ function validatePair(
 	source: string,
 	trigger: unknown,
 	target: unknown,
+	parse: (name: string, value: unknown) => number,
 ): { triggerTokens: number; targetTokens: number } {
 	if (trigger === undefined || target === undefined) {
 		throw new Error(
@@ -150,8 +169,8 @@ function validatePair(
 				`(omit both for the server's defaults)`,
 		);
 	}
-	const triggerTokens = parseThreshold(`${source} triggerTokens`, trigger);
-	const targetTokens = parseThreshold(`${source} targetTokens`, target);
+	const triggerTokens = parse(`${source} triggerTokens`, trigger);
+	const targetTokens = parse(`${source} targetTokens`, target);
 	if (targetTokens >= triggerTokens) {
 		throw new Error(
 			`[voice-config] ${source}: need 0 < targetTokens < triggerTokens, ` +
@@ -196,6 +215,7 @@ export function resolveSessionTuning(
 			'VOICE_CTX_TRIGGER_TOKENS/VOICE_CTX_TARGET_TOKENS',
 			envTrigger,
 			envTarget,
+			parseEnvThreshold,
 		);
 	} else if (config.compressionConfig !== undefined) {
 		const cc = config.compressionConfig;
@@ -214,6 +234,7 @@ export function resolveSessionTuning(
 				'compressionConfig',
 				cc.triggerTokens,
 				cc.targetTokens,
+				parseFileThreshold,
 			);
 		}
 	}

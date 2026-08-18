@@ -108,6 +108,36 @@ describe('P7 Phase 0.5 — resolveSessionTuning', () => {
 		);
 	});
 
+	it('file thresholds must BE numbers — a JSON string "3000" is a schema violation, not tuning', () => {
+		assert.throws(
+			() =>
+				resolveSessionTuning(
+					cfg({
+						compressionConfig: {
+							triggerTokens: '3000',
+							targetTokens: 1500,
+						} as unknown as VoiceConfig['compressionConfig'],
+					}),
+					NO_ENV,
+				),
+			/positive integer/,
+		);
+	});
+
+	it('env thresholds are digits-only strings — floats, exponents, hex, padding all throw', () => {
+		for (const bad of ['1e3', '0x10', ' 3000', '3000.0', '-3000', '+3000']) {
+			assert.throws(
+				() =>
+					resolveSessionTuning(cfg(), {
+						VOICE_CTX_TRIGGER_TOKENS: bad,
+						VOICE_CTX_TARGET_TOKENS: '100',
+					}),
+				/positive integer/,
+				`expected throw for ${JSON.stringify(bad)}`,
+			);
+		}
+	});
+
 	it('env overrides the file and on its own enables compression', () => {
 		const env = { VOICE_CTX_TRIGGER_TOKENS: '4000', VOICE_CTX_TARGET_TOKENS: '2000' };
 		const fromNothing = resolveSessionTuning(cfg(), env);
