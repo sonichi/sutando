@@ -395,7 +395,7 @@ def mark_probe(file_age, mark_age, deadline="900", proc_age=9999):
     if mark_age is not None:
         md = tmp / "state" / "task-workstream-runs"; md.mkdir(parents=True)
         (md / "task-000.txt.started").write_text(json.dumps(
-            {"pid": MARK_PID, "started": round(_time.time() - mark_age, 3)}) + "\n")
+            {"pid": MARK_PID, "started": _time.time() - mark_age}) + "\n")
     ows, oh = hc.WORKSPACE_DIR, hc._worker_holdings
     hc.WORKSPACE_DIR = tmp
     # Only `ps` is stubbed; the REAL mark reader decides the runtime, with a
@@ -418,10 +418,10 @@ check("wedged" not in r["detail"], "and a waiter is never called wedged")
 r = mark_probe(5000, 1200)
 check(r["status"] == "warn",
       f"provider running 1200s past a 900s deadline -> warn (got {r['status']!r})")
-# int(elapsed), so a slow runner renders 1201: bound it instead of pinning a
-# second. 9999 (the process age) is far outside, so the guarantee is intact.
+# BOTH edges: rounding a start can render 1199, a slow runner 1201+. 9999 (the
+# process age) is far outside either, so the guarantee survives the tolerance.
 _m = re.search(r"running (\d+)s", r["detail"] or "")
-check(bool(_m) and 1200 <= int(_m.group(1)) <= 1230,
+check(bool(_m) and 1199 <= int(_m.group(1)) <= 1230,
       f"and it quotes the PROVIDER's runtime, not the 9999s process age "
       f"(got {_m.group(1) + 's' if _m else r['detail'][-60:]!r})")
 
@@ -478,7 +478,7 @@ def owner_probe(proc_age, mark, deadline="900"):
         owner, age = mark
         md = tmp / "state" / "task-workstream-runs"; md.mkdir(parents=True)
         (md / "task-000.txt.started").write_text(json.dumps(
-            {"pid": owner, "started": round(_time.time() - age, 3)}) + "\n")
+            {"pid": owner, "started": _time.time() - age}) + "\n")
     ows, oh = hc.WORKSPACE_DIR, hc._worker_holdings
     hc.WORKSPACE_DIR = tmp
     hc._worker_holdings = lambda ps_output=None: {
