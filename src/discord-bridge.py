@@ -207,6 +207,7 @@ from task_body_guard import confine_user_content  # noqa: E402
 from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_redaction import redact_chat_body  # noqa: E402
 from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
@@ -317,8 +318,6 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
-# Load token — env var takes precedence (allows test injection without a real .env file)
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 # Tighten perms whenever the token file exists — even when the token is already
 # in process env — so a world-readable .env never survives startup.
 channels_env = claude_home_path("channels", "discord", ".env")
@@ -330,16 +329,9 @@ if channels_env.exists():
         # restore/sync, or an ACL-restricted file must NOT crash the bridge at
         # startup — the file may still be perfectly readable. Warn and continue.
         print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
-if not TOKEN and channels_env.exists():
-    for line in channels_env.read_text().splitlines():
-        if line.startswith("DISCORD_BOT_TOKEN="):
-            TOKEN = line.split("=", 1)[1].strip()
-
-if not TOKEN:
-    # Last resort: the Keychain vault. Before this, no bridge read it, so
-    # `vault set DISCORD_BOT_TOKEN` stored the value and changed nothing.
-    from channel_token import token_from_vault  # noqa: E402
-    TOKEN = token_from_vault("DISCORD_BOT_TOKEN")
+# env -> channel .env -> vault; shared policy so quoting rules cannot drift.
+from channel_token import resolve_channel_token  # noqa: E402
+TOKEN = resolve_channel_token("DISCORD_BOT_TOKEN", env_file=channels_env)
 
 if not TOKEN:
     print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env "
@@ -3041,7 +3033,7 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    safe_log_text = redact_vault_commands(initial_secret_filter.text)
+    safe_log_text = redact_chat_body(text)   # the shared chain; see src/chat_redaction.py
     print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
@@ -4073,7 +4065,7 @@ async def _handle_discord_message(message, force=False):
         # self-contained-judgment form (root-cause 2026-06-25).
         lines.append(
             f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
-            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str}` — '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str}` — '
             f'and read it back (everyone\'s messages including your own prior replies) '
             f'until this message stands on its own, then answer from the reconstructed '
             f'thread, NOT from memory. Do this every time; do NOT skip it because the '
