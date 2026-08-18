@@ -40,8 +40,9 @@ const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
 export const VISION_MIN_SEND_INTERVAL_MS = 900;
-// Gemini Live documents a 1 fps maximum for video frames. Deriving this from the
-// send interval instead yielded 1.11 fps — a ceiling above the API's own limit.
+// https://ai.google.dev/gemini-api/docs/live-api — video is sampled at 1 fps.
+// Cite it: the repo states this rate nowhere else, so an uncited literal here
+// would be unfalsifiable for the next reader.
 export const MAX_FPS = 1.0;
 // Floor is deliberately below any shipping default: sub-0.5 rates exist so the
 // cost/cadence experiments can run, not because they are a good user default.
