@@ -1797,9 +1797,7 @@ def _write_task(task: dict) -> str | None:
         # exact task id — cheap (one stat per month dir, not a full tree walk).
         or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
     )
-    if (task_archived
-            or (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists()
-            or next(ARCHIVE_RESULTS_DIR.glob(f"{tid}-[0-9]*.txt"), None)):
+    if task_archived or _delivered_copy_exists(tid):
         rfile = RESULTS_DIR / f"{tid}.txt"
         if not rfile.exists():
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2683,7 +2681,8 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
             if _valid_local_tid(tid)
             and not (TASKS_DIR / f"{tid}.txt").exists()
             and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
-            and not (RESULTS_DIR / f"{tid}.txt").exists()}
+            and not (RESULTS_DIR / f"{tid}.txt").exists()
+            and not _task_archived_recently(tid)}
     confirmed = gone & suspects
     if confirmed:
         for tid in sorted(confirmed):
@@ -2691,6 +2690,185 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
             _log(f"dropped abandoned in-flight id {tid} (no task/result file — completed elsewhere)")
         _save_inflight(inflight)
     return gone - confirmed
+
+
+# A task archived here minutes ago was completed HERE, not elsewhere — its
+# result may still be seconds away (measured 7-minute gap, sonichi/sutando#3009).
+ARCHIVE_COMPLETION_GRACE_S = 1800.0
+
+
+def _archived_task_file(tid: str):
+    """The archived task file for tid, or None — flat and month-partitioned."""
+    base = TASKS_DIR / "archive"
+    flat = base / f"{tid}.txt"
+    if flat.exists():
+        return flat
+    hits = sorted(base.glob(f"*/{tid}.txt"))
+    return hits[-1] if hits else None
+
+
+def _task_archived_recently(tid: str) -> bool:
+    f = _archived_task_file(tid)
+    if f is None:
+        return False
+    try:
+        return (time.time() - f.stat().st_mtime) < ARCHIVE_COMPLETION_GRACE_S
+    except OSError:
+        return False
+
+
+# ── orphan-result reconciler (sonichi/sutando#3009) ─────────────────────────
+# Results whose tid left the in-flight ledger have no consumer.
+ORPHAN_SWEEP_EVERY_S = 600.0
+ORPHAN_GRACE_S = 600.0
+# Beyond this, an automatic sweep must not replay into a live room.
+ORPHAN_MAX_AGE_S = 86400.0
+_last_orphan_sweep = 0.0
+_orphan_quarantine_logged: set = set()
+
+
+# Exactly what the writers emit after `{tid}`: ONE epoch, optionally tagged,
+# optionally uniquified. A second `-\d+` would re-admit a longer id's entry.
+_ARCHIVE_SUFFIX = re.compile(r"-\d+(?:-late-duplicate)?(?:\.\d+)?\.txt\Z")
+
+
+def _delivered_copy_exists(tid: str) -> bool:
+    """Both archive conventions: flat `<tid>-<ts>.txt` AND month-partitioned
+    `YYYY-MM/<tid>.txt` (bare name) — a flat-only probe mis-routes real
+    replies to re-delivery (peer-measured 4/50 on a live corpus)."""
+    # The id boundary must be unambiguous: a bare `{tid}-*` glob also matches
+    # a LONGER valid id's archive entry, so `task-a` reads as delivered.
+    if any(_ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):])
+           for p in ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
+        return True
+    if (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists():   # flat bare: retired writer
+        return True
+    if any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}.txt")):
+        return True
+    return any(_ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):])
+               for p in ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
+
+
+def _move_no_clobber(src, dst) -> bool:
+    """Move src to dst or a uniquified sibling, never over an existing file:
+    os.link fails EEXIST atomically, where exists-then-rename clobbers."""
+    for candidate in (dst, dst.with_name(f"{dst.stem}.{time.time_ns()}{dst.suffix}")):
+        try:
+            os.link(str(src), str(candidate))
+        except FileExistsError:
+            continue
+        except OSError:
+            return False
+        try:
+            src.unlink()
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def _quarantine_orphan(rfile, tid: str, reason: str) -> bool:
+    """Never replaces prior quarantined evidence, under collision."""
+    UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    dst = UNDELIVERABLE_RESULTS_DIR / f"{tid}.{reason}.{int(time.time())}.txt"
+    return _move_no_clobber(rfile, dst)
+
+
+def _reconcile_orphan_results(inflight: "set[str]") -> None:
+    global _last_orphan_sweep
+    now = time.time()
+    if now - _last_orphan_sweep < ORPHAN_SWEEP_EVERY_S:
+        return
+    _last_orphan_sweep = now
+    try:
+        candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
+    except OSError:
+        return
+    for rfile in candidates:
+        tid = rfile.stem
+        if not _valid_local_tid(tid) or tid in inflight:
+            continue
+        try:
+            age = now - rfile.stat().st_mtime
+        except OSError:
+            continue
+        if age < ORPHAN_GRACE_S:
+            continue                            # young: normal path may claim it
+        if age > ORPHAN_MAX_AGE_S:
+            # A minimum age alone lets an automatic pass replay an unbounded
+            # historical backlog into live rooms; backfill must be deliberate.
+            if _quarantine_orphan(rfile, tid, "too-old"):
+                if tid not in _orphan_quarantine_logged:
+                    _orphan_quarantine_logged.add(tid)
+                    _log(f"orphan sweep: {tid} is {int(age)}s old (>{int(ORPHAN_MAX_AGE_S)}s) "
+                         "— quarantined rather than replayed")
+            continue
+        # Delivered copy = double-write. NEVER re-deliver: the sweep would
+        # post agent narration about having answered into the room.
+        if _delivered_copy_exists(tid):
+            ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            dst = ARCHIVE_RESULTS_DIR / f"{tid}-{int(now)}-late-duplicate.txt"
+            if _move_no_clobber(rfile, dst):
+                _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
+            continue
+        # No task anywhere: nothing resolves a destination — quarantine,
+        # never a labeled re-delivery (permanent sweep error otherwise).
+        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
+        if task is None:
+            if not _quarantine_orphan(rfile, tid, "no-task"):
+                continue
+            if tid not in _orphan_quarantine_logged:
+                _orphan_quarantine_logged.add(tid)
+                _log(f"orphan sweep: {tid} has no task file — quarantined")
+            continue
+        # Genuinely undelivered: ONE labeled attempt — at-least-once by
+        # design; the label makes the rare duplicate self-explaining.
+        body = read_ready_result(rfile)
+        if body is None:
+            continue
+        delivery = _delivery_tid(tid)
+        if delivery is None:
+            continue                            # alias ledger unreadable: retry later
+        parsed = parse_markers(body)
+        if [a for a in parsed.actions if a.kind == "attach"]:
+            # Delivering without the files would silently drop them — park
+            # for a human instead of composing a partial delivery.
+            if _quarantine_orphan(rfile, tid, "has-attachments"):
+                _log(f"orphan sweep: {tid} carries attachments — quarantined")
+            continue
+        skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip and skip.value == "deduped":
+            # _dedup_plan reports or requeues when the holder delivered
+            # nothing; posting here would retire the ask without that check.
+            if _quarantine_orphan(rfile, tid, "deduped-orphan"):
+                _log(f"orphan sweep: {tid} defers to its dedup holder — quarantined")
+            continue
+        if skip:
+            # Marker parity with _post_ready_results: original body goes up;
+            # the server suppresses user delivery and still closes the lease.
+            labeled = body
+        else:
+            labeled = ("(recovered result — original delivery was lost)\n"
+                       + parsed.body)
+            _r = next((a for a in parsed.actions if a.kind == "redirect"), None)
+            if _r:
+                labeled = f"[channel: {_r.value}]\n{labeled}"
+        try:
+            _req("POST", "/v1/results",
+                 {"id": _broker_tid(delivery), "body": labeled})
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                # Lease long gone: no consumer will ever accept this POST.
+                if _quarantine_orphan(rfile, tid, "lease-gone"):
+                    _log(f"orphan sweep: {tid} lease gone (HTTP {e.code}) — quarantined")
+            else:
+                _log(f"orphan sweep: {tid} POST failed HTTP {e.code} — will retry")
+            continue
+        except (urllib.error.URLError, TimeoutError) as e:
+            _log(f"orphan sweep: {tid} network error {e} — will retry")
+            continue
+        _archive_result(rfile, tid)
+        _log(f"orphan sweep: recovered + delivered {tid}")
 
 
 # ── MC1 per-workspace singleton (dual-poller guard) ─────────────────────────
@@ -2915,6 +3093,7 @@ def main() -> None:
             _post_ready_results(inflight)
             _post_proactive()
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
+            _reconcile_orphan_results(inflight)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
             _emit_gateway_status(True)
