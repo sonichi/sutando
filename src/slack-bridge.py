@@ -65,6 +65,12 @@ from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
 from proactive_routing import proactive_destination  # noqa: E402
+
+
+def _slack_claims_name(name: str) -> bool:
+    """Filename-level claim decision: an explicit destination for another
+    bridge is skipped; undestined and slack-destined names stay claimable."""
+    return proactive_destination(name) in (None, "slack")
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
@@ -1612,9 +1618,8 @@ def result_watcher():
                     if peek.startswith("[channel:") and \
                             re.match(r'\[channel:\s*\d{17,20}\]', peek):
                         continue
-                    # Explicit filename destination outranks the race: skip
-                    # anything declared for another bridge (owner 2026-08-18).
-                    if proactive_destination(f.name) not in (None, "slack"):
+                    # Explicit filename destination outranks the race.
+                    if not _slack_claims_name(f.name):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

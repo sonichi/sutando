@@ -87,6 +87,35 @@ def main() -> int:
               all(should_claim_proactive_file(alien, st, c) is False
                   for c in ("discord", "telegram", "ag2space")))
 
+    # slack's filename-level claim predicate (module-loadable without bolt).
+    import importlib.util as _ilu
+    import types as _types
+    for _m in ("slack_bolt", "slack_bolt.adapter", "slack_bolt.adapter.socket_mode"):
+        mod = _types.ModuleType(_m)
+        if _m.endswith("socket_mode"):
+            mod.SocketModeHandler = type("SocketModeHandler", (), {})
+        if _m == "slack_bolt":
+            mod.App = type("App", (), {"__init__": lambda self, **k: None,
+                                       "event": lambda self, *_a, **_k: (lambda f: f)})
+        sys.modules[_m] = mod
+    import os as _os
+    import tempfile as _tf
+    _os.environ.setdefault("SUTANDO_TEST_MODE", "1")
+    _os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
+    _os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
+    _spec = _ilu.spec_from_file_location("slackbridge_dest_test",
+                                         REPO / "src" / "slack-bridge.py")
+    _sb = _ilu.module_from_spec(_spec)
+    try:
+        _spec.loader.exec_module(_sb)
+        check("slack claims undestined", _sb._slack_claims_name("proactive-1.txt"))
+        check("slack claims its own destination",
+              _sb._slack_claims_name(proactive_filename(1, "slack")))
+        check("slack skips a foreign destination",
+              _sb._slack_claims_name(proactive_filename(1, "discord")) is False)
+    except Exception as e:  # pragma: no cover — loader env drift, not the predicate
+        check("slack bridge loadable for predicate checks", False, str(e))
+
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)
         return 1

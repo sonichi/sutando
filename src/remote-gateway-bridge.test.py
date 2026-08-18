@@ -548,6 +548,14 @@ def main() -> int:
     check(bool(_posted) and "[no-send]" in (_posted[0].get("body") or ""),
           "[no-send] body keeps its marker so the server suppresses delivery")
 
+    # Destined filenames outrank the gate's activity/grace logic entirely.
+    check(rtc._ag2space_proactive_claim_gate(
+              Path("proactive-1.to-ag2space.txt")) is True,
+          "gateway gate claims its own destined file unconditionally")
+    check(rtc._ag2space_proactive_claim_gate(
+              Path("proactive-1.to-discord.txt")) is False,
+          "gateway gate refuses a foreign destined file")
+
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
     rtc._write_task(TASK)
