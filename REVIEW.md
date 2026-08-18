@@ -182,9 +182,12 @@ and loads whichever repo it reviews.
     state at the arm site, and a maintainer had to disarm manually 78 seconds later.
     The same night's counter-example proves the cheap check works: a half-written
     "armed over a stale approval" bug report was discarded by reading
-    `reviewDecision: REVIEW_REQUIRED` first — this repo dismisses approvals on push,
-    so the feared exposure could not exist. Blocks survive pushes; approvals don't;
-    the current state, not the remembered one, is what authorizes.
+    `reviewDecision` first — it was `REVIEW_REQUIRED`, so no authorization was
+    outstanding to be stale. Blocks survive pushes; in this repo so do approvals
+    (`dismiss_stale_reviews_on_push: false` on both the classic and ruleset gate
+    surfaces) — an approval CAN be stale at arm time, which is exactly why the
+    re-read is necessary rather than optional. The current state, not the
+    remembered one, is what authorizes.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
