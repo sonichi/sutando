@@ -119,6 +119,24 @@ def _init(self, *a, **k):
     mod._STRIPED.add(os.path.realpath(str(self.root)))
 M.BClaimDriver.__init__ = _init
 
+# FIXTURE FIX: the machine's plant_dead_claim writes a 4-part B-format ghost
+# (key~ghost~pid~birth); designC.TOKEN_PARTS is 5 (adds generation), so C's
+# recover() skipped the ghost in EVERY prior run — the whole recover path
+# (live-holder check, _move re-arm, quarantine) was dead code in the matrix.
+# Plant a 5-part C-format ghost so recover's multi-step legs are exercised.
+import json as _json
+def _plant_dead_claim_c(self):
+    if any(self.busy.values()) or self._believers():
+        return
+    key = mod.safe_key(M.ITEM)
+    d = Path(self.root) / mod.INFLIGHT
+    if d.exists() and any(f.name.split(mod.SEP)[0] == key for f in d.iterdir()):
+        return
+    d.mkdir(parents=True, exist_ok=True)
+    ghost = d / mod.SEP.join((key, "ghost", str(M.DEAD_PID), "1", "0"))
+    ghost.write_text(_json.dumps({"body": "payload"}), encoding="utf-8")
+M.BClaimDriver.plant_dead_claim = _plant_dead_claim_c
+
 # in_flock-aware step: skip an actor parked in a flock wait instead of
 # burning the arrival window (mirrors the A-driver's flock_skip).
 def _step(self, actor, n):
