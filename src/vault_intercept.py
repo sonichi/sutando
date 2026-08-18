@@ -259,9 +259,9 @@ def intercept_vault_commands(text: str) -> InterceptResult:
             try:
                 from secret_scanner import DETECT_SECRETS_ACTIVE, scan_secrets
             except ImportError:
-                DETECT_SECRETS_ACTIVE = False  # no scanner module at all
-            # Branch on CAPABILITY, not import success: the guarded import
-            # loads in degraded mode, so an ImportError gate skips this.
+                DETECT_SECRETS_ACTIVE = False
+            # Capability gate: the guarded import loads even when degraded,
+            # so an ImportError gate would skip this refusal (yixuan, #3103).
             if not DETECT_SECRETS_ACTIVE:
                 # detect-secrets (the FP backstop) isn't installed. The vault-set
                 # regex is DELIBERATELY loose — it matches `vault set K V` anywhere,
