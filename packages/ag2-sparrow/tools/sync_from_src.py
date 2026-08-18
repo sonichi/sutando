@@ -26,11 +26,17 @@ MAP = {
     "dedup_recovery.py": "dedup_recovery.py",
     "workspace_lock.py": "workspace_lock.py",
     "chat_secret_filter.py": "chat_secret_filter.py",
+    "team_result_guard.py": "team_result_guard.py",
+    "team_guardrail.py": "team_guardrail.py",
     "vault_set_grammar.py": "vault_set_grammar.py",
     "send_failure_policy.py": "send_failure_policy.py",
     # send_failure_policy.resolve_failed_send imports it; vendoring one without
     # the other ships a copy that dies on first call (ModuleNotFoundError).
     "proactive_recovery.py": "proactive_recovery.py",
+    # outbox core + its transport seam: src-canonical like send_failure_policy,
+    # so the coverage gate (source = src) can see them.
+    "outbox.py": "outbox.py",
+    "outbox_adapter.py": "outbox_adapter.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"
