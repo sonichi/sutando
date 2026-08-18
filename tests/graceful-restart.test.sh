@@ -48,7 +48,7 @@ for _i in $(seq 1 "$N_CONC"); do
   # Check exit codes too: a peer that CRASHES also fails to restart, so the
   # decision count alone cannot tell a correct deferral from a dead process.
   case "$ra:$rb" in
-    0:4|4:0) : ;;
+    5:4|4:5) : ;;
     *) rc_bad=$((${rc_bad:-0} + 1)) ;;
   esac
   d=0
@@ -69,7 +69,7 @@ done
   && say ok "the losing peer deferred with a reason every time" \
   || say FAIL "peer deferred with a reason in only $deferrals/$N_CONC pairs"
 [ "$rc_bad" = 0 ] \
-  && say ok "winner exited 0 and loser exited 4 in every pair" \
+  && say ok "winner exited 5 (dry run) and loser exited 4 in every pair" \
   || say FAIL "$rc_bad/$N_CONC pairs had an unexpected exit-code pair (a CRASHED peer is indistinguishable from a deferring one by count alone)"
 # A LIVE lock must never be reaped, so an unreadable age fails CLOSED. Age comes
 # from the lock dir's own mtime, which mkdir sets atomically with the claim.
@@ -81,10 +81,14 @@ done
   && say ok "surviving sentinel intact + rid-stamped in all $N_CONC pairs" \
   || say FAIL "$bad_sentinel/$N_CONC pairs lost or corrupted the terminal sentinel"
 
+# A dry run reaches the restart decision and exits 5, not 0: the menu-bar app
+# maps the status to a notification and every 0 read as "Core restarted".
+DRY_OK=5
+
 echo "1. quiet core → prep runs directly → ready sentinel → dry-run restart"
 WS1="$TMP/ws1"; mkws "$WS1"
 out="$(GR_WS="$WS1" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"; rc=$?
-[ "$rc" = 0 ] && say ok "exit 0" || say FAIL "exit 0 (got $rc): $out"
+[ "$rc" = "$DRY_OK" ] && say ok "exit $DRY_OK (dry run)" || say FAIL "exit $DRY_OK (got $rc): $out"
 echo "$out" | grep -q "DRY-RUN — would exec" && say ok "reached restart" || say FAIL "reached restart: $out"
 echo "$out" | grep -q "prep-ready" && say ok "prep-ready reason" || say FAIL "prep-ready reason: $out"
 [ -f "$WS1/state/restart-ready.json" ] && say ok "ready sentinel written" || say FAIL "ready sentinel written"
@@ -102,7 +106,7 @@ start=$(date +%s)
 out="$(GR_WS="$WS2" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"; rc=$?
 took=$(( $(date +%s) - start ))
 wait "$flip" 2>/dev/null
-[ "$rc" = 0 ] && say ok "exit 0" || say FAIL "exit 0 (got $rc): $out"
+[ "$rc" = "$DRY_OK" ] && say ok "exit $DRY_OK (dry run)" || say FAIL "exit $DRY_OK (got $rc): $out"
 [ "$took" -ge 2 ] && say ok "waited for the idle flip (${took}s)" || say FAIL "waited for the idle flip (took ${took}s — gate did not hold)"
 echo "$out" | grep -q "prep-ready" && say ok "graceful after wait" || say FAIL "graceful after wait: $out"
 
@@ -112,7 +116,7 @@ printf '{"status":"running","step":"wedged","ts":%s}\n' "$(( $(date +%s) - 100 )
 start=$(date +%s)
 out="$(GR_WS="$WS3" GR_SYNC_CMD="true" GR_POLL_S=1 GR_STATUS_TTL_S=5 bash "$GR" --dry-run 2>&1)"; rc=$?
 took=$(( $(date +%s) - start ))
-[ "$rc" = 0 ] && say ok "exit 0" || say FAIL "exit 0 (got $rc): $out"
+[ "$rc" = "$DRY_OK" ] && say ok "exit $DRY_OK (dry run)" || say FAIL "exit $DRY_OK (got $rc): $out"
 [ "$took" -le 10 ] && say ok "proceeded promptly (${took}s)" || say FAIL "proceeded promptly (took ${took}s)"
 echo "$out" | grep -q "DRY-RUN — would exec" && say ok "restarted despite wedged status" || say FAIL "restarted despite wedged status: $out"
 
@@ -158,7 +162,7 @@ WS5="$TMP/ws5"; mkws "$WS5"
 rm -f "$WS5/state/cores/$HOST.alive"
 printf '{"status":"running","step":"ghost","ts":%s}\n' "$(date +%s)" > "$WS5/state/core-status.json"
 out="$(GR_WS="$WS5" GR_SYNC_CMD="false" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"; rc=$?
-[ "$rc" = 0 ] && say ok "exit 0" || say FAIL "exit 0 (got $rc): $out"
+[ "$rc" = "$DRY_OK" ] && say ok "exit $DRY_OK (dry run)" || say FAIL "exit $DRY_OK (got $rc): $out"
 echo "$out" | grep -q "agent-dead-abrupt" && say ok "dead-abrupt path" || say FAIL "dead-abrupt path: $out"
 echo "$out" | grep -q "DRY-RUN — would exec" && say ok "restarted" || say FAIL "restarted: $out"
 
@@ -264,7 +268,7 @@ echo "$out" | grep -q "core is DEAD" \
 echo "$out" | grep -qiE 'integer expression|unbound variable|File:' \
   && say FAIL "no arithmetic/unbound diagnostic leaked: $out" \
   || say ok "no arithmetic/unbound diagnostic"
-[ "$rc" = 0 ] && say ok "exit 0 under GNU-style stat" || say FAIL "exit 0 under GNU-style stat (got $rc): $out"
+[ "$rc" = "$DRY_OK" ] && say ok "exit $DRY_OK under GNU-style stat" || say FAIL "exit $DRY_OK under GNU-style stat (got $rc): $out"
 
 echo "9. A LIVE holder waiting longer than LOCK_STALE_S must NOT be reaped"
 # The gate is unbounded but `mkdir` stamps $LOCKDIR's mtime ONCE, so a holder
@@ -376,7 +380,7 @@ LOCK13="$WS13/state/locks/graceful-restart.lock"
 
 # The load-bearing assertion: the FOLLOWING run must not defer.
 out13b="$(GR_WS="$WS13" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"; rc13b=$?
-[ "$rc13b" = 0 ] && say ok "the run immediately after a dry-run proceeds (rc 0)" \
+[ "$rc13b" = "$DRY_OK" ] && say ok "the run immediately after a dry-run proceeds (rc $DRY_OK)" \
   || say FAIL "the run after a dry-run exited $rc13b (4 = self-deferred on its own stale lock)"
 echo "$out13b" | grep -q "another restart is in progress" \
   && say FAIL "the following run deferred to its own predecessor's lock" \
@@ -403,6 +407,26 @@ out14b="$(GR_WS="$WS15b" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&
 echo "$out14b" | grep -q "would exec 'start-cli.sh --restart'" \
   && say ok "no trailing args → bare --restart (negative control)" \
   || say FAIL "bare invocation did not produce a bare --restart argv: $(echo "$out14b" | grep 'would exec' | cut -c1-160)"
+
+echo "14b. a dry run must NOT exit 0 — the caller cannot tell it from a real restart"
+# The menu-bar app maps the status to a user-facing notification, and every
+# exit 0 read as "Core restarted". A rehearsal killed nothing, so it needs
+# its own code. Real-restart control below keeps this from passing vacuously.
+WS14c="$TMP/ws14c"; mkws "$WS14c"
+GR_WS="$WS14c" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run -- --visible >/dev/null 2>&1
+rc14c=$?
+[ "$rc14c" = 5 ] \
+  && say ok "dry run exits 5 (nothing killed or restarted)" \
+  || say FAIL "dry run exited $rc14c, want 5 — a caller cannot distinguish it from a real restart"
+
+WS14d="$TMP/ws14d"; mkws "$WS14d"
+stub14d="$TMP/stub-start-cli-14d.sh"
+printf '#!/bin/bash\nexit 0\n' > "$stub14d"; chmod +x "$stub14d"
+GR_WS="$WS14d" GR_SYNC_CMD="true" GR_POLL_S=1 GR_START_CLI="$stub14d" bash "$GR" -- --visible >/dev/null 2>&1
+rc14d=$?
+[ "$rc14d" = 0 ] \
+  && say ok "a REAL restart still exits 0 (control: 5 is not simply the new always)" \
+  || say FAIL "real restart exited $rc14d, want 0"
 
 echo "15. the REAL exec argv forwards the flag (not just the dry-run echo)"
 # Case 14 reads the dry-run log, and dry-run returns BEFORE the exec, so it

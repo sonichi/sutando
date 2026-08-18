@@ -2547,25 +2547,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let status = proc.terminationStatus
             self.graceful.finish(epoch: epoch, proc: proc)
 
-            switch status {
-            case 0:
-                self.notify("Sutando", "Core restarted. Attach via Open Core CLI in menu.")
-            case 3:
-                // Not a failure: exit 3 means nothing was killed.
-                self.notify("Sutando", "Restart stopped before the kill — prep failed, "
-                                      + "so the core is STILL RUNNING. Nothing was killed.")
-            case 4:
-                self.notify("Sutando", "Another restart is already in progress — this one deferred. "
-                                      + "(A recent --dry-run holds the lock for up to 15 min.)")
-            case 143:
-                // Cancelled by Force Restart: the TERM trap released the lock
-                // before any kill, so this is intended.
-                break
-            default:
+            // 143 = cancelled by Force Restart: the TERM trap released the lock
+            // before any kill, so it is intended and stays silent.
+            if let outcome = GracefulRestartInvocation.outcomeMessage(for: status) {
+                self.notify("Sutando", outcome)
+            } else if status != 143 {
                 let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 let errStr = String(data: errData, encoding: .utf8) ?? ""
                 let preview = String(errStr.prefix(200))
-                self.notify("Sutando", "Core restart failed (exit \(proc.terminationStatus)): \(preview)")
+                self.notify("Sutando", "Core restart failed (exit \(status)): \(preview)")
             }
         }
     }

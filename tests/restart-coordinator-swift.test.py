@@ -165,6 +165,11 @@ case "invocation-rehearse-off":
     print(GracefulRestartInvocation.args(script: "/s/gr.sh",
           env: ["SUTANDO_RESTART_REHEARSE": "0"]).joined(separator: " "))
 
+case "outcome-messages":
+    for st: Int32 in [0, 3, 4, 5, 143, 9] {
+        print("\(st)=" + (GracefulRestartInvocation.outcomeMessage(for: st) ?? "<nil>"))
+    }
+
 default:
     fatalError("unknown scenario \(scenario)")
 }
@@ -278,6 +283,30 @@ class TestRestartCoordinator(unittest.TestCase):
     def test_rehearse_requires_exactly_1(self):
         out = self.run_scenario("invocation-rehearse-off")
         self.assertEqual(["/s/gr.sh -- --visible"], out)
+
+    # The rehearsal notification. SUTANDO_RESTART_REHEARSE=1 adds --dry-run, the
+    # script returns without killing anything, and before this the caller mapped
+    # its status to the success message — reporting a restart that never ran.
+    def test_rehearsal_is_not_reported_as_a_restart(self):
+        msgs = dict(line.split("=", 1) for line in self.run_scenario("outcome-messages"))
+        self.assertNotEqual(msgs["0"], msgs["5"],
+                            "a rehearsal must not reuse the success message")
+        self.assertIn("NOT restarted", msgs["5"])
+        self.assertIn("nothing was killed", msgs["5"].lower())
+        self.assertNotIn("Core restarted", msgs["5"])
+
+    def test_every_documented_status_has_its_own_message(self):
+        msgs = dict(line.split("=", 1) for line in self.run_scenario("outcome-messages"))
+        documented = [msgs[k] for k in ("0", "3", "4", "5")]
+        self.assertEqual(len(set(documented)), 4, f"statuses share a message: {documented}")
+        self.assertIn("Core restarted", msgs["0"])
+
+    def test_cancel_and_unknown_stay_with_the_caller(self):
+        # nil means "caller decides": 143 is a silent intended cancel, and an
+        # undocumented status needs the stderr preview the mapping cannot see.
+        msgs = dict(line.split("=", 1) for line in self.run_scenario("outcome-messages"))
+        self.assertEqual("<nil>", msgs["143"])
+        self.assertEqual("<nil>", msgs["9"])
 
 
 if __name__ == "__main__":

@@ -142,4 +142,26 @@ enum GracefulRestartInvocation {
         return rehearse ? [script, "--dry-run", "--", "--visible"]
                         : [script, "--", "--visible"]
     }
+
+    /// The other half of the same contract: what each documented exit status
+    /// means. nil = the caller decides (143 cancel, or an undocumented failure).
+    static func outcomeMessage(for status: Int32) -> String? {
+        switch status {
+        case 0:
+            return "Core restarted. Attach via Open Core CLI in menu."
+        case 3:
+            return "Restart stopped before the kill — prep failed, "
+                 + "so the core is STILL RUNNING. Nothing was killed."
+        case 4:
+            return "Another restart is already in progress — this one deferred. "
+                 + "(A recent --dry-run holds the lock for up to 15 min.)"
+        case 5:
+            // Rehearsal reaches the same success path having killed nothing,
+            // so exit 0 here would report an action that did not happen.
+            return "Rehearsal only (SUTANDO_RESTART_REHEARSE=1) — the core was "
+                 + "NOT restarted and nothing was killed. Prep did run."
+        default:
+            return nil
+        }
+    }
 }

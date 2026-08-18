@@ -1,6 +1,7 @@
 #!/bin/bash
 # Graceful core-restart orchestrator. Flow, flags and rationale live in
-# notes/graceful-restart-design.md. Exit: 0 ok · 3 prep failed · 4 deferred.
+# notes/graceful-restart-design.md. Exit: 0 ok · 3 prep failed · 4 deferred ·
+# 5 dry-run (nothing killed or restarted).
 set -euo pipefail
 
 DRY_RUN=0
@@ -130,7 +131,9 @@ do_restart() {
   if [ "$DRY_RUN" = 1 ]; then
     # Echo the REAL argv: without it the passthrough is unobservable in dry-run.
     log "DRY-RUN — would exec 'start-cli.sh --restart${RESTART_ARGS_STR}' now ($reason). Skipping the actual kill."
-    return 0
+    # Exit rather than return: both call sites follow with `exit 0`, which is
+    # indistinguishable from a real restart to anyone reading the status.
+    exit 5
   fi
   log "restarting core ($reason)…"
   # The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
