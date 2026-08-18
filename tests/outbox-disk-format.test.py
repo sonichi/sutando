@@ -8,6 +8,12 @@ existing outbox suites: only CLAIMS_DIR was caught, and only incidentally (one
 test pre-creates `.claims` in setup, another globs it to locate a file).
 LOCKS_DIR, ITEMS_DIR and STRIPES_FENCE were caught by nothing.
 
+A first version of this file pinned only those directory names, and review
+showed that was still too narrow: the stripe COUNT, the fence payload, the
+stripe lock filename and the lifecycle item path could all move while every
+assertion here stayed green. Those are pinned below too - the concurrency
+protocol and the lifecycle layout are as much on-disk format as the paths.
+
 Expected values are spelled out as literals. Comparing a constant to itself, or
 rebuilding a name by calling the same helper that produces it, is a tautology
 that survives every rename - the golden values below are what make a rename fail.
@@ -16,6 +22,7 @@ Run: python3 tests/outbox-disk-format.test.py
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -74,6 +81,71 @@ def test_claim_dir_is_created_where_the_constant_says():
         assert ".claims" in on_disk, on_disk
         claims = {e.name for e in os.scandir(Path(tmp) / ".claims")}
         assert claims == {"item-1.59908df50572502c.claim"}, claims
+
+
+# -- concurrency protocol: the stripe count is a migration, not a tuning knob ---
+
+def test_lock_stripe_count_and_mapping():
+    """LOCK_STRIPES is part of the on-disk contract: it decides which lock file
+    an item takes, so two builds with different values stop excluding each other.
+    """
+    assert outbox.LOCK_STRIPES == 64, outbox.LOCK_STRIPES
+    # sha256(id) % 64, computed independently of _lock_stripe.
+    for item_id, expected in (("item-1", 51), ("a/b", 17), ("a_b", 34)):
+        assert outbox._lock_stripe(item_id) == expected, (item_id, outbox._lock_stripe(item_id))
+
+
+def test_fence_payload_as_written_by_the_production_writer():
+    """<root>/.claim-locks/stripes-active.json holds {"stripes": 64} exactly.
+
+    _stripe_mode refuses a fence declaring a different count, so the key name and
+    the value are both load-bearing for a rolling upgrade.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        assert outbox.activate_lock_striping(tmp) is True
+        fence = Path(tmp) / ".claim-locks" / "stripes-active.json"
+        assert fence.is_file(), sorted(p.name for p in (Path(tmp) / ".claim-locks").iterdir())
+        assert json.loads(fence.read_text()) == {"stripes": 64}, fence.read_text()
+
+
+def test_stripe_lock_filename_is_zero_padded_two_digits():
+    """stripe-NN.lock — the width is what makes two builds agree on one inode."""
+    with tempfile.TemporaryDirectory() as tmp:
+        outbox.activate_lock_striping(tmp)
+        assert outbox.acquire_delivery_claim(tmp, "item-1", drainer_id="d0")
+        locks = {p.name for p in (Path(tmp) / ".claim-locks").iterdir() if p.suffix == ".lock"}
+        assert locks == {"stripe-51.lock"}, locks
+
+
+def test_pre_migration_lock_filename_is_per_item():
+    """Without the fence, the lock is <safe-key>.lock — the same inode a
+    pre-striping build takes, which is what lets a rolling upgrade mix safely.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        assert outbox.acquire_delivery_claim(tmp, "item-1", drainer_id="d0")
+        locks = {p.name for p in (Path(tmp) / ".claim-locks").iterdir() if p.suffix == ".lock"}
+        assert locks == {"item-1.59908df50572502c.lock"}, locks
+
+
+# -- item lifecycle records ----------------------------------------------------
+
+def test_item_path_shape():
+    """<root>/.items/<readable>.<sha256[:16]>.json"""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = outbox._item_path(Path(tmp), "item-1")
+        assert p == Path(tmp) / ".items" / "item-1.59908df50572502c.json", p
+
+
+def test_lifecycle_file_written_by_the_production_writer():
+    """Drive note_attempt/park_item and inspect what actually lands on disk."""
+    with tempfile.TemporaryDirectory() as tmp:
+        assert outbox.note_attempt(tmp, "item-1") == 1
+        outbox.park_item(tmp, "item-1", reason="destination refused")
+        items = {p.name for p in (Path(tmp) / ".items").iterdir()}
+        assert items == {"item-1.59908df50572502c.json"}, items
+        rec = json.loads((Path(tmp) / ".items" / "item-1.59908df50572502c.json").read_text())
+        assert rec == {"item_id": "item-1", "attempts": 1,
+                       "status": "PARKED", "reason": "destination refused"}, rec
 
 
 if __name__ == "__main__":
