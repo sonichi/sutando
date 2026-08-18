@@ -125,6 +125,32 @@ def _locked(path: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+RUN_MARK_DIR = Path("state") / "task-workstream-runs"
+
+
+@contextmanager
+def _run_mark(workspace: Path, task_name: str):
+    """Stamp when the PROVIDER run starts, so a reader can tell it from lock wait.
+
+    Absent mark + live process = still waiting on the workstream lock, which is
+    progress, not a stall. Best-effort: a mark that cannot be written must never
+    stop the run it is only describing.
+    """
+    mark = workspace / RUN_MARK_DIR / f"{task_name}.started"
+    try:
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        mark.write_text(f"{time.time():.3f}\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"workstream session worker: could not write run mark: {exc}", file=sys.stderr)
+    try:
+        yield
+    finally:
+        try:
+            mark.unlink()
+        except OSError:
+            pass
+
+
 def _headers(task_file: Path) -> dict[str, str]:
     try:
         content = task_file.read_text(encoding="utf-8", errors="replace")
@@ -603,11 +629,14 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
         with _locked(workspace / "state" / "task-workstream-session-locks" / f"{lock_name}.lock"):
             if _completed_result_exists(results_dir, task_file.name):
                 return 0
-            body = (
-                _run_claude(workspace, workstream_id, _prompt(task_file), repo)
-                if runtime == "claude"
-                else _run_codex(workspace, workstream_id, _prompt(task_file), repo)
-            )
+            # Lock wait is not run time. Health checks compare the hard deadline
+            # to THIS mark, never to process age (sonichi/sutando#3059).
+            with _run_mark(workspace, task_file.name):
+                body = (
+                    _run_claude(workspace, workstream_id, _prompt(task_file), repo)
+                    if runtime == "claude"
+                    else _run_codex(workspace, workstream_id, _prompt(task_file), repo)
+                )
             if not body.strip():
                 raise RuntimeError(f"{runtime} returned an empty result")
             _publish_result(result_path, body)

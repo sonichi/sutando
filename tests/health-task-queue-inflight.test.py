@@ -276,10 +276,17 @@ if hasattr(hc, "_worker_holdings"):
                "session-worker.py --task-file /w/tasks/task-old.txt\n")
     PS_FRESH = ("    00:03 /usr/bin/python3 /r/skills/task-workstream-sessions/scripts/"
                 "session-worker.py --task-file /w/tasks/task-new.txt\n")
-    check(hc._worker_holdings(PS_AGED) == {"task-old.txt": 54001.0},
-          f"runtime parsed off the ps row (got {hc._worker_holdings(PS_AGED)})")
-    check(hc._worker_holdings(PS_FRESH) == {"task-new.txt": 3.0},
-          "a fresh holder reads as seconds")
+    # SUPERSEDED semantics, kept as an assertion rather than deleted: the value
+    # is the PROVIDER runtime, so a live process with no run mark reads WAITING.
+    check(hasattr(hc, "WAITING_FOR_LOCK") and
+          hc._worker_holdings(PS_AGED) == {"task-old.txt": hc.WAITING_FOR_LOCK},
+          f"a 900:01 pid with no run mark is WAITING, not 54001s "
+          f"(got {hc._worker_holdings(PS_AGED)})")
+    check(hasattr(hc, "WAITING_FOR_LOCK") and
+          hc._worker_holdings(PS_FRESH) == {"task-new.txt": hc.WAITING_FOR_LOCK},
+          "same for a fresh pid — process age is no longer the runtime")
+    check(hc._parse_etime("900:01") == 54001.0,
+          "the ps ELAPSED parser itself is unchanged and still tested")
     # argv-only output (no ELAPSED column) must still yield the filename, age unknown.
     check(hc._worker_holdings(PS) == {"task-aaa.txt": None, "task-bbb.txt": None},
           f"argv-only ps -> names with unknown age (got {hc._worker_holdings(PS)})")
@@ -304,6 +311,88 @@ if hasattr(hc, "_worker_holdings"):
               f"unreadable worker runtime -> warn, never quiet (got {ru['status']!r})")
         check("could not be read" in ru["detail"],
               "and it says why progress cannot be established")
+
+# ---- lock WAIT is not run time ------------------------------------------------
+# Same-workstream tasks serialize on a lock taken AFTER the process starts.
+def _runtime_for(name, proc_age):
+    """The module's own notion of runtime, or process age on a build that has
+    none — so these cases FAIL at the merge-base instead of raising there."""
+    return hc._provider_runtime(name, proc_age) if hasattr(hc, "_provider_runtime") else proc_age
+
+
+def mark_probe(file_age, mark_age, deadline="900"):
+    """mark_age None = no run mark on disk, i.e. still waiting for the lock."""
+    tmp = Path(tempfile.mkdtemp()); (tmp / "tasks").mkdir()
+    f = tmp / "tasks" / "task-000.txt"; f.write_text("x")
+    t0 = _time.time() - file_age; os.utime(f, (t0, t0))
+    if mark_age is not None:
+        md = tmp / "state" / "task-workstream-runs"; md.mkdir(parents=True)
+        (md / "task-000.txt.started").write_text(f"{_time.time() - mark_age:.3f}\n")
+    ows, oh = hc.WORKSPACE_DIR, hc._worker_holdings
+    hc.WORKSPACE_DIR = tmp
+    # Only `ps` is stubbed; the REAL mark reader decides the runtime, with a
+    # deliberately huge process age so a regression to pid-age cannot pass.
+    hc._worker_holdings = lambda ps_output=None: {
+        "task-000.txt": _runtime_for("task-000.txt", 9999)}
+    try:
+        with hard_timeout(deadline):
+            return hc.check_task_queue()
+    finally:
+        hc.WORKSPACE_DIR, hc._worker_holdings = ows, oh
+
+# THE PAIR the reviewer asked for, BEHAVIOURAL and unguarded. Both carry a
+# 9999s process age, so a build that uses pid age fails both.
+r = mark_probe(5000, None)
+check(r["status"] == "ok",
+      f"waiting for the lock (no run mark) -> ok (got {r['status']!r})")
+check("wedged" not in r["detail"], "and a waiter is never called wedged")
+
+r = mark_probe(5000, 1200)
+check(r["status"] == "warn",
+      f"provider running 1200s past a 900s deadline -> warn (got {r['status']!r})")
+check("running 1200s" in r["detail"], "and it quotes the PROVIDER's runtime")
+
+r = mark_probe(5000, 5)
+check(r["status"] == "ok",
+      f"fresh provider run on an old pid -> ok (got {r['status']!r})")
+
+check(hasattr(hc, "_provider_runtime"),
+      "runtime comes from a named reader, not from process age")
+
+if hasattr(hc, "_provider_runtime"):
+    # The mark reader itself, away from check_task_queue.
+    tmpm = Path(tempfile.mkdtemp()); ows = hc.WORKSPACE_DIR; hc.WORKSPACE_DIR = tmpm
+    try:
+        check(hc._provider_runtime("nope.txt", 500) == hc.WAITING_FOR_LOCK,
+              "absent mark + live process = WAITING_FOR_LOCK, not a runtime")
+        check(hc._provider_runtime("nope.txt", None) is None,
+              "absent mark + no process = unknown, not waiting")
+        md = tmpm / "state" / "task-workstream-runs"; md.mkdir(parents=True)
+        (md / "bad.txt.started").write_text("not-a-float\n")
+        check(hc._provider_runtime("bad.txt", 10) is None,
+              "an unreadable mark is unknown, never zero")
+    finally:
+        hc.WORKSPACE_DIR = ows
+
+    # A waiter must not be able to silence a genuinely wedged sibling.
+    tmp2 = Path(tempfile.mkdtemp()); (tmp2 / "tasks").mkdir()
+    for i, ma in ((0, None), (1, 1200)):
+        f = tmp2 / "tasks" / f"task-{i:03d}.txt"; f.write_text("x")
+        t0 = _time.time() - 5000; os.utime(f, (t0, t0))
+        if ma is not None:
+            md = tmp2 / "state" / "task-workstream-runs"; md.mkdir(parents=True, exist_ok=True)
+            (md / f"task-{i:03d}.txt.started").write_text(f"{_time.time() - ma:.3f}\n")
+    ows, oh = hc.WORKSPACE_DIR, hc._worker_holdings
+    hc.WORKSPACE_DIR = tmp2
+    hc._worker_holdings = lambda ps_output=None: {
+        n: _runtime_for(n, 9999) for n in ("task-000.txt", "task-001.txt")}
+    try:
+        with hard_timeout("900"):
+            rmix = hc.check_task_queue()
+    finally:
+        hc.WORKSPACE_DIR, hc._worker_holdings = ows, oh
+    check(rmix["status"] == "warn",
+          f"one waiter + one wedged sibling -> warn (got {rmix['status']!r})")
 
 print()
 if failures:

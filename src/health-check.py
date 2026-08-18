@@ -5612,11 +5612,37 @@ def _worker_holdings(ps_output: "str | None" = None) -> dict:
             continue
         fields = line.split()
         # Callers may pass argv-only output; then the first field is not an etime.
-        age = _parse_etime(fields[0]) if fields else None
+        proc_age = _parse_etime(fields[0]) if fields else None
         for tok in fields:
             if tok.endswith(".txt") and "/tasks/" in tok:
-                held[Path(tok).name] = age
+                name = Path(tok).name
+                held[name] = _provider_runtime(name, proc_age)
     return held
+
+
+#: The worker stamps this after acquiring its workstream lock; see
+#: session-worker.py::_run_mark. Absent + alive = still waiting for the lock.
+WORKER_RUN_MARK_DIR = Path("state") / "task-workstream-runs"
+WAITING_FOR_LOCK = "waiting"
+
+
+def _provider_runtime(task_name: str, proc_age: "float | None"):
+    """Seconds the PROVIDER has run, `WAITING_FOR_LOCK`, or None if unreadable.
+
+    Process age is the wrong quantity: the dispatcher starts handlers
+    concurrently and same-workstream tasks serialize on a lock taken AFTER the
+    process starts, so a fresh run can inherit a long-lived pid.
+    """
+    mark = WORKSPACE_DIR / WORKER_RUN_MARK_DIR / f"{task_name}.started"
+    try:
+        started = float(mark.read_text().strip())
+    except FileNotFoundError:
+        # No mark and a live process: the provider has not started yet.
+        return WAITING_FOR_LOCK if proc_age is not None else None
+    except (OSError, ValueError):
+        return None
+    age = time.time() - started
+    return age if age >= 0 else 0.0
 
 
 def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
@@ -5650,8 +5676,11 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     all_held = inflight == len(files)
     held_deadline = int(_worker_hard_timeout_s())
     ages = [holdings.get(f.name) for f in files if f.name in holdings]
-    # An unreadable runtime cannot establish progress — refuse to go quiet on it.
-    worker_age = None if (not ages or any(a is None for a in ages)) else int(max(ages))
+    # A holder still waiting for its workstream lock has not started running, so
+    # it can never be past its own deadline — that wait is progress, not a stall.
+    running = [a for a in ages if isinstance(a, (int, float))]
+    unreadable = any(a is None for a in ages)
+    worker_age = None if (unreadable or not ages) else (int(max(running)) if running else 0)
     held_is_progress = all_held and worker_age is not None and worker_age <= held_deadline
     wedged_note = (f" — still held by a live worker running {worker_age}s, past its own "
                    f"{held_deadline}s hard deadline, so the WORKER is wedged, not the watcher"
