@@ -96,6 +96,26 @@ def in_process_degraded_arm():
         check("refusal still names this interpreter",
               sys.executable in out)
         sys.modules.pop("vault_intercept", None)
+        # The no-module-at-all branch: hide secret_scanner itself and the
+        # refusal must still hold (DETECT_SECRETS_ACTIVE = False fallback).
+        class _HideScanner(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if name == "secret_scanner":
+                    raise ImportError("hidden for no-module arm")
+        hook2 = _HideScanner()
+        saved2 = sys.modules.pop("secret_scanner", None)
+        sys.meta_path.insert(0, hook2)
+        try:
+            import vault_intercept as vi2
+            out2 = vi2.intercept_vault_commands(
+                "vault set STRIPE_KEY sk-live-abc123XYZ").text
+            check("no-module arm: refusal holds without secret_scanner",
+                  "REFUSED" in out2 and sys.executable in out2)
+        finally:
+            sys.meta_path.remove(hook2)
+            sys.modules.pop("vault_intercept", None)
+            if saved2 is not None:
+                sys.modules["secret_scanner"] = saved2
     finally:
         sys.meta_path.remove(hook)
         sys.modules.pop("secret_scanner", None)
