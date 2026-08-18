@@ -161,6 +161,74 @@ try:
 finally:
     hc.subprocess.run = _orig_run
 
+# ---- the bound is the WORKER's CONFIGURED deadline, not a constant -----------
+# A fixed 900s pages above a raised deadline and hides an overdue worker below it.
+import contextlib
+
+
+@contextlib.contextmanager
+def hard_timeout(value):
+    prev = os.environ.get("SUTANDO_TIER_HARD_TIMEOUT")
+    if value is None:
+        os.environ.pop("SUTANDO_TIER_HARD_TIMEOUT", None)
+    else:
+        os.environ["SUTANDO_TIER_HARD_TIMEOUT"] = value
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("SUTANDO_TIER_HARD_TIMEOUT", None)
+        else:
+            os.environ["SUTANDO_TIER_HARD_TIMEOUT"] = prev
+
+
+# The two BEHAVIOURAL controls come first and use nothing this change adds, so
+# they fail as FAILs at the merge-base instead of dying on an AttributeError.
+with hard_timeout("1800"):
+    r = probe(1, 1, 1000)
+    check(r["status"] == "ok",
+          f"configured 1800s, held 1000s -> ok (got {r['status']!r})")
+    check("not stalled" in r["detail"], "and it says the worker is still working")
+    check("900s" not in r["detail"], "the detail quotes the CONFIGURED deadline, not 900")
+
+# Age 400s is UNDER stuck_age_sec, so the age test alone can never reach this.
+with hard_timeout("300"):
+    r = probe(1, 1, 400)
+    check(r["status"] == "warn",
+          f"configured 300s, held 400s -> warn (got {r['status']!r})")
+    check(r["status"] in ALERTABLE, "an overdue worker reaches the notifier")
+    check("300s hard deadline" in r["detail"], "the detail names the configured deadline")
+
+# The new clause is gated on all_held: an UNHELD young queue must stay quiet, or
+# every ordinary short-deadline deploy warns on a task nobody has claimed yet.
+with hard_timeout("300"):
+    r = probe(1, 0, 400)
+    check(r["status"] == "ok",
+          f"unheld + under stuck age stays ok on a short deadline (got {r['status']!r})")
+    r = probe(4, 2, 400)
+    check(r["status"] == "warn", f"a mixed queue still warns (got {r['status']!r})")
+
+check(hasattr(hc, "_worker_hard_timeout_s"),
+      "one named resolver owns the deadline, so claim-age and queue cannot drift")
+if hasattr(hc, "_worker_hard_timeout_s"):
+    with hard_timeout(None):
+        check(hc._worker_hard_timeout_s() == 900.0, "unset resolves to the worker's own default")
+    with hard_timeout("1800"):
+        check(hc._worker_hard_timeout_s() == 1800.0, "a configured longer deadline is honoured")
+    with hard_timeout("300"):
+        check(hc._worker_hard_timeout_s() == 300.0, "a configured shorter deadline is honoured")
+    # Non-positive and unparseable both make the worker refuse to start, so no
+    # running worker can hold them; the fallback must never page a permitted run.
+    for bad in ("0", "-5", "", "abc", "None"):
+        with hard_timeout(bad):
+            check(hc._worker_hard_timeout_s() == 900.0,
+                  f"{bad!r} falls back to the default rather than to a pageable bound")
+
+# The claim-age probe reads the SAME resolver, so the two cannot drift apart.
+with hard_timeout("7200"):
+    check(hc._task_claim_thresholds() == (14400.0, 57600.0),
+          f"claim thresholds track the configured deadline (got {hc._task_claim_thresholds()})")
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: " + "; ".join(failures))

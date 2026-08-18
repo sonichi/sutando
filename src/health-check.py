@@ -5615,12 +5615,15 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     held_note = f", {inflight} in flight with a worker" if inflight else ""
     oldest = min(files, key=lambda p: p.stat().st_mtime)
     oldest_age = int(now - oldest.stat().st_mtime)
-    # SUTANDO_TIER_HARD_TIMEOUT defaults to 900s, so past stuck_age_sec a live
-    # holder has outlived the limit it enforces on itself: wedged, not working.
+    # Bound the suppression by the WORKER's own deadline, not the queue's: past
+    # it a live holder has outlived the limit it enforces on itself.
     all_held = inflight == len(files)
-    held_is_progress = all_held and oldest_age <= stuck_age_sec
-    wedged_note = (f" — still held by a live worker past its own {stuck_age_sec}s "
+    held_deadline = int(_worker_hard_timeout_s())
+    held_is_progress = all_held and oldest_age <= held_deadline
+    wedged_note = (f" — still held by a live worker past its own {held_deadline}s "
                    "hard deadline, so the WORKER is wedged, not the watcher")
+    held_verdict = (" — all held by a live worker, not stalled" if held_is_progress
+                    else wedged_note if all_held else None)
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
@@ -5628,21 +5631,18 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
             # notify_for_failures), so rewording alone still fires the false alert.
             "status": "ok" if held_is_progress else "warn",
             "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
-                       + (" — all held by a live worker, not stalled" if held_is_progress
-                          else wedged_note if all_held
-                          else " — watcher or core may be stuck")),
+                       + (held_verdict or " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
     # message could sit indefinitely while this probe printed its age under "ok".
-    if oldest_age > stuck_age_sec:
+    # A worker configured SHORTER than stuck_age_sec is already overdue here, so
+    # the age test alone would let it fall through to "ok" and hide it.
+    if oldest_age > stuck_age_sec or (all_held and not held_is_progress):
         return {
             "name": name,
-            # held_is_progress is False here by construction (oldest_age >
-            # stuck_age_sec), so an all-held pile warns rather than going quiet.
             "status": "ok" if held_is_progress else "warn",
             "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
-                       + (wedged_note if all_held
-                          else f" — undrained past {stuck_age_sec}s")),
+                       + (held_verdict or f" — undrained past {stuck_age_sec}s")),
         }
     return {"name": name, "status": "ok",
             "detail": f"{len(files)} task(s){held_note}, oldest {oldest_age}s"}
@@ -6090,16 +6090,24 @@ _TASK_CLAIM_WARN_MULTIPLE = 2
 _TASK_CLAIM_DOWN_MULTIPLE = 8
 
 
-def _task_claim_thresholds() -> tuple[float, float]:
-    """(warn, down) seconds from the handler's configured hard timeout, falling back to
-    its default on anything unparseable so a threshold never pages a permitted run."""
+def _worker_hard_timeout_s() -> float:
+    """session-worker.py's own per-run deadline (`SUTANDO_TIER_HARD_TIMEOUT`).
+
+    Non-positive or unparseable makes the worker refuse to start
+    (session-worker.py:249-252), so the default is the only value a RUNNING
+    worker can hold — falling back to it never pages a permitted run.
+    """
     raw = os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "")
     try:
         hard = float(raw)
     except (TypeError, ValueError):
-        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
-    if hard <= 0:
-        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+        return _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+    return hard if hard > 0 else _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+
+
+def _task_claim_thresholds() -> tuple[float, float]:
+    """(warn, down) seconds from the handler's configured hard timeout."""
+    hard = _worker_hard_timeout_s()
     return hard * _TASK_CLAIM_WARN_MULTIPLE, hard * _TASK_CLAIM_DOWN_MULTIPLE
 
 
