@@ -15,17 +15,24 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
-# Delivery-control markers. A Team sender must never be able to redirect a reply
-# to another channel, attach a file, or suppress the reply, via result text.
-TEAM_RESULT_CONTROL = re.compile(
-    r"\[(?:channel|file|send|attach|dm-only|no-send|replied|deduped)\s*(?::|\])",
-    re.IGNORECASE,
-)
+# A marker is a control only where the shared parser EXECUTES it, so the guard
+# derives its classification from parse_markers rather than a parallel grammar.
+try:
+    from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
+except ImportError:
+    from result_markers import parse_markers  # monorepo src/ on sys.path
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
     "contain sensitive information. The owner can review the work locally."
+)
+
+TEAM_SUPPRESS_RESULT = (
+    "Task handled. The agent marked this reply as not-for-delivery; suppression "
+    "markers are not honoured on Team-tier results, so this notice is delivered "
+    "in its place. Nothing was withheld for content reasons."
 )
 
 # Only `owner` is exempt — markers are a feature for the owner and a capability
@@ -101,8 +108,13 @@ def load_team_result_scanner(repo: Path):
 
 def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
-    if TEAM_RESULT_CONTROL.search(body):
+    kinds = {action.kind for action in parse_markers(body or "").actions}
+    # dm-only only suppresses a redirect the guard already withholds, and a
+    # redirect it suppressed never executes -- neither is a control here.
+    if kinds & {"redirect", "attach"}:
         raise TeamResultLeakError("result delivery control marker")
+    if "skip" in kinds:
+        raise TeamResultLeakError("suppressive delivery marker")
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)
@@ -113,19 +125,73 @@ def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
     return body
 
 
+# The suppression verdict: one policy here, transport mechanics at the
+# edges (stub-alone where the server suppresses; notice where it delivers).
+_SKIP_STUB_LITERAL = {"no-send": "[no-send]", "REPLIED": "[REPLIED]"}
+_DEDUP_EXTRA_RE = re.compile(r"task-[A-Za-z0-9_-]{1,64}\Z")
+
+
+def suppression_stub_for_tier(body: str, tier) -> "str | None":
+    """The stub a guarded sender may close its lease with, or None.
+
+    None means NO suppression verdict -- the caller proceeds through
+    guard_result_for_tier as before (owner results, mixed markers,
+    out-of-grammar dedup extras, unknown future markers all land here)."""
+    if not is_guarded_tier(tier):
+        return None
+    parsed = parse_markers(body)
+    if not parsed.actions or any(a.kind != "skip" for a in parsed.actions):
+        return None
+    a = parsed.actions[0]
+    if a.value == "deduped":
+        extra = (a.extra or "").strip()
+        if _DEDUP_EXTRA_RE.fullmatch(extra):
+            return f"[deduped: {extra}]"
+        return None
+    return _SKIP_STUB_LITERAL.get(a.value)
+
+
+VERDICT_DELIVER = "deliver"
+VERDICT_LEAK = "leak"
+VERDICT_SUPPRESS = "suppress"
+
+
+class TeamResultVerdict(NamedTuple):
+    """kind: deliver | leak | suppress. body: what a notice-mechanics adapter
+    delivers; an adapter with a durable transport journal may realise SUPPRESS
+    as a journaled silent close instead -- the record requirement is the policy."""
+    kind: str
+    body: str
+    reason: "str | None"
+
+
+def classify_result_for_tier(body: str, tier, repo: Path,
+                             secret_filter=None) -> TeamResultVerdict:
+    """The guard-owned policy verdict. Adapters apply transport mechanics only;
+    re-deciding (or bypassing) this classification in a bridge is a boundary
+    violation, not an implementation choice."""
+    if not is_guarded_tier(tier):
+        return TeamResultVerdict(VERDICT_DELIVER, body, None)
+    try:
+        return TeamResultVerdict(
+            VERDICT_DELIVER, scan_team_result(body, repo, secret_filter), None)
+    except TeamResultLeakError as exc:
+        if str(exc) == "suppressive delivery marker":
+            return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT, str(exc))
+        return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT, str(exc))
+    except Exception as exc:
+        # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
+        # withheld, never delivered on the assumption that it was probably fine.
+        return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT,
+                                 f"scanner unavailable: {exc}")
+
+
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
-    by catching an exception — the safe body is the only one it is handed.
+    by catching an exception -- the safe body is the only one it is handed.
+    Derived from classify_result_for_tier so the verdict has exactly one owner.
     """
-    if not is_guarded_tier(tier):
-        return body, None
-    try:
-        return scan_team_result(body, repo, secret_filter), None
-    except TeamResultLeakError as exc:
-        return TEAM_LEAK_RESULT, str(exc)
-    except Exception as exc:
-        # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
-        # withheld, never delivered on the assumption that it was probably fine.
-        return TEAM_LEAK_RESULT, f"scanner unavailable: {exc}"
+    verdict = classify_result_for_tier(body, tier, repo, secret_filter)
+    return verdict.body, verdict.reason
