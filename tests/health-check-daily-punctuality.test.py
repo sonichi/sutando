@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -23,9 +24,10 @@ except SystemExit:
     pass
 
 
-def job(name, hour, minute, arts, today_seen=True, since_due=0):
+def job(name, hour, minute, arts, today_seen=True, since_due=0, conditional=False):
     return {"name": name, "hour": hour, "minute": minute, "artifacts": arts,
-            "today_seen": today_seen, "minutes_since_due": since_due}
+            "today_seen": today_seen, "minutes_since_due": since_due,
+            "conditional": conditional, "stem_declared": False}
 
 
 DUE = 6 * 60 + 50
@@ -233,6 +235,55 @@ class TestCollector(unittest.TestCase):
     def test_a_dict_shaped_config_is_read_too(self):
         r = self._run(json.dumps({"crons": [{"name": "x", "cron": "*/5 * * * *"}]}))
         self.assertIn("no session-owned daily jobs", r["detail"])
+
+    def test_a_declared_artifact_beats_the_name_derived_stem(self):
+        """`talk-events-nightly` infers stem `nightly`, so its real
+        fleet-growth-<date>.mp4 is never observed and the job is UNCHECKED
+        forever — invisible behind a status that is not a failure."""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        arts = [(f"fleet-growth-{today}.mp4", now.timetuple())]
+        entry = {"name": "talk-events-nightly", "cron": f"{now.minute} {now.hour} * * *"}
+        inferred = self._run(json.dumps({"crons": [entry]}), arts)
+        declared = self._run(
+            json.dumps({"crons": [dict(entry, artifact="fleet-growth")]}), arts)
+        self.assertIn("UNCHECKED", inferred["detail"])
+        self.assertNotIn("UNCHECKED", declared["detail"])
+        self.assertEqual(declared["status"], "ok", declared["detail"])
+
+    def test_an_inferred_stem_that_matched_nothing_never_reports_a_miss(self):
+        """A wrong stem and a job that did not run are the same observation.
+        Calling it missed would alarm on a job the probe cannot even see."""
+        entry = {"name": "talk-events-nightly", "cron": "0 3 * * *"}
+        r = self._run(json.dumps({"crons": [entry]}), ())
+        self.assertNotIn("no output today", r["detail"])
+        self.assertIn("UNCHECKED", r["detail"])
+
+
+class TestConditionalProducers(unittest.TestCase):
+    """A job that renders only when new input exists produces nothing on a quiet
+    day. Absence is then evidence of nothing, not evidence of a miss."""
+
+    def test_the_reviewers_control_prior_artifacts_none_today_120min_late(self):
+        prior = [(f"2026-08-{d:02d}", 361) for d in range(6, 13)]
+        unconditional = job("render", 6, 0, prior, today_seen=False, since_due=120)
+        self.assertEqual(
+            hc._interpret_daily_punctuality([unconditional])["status"], "warn",
+            "an UNCONDITIONAL producer with no output today must still warn")
+
+        conditional = job("render", 6, 0, prior, today_seen=False, since_due=120,
+                          conditional=True)
+        r = hc._interpret_daily_punctuality([conditional])
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertNotIn("no output today", r["detail"])
+
+    def test_conditional_does_not_suppress_LATENESS(self):
+        """Only absence is excused. A conditional job that renders consistently
+        late is still late, and that signal must survive the exemption."""
+        late = [(f"2026-08-{d:02d}", 6 * 60 + 0 + 200) for d in range(6, 13)]
+        r = hc._interpret_daily_punctuality(
+            [job("render", 6, 0, late, today_seen=True, conditional=True)])
+        self.assertEqual(r["status"], "warn", r["detail"])
 
 
 if __name__ == "__main__":

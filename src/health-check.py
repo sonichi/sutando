@@ -5184,7 +5184,9 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         median = statistics.median(deltas)
         if median > DAILY_LATE_TOLERANCE_MIN:
             late.append((j["name"], median, len(deltas)))
-        if not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN:
+        if (not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN
+                and not j.get("conditional")
+                and (j.get("stem_declared") or j["artifacts"])):
             missed.append((j["name"], j["minutes_since_due"]))
     if not late and not missed:
         seen = len(jobs) - len(unknown)
@@ -5268,12 +5270,19 @@ def check_daily_cron_punctuality() -> dict:
         except ValueError:
             malformed.append(f"{jname} ({' '.join(f[:2])})")
             continue
-        stem = jname.split("-")[-1] if "-" in jname else jname
+        # A NAME is not an artifact: "talk-events-nightly" infers stem "nightly"
+        # and never sees its real fleet-growth-<date>.mp4 output.
+        declared = str(e.get("artifact") or "").strip()
+        stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
         arts = _daily_artifact_minutes(ws / "results", stem)
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
+            "stem": stem, "stem_declared": bool(declared),
+            # Renders only when new input exists, so a quiet day produces nothing
+            # and absence is evidence of nothing rather than of a miss.
+            "conditional": bool(e.get("conditional")),
         })
     if malformed:
         return {"name": name, "status": "warn",
