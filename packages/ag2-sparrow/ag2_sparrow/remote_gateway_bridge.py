@@ -2539,13 +2539,15 @@ def _delivery_core() -> DeliveryCore:
     claim, retry, ambiguity and crash-recovery semantics live in DeliveryCore;
     this bridge keeps presentation (guard, markers, attachments) and the
     resolved dirs. max_attempts=None preserves the legacy semantics — a failed
-    POST retries on every pass, never parks. The one narrowing: UNKNOWN on
-    both the send and its idempotent re-send parks the item
-    ("outcome-unknown"); the NOT_CLAIMED log names the operator recipe."""
+    POST retries on every pass, never terminally. The root lives INSIDE the
+    results dir it drains (archive/ and undelivered/ precedent), so every
+    harness that redirects RESULTS_DIR is hermetic for free; the singleton is
+    keyed by that root and recomposes when it moves."""
     global _DELIVERY_CORE
-    if _DELIVERY_CORE is None:
+    root = RESULTS_DIR / f".outbox{_INST_SUFFIX}"
+    if _DELIVERY_CORE is None or _DELIVERY_CORE.backend.root != root:
         _DELIVERY_CORE = DeliveryCore(
-            DesignAClaimBackend(_STATE / f"remote-outbox{_INST_SUFFIX}"),
+            DesignAClaimBackend(root),
             # Late-bound so token rotation reassigning module globals (and the
             # test harness's _req double) reach the provider mid-process.
             AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)),
@@ -2563,9 +2565,10 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str) -> bool:
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
     if res.status is DrainStatus.NOT_CLAIMED:
-        _log(f"result {tid}: outbox item not claimable "
-             f"(attempts={core.backend.attempts(broker_tid)}) — parked or "
-             "contested; requeue with delivery_core force_release if parked")
+        # A dead prior incarnation's claim; reclaim-TTL recovers it, and
+        # with an idempotent provider nothing parks on ambiguity.
+        _log(f"result {tid}: outbox item not claimable this pass "
+             f"(attempts={core.backend.attempts(broker_tid)}) — will retry")
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
         return True

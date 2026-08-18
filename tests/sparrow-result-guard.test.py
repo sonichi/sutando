@@ -273,7 +273,9 @@ def drain_two_pass():
         if path != "/v1/results":
             return {}
         attempts["n"] += 1
-        if attempts["n"] == 1:
+        # The drain's idempotent re-send retries ambiguity once IN-pass, so a
+        # genuinely failed pass must fail both the send and its re-send.
+        if attempts["n"] <= 2:
             raise urllib.error.URLError("transient")
         posted.append(payload)
         return {}

@@ -127,6 +127,45 @@ def main() -> int:
               and res.outcome is DeliveryOutcome.CONFIRMED)
         check("exactly two gateway calls (send + safe resend)", len(gw.calls) == 2)
 
+    # Double-UNKNOWN completes retryable under the idempotent-send license —
+    # parking would strand an item a later safe re-send could still deliver.
+    with tempfile.TemporaryDirectory() as td:
+        gw = ScriptedGateway(TimeoutError("t1"), TimeoutError("t2"),
+                             {"ok": True, "duplicate": True})
+        core = DeliveryCore(DesignAClaimBackend(Path(td)),
+                            AG2SpaceResultProvider(gw),
+                            policy=RetryPolicy(max_attempts=None), worker="w")
+        core.backend.publish("task-X", ENVELOPE)
+        res = core.deliver_one("task-X", ENVELOPE)
+        check("double-UNKNOWN completes NOT_DELIVERED (retryable), not parked",
+              res.outcome is DeliveryOutcome.NOT_DELIVERED)
+        res = core.deliver_one("task-X", ENVELOPE)
+        check("next pass re-claims and the rid-dedup answer confirms",
+              res.outcome is DeliveryOutcome.CONFIRMED)
+
+    # A DELIVERED id is a completed lifecycle, not a live item: the same
+    # broker tid can carry a later, distinct send (fresh cycle, C-parity).
+    with tempfile.TemporaryDirectory() as td:
+        gw = ScriptedGateway({"ok": True}, {"ok": True})
+        core = DeliveryCore(DesignAClaimBackend(Path(td)),
+                            AG2SpaceResultProvider(gw),
+                            policy=RetryPolicy(max_attempts=None), worker="w")
+        core.backend.publish("task-X", ENVELOPE)
+        check("first cycle confirms",
+              core.deliver_one("task-X", ENVELOPE).outcome
+              is DeliveryOutcome.CONFIRMED)
+        check("re-publish after DELIVERED starts a fresh cycle",
+              core.backend.publish("task-X", ENVELOPE) is True)
+        check("fresh cycle delivers independently",
+              core.deliver_one("task-X", ENVELOPE).outcome
+              is DeliveryOutcome.CONFIRMED)
+        core.backend.publish("task-Y", ENVELOPE)
+        t = core.backend.claim("task-Y", "w")
+        core.backend.complete(t, DeliveryOutcome.OUTCOME_UNKNOWN)
+        # UNKNOWN park is unreachable for THIS provider, planted directly:
+        check("PARKED still refuses re-publish (operator holds it)",
+              core.backend.publish("task-Y", ENVELOPE) is False)
+
     # Refusals stay retryable forever under max_attempts=None (the legacy
     # retry-every-pass semantics this adapter keeps).
     with tempfile.TemporaryDirectory() as td:
