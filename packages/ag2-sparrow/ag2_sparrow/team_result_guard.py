@@ -16,8 +16,8 @@ import re
 import sys
 from pathlib import Path
 
-# Delivery-control markers. A Team sender must never be able to redirect a reply
-# to another channel, attach a file, or suppress the reply, via result text.
+# LEGACY re-export only — detection now derives from result_markers.parse_markers
+# (per-family slot rules); this unanchored form over-matched prose mentions.
 TEAM_RESULT_CONTROL = re.compile(
     r"\[(?:channel|file|send|attach|dm-only|no-send|replied|deduped)\s*(?::|\])",
     re.IGNORECASE,
@@ -25,8 +25,22 @@ TEAM_RESULT_CONTROL = re.compile(
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
-    "contain sensitive information. The owner can review the work locally."
+    "contain sensitive information or delivery-control markers. The original "
+    "output is saved for owner review under state/withheld-team-results/ on "
+    "the host."
 )
+
+# The reply when persistence ITSELF failed: never claim a saved copy that
+# does not exist, and never release the body either.
+TEAM_LEAK_RESULT_UNSAVED = (
+    "I completed the Team task, but the response was withheld because it may "
+    "contain sensitive information or delivery-control markers. Saving the "
+    "original for owner review ALSO failed, so no copy exists."
+)
+
+# Withheld bodies are persisted here (workspace-relative) so the placeholder
+# above is TRUE — before this existed the body was simply dropped.
+WITHHELD_DIR_RELPATH = "state/withheld-team-results"
 
 # Only `owner` is exempt — markers are a feature for the owner and a capability
 # for everyone else. Stated as an exemption so an unknown tier guards by default.
@@ -99,10 +113,30 @@ def load_team_result_scanner(repo: Path):
     return filter_chat_secrets
 
 
+def _control_marker_families(body: str) -> "list[str]":
+    """Marker families a CONSUMER would act on, from the canonical grammar.
+
+    src/result_markers.py owns per-family slot rules (skip/redirect anchored,
+    attach unanchored, dm-only anywhere). Deriving detection from the same
+    parser keeps the guard exactly as wide as every consumer, per family —
+    a mid-prose MENTION of an anchored marker is prose, not an action."""
+    from result_markers import parse_markers
+    seen: list[str] = []
+    for action in parse_markers(body).actions:
+        if action.kind not in seen:
+            seen.append(action.kind)
+    return seen
+
+
 def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
-    if TEAM_RESULT_CONTROL.search(body):
-        raise TeamResultLeakError("result delivery control marker")
+    try:
+        families = _control_marker_families(body)
+    except Exception as exc:
+        raise TeamResultLeakError(f"marker grammar unavailable: {exc}") from exc
+    if families:
+        raise TeamResultLeakError(
+            "delivery-control marker in effect: " + ", ".join(families))
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)
@@ -124,8 +158,41 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None):
     try:
         return scan_team_result(body, repo, secret_filter), None
     except TeamResultLeakError as exc:
-        return TEAM_LEAK_RESULT, str(exc)
+        return _withheld_reply(body, str(exc)), str(exc)
     except Exception as exc:
         # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
         # withheld, never delivered on the assumption that it was probably fine.
-        return TEAM_LEAK_RESULT, f"scanner unavailable: {exc}"
+        reason = f"scanner unavailable: {exc}"
+        return _withheld_reply(body, reason), reason
+
+
+def _withheld_reply(body: str, reason: str) -> str:
+    """The placeholder claims a saved copy only when one actually exists."""
+    if persist_withheld_body(body, reason) is not None:
+        return TEAM_LEAK_RESULT
+    return TEAM_LEAK_RESULT_UNSAVED
+
+
+def persist_withheld_body(body: str, reason: str) -> "str | None":
+    """Save a withheld body for owner review; returns the path or None.
+
+    Best-effort BY DESIGN: a persistence failure must never resurrect the
+    body or fail the withhold — the guard's verdict stands either way."""
+    try:
+        import os
+        import time
+        from workspace_default import resolve_workspace
+        directory = resolve_workspace() / WITHHELD_DIR_RELPATH
+        directory.mkdir(parents=True, exist_ok=True)
+        # uuid4 suffix: ms+pid collides for same-process same-ms withholds;
+        # a swallowed O_EXCL failure then falsifies the "saved" claim.
+        import uuid
+        path = directory / (
+            f"withheld-{int(time.time() * 1000)}-{os.getpid()}"
+            f"-{uuid.uuid4().hex[:8]}.txt")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"withheld_reason: {reason}\n---\n{body}")
+        return str(path)
+    except Exception:
+        return None

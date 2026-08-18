@@ -184,9 +184,8 @@ def persist_withheld_body(body: str, reason: str) -> "str | None":
         from workspace_default import resolve_workspace
         directory = resolve_workspace() / WITHHELD_DIR_RELPATH
         directory.mkdir(parents=True, exist_ok=True)
-        # uuid4 suffix: ms+pid alone collides for two withholds in the same
-        # process and millisecond; a swallowed O_EXCL failure then falsifies
-        # the placeholder's "saved" claim.
+        # uuid4 suffix: ms+pid collides for same-process same-ms withholds;
+        # a swallowed O_EXCL failure then falsifies the "saved" claim.
         import uuid
         path = directory / (
             f"withheld-{int(time.time() * 1000)}-{os.getpid()}"

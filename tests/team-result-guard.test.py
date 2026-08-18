@@ -53,12 +53,8 @@ def _raises(_body):
 def behavioral() -> list:
     fails = []
     cases = [
-        # name, body, tier, filter, expect_withheld
-        #
-        # Detection derives from result_markers.parse_markers, so the guard is
-        # exactly as wide as every consumer PER FAMILY: anchored families
-        # (skip/redirect) only count in their canonical slot; attach and
-        # dm-only count anywhere, matching their consumers.
+        # name, body, tier, filter, expect_withheld — guard width tracks
+        # parse_markers per family (anchored vs anywhere), matching consumers.
         ("owner keeps its markers", "[channel: 123]\nsee this", "owner", _clean, False),
         ("owner keeps an attach", "[attach: /tmp/x.png]", "owner", _clean, False),
         ("team redirect (body start) withheld", "[channel: 123]\nthe reply", "team", _clean, True),
@@ -109,9 +105,8 @@ def behavioral() -> list:
     if not guard.is_guarded_tier("Owner "):
         pass  # case/space-insensitive owner is intentionally exempt
 
-    # Wideness invariant: any body the CONSUMER grammar acts on must be
-    # withheld for a guarded tier — derived over every family the parser
-    # can emit, so a new marker family cannot silently bypass the guard.
+    # Any body the consumer grammar acts on must be withheld for a guarded
+    # tier, over every parser family — new families cannot bypass the guard.
     from result_markers import parse_markers
     family_uses = {
         "skip": "[no-send]\nbody",
@@ -136,7 +131,7 @@ def behavioral() -> list:
         os.environ["SUTANDO_WORKSPACE_FOR_TEST"] = td
         import workspace_default as wd
         real_resolve = wd.resolve_workspace
-        wd.resolve_workspace = lambda: Path(td)
+        wd.resolve_workspace = lambda *a, **kw: Path(td)
         try:
             secret_body = "[channel: 5]\nthe withheld payload"
             out, why = guard.guard_result_for_tier(secret_body, "team", REPO, secret_filter=_clean)
@@ -155,14 +150,13 @@ def behavioral() -> list:
             wd.resolve_workspace = real_resolve
             os.environ.pop("SUTANDO_WORKSPACE_FOR_TEST", None)
 
-    # Same-millisecond durability: two withholds in one process+ms must BOTH
-    # persist (uuid suffix), and a persistence failure must switch the
-    # placeholder to the no-copy-exists variant, never claim "saved".
+    # Two same-process same-ms withholds must BOTH persist; a persist
+    # failure must switch to the no-copy variant, never claim "saved".
     import time as _time
     with tempfile.TemporaryDirectory() as td:
         import workspace_default as wd2
         real_resolve2 = wd2.resolve_workspace
-        wd2.resolve_workspace = lambda: Path(td)
+        wd2.resolve_workspace = lambda *a, **kw: Path(td)
         real_time = _time.time
         _time.time = lambda: 1700000000.123  # frozen clock: same ms for both
         try:

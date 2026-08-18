@@ -851,11 +851,8 @@ def test_team_output_injection_cannot_control_bridge_delivery() -> None:
             raise AssertionError("Team result must not control bridge delivery")
         except worker.TeamResultLeakError as exc:
             assert str(exc).startswith("delivery-control marker in effect:")
-    # Guard width equals the CONSUMER grammar by construction: an uppercase
-    # "[CHANNEL:" never redirects (result_markers' redirect regex is
-    # case-sensitive), so the guard passing it is consistent — pinned by
-    # asserting BOTH facts together, so an IGNORECASE change in the grammar
-    # flips this test rather than silently widening delivery.
+    # Uppercase "[CHANNEL:" is inert for consumers (case-sensitive regex);
+    # asserting both facts pins guard width to the consumer grammar.
     from result_markers import parse_markers
     inert = "[CHANNEL: owner-dm]\nredirect"
     assert parse_markers(inert).actions == [], "case-variant redirect must be inert for consumers"
