@@ -65,7 +65,12 @@ def behavioral() -> list:
         ("team no-send withheld", "[no-send]", "team", _clean, True),
         ("team deduped withheld", "[deduped: task-1]", "team", _clean, True),
         ("team no-send MENTION passes", "the [no-send] marker is documented", "team", _clean, False),
+        # The parser peels a D7 header before reading skips, so the guard must
+        # classify what parse_markers EXECUTES, not what body-start text shows.
+        ("team D7-headed no-send withheld", "**[core: 1]**\n[no-send]\nhide", "team", _clean, True),
+        ("team non-leading channel passes", "intro\n[channel: 123]\nquoted", "team", _clean, False),
         ("team dm-only passes", "text\n[dm-only]\nmore", "team", _clean, False),
+        ("team dm-only suppressed redirect passes", "[dm-only]\n[channel: 123]\nboth", "team", _clean, False),
         ("team secret withheld", "ordinary text", "team", _leaky, True),
         ("team clean text passes", "ordinary text", "team", _clean, False),
         ("guest guarded like team", "[channel: 9]\nx", "guest", _clean, True),
@@ -73,7 +78,8 @@ def behavioral() -> list:
         ("None tier guarded", "[channel: 9]\nx", None, _clean, True),
     ]
     # Suppressive markers get the HONEST notice; everything else the leak one.
-    _suppress_names = {"team no-send withheld", "team deduped withheld"}
+    _suppress_names = {"team no-send withheld", "team deduped withheld",
+                       "team D7-headed no-send withheld"}
     for name, body, tier, filt, expect in cases:
         out, why = guard.guard_result_for_tier(body, tier, REPO, secret_filter=filt)
         withheld = why is not None

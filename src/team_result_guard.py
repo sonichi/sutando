@@ -12,22 +12,15 @@ their own tier lookup and delivery; they must not restate any of it.
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
-# A marker is a control only WHERE result_markers executes it: [channel:] at
-# line start, attach aliases anywhere (their regex is unanchored).
-TEAM_RESULT_CONTROL = re.compile(
-    r"(?m:^\s*\[channel\s*(?::|\]))|\[(?:file|send|attach)\s*(?::|\])",
-    re.IGNORECASE,
-)
-
-# Suppressive markers are controls at BODY START only (the router's reach) and
-# stay withheld there: a guarded sender must not close its own lease silently.
-TEAM_SUPPRESS_CONTROL = re.compile(
-    r"\A\s*\[(?:no-send\]|replied\]|deduped\s*:)", re.IGNORECASE,
-)
+# A marker is a control only where the shared parser EXECUTES it, so the guard
+# derives its classification from parse_markers rather than a parallel grammar.
+try:
+    from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
+except ImportError:
+    from result_markers import parse_markers  # monorepo src/ on sys.path
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -113,9 +106,12 @@ def load_team_result_scanner(repo: Path):
 
 def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
-    if TEAM_RESULT_CONTROL.search(body):
+    kinds = {action.kind for action in parse_markers(body or "").actions}
+    # dm-only only suppresses a redirect the guard already withholds, and a
+    # redirect it suppressed never executes -- neither is a control here.
+    if kinds & {"redirect", "attach"}:
         raise TeamResultLeakError("result delivery control marker")
-    if TEAM_SUPPRESS_CONTROL.match(body or ""):
+    if "skip" in kinds:
         raise TeamResultLeakError("suppressive delivery marker")
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:

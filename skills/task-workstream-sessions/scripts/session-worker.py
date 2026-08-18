@@ -40,7 +40,6 @@ if _GUARD_ROOT is not None and str(_GUARD_ROOT / "src") not in sys.path:
 from team_guardrail import TEAM_GUARDRAIL  # noqa: E402
 from team_result_guard import (  # noqa: E402
     TEAM_LEAK_RESULT,
-    TEAM_RESULT_CONTROL,
     TeamResultLeakError,
     load_team_result_scanner as _load_team_result_scanner,
     resolve_access_tier,
