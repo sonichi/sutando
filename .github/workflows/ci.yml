@@ -12,7 +12,7 @@ env:
 
 jobs:
   typecheck-and-test:
-    name: tsc + tests (clean install)
+    name: typecheck + node & shell tests
     runs-on: ubuntu-latest
     # 20, not 10: measured 2026-08-03, this job is at capacity on legitimate work,
     # not hanging. Run 30801403218 spent 3.9 min (node tests) + 3.2 min (python) +
@@ -292,3 +292,24 @@ jobs:
             printf '  %s\n' "${failed_files[@]}"
           fi
           exit "$failed"
+
+  required-tests:
+    name: tsc + tests (clean install)
+    # Carries the name the `main` ruleset requires. Splitting a suite into its
+    # own job removes it from the required-context list; this keeps one gate
+    # that fails when any suite fails, so a split cannot weaken protection.
+    needs: [typecheck-and-test, python-standalone-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # `needs.*.result` is checked explicitly: a job skipped because its
+      # dependency failed reports "skipped", which a required check can treat
+      # as satisfied. Failing here makes the outcome explicit either way.
+      - name: Require every test job to have succeeded
+        run: |
+          set -euo pipefail
+          echo "typecheck-and-test:      ${{ needs.typecheck-and-test.result }}"
+          echo "python-standalone-tests: ${{ needs.python-standalone-tests.result }}"
+          [ "${{ needs.typecheck-and-test.result }}" = "success" ] || exit 1
+          [ "${{ needs.python-standalone-tests.result }}" = "success" ] || exit 1
