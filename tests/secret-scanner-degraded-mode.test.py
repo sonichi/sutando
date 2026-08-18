@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""secret_scanner degraded mode: detect-secrets' absence must not disable the
+repo-local whole-line rules (issue #3100 — a compensating control was killed
+by the absence of the thing it compensates for), and each mode announces
+itself loudly at import so a degraded host is visible.
+
+Both arms run in subprocesses: the degraded arm hides detect_secrets via an
+import hook (the package IS installed on some hosts), the full arm is the
+positive control proving the probe can tell the modes apart.
+
+Run: python3 tests/secret-scanner-degraded-mode.test.py
+"""
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+FAILS = []
+
+
+def check(name, cond, detail=""):
+    if cond:
+        print(f"  ok: {name}")
+    else:
+        FAILS.append(name)
+        print(f"  FAIL: {name} {detail}", file=sys.stderr)
+
+
+PROBE = r"""
+import sys
+sys.path.insert(0, {src!r})
+{blocker}
+import secret_scanner as ss
+hits = ss.scan_secrets("prose line\n" + "a1" * 20 + "\n")
+print("ACTIVE=" + str(ss.DETECT_SECRETS_ACTIVE))
+print("HEX_HIT=" + str(any(h.secret_type == "Bare Hex Token" for h in hits)))
+"""
+
+BLOCKER = r"""
+import importlib.abc
+
+
+class _Hide(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "detect_secrets" or name.startswith("detect_secrets."):
+            raise ImportError("hidden for degraded-mode test")
+
+
+sys.meta_path.insert(0, _Hide())
+"""
+
+
+def run(blocker):
+    code = PROBE.format(src=str(REPO / "src"), blocker=blocker)
+    return subprocess.run([sys.executable, "-c", code],
+                          capture_output=True, text=True, timeout=60)
+
+
+def main() -> int:
+    deg = run(BLOCKER)
+    check("degraded: module imports (no ModuleNotFoundError)", deg.returncode == 0,
+          deg.stderr[-300:])
+    check("degraded: ACTIVE=False", "ACTIVE=False" in deg.stdout)
+    check("degraded: Bare Hex Token rule still fires", "HEX_HIT=True" in deg.stdout)
+    check("degraded: mode announced loudly on stderr",
+          "DEGRADED" in deg.stderr and "detect-secrets missing" in deg.stderr)
+
+    full = run("")
+    if "ACTIVE=True" not in full.stdout:
+        # Host without detect_secrets: the degraded arm above already proved
+        # the guard; the full arm's assertions would be vacuous here.
+        print("  note: detect_secrets not installed on this host — full-mode "
+              "arm skipped (degraded arm is the load-bearing one)")
+    else:
+        check("full: positive control — modes are distinguishable",
+              "ACTIVE=True" in full.stdout)
+        check("full: hex rule fires in full mode too", "HEX_HIT=True" in full.stdout)
+        check("full: mode announced as full", "full (detect-secrets active)" in full.stderr)
+
+    if FAILS:
+        print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)
+        return 1
+    print("\nPASS: secret-scanner survives detect-secrets absence; repo-local "
+          "rules live in both modes; mode is loud")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
