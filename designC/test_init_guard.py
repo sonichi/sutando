@@ -18,9 +18,11 @@ sys.path.insert(0, str(_HERE))
 import designC as C  # noqa: E402
 
 FAILS = []
+RAN = []
 
 
 def check(name, cond, detail=""):
+    RAN.append(name)
     if cond:
         print(f"  ok: {name}")
     else:
@@ -61,12 +63,15 @@ def main() -> int:
         shutil.rmtree(cold, ignore_errors=True)
         shutil.rmtree(warm, ignore_errors=True)
 
-    n_ref, n_ctl = 6, 3
+    # Derived, never asserted: a hardcoded total goes stale silently.
+    n_total = len(RAN)
+    n_ref = sum(1 for n in RAN if "refuses" in n)
+    n_ctl = n_total - n_ref
     if FAILS:
-        print(f"\nFAIL: {len(FAILS)}/{n_ref + n_ctl}: {FAILS}", file=sys.stderr)
+        print(f"\nFAIL: {len(FAILS)}/{n_total}: {FAILS}", file=sys.stderr)
         return 1
     print(f"\nPASS: activation guard — {n_ref} refusals + {n_ctl} controls "
-          f"(9/9 checks ran)")
+          f"({n_total}/{n_total} checks ran)")
     return 0
 
 
