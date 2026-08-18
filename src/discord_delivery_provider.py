@@ -14,19 +14,11 @@ File attachments arrive with the poll_proactive conversion (5b).
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-_PKG = (Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root — locates the CODE package (same mechanism as the gateway shim)
-        / "packages" / "ag2-sparrow")
-if str(_PKG) not in sys.path:
-    sys.path.insert(0, str(_PKG))
-
-from ag2_sparrow.delivery_core.contract import (  # noqa: E402
+from ag2_sparrow.delivery_core.contract import (
     DeliveryOutcome, DeliveryReceipt, ProviderCapabilities)
-from discord_rest_client import DiscordRestClient  # noqa: E402
-from outbox import DeliveryOutcome as TransportOutcome  # noqa: E402
+from discord_rest_client import DiscordRestClient
+from outbox import DeliveryOutcome as TransportOutcome
 
 _OUTCOME_MAP = {
     TransportOutcome.CONFIRMED: DeliveryOutcome.CONFIRMED,
