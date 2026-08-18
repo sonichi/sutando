@@ -129,6 +129,53 @@ def main() -> int:
                          guild_resolver=lambda t, tok: "other-guild", access_file=acc)
     check("policy allows unlisted guild", reason is None)
 
+    # 5. Coverage of the remaining policy/reader surfaces (diff-cover bar).
+    check("blacklist loader: unreadable file -> empty set",
+          policy.load_channel_context_blacklist("srv", access_file=Path("/nonexistent/x.json")) == set())
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+        json.dump({"groups": {"srv": {"contextNotFrom": ["g1"]}}}, tf)
+        acc2 = Path(tf.name)
+    check("blacklist loader: reads channel entries",
+          policy.load_channel_context_blacklist("srv", access_file=acc2) == {"g1"})
+
+    real_rj = policy.request_json
+    try:
+        policy.request_json = lambda req, timeout=10: {"guild_id": 42}
+        check("resolve_guild returns str guild id", policy.resolve_guild("t", "tok") == "42")
+        policy.request_json = lambda req, timeout=10: {}
+        check("resolve_guild: DM channel (no guild) -> None", policy.resolve_guild("t", "tok") is None)
+        def _boom(req, timeout=10):
+            raise RuntimeError("net down")
+        policy.request_json = _boom
+        check("resolve_guild: transport failure -> None (fail-closed upstream)",
+              policy.resolve_guild("t", "tok") is None)
+    finally:
+        policy.request_json = real_rj
+
+    reader = sys.modules["discord_reader"]
+    line = reader.render_line({"id": "1", "timestamp": "2026-08-18T00:00:00.000",
+                               "author": {"username": "u"}, "content": "x" * 300})
+    check("render_line clips by default", "[2026-08-18T00:00:00] u: " in line and len(line) < 240)
+    full_line = reader.render_line({"id": "1", "timestamp": "", "author": {}, "content": "x" * 300}, full=True)
+    check("render_line --full does not clip", "x" * 300 in full_line)
+
+    # rdc wrapper surfaces: loader wrapper + resolve_guild delegate + _api_get.
+    rdc.ACCESS_FILE = acc2
+    check("rdc loader wrapper binds module ACCESS_FILE",
+          rdc.load_channel_context_blacklist("srv") == {"g1"})
+    real_pol_rg = sys.modules["discord_context_policy"].resolve_guild
+    try:
+        sys.modules["discord_context_policy"].resolve_guild = lambda t, tok: "g9"
+        check("rdc.resolve_guild delegates to policy", rdc.resolve_guild("t", "tok") == "g9")
+    finally:
+        sys.modules["discord_context_policy"].resolve_guild = real_pol_rg
+    real_rdc_rj = rdc.request_json
+    try:
+        rdc.request_json = lambda req, timeout=10: [{"author": {"username": "a"}, "content": "hi"}]
+        check("rdc._api_get drives request_json", rdc._api_get("/x", "tok") and True)
+    finally:
+        rdc.request_json = real_rdc_rj
+
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)
         return 1
