@@ -12,7 +12,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { readCaptureToken } from './util_paths.js';
-import { setupHint } from './osascript-setup-hint.js';
+import { setupHint, scrollOutcome } from './osascript-setup-hint.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -137,24 +137,14 @@ export const scrollTool: ToolDefinition = {
 
 			// Keyboard scroll on the frontmost app (works in any app, no focus steal)
 			const keyCode = direction === 'down' ? '121' : direction === 'up' ? '116' : direction === 'top' ? '115 using command down' : '119 using command down';
+			let _keyDenied = false;
 			try {
 				execSync(`osascript -e 'tell application "System Events" to key code ${keyCode}'`, { timeout: 3_000 });
-			} catch (e) { _noteHint(e); /* best-effort, but a denial is reportable */ }
+			} catch (e) { _noteHint(e); _keyDenied = true; }
 
 			console.log(`${ts()} [Scroll] ${direction} (app: ${frontApp})`);
-			// A denial is not a scroll: report the fix the OS named instead.
-			if (_scrollMoved !== true && _hints.length > 0) {
-				return { status: 'setup_required', direction, app: frontApp, moved: false, steps: _hints,
-				         message: 'The scroll did not go through — a one-time setup step is needed. Tell the user that, then read the "steps" to them verbatim, in order. Do not add steps of your own.' };
-			}
-			// Honest result: if the JS pass found nothing moved (page already at the
-			// direction's limit), say so instead of falsely claiming a scroll — so the
-			// model can tell the user "looks like we're at the bottom" rather than insist.
-			if (_scrollMoved === false) {
-				return { status: 'at_limit', direction, app: frontApp, moved: false,
-				         message: `Nothing scrolled — the page appears to be at the ${direction === 'down' ? 'bottom' : direction === 'up' ? 'top' : direction}. Tell the user it can't scroll further that way.` };
-			}
-			return { status: 'scrolled', direction, app: frontApp, moved: _scrollMoved };
+			return { ...scrollOutcome({ scrollMoved: _scrollMoved, keyDenied: _keyDenied, hints: _hints, direction }),
+			         direction, app: frontApp };
 		} catch (err) {
 			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
 		}

@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { setupHint } from '../src/osascript-setup-hint.js';
+import { setupHint, scrollOutcome } from '../src/osascript-setup-hint.js';
 
 const SRC = readFileSync(
 	join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'browser-tools.ts'),
@@ -49,13 +49,43 @@ describe('setupHint', () => {
 });
 
 describe('scroll reporting', () => {
-	it('reports setup_required instead of claiming a scroll that did not happen', () => {
-		assert.match(SRC, /_scrollMoved !== true && _hints\.length > 0/);
-		assert.match(SRC, /status: 'setup_required'/);
+	const HINT = ['Turn on AG2 Space in System Settings > Privacy & Security > Accessibility.'];
+
+	it('BOTH paths denied -> setup_required, carrying the OS steps', () => {
+		const r = scrollOutcome({ scrollMoved: null, keyDenied: true, hints: HINT, direction: 'down' });
+		assert.equal(r.status, 'setup_required');
+		assert.equal(r.moved, false);
+		assert.deepEqual((r as { steps: string[] }).steps, HINT);
+	});
+
+	it('JS denied but the keystroke SUCCEEDED -> not setup_required', () => {
+		// The adjacent input: Chrome ships "Allow JavaScript from Apple Events" off,
+		// so the JS path is denied on a normal machine while Page Down still scrolls.
+		const r = scrollOutcome({ scrollMoved: null, keyDenied: false, hints: HINT, direction: 'down' });
+		assert.notEqual(r.status, 'setup_required',
+			'a hint from the JS path must not report failure when the keystroke fallback ran');
+		assert.equal(r.status, 'scrolled');
+	});
+
+	it('a denial with no keystroke failure never claims the scroll did not happen', () => {
+		const r = scrollOutcome({ scrollMoved: null, keyDenied: false, hints: HINT, direction: 'up' });
+		assert.doesNotMatch(JSON.stringify(r), /did not go through/);
+	});
+
+	it('JS reported no movement and nothing was denied -> at_limit', () => {
+		const r = scrollOutcome({ scrollMoved: false, keyDenied: false, hints: [], direction: 'down' });
+		assert.equal(r.status, 'at_limit');
+		assert.equal(r.moved, false);
+	});
+
+	it('a real scroll stays scrolled even if the keystroke was denied', () => {
+		const r = scrollOutcome({ scrollMoved: true, keyDenied: true, hints: HINT, direction: 'down' });
+		assert.equal(r.status, 'scrolled');
+		assert.equal(r.moved, true);
 	});
 
 	it('captures the keyboard fallback error rather than swallowing it', () => {
 		assert.doesNotMatch(SRC, /catch \{ \/\* keyboard fallback is best-effort \*\/ \}/);
-		assert.match(SRC, /catch \(e\) \{ _noteHint\(e\);/);
+		assert.match(SRC, /catch \(e\) \{ _noteHint\(e\); _keyDenied = true; \}/);
 	});
 });
