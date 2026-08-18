@@ -383,9 +383,34 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 			false,
 			'a window that was never measured must not read as lossless',
 		);
-		// The FACT is coverage-independent (see the note on the coverage-gated
-		// verdict below), so this holds regardless of the coverage mode.
-		assert.equal(r.facts.upstreamWindowObserved ?? false, false);
+		// NOT `r.facts.upstreamWindowObserved` — that is a local const, not a
+		// MatrixFacts member, so the assertion could never fail (john-the-dev).
+		assert.equal(r.facts.attemptedAudioAdvanced, false);
+		assert.equal(r.facts.queuedAudioAdvanced, false);
+	});
+
+	it('an unobserved echoSuppressed baseline cannot fabricate echoSuppressedAdvanced', () => {
+		// Same defect as the upstream counters, one field over: `?? 0` on a wholly
+		// null diag recorded a real zero, so the next observed tick turned a
+		// generation-lifetime total into a one-window delta on a fact the
+		// watchdog reads (john-the-dev, after 2af342d9 fixed only the siblings).
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 900, queued: 900, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 5,
+			echoSuppressed: 4000,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			transportGeneration: 5,
+			echoSuppressed: null, // the tick where diagnostics were absent entirely
+		});
+		const r = evalWith(s, prev);
+		assert.equal(
+			r.facts.echoSuppressedAdvanced,
+			false,
+			'a lifetime total across an unobserved baseline is not a window delta',
+		);
 	});
 
 	it('an unobserved BASELINE can never fabricate post-sdk-silent (null→observed transition)', () => {

@@ -31,7 +31,7 @@ export const observesUpstreamSend = (c: LedgerCoverage): boolean =>
 export interface SessionDiagnosticsSample {
   upstream: UpstreamCounters | null;
   transportGeneration: number | null;
-  echoSuppressed: number;
+  echoSuppressed: number | null;
 }
 
 /** Mirror of the client transport's speech constants: floor above which a
@@ -126,7 +126,7 @@ export interface AudioHealthSnapshot {
   /** Sampled bodhi diagnostics at snapshot time; null = unobserved. */
   upstream: UpstreamCounters | null;
   transportGeneration: number | null;
-  echoSuppressed: number;
+  echoSuppressed: number | null;
   /** Resumption lineage, derived sutando-side from lifecycle events (design
    *  §1.1). Minted on a handle-less setup-ok; 'suspected-sever' is terminal. */
   logicalSessionId: number;
@@ -669,7 +669,9 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
         coverage: 'session-only',
         upstream: diag?.upstream ?? null,
         transportGeneration: diag?.transportGeneration ?? null,
-        echoSuppressed: diag?.echoSuppressed ?? 0,
+        // NOT `?? 0`: a null diag means UNOBSERVED, and a zero here becomes a
+        // lifetime total masquerading as a one-window delta on the next tick.
+        echoSuppressed: diag?.echoSuppressed ?? null,
         logicalSessionId,
         lineageState,
         contextTokens,

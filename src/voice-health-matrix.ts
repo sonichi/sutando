@@ -49,7 +49,7 @@ export interface MatrixBaseline {
    *  generation-lifetime totals — these are the diff sources. */
   audioSkippedNoSession: number | null;
   audioThrew: number | null;
-  echoSuppressed: number;
+  echoSuppressed: number | null;
   ctxTimeMs: number | null;
   bufferedAmount: number | null;
   serverBufferedAmount: number | null;
@@ -188,7 +188,9 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
       ? Math.max(0, au.threw - (winPrev.audioThrew as number))
       : 0;
   const dEchoSuppressed =
-    winPrev !== null ? Math.max(0, s.echoSuppressed - winPrev.echoSuppressed) : 0;
+    winPrev !== null && s.echoSuppressed !== null && winPrev.echoSuppressed !== null
+      ? Math.max(0, s.echoSuppressed - winPrev.echoSuppressed)
+      : 0;
   const speech = s.speech;
   const speechInWindow =
     speech.active || (speech.lastAboveFloorAt !== null && now - speech.lastAboveFloorAt < 30_000);
