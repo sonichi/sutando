@@ -129,9 +129,10 @@ def filter_chat_secrets(text: str) -> ChatSecretFilterResult:
     try:
         from secret_scanner import scan_and_redact
     except ImportError as e:
-        # A broken detect-secrets INSTALL (scanner absence degrades inside
-        # secret_scanner and never raises). Surface it; keep the fallback.
-        _warn_scanner_broken(e)
+        # Scanner-module absence = expected install shape (silent);
+        # any deeper ImportError = broken install (surface it).
+        if not (isinstance(e, ModuleNotFoundError) and e.name == "secret_scanner"):
+            _warn_scanner_broken(e)
         return ChatSecretFilterResult(text=redacted, secret_types=tuple(sorted(found)))
     try:
         hits, library_redacted = scan_and_redact(text)

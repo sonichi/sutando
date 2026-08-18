@@ -159,6 +159,30 @@ def broken_install_arm():
               "broken" in err.getvalue() and "FAILED" in err.getvalue())
         check("broken install: curated fallback still redacts",
               "ghp_" + "a" * 36 not in res.text and res.secret_types)
+        # Packaged-consumer shape: the scanner MODULE absent entirely is an
+        # expected install, not a broken one — fallback stays SILENT.
+        sys.modules.pop("chat_secret_filter", None)
+
+        class _HideScanner(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if name == "secret_scanner":
+                    raise ModuleNotFoundError(
+                        f"No module named {name!r}", name=name)
+        hook2 = _HideScanner()
+        saved_ss = sys.modules.pop("secret_scanner", None)
+        sys.meta_path.insert(0, hook2)
+        try:
+            err2 = io.StringIO()
+            with contextlib.redirect_stderr(err2):
+                import chat_secret_filter as csf2
+                res2 = csf2.filter_chat_secrets("token ghp_" + "b" * 36 + " end")
+            check("absent scanner module: silent curated fallback",
+                  err2.getvalue() == "" and res2.secret_types, err2.getvalue())
+        finally:
+            sys.meta_path.remove(hook2)
+            sys.modules.pop("chat_secret_filter", None)
+            if saved_ss is not None:
+                sys.modules["secret_scanner"] = saved_ss
     finally:
         sys.meta_path.remove(hook)
         sys.modules.pop("detect_secrets", None)
