@@ -56,6 +56,17 @@ for marker in 'Codex' 'AGENTS.md'; do
   }
 done
 
+# Context-budget ceiling: the runtime truncates/compacts past ~40k, and the
+# file regrew ~780 B/day through Aug 2026 — gate it so it cannot re-cross.
+BUDGET=40960
+for f in "$src" "$tmp"; do
+  size=$(wc -c < "$f")
+  if [ "$size" -gt "$BUDGET" ]; then
+    echo "agents-md-sync: $(basename "$f" .tmp) is ${size} bytes — over the ${BUDGET}-byte always-loaded budget. Relocate sections to docs/ (see #3016) instead of growing the file." >&2
+    exit 1
+  fi
+done
+
 if [ "$CHECK_ONLY" = "1" ]; then
   if diff -q "$dst" "$tmp" >/dev/null 2>&1; then
     echo "agents-md-sync: AGENTS.md is up to date"

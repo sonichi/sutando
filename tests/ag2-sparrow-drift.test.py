@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""CI guard: the ag2-sparrow package's bundled pure utils must stay in sync
-with their canonical src/ source (option A: task_archive / local_task_protocol /
-result_markers are bundled-from-src; the transport modules are package-canonical
-and intentionally diverge).
+"""CI guard: the ag2-sparrow package's bundled modules must stay in sync with
+their canonical src/ source (option A). Which modules those are is MAP in
+sync_from_src.py, never a list restated here; modules absent from MAP are
+package-canonical and intentionally diverge.
 
 This lives under tests/ so the repo's test discovery
 (`find tests -name '*.test.py'`, package.json) actually runs it — the package's

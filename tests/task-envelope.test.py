@@ -267,6 +267,46 @@ class FailOpenArms(unittest.TestCase):
         self.assertIsNotNone(m, "stamp call must be fail-open wrapped")
 
 
+class CorruptKeyFile(unittest.TestCase):
+    """bytes.fromhex('') returns b'' without raising, so before the
+    _parse_key guard an EMPTY key file stamped and verified under a
+    zero-length key; a malformed one crashed verify callers instead of
+    yielding a verdict. Mirrored guard in task_envelope.ts (#3058)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="env-ck-")
+        self.ws = Path(self._tmp.name)
+        (self.ws / "state" / "auth").mkdir(parents=True)
+        self.keyfile = self.ws / "state" / "auth" / "task-hmac.key"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_stamping_rejects_corrupt_key_content(self):
+        for bad in ("", "zzzz", "deadbeef", "a" * 63):
+            self.keyfile.write_text(bad)
+            with self.assertRaises(ValueError, msg=f"key file {bad!r}"):
+                E.load_or_create_key(self.ws)
+            with self.assertRaises(ValueError, msg=f"key file {bad!r}"):
+                E.stamp_text("id: task-x\ntask: t\n", self.ws)
+
+    def test_verify_maps_corrupt_key_to_unverifiable(self):
+        good = E.stamp_text("id: task-x\ntask: t\n", self.ws)
+        for bad in ("", "zzzz"):
+            self.keyfile.write_text(bad)
+            v = E.verify_text(good, self.ws)
+            self.assertEqual(v["verdict"], "unverifiable",
+                             f"key file {bad!r} must not crash or blame content")
+            self.assertIn("corrupt local key", v["reason"])
+
+    def test_missing_key_still_distinct_from_corrupt(self):
+        self.keyfile.parent.mkdir(parents=True, exist_ok=True)
+        v = E.verify_text("id: task-x\nenvelope_hmac: v1:" + "a" * 64 + "\ntask: t\n",
+                           self.ws)
+        self.assertEqual(v["verdict"], "unverifiable")
+        self.assertIn("no local key", v["reason"])
+
+
 class WriterWiring(unittest.TestCase):
     """The two phase-1 writers must import and call stamp_task on the text
     they persist; a regex pin so the call cannot silently vanish."""
