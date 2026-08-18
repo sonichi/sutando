@@ -37,7 +37,7 @@ def check(name, filename, body, want_rc):
                 f"index 0000000..{blob_sha(body)} 100644\n--- /dev/null\n"
                 f"+++ b/{filename}\n@@ -0,0 +1,{n} @@\n"
                 + "".join("+" + l + "\n" for l in body.splitlines()))
-        found, unscannable, _absent = pc.violations(diff, 2, (".py",), root=td)
+        found, unscannable, _absent, _inscope = pc.violations(diff, 2, (".py",), root=td)
         rc = 1 if found else 0
         if rc != want_rc:
             failures.append(f"{name}: rc={rc} want={want_rc} found={found} unscannable={unscannable}")
@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory() as td:
     p.write_text("# pre-existing one\n# pre-existing two\n# newly added third\nV = 1\n")
     diff = (f"diff --git a/f.py b/f.py\nindex 0000000..{blob_sha(p.read_text())} 100644\n"
             "--- a/f.py\n+++ b/f.py\n@@ -2,1 +3,1 @@\n+# newly added third\n")
-    found, _, _absent = pc.violations(diff, 2, (".py",), root=td)
+    found, _, _absent, _inscope = pc.violations(diff, 2, (".py",), root=td)
     if found:
         failures.append(f"partially-added run must not fire: {found}")
     else:
@@ -77,7 +77,7 @@ with tempfile.TemporaryDirectory() as td:
     p.write_text("def broken(:\n")
     diff = (f"diff --git a/g.py b/g.py\nindex 0000000..{blob_sha(p.read_text())} 100644\n"
             "--- /dev/null\n+++ b/g.py\n@@ -0,0 +1,1 @@\n+def broken(:\n")
-    found, unscannable, _absent = pc.violations(diff, 2, (".py",), root=td)
+    found, unscannable, _absent, _inscope = pc.violations(diff, 2, (".py",), root=td)
     if "g.py" not in unscannable:
         failures.append("an untokenizable file must be REPORTED as unscannable")
     else:
@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory() as td:
     same = (f"diff --git a/rev.py b/rev.py\nindex 0000000..{blob_sha(disk)} 100644\n"
             "--- /dev/null\n+++ b/rev.py\n@@ -0,0 +1,4 @@\n"
             + "".join("+" + l + "\n" for l in disk.splitlines()))
-    found, _u, det = pc.violations(same, 2, (".py",), root=td)
+    found, _u, det, _inscope = pc.violations(same, 2, (".py",), root=td)
     if found and not det:
         print("  ok: control — when the tree IS the diff's revision, the run still fires")
     else:
@@ -102,7 +102,7 @@ with tempfile.TemporaryDirectory() as td:
     other = (f"diff --git a/rev.py b/rev.py\nindex 0000000..{blob_sha(submitted)} 100644\n"
              "--- /dev/null\n+++ b/rev.py\n@@ -0,0 +1,4 @@\n"
              + "".join("+" + l + "\n" for l in submitted.splitlines()))
-    found, _u, det = pc.violations(other, 2, (".py",), root=td)
+    found, _u, det, _inscope = pc.violations(other, 2, (".py",), root=td)
     if not found and det == ["rev.py"]:
         print("  ok: a foreign revision is SKIPPED, not reported as the diff's own finding")
     else:
@@ -116,7 +116,7 @@ with tempfile.TemporaryDirectory() as td:
     (pathlib.Path(td) / "ctx.py").write_text(foreign)
     d = (f"diff --git a/ctx.py b/ctx.py\nindex 0000000..{blob_sha(submitted)} 100644\n"
          "--- a/ctx.py\n+++ b/ctx.py\n@@ -1,4 +1,4 @@\n x = 1\n+# one\n+# two\n+# three\n")
-    found, _u, det = pc.violations(d, 2, (".py",), root=td)
+    found, _u, det, _inscope = pc.violations(d, 2, (".py",), root=td)
     if not found and det == ["ctx.py"]:
         print("  ok: identical added lines in a foreign context are SKIPPED, not judged")
     else:
@@ -138,7 +138,7 @@ def diff_for(filename, body, *, disk=None):
 with tempfile.TemporaryDirectory() as td:
     # A non-.py file in the diff must be skipped by the extension filter.
     (pathlib.Path(td) / "notes.md").write_text("# one\n# two\n# three\n")
-    found, _, _absent = pc.violations(diff_for("notes.md", "# one\n# two\n# three\n"), 2, (".py",), root=td)
+    found, _, _absent, _inscope = pc.violations(diff_for("notes.md", "# one\n# two\n# three\n"), 2, (".py",), root=td)
     print("  ok: non-.py file is skipped by the extension filter" if not found
           else f"  FAIL ext filter: {found}")
     if found:
@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory() as td:
     d = (f"diff --git a/split.py b/split.py\nindex 0000000..{blob_sha(p2.read_text())} 100644\n"
          "--- a/split.py\n+++ b/split.py\n@@ -1,8 +1,8 @@\n"
          "+# a1\n+# a2\n+# a3\n # preexisting\n+# b1\n+# b2\n+# b3\n V = 1\n")
-    found, _, _absent = pc.violations(d, 2, (".py",), root=td)
+    found, _, _absent, _inscope = pc.violations(d, 2, (".py",), root=td)
     if len(found) == 2:
         print("  ok: a run split by a non-added comment flushes as two runs")
     else:
@@ -162,7 +162,7 @@ with tempfile.TemporaryDirectory() as td:
     # so the first run must flush at the gap rather than merging across it.
     p3 = pathlib.Path(td) / "gap.py"
     p3.write_text("# a1\n# a2\n# a3\nV = 1\n# b1\n# b2\n# b3\nW = 2\n")
-    found, _, _absent = pc.violations(diff_for("gap.py", p3.read_text()), 2, (".py",), root=td)
+    found, _, _absent, _inscope = pc.violations(diff_for("gap.py", p3.read_text()), 2, (".py",), root=td)
     if len(found) == 2 and found[0][1] == 1 and found[1][1] == 5:
         print("  ok: runs separated by code flush at the gap, not merged")
     else:
@@ -389,6 +389,24 @@ with tempfile.TemporaryDirectory() as td:
     else:
         failures.append(f"a finding was reported as a verdict token: rc={r.returncode} out={r.stdout!r}")
 
+
+# --- Zero in-scope files is the same lie one step out (#2989): a shell-only
+# diff cannot fail a .py-scoped gate, so its token must be PARTIAL, not PASS.
+with tempfile.TemporaryDirectory() as td:
+    sh_body = "# one\n# two\n# three\n# four\necho hi\n"
+    (pathlib.Path(td) / "only.sh").write_text(sh_body)
+    guide = pathlib.Path(td) / "GUIDE.md"
+    guide.write_text("```yaml\nchecks:\n  prose-cap:\n    prose_cap: 2\n"
+                     "    prose_exts: ['.py']\n```\n")
+    d = (f"diff --git a/only.sh b/only.sh\nindex 0000000..{blob_sha(sh_body)} 100644\n"
+         f"--- a/only.sh\n+++ b/only.sh\n@@ -1,5 +1,5 @@\n"
+         + "".join("+" + l + "\n" for l in sh_body.splitlines()))
+    r = subprocess.run(["bash", str(ROOT / "scripts" / "review-checks.sh"),
+                        "--guide", str(guide)], input=d, capture_output=True, text=True, cwd=td)
+    if "review-checks: PARTIAL" in r.stdout and "no in-scope files" in (r.stdout + r.stderr):
+        print("  ok: shell-only diff yields PARTIAL naming no-in-scope, never a bare PASS")
+    else:
+        failures.append(f"shell-only diff verdict: rc={r.returncode} out={r.stdout!r} err={r.stderr[-200:]!r}")
 
 if failures:
     print("\nFAILURES:")

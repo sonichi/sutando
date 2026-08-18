@@ -153,6 +153,9 @@ VERDICT="PASS"
 if grep -q '^prose-cap: SKIPPED' "$PROSE_ERR"; then
     PROSE_SCOPE="hardcoded-paths + root-artifacts clean; prose-cap SKIPPED — no post-image"
     VERDICT="PARTIAL"
+elif grep -q '^prose-cap: no in-scope files' "$PROSE_ERR"; then
+    PROSE_SCOPE="hardcoded-paths + root-artifacts clean; prose-cap had no in-scope files"
+    VERDICT="PARTIAL"
 fi
 # Fail-closed is asserted AFTER the other scanners report. Exiting here would
 # suppress real hardcoded-path/root-artifact findings already in hand.
