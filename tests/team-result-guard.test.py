@@ -199,10 +199,8 @@ def main() -> int:
         got = guard.suppression_stub_for_tier(body, tier)
         assert got == stub, (body, tier, got)
         if got is not None:
-            # stub⊆suppress must hold regardless of filter: the marker check
-            # precedes the secret scan, so even _leaky cannot flip a stubbed
-            # body to LEAK (else the drain would speak a withhold notice for
-            # a body the producer marked as bookkeeping).
+            # stub⊆suppress holds regardless of filter: the marker check
+            # precedes the secret scan, so _leaky cannot flip a stub to LEAK.
             for filt in (_clean, _leaky):
                 v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
                 assert v.kind == guard.VERDICT_SUPPRESS, (body, filt.__name__, "stub without suppress verdict")
