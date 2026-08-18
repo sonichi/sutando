@@ -51,7 +51,10 @@ and loads whichever repo it reviews.
    Sutando's users from this PR, and how do we mitigate it?"** (Chi 2026-07-25.) Concretely
    check: opt-in vs always-on; on-disk state-format/migration compatibility across the
    rolling-upgrade window; new hard-required config that breaks current installs;
-   process-global patches with wide blast radius; and — per #1898 — for any auto-action,
+   removal or rename of a path, command or flag that something outside the repo invokes —
+   a registered cron, plist or saved prompt holds its own copy, so an in-repo grep answers
+   about the wrong population (#3005); process-global patches with wide blast radius;
+   and — per #1898 — for any auto-action,
    *what code or state does it act on* (does it verify the target is canonical, or run
    whatever's there?). A PR is not merge-ready until that worst case is named and mitigated.
    *Grounded by:* #1898 itself — the live test verified the claimed behavior, but the
