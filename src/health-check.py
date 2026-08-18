@@ -6971,9 +6971,25 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
                             channel_access_path("slack"))
                     except Exception:  # noqa: BLE001 — a probe must not fail the check
                         slack_state = slack_access.UNKNOWN
-                # UNKNOWN takes the enrolled branch deliberately: an unreadable
-                # record cannot justify telling the operator to enroll.
-                if slack_state in (slack_access.ENROLLED, slack_access.UNKNOWN):
+                if slack_state == slack_access.ENROLLED:
+                    return "warn", ("connected but events not arriving — enable Event "
+                                    "Subscriptions at api.slack.com/apps")
+                if slack_state == slack_access.UNKNOWN:
+                    # A resolver we could not run leaves us knowing nothing, so it
+                    # keeps the quieter enrolled remedy; a malformed record does not.
+                    try:
+                        bad_record = channel_access_path("slack")
+                    except Exception:  # noqa: BLE001 — a probe must not fail the check
+                        bad_record = None
+                    if bad_record is not None:
+                        return "warn", ("connected but events not arriving, and access.json "
+                                        "is unreadable or malformed, so no user can be "
+                                        "authorized and TOFU stays closed — Event "
+                                        "Subscriptions alone leaves Slack silent: inspect "
+                                        f"or repair {shlex.quote(str(bad_record))} "
+                                        "(allowFrom must be a list of user-id strings), "
+                                        "then enable Event Subscriptions at "
+                                        "api.slack.com/apps")
                     return "warn", ("connected but events not arriving — enable Event "
                                     "Subscriptions at api.slack.com/apps")
                 # Name the log this check actually read — the workspace is

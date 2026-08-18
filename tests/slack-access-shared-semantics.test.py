@@ -70,7 +70,7 @@ def _bridge_load_allowed(access_file: Path):
                    if isinstance(node, ast.FunctionDef) and node.name == "load_allowed")
     cached: list = []
     ns = {"json": json, "ACCESS_FILE": access_file,
-          "_update_access_cache": cached.append}
+          "slack_access": slack_access, "_update_access_cache": cached.append}
     module = ast.Module(body=[fn_node], type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, str(BRIDGE), "exec"), ns)
@@ -93,13 +93,14 @@ def main() -> int:
         "allowFrom is a scalar": {"allowFrom": 42},
         "allowFrom holds objects": {"allowFrom": [{"id": "U1"}]},
     }
-    # These CONVERT without raising, which is why value-equality with the bridge
-    # is the wrong contract for them: set("U123") is a set of characters.
+    # Formerly exempted from value-equality because the bridge splayed them into
+    # characters. It delegates now, so they carry the SAME contract as the rest.
     permissive = {
         "allowFrom is a string": {"allowFrom": "U123"},
         "allowFrom holds numbers": {"allowFrom": [7]},
         "allowFrom is mixed": {"allowFrom": ["U1", 7]},
     }
+    cases.update(permissive)
     expected_state = {
         "absent": slack_access.UNCONFIGURED,
         "empty allowFrom": slack_access.LOCKED,
@@ -145,8 +146,8 @@ def main() -> int:
         check(_guard(lambda: slack_access.access_state(p)) != slack_access.LOCKED,
               f"{label}: does NOT read as a deliberate lockout")
 
-    # A record that CONVERTS but enrols nobody real: value-equality is the wrong
-    # contract, so assert the property that matters — neither side lets a user in.
+    # Value-equality now covers these (they are in `cases`); this keeps the
+    # property that motivated them — neither side lets a real user in.
     PROBE = "U9REALUSER"
     for label, payload in permissive.items():
         q = tmp / (label.replace(" ", "_") + ".json")
@@ -163,10 +164,10 @@ def main() -> int:
     # The one that motivated this: "U123" becomes a set of CHARACTERS, which the
     # old equality contract would have called agreement.
     q = tmp / "allowFrom_is_a_string.json"
-    check(_bridge_load_allowed(q) == {"U", "1", "2", "3"},
-          "the bridge really does splay a string into characters")
+    check(_bridge_load_allowed(q) == set(),
+          "the bridge no longer splays a string into characters")
     check(slack_access.read_access(q).allowed == set(),
-          "and the helper refuses it outright rather than matching that")
+          "and it refuses the record for the same reason the helper does")
 
     # The extraction must be running the real thing. If the bridge ever stops
     # defining load_allowed, every equivalence above would pass vacuously.
@@ -175,6 +176,15 @@ def main() -> int:
           "the bridge still defines the function this test extracts")
     check(_bridge_load_allowed(tmp / "populated_allowFrom.json") == {"U1", "U2"},
           "the extracted function returns the bridge's real allowlist")
+
+    # TOFU rests on None-vs-empty-set, previously pinned by grepping the bridge
+    # for `return None`. Delegation deletes that text, so assert the behaviour.
+    check(_bridge_load_allowed(tmp / "no_such_file.json") is None,
+          "a MISSING record is None (TOFU-eligible), never an empty set")
+    check(_bridge_load_allowed(tmp / "empty_allowFrom.json") == set(),
+          "an empty allowFrom is a set (deliberate lockout), never None")
+    check(_bridge_load_allowed(tmp / "unreadable.json") == set(),
+          "an unreadable record fails CLOSED to a set, never to None")
 
     print()
     if FAILS:

@@ -65,6 +65,7 @@ from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
+import slack_access  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -306,14 +307,12 @@ def load_allowed():
 
     None vs empty-set: file-missing means never-configured (TOFU-eligible);
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        _update_access_cache(data)
-        return set(data.get("allowFrom", []))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return set()
+    access = slack_access.read_access(ACCESS_FILE)
+    # Only a record the shared reader accepted is worth caching; a malformed one
+    # would overwrite a good backup with a document nobody can authenticate from.
+    if access.record is not None:
+        _update_access_cache(access.record)
+    return access.allowed
 
 
 def load_tier_map() -> dict:

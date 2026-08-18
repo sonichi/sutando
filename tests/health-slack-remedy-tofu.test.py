@@ -61,10 +61,19 @@ check("DM the bot" not in locked[1],
 check(locked[1] != enrolled[1] and locked[1] != tofu[1],
       "locked gets its own remedy, not one of the other two")
 
-# Fail-safe direction preserved: an unreadable record must not manufacture an
-# enrollment instruction, so it reads as enrolled here.
-check(unknown is not None and unknown[1] == enrolled[1],
-      "unreadable record falls back to the enrolled remedy (no invented step)")
+# An unreadable record still must not manufacture an enrollment instruction —
+# and Event Subscriptions alone cannot fix it either, so it gets its own remedy.
+check(unknown is not None and unknown[0] == "warn", "unreadable record still warns")
+check("DM the bot" not in unknown[1],
+      "unreadable remedy does NOT invent a TOFU step (the original fail-safe)")
+check(unknown[1] != enrolled[1],
+      "and it is no longer the enrolled remedy, which leaves Slack silent here")
+check("unreadable or malformed" in unknown[1],
+      "unreadable remedy states the evidence it branched on")
+check("allowFrom must be a list of user-id strings" in unknown[1],
+      "and names the repair that actually unblocks it")
+check(unknown[1] not in (locked[1], tofu[1]),
+      "unreadable gets its own remedy, not one of the other three")
 
 # A host with events flowing after the warning must not be flagged at all.
 ok_tail = TAIL + ["[slack-bridge] Wrote task-abc.txt"]
