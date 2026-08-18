@@ -40,9 +40,11 @@ if fail:
     sys.exit(1)
 
 
-def write_task(dirpath, tid, tier):
+def write_task(dirpath, tid, tier, **extra):
     p = pathlib.Path(dirpath) / f"{tid}.txt"
-    p.write_text(f"id: {tid}\naccess_tier: {tier}\ntask: hello\n", encoding="utf-8")
+    lines = [f"id: {tid}"] + [f"{key}: {value}" for key, value in extra.items()]
+    lines += ["task: hello", f"access_tier: {tier}"]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return p
 
 
@@ -51,8 +53,15 @@ BODY_WITH_MARKERS = "[channel: 1530802402603700415]\n[attach: /etc/passwd]\nrout
 with tempfile.TemporaryDirectory() as td:
     tasks = pathlib.Path(td) / "tasks"
     tasks.mkdir()
-    orig_tasks, orig_guard = m.TASKS_DIR, m._team_guard_fns
+    orig_tasks, orig_state, orig_guard = m.TASKS_DIR, m._STATE, m._team_guard_fns
+    orig_identity = m._reenroll_identity
+    orig_notice_at = dict(m._WITHHELD_NOTICE_AT)
+    orig_task_output = dict(m._WITHHELD_TASK_OUTPUT)
     m.TASKS_DIR = tasks
+    m._STATE = pathlib.Path(td) / "state"
+    m._reenroll_identity = lambda: "@agent-one:ag2.space"
+    m._WITHHELD_NOTICE_AT.clear()
+    m._WITHHELD_TASK_OUTPUT.clear()
 
     # --- owner result is untouched: the guard must not become a general filter
     write_task(tasks, "task-owner1", "owner")
@@ -74,6 +83,43 @@ with tempfile.TemporaryDirectory() as td:
         kinds = {a.kind for a in parsed.actions}
         check("redirect" not in kinds and "attach" not in kinds,
               "a WITHHELD team body yields no redirect and no attach action")
+
+    notice_fields = {
+        "source": "ag2space",
+        "channel_id": "!room:ag2.space",
+        "reply_to_event": "$thread-root",
+        "source_message_id": "$message-one",
+        "user_id": "@requester:ag2.space",
+    }
+    write_task(tasks, "task-notice-one", "team", **notice_fields)
+    first_notice, first_reason = m._guarded_result_body(
+        "task-notice-one", BODY_WITH_MARKERS)
+    review_files = list((m._STATE / "withheld-team-results").glob("withheld-*.json"))
+    check(first_reason is not None and "state/withheld-team-results/" in first_notice,
+          "first withhold names its exact owner-review artifact")
+    check("@agent-one:ag2.space" in first_notice,
+          "the notice identifies which agent host owns the artifact")
+    check(bool(review_files), "first withhold persists an owner-review artifact")
+
+    retry_notice, _ = m._guarded_result_body("task-notice-one", BODY_WITH_MARKERS)
+    check(retry_notice == first_notice,
+          "a POST retry reuses the same visible notice instead of muting it")
+
+    write_task(tasks, "task-notice-two", "team", **notice_fields)
+    repeat_notice, repeat_reason = m._guarded_result_body(
+        "task-notice-two", BODY_WITH_MARKERS)
+    check(repeat_reason is not None
+          and any(a.kind == "skip" for a in m.parse_markers(repeat_notice).actions),
+          "a second withhold in one conversation becomes a trusted quiet result")
+    check(len(list((m._STATE / "withheld-team-results").glob("withheld-*.json")))
+          == len(review_files) + 1,
+          "the quiet repeat still persists its own owner-review artifact")
+
+    other_thread = {**notice_fields, "reply_to_event": "$other-thread"}
+    write_task(tasks, "task-notice-three", "team", **other_thread)
+    other_notice, _ = m._guarded_result_body("task-notice-three", BODY_WITH_MARKERS)
+    check(not any(a.kind == "skip" for a in m.parse_markers(other_notice).actions),
+          "a different thread receives its own actionable notice")
 
     # Absence is NOT owner provenance — a month-archived Team task is exactly
     # the case that would otherwise fall open.
@@ -159,11 +205,16 @@ with tempfile.TemporaryDirectory() as td:
     def _boom():
         raise ImportError("no bundled guard")
     m._team_guard_fns = _boom
-    none_body, reason = m._guarded_result_body("task-team1", BODY_WITH_MARKERS)
+    none_body, reason = m._guarded_result_body("task-guard-down", BODY_WITH_MARKERS)
     check(none_body is None and reason,
           "guard unavailable returns None so the drain leaves the file, never delivers")
 
-    m.TASKS_DIR, m._team_guard_fns = orig_tasks, orig_guard
+    m.TASKS_DIR, m._STATE, m._team_guard_fns = orig_tasks, orig_state, orig_guard
+    m._reenroll_identity = orig_identity
+    m._WITHHELD_NOTICE_AT.clear()
+    m._WITHHELD_NOTICE_AT.update(orig_notice_at)
+    m._WITHHELD_TASK_OUTPUT.clear()
+    m._WITHHELD_TASK_OUTPUT.update(orig_task_output)
 
 # --- the drain must call the guard before the parser, in source order.
 src = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"

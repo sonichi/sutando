@@ -205,6 +205,9 @@ GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled tas
 
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
+_WITHHELD_NOTICE_TTL_S = 300
+_WITHHELD_NOTICE_AT: "dict[tuple, float]" = {}
+_WITHHELD_TASK_OUTPUT: "dict[str, tuple]" = {}
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
 # retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
@@ -554,10 +557,13 @@ def _token_from_vault_ag2space(vault_get=None):
 
 
 def _team_guard_fns():
-    """Return (guard_result_for_tier, resolve_access_tier) from the BUNDLED module.
-    Sibling import only — an installed wheel has no monorepo `src/` to walk to."""
-    from .team_result_guard import guard_result_for_tier, resolve_access_tier
-    return guard_result_for_tier, resolve_access_tier
+    """Load the BUNDLED guard; an installed wheel has no monorepo src/."""
+    from .team_result_guard import (
+        classify_result_for_tier,
+        materialize_withheld_verdict,
+        resolve_access_tier,
+    )
+    return classify_result_for_tier, materialize_withheld_verdict, resolve_access_tier
 
 
 def _is_redelivery_control(body: str) -> bool:
@@ -577,8 +583,10 @@ def _guarded_result_body(tid: str, body: str):
     # not consume it — a deferred POST retries and needs the same provenance.
     if tid in _REDELIVERED and _is_redelivery_control(body):
         return body, None
+    if tid in _WITHHELD_TASK_OUTPUT:
+        return _WITHHELD_TASK_OUTPUT[tid]
     try:
-        guard, resolve = _team_guard_fns()
+        classify, materialize, resolve = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
         return None, f"team_result_guard unavailable: {exc}"
@@ -586,7 +594,45 @@ def _guarded_result_body(tid: str, body: str):
     # Absence is not owner provenance: a month-archived Team task is exactly the
     # case that would otherwise fall open.
     tier = resolve(tfile) if tfile is not None else "guest"
-    return guard(body, tier, None, secret_filter=filter_chat_secrets)
+    context = {}
+    if tfile is not None:
+        try:
+            headers = local_task_protocol.parse_task_headers_trusted(
+                tfile.read_text(encoding="utf-8", errors="replace")).headers
+            context = {key: headers.get(key, "") for key in (
+                "source", "channel_id", "reply_to_event", "source_message_id", "user_id")}
+        except OSError:
+            pass
+    verdict = classify(body, tier, None, secret_filter=filter_chat_secrets)
+    agent_id = _reenroll_identity()
+    now = time.time()
+    repeat = False
+    if verdict.kind == "leak":
+        room = str(context.get("channel_id") or "")[:512]
+        user = str(context.get("user_id") or "")[:512]
+        if room and user:
+            key = (
+                agent_id,
+                str(context.get("source") or "")[:512],
+                room,
+                str(context.get("reply_to_event") or "room")[:512],
+                user,
+            )
+            previous = _WITHHELD_NOTICE_AT.get(key)
+            repeat = previous is not None and now - previous < _WITHHELD_NOTICE_TTL_S
+            _WITHHELD_NOTICE_AT[key] = now
+            if len(_WITHHELD_NOTICE_AT) > 512:
+                oldest = min(_WITHHELD_NOTICE_AT, key=_WITHHELD_NOTICE_AT.get)
+                _WITHHELD_NOTICE_AT.pop(oldest)
+    verdict = materialize(
+        verdict, body, _STATE, tid, context=context, agent_id=agent_id,
+        repeat=repeat, now=now)
+    result = (verdict.body, verdict.reason)
+    if verdict.reason is not None:
+        _WITHHELD_TASK_OUTPUT[tid] = result
+        if len(_WITHHELD_TASK_OUTPUT) > 512:
+            _WITHHELD_TASK_OUTPUT.pop(next(iter(_WITHHELD_TASK_OUTPUT)))
+    return result
 
 
 _VAULT_INTERCEPT_FNS: "tuple | None" = None

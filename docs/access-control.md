@@ -67,6 +67,17 @@ members are trusted with that environment. Future AG2 Space monitoring can add
 telemetry, injection/anomaly detection, alerts, and revocation as defense in
 depth; those are not current guarantees.
 
+When that final scan withholds a result, the gateway saves a mode-0600 JSON
+artifact under `state/withheld-team-results/` in the responding agent's Sutando
+workspace. The room notice identifies the agent host and exact relative file,
+so “local” means the responding agent's machine, not the requester's device.
+Repeated notices from the same agent, requester, and room thread are muted for
+five minutes; each withheld result is still saved. Without a thread reference,
+the same requester/room pair is the dedupe scope. This is deliberately local to
+one agent: different agents retain separate artifacts and each identifies itself.
+No owner DM is sent by this path; adding private delivery requires an explicit
+gateway owner-routing contract rather than guessing an owner destination.
+
 ## Ambient (events-promotion) access control
 
 Tasks with `access_tier: ambient` are **taskify promotions** — the events
@@ -92,4 +103,3 @@ promotion_reason + cursor range).
   — or tasks without an access_tier field — get full processing") already
   fails it closed; this section makes the mapping explicit rather than
   implicit (sonichi#2292 P1-1 follow-through).
-
