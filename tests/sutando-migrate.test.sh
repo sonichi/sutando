@@ -80,6 +80,21 @@ echo "loose ts file" > "$C/repro-bug.ts"
 mkdir -p "$B/personal-src"
 echo "personal lib" > "$B/personal-src/lib.py"
 
+# Newly-canonical surfaces (#3036): B/C scripts/ + agent config tree must
+# MIGRATE, not quarantine; repo-root Source A scripts/ is code, stays excluded.
+mkdir -p "$B/scripts" "$C/scripts" "$A/scripts"
+echo "B tool v1" > "$B/scripts/my-tool.sh"
+echo "C tool v2" > "$C/scripts/my-tool.sh"
+touch -t 202605011000 "$B/scripts/my-tool.sh"   # older — loses the collision
+touch -t 202606011000 "$C/scripts/my-tool.sh"   # newer — canonical
+echo "repo code, not data" > "$A/scripts/repo-code.sh"
+# The repo marker lives in the very dir being excluded — matches a real
+# checkout, and flips IS_SUTANDO_REPO=1 so SOURCE_A_EXCLUDE actually applies.
+echo "# repo marker" > "$A/scripts/sutando-config.sh"
+mkdir -p "$C/.claude-sutando/skills/custom" "$C/.claude-sutando/hooks"
+echo "custom skill body" > "$C/.claude-sutando/skills/custom/SKILL.md"
+echo "print('hook')" > "$C/.claude-sutando/hooks/pre-task.py"
+
 echo "==== TEST: scan ===="
 RUN_MIGRATE scan --source A,B,C 2>&1 \
     | grep -E "Source A|Source B|Source C|Cross-source|of which identical|genuine|notable|append\] build_log" \
@@ -203,6 +218,47 @@ elif [ ! -f "$DEST/tasks/archive/B/task-stale.txt" ]; then
     echo "  FAIL: stale task not routed to archive/B/"; fail=1
 else
     echo "  OK: stale task routed to tasks/archive/B/ (no watcher re-fire)"
+fi
+
+# 6d. (#3036) B/C custom scripts/ MIGRATE to dest — canonical newest wins,
+# conflicting version preserved (collision-keep-both), nothing quarantined.
+if [ ! -f "$DEST/scripts/my-tool.sh" ]; then
+    echo "  FAIL: scripts/my-tool.sh not at dest (quarantined? #3036 surface regression)"; fail=1
+elif [ "$(cat "$DEST/scripts/my-tool.sh")" != "C tool v2" ]; then
+    echo "  FAIL: scripts/my-tool.sh should hold C's newer version, got: $(cat "$DEST/scripts/my-tool.sh")"; fail=1
+else
+    tool_sidecar="$(ls "$DEST/scripts/my-tool.sh.legacy-"* 2>/dev/null | head -1)"
+    if [ -z "$tool_sidecar" ]; then
+        echo "  FAIL: scripts/my-tool.sh conflicting B version not preserved (no legacy sidecar)"; fail=1
+    elif [ "$(cat "$tool_sidecar")" != "B tool v1" ]; then
+        echo "  FAIL: scripts sidecar should hold B's version, got: $(cat "$tool_sidecar")"; fail=1
+    else
+        echo "  OK: scripts/ migrates; collision keeps both (canonical=C, sidecar=B)"
+    fi
+fi
+if [ -e "$DEST/legacy/B/quarantine/scripts" ] || [ -e "$DEST/legacy/C/quarantine/scripts" ]; then
+    echo "  FAIL: B/C scripts/ was quarantined — must migrate to dest (#3036)"; fail=1
+fi
+
+# 6e. (#3036) nested agent config tree lands at its canonical relpath
+for f in "$DEST/.claude-sutando/skills/custom/SKILL.md" \
+         "$DEST/.claude-sutando/hooks/pre-task.py"; do
+    if [ ! -f "$f" ]; then
+        echo "  FAIL: agent-config file not migrated: $f (#3036 surface regression)"; fail=1
+    fi
+done
+if [ -e "$DEST/legacy/C/quarantine/.claude-sutando" ]; then
+    echo "  FAIL: .claude-sutando was quarantined — breaks hooks/skills/memory (#3036)"; fail=1
+fi
+[ "$fail" = "0" ] && echo "  OK: .claude-sutando nested skill+hook migrated to canonical relpaths"
+
+# 6f. (#3036) repo-root Source A scripts/ is CODE — excluded, not migrated, not quarantined
+if [ -f "$DEST/scripts/repo-code.sh" ]; then
+    echo "  FAIL: Source A repo scripts/ leaked into dest (SOURCE_A_EXCLUDE regression)"; fail=1
+elif [ -e "$DEST/legacy/A/quarantine/scripts" ]; then
+    echo "  FAIL: Source A repo scripts/ was quarantined — should be excluded entirely"; fail=1
+else
+    echo "  OK: Source A repo scripts/ excluded from migration"
 fi
 
 # 7. Per-source sentinels exist
