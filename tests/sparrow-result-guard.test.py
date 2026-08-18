@@ -282,20 +282,25 @@ def drain_once(tids, provenance=()):
         m._req = real_req
 
 
-# THE security property. A Team runtime controls its own result bytes, so an
-# unprovenanced control must NOT buy a silent close — it stays withheld.
+# THE security property, post-#3108: a guarded tier may suppress its own
+# reply, but its bytes never move — the wire body is the bare marker alone.
 posted, inflight = drain_once(["task-forged"])
 bodies = [p.get("body", "") for p in posted]
-check(all("[no-send]" not in b for b in bodies),
-      "a collaborator-producible control body does NOT close the lease silently")
-check(any("withheld" in b for b in bodies),
-      "it takes the guard's withheld notice instead — the safe failure")
+check(len(bodies) == 1 and bodies[0].strip() == "[no-send]",
+      "a team skip-only result closes the lease with the bare marker ONLY")
+check(all("redelivery" not in b for b in bodies),
+      "the collaborator's surrounding prose never reaches the wire")
+check(len(posted) == 1 and posted[0].get("no_send") is True,
+      "the lease close uses the structured broker suppression field")
+check(inflight == set(), "and that lease is retired")
 
 # The PROVENANCED path is this process's own record, which a collaborator cannot
 # forge, so it still closes silently. Same bytes, opposite verdict.
 posted2, inflight2 = drain_once(["task-real"], provenance=["task-real"])
 check(len(posted2) == 1 and "[no-send]" in posted2[0]["body"],
       "the same bytes WITH this process's record still close the lease silently")
+check(posted2[0].get("no_send") is True,
+      "the provenance-backed close also carries structured suppression")
 check(inflight2 == set(), "and that lease is retired")
 
 # The reviewer's P1: a transient POST failure must not burn the provenance.
