@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contract import (ClaimBackend, DeliveryOutcome, DeliveryProvider,
+from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
                        DrainResult, DrainStatus, ProviderIndeterminate,
                        ProviderRefused, RecoverReport)
 
@@ -64,7 +64,8 @@ class DeliveryCore:
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
-                resolved = self.provider.reconcile(item_id, key)
+                resolved = self.provider.reconcile(
+                    DeliveryAttempt(item_id, payload, key))
                 if resolved is not None:
                     outcome = resolved.outcome
             elif caps.idempotent_send:

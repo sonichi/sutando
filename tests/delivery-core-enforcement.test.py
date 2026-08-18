@@ -60,7 +60,7 @@ class _KeyRecorder:
             raise out
         return DeliveryReceipt(outcome=out)
 
-    def reconcile(self, item_id, idempotency_key):
+    def reconcile(self, attempt):
         return None
 
 
@@ -160,6 +160,11 @@ class StaticKeyScan(unittest.TestCase):
                     key_arg = kw.get("idempotency_key")
                     if key_arg is None and node.args:
                         key_arg = node.args[-1]
+                    # reconcile takes DeliveryAttempt(...): the invariant moves
+                    # INSIDE the constructor — its key field must be derived.
+                    if isinstance(key_arg, ast.Call) and                             isinstance(key_arg.func, ast.Name) and                             key_arg.func.id == "DeliveryAttempt":
+                        akw = {k.arg: k.value for k in key_arg.keywords if k.arg}
+                        key_arg = akw.get("idempotency_key") or                             (key_arg.args[-1] if key_arg.args else None)
                     if key_arg is None:
                         # Unrecognised shape: fail closed, never `continue`.
                         bad.append(f"{src.name}:{node.lineno} (no key arg found)")
@@ -192,7 +197,7 @@ class _LeaseProvider:
         return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
                                provider_ref="rcpt-1")
 
-    def reconcile(self, item_id, idempotency_key):
+    def reconcile(self, attempt):
         return DeliveryReceipt(
             outcome=DeliveryOutcome.CONFIRMED if self.provider_confirmed
             else DeliveryOutcome.NOT_DELIVERED, provider_ref="rcpt-1")

@@ -56,8 +56,8 @@ class _Recorder:
             raise out
         return DeliveryReceipt(outcome=out)
 
-    def reconcile(self, item_id, idempotency_key):
-        self.reconcile_calls.append((item_id, idempotency_key))
+    def reconcile(self, attempt):
+        self.reconcile_calls.append((attempt.item_id, attempt.idempotency_key))
         return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
                                provider_ref="r-1")
 
@@ -215,6 +215,27 @@ class CorePolicy(unittest.TestCase):
         r = self._core(p).deliver_one(ITEM, b"x")
         self.assertIs(r.outcome, DeliveryOutcome.CONFIRMED)
         self.assertEqual(len(p.reconcile_calls), 1)
+
+    def test_reconcile_by_safe_resend_uses_the_attempt_payload(self):
+        """The case the (item_id, key) signature could not express: a
+        keyed-dedup provider whose only receipt store IS the send. Its
+        reconcile re-offers the attempt's own payload under the attempt's
+        own key — possible only because the attempt object carries both."""
+        class _ResendReconciler(_Recorder):
+            def reconcile(self, attempt):
+                self.reconcile_calls.append(
+                    (attempt.item_id, attempt.idempotency_key))
+                return self.deliver(attempt.item_id, attempt.payload,
+                                    attempt.idempotency_key)
+        p = _ResendReconciler(
+            [ProviderIndeterminate("timeout after send"),
+             DeliveryOutcome.CONFIRMED],
+            ProviderCapabilities(reconcile_capable=True))
+        r = self._core(p).deliver_one(ITEM, b"the-body")
+        self.assertIs(r.outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(len(p.reconcile_calls), 1)
+        # both offers carried the SAME derived key: dedup identity held.
+        self.assertEqual(p.deliver_calls[0], p.deliver_calls[1])
 
     def test_unknown_resends_only_with_idempotent_send(self):
         p = _Recorder([ProviderIndeterminate("timeout after send"),
