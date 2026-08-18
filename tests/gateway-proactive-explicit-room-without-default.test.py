@@ -88,9 +88,8 @@ def main() -> int:
     check(posts and posts[0]["payload"].get("room_id") == ROOM,
           f"b) explicit beats default, got {posts[0]['payload'].get('room_id') if posts else None}")
 
-    # c) The skip must happen BEFORE the claim: claiming a file with nowhere to
-    #    go means claim -> hand back -> re-claim, every pass, forever. Leaving it
-    #    as a plain .txt is the only quiet state.
+    # c) Skip BEFORE the claim: claiming a file with nowhere to go means
+    #    claim -> hand back -> re-claim, every pass, forever.
     posts, left = drain("no target here\n", "")
     check(posts == [], f"c) no target + no default -> nothing sent, got {len(posts)}")
     check(left == ["proactive-1.txt"],

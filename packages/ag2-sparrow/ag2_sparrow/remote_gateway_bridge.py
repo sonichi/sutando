@@ -2366,10 +2366,8 @@ def _post_proactive() -> None:
             continue
         if route == "foreign" or (
                 route == "send" and room_override is None and not PROACTIVE_ROOM):
-            # A foreign destination that only became visible post-claim: hand
-            # the file back to its real consumer rather than eating it. Same for
-            # a target that disappeared between peek and claim with no default —
-            # posting to room_id=None would be the one branch that loses a body.
+            # Hand back rather than eat: a foreign target seen only post-claim,
+            # or one that vanished with no default (room_id=None loses the body).
             try:
                 claim.rename(f)
             except OSError:
