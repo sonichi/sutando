@@ -196,9 +196,12 @@ def test_poll_results_marks_delivered_in_send_block():
 
 
 def test_poll_results_clears_sentinel_after_archive():
-    """Architectural: `_clear_delivered` must be called AFTER both
-    archive_file calls. Without it, sentinels accumulate forever in
-    `state/discord-delivered/`."""
+    """Architectural: the sentinel must be retired after both archive_file
+    calls, or sentinels accumulate forever in `state/discord-delivered/`.
+
+    That policy now lives in `_archive_delivered_pair`, which both delivery
+    paths call, so follow it there rather than requiring the call to be
+    open-coded inside poll_results."""
     import re
     src = (REPO / "src" / "discord-bridge.py").read_text()
     poll_block = re.search(
@@ -207,8 +210,17 @@ def test_poll_results_clears_sentinel_after_archive():
     )
     assert poll_block
     body = poll_block.group(1)
-    clear_pos = body.find("_clear_delivered(task_id)")
-    assert clear_pos > 0, "_clear_delivered NOT called in poll_results"
+    assert "_archive_delivered_pair(" in body, (
+        "poll_results must route cleanup through the shared helper")
+
+    helper = re.search(r"def _archive_delivered_pair\(.*?\n\n\n", src, re.DOTALL)
+    assert helper, "the shared cleanup helper is missing"
+    h = helper.group(0)
+    clear_pos = h.find("_clear_delivered(task_id)")
+    assert clear_pos > 0, "_clear_delivered NOT called in the shared helper"
+    last_archive = h.rfind("archive_file(")
+    assert last_archive > 0 and clear_pos > last_archive, (
+        "the sentinel must be retired AFTER both archive_file calls")
 
 
 def main():

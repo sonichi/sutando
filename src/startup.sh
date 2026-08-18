@@ -1,10 +1,17 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh
+# Usage: bash src/startup.sh [--with-app]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job).
 
 set -e
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# --with-app is opt-in and parsed here so an unknown flag cannot silently do
+# nothing: every other argument is still ignored exactly as before.
+WITH_APP=0
+for _arg in "$@"; do
+    case "$_arg" in --with-app) WITH_APP=1 ;; esac
+done
 
 # Resolve python3 ONCE, refusing Apple's Xcode-CLT stub. On a Mac without the
 # developer tools `/usr/bin/python3` exists but raises a modal install dialog
@@ -30,6 +37,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # suppress. An actionable message beats that dialog.
 . "$REPO/scripts/python-binary.sh"
 PY="$(resolve_python "$REPO")"
+
 if [ -z "$PY" ]; then
   {
     echo "✗ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
@@ -45,6 +53,14 @@ if [ -z "$PY" ]; then
   } >&2
   exit 1
 fi
+
+# Must run after the PY-validity abort but before ANY workspace-derived write:
+# a write below on a broken link materializes an unhealable real dir.
+_wl_out="$("$PY" "$REPO/src/workspace_layout.py" --ensure)" || {
+  echo "✗ workspace wiring broken and not auto-healable — refusing to start services onto a stranded workspace. Diagnose: $PY $REPO/src/workspace_layout.py --check" >&2
+  exit 1
+}
+case "$_wl_out" in *'"action": "healed-'*) echo "🔧 workspace wiring healed: $_wl_out" >&2 ;; esac
 cd "$REPO"
 
 # Belt-and-suspenders startup log → always recoverable from /tmp (Lucy's Bug #5
@@ -1316,6 +1332,7 @@ for port_name in $VERIFY_PORTS; do
 done
 echo ""
 
+
 # Delegate to the runtime dispatcher — canonical sutando-core launch command.
 # Sutando.app and health recovery use this same Claude-or-Codex selection.
 #
@@ -1331,6 +1348,20 @@ echo ""
 # must stay detached. Restoring /dev/tty there makes the runtime launcher try
 # to attach to sutando-core from inside tmux, which blocks startup forever and
 # leaves the old core running without completing recovery.
+# --with-app runs BEFORE the exec below (which replaces this process) and is
+# guarded: its installer must never take the core down (`set -e` is on).
+if [ "$WITH_APP" -eq 1 ]; then
+    # --launch, not --supervise: a login-persistent launchd job is a separate
+    # decision the user makes explicitly.
+    echo "→ menu-bar app (--with-app): building + launching" >&2
+    if bash "$REPO/scripts/install-menu-bar-app.sh" --launch; then
+        echo "  ✓ menu-bar app launched" >&2
+        echo "    auto-start at login is opt-in: bash scripts/install-menu-bar-app.sh --supervise" >&2
+    else
+        echo "  ✗ menu-bar app setup failed (exit $?) — the core is unaffected and still starting." >&2
+    fi
+fi
+
 if [ -t 0 ] && [ -z "${TMUX:-}" ]; then
     exec >/dev/tty 2>&1
 fi

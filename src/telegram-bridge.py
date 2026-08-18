@@ -56,7 +56,8 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 import local_task_protocol  # noqa: E402
-from result_markers import parse_markers  # noqa: E402
+from result_markers import parse_markers
+from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -65,6 +66,7 @@ from util_paths import channel_access_path, claude_home_path, write_private_text
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -188,26 +190,15 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     )
 
 
-def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
-    Silent on failure. Chi's ask 2026-04-18: archive tasks + results for
-    later pattern-mining / self-improvement analysis."""
-    try:
-        if not src.exists():
-            return
-        from datetime import datetime
-        import shutil
-        ym = datetime.now().strftime("%Y-%m")
-        base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-        dest_dir = base / ym
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
-    except Exception as e:
-        print(f"[Telegram] archive_file({kind}, {task_id}) failed: {e}")
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+def archive_file(src: "Path", kind: str, task_id: str) -> bool:
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy. It used to unlink the source when the move failed,
+    which destroyed the only copy of the task."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(f"[Telegram]{m}"))
+
 
 # Load access config
 ACCESS_FILE = channel_access_path("telegram")
@@ -417,14 +408,17 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     parsed = parse_markers(text)
     files = [a.value for a in parsed.actions if a.kind == "attach"]
     clean_text = parsed.body
-    text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
+    # Fence-aware chunks via the shared chunker — naive [i:i+4000] slicing tore
+    # code fences at the boundary and re-declared policy discord/slack share.
+    chunks = chunk_plain_text(clean_text, 4000) if clean_text else []
+    text_chunks = len(chunks)
     delivered_ok = True
     files_sent = 0
 
     # Send text (if any remains after extracting file refs)
     if clean_text:
-        for i in range(0, len(clean_text), 4000):
-            resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+        for piece in chunks:
+            resp = api("sendMessage", chat_id=chat_id, text=piece)
             if not (isinstance(resp, dict) and resp.get("ok")):
                 delivered_ok = False
         try:

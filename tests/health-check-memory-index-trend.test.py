@@ -81,26 +81,27 @@ class OverCapIsNamedAsLoss(unittest.TestCase):
 
 
 class FailsOpen(unittest.TestCase):
-    """A trend is a nicety; suppressing the level would be a regression."""
+    """Fails open — but SAYS SO (#2958). A trend is a nicety and suppressing the
+    level would be a regression; returning "" hid WHY there was no trend."""
 
-    def test_not_a_git_repo_returns_empty(self):
+    def test_not_a_git_repo_says_unavailable(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x" * 100)
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_single_commit_is_not_a_trend(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             idx = _repo_with_sizes(Path(td), [1000])
-            self.assertEqual(m._index_growth_note(idx, 1000), "")
+            self.assertEqual(m._index_growth_note(idx, 1000), m._TREND_UNAVAILABLE)
 
-    def test_missing_file_returns_empty(self):
+    def test_missing_file_says_unavailable(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(
-                m._index_growth_note(Path(td) / "nope" / "MEMORY.md", 100), "")
+                m._index_growth_note(Path(td) / "nope" / "MEMORY.md", 100), m._TREND_UNAVAILABLE)
 
 
 class TheHelperCanActuallyFire(unittest.TestCase):
@@ -116,6 +117,48 @@ class TheHelperCanActuallyFire(unittest.TestCase):
             idx = _repo_with_sizes(Path(td), [cap - 3000, cap + 10, cap - 800])
             note = m._index_growth_note(idx, cap - 800)
         self.assertTrue(note.strip(), "the helper produced nothing on a real history")
+
+
+class RateIsMeasuredFromTheLastCompaction(unittest.TestCase):
+    """Neither a compaction nor a 1-byte dip may lower the reported rate.
+    Rationale and the reviewer's jitter control are in the PR body."""
+
+    def test_growth_after_a_drop_is_not_cancelled_by_the_drop(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        # Rises, is compacted hard, then climbs steadily again — the real shape.
+        sizes = [cap - 1000, cap - 900, cap - 2400, cap - 2000, cap - 1600, cap - 1200]
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), sizes)
+            note = m._index_growth_note(idx, sizes[-1])
+        # From the drop: +1200 B. From the oldest point: only +(-200) B, which the
+        # `grew > 0` guard would suppress entirely.
+        self.assertIn("+1,200 B", note)
+        self.assertIn("remaining headroom", note)
+
+    def test_a_one_byte_dip_does_not_reset_the_baseline(self):
+        """The reviewer's jitter control: a 1-B decrease near the end must not
+        become the baseline and hide a 900-B climb behind it."""
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        sizes = [cap - 1000, cap - 100, cap - 101, cap - 100]
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), sizes)
+            note = m._index_growth_note(idx, sizes[-1])
+        # Anchoring on the last decrease reports +1 B; the real climb is +900 B.
+        self.assertIn("+900 B", note)
+        self.assertNotIn("+1 B", note)
+
+    def test_a_net_shrinking_history_still_reports_the_regrowth(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        # Net change oldest->newest is NEGATIVE, so the old code printed no rate at
+        # all. The post-compaction climb is the number a reader needs.
+        sizes = [cap - 500, cap - 3000, cap - 2500, cap - 2000]
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), sizes)
+            note = m._index_growth_note(idx, sizes[-1])
+        self.assertIn("+1,000 B", note)
 
 
 class DefensiveBranches(unittest.TestCase):
@@ -146,7 +189,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_a_truncated_batch_stream_stops_cleanly(self):
         """`--batch` output that ends mid-record (a killed git, a short pipe).
@@ -164,7 +207,7 @@ class DefensiveBranches(unittest.TestCase):
                                       "SubprocessError": Exception})
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"; idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_an_object_cat_file_reports_missing_is_skipped(self):
         """`cat-file --batch-check` does NOT fail on a bad spec — it prints
@@ -189,10 +232,10 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            # both objects skipped -> 0 points -> ""
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            # both objects skipped -> 0 points -> the unavailable marker
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
-    def test_a_failing_batch_returns_empty(self):
+    def test_a_failing_batch_says_unavailable(self):
         m = _hc()
         state = {"first": True}
 
@@ -209,7 +252,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_git_unavailable_is_swallowed(self):
         m = _hc()
@@ -221,7 +264,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
 
 class HistoricalBytesUseTheSAMEUnitsAsTheLimit(unittest.TestCase):
