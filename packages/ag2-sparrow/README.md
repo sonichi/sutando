@@ -10,10 +10,12 @@
 connects a persistent AI agent's workspace to external systems.**
 
 It transports inbound tasks and room events into a durable local workspace and
-delivers outbound results and messages through a transactional outbox. Its
-delivery core provides atomic publication, single-drainer claims, crash
-recovery, bounded retry, parking of uncertain outcomes, and provider-specific
-transport adapters.
+posts results back to the gateway. It also ships a **delivery core** — a
+transactional-outbox library (atomic publication, single-drainer claims, crash
+recovery, bounded retry, parking of uncertain outcomes, provider adapters)
+whose contract the outbound path is migrating onto. Today the default relay
+path posts results directly; the outbox is an available primitive, not yet the
+wired guarantee of that path.
 
 Sparrow contains no model or agent execution logic. It also does not decide
 room participation, recipients, fanout, task ownership, or business
@@ -27,9 +29,13 @@ profile, not its full definition.
 |---|---|
 | **Task relay** | Long-polls the AG2 Space gateway for *your* agent's tasks (identified by its relay token), drops each into the local workspace, scans for results and posts them back |
 | **Event channel** | Optionally subscribes to room events, persists them to a durable local inbox, and promotes meaningful batches into ambient tasks |
-| **Delivery outbox** | For already-published outbound items: single-sender claims, crash recovery, delivery-outcome classification, retry/park, provider adapters |
+| **Delivery outbox** *(library contract — not yet wired into the default relay path)* | For already-published outbound items: single-sender claims, crash recovery, delivery-outcome classification, retry/park, provider adapters |
 
-## The delivery outbox
+## The delivery outbox (contract)
+
+The design the `delivery_core/` modules pin. Routing the default relay result
+path through it is a separate migration; until then these are the library's
+contracts, not guarantees of the shipped `ag2-sparrow` entry point.
 
 ```mermaid
 flowchart TD
@@ -42,12 +48,13 @@ flowchart TD
     R --> D["Complete / retry / park"]
 ```
 
-The boundaries it establishes (implemented in `outbox.py`, `outbox_adapter.py`,
-and the `delivery_core/` contract):
+The boundaries the contract establishes (`outbox.py`, `outbox_adapter.py`,
+`delivery_core/`):
 
 - Upstream decides *what to send and to whom*; Sparrow does no room
   eligibility, fanout, or ownership policy.
-- In a shared outbox, the same item is never sent by two drainers at once.
+- In a shared outbox, the same item is never sent by two drainers at once
+  (for consumers that route delivery through the outbox).
 - Provider-specific HTTP statuses, response bodies, and exceptions stop at the
   adapter. The core only ever sees a three-state outcome:
   `CONFIRMED` / `NOT_DELIVERED` / `OUTCOME_UNKNOWN`.

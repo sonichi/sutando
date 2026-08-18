@@ -7,7 +7,7 @@ name = "ag2-sparrow"
 # Single-sourced from ag2_sparrow.__version__ (see [tool.setuptools.dynamic]) so the
 # packaged dist version and the importable __version__ can never drift.
 dynamic = ["version"]
-description = "A channel-neutral local delivery runtime for AI agents: durable task and event transport, transactional outbox delivery, crash-safe claims, recovery, and provider adapters."
+description = "A channel-neutral local delivery runtime for AI agents: durable task and event transport, plus a transactional-outbox delivery-core library (crash-safe claims, recovery, provider adapters)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
