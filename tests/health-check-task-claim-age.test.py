@@ -142,6 +142,16 @@ class TestTaskClaimAge(unittest.TestCase):
             self.hc.check_task_claim_age(workspace_dir=self.ws)["status"], "ok"
         )
 
+    def test_a_running_bounded_claim_is_not_counted_as_zero_running(self):
+        """The measured live shape: two `must-handle` claims on tasks that exist,
+        both inside the bound. The count must not read the leak condition."""
+        self._claim("task-43f5aca3ff8332f997.txt", 30)
+        self._claim("task-d70e2596cf7044645a.txt", 30)
+        out = self.hc.check_task_claim_age(workspace_dir=self.ws)
+        self.assertEqual(out["status"], "ok", out["detail"])
+        self.assertNotIn("0 still queued or running", out["detail"])
+        self.assertIn("2 held claim(s), 2 still queued or running", out["detail"])
+
     def test_empty_claims_dir_is_ok(self):
         self.claims.mkdir(parents=True, exist_ok=True)
         self.assertEqual(
