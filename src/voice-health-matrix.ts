@@ -43,12 +43,12 @@ export interface MatrixBaseline {
   /** Upstream (agent→SDK) counters — null while unobserved. Deltas NEVER cross
    *  a transport generation; the structural guard downgrades that window. */
   transportGeneration: number | null;
-  audioAttempted: number;
-  audioQueued: number;
+  audioAttempted: number | null;
+  audioQueued: number | null;
   /** Row 4b names the guard outcome from WINDOW deltas, not
    *  generation-lifetime totals — these are the diff sources. */
-  audioSkippedNoSession: number;
-  audioThrew: number;
+  audioSkippedNoSession: number | null;
+  audioThrew: number | null;
   echoSuppressed: number;
   ctxTimeMs: number | null;
   bufferedAmount: number | null;
@@ -124,10 +124,12 @@ function makeBaseline(input: MatrixInput): MatrixBaseline {
     chunksEnded: s.clientTotals.chunksEnded,
     chunksCancelled: s.clientTotals.chunksCancelled,
     transportGeneration: s.transportGeneration,
-    audioAttempted: s.upstream?.audio.attempted ?? 0,
-    audioQueued: s.upstream?.audio.queued ?? 0,
-    audioSkippedNoSession: s.upstream?.audio.skippedNoSession ?? 0,
-    audioThrew: s.upstream?.audio.threw ?? 0,
+    // NOT `?? 0`: a zero baseline is indistinguishable from an unobserved one,
+    // and a delta taken against it is a lifetime total wearing a window's clothes.
+    audioAttempted: s.upstream?.audio.attempted ?? null,
+    audioQueued: s.upstream?.audio.queued ?? null,
+    audioSkippedNoSession: s.upstream?.audio.skippedNoSession ?? null,
+    audioThrew: s.upstream?.audio.threw ?? null,
     echoSuppressed: s.echoSuppressed,
     ctxTimeMs: hb?.ctxTimeMs ?? (sameEpoch ? (input.prev?.ctxTimeMs ?? null) : null),
     bufferedAmount: hb?.bufferedAmount ?? null,
@@ -164,25 +166,26 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
   const upstreamWindowObserved =
     winPrev !== null &&
     au !== null &&
+    winPrev.audioAttempted !== null &&
     winPrev.transportGeneration !== null &&
     s.transportGeneration !== null &&
     !genChanged;
   const dDelivered = winPrev !== null ? s.deliveredFrames - winPrev.deliveredFrames : 0;
   const dAttemptedAudio =
     upstreamWindowObserved && au !== null && winPrev !== null
-      ? Math.max(0, au.attempted - winPrev.audioAttempted)
+      ? Math.max(0, au.attempted - (winPrev.audioAttempted as number))
       : 0;
   const dQueuedAudio =
     upstreamWindowObserved && au !== null && winPrev !== null
-      ? Math.max(0, au.queued - winPrev.audioQueued)
+      ? Math.max(0, au.queued - (winPrev.audioQueued as number))
       : 0;
   const dSkippedNoSession =
     upstreamWindowObserved && au !== null && winPrev !== null
-      ? Math.max(0, au.skippedNoSession - winPrev.audioSkippedNoSession)
+      ? Math.max(0, au.skippedNoSession - (winPrev.audioSkippedNoSession as number))
       : 0;
   const dThrewAudio =
     upstreamWindowObserved && au !== null && winPrev !== null
-      ? Math.max(0, au.threw - winPrev.audioThrew)
+      ? Math.max(0, au.threw - (winPrev.audioThrew as number))
       : 0;
   const dEchoSuppressed =
     winPrev !== null ? Math.max(0, s.echoSuppressed - winPrev.echoSuppressed) : 0;
@@ -235,8 +238,11 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
   }
   // ── Structural guard, BEFORE every delta-based row: upstream counters reset
   // per transport generation, so every delta and last…At is garbage across a
-  // reconnect — row 5 as much as row 4 (design §1.5). The FACT is recorded
-  // above, coverage-independently; only this verdict-side return is gated. ──
+  // reconnect (design §1.5). The FACT is recorded above, coverage-independently;
+  // only this verdict-side return is gated. NOTE this guard is gated on
+  // observesUpstreamSend, so BELOW session+egress it does not fire — row 5 is
+  // protected there by its own honesty branch, not by this. Relaxing that branch
+  // without widening this guard loses row 5's protection. ──
   if (observesUpstreamSend(coverage) && genChanged) {
     return out('insufficient-evidence', 'transport-generation-changed');
   }

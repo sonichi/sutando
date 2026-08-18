@@ -128,10 +128,10 @@ function baselineBefore(s: AudioHealthSnapshot, deltas: Partial<MatrixBaseline> 
 		chunksEnded: s.clientTotals.chunksEnded,
 		chunksCancelled: s.clientTotals.chunksCancelled,
 		transportGeneration: s.transportGeneration,
-		audioAttempted: s.upstream?.audio.attempted ?? 0,
-		audioQueued: s.upstream?.audio.queued ?? 0,
-		audioSkippedNoSession: s.upstream?.audio.skippedNoSession ?? 0,
-		audioThrew: s.upstream?.audio.threw ?? 0,
+		audioAttempted: s.upstream?.audio.attempted ?? null,
+		audioQueued: s.upstream?.audio.queued ?? null,
+		audioSkippedNoSession: s.upstream?.audio.skippedNoSession ?? null,
+		audioThrew: s.upstream?.audio.threw ?? null,
 		echoSuppressed: s.echoSuppressed,
 		ctxTimeMs: s.lastHeartbeat?.ctxTimeMs ?? null,
 		bufferedAmount: s.lastHeartbeat?.bufferedAmount ?? null,
@@ -356,6 +356,36 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 		assert.equal(shadow.verdict, 'post-sdk-silent');
 		assert.deepEqual(r.facts, shadow.facts, 'same input, same facts, different claim');
 		assert.equal(r.facts.losslessWindowWithSpeechQueued, true);
+	});
+
+	it('a baseline with a generation but NO upstream cannot fabricate a lossless window', () => {
+		// john-the-dev's finding: the previous tick's observedness was inferred
+		// from transportGeneration being non-null, but generation and upstream are
+		// independent fields off the same diag. A prev with a REAL generation and
+		// absent counters therefore passed the guard, and `?? 0` made the missing
+		// counters look like a real zero — so the delta became a lifetime total.
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 4000, queued: 4000, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 5,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			transportGeneration: 5, // NOT null — same generation, so genChanged is false
+			audioAttempted: null, // …but upstream was absent at that tick
+			audioQueued: null,
+			audioSkippedNoSession: null,
+			audioThrew: null,
+		});
+		const r = evalWith(s, prev);
+		assert.equal(
+			r.facts.losslessWindowWithSpeechQueued,
+			false,
+			'a window that was never measured must not read as lossless',
+		);
+		// The FACT is coverage-independent (see the note on the coverage-gated
+		// verdict below), so this holds regardless of the coverage mode.
+		assert.equal(r.facts.upstreamWindowObserved ?? false, false);
 	});
 
 	it('an unobserved BASELINE can never fabricate post-sdk-silent (null→observed transition)', () => {
