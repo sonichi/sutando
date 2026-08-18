@@ -6,7 +6,9 @@ not cosmetic:
     file absent             -> UNCONFIGURED   never configured; TOFU open
     allowFrom populated     -> ENROLLED       an owner is enrolled
     allowFrom empty         -> LOCKED         admin locked it down; TOFU CLOSED
-    record unreadable       -> UNKNOWN        we cannot tell
+    record unreadable       -> UNKNOWN        we cannot tell — including a
+                                              present `allowFrom` that is not a
+                                              list of string user IDs
 
 UNKNOWN is reported rather than folded into LOCKED because the two consumers
 need OPPOSITE fail-safes and each must choose its own: the bridge denies
@@ -51,11 +53,14 @@ def read_access(access_file) -> SlackAccess:
         return SlackAccess(set(), None)
     if not isinstance(record, dict):
         return SlackAccess(set(), None)
-    # The conversion stays INSIDE the parse boundary: `allowFrom: 42` or a list
-    # of dicts is unusable, and raising here would crash the health check.
-    try:
-        allowed = set(record.get("allowFrom") or [])
-    except TypeError:
+    # Validate the SHAPE, not just that a conversion succeeds. `"U123"` and `[7]`
+    # both convert fine and would enrol nobody real, so they must read UNKNOWN.
+    allow = record.get("allowFrom")
+    if allow is None:
+        allowed: Set[str] = set()   # absent key: the bridge's own `.get(..., [])`
+    elif isinstance(allow, list) and all(isinstance(u, str) for u in allow):
+        allowed = set(allow)
+    else:
         return SlackAccess(set(), None)
     # record is not None ONLY on a genuine parse; that is what separates a real
     # empty allowFrom (LOCKED) from an unreadable one (UNKNOWN).

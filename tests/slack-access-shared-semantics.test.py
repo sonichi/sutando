@@ -93,6 +93,13 @@ def main() -> int:
         "allowFrom is a scalar": {"allowFrom": 42},
         "allowFrom holds objects": {"allowFrom": [{"id": "U1"}]},
     }
+    # These CONVERT without raising, which is why value-equality with the bridge
+    # is the wrong contract for them: set("U123") is a set of characters.
+    permissive = {
+        "allowFrom is a string": {"allowFrom": "U123"},
+        "allowFrom holds numbers": {"allowFrom": [7]},
+        "allowFrom is mixed": {"allowFrom": ["U1", 7]},
+    }
     expected_state = {
         "absent": slack_access.UNCONFIGURED,
         "empty allowFrom": slack_access.LOCKED,
@@ -103,6 +110,7 @@ def main() -> int:
         "allowFrom is a scalar": slack_access.UNKNOWN,
         "allowFrom holds objects": slack_access.UNKNOWN,
     }
+    expected_state.update(dict.fromkeys(permissive, slack_access.UNKNOWN))
     for label, payload in cases.items():
         p = tmp / (label.replace(" ", "_") + ".json")
         if payload is None:
@@ -136,6 +144,29 @@ def main() -> int:
         p = tmp / (label.replace(" ", "_") + ".json")
         check(_guard(lambda: slack_access.access_state(p)) != slack_access.LOCKED,
               f"{label}: does NOT read as a deliberate lockout")
+
+    # A record that CONVERTS but enrols nobody real: value-equality is the wrong
+    # contract, so assert the property that matters — neither side lets a user in.
+    PROBE = "U9REALUSER"
+    for label, payload in permissive.items():
+        q = tmp / (label.replace(" ", "_") + ".json")
+        q.write_text(json.dumps(payload))
+        helper = _guard(lambda: slack_access.read_access(q).allowed)
+        bridge = _guard(lambda: _bridge_load_allowed(q))
+        state = _guard(lambda: slack_access.access_state(q))
+        check(state == slack_access.UNKNOWN,
+              f"{label}: reads UNKNOWN, not ENROLLED (got {state!r})")
+        check(isinstance(helper, set) and PROBE not in helper,
+              f"{label}: the helper enrols no real user (got {helper!r})")
+        check(isinstance(bridge, set) and PROBE not in bridge,
+              f"{label}: the bridge admits no real user either (got {bridge!r})")
+    # The one that motivated this: "U123" becomes a set of CHARACTERS, which the
+    # old equality contract would have called agreement.
+    q = tmp / "allowFrom_is_a_string.json"
+    check(_bridge_load_allowed(q) == {"U", "1", "2", "3"},
+          "the bridge really does splay a string into characters")
+    check(slack_access.read_access(q).allowed == set(),
+          "and the helper refuses it outright rather than matching that")
 
     # The extraction must be running the real thing. If the bridge ever stops
     # defining load_allowed, every equivalence above would pass vacuously.
