@@ -120,6 +120,18 @@ def main() -> int:
             chan_env.write_text("DISCORD_BOT_TOKEN=\n")
             check("dm-result: repo .env legacy tier still reachable",
                   dmr._load_token() == "tok-repo")
+            # divergence: resolved wins AND the flip is logged (values never).
+            chan_env.write_text("DISCORD_BOT_TOKEN=tok-chan\n")
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                got = dmr._load_token()
+            check("dm-result divergence: resolved source wins", got == "tok-chan")
+            check("dm-result divergence is logged, values are not",
+                  "differs from the resolved source" in buf.getvalue()
+                  and "tok-chan" not in buf.getvalue()
+                  and "tok-repo" not in buf.getvalue())
 
         # 6. Bridge (structural): token block delegates, no private scan left.
         bridge_src = (SRC / "discord-bridge.py").read_text()
