@@ -109,8 +109,8 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # How much of MEMORY.md a session actually loads. These are the RUNTIME's
 # documented numbers, not this repo's guess:
 #
-#   "Claude Code reads the first 200 lines or 25KB of a memory file, whichever
-#    comes first" — content BEYOND that point is dropped; the prefix still
+#   "The first 200 lines of MEMORY.md, or the first 25KB, whichever comes
+#    first" — and ONLY MEMORY.md. Content beyond it is dropped; the prefix still
 #    loads. YAML frontmatter and block-level HTML comments are stripped before
 #    those limits are measured.
 #   https://code.claude.com/docs/en/memory#how-it-works
@@ -2640,9 +2640,12 @@ def _behind_warn_threshold(repo: "Path") -> int:
     return raw if raw > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
 
 
-def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
+def _behind_commits_changing(repo: "Path", branch: str, prefix: "str | list[str]",
                              git_bin: str = "git") -> "list[str]":
     """Subjects of not-yet-pulled commits that EFFECTIVELY change ``prefix``.
+
+    ``prefix`` is one pathspec or several; several are passed to git as
+    separate pathspecs, so the result is their union.
 
     Two different questions, and the first cut answered the wrong one. "Did a
     not-yet-pulled commit TOUCH this path" is commit-path history; "would
@@ -2665,10 +2668,13 @@ def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
     additional signal layered on a probe that must not become the thing that
     breaks the health run.
     """
+    paths = [prefix] if isinstance(prefix, str) else list(prefix)
+    if not paths:
+        return []
     try:
         changed = subprocess.run(
             [git_bin, "-C", str(repo), "diff", "--name-only",
-             f"HEAD..origin/{branch}", "--", prefix],
+             f"HEAD..origin/{branch}", "--", *paths],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -2679,7 +2685,7 @@ def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
     try:
         out = subprocess.run(
             [git_bin, "-C", str(repo), "log", "--no-merges", "--format=%s",
-             f"HEAD..origin/{branch}", "--", prefix],
+             f"HEAD..origin/{branch}", "--", *paths],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -2687,6 +2693,45 @@ def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
     if out.returncode != 0:
         return []
     return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+# Source path -> pgrep pattern for each long-running service launched from this
+# checkout. A directory entry covers every file the service imports from it.
+_SERVICE_SOURCES = (
+    ("src/voice-agent.ts", "voice-agent.ts"),
+    ("src/web-client.ts", "web-client.ts"),
+    ("src/discord-bridge.py", "discord-bridge.py"),
+    ("src/telegram-bridge.py", "telegram-bridge.py"),
+    ("src/slack-bridge.py", "slack-bridge.py"),
+    ("src/core_heartbeat.py", "core_heartbeat.py"),
+    ("src/watch-tasks-stream.sh", "watch-tasks-stream.sh"),
+    ("src/remote-gateway-bridge.py", "remote-gateway-bridge.py"),
+    ("packages/ag2-sparrow/ag2_sparrow/", "remote-gateway-bridge.py"),
+    ("skills/phone-conversation/scripts/conversation-server.ts", "conversation-server.ts"),
+)
+
+
+def _running_service_sources() -> "list[str]":
+    """Repo-relative paths whose backing service is running FROM THIS CHECKOUT.
+
+    Returns paths, not verdicts: the caller decides what a not-yet-pulled change
+    to one of them means. Empty on any probe failure, so a broken `pgrep` cannot
+    manufacture a warning.
+    """
+    live = []
+    for path, pattern in _SERVICE_SOURCES:
+        try:
+            found = subprocess.run(
+                ["/usr/bin/pgrep", "-f", pattern],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.split()
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        # Same checkout-scoping as mark_stale_if_outdated: a sibling clone's
+        # process is not evidence about this checkout's source.
+        if found and _filter_pids_this_checkout([p for p in found if p]):
+            live.append(path)
+    return live
 
 
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
@@ -2824,11 +2869,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # moves several times a day. But one commit that rewrites a skill outranks
     # nine that touch docs, and a count cannot tell them apart.
     #
-    # Skills are the case with no other detector. `src/` needs a restart to take
-    # effect, so the `*-stale` probes catch it by comparing a running process
-    # against its source. A skill has no process: the agent reads the markdown
-    # from THIS checkout on every invocation, so a merged skill fix that has not
-    # been pulled is simply not in effect, with nothing anywhere to compare.
+    # `src/` shares the skills blind spot: `*-stale` probes compare a process to
+    # the file ON DISK, which agree byte for byte while the checkout is behind.
     #
     # Observed 2026-08-03 on this node: exactly ONE commit behind — far under the
     # threshold, so this probe reported ok — while the live `context-reconstruct`
@@ -2843,16 +2885,28 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # peer INTO its own branch. The example still lands, because it never needed
     # the destruction to: the point is that the running skill and the merged one
     # disagreed invisibly, and that is true of any content difference.
+
+    # behind==0 => empty tree diff => both probes below are provably empty, and the
+    # census costs ten 5s-timeout pgreps to say so. None is unanswerable, so it probes.
+    if behind == 0:
+        return {"name": name, "status": "ok",
+                "detail": f"live checkout on {expected!r}"}
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
-    if stale_skills:
+    # LIVE processes only: `src/` moves several times a day, so the running set
+    # is what keeps this from becoming the alert fatigue the threshold prevents.
+    live_sources = _running_service_sources()
+    stale_services = (_behind_commits_changing(repo, expected, live_sources, git_bin)
+                      if live_sources else [])
+    if stale_skills or stale_services:
         # No shared history: the tree diff is still valid, but no count and no
         # fast-forward are, so say that rather than render "None commit(s)".
+        subset = stale_skills or stale_services
         if behind is None:
             distance = (f"live checkout is on {expected!r} an unknown distance behind "
                         f"origin/{expected} (no common ancestor — shallow clone, so a commit "
                         "count is not available)")
             # "of them" needs a total to refer to.
-            share = f"{len(stale_skills)} commit(s) change"
+            share = f"{len(subset)} commit(s) change"
             refresh = (f"`git -C {repo} fetch --unshallow` first; `pull --ff-only` cannot "
                        "apply without a shared history")
         else:
@@ -2860,17 +2914,27 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                         f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
                         "nag threshold")
             # The count above is the TOTAL, so "of them" keeps the subset a subset.
-            share = f"{len(stale_skills)} of them change"
+            share = f"{len(subset)} of them change"
             refresh = f"`git -C {repo} pull --ff-only`"
+        tail = (f"Measured against the last-fetched ref; this probe does not fetch, "
+                f"so it can only under-report.")
+        if stale_skills:
+            return {"name": name, "status": "warn",
+                    "detail": f"{distance} — but {share} `skills/`, "
+                              "which the agent re-reads from this checkout on EVERY invocation. "
+                              "Those merged skill fixes are not in effect here, and no "
+                              "restart-staleness probe can see it: a skill has no running process "
+                              f"to compare against. ({'; '.join(stale_skills[:3])}"
+                              f"{'; …' if len(stale_skills) > 3 else ''}) Refresh with "
+                              f"{refresh}. {tail}"}
         return {"name": name, "status": "warn",
-                "detail": f"{distance} — but {share} `skills/`, "
-                          "which the agent re-reads from this checkout on EVERY invocation. "
-                          "Those merged skill fixes are not in effect here, and no "
-                          "restart-staleness probe can see it: a skill has no running process "
-                          f"to compare against. ({'; '.join(stale_skills[:3])}"
-                          f"{'; …' if len(stale_skills) > 3 else ''}) Refresh with "
-                          f"{refresh}. Measured against the last-fetched "
-                          "ref; this probe does not fetch, so it can only under-report."}
+                "detail": f"{distance} — but {share} source backing a service running "
+                          "here, so those merged fixes are not executing. No restart-staleness "
+                          "probe can see it: they compare a process against the file ON DISK, "
+                          "and while the checkout is behind those agree exactly. "
+                          f"({'; '.join(stale_services[:3])}"
+                          f"{'; …' if len(stale_services) > 3 else ''}) Refresh with "
+                          f"{refresh} + restart the affected service. {tail}"}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
                       + (f", {behind} commits behind" if behind else "")}
@@ -5305,8 +5369,12 @@ def check_gateway_bridge() -> "dict | None":
                 "detail": f"running; last poll did not succeed, last one that did "
                           f"was {age_h * 3600:.0f}s ago (transient)",
             }
-        since = ("last successful poll UNKNOWN" if age_h is None
-                 else f"last successful poll {age_h:.1f}h ago")
+        # Seconds below an hour: `{age_h:.1f}h` renders a 106s age as "0.0h ago",
+        # the self-refuting line the transient branch above exists to remove.
+        age_s = None if age_h is None or age_h < 0 else age_h * 3600
+        since = ("last successful poll UNKNOWN" if age_s is None
+                 else f"last successful poll {age_s:.0f}s ago" if age_s < 3600
+                 else f"last successful poll {age_s / 3600:.1f}h ago")
         return {
             "name": "gateway-bridge",
             "status": "warn",
@@ -6325,7 +6393,7 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         # Age-INDEPENDENT and definitive, so it is checked FIRST: nothing can
         # release a claim whose owner is gone, whatever the ledger says.
         if pid is not None and not _pid_alive(pid):
-            leaked.append((age or 0.0, entry.name, "owner process gone"))
+            leaked.append((age, entry.name, "owner process gone"))
         elif not task_live:
             # Archival and claim release are ASYNCHRONOUS; only past that window
             # is an absent task evidence that nothing will release the claim.
@@ -6347,11 +6415,16 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no held task-handler claims"}
 
     if leaked:
-        leaked.sort(reverse=True)
+        # Unknown first — nothing can vouch for it — then genuinely oldest. The
+        # negation matters: a plain ascending key names the YOUNGEST leak "oldest".
+        leaked.sort(key=lambda r: (r[0] is not None, -(r[0] or 0.0)))
         age, who, why = leaked[0]
+        oldest = ("age unknown" if age is None
+                  else f"oldest {age:.0f}s" if age < 3600
+                  else f"oldest {age / 3600:.1f}h")
         return {"name": name, "status": "down",
                 "detail": f"{len(leaked)} of {held} held claim(s) leaked — {why}, "
-                          f"oldest {age / 3600:.1f}h ({who}); nothing will release "
+                          f"{oldest} ({who}); nothing will release "
                           "them, and each publishes a user-visible failure when the "
                           "watcher next exits"}
     if bounded:
