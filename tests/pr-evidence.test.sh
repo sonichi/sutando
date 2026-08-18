@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# The evidence generator must capture what actually happened — stdout, stderr,
-# and the exit code — and bind the block to a sha. If it can drop a failure or
-# emit a block for commands it never ran, it launders a claim instead of proving
-# one, which is the exact failure it exists to prevent.
+# The generator must capture what happened — stdout, stderr, exit code — and bind
+# the block to a sha; dropping any of it launders a claim instead of proving one.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -91,16 +89,14 @@ bash "$GEN" --at not-a-real-ref 'echo x' >/dev/null 2>&1 || rc_ref=$?
 nonzero "$rc_ref" "refuses an unknown ref instead of silently running at HEAD"
 
 # ---- --at must pin the workspace even with NO local config file -------------
-# Pinning used to require sutando.config.local.json, so by default the worktree
-# resolved its own empty workspace/ and every probe reported false-clean.
+# Pinning used to need a local config, so the worktree read its own empty one.
 live_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
 ws_out="$(bash "$GEN" --at HEAD~1 'bash scripts/sutando-config.sh workspace' 2>/dev/null)"
 has "$ws_out" "$live_ws" "--at reports the LIVE workspace with no local config present"
 lacks "$ws_out" "pr-evidence-" "--at does NOT report a workspace under its own temp dir"
 
 # ---- the pinned config is minimal and private ------------------------------
-# It used to copy the whole local config into a 0755 worktree, where a failed
-# cleanup strands it world-readable.
+# A whole-config copy in a 0755 worktree survives a failed cleanup, world-readable.
 perm_out="$(bash "$GEN" --at HEAD~1 \
     'pwd' \
     'stat -f \"%Sp\" sutando.config.local.json 2>/dev/null || stat -c \"%A\" sutando.config.local.json' \
@@ -115,8 +111,7 @@ has "$perm_out" 'drwx------' "that wrapper is private (0700)"
 has "$perm_out" "['workspace']" "the pinned config carries ONLY workspace, not the real one"
 
 # ---- verbatim: trailing newlines are NOT stripped ---------------------------
-# Compare through a FILE, never $( ): command substitution strips the exact
-# newlines under test, so a captured comparison would pass for the wrong reason.
+# Compare through a FILE, never $( ): that strips the very newlines under test.
 nl_file="$(mktemp)"
 bash "$GEN" 'printf "alpha\n\n"' > "$nl_file" 2>/dev/null
 gap="$(awk '/^alpha$/{f=1;n=0;next} f&&/^\[exit 0\]$/{print n;exit} f{n++}' "$nl_file")"
@@ -126,6 +121,16 @@ bash "$GEN" 'printf "beta"' > "$nl_file" 2>/dev/null
 gap0="$(awk '/^beta$/{f=1;n=0;next} f&&/^\[exit 0\]$/{print n;exit} f{n++}' "$nl_file")"
 same "$gap0" "0" "output with NO trailing newline still gets the marker on its own line"
 rm -f "$nl_file"
+
+# ---- --help carries its own text ------------------------------------------
+# usage() used to sed its own header, so a comment edit silently gutted --help.
+help_out="$(bash "$GEN" --help 2>/dev/null)"; help_rc=$?
+same "$help_rc" "0" "--help exits 0"
+has "$help_out" '--at <ref>' "--help documents the --at form"
+has "$help_out" 'false-clean evidence' "--help keeps the reason --at pins the workspace"
+noflag_out="$(bash "$GEN" 2>&1)"; noflag_rc=$?
+nonzero "$noflag_rc" "no commands is an error, not an empty block"
+has "$noflag_out" 'Usage:' "and the error prints the usage text"
 
 if [[ "$fail" -ne 0 ]]; then
     echo "FAIL: pr-evidence generator"

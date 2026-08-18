@@ -1,18 +1,6 @@
 #!/usr/bin/env bash
-# Generate PR before/after evidence by RUNNING the commands and capturing their
-# real output, so the author never transcribes and therefore cannot invent it.
-#
-# Usage:
-#   bash scripts/pr-evidence.sh 'cmd' ['cmd' ...]           # run at the current HEAD
-#   bash scripts/pr-evidence.sh --at <ref> 'cmd' ['cmd' ...] # run at <ref>, workspace-pinned
-#
-# Prints a markdown block: each command, its verbatim stdout+stderr, its exit
-# code, and a stamp naming the sha the block was produced at. Paste it whole.
-#
-# --at builds the "before" half without touching the live checkout, and pins the
-# temporary worktree at the LIVE workspace. CONTRIBUTING warns why: an unpinned
-# worktree resolves its own empty workspace/ and every workspace-reading probe
-# reports clean no matter what the code does — false-clean evidence.
+# Generates PR before/after evidence by RUNNING the commands and capturing their
+# real output, so an author never transcribes it and therefore cannot invent it.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,7 +8,22 @@ REF=""
 WT=""
 WTPARENT=""
 
-usage() { sed -n '2,12p' "$0"; exit "${1:-0}"; }
+usage() {
+    cat <<'USAGE'
+Usage:
+  bash scripts/pr-evidence.sh 'cmd' ['cmd' ...]            run at the current HEAD
+  bash scripts/pr-evidence.sh --at <ref> 'cmd' ['cmd' ...]  run at <ref>, workspace-pinned
+
+Prints a markdown block: each command, its verbatim stdout+stderr, its exit code,
+and a stamp naming the sha the block was produced at. Paste it whole.
+
+--at builds the "before" half without touching the live checkout, and pins the
+temporary worktree at the LIVE workspace. CONTRIBUTING warns why: an unpinned
+worktree resolves its own empty workspace/ and every workspace-reading probe
+reports clean no matter what the code does — false-clean evidence.
+USAGE
+    exit "${1:-0}"
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -70,8 +73,6 @@ if [[ -n "$REF" ]]; then
         || { echo "pr-evidence: could not create a worktree at '$REF'" >&2; exit 2; }
     RUNDIR="$WT"
 
-    # MINIMAL config, never a copy: the real one carries unrelated local
-    # settings (vault, migrate) this tool has no need to duplicate.
     # Bare python3 is the Xcode-CLT stub on a Mac without developer tools — the
     # exact modal this resolver exists to avoid.
     . "$REPO/scripts/python-binary.sh"
@@ -80,6 +81,8 @@ if [[ -n "$REF" ]]; then
         echo "pr-evidence: no runnable python3 — cannot pin the worktree's workspace" >&2
         exit 2
     }
+    # MINIMAL config, never a copy: the real one carries unrelated local
+    # settings (vault, migrate) this tool has no need to duplicate.
     ( umask 077
       "$PY_BIN" - "$WT/sutando.config.local.json" "$LIVE_WS" <<'PY'
 import json, pathlib, sys
