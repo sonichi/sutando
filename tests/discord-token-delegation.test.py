@@ -23,6 +23,13 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
+# Isolate channel config BEFORE any bridge-file load: dm-result resolves
+# channel paths at import, and an unset CLAUDE_CONFIG_DIR reads the real one.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-token-delegation-")
+_cfg_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_cfg_discord.mkdir(parents=True, exist_ok=True)
+(_cfg_discord / "access.json").write_text('{"allowFrom": []}')
+
 import channel_token  # noqa: E402
 
 FAILS = []
@@ -61,10 +68,8 @@ def main() -> int:
             check("read_discord_channel strips quotes",
                   rdc._bot_token() == "tok-quoted")
 
-            # 1b. The drift population (air's divergence table): a mismatched
-            #     pair and a doubled quote are where the five old parsers
-            #     disagreed (dm-result stripped both; the shared _clean strips
-            #     exactly one MATCHING layer). Pin the unified semantics.
+            # 1b. Drift population: the shapes where the five old parsers
+            #     disagreed — pin the unified one-matching-layer semantics.
             envf.write_text("DISCORD_BOT_TOKEN=\"abc'\n")
             check("mismatched quotes kept verbatim (discord-read)",
                   dread._load_token(envf) == "\"abc'")
@@ -99,9 +104,8 @@ def main() -> int:
             check("read_discord_channel absent -> None", rdc._bot_token() is None)
             check("discord-read absent -> ''", dread._load_token(envf) == "")
 
-            # 5. dm-result: shared resolution first, repo/.env only as legacy tier.
-            #    Import needs its util_paths deps; drive it with a redirected
-            #    claude_home_path so no real config dir is touched.
+            # 5. dm-result: shared resolution first, repo/.env only as a
+            #    legacy tier (redirected claude_home_path; no real config).
             dmr = load("dmr_t", "dm-result.py")
             chan_env = Path(td) / "chan.env"
             repo_env = Path(td) / "repo.env"

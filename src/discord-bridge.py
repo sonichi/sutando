@@ -328,9 +328,7 @@ if channels_env.exists():
         # restore/sync, or an ACL-restricted file must NOT crash the bridge at
         # startup — the file may still be perfectly readable. Warn and continue.
         print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
-# env var takes precedence (test injection without a real .env), then the
-# channel .env, then the Keychain vault — discord's native order, now resolved
-# by the shared policy so quoting/emptiness rules cannot drift per consumer.
+# env -> channel .env -> vault; shared policy so quoting rules cannot drift.
 from channel_token import resolve_channel_token  # noqa: E402
 TOKEN = resolve_channel_token("DISCORD_BOT_TOKEN", env_file=channels_env)
 

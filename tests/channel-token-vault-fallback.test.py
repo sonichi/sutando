@@ -84,9 +84,8 @@ def _load_bridge_starved(filename: str, mod_name: str, wants: list[str], stubs: 
     fake_ct = types.ModuleType("channel_token")
     fake_ct.token_from_vault = lambda var, vault_get=None: (
         asked.append(var) or (f"vault-{var}" if vault_value is None else vault_value))
-    # discord-bridge now resolves through resolve_channel_token (env -> file ->
-    # vault); mirror that order over the SAME stub vault so `asked` still
-    # records the consult and the starved environment still ends at the vault.
+    # discord-bridge resolves via resolve_channel_token now; mirror its order
+    # over the SAME stub vault so `asked` still records the consult.
     fake_ct.resolve_channel_token = lambda var, env_file=None, environ=None, vault_get=None: (
         (environ or os.environ).get(var, "").strip()
         or fake_ct.token_from_vault(var))
