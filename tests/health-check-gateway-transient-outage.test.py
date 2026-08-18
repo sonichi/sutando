@@ -66,10 +66,28 @@ class TestTransientIsNotAnOutage(unittest.TestCase):
         self.assertEqual(_probe(299)["status"], "warn")
 
     def test_a_negative_age_is_not_freshness(self):
-        """Review finding: a clock step must not read as a 'transient' ok."""
+        """Review finding: a clock step must not read as a 'transient' ok.
+
+        `assertNotIn` alone is satisfiable by an implementation that renders
+        nothing at all, so the line is pinned positively too.
+        """
         res = _probe(-600)
         self.assertEqual(res["status"], "warn", res["detail"])
         self.assertNotIn("-600s", res["detail"])
+        self.assertIn("last successful poll UNKNOWN", res["detail"])
+
+    def test_the_warn_line_reads_in_seconds_below_an_hour(self):
+        """`{age_h:.1f}h` rendered a 106s age as "0.0h ago" — the same
+        self-refuting shape, surviving on the correct side of the verdict."""
+        for age_s in (106, 299, 3599):
+            detail = _probe(age_s)["detail"]
+            self.assertIn(f"{age_s}s ago", detail)
+            self.assertNotIn("0.0h", detail)
+        # An hour and over still reads in hours; the boundary belongs to hours.
+        self.assertIn("1.0h ago", _probe(3600)["detail"])
+        self.assertIn("13.5h ago", _probe(48600)["detail"])
+        # UNKNOWN is untouched by the unit change.
+        self.assertIn("UNKNOWN", _probe(0, last_ok=False)["detail"])
 
     def test_a_real_outage_still_warns(self):
         res = _probe(13.5 * 3600)
