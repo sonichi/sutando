@@ -23,10 +23,12 @@ sys.path.insert(0, str(REPO / "src"))
 # Hermetic (module level, before any bridge import): bridges resolve channel
 # config at import — point them at a seeded temp dir, never the real one.
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="dest-drive-ccd-")
-for _ch in ("discord", "slack"):
-    _d = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / _ch
-    _d.mkdir(parents=True, exist_ok=True)
-    (_d / "access.json").write_text('{"allowFrom": ["4242"]}')
+_DISCORD_CFG = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_DISCORD_CFG.mkdir(parents=True, exist_ok=True)
+(_DISCORD_CFG / "access.json").write_text('{"allowFrom": ["4242"]}')
+_SLACK_CFG = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_SLACK_CFG.mkdir(parents=True, exist_ok=True)
+(_SLACK_CFG / "access.json").write_text('{"allowFrom": ["4242"]}')
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
 os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
