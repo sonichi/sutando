@@ -1,0 +1,377 @@
+/**
+ * Coordinator tests (Phase 1 armed mode): the impure driver around the pure
+ * reducer, driven end-to-end against a fake bodhi session — the integration
+ * fake from the design's test plan (a transport that activates, fails, or
+ * goes silent exactly as scripted) — with a virtual clock and manual timers.
+ */
+
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+import {
+	VoiceSilenceRecoveryCoordinator,
+	parseRetryUpstreamCommand,
+	recoverySurfaceSupported,
+} from '../src/voice-silence-recovery-coordinator.js';
+import type { MatrixFactsLike } from '../src/voice-active-silence-watchdog.js';
+
+interface FakeTimer {
+	fn: () => void;
+	at: number;
+	cleared: boolean;
+	fired: boolean;
+}
+
+function makeHarness(opts: { requiredTicks?: number } = {}) {
+	let now = 100_000;
+	const timers: FakeTimer[] = [];
+	const sent: Array<Record<string, unknown>> = [];
+	const rows: Array<Record<string, unknown>> = [];
+	const restarts: Array<{
+		reason: string;
+		dialGen: number;
+		resolve: () => void;
+		reject: (e: unknown) => void;
+	}> = [];
+	let dialGen = 1; // the initial session dial took generation 1
+	const session = {
+		recoverUpstream(args: { reason: string }) {
+			dialGen += 1;
+			let resolveA!: () => void;
+			let rejectA!: (e: unknown) => void;
+			const activated = new Promise<void>((res, rej) => {
+				resolveA = res;
+				rejectA = rej;
+			});
+			activated.catch(() => {});
+			restarts.push({ reason: args.reason, dialGen, resolve: resolveA, reject: rejectA });
+			return {
+				attemptEpoch: dialGen,
+				activated,
+				incumbentClosed: Promise.resolve('closed' as const),
+			};
+		},
+		sendJsonToClient(m: Record<string, unknown>) {
+			sent.push(m);
+		},
+		getRecoveryCapabilities() {
+			return { version: 1, recoverUpstream: true, transportGenerations: true };
+		},
+	};
+	const coord = new VoiceSilenceRecoveryCoordinator({
+		voiceSessionId: 'vs_test',
+		session,
+		requiredTicks: opts.requiredTicks ?? 3,
+		nowFn: () => now,
+		wallNowFn: () => now,
+		record: (row) => rows.push(row),
+		setTimer: (fn, ms) => {
+			const t: FakeTimer = { fn, at: now + ms, cleared: false, fired: false };
+			timers.push(t);
+			return t;
+		},
+		clearTimer: (h) => {
+			(h as FakeTimer).cleared = true;
+		},
+	});
+	const advance = (ms: number) => {
+		now += ms;
+		for (const t of timers) {
+			if (!t.cleared && !t.fired && t.at <= now) {
+				t.fired = true;
+				t.fn();
+			}
+		}
+	};
+	const facts = (over: Partial<MatrixFactsLike> = {}): MatrixFactsLike => ({
+		factsAvailable: true,
+		speechInWindow: true,
+		speechObservedAt: null,
+		ingressAdvanced: true,
+		modelSilentFor15s: true,
+		...over,
+	});
+	const tick = (over: { lastAboveFloorAt?: number | null; pendingToolCount?: number; deliveredAdvanced?: boolean; sessionState?: string } = {}) => {
+		coord.observeTick({
+			at: now,
+			sessionState: over.sessionState ?? 'ACTIVE',
+			facts: facts(),
+			lastAboveFloorAt: over.lastAboveFloorAt ?? null,
+			pendingToolCount: over.pendingToolCount ?? 0,
+			deliveredAdvanced: over.deliveredAdvanced ?? false,
+		});
+	};
+	const setupOk = (dial: number, gen: number) =>
+		coord.handleLifecycleEvent({ kind: 'setup-ok', connectAttemptId: `att_${dial}`, transportGeneration: gen });
+	const flush = () => new Promise<void>((r) => setImmediate(r));
+	return { coord, session, advance, tick, setupOk, flush, sent, rows, restarts, timers, nowOf: () => now };
+}
+
+/** Attach a client, activate generation 1 ordinarily, latch speech, and walk
+ *  three qualifying ticks to the first authorized restart. */
+async function fireOnce(h: ReturnType<typeof makeHarness>) {
+	h.coord.handleClientConnected();
+	h.setupOk(1, 1);
+	h.advance(10_000);
+	const speechAt = h.nowOf();
+	h.advance(20_000);
+	h.tick({ lastAboveFloorAt: speechAt }); // speech + streak 1
+	h.advance(30_000);
+	h.tick({ lastAboveFloorAt: speechAt }); // streak 2
+	h.advance(30_000);
+	h.tick({ lastAboveFloorAt: speechAt }); // streak 3 -> authorize
+}
+
+describe('recovery coordinator: fire and restart', () => {
+	it('three qualifying ticks authorize one injection-free held restart', async () => {
+		const h = makeHarness();
+		await fireOnce(h);
+		assert.equal(h.restarts.length, 1);
+		assert.equal(h.restarts[0].reason, 'active-silence');
+		assert.equal(h.coord.phase, 'restarting');
+		// Correlated activation returns to idle on the recovery dial's setup-ok.
+		h.setupOk(h.restarts[0].dialGen, 2);
+		assert.equal(h.coord.phase, 'idle');
+		assert.equal(h.coord.state.currentTransportEpoch, 2);
+		assert.equal(h.coord.state.episodeAttempts, 1);
+	});
+
+	it('a non-ACTIVE state or pending tool never fires', async () => {
+		const h = makeHarness();
+		h.coord.handleClientConnected();
+		h.setupOk(1, 1);
+		h.advance(10_000);
+		const speechAt = h.nowOf();
+		h.advance(20_000);
+		h.coord.noteToolCall('t1', 'inline');
+		for (let i = 0; i < 5; i += 1) {
+			h.tick({ lastAboveFloorAt: speechAt });
+			h.advance(30_000);
+		}
+		assert.equal(h.restarts.length, 0);
+		h.coord.noteToolSettled('t1'); // advances the anchor via toolOutcome
+		for (let i = 0; i < 5; i += 1) {
+			h.tick({ lastAboveFloorAt: speechAt, sessionState: 'CONNECTING' });
+			h.advance(30_000);
+		}
+		assert.equal(h.restarts.length, 0);
+	});
+
+	it('background tool calls never veto', async () => {
+		const h = makeHarness();
+		h.coord.noteToolCall('bg1', 'background');
+		assert.equal(h.coord.pendingToolCount, 0);
+	});
+});
+
+describe('recovery coordinator: retry ladder and terminal', () => {
+	it('dial failure schedules a cooldown retry that re-authorizes', async () => {
+		const h = makeHarness();
+		await fireOnce(h);
+		h.restarts[0].reject(new Error('dial failed'));
+		await h.flush();
+		assert.equal(h.coord.phase, 'waiting-retry');
+		// The retry timer targets lastActionAt + 60s cooldown.
+		h.advance(60_001);
+		assert.equal(h.restarts.length, 2);
+		assert.equal(h.coord.state.episodeAttempts, 2);
+	});
+
+	it('three failed attempts latch terminal and push voice-stalled', async () => {
+		const h = makeHarness();
+		await fireOnce(h);
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			h.restarts[h.restarts.length - 1].reject(new Error('dial failed'));
+			await h.flush();
+			if (attempt < 2) h.advance(60_001);
+		}
+		assert.equal(h.restarts.length, 3);
+		assert.equal(h.coord.phase, 'terminal');
+		assert.equal(h.coord.isTerminal, true);
+		const stalled = h.sent.filter((m) => m.type === 'voice-stalled');
+		assert.equal(stalled.length, 1);
+		assert.equal(stalled[0].voiceSessionId, 'vs_test');
+		assert.equal(stalled[0].clientEpoch, 1);
+		assert.equal(stalled[0].stalledAttemptEpoch, 3);
+		assert.equal(stalled[0].episodeAttempts, 3);
+		assert.equal(stalled[0].reason, 'active-silence-attempts-exhausted');
+	});
+
+	it('terminal state is re-sent on client reattach with a fresh epoch', async () => {
+		const h = makeHarness();
+		await fireOnce(h);
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			h.restarts[h.restarts.length - 1].reject(new Error('dial failed'));
+			await h.flush();
+			if (attempt < 2) h.advance(60_001);
+		}
+		h.coord.handleClientDisconnected();
+		h.coord.handleClientConnected();
+		const stalled = h.sent.filter((m) => m.type === 'voice-stalled');
+		assert.equal(stalled.length, 2);
+		assert.equal(stalled[1].clientEpoch, 2);
+		// enteredAtUnixMs is the LATCH time, not the resend time.
+		assert.equal(stalled[1].enteredAtUnixMs, stalled[0].enteredAtUnixMs);
+	});
+
+	it('a current-generation close after a recovered episode re-enters the ladder', async () => {
+		const h = makeHarness();
+		await fireOnce(h);
+		h.setupOk(h.restarts[0].dialGen, 2); // recovery succeeded -> idle
+		h.coord.handleLifecycleEvent({ kind: 'generation-close', transportGeneration: 2 });
+		assert.equal(h.coord.phase, 'waiting-retry');
+	});
+});
+
+async function driveToTerminal(h: ReturnType<typeof makeHarness>) {
+	await fireOnce(h);
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		h.restarts[h.restarts.length - 1].reject(new Error('dial failed'));
+		await h.flush();
+		if (attempt < 2) h.advance(60_001);
+	}
+	assert.equal(h.coord.phase, 'terminal');
+}
+
+const retryCmd = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+	type: 'voice.retryUpstream',
+	version: 1,
+	voiceSessionId: 'vs_test',
+	clientEpoch: 1,
+	stalledAttemptEpoch: 3,
+	requestId: 'req-1',
+	...over,
+});
+
+describe('recovery coordinator: human retry wire', () => {
+	it('a matching retry restarts a fresh episode and acks accepted with the new epoch', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.advance(120_000);
+		h.coord.handleClientCommand(retryCmd());
+		assert.equal(h.restarts.length, 4);
+		assert.equal(h.restarts[3].reason, 'human-retry');
+		const ack = h.sent.filter((m) => m.type === 'voice.retryUpstream.ack');
+		assert.equal(ack.length, 1);
+		assert.equal(ack[0].disposition, 'accepted');
+		assert.equal(ack[0].acceptedAttemptEpoch, 4);
+		assert.equal(ack[0].requestId, 'req-1');
+		assert.equal(h.coord.state.episodeAttempts, 1); // fresh episode
+	});
+
+	it('a duplicate requestId returns the original ack and never redials', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.advance(120_000);
+		h.coord.handleClientCommand(retryCmd());
+		const restartsAfterFirst = h.restarts.length;
+		h.coord.handleClientCommand(retryCmd());
+		assert.equal(h.restarts.length, restartsAfterFirst);
+		const acks = h.sent.filter((m) => m.type === 'voice.retryUpstream.ack');
+		assert.equal(acks.length, 2);
+		assert.deepEqual(acks[1], acks[0]);
+	});
+
+	it('a stale attempt epoch acks stale and changes nothing', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.advance(120_000);
+		h.coord.handleClientCommand(retryCmd({ stalledAttemptEpoch: 2, requestId: 'req-old' }));
+		const ack = h.sent.filter((m) => m.type === 'voice.retryUpstream.ack');
+		assert.equal(ack.length, 1);
+		assert.equal(ack[0].disposition, 'stale');
+		assert.equal(ack[0].acceptedAttemptEpoch, null);
+		assert.equal(h.restarts.length, 3);
+		assert.equal(h.coord.phase, 'terminal');
+	});
+
+	it('a retry outside terminal acks not-terminal', async () => {
+		const h = makeHarness();
+		h.coord.handleClientConnected();
+		h.setupOk(1, 1);
+		h.coord.handleClientCommand(retryCmd({ stalledAttemptEpoch: 1 }));
+		const ack = h.sent.filter((m) => m.type === 'voice.retryUpstream.ack');
+		assert.equal(ack.length, 1);
+		assert.equal(ack[0].disposition, 'not-terminal');
+		assert.equal(ack[0].acceptedAttemptEpoch, null);
+		assert.equal(h.restarts.length, 0);
+	});
+
+	it('a schema-invalid retry is dropped without an ack', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.coord.handleClientCommand(retryCmd({ extra: true }));
+		assert.equal(h.sent.filter((m) => m.type === 'voice.retryUpstream.ack').length, 0);
+	});
+
+	it('retry during fatal backoff parks (accepted), then dials when it clears', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.advance(120_000);
+		h.coord.handleFatalBackoff(h.nowOf() + 300_000);
+		h.coord.handleClientCommand(retryCmd());
+		const ack = h.sent.filter((m) => m.type === 'voice.retryUpstream.ack');
+		assert.equal(ack[0].disposition, 'accepted');
+		assert.equal(h.restarts.length, 3); // parked — no dial yet
+		assert.equal(h.coord.phase, 'waiting-retry');
+		h.advance(300_001);
+		assert.equal(h.restarts.length, 4); // dialed once the backoff cleared
+		assert.equal(h.restarts[3].reason, 'active-silence');
+	});
+});
+
+describe('recovery coordinator: terminal clears', () => {
+	it('a current-epoch user-visible response clears terminal (functional recovery)', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.tick({ deliveredAdvanced: true });
+		assert.equal(h.coord.phase, 'idle');
+		assert.equal(h.coord.isTerminal, false);
+		assert.equal(h.coord.state.episodeAttempts, 0);
+	});
+
+	it('modelEvent, detach, and reattach do NOT clear terminal', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.coord.handleClientDisconnected();
+		h.coord.handleClientConnected();
+		h.tick({}); // ordinary tick, nothing delivered
+		assert.equal(h.coord.phase, 'terminal');
+	});
+});
+
+describe('capability validation and schema', () => {
+	it('recoverySurfaceSupported requires the full armed surface', () => {
+		const full = {
+			recoverUpstream() {},
+			sendJsonToClient() {},
+			getRecoveryCapabilities: () => ({ version: 1, recoverUpstream: true, transportGenerations: true }),
+		};
+		assert.equal(recoverySurfaceSupported(full), true);
+		assert.equal(recoverySurfaceSupported({ ...full, recoverUpstream: undefined }), false);
+		assert.equal(
+			recoverySurfaceSupported({
+				...full,
+				getRecoveryCapabilities: () => ({ version: 1, recoverUpstream: false, transportGenerations: true }),
+			}),
+			false,
+		);
+		assert.equal(
+			recoverySurfaceSupported({
+				...full,
+				getRecoveryCapabilities: () => {
+					throw new Error('old pin');
+				},
+			}),
+			false,
+		);
+	});
+
+	it('parseRetryUpstreamCommand is schema-faithful with character lengths', () => {
+		assert.ok(parseRetryUpstreamCommand(retryCmd()));
+		assert.equal(parseRetryUpstreamCommand(retryCmd({ extra: 1 })), null);
+		assert.equal(parseRetryUpstreamCommand(retryCmd({ version: 2 })), null);
+		assert.equal(parseRetryUpstreamCommand(retryCmd({ stalledAttemptEpoch: 0 })), null);
+		assert.ok(parseRetryUpstreamCommand(retryCmd({ requestId: '\u{1F600}'.repeat(65) })));
+		assert.equal(parseRetryUpstreamCommand(retryCmd({ requestId: '\u{1F600}'.repeat(129) })), null);
+	});
+});
