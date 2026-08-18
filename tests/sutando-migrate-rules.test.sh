@@ -81,6 +81,9 @@ assert_class "state/voice-state.json" "structural" || fail=1
 assert_class "state/core-status.json" "structural" || fail=1
 assert_class "state/quota-state.json" "structural" || fail=1
 assert_class "state/dynamic-content.json" "structural" || fail=1
+# Accumulated grants, not a snapshot: under newest-mtime a fresh install's empty
+# allow-set silently discarded the whole granted set with no sidecar (b51e3db6).
+assert_class "state/slack-allowed-recipients.json" "structural" || fail=1
 # Other state/*.json (not in the per-host carve-out list) still hit newest-mtime
 assert_class "state/random-other.json" "newest-mtime" || fail=1
 assert_class "state/loop-paused-until.sentinel" "structural" || fail=1

@@ -226,6 +226,9 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
+    # Accumulated grants, not a snapshot: newest-mtime discards the whole
+    # allow-set when a fresh install writes an empty one first, with no sidecar.
+    "state/slack-allowed-recipients.json|structural"
     "state/*.json|newest-mtime"
     "state/*|structural"
     "notes/*|collision-keep-both"  # Mini #4: accretes cruft over N migrations;
