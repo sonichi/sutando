@@ -87,7 +87,7 @@ def main() -> int:
     dr._load_token = lambda env: ""
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = dr.main(["999"])
+        rc = dr.main(["999", "--operator"])
     results.append(check(rc == 1, "main: missing token → returns 1"))
 
     # --- main() single page (no --until) ----------------------------------
@@ -98,7 +98,7 @@ def main() -> int:
     ]
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = dr.main(["999"])
+        rc = dr.main(["999", "--operator"])
     printed = buf.getvalue()
     results.append(check(rc == 0 and "amy" in printed and "bob" in printed and printed.index("amy") < printed.index("bob"),
                          "main: single page prints oldest-first, returns 0"))
@@ -113,7 +113,7 @@ def main() -> int:
     dr.request_json = lambda req, timeout=10: next(seq)
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = dr.main(["999", "--until", "20"])
+        rc = dr.main(["999", "--until", "20", "--operator"])
     printed = buf.getvalue()
     # boundary=20 → id 10 is strictly older, trimmed; 20 and 30 kept.
     results.append(check(rc == 0 and "mid" in printed and "new" in printed and "old" not in printed,
@@ -123,7 +123,7 @@ def main() -> int:
     dr.request_json = lambda req, timeout=10: []
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = dr.main(["999", "--until", "20"])
+        rc = dr.main(["999", "--until", "20", "--operator"])
     results.append(check(rc == 0 and buf.getvalue() == "", "main: --until empty page breaks cleanly, returns 0"))
 
     # --- main() fetch error → returns 1 -----------------------------------
@@ -133,7 +133,7 @@ def main() -> int:
     dr.request_json = boom
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = dr.main(["999"])
+        rc = dr.main(["999", "--operator"])
     results.append(check(rc == 1, "main: fetch error → returns 1"))
 
     # --- read_discord_channel.py::_api_get --------------------------------

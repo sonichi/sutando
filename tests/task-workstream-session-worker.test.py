@@ -43,6 +43,32 @@ assert spec.loader is not None
 spec.loader.exec_module(worker)
 
 
+def _hang_report(starts: Path, terminated_at: float, *, calls: Path | None = None) -> str:
+    """The diagnostic for a shutdown that never returns, built from disk only.
+
+    Both call sites computed `after_signal` AFTER `communicate()`, so a hang aborted
+    before the payload existed — empty in exactly the case it explains (#2934).
+    """
+    try:
+        started_at = {path.name: path.stat().st_mtime for path in starts.iterdir()}
+    except OSError as exc:
+        return f"shutdown hung; starts dir unreadable ({exc})"
+    after_signal = sorted(name for name, at in started_at.items() if at > terminated_at)
+    parts = [
+        f"shutdown hung: communicate() timed out after {SHUTDOWN_DRAIN_TIMEOUT_S}s",
+        f"terminated_at={terminated_at!r}",
+        f"started_at={started_at!r}",
+        f"after_signal={after_signal!r}",
+    ]
+    if calls is not None:
+        try:
+            parts.append(f"handler_calls={calls.read_text().splitlines()!r}")
+        except OSError as exc:
+            parts.append(f"handler_calls unreadable ({exc})")
+    return "  ".join(parts)
+
+
+
 def _task(
     workspace: Path,
     task_id: str,
@@ -1230,6 +1256,40 @@ def test_required_team_handler_failure_never_emits_live_core_event() -> None:
         assert not (workspace / "state" / "task-event-handler-claims" / task.name).exists()
 
 
+def test_hang_report_is_exercised_without_a_hang() -> None:
+    """The `except TimeoutExpired` branch only runs on a failing run, so a green
+    suite proves nothing about the payload. Call the builder directly instead."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        starts = root / "starts"
+        starts.mkdir()
+        before, after = starts / "task-before.txt", starts / "task-after.txt"
+        before.touch()
+        terminated_at = time.time()
+        # mtime, not creation order, is what the report reads — set both explicitly
+        # so the assertion cannot pass on filesystem timestamp granularity.
+        os.utime(before, (terminated_at - 5, terminated_at - 5))
+        after.touch()
+        os.utime(after, (terminated_at + 5, terminated_at + 5))
+
+        report = _hang_report(starts, terminated_at)
+        assert "after_signal=['task-after.txt']" in report, report
+        assert "task-before.txt" in report, "started_at must list every marker"
+        assert str(SHUTDOWN_DRAIN_TIMEOUT_S) in report, "the bound belongs in the payload"
+
+        calls = root / "calls"
+        calls.write_text("task-before.txt\ntask-after.txt\n")
+        with_calls = _hang_report(starts, terminated_at, calls=calls)
+        assert "handler_calls=['task-before.txt', 'task-after.txt']" in with_calls, with_calls
+        assert "handler_calls" not in report, "calls= is opt-in, not always present"
+
+        # A hang can leave the temp tree torn down; the diagnostic must not raise
+        # from inside the diagnostic.
+        shutil.rmtree(starts)
+        gone = _hang_report(starts, terminated_at)
+        assert "starts dir unreadable" in gone, gone
+
+
 def test_required_team_handler_shutdown_never_falls_through() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -1242,8 +1302,18 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
         task.write_text("access_tier: team\ntask: protected\n")
         handler = _executable(
             root / "handler",
-            "#!/bin/sh\ncase \" $* \" in *\" --probe \"*) exit 4;; esac\nsleep 30\n",
+            "#!/bin/sh\n"
+            "probe=0\ntask_file=\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  case \"$1\" in --probe) probe=1;; --task-file) shift; task_file=$1;; esac\n"
+            "  shift\n"
+            "done\n"
+            "[ \"$probe\" = 1 ] && exit 4\n"
+            "[ -n \"$task_file\" ] && : > \"$HANDLER_STARTS/$(basename \"$task_file\")\"\n"
+            "sleep 30\n",
         )
+        starts = root / "starts"
+        starts.mkdir()
         bin_dir = root / "bin"
         bin_dir.mkdir()
         _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 30\n")
@@ -1252,6 +1322,7 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
             env={
                 **os.environ,
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "HANDLER_STARTS": str(starts),
                 "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
                 "SUTANDO_TASK_EVENT_HANDLER": str(handler),
                 "SUTANDO_CORE_RUNTIME": "claude",
@@ -1269,8 +1340,12 @@ def test_required_team_handler_shutdown_never_falls_through() -> None:
                 time.sleep(0.01)
             assert claim.exists()
             assert claim.read_text().splitlines()[3] == "must-handle"
+            terminated_at = time.time()
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
+            try:
+                stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError(_hang_report(starts, terminated_at)) from exc
             assert "TASK_FILE:" not in stdout
             assert "safe terminal failure" in stderr
             assert "No unrestricted fallback was used" in (results / task.name).read_text()
@@ -1586,7 +1661,11 @@ def _assert_shutdown_falls_back_without_surviving_workers() -> None:
 
             terminated_at = time.time()
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
+            try:
+                stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError(
+                    _hang_report(starts, terminated_at, calls=calls)) from exc
             process = None
             remaining_claims = sorted(path.name for path in claims.glob("task-*.txt"))
             fallbacks = workspace / "state" / "task-event-handler-fallbacks"
@@ -1793,8 +1872,18 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
         task.write_text("access_tier: team\ntask: protected\n")
         handler = _executable(
             root / "handler",
-            "#!/bin/sh\ncase \" $* \" in *\" --probe \"*) exit 4;; esac\nsleep 30\n",
+            "#!/bin/sh\n"
+            "probe=0\ntask_file=\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  case \"$1\" in --probe) probe=1;; --task-file) shift; task_file=$1;; esac\n"
+            "  shift\n"
+            "done\n"
+            "[ \"$probe\" = 1 ] && exit 4\n"
+            "[ -n \"$task_file\" ] && : > \"$HANDLER_STARTS/$(basename \"$task_file\")\"\n"
+            "sleep 30\n",
         )
+        starts = root / "starts"
+        starts.mkdir()
         bin_dir = root / "bin"
         bin_dir.mkdir()
         _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 30\n")
@@ -1803,6 +1892,7 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
             env={
                 **os.environ,
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "HANDLER_STARTS": str(starts),
                 "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
                 "SUTANDO_TASK_EVENT_HANDLER": str(handler),
                 "SUTANDO_CORE_RUNTIME": "claude",
@@ -1824,8 +1914,12 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
             # Neither written token: the watcher must not read this as optional.
             lines[3] = "must-handl"
             claim.write_text("\n".join(lines) + "\n")
+            terminated_at = time.time()
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
+            try:
+                stdout, stderr = process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError(_hang_report(starts, terminated_at)) from exc
             assert "TASK_FILE:" not in stdout, (
                 "an unrecognised disposition was published to the unrestricted core")
             assert "no recognised disposition" in stderr
@@ -1890,6 +1984,7 @@ if __name__ == "__main__":
     test_cli_main_delegates_parsed_paths()
     test_watcher_provider_failure_falls_back_without_leaking_stdout()
     test_required_team_handler_failure_never_emits_live_core_event()
+    test_hang_report_is_exercised_without_a_hang()
     test_required_team_handler_shutdown_never_falls_through()
     test_slow_handler_does_not_block_the_next_task_event()
     test_watcher_bounds_provider_backlog_and_drains_every_receipt_once()
