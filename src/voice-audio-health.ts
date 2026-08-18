@@ -828,6 +828,8 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
             prevUpTick.generation === cur.generation
               ? prevUpTick
               : { aQ: 0, aW: 0, vQ: 0, vW: 0, drop: 0 };
+          // Safe by the pin's construction: bodhi resets these counters and
+          // bumps transportGeneration on adjacent lines (0d506ead :854-855).
           const d = (x: number, y: number) => Math.max(0, x - y);
           up =
             `up={aQ/s:${(d(cur.aQ, base.aQ) / dt).toFixed(1)},` +
