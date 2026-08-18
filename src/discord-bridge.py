@@ -5142,14 +5142,14 @@ async def poll_proactive():
             # decision rule (last-active channel from
             # state/last-owner-activity.json; default discord on missing
             # state).
-            from proactive_routing import should_claim_proactive  # noqa: E402
-            if not should_claim_proactive(
-                STATE_DIR / "last-owner-activity.json", "discord"
-            ):
-                await asyncio.sleep(3)
-                continue
+            from proactive_routing import should_claim_proactive_file  # noqa: E402
             for f in RESULTS_DIR.iterdir():
-                if f.name.startswith("proactive-") and f.suffix == ".txt":
+                # Per-FILE decision: an explicit .to-<channel> destination
+                # outranks activity routing (see proactive_routing).
+                if f.name.startswith("proactive-") and f.suffix == ".txt" \
+                        and should_claim_proactive_file(
+                            f.name, STATE_DIR / "last-owner-activity.json",
+                            "discord"):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram

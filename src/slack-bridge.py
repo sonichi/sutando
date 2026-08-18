@@ -64,6 +64,7 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
+from proactive_routing import proactive_destination  # noqa: E402
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
@@ -1610,6 +1611,10 @@ def result_watcher():
                         continue
                     if peek.startswith("[channel:") and \
                             re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                        continue
+                    # Explicit filename destination outranks the race: skip
+                    # anything declared for another bridge (owner 2026-08-18).
+                    if proactive_destination(f.name) not in (None, "slack"):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.
