@@ -107,6 +107,12 @@ def main() -> int:
             # 5. dm-result: shared resolution first, repo/.env only as a
             #    legacy tier (redirected claude_home_path; no real config).
             dmr = load("dmr_t", "dm-result.py")
+            # Pin the legacy tier's PRODUCTION source before injecting paths:
+            # REPO is resolve_workspace() — the workspace .env, NOT the repo
+            # root. A relabel or path change must fail here, not in review.
+            import workspace_default
+            check("dm-result legacy tier reads the WORKSPACE .env",
+                  dmr.REPO == workspace_default.resolve_workspace())
             chan_env = Path(td) / "chan.env"
             repo_env = Path(td) / "repo.env"
             chan_env.write_text("DISCORD_BOT_TOKEN=tok-chan\n")
@@ -115,10 +121,10 @@ def main() -> int:
             dmr.REPO = Path(td)
             real_repo_env = Path(td) / ".env"
             real_repo_env.write_text("DISCORD_BOT_TOKEN=tok-repo\n")
-            check("dm-result: channel .env wins over repo .env",
+            check("dm-result: channel .env wins over workspace .env",
                   dmr._load_token() == "tok-chan")
             chan_env.write_text("DISCORD_BOT_TOKEN=\n")
-            check("dm-result: repo .env legacy tier still reachable",
+            check("dm-result: workspace .env legacy tier still reachable",
                   dmr._load_token() == "tok-repo")
             # divergence: resolved wins AND the flip is logged (values never).
             chan_env.write_text("DISCORD_BOT_TOKEN=tok-chan\n")

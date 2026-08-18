@@ -84,15 +84,16 @@ def voice_connected() -> bool:
 def _load_token() -> str:
     """Resolve DISCORD_BOT_TOKEN via the shared policy: env -> channel .env -> vault.
 
-    The repo-root .env is kept as a final legacy tier (this file historically
-    read it; no other Discord path does) via the shared parser."""
+    The WORKSPACE .env (REPO here is resolve_workspace(), not the repo root) is
+    kept as a final legacy tier (this file historically read it; no other
+    Discord path does) via the shared parser."""
     from channel_token import resolve_channel_token, token_from_env_file
     tok = resolve_channel_token("DISCORD_BOT_TOKEN",
                                 env_file=claude_home_path("channels", "discord", ".env"))
     legacy = token_from_env_file("DISCORD_BOT_TOKEN", REPO / ".env")
     if tok and legacy and tok != legacy:
         # divergence is logged (never the values) so the flip is visible.
-        print("[dm-result] DISCORD_BOT_TOKEN: repo-root .env differs from the "
+        print("[dm-result] DISCORD_BOT_TOKEN: workspace .env differs from the "
               "resolved source; using the resolved one", file=sys.stderr)
     return tok or legacy
 
