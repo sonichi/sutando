@@ -30,6 +30,14 @@ TEAM_LEAK_RESULT = (
     "the host."
 )
 
+# The reply when persistence ITSELF failed: never claim a saved copy that
+# does not exist, and never release the body either.
+TEAM_LEAK_RESULT_UNSAVED = (
+    "I completed the Team task, but the response was withheld because it may "
+    "contain sensitive information or delivery-control markers. Saving the "
+    "original for owner review ALSO failed, so no copy exists."
+)
+
 # Withheld bodies are persisted here (workspace-relative) so the placeholder
 # above is TRUE — before this existed the body was simply dropped.
 WITHHELD_DIR_RELPATH = "state/withheld-team-results"
@@ -150,13 +158,19 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None):
     try:
         return scan_team_result(body, repo, secret_filter), None
     except TeamResultLeakError as exc:
-        persist_withheld_body(body, str(exc))
-        return TEAM_LEAK_RESULT, str(exc)
+        return _withheld_reply(body, str(exc)), str(exc)
     except Exception as exc:
         # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
         # withheld, never delivered on the assumption that it was probably fine.
-        persist_withheld_body(body, f"scanner unavailable: {exc}")
-        return TEAM_LEAK_RESULT, f"scanner unavailable: {exc}"
+        reason = f"scanner unavailable: {exc}"
+        return _withheld_reply(body, reason), reason
+
+
+def _withheld_reply(body: str, reason: str) -> str:
+    """The placeholder claims a saved copy only when one actually exists."""
+    if persist_withheld_body(body, reason) is not None:
+        return TEAM_LEAK_RESULT
+    return TEAM_LEAK_RESULT_UNSAVED
 
 
 def persist_withheld_body(body: str, reason: str) -> "str | None":
@@ -170,7 +184,13 @@ def persist_withheld_body(body: str, reason: str) -> "str | None":
         from workspace_default import resolve_workspace
         directory = resolve_workspace() / WITHHELD_DIR_RELPATH
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"withheld-{int(time.time() * 1000)}-{os.getpid()}.txt"
+        # uuid4 suffix: ms+pid alone collides for two withholds in the same
+        # process and millisecond; a swallowed O_EXCL failure then falsifies
+        # the placeholder's "saved" claim.
+        import uuid
+        path = directory / (
+            f"withheld-{int(time.time() * 1000)}-{os.getpid()}"
+            f"-{uuid.uuid4().hex[:8]}.txt")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(f"withheld_reason: {reason}\n---\n{body}")

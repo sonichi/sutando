@@ -154,6 +154,45 @@ def behavioral() -> list:
         finally:
             wd.resolve_workspace = real_resolve
             os.environ.pop("SUTANDO_WORKSPACE_FOR_TEST", None)
+
+    # Same-millisecond durability: two withholds in one process+ms must BOTH
+    # persist (uuid suffix), and a persistence failure must switch the
+    # placeholder to the no-copy-exists variant, never claim "saved".
+    import time as _time
+    with tempfile.TemporaryDirectory() as td:
+        import workspace_default as wd2
+        real_resolve2 = wd2.resolve_workspace
+        wd2.resolve_workspace = lambda: Path(td)
+        real_time = _time.time
+        _time.time = lambda: 1700000000.123  # frozen clock: same ms for both
+        try:
+            out1, _ = guard.guard_result_for_tier("[no-send]\nbody one", "team", REPO, secret_filter=_clean)
+            out2, _ = guard.guard_result_for_tier("[no-send]\nbody two", "team", REPO, secret_filter=_clean)
+            saved = list((Path(td) / "state" / "withheld-team-results").glob("withheld-*.txt"))
+            if len(saved) != 2:
+                fails.append(f"same-ms withholds must both persist (found {len(saved)})")
+            if out1 != guard.TEAM_LEAK_RESULT or out2 != guard.TEAM_LEAK_RESULT:
+                fails.append("both same-ms placeholders must claim the saved copy")
+        finally:
+            _time.time = real_time
+            wd2.resolve_workspace = real_resolve2
+
+    # Persistence failure -> honest placeholder, body still withheld.
+    import workspace_default as wd3
+    real_resolve3 = wd3.resolve_workspace
+    def _boom():
+        raise RuntimeError("no workspace")
+    wd3.resolve_workspace = _boom
+    try:
+        out, why = guard.guard_result_for_tier("[no-send]\nsecret", "team", REPO, secret_filter=_clean)
+        if out != guard.TEAM_LEAK_RESULT_UNSAVED:
+            fails.append("persist failure must use the no-copy-exists placeholder")
+        if "secret" in out:
+            fails.append("persist failure must never release the body")
+        if why is None:
+            fails.append("persist failure must still report withheld")
+    finally:
+        wd3.resolve_workspace = real_resolve3
     return fails
 
 
