@@ -126,6 +126,7 @@ One entry per agent-facing module.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
+- **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.

@@ -59,6 +59,9 @@ def main() -> int:
         "populated allowFrom": {"allowFrom": ["U1", "U2"]},
         "missing allowFrom key": {"dmPolicy": "closed"},
         "unreadable": "{not json",
+        # Valid JSON, wrong shape: `.get()` raises, which must read as UNKNOWN
+        # rather than as an empty allowFrom.
+        "not a mapping": "[]",
     }
     expected_state = {
         "absent": slack_access.UNCONFIGURED,
@@ -66,6 +69,7 @@ def main() -> int:
         "populated allowFrom": slack_access.ENROLLED,
         "missing allowFrom key": slack_access.LOCKED,
         "unreadable": slack_access.UNKNOWN,
+        "not a mapping": slack_access.UNKNOWN,
     }
     for label, payload in cases.items():
         p = tmp / (label.replace(" ", "_") + ".json")

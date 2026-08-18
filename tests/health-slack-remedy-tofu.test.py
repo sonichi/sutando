@@ -48,9 +48,8 @@ check("BOTH" in tofu[1], "TOFU remedy says both are required")
 check("access.json absent" in tofu[1], "TOFU remedy states the evidence it branched on")
 check(enrolled[1] != tofu[1], "the two hosts get materially different remedies")
 
-# NEW — the third and fourth states. `.exists()` could not tell these from
-# `enrolled`, so a locked-down workspace was told to enable Event Subscriptions
-# and stayed silent afterwards.
+# The third and fourth states: `.exists()` could not tell these from
+# `enrolled`, so a locked-down workspace was told to enable Event Subscriptions.
 locked = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_state="locked")
 unknown = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_state="unknown")
 
