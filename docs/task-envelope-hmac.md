@@ -159,6 +159,23 @@ L3  privileged core execution
 Authority rises only along: remote → `drop/` → validation + policy → HMAC
 seal → `ready/` → privileged processing → replay ledger → side effects.
 
+## PR trail
+
+| PR | What it shipped | State |
+|---|---|---|
+| #3014 | The envelope itself: `src/task_envelope.py` (key, canonical slot, four verdicts) + contract/falsifier suite | merged |
+| #3030 | Remote gateway bridge stamps at the writer edge | merged |
+| #3044 | Census (`src/task_envelope_census.py`) + remaining Python writer edges | merged |
+| #3034 | Writer-edge stamping (agent-api, voice path) — note: its auto-merge raced its own review fix | merged |
+| #3055 | Census read/stat TOCTOU fix (the #3034 race, recovered) | merged |
+| #3058 | TS mirror `src/task_envelope.ts` + delegation-seam/context-drop stamping + cross-language parity tests + TS corrupt-key guard | open |
+| #3065 | Python corrupt-key guard: loud error or `unverifiable`, never a zero-length key | open |
+| #3070 | This document | open |
+
+Related hardening from the same design thread: #3069 (Team-result guard
+derives marker detection from the canonical grammar; withheld bodies persist
+for owner review) and the staged spawn-cwd resolver (Phase-5-adjacent).
+
 ## Pointers
 
 - Stamper/verifier: `src/task_envelope.py`, `src/task_envelope.ts`
