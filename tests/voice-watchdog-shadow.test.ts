@@ -287,5 +287,40 @@ const dir = mkdtempSync(join(tmpdir(), 'watchdog-shadow-'));
 		ledger.written + ledger.dropped, 600);
 }
 
+// Containment: shadow mode's value is that it may be WRONG without cost. Every
+// public entry sits on a live path whose uncaughtException handler is crash-only.
+{
+	const boom = () => { throw new Error('reducer exploded'); };
+	const led = new WatchdogLedger(join(dir, 'containment.jsonl'), { onError: () => {} });
+	const sh = new VoiceWatchdogShadow({ ledger: led, now: () => 1_000 });
+
+	// Force a throw from inside the reducer path the tick drives.
+	(sh as unknown as { observeTickUnguarded: () => void }).observeTickUnguarded = boom;
+	(sh as unknown as { noteMeetingModeUnguarded: () => void }).noteMeetingModeUnguarded = boom;
+	(sh as unknown as { noteToolCallUnguarded: () => void }).noteToolCallUnguarded = boom;
+	(sh as unknown as { noteToolSettledUnguarded: () => void }).noteToolSettledUnguarded = boom;
+
+	let escaped: string | null = null;
+	try {
+		sh.observeTick({
+			at: 1_000, sessionState: 'ACTIVE', clientConnected: true,
+			meetingMode: false, snapshot: snap({}), facts: facts(),
+		} as never);
+		sh.noteMeetingMode(true);
+		sh.noteToolCall('t-1');
+		sh.noteToolSettled('t-1');
+	} catch (err) { escaped = (err as Error).message; }
+	check('a throwing reducer never escapes the tick', escaped, null);
+
+	// flush() is awaited on the shutdown path, so a SYNC throw there would fault exit.
+	const bad = new VoiceWatchdogShadow({
+		ledger: { flush: boom, append: () => {}, mergeMeta: () => {}, dropped: 0, written: 0 } as never,
+		now: () => 1_000,
+	});
+	let flushEscaped: string | null = null;
+	try { await bad.flush(); } catch (err) { flushEscaped = (err as Error).message; }
+	check('a throwing flush never escapes shutdown', flushEscaped, null);
+}
+
 console.log(failed ? `FAILED: ${failed} check(s)` : 'voice watchdog shadow: all checks passed');
 process.exit(failed ? 1 : 0);

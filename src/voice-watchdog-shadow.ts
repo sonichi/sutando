@@ -96,13 +96,40 @@ export class VoiceWatchdogShadow {
 
 	/** Tool lifecycle from session hooks. Background `work` never vetoes (its
 	 *  results ride TaskBridge and must not mask a dead session). */
+	/** Shadow mode's whole value is that it may be WRONG without cost. A throw
+	 *  here reaches the crash-only uncaughtException handler and kills the agent. */
+	private guard(where: string, fn: () => void): void {
+		try {
+			fn();
+		} catch (err) {
+			this.log(`[SilenceShadow] ${where} threw; observation degraded, session untouched: `
+				+ `${(err as Error)?.message ?? err}`);
+		}
+	}
+
 	noteToolCall(toolCallId: string, execution?: string): void {
+		this.guard('noteToolCall', () => this.noteToolCallUnguarded(toolCallId, execution));
+	}
+
+	noteToolSettled(toolCallId: string): void {
+		this.guard('noteToolSettled', () => this.noteToolSettledUnguarded(toolCallId));
+	}
+
+	noteMeetingMode(active: boolean): void {
+		this.guard('noteMeetingMode', () => this.noteMeetingModeUnguarded(active));
+	}
+
+	observeTick(input: ShadowTickInput): void {
+		this.guard('observeTick', () => this.observeTickUnguarded(input));
+	}
+
+	private noteToolCallUnguarded(toolCallId: string, execution?: string): void {
 		if (this.mode === 'off' || execution === 'background') return;
 		// Pre-first-edge calls adopt into the upcoming epoch (see observeTick).
 		this.pendingTools.set(toolCallId, this.transportEpoch);
 	}
 
-	noteToolSettled(toolCallId: string): void {
+	private noteToolSettledUnguarded(toolCallId: string): void {
 		if (this.mode === 'off') return;
 		const originEpoch = this.pendingTools.get(toolCallId);
 		if (originEpoch === undefined) return; // background/unknown: ignore
@@ -115,13 +142,21 @@ export class VoiceWatchdogShadow {
 
 	/** Meeting-mode mutations from every site (1s request path, tool auto-
 	 *  switch), not just the 30s tick — meeting-only speech must never latch. */
-	noteMeetingMode(active: boolean): void {
+	private noteMeetingModeUnguarded(active: boolean): void {
 		if (this.mode === 'off') return;
 		this.hookQueue.push({ kind: 'meetingModeChanged', active, at: this.nowFn() });
 	}
 
 	flush(): Promise<void> {
-		return this.ledger.flush();
+		// Sync throw too: the shutdown site awaits this, so an escape there
+		// would fault the exit path rather than merely losing evidence.
+		try {
+			return this.ledger.flush();
+		} catch (err) {
+			this.log(`[SilenceShadow] flush threw; evidence lost, exit unaffected: `
+				+ `${(err as Error)?.message ?? err}`);
+			return Promise.resolve();
+		}
 	}
 
 	get snapshotState(): RecoveryState {
@@ -136,7 +171,7 @@ export class VoiceWatchdogShadow {
 
 	private lastDropReported = 0;
 
-	observeTick(input: ShadowTickInput): void {
+	private observeTickUnguarded(input: ShadowTickInput): void {
 		if (this.mode === 'off') return;
 		if (this.ledger.dropped > this.lastDropReported) {
 			this.log(`[SilenceShadow] ledger dropped ${this.ledger.dropped - this.lastDropReported} row(s) under pressure`);
