@@ -3,7 +3,7 @@
 > **Status:** this tracer did its job. The loop is now folded into the live app
 > ([design §6](../docs/pointer-teacher-design.md#6-v1--productionized-into-sutando-)):
 > `resolver.py` → the **`point_at` inline tool** (`src/browser-tools.ts`);
-> `pointer-overlay.swift` → **`PointerOverlayView`** in `src/Sutando/main.swift`
+> `Sources/pointer-overlay/main.swift` → **`PointerOverlayView`** in `src/Sutando/main.swift`
 > driven by the app's `DispatchSource` watch of `<workspace>/state/pointer-cmd.json`.
 > Kept here as the proof artifact and the reference the production port was lifted from.
 
