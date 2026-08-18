@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""A future-dated `.alive` must not read as a live core.
+
+Five call sites asked "is this heartbeat fresh?" with a one-sided threshold
+(`age >= max` / `age < max`). A future-dated file has a NEGATIVE age, so every
+one of them accepted it as fresh — a clock step or a bad write reads as a live
+core indefinitely, and in the socket resolvers it also outranks genuinely live
+peers, since selection is max(mtime).
+
+The sites are driven through their real functions, not through the helper, so a
+site that stops calling the helper fails here rather than passing on the helper's
+own behaviour.
+
+Run: python3 tests/heartbeat-freshness-bounds.test.py
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
+
+_spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
+hc = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(hc)
+except SystemExit:                      # the module runs checks when executed directly
+    pass
+
+FUTURE_S = 3600.0
+STALE_S = 600.0
+FRESH_S = 10.0
+
+
+def _write_alive(cores: Path, label: str, age_s: float, socket: str = "/tmp/s.sock"):
+    """age_s < 0 means future-dated."""
+    import time
+    p = cores / f"{label}.alive"
+    p.write_text(json.dumps({"host": label, "socket": socket, "started_at": 1.0}))
+    t = time.time() - age_s
+    os.utime(p, (t, t))
+    return p
+
+
+def _label():
+    labels = sorted(hc._local_host_labels())
+    assert labels, "no local host label resolved"
+    return labels[0]
+
+
+def test_helper_rejects_both_ends():
+    now = 1_000_000.0
+    assert hc.heartbeat_is_fresh(now - FRESH_S, now) is True
+    assert hc.heartbeat_is_fresh(now - STALE_S, now) is False, "stale must be rejected"
+    assert hc.heartbeat_is_fresh(now + FUTURE_S, now) is False, "future-dated must be rejected"
+    assert hc.heartbeat_is_fresh(now, now) is True, "age 0 is fresh"
+
+
+def test_live_core_socket_rejects_a_future_dated_heartbeat():
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, _label(), -FUTURE_S, socket="/tmp/FUTURE.sock")
+        got = hc._live_core_socket(workspace=ws)
+        assert got != "/tmp/FUTURE.sock", f"future-dated heartbeat accepted as live: {got}"
+
+
+def test_any_core_alive_rejects_a_future_dated_heartbeat():
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, _label(), -FUTURE_S)
+        assert hc._any_core_alive(workspace=ws) is False, "future-dated read as a live core"
+
+
+def test_a_genuinely_fresh_heartbeat_is_still_accepted():
+    """The bound must not cost the positive case - a fix that rejects everything
+    would pass every assertion above."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, _label(), FRESH_S, socket="/tmp/LIVE.sock")
+        assert hc._any_core_alive(workspace=ws) is True, "fresh heartbeat rejected"
+        assert hc._live_core_socket(workspace=ws) == "/tmp/LIVE.sock"
+
+
+def test_a_stale_heartbeat_is_still_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, _label(), STALE_S, socket="/tmp/STALE.sock")
+        assert hc._any_core_alive(workspace=ws) is False
+        assert hc._live_core_socket(workspace=ws) != "/tmp/STALE.sock"
+
+
+if __name__ == "__main__":
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print(f"  ok  {name}")
+    print("PASS - heartbeat freshness is bounded on both ends")
