@@ -7,9 +7,12 @@ one of them accepted it as fresh — a clock step or a bad write reads as a live
 core indefinitely, and in the socket resolvers it also outranks genuinely live
 peers, since selection is max(mtime).
 
-The sites are driven through their real functions, not through the helper, so a
-site that stops calling the helper fails here rather than passing on the helper's
-own behaviour.
+All five sites are driven through their real functions — _local_core_socket,
+_fresh_local_core_record, _any_core_alive, _core_started_within and
+_live_core_socket — not through the helper, so a site that stops calling the
+helper fails here rather than passing on the helper's own behaviour. Each is
+asserted in BOTH directions: a fix that rejected every heartbeat would satisfy
+the future-dated half alone.
 
 Run: python3 tests/heartbeat-freshness-bounds.test.py
 """
@@ -99,6 +102,73 @@ def test_a_stale_heartbeat_is_still_rejected():
         _write_alive(cores, _label(), STALE_S, socket="/tmp/STALE.sock")
         assert hc._any_core_alive(workspace=ws) is False
         assert hc._live_core_socket(workspace=ws) != "/tmp/STALE.sock"
+
+
+def test_local_core_socket_rejects_a_future_dated_heartbeat():
+    """This host's own socket resolver — a separate site from _live_core_socket."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, _label(), -FUTURE_S, socket="/tmp/FUTURE.sock")
+        assert hc._local_core_socket(workspace=ws) != "/tmp/FUTURE.sock"
+
+
+def test_local_core_socket_still_accepts_a_fresh_heartbeat():
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, _label(), FRESH_S, socket="/tmp/LIVE.sock")
+        assert hc._local_core_socket(workspace=ws) == "/tmp/LIVE.sock"
+
+
+def test_fresh_local_core_record_rejects_a_future_dated_heartbeat():
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, _label(), -FUTURE_S)
+        assert hc._fresh_local_core_record(workspace=ws) is None
+
+
+def test_fresh_local_core_record_still_returns_a_fresh_one():
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, _label(), FRESH_S)
+        rec = hc._fresh_local_core_record(workspace=ws)
+        assert isinstance(rec, dict) and rec.get("socket") == "/tmp/s.sock", rec
+
+
+def test_core_started_within_rejects_a_future_dated_heartbeat():
+    """started_at is recent, so only the heartbeat's own freshness can reject it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        import time
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        p = _write_alive(cores, _label(), -FUTURE_S)
+        p.write_text(json.dumps({"host": _label(), "socket": "/tmp/s.sock",
+                                 "started_at": time.time()}))
+        t = time.time() + FUTURE_S
+        os.utime(p, (t, t))
+        assert hc._core_started_within(3600.0, workspace=ws) is False
+
+
+def test_core_started_within_still_sees_a_fresh_recent_core():
+    with tempfile.TemporaryDirectory() as tmp:
+        import time
+        ws = Path(tmp)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        p = _write_alive(cores, _label(), FRESH_S)
+        p.write_text(json.dumps({"host": _label(), "socket": "/tmp/s.sock",
+                                 "started_at": time.time() - 5}))
+        t = time.time() - FRESH_S
+        os.utime(p, (t, t))
+        assert hc._core_started_within(3600.0, workspace=ws) is True
 
 
 if __name__ == "__main__":
