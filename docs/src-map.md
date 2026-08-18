@@ -160,6 +160,7 @@ One entry per agent-facing module.
 - **`verify-setup.sh`** — Sutando setup verification — checks everything a new user needs
 - **`vision-tools.ts`** — Vision pipeline — pipe JPEG frames from a source (screen, webcam) into the Gemini Live voice session.
 - **`vision_push.py`** — Small helper for posting one-shot vision frames to the active voice session.
+- **`voice-active-silence-watchdog.ts`** — ACTIVE-silence recovery policy (#2963 family, fourth guard) — the pure event reducer from docs/design-voice-active-silence-recovery.md (desktop repo), normative transition table included.
 - **`voice-agent-config.ts`** — Voice agent tuned-prompt configuration — step 5a-1 of the interaction-planes refactor (LiveAgentRuntime extraction, slice 1).
 - **`voice-agent-state.ts`** — `agent.state` v1 protocol provider + lifecycle snapshot publisher (design 1a′; impl plan WS1 Step 12, amendments R8/A9/A10/S3/Z3).
 - **`voice-agent.ts`** — Sutando — Voice Interface
@@ -176,6 +177,8 @@ One entry per agent-facing module.
 - **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent, phone-conversation, and any plugin voice surface).
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
+- **`voice-watchdog-ledger.ts`** — Durable append-only ledger for watchdog evidence rows (design §Observability: the shared audio-health mailbox is a lossy one-slot queue, so watchdog rows get their own small bounded channel).
+- **`voice-watchdog-shadow.ts`** — Shadow-mode host for the ACTIVE-silence recovery reducer — Phase 0a of docs/design-voice-active-silence-recovery.md (desktop repo): derives diagnostic events from the health tick, feeds the pure reducer in chronological order, persists would-fire evidence, and never touches the live session.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando

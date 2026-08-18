@@ -34,6 +34,10 @@ export const PERSIST_PAYLOAD_MAX_BYTES = 4096;
 export interface SpeechEvidence {
   active: boolean;
   onsetAt: number | null;
+  /** Onset of the most recent utterance, RETAINED after the hangover expires
+   *  (cleared only on epoch reset) — the 30s matrix window needs the first
+   *  sample of a completed utterance, which live `onsetAt` erases. */
+  lastOnsetAt: number | null;
   lastAboveFloorAt: number | null;
 }
 
@@ -480,7 +484,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     // flag alone would latch active forever — the hangover check here makes
     // silence (and stalls) end the evidence.
     const active = lastAboveFloorAt !== null && t - lastAboveFloorAt <= hangMs;
-    return { active, onsetAt: active ? onsetAt : null, lastAboveFloorAt };
+    return { active, onsetAt: active ? onsetAt : null, lastOnsetAt: onsetAt, lastAboveFloorAt };
   }
 
   function inputHealth(

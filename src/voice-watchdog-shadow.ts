@@ -1,0 +1,303 @@
+/**
+ * Shadow-mode host for the ACTIVE-silence recovery reducer — Phase 0a of
+ * docs/design-voice-active-silence-recovery.md (desktop repo): derives
+ * diagnostic events from the health tick, feeds the pure reducer in
+ * chronological order, persists would-fire evidence, and never touches the
+ * live session. `armed` degrades to shadow (no bodhi capability descriptor).
+ */
+import type { AudioHealthSnapshot } from './voice-audio-health.js';
+import type { MatrixFacts } from './voice-health-matrix.js';
+import {
+	initialRecoveryState, parseActiveSilenceMode, parseActiveSilenceTicks,
+	reduceRecovery, type ActiveSilenceMode, type RecoveryEvent, type RecoveryState,
+} from './voice-active-silence-watchdog.js';
+import { WatchdogLedger } from './voice-watchdog-ledger.js';
+
+export const DETECTOR_VERSION = 'pr1-engine-diagnostic-2';
+export const CAPABILITY_SET = Object.freeze({
+	turnStart: false,
+	routedToolOutcomes: 'settle-hook-only',
+	timestampedSpeech: 'tick-coalesced',
+	epochFencing: 'engine-diagnostic',
+	// Diagnostic phase: all timestamps share the audio-health snapshot's
+	// Date.now domain; the armed implementation migrates to monotonic time.
+	clockDomain: 'wall-datenow-diagnostic',
+});
+export const POST_FIRE_RECOVERY_WINDOW_MS = 60_000;
+
+export interface ShadowTickInput {
+	at: number;
+	sessionState: string;
+	clientConnected: boolean;
+	meetingMode: boolean;
+	snapshot: AudioHealthSnapshot;
+	facts: MatrixFacts;
+}
+
+export class VoiceWatchdogShadow {
+	readonly mode: ActiveSilenceMode;
+	private state: RecoveryState = initialRecoveryState();
+	private readonly requiredTicks: number;
+	private readonly ledger: WatchdogLedger;
+	private readonly log: (line: string) => void;
+
+	private transportEpoch = 0;
+	private sawFirstActiveEdge = false;
+	private lastSessionState: string | null = null;
+	private lastClientEpochSeen: number | null = null;
+	private lastClientConnected = false;
+	private lastModelEventSeen: number | null = null;
+	private lastEgressFramesSeen = 0;
+	private lastAboveFloorSeen: number | null = null;
+	private lastOnsetSeen: number | null = null;
+	private lastMeeting = false;
+	private lastFireAt: number | null = null;
+	private awaitingPostFire = false;
+	/** `${epoch}:${toolCallId}` -> epoch. Non-background routes only. */
+	private readonly pendingTools = new Map<string, number>();
+	/** Hook events observed between ticks, replayed chronologically. */
+	private hookQueue: RecoveryEvent[] = [];
+
+	private readonly nowFn: () => number;
+
+	constructor(o: {
+		ledger: WatchdogLedger;
+		voiceSessionId?: string;
+		env?: NodeJS.ProcessEnv;
+		log?: (line: string) => void;
+		/** Injectable clock; must share the snapshot's time domain. */
+		nowFn?: () => number;
+	}) {
+		this.nowFn = o.nowFn ?? Date.now;
+		this.ledger = o.ledger;
+		this.log = o.log ?? ((l) => console.log(l));
+		const env = o.env ?? process.env;
+		const warn = (m: string) => this.log(m);
+		let mode = parseActiveSilenceMode(env.VOICE_ACTIVE_SILENCE_MODE, warn);
+		this.requiredTicks = parseActiveSilenceTicks(env.VOICE_ACTIVE_SILENCE_TICKS, warn);
+		if (mode === 'armed') {
+			this.log(
+				'[SilenceShadow] VOICE_ACTIVE_SILENCE_MODE=armed requires the bodhi recovery '
+				+ 'capability descriptor, which this build does not have — falling back to shadow',
+			);
+			mode = 'shadow';
+		}
+		if (this.requiredTicks === 0) mode = 'off';
+		this.mode = mode;
+		this.ledger.mergeMeta({
+			mode: this.mode,
+			voiceSessionId: o.voiceSessionId ?? null,
+			requiredTicks: this.requiredTicks,
+		});
+	}
+
+	/** Tool lifecycle from session hooks. Background `work` never vetoes (its
+	 *  results ride TaskBridge and must not mask a dead session). */
+	noteToolCall(toolCallId: string, execution?: string): void {
+		if (this.mode === 'off' || execution === 'background') return;
+		// Pre-first-edge calls adopt into the upcoming epoch (see observeTick).
+		this.pendingTools.set(`${this.transportEpoch}:${toolCallId}`, this.transportEpoch);
+	}
+
+	noteToolSettled(toolCallId: string): void {
+		if (this.mode === 'off') return;
+		const key = `${this.transportEpoch}:${toolCallId}`;
+		if (!this.pendingTools.delete(key)) return; // stale/background/unknown: ignore
+		// An ordinary settle is upstream progress (design: advances the anchor,
+		// retains the latch); replayed chronologically at the next tick.
+		this.hookQueue.push({ kind: 'toolOutcome', at: this.nowFn(), transportEpoch: this.transportEpoch });
+	}
+
+	flush(): Promise<void> {
+		return this.ledger.flush();
+	}
+
+	get snapshotState(): RecoveryState {
+		return this.state;
+	}
+
+	private pendingToolCountForCurrentEpoch(): number {
+		let n = 0;
+		for (const epoch of this.pendingTools.values()) if (epoch === this.transportEpoch) n += 1;
+		return n;
+	}
+
+	observeTick(input: ShadowTickInput): void {
+		if (this.mode === 'off') return;
+		const derived: RecoveryEvent[] = [];
+
+		// Client lifecycle: epoch CHANGES are attach boundaries even when the
+		// polled boolean never blinked (reload between ticks).
+		const epoch = input.snapshot.epoch ?? null;
+		if (input.clientConnected) {
+			if (!this.lastClientConnected || (epoch !== null && epoch !== this.lastClientEpochSeen)) {
+				if (this.lastClientConnected && this.lastClientEpochSeen !== null) {
+					derived.push({ kind: 'clientDetached', clientEpoch: this.lastClientEpochSeen, at: input.at });
+				}
+				derived.push({ kind: 'clientAttached', clientEpoch: epoch ?? 0, at: input.at });
+				this.lastClientEpochSeen = epoch;
+			}
+		} else if (this.lastClientConnected) {
+			derived.push({
+				kind: 'clientDetached',
+				clientEpoch: this.lastClientEpochSeen ?? 0,
+				at: input.at,
+			});
+		}
+		this.lastClientConnected = input.clientConnected;
+
+		// Transport lifecycle (engine-diagnostic epochs).
+		if (input.sessionState !== this.lastSessionState) {
+			if (input.sessionState === 'ACTIVE') {
+				const previousEpoch = this.transportEpoch;
+				this.transportEpoch += 1;
+				if (!this.sawFirstActiveEdge) {
+					// Tools that started before our first observation belong to the
+					// transport we are just now seeing: adopt, don't evict.
+					this.sawFirstActiveEdge = true;
+					for (const [key, ep] of [...this.pendingTools]) {
+						if (ep === previousEpoch) {
+							this.pendingTools.delete(key);
+							this.pendingTools.set(key.replace(`${ep}:`, `${this.transportEpoch}:`), this.transportEpoch);
+						}
+					}
+				} else {
+					for (const [key, ep] of [...this.pendingTools]) {
+						if (ep !== this.transportEpoch) this.pendingTools.delete(key);
+					}
+				}
+				derived.push({
+					kind: 'transportActive', transportEpoch: this.transportEpoch,
+					attemptEpoch: null, at: input.at,
+				});
+			} else if (input.sessionState === 'CLOSED' && this.lastSessionState !== null) {
+				derived.push({
+					kind: 'closedObserved', transportEpoch: this.transportEpoch,
+					attemptEpoch: null, at: input.at,
+				});
+			}
+			this.lastSessionState = input.sessionState;
+		}
+		if (input.meetingMode !== this.lastMeeting) {
+			derived.push({ kind: 'meetingModeChanged', active: input.meetingMode, at: input.at });
+			this.lastMeeting = input.meetingMode;
+		}
+
+		// Snapshot-derived progress and speech, each with its own timestamp.
+		const lm = input.snapshot.lastModelEventAt;
+		if (lm !== null && lm !== this.lastModelEventSeen) {
+			derived.push({ kind: 'modelEvent', at: lm, transportEpoch: this.transportEpoch });
+			this.lastModelEventSeen = lm;
+		}
+		if (
+			input.snapshot.egressFrames > this.lastEgressFramesSeen &&
+			input.clientConnected &&
+			input.snapshot.lastEgressAt !== null
+		) {
+			derived.push({
+				kind: 'userVisibleResponse', at: input.snapshot.lastEgressAt,
+				transportEpoch: this.transportEpoch,
+				clientEpoch: epoch ?? 0,
+				channel: 'audio-egress',
+			});
+		}
+		this.lastEgressFramesSeen = input.snapshot.egressFrames;
+		const onset = input.facts.speechObservedAt;
+		if (onset !== null && onset !== this.lastOnsetSeen) {
+			// A NEW utterance onset (value change), never a replay of the old one.
+			derived.push({ kind: 'speechObserved', at: onset });
+			this.lastOnsetSeen = onset;
+		}
+		const floor = input.snapshot.speech.lastAboveFloorAt;
+		if (floor !== null && floor !== this.lastAboveFloorSeen) {
+			derived.push({ kind: 'speechObserved', at: floor });
+			this.lastAboveFloorSeen = floor;
+		}
+
+		// Merge hook-queue events and replay everything chronologically so a
+		// response cannot be applied before the speech that preceded it.
+		const batch = [...this.hookQueue, ...derived].sort((a, b) => {
+			const ta = 'at' in a ? a.at : 0;
+			const tb = 'at' in b ? b.at : 0;
+			return ta - tb;
+		});
+		this.hookQueue = [];
+		for (const ev of batch) this.feed(ev, input);
+
+		// Deterministic retryDue synthesis (shadow has no timers).
+		if (
+			this.state.phase === 'waiting-retry' &&
+			this.state.retryNotBefore !== null &&
+			input.at >= this.state.retryNotBefore
+		) {
+			this.feed({ kind: 'retryDue', attemptEpoch: this.state.attemptEpoch, at: input.at }, input);
+		}
+
+		this.feed({
+			kind: 'tick', at: input.at, state: input.sessionState,
+			facts: input.facts, pendingToolCount: this.pendingToolCountForCurrentEpoch(),
+			requiredTicks: this.requiredTicks,
+		}, input);
+	}
+
+	private feed(ev: RecoveryEvent, input: ShadowTickInput): void {
+		// Post-fire classification input: genuine upstream progress after a
+		// would-fire, within the counterfactual window.
+		if (
+			this.awaitingPostFire &&
+			this.lastFireAt !== null &&
+			(ev.kind === 'modelEvent' || ev.kind === 'userVisibleResponse') &&
+			ev.at > this.lastFireAt
+		) {
+			const deltaMs = ev.at - this.lastFireAt;
+			this.awaitingPostFire = false;
+			this.ledger.append({
+				row: 'post-fire-progress',
+				kindObserved: ev.kind,
+				deltaMs,
+				withinCounterfactualWindow: deltaMs <= POST_FIRE_RECOVERY_WINDOW_MS,
+				attemptEpoch: this.state.attemptEpoch,
+			});
+		}
+		const r = reduceRecovery(this.state, ev);
+		this.state = r.state;
+		if (r.effect === 'restart') {
+			const first = this.state.episodeAttempts === 1;
+			this.log(
+				`[SilenceShadow] would-restart (${first ? 'first-fire' : 'synthetic-follow-up'}) `
+				+ `attempt=${this.state.episodeAttempts} anchorAgeMs=${input.at - (this.state.silenceAnchorAt ?? input.at)}`,
+			);
+			this.ledger.append({
+				row: 'would-restart',
+				shadowEvidence: first ? 'first-fire' : 'synthetic-follow-up',
+				attempt: this.state.episodeAttempts,
+				attemptEpoch: this.state.attemptEpoch,
+				transportEpoch: this.state.currentTransportEpoch,
+				clientEpoch: this.state.currentClientEpoch,
+				anchorAgeMs: input.at - (this.state.silenceAnchorAt ?? input.at),
+				quiescenceMs:
+					this.state.lastAboveFloorAt === null ? null : input.at - this.state.lastAboveFloorAt,
+				sinceFirstSpeechMs:
+					this.state.firstSpeechAt === null ? null : input.at - this.state.firstSpeechAt,
+				atMs: input.at,
+			});
+			this.lastFireAt = input.at;
+			this.awaitingPostFire = true;
+			const r2 = reduceRecovery(this.state, {
+				kind: 'shadowRestarted', attemptEpoch: this.state.attemptEpoch, at: input.at,
+			});
+			this.state = r2.state;
+		} else if (r.effect === 'notify-stalled') {
+			this.log('[SilenceShadow] would-enter-terminal (telemetry only)');
+			this.ledger.append({
+				row: 'would-terminal',
+				shadowEvidence: 'synthetic-follow-up',
+				attemptEpoch: this.state.attemptEpoch,
+				transportEpoch: this.state.currentTransportEpoch,
+				clientEpoch: this.state.currentClientEpoch,
+				episodeAttempts: this.state.episodeAttempts,
+				atMs: 'at' in ev ? ev.at : null,
+			});
+		}
+	}
+}

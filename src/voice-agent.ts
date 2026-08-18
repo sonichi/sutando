@@ -75,6 +75,8 @@ import {
 
 import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_paths.js';
 import { nextConnectingTick } from './voice-connect-watchdog.js';
+import { VoiceWatchdogShadow, DETECTOR_VERSION, CAPABILITY_SET } from './voice-watchdog-shadow.js';
+import { WatchdogLedger } from './voice-watchdog-ledger.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -147,11 +149,26 @@ const HOST = process.env.HOST || '127.0.0.1';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
 const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
+
 /** Bounded primitive-only crash record — shared by BOTH fatal paths (the
  * uncaught handler and `main().catch`), which obey identical crash-only
  * rules (design 1d; amendments R1/R2). */
 const CRASH_RECORD_PATH = join(WORKSPACE_DIR, 'logs', 'voice-agent.crash.json');
 const SESSION_ID = `session_${Date.now()}`;
+// ACTIVE-silence watchdog, Phase 0a shadow observer (never touches the live
+// session; see docs/design-voice-active-silence-recovery.md in the desktop
+// repo). Timestamps deliberately share the audio-health snapshot's Date.now
+// domain for this diagnostic phase; the armed implementation migrates to the
+// monotonic domain with the bodhi surface.
+const voiceWatchdogShadow = new VoiceWatchdogShadow({
+	voiceSessionId: SESSION_ID,
+	ledger: new WatchdogLedger({
+		path: join(WORKSPACE_DIR, 'logs', 'voice-watchdog.jsonl'),
+		meta: { detectorVersion: DETECTOR_VERSION, capabilitySet: CAPABILITY_SET, pid: process.pid },
+		onError: (err) => console.error(`${new Date().toISOString().slice(11, 23)} [SilenceShadow] ledger write failed: ${err.message}`),
+	}),
+});
+
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
 /** Single-instance lock for this workspace.
@@ -989,6 +1006,7 @@ async function main() {
 			},
 			onToolCall: (e) => {
 				audioHealth.noteModelEvent(); // P7 D7.1: a tool call is model activity
+				voiceWatchdogShadow.noteToolCall(e.toolCallId, e.execution);
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				// tool_call event push removed per #1052 — canonical record
 				// is the surface-table row written in onToolResult via
@@ -1011,6 +1029,7 @@ async function main() {
 				}
 			},
 			onToolResult: (e) => {
+				voiceWatchdogShadow.noteToolSettled(e.toolCallId);
 				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
 				recorder.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				// tool_result event push removed per #1052 — recordToolCall
@@ -1309,6 +1328,7 @@ async function main() {
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);
 		recorder.flush();
+		await voiceWatchdogShadow.flush().catch(() => {});
 		setVisionSession(null);
 		setSessionToolUpdater(null, []);
 		stopVisionControlServer();
@@ -1695,6 +1715,16 @@ async function main() {
 				console.error(`${ts()} [Health] Reconnect trigger failed:`, (err as Error)?.message ?? err);
 			}
 		}
+		// ACTIVE-silence shadow observation (Phase 0a): diagnostic only — no
+		// effect on the guards above, ever, in this mode.
+		voiceWatchdogShadow.observeTick({
+			at: Date.now(),
+			sessionState: state,
+			clientConnected,
+			meetingMode: meetingActive,
+			snapshot,
+			facts: matrix.facts,
+		});
 	}, 30_000);
 
 	// P7 D7.1: periodic ledger persistence — a try-enqueue into the worker's

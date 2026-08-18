@@ -59,10 +59,38 @@ export interface MatrixInput {
   now: number;
 }
 
+/** Raw, verdict-independent facts for the ACTIVE-silence watchdog (design:
+ *  design-voice-active-silence-recovery.md §Trigger (a)). Identical under
+ *  every coverage mode; fail closed when their inputs are missing.
+ *  Formulas: ingressAdvanced = delta(deliveredFrames) > 0 at session-only
+ *  coverage (the ingest-accepted delta once full coverage exists);
+ *  modelSilentFor15s = lastModelEventAt !== null && now - lastModelEventAt
+ *  > 15_000 (null is a fresh session, not silence). */
+export interface MatrixFacts {
+  /** Same-epoch baseline + heartbeat existed this tick; false ⇒ every other
+   *  fact is false. */
+  factsAvailable: boolean;
+  speechInWindow: boolean;
+  /** Monotonic timestamp of the retained speech observation's first
+   *  above-floor sample; non-null exactly when speechInWindow. */
+  speechObservedAt: number | null;
+  ingressAdvanced: boolean;
+  modelSilentFor15s: boolean;
+}
+
+const FACTS_UNAVAILABLE: MatrixFacts = Object.freeze({
+  factsAvailable: false,
+  speechInWindow: false,
+  speechObservedAt: null,
+  ingressAdvanced: false,
+  modelSilentFor15s: false,
+});
+
 export interface MatrixResult {
   verdict: MatrixVerdict;
   reasons: string[];
   baseline: MatrixBaseline;
+  facts: MatrixFacts;
 }
 
 /** An episode (or open gap) is only row-1 evidence while fresh. */
@@ -108,10 +136,12 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
   const { snapshot: s, prev, now } = input;
   const hb = s.lastHeartbeat;
   const baseline = makeBaseline(input);
+  let facts: MatrixFacts = FACTS_UNAVAILABLE;
   const out = (verdict: MatrixVerdict, ...reasons: string[]): MatrixResult => ({
     verdict,
     reasons,
     baseline,
+    facts,
   });
 
   // ── Row 0: reconnect window / structural insufficiency ──
@@ -143,6 +173,22 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
   const muted = hb.muted;
   const ingressStalled =
     s.lastDeliveredAt === null || now - s.lastDeliveredAt > MATRIX_INGRESS_STALL_MS;
+
+  // Facts are computed once the same-epoch deltas exist, and attach to EVERY
+  // result from here down — they are observations, not verdicts.
+  const factsSpeechInWindow =
+    s.speech.active ||
+    (s.speech.lastAboveFloorAt !== null && now - s.speech.lastAboveFloorAt < 30_000);
+  facts = {
+    factsAvailable: true,
+    speechInWindow: factsSpeechInWindow,
+    speechObservedAt: factsSpeechInWindow
+      ? (s.speech.onsetAt ?? s.speech.lastOnsetAt ?? s.speech.lastAboveFloorAt)
+      : null,
+    ingressAdvanced: dDelivered > 0,
+    modelSilentFor15s:
+      input.lastModelEventAt != null && now - input.lastModelEventAt > 15_000,
+  };
 
   // ── Row 1: client capture dead/suspended ──
   // A CURRENT-epoch, UNEXPIRED gap (or the open gap itself) whose interval
