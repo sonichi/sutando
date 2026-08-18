@@ -56,7 +56,42 @@ def run(blocker):
                           capture_output=True, text=True, timeout=60)
 
 
+
+def in_process_degraded_arm():
+    """Coverage-visible twin of the subprocess arm: reload the module under
+    an import hook IN THIS interpreter so instrumentation sees the fallback
+    branch execute (the subprocess arms stay as the behavioral proof)."""
+    import contextlib
+    import importlib.abc
+    import io
+
+    class _Hide(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path=None, target=None):
+            if name == "detect_secrets" or name.startswith("detect_secrets."):
+                raise ImportError("hidden for in-process degraded arm")
+
+    hook = _Hide()
+    saved = {k: sys.modules.pop(k) for k in list(sys.modules)
+             if k == "secret_scanner" or k.startswith("detect_secrets")}
+    sys.meta_path.insert(0, hook)
+    try:
+        sys.path.insert(0, str(REPO / "src"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            import secret_scanner as ss
+        check("in-process: ACTIVE=False", ss.DETECT_SECRETS_ACTIVE is False)
+        hits = ss.scan_secrets("prose\n" + "a1" * 20 + "\n")
+        check("in-process: hex rule fires",
+              any(h.secret_type == "Bare Hex Token" for h in hits))
+        check("in-process: DEGRADED announced", "DEGRADED" in err.getvalue())
+    finally:
+        sys.meta_path.remove(hook)
+        sys.modules.pop("secret_scanner", None)
+        sys.modules.update(saved)
+
+
 def main() -> int:
+    in_process_degraded_arm()
     deg = run(BLOCKER)
     check("degraded: module imports (no ModuleNotFoundError)", deg.returncode == 0,
           deg.stderr[-300:])
