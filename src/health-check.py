@@ -5765,10 +5765,16 @@ def check_stranded_destined_proactive() -> dict:
         return {"name": name, "status": "ok", "detail": "no results/ directory"}
     try:
         sys.path.insert(0, str(REPO_DIR / "src"))
+        from presenter_mode import presenter_mode_active
         from proactive_routing import PROACTIVE_DESTINATIONS, proactive_destination
     except ImportError as e:
         return {"name": name, "status": "warn",
                 "detail": f"could not load proactive_routing: {e}"}
+    # Presenter mode intentionally holds ALL proactive deliveries — an aged
+    # destined file is the bridge waiting for the talk to end, not a strand.
+    if presenter_mode_active(WORKSPACE_DIR):
+        return {"name": name, "status": "ok",
+                "detail": "presenter mode active — deliveries intentionally held"}
     now = time.time()
     stranded: list[tuple[str, str, int]] = []
     for path in results.glob("proactive-*.txt"):

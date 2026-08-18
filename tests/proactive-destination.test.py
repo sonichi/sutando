@@ -219,6 +219,19 @@ def main() -> int:
         out2 = _hc.check_stranded_destined_proactive()
         check("strand probe is quiet for fresh/undestined files only",
               out2["status"] == "ok", out2["detail"])
+        # Presenter mode: an aged destined file is INTENTIONAL retention.
+        st = (Path(td) / "state"); st.mkdir(exist_ok=True)
+        aged = res / "proactive-stage.to-telegram.txt"
+        aged.write_text("held for the talk")
+        _hos.utime(aged, (old_ts, old_ts))
+        (st / "presenter-mode.sentinel").write_text("2099-01-01T00:00:00Z")
+        out3 = _hc.check_stranded_destined_proactive()
+        check("strand probe stays quiet under active presenter mode",
+              out3["status"] == "ok" and "presenter" in out3["detail"], out3["detail"])
+        (st / "presenter-mode.sentinel").write_text("2001-01-01T00:00:00Z")
+        out4 = _hc.check_stranded_destined_proactive()
+        check("same aged file warns once presenter mode expires",
+              out4["status"] == "warn", out4["detail"])
 
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)

@@ -106,10 +106,8 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     return this_channel == "discord"
 
 
-# Explicit destination: the .to-<channel> filename tag rides between stem
-# and suffix so every proactive-*.txt glob and claim-rename preserves it.
-# Distinct from the [channel: <id>] BODY marker: that redirects a delivery
-# to a room; the filename tag selects WHICH BRIDGE claims. Never unify them.
+# The .to-<channel> tag rides between stem and suffix (globs/claims keep it).
+# Unlike the [channel:] BODY marker (room redirect), it selects WHICH BRIDGE.
 
 # Slack is deliberately a destination but NOT a BRIDGE_CHANNEL: it races
 # without activity routing — aimable, never the undestined-activity winner.
