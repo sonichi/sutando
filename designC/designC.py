@@ -170,20 +170,39 @@ def _inflight_tokens(root, key: str):
     return [f for f in d.iterdir() if f.name.split(SEP)[0] == key]
 
 
-def _state_of(root, key: str) -> ItemState:
-    """The item's live state; a held token outranks a ready copy.
+def _live_holders(tokens):
+    """Tokens whose owner is a LIVE same-incarnation process. A dead ghost
+    beside a live claim is a LEGAL state (recover's live-holder leg exists
+    for it); only >=2 LIVE holders are unreachable."""
+    out = []
+    for f in tokens:
+        parts = f.name.split(SEP)
+        if len(parts) != TOKEN_PARTS or not parts[2].isdigit():
+            continue
+        ident = ob.process_identity(int(parts[2]))
+        if (ident.state is not ob.OwnerState.DEAD
+                and str(ident.start_usec) == parts[3]):
+            out.append(f)
+    return out
 
-    ready/ and inflight/ CAN both hold this key -- recover's collision leg
-    exists precisely to quarantine that state -- so coexistence is reported,
-    not rejected. Only two simultaneous holders are unreachable: claim
-    consumes ready/ with a single rename, so at most one racer wins it."""
+
+def _state_of(root, key: str) -> ItemState:
+    """The item's live state; a live holder outranks everything.
+
+    ready/ and inflight/ CAN coexist, and a DEAD token beside a live claim can
+    too -- publish + stale ghost + claim reaches it without any race. Both are
+    recover's job, not an invariant breach. Counted on LIVE holders only:
+    claim consumes ready/ with a single rename, so two racers cannot both win."""
     ready = Path(root) / READY / key
     held = _inflight_tokens(root, key)
-    if len(held) > 1:
-        raise InvariantError(f"{key}: {len(held)} inflight tokens {[f.name for f in held]}")
-    if held:
-        parts = held[0].name.split(SEP)
-        return ItemState(HELD, held[0].name, parts[1], held[0])
+    live = _live_holders(held)
+    if len(live) > 1:
+        raise InvariantError(
+            f"{key}: {len(live)} LIVE holders {[f.name for f in live]}")
+    pick = live[0] if live else (held[0] if held else None)
+    if pick is not None:
+        parts = pick.name.split(SEP)
+        return ItemState(HELD, pick.name, parts[1], pick)
     if ready.exists():
         return ItemState(AVAILABLE, None, None, ready)
     return ItemState(ABSENT, None, None, None)
