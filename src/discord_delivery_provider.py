@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-_PKG = (Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root — locating the CODE package, not workspace state
+_PKG = (Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root — locates the CODE package (same mechanism as the gateway shim)
         / "packages" / "ag2-sparrow")
 if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
