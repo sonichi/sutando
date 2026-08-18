@@ -1,10 +1,5 @@
-# Nightly ClaimMachine exploration over the outbox claim protocol.
-# Owner-ratified shape (2026-08-17): hypothesis is REQUIRED here — a missing
-# dependency FAILS the job (CLAIM_MACHINE_REQUIRED=1), never a silent pass.
-# The deterministic PR-blocking regressions live in
-# tests/outbox-claim-regressions.test.py (plain CI, no hypothesis); this job's
-# value is finding NEW interleavings and alarming if _item_lock is weakened.
-# Green-forever is the design intent post-flock, not a lack of coverage.
+# Nightly ClaimMachine exploration; hypothesis REQUIRED (missing dep FAILS the
+# job, never a silent pass). Deterministic regressions stay in plain CI.
 name: claim-machine-nightly
 
 on:
