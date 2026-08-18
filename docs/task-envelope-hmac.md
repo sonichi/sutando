@@ -219,21 +219,20 @@ Non-goals:
 
 ## PR trail
 
-The GitHub author field reads `qingyun-wu` for the whole fleet (shared
-login); the **author** column below is the ownership identity per the
-fleet's mxid-signature convention, matching each PR body's
+Author identity is two-part: the GitHub handle (`qingyun-wu`, shared by
+the fleet) plus the acting agent's mxid, matching each PR body's
 `owner-identifier` line.
 
 | PR | What it shipped | Author | State |
 |---|---|---|---|
-| #3014 | The envelope itself: `src/task_envelope.py` (key, canonical slot, four verdicts) + contract/falsifier suite | @sutando-qingyun-001:ag2.space | merged |
-| #3030 | Remote gateway bridge stamps at the writer edge | @sutando-qingyun-001:ag2.space | merged |
-| #3044 | Census (`src/task_envelope_census.py`) + remaining Python writer edges | @sutando-qingyun-001:ag2.space | merged |
-| #3034 | Writer-edge stamping (agent-api, voice path) — note: its auto-merge raced its own review fix | @sutando-qingyun-001:ag2.space | merged |
-| #3055 | Census read/stat TOCTOU fix (the #3034 race, recovered) | @sutando-qingyun-001:ag2.space | merged |
-| #3058 | TS mirror `src/task_envelope.ts` + delegation-seam/context-drop stamping + cross-language parity tests + TS corrupt-key guard | @sutando-qingyun-001:ag2.space | open |
-| #3065 | Python corrupt-key guard: loud error or `unverifiable`, never a zero-length key | @sutando-qingyun-001:ag2.space | open |
-| #3070 | This document | @sutando-qingyun-001:ag2.space | open |
+| #3014 | The envelope itself: `src/task_envelope.py` (key, canonical slot, four verdicts) + contract/falsifier suite | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3030 | Remote gateway bridge stamps at the writer edge | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3044 | Census (`src/task_envelope_census.py`) + remaining Python writer edges | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3034 | Writer-edge stamping (agent-api, voice path) — note: its auto-merge raced its own review fix | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3055 | Census read/stat TOCTOU fix (the #3034 race, recovered) | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3058 | TS mirror `src/task_envelope.ts` + delegation-seam/context-drop stamping + cross-language parity tests + TS corrupt-key guard | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
+| #3065 | Python corrupt-key guard: loud error or `unverifiable`, never a zero-length key | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
+| #3070 | This document | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
 
 Reviewer/approver identities are the GitHub accounts on each PR (sonichi,
 yixuan-ag2, john-the-dev, keweichen — individually held, not shared); the
