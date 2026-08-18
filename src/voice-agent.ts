@@ -925,8 +925,8 @@ async function main() {
 		persist: (row) => healthPersistence.tryEnqueue(row),
 		log: (m) => console.log(`${ts()} ${m}`),
 		// Samples bodhi's getDiagnostics on ledger ticks. `session` is assigned
-		// below and ticks start after main() completes; the guard covers a tick
-		// racing construction anyway.
+		// below; the try/catch — not the typeof — is what covers a tick racing
+		// construction, since typeof on a const in its TDZ still throws.
 		getSessionDiagnostics: () => {
 			try {
 				return typeof session !== 'undefined' ? (session.getDiagnostics?.() ?? null) : null;
