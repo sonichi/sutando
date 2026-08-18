@@ -144,6 +144,39 @@ and loads whichever repo it reviews.
     The tell that you are in this pattern: your test suite grows by exactly one case per
     round, and each new case is the previous one with a single field changed.
 
+11. **A change that removes a capability must relocate it, not just delete it — and one
+    deployment's requirement is never a global default.** If a PR turns behaviour off for
+    everyone to satisfy one environment, ask for the flag instead: the environment that
+    wants the change carries it, and every other install is untouched. Then check the
+    *teardown* side — code that stops, kills, or cleans up the removed thing usually
+    survives the deletion and becomes a one-way operation. And check whether any existing
+    opt-in path depended on the deleted code to produce its inputs.
+    *Grounded by:* #2677 — "keep the open-source core headless" deleted the menu-bar app's
+    build and launch from `startup.sh` (−100 lines) and shipped no replacement script, so
+    every OSS install silently lost the app and the documented alternative became "run
+    `swiftc` by hand". Three knock-on effects, none visible in the diff: `restart.sh:73`
+    still `pkill`s the app while nothing starts it, making a restart a permanent stop;
+    `install-sutando-app-launchd.sh` (#1294) still points at
+    `src/Sutando/Sutando.app/Contents/MacOS/Sutando`, a bundle `startup.sh` was the only
+    thing that built, so the pre-existing opt-in supervisor was silently disabled; and the
+    PR's own new test asserted the removed strings appear *nowhere* in `startup.sh`, which
+    made the previous default unrestorable without deleting the guard. Pin behaviour under
+    the flag, never the absence of a string.
+
+12. **Cut the diff against the merge-base, not against `main`.** `git diff origin/main <pr>`
+    on a branch that is behind renders `main`'s own newer commits as *removals* by the PR,
+    so a reviewer reads deletions the author never wrote. Use
+    `git diff $(git merge-base origin/main <pr>) <pr>`, and for a stacked PR review the
+    child-only commit as well as the cumulative result — the child layer is what this PR
+    is being asked to add.
+    *Grounded by:* #3020 (2026-08-17). Diffing it against `main` showed ~20 removed lines
+    in `check_cron_runner`, a function the PR does not touch; the topic diff against its
+    merge-base is 2 files, +105/-4. Verify a stated stack rather than trusting the body:
+    `git merge-base --is-ancestor <parent-head> <child>` confirmed #2995's head really is
+    an ancestor, which is what makes "merge the parent first" load-bearing rather than
+    a courtesy — and what makes `--delete-branch` on the parent dangerous while the child
+    is open.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
