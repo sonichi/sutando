@@ -18,6 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path  # noqa: E402
 from discord_http import request_json  # noqa: E402
+from chat_secret_filter import filter_chat_secrets  # noqa: E402
+from vault_intercept import redact_vault_commands  # noqa: E402
 
 # Runaway backstop only (not a depth target — depth is governed by --until):
 # 200 pages * 100 = 20k messages before we refuse to loop forever.
@@ -48,6 +50,23 @@ def _fetch(extra, channel_id, page, headers):
     # request_json honors 429 Retry-After + retries transient 5xx, so a rate
     # limit mid-pagination no longer aborts the read (2026-07-24 truncation fix).
     return request_json(req, timeout=10)
+
+
+def _redact(text):
+    """The same two filters `discord-bridge.py` applies, in the same order.
+
+    The bridge redacts what it writes into a task file, but this reader — which
+    `context-reconstruct` runs on every pass — read the channel raw, so a secret
+    the bridge had just stripped came straight back through the other door. Both
+    helpers already live in dependency-light modules; the reader was simply never
+    wired to them.
+
+    Order matches the bridge (`filter_chat_secrets` then `redact_vault_commands`)
+    so the two consumers cannot disagree about what a message says.
+    """
+    if not text:
+        return text
+    return redact_vault_commands(filter_chat_secrets(text).text)
 
 
 def _reply_context(msg, clip=REPLY_CLIP):
@@ -96,7 +115,9 @@ def _render(msg, clip=CLIP):
     from the 200-char clip — the clip exists to keep ordinary chatter scannable,
     and a forward is usually carrying the substance someone moved deliberately.
     """
-    body = (msg.get("content") or "").strip()
+    # Redact BEFORE clipping: the clip can land mid-token, and half a secret is
+    # still a leak that the pattern would no longer match.
+    body = _redact((msg.get("content") or "").strip())
     snaps = msg.get("message_snapshots") or []
     if not snaps:
         return body[:clip] if clip is not None else body
@@ -107,7 +128,10 @@ def _render(msg, clip=CLIP):
         extra.append(f"<attachment: {a.get('filename', '?')}>")
     for e in fwd.get("embeds") or []:
         extra.append(f"<embed: {e.get('title') or e.get('type') or '?'}>")
-    inner = " ".join(x for x in (fwd_body, *extra) if x) or "(forward with no readable body)"
+    # Redact the COMPOSED inner, not the body alone: filenames and embed titles
+    # are user-supplied too, and the bridge filters them on the same path.
+    inner = _redact(" ".join(x for x in (fwd_body, *extra) if x)) \
+        or "(forward with no readable body)"
     prefix = f"{body} " if body else ""
     return f"{prefix}[forwarded] {inner}"
 
