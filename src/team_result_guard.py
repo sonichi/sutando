@@ -12,6 +12,7 @@ their own tier lookup and delivery; they must not restate any of it.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -122,6 +123,32 @@ def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
     if result.detected:
         raise TeamResultLeakError(", ".join(result.secret_types))
     return body
+
+
+# The suppression verdict: one policy here, transport mechanics at the
+# edges (stub-alone where the server suppresses; notice where it delivers).
+_SKIP_STUB_LITERAL = {"no-send": "[no-send]", "REPLIED": "[REPLIED]"}
+_DEDUP_EXTRA_RE = re.compile(r"task-[A-Za-z0-9_-]{1,64}\Z")
+
+
+def suppression_stub_for_tier(body: str, tier) -> "str | None":
+    """The stub a guarded sender may close its lease with, or None.
+
+    None means NO suppression verdict -- the caller proceeds through
+    guard_result_for_tier as before (owner results, mixed markers,
+    out-of-grammar dedup extras, unknown future markers all land here)."""
+    if not is_guarded_tier(tier):
+        return None
+    parsed = parse_markers(body)
+    if not parsed.actions or any(a.kind != "skip" for a in parsed.actions):
+        return None
+    a = parsed.actions[0]
+    if a.value == "deduped":
+        extra = (a.extra or "").strip()
+        if _DEDUP_EXTRA_RE.fullmatch(extra):
+            return f"[deduped: {extra}]"
+        return None
+    return _SKIP_STUB_LITERAL.get(a.value)
 
 
 VERDICT_DELIVER = "deliver"

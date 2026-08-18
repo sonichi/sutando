@@ -181,6 +181,26 @@ def main() -> int:
         assert v.kind == kind, (body, tier, v)
         wrapped = guard.guard_result_for_tier(body, tier, REPO, secret_filter=filt)
         assert wrapped == (v.body, v.reason), (body, tier, "wrapper diverged from verdict")
+    # Cross-verdict consistency: a stub verdict NEVER contradicts classify --
+    # every body the journaled path may close silently is one classify calls
+    # suppress, and no influenced bytes ride in the stub (literals + id only).
+    for body, tier, stub in (
+        ("[no-send]", "team", "[no-send]"),
+        ("[no-send]\nhidden content", "team", "[no-send]"),
+        ("[REPLIED]", "team", "[REPLIED]"),
+        ("[deduped: task-abc123]", "team", "[deduped: task-abc123]"),
+        ("[deduped: EVIL bytes]", "team", None),
+        ("[no-send]", "owner", None),
+        ("plain reply", "team", None),
+        ("[channel: 123]\nx", "team", None),
+    ):
+        got = guard.suppression_stub_for_tier(body, tier)
+        assert got == stub, (body, tier, got)
+        if got is not None:
+            v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=_clean)
+            assert v.kind == guard.VERDICT_SUPPRESS, (body, "stub without suppress verdict")
+            assert got == body[:len(got)] or got.startswith("[deduped:"), body
+    print("  [stub] suppression_stub_for_tier: inert bytes only, subset of suppress")
     print("  [verdict] classify_result_for_tier owns the three-way decision;")
     print("            guard_result_for_tier provably derives from it")
     print("  [behavioral] owner passes through; redirect/attach/no-send/secret withheld;")
