@@ -260,6 +260,26 @@ class TestReviewFindings(unittest.TestCase):
         self.assertNotIn("xxxxxxxxxx", body, "no title prose may ride in the body")
         self.assertIn("(+23 more)", body, "the remainder must be counted, not dropped silently")
 
+    def test_f2_cap_bounds_every_measured_title_vocabulary(self):
+        """Three comma-less shapes measured on a second host (44 of 61 titles
+        there carry no comma). The cap must bound each, delimiter or not."""
+        for lead in (
+            "[2026-08-07 03:4x UTC] approve #2701/#2702 — blocked on " + ("z" * 50),
+            "2026-08-17 07:1x — `sutando-app` stale is real but NOT a fault " + ("z" * 50),
+            "[2026-07-30 14:10] ngrok (phone tunnel) is DOWN and conflicts " + ("z" * 50),
+        ):
+            with self.subTest(lead=lead[:26]):
+                sent = []
+                self.m.subprocess = _Capture(sent)
+                titles = [lead] + [f"slug-{i}, 2026-08-18 — " + ("x" * 90)
+                                   for i in range(25)]
+                self.m.notify_macos(26, titles)
+                body = sent[0]
+                self.assertLess(len(body), 160, f"body must stay short, got {len(body)}: {body}")
+                self.assertNotIn("zzzzzzzzzz", body,
+                                 "no comma exists in this shape; only the cap can bound it")
+                self.assertIn("(+23 more)", body, "the remainder must still be counted")
+
     def test_d_written_name_matches_the_scanned_prefix(self):
         """Writer and detector must agree, or the check silently never fires."""
         src = (REPO / "src" / "check-pending-questions.py").read_text()
