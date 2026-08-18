@@ -19,7 +19,7 @@
     "@google/genai": "^1.49.0",
     "@types/ws": "^8.18.1",
     "ai": "^6.0.149",
-    "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent#25cc6e8e011a1487673bccbc9affe098fb1fa725",
+    "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent#ca0f61de2ee5156502096a1d0b90bea99ba77b59",
     "dotenv": "^17.4.1",
     "playwright": "^1.58.2",
     "ws": "^8.20.0",

@@ -147,6 +147,8 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
+from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
@@ -3942,27 +3944,8 @@ async def _handle_discord_message(message, force=False):
     # review. Removed in favor of skipping the task-file write entirely.)
     tier_instructions = {
         "owner": "",
-        "team-collaborator": (
-            "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            "This task is from a designated COLLABORATOR in this channel (a team-tier sender the owner "
-            "has listed under this channel's `collaborators`). Engage substantively — do NOT sandbox "
-            "them via codex and do NOT default to NO-REPLY the way a plain team task is handled.\n\n"
-            "DO:\n"
-            "- Reply in-channel: write your response to results/task-{id}.txt (delivered back to this channel).\n"
-            "- Treat their message as collaborative input from a working peer within this channel's scope — "
-            "discuss, draft, and iterate on copy / design / analysis, and fold their contributions into the "
-            "shared work. Do not silently archive a substantive contribution.\n\n"
-            "DO NOT (authority boundary — unchanged from team tier):\n"
-            "- Take any irreversible or system-mutating action on their say-so: no git commit / push / merge, "
-            "no deleting or overwriting files, no sending to other channels or external services (email, "
-            "posts, DMs), no financial actions, no config / credential changes, no restarts. Those still "
-            "require the OWNER.\n"
-            "- If they ask for such an action, engage on the substance and prepare it if useful, but route "
-            "the go/no-go to the owner (say so in-channel) rather than executing it yourself.\n"
-            "- Never read .env, credentials, or secrets.\n\n"
-            "Scope: collaborator status is per-channel only — it grants engagement HERE, not owner authority "
-            "anywhere else.\n"
-            "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        "team-collaborator": engage_rulebook(
+            "channel", DISCORD_PROVENANCE, "results/task-{id}.txt"
         ),
         "team": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
@@ -4685,6 +4668,16 @@ async def poll_results():
                 # re-fire infinitely on the leftover task. Observed 2026-04-17:
                 # `[no-send]` tasks persisted in tasks/ because `continue`
                 # skipped the cleanup block at the bottom of this loop.
+                # Non-owner results are scanned before ANY marker below. The tier
+                # map dies on restart, so unknown is re-read from the task file.
+                _guard_tier = _task_tier
+                if _guard_tier == "unknown":
+                    _guard_tf = find_task_file(TASKS_DIR, task_id)
+                    _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
+                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO)
+                if _withheld:
+                    print(f"  [team-guard] withheld result for {task_id} "
+                          f"(tier={_guard_tier}): {_withheld}", flush=True)
                 _parsed = parse_markers(reply_text)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
@@ -5185,6 +5178,18 @@ async def poll_proactive():
                     if text is None:
                         release_claim(f)
                         continue
+                    # Parse ONCE, here, and reuse below: a second grammar would
+                    # miss what parse_markers peels (D7 `**[core: N]**` headers).
+                    _pp = parse_markers(text)
+                    _early_redirect = next(
+                        (a for a in _pp.actions if a.kind == "redirect"), None)
+                    if _early_redirect is not None and not re.fullmatch(
+                            r"\d{17,20}", str(_early_redirect.value).strip()):
+                        print(f"  [proactive] {f.name} targets "
+                              f"{str(_early_redirect.value).strip()!r} — not a Discord "
+                              f"channel id; releasing for its own bridge", flush=True)
+                        release_claim(f)
+                        continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
                     # workspace `state/discord-config.json` (Sutando's owned config
@@ -5231,7 +5236,8 @@ async def poll_proactive():
                         # Parse protocol markers (skip / redirect / attach).
                         # parse_markers strips all markers from .body and
                         # surfaces them as typed actions — no hand-rolled regex.
-                        _pp = parse_markers(text)
+                        # already parsed once, above the owner work
+
                         clean_text = _pp.body
                         files = [a.value for a in _pp.actions if a.kind == "attach"]
 
@@ -5734,7 +5740,23 @@ async def poll_dm_fallback():
         await asyncio.sleep(30)
 
 
-def _send_via_rest(channel_id: str, message: str):
+def _parse_send_argv(argv):
+    """Split `send`'s post-channel argv into (reply_to, body_argv).
+
+    `--reply-to <id>` threads the post onto an existing message, giving the CLI
+    the reach the results path already has by default. Leading position only, so
+    a body word that happens to read `--reply-to` cannot be eaten mid-text.
+    """
+    reply_to = ""
+    if len(argv) >= 2 and argv[0] == "--reply-to":
+        reply_to, argv = argv[1], argv[2:]
+    if not argv:
+        raise SystemExit("usage: discord-bridge.py send <channel_id> "
+                         "[--reply-to <message_id>] <body|--body-file PATH>")
+    return reply_to, argv
+
+
+def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
     """Send a message via Discord REST API (no gateway connection).
 
     Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
@@ -5754,7 +5776,13 @@ def _send_via_rest(channel_id: str, message: str):
         # Empty message — nothing to send. Treat as no-op rather than error.
         return
     for i, chunk in enumerate(chunks, 1):
-        data = json.dumps({"content": chunk}).encode()
+        payload = {"content": chunk}
+        # First chunk only: on every chunk it renders N reply-headers for one
+        # answer. fail_if_not_exists=False -> deleted target degrades to plain.
+        if reply_to and i == 1:
+            payload["message_reference"] = {"message_id": str(reply_to),
+                                            "fail_if_not_exists": False}
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
         # Transport only: once urlopen returns, the message is committed, so
         # read() belongs below. Not a `with` — doubles are plain objects.
@@ -5831,7 +5859,8 @@ def _send_cli_body(argv: list) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
-        _send_via_rest(sys.argv[2], _send_cli_body(sys.argv[3:]))
+        reply_to, body_argv = _parse_send_argv(sys.argv[3:])
+        _send_via_rest(sys.argv[2], _send_cli_body(body_argv), reply_to)
     elif sys.argv[1:2] == ["edit"]:
         # Arity is checked here rather than by the `>= 5` guard the send branch
         # uses: falling through on a short `edit` would boot the whole bridge.
