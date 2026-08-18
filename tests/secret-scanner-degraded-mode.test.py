@@ -43,7 +43,7 @@ import importlib.abc
 class _Hide(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path=None, target=None):
         if name == "detect_secrets" or name.startswith("detect_secrets."):
-            raise ImportError("hidden for degraded-mode test")
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
 
 
 sys.meta_path.insert(0, _Hide())
@@ -68,7 +68,7 @@ def in_process_degraded_arm():
     class _Hide(importlib.abc.MetaPathFinder):
         def find_spec(self, name, path=None, target=None):
             if name == "detect_secrets" or name.startswith("detect_secrets."):
-                raise ImportError("hidden for in-process degraded arm")
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
 
     hook = _Hide()
     saved = {k: sys.modules.pop(k) for k in list(sys.modules)
@@ -122,8 +122,54 @@ def in_process_degraded_arm():
         sys.modules.update(saved)
 
 
+def broken_install_arm():
+    """Third control: an INSTALLED detect_secrets whose graph is broken must
+    surface (secret_scanner import raises) and the chat filter must warn and
+    keep its curated fallback — never silently relabel broken as absent."""
+    import contextlib
+    import importlib.abc
+    import io
+    import types
+
+    class _BreakGraph(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path=None, target=None):
+            if name.startswith("detect_secrets."):
+                # Root imports fine; the submodule graph is broken.
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+    hook = _BreakGraph()
+    saved = {k: sys.modules.pop(k) for k in list(sys.modules)
+             if k in ("secret_scanner", "chat_secret_filter")
+             or k.startswith("detect_secrets")}
+    sys.modules["detect_secrets"] = types.ModuleType("detect_secrets")
+    sys.meta_path.insert(0, hook)
+    try:
+        sys.path.insert(0, str(REPO / "src"))
+        try:
+            import secret_scanner  # noqa: F401
+            check("broken install: secret_scanner import raises", False)
+        except ModuleNotFoundError as e:
+            check("broken install: secret_scanner import raises",
+                  e.name != "detect_secrets", str(e))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            import chat_secret_filter as csf
+            res = csf.filter_chat_secrets("token ghp_" + "a" * 36 + " end")
+        check("broken install: chat filter warns loudly",
+              "broken" in err.getvalue() and "FAILED" in err.getvalue())
+        check("broken install: curated fallback still redacts",
+              "ghp_" + "a" * 36 not in res.text and res.secret_types)
+    finally:
+        sys.meta_path.remove(hook)
+        sys.modules.pop("detect_secrets", None)
+        sys.modules.pop("secret_scanner", None)
+        sys.modules.pop("chat_secret_filter", None)
+        sys.modules.update(saved)
+
+
 def main() -> int:
     in_process_degraded_arm()
+    broken_install_arm()
     deg = run(BLOCKER)
     check("degraded: module imports (no ModuleNotFoundError)", deg.returncode == 0,
           deg.stderr[-300:])

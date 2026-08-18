@@ -9,6 +9,7 @@ state, prompt scratch files, or bridge logs are written.
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 from typing import Iterable, Tuple
 
@@ -107,6 +108,18 @@ def _actionable_hits(text: str, hits: Iterable[object]) -> list[object]:
     return actionable
 
 
+_SCANNER_BROKEN_WARNED = False
+
+
+def _warn_scanner_broken(exc) -> None:
+    global _SCANNER_BROKEN_WARNED
+    if not _SCANNER_BROKEN_WARNED:
+        print(f"[chat-secret-filter] secret scanner import FAILED ({exc}) — "
+              "detect-secrets install is broken, not absent; curated fallback "
+              "rules only until the environment is repaired", file=sys.stderr)
+        _SCANNER_BROKEN_WARNED = True
+
+
 def filter_chat_secrets(text: str) -> ChatSecretFilterResult:
     """Return text safe for persistence plus detected secret type names."""
     if not text:
@@ -115,7 +128,12 @@ def filter_chat_secrets(text: str) -> ChatSecretFilterResult:
     redacted, found = _replace_patterns(text)
     try:
         from secret_scanner import scan_and_redact
-
+    except ImportError as e:
+        # A broken detect-secrets INSTALL (scanner absence degrades inside
+        # secret_scanner and never raises). Surface it; keep the fallback.
+        _warn_scanner_broken(e)
+        return ChatSecretFilterResult(text=redacted, secret_types=tuple(sorted(found)))
+    try:
         hits, library_redacted = scan_and_redact(text)
         hits = _actionable_hits(text, hits)
         # Recompute when the library changed a line for an entropy-only false

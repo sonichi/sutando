@@ -32,7 +32,11 @@ try:
     from detect_secrets.core.scan import _process_line_based_plugins
     from detect_secrets.settings import transient_settings
     DETECT_SECRETS_ACTIVE = True
-except ImportError:
+except ModuleNotFoundError as e:
+    # Only true package ABSENCE degrades; a broken installed graph (missing
+    # submodule or transitive dep) must surface, never read as intentional.
+    if e.name != "detect_secrets":
+        raise
     _process_line_based_plugins = None
     transient_settings = None
     DETECT_SECRETS_ACTIVE = False
