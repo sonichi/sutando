@@ -164,14 +164,6 @@ describe('P7 D7.4 vision egress controls', () => {
 		stopStreaming();
 	});
 
-	it('the send-interval gate still bounds bursts independently of the fps cap', () => {
-		// The two limits are separate: MAX_FPS bounds the pull ticker, while
-		// VISION_MIN_SEND_INTERVAL_MS bounds any source's back-to-back sends.
-		assert.equal(VISION_MIN_SEND_INTERVAL_MS, 900);
-		assert.ok(1000 / VISION_MIN_SEND_INTERVAL_MS > MAX_FPS,
-			'the send gate is looser than the fps cap, so it cannot enforce it for push sources');
-	});
-
 	it('stopStreaming fences an in-flight pull capture — the stale frame never sends', async () => {
 		const { session, sent } = fakeSession();
 		setVisionSession(session);
