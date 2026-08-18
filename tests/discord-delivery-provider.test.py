@@ -7,6 +7,7 @@ toward the park path, and the claim is not left dangling.
 
 Run: python3 tests/discord-delivery-provider.test.py
 """
+# ruff: noqa: E402 — imports follow the sys.path inserts below
 import importlib.util
 import json
 import sys
@@ -17,11 +18,11 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
-from ag2_sparrow.delivery_core import backend_a  # noqa: E402
-from ag2_sparrow.delivery_core.contract import DeliveryOutcome as CO  # noqa: E402
-from ag2_sparrow.delivery_core.core import DeliveryCore  # noqa: E402
-from outbox import DeliveryOutcome as TO, RetrySafety  # noqa: E402
-from outbox_adapter import DeliveryReceipt as TransportReceipt  # noqa: E402
+from ag2_sparrow.delivery_core import backend_a
+from ag2_sparrow.delivery_core.contract import DeliveryOutcome as CO
+from ag2_sparrow.delivery_core.core import DeliveryCore
+from outbox import DeliveryOutcome as TO, RetrySafety
+from outbox_adapter import DeliveryReceipt as TransportReceipt
 
 spec = importlib.util.spec_from_file_location(
     "ddp", REPO / "src" / "discord_delivery_provider.py")
