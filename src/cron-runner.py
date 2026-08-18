@@ -411,6 +411,13 @@ def emit_task(name: str, entry: dict) -> Path:
             except OSError:
                 pass
     path = TASKS_DIR / f"{task_id}.txt"
+    # HMAC envelope (#3014 writer census): stamp at this writer's edge, fail-open
+    # so a stamping error costs the stamp and never the fire.
+    try:
+        from task_envelope import stamp_text  # sibling module (src/ on sys.path)
+        body = stamp_text(body, WORKSPACE)
+    except Exception:
+        pass
     path.write_text(body)
     _emit_cron_telemetry()
     return path
