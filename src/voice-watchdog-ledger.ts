@@ -47,13 +47,18 @@ export class WatchdogLedger {
 		return this._written;
 	}
 
-	append(row: Record<string, unknown>): void {
+	append(row: Record<string, unknown> & { row: string }): void {
 		if (this.queue.length >= LEDGER_QUEUE_CAP) {
 			this._dropped += 1;
 			return;
 		}
 		this.queue.push(
-			JSON.stringify({ ...this.meta, ...row, wallAtUnixMs: Date.now() }) + '\n',
+			JSON.stringify({
+				...this.meta,
+				...row,
+				wallAtUnixMs: Date.now(),
+				monoOffsetMs: Math.round(performance.now()),
+			}) + '\n',
 		);
 		this.chain = this.chain.then(() => this.drain());
 	}

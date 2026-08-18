@@ -13,7 +13,7 @@ import {
 } from './voice-active-silence-watchdog.js';
 import { WatchdogLedger } from './voice-watchdog-ledger.js';
 
-export const DETECTOR_VERSION = 'pr1-engine-diagnostic-2';
+export const DETECTOR_VERSION = 'pr1-engine-diagnostic-3';
 export const CAPABILITY_SET = Object.freeze({
 	turnStart: false,
 	routedToolOutcomes: 'settle-hook-only',
@@ -51,9 +51,12 @@ export class VoiceWatchdogShadow {
 	private lastAboveFloorSeen: number | null = null;
 	private lastOnsetSeen: number | null = null;
 	private lastMeeting = false;
-	private lastFireAt: number | null = null;
-	private awaitingPostFire = false;
-	/** `${epoch}:${toolCallId}` -> epoch. Non-background routes only. */
+	private lastFireAt: number | null = null; // episode FIRST fire only
+	private awaitingProgress = false;
+	private awaitingFunctional = false;
+	/** toolCallId -> originating engine-diagnostic epoch. Non-background only.
+	 *  Diagnostic boundary: a reused id across generations with an interleaved
+	 *  new call cannot be disambiguated until bodhi carries call tokens. */
 	private readonly pendingTools = new Map<string, number>();
 	/** Hook events observed between ticks, replayed chronologically. */
 	private hookQueue: RecoveryEvent[] = [];
@@ -96,16 +99,25 @@ export class VoiceWatchdogShadow {
 	noteToolCall(toolCallId: string, execution?: string): void {
 		if (this.mode === 'off' || execution === 'background') return;
 		// Pre-first-edge calls adopt into the upcoming epoch (see observeTick).
-		this.pendingTools.set(`${this.transportEpoch}:${toolCallId}`, this.transportEpoch);
+		this.pendingTools.set(toolCallId, this.transportEpoch);
 	}
 
 	noteToolSettled(toolCallId: string): void {
 		if (this.mode === 'off') return;
-		const key = `${this.transportEpoch}:${toolCallId}`;
-		if (!this.pendingTools.delete(key)) return; // stale/background/unknown: ignore
+		const originEpoch = this.pendingTools.get(toolCallId);
+		if (originEpoch === undefined) return; // background/unknown: ignore
+		this.pendingTools.delete(toolCallId);
+		if (originEpoch !== this.transportEpoch) return; // stale generation: no outcome
 		// An ordinary settle is upstream progress (design: advances the anchor,
 		// retains the latch); replayed chronologically at the next tick.
 		this.hookQueue.push({ kind: 'toolOutcome', at: this.nowFn(), transportEpoch: this.transportEpoch });
+	}
+
+	/** Meeting-mode mutations from every site (1s request path, tool auto-
+	 *  switch), not just the 30s tick — meeting-only speech must never latch. */
+	noteMeetingMode(active: boolean): void {
+		if (this.mode === 'off') return;
+		this.hookQueue.push({ kind: 'meetingModeChanged', active, at: this.nowFn() });
 	}
 
 	flush(): Promise<void> {
@@ -122,27 +134,38 @@ export class VoiceWatchdogShadow {
 		return n;
 	}
 
+	private lastDropReported = 0;
+
 	observeTick(input: ShadowTickInput): void {
 		if (this.mode === 'off') return;
+		if (this.ledger.dropped > this.lastDropReported) {
+			this.log(`[SilenceShadow] ledger dropped ${this.ledger.dropped - this.lastDropReported} row(s) under pressure`);
+			this.lastDropReported = this.ledger.dropped;
+		}
 		const derived: RecoveryEvent[] = [];
 
-		// Client lifecycle: epoch CHANGES are attach boundaries even when the
-		// polled boolean never blinked (reload between ticks).
+		// Client lifecycle FIRST and out-of-band: a detected epoch boundary must
+		// be applied before any event carried by the NEW snapshot (chronological
+		// sort would otherwise clear fresh new-epoch speech with the detach).
 		const epoch = input.snapshot.epoch ?? null;
 		if (input.clientConnected) {
 			if (!this.lastClientConnected || (epoch !== null && epoch !== this.lastClientEpochSeen)) {
 				if (this.lastClientConnected && this.lastClientEpochSeen !== null) {
-					derived.push({ kind: 'clientDetached', clientEpoch: this.lastClientEpochSeen, at: input.at });
+					this.feed({ kind: 'clientDetached', clientEpoch: this.lastClientEpochSeen, at: input.at }, input);
 				}
-				derived.push({ kind: 'clientAttached', clientEpoch: epoch ?? 0, at: input.at });
+				this.feed({ kind: 'clientAttached', clientEpoch: epoch ?? 0, at: input.at }, input);
 				this.lastClientEpochSeen = epoch;
+				// Rebase speech watermarks: this snapshot's speech belongs to the
+				// NEW epoch and must re-derive after the attach.
+				this.lastOnsetSeen = null;
+				this.lastAboveFloorSeen = null;
 			}
 		} else if (this.lastClientConnected) {
-			derived.push({
+			this.feed({
 				kind: 'clientDetached',
 				clientEpoch: this.lastClientEpochSeen ?? 0,
 				at: input.at,
-			});
+			}, input);
 		}
 		this.lastClientConnected = input.clientConnected;
 
@@ -155,15 +178,12 @@ export class VoiceWatchdogShadow {
 					// Tools that started before our first observation belong to the
 					// transport we are just now seeing: adopt, don't evict.
 					this.sawFirstActiveEdge = true;
-					for (const [key, ep] of [...this.pendingTools]) {
-						if (ep === previousEpoch) {
-							this.pendingTools.delete(key);
-							this.pendingTools.set(key.replace(`${ep}:`, `${this.transportEpoch}:`), this.transportEpoch);
-						}
+					for (const [id, ep] of [...this.pendingTools]) {
+						if (ep === previousEpoch) this.pendingTools.set(id, this.transportEpoch);
 					}
 				} else {
-					for (const [key, ep] of [...this.pendingTools]) {
-						if (ep !== this.transportEpoch) this.pendingTools.delete(key);
+					for (const [id, ep] of [...this.pendingTools]) {
+						if (ep !== this.transportEpoch) this.pendingTools.delete(id);
 					}
 				}
 				derived.push({
@@ -244,20 +264,34 @@ export class VoiceWatchdogShadow {
 		// Post-fire classification input: genuine upstream progress after a
 		// would-fire, within the counterfactual window.
 		if (
-			this.awaitingPostFire &&
 			this.lastFireAt !== null &&
-			(ev.kind === 'modelEvent' || ev.kind === 'userVisibleResponse') &&
+			(ev.kind === 'modelEvent' || ev.kind === 'toolOutcome' || ev.kind === 'userVisibleResponse') &&
 			ev.at > this.lastFireAt
 		) {
 			const deltaMs = ev.at - this.lastFireAt;
-			this.awaitingPostFire = false;
-			this.ledger.append({
-				row: 'post-fire-progress',
-				kindObserved: ev.kind,
-				deltaMs,
-				withinCounterfactualWindow: deltaMs <= POST_FIRE_RECOVERY_WINDOW_MS,
-				attemptEpoch: this.state.attemptEpoch,
-			});
+			if (this.awaitingProgress && ev.kind !== 'userVisibleResponse') {
+				this.awaitingProgress = false;
+				this.ledger.append({
+					row: 'post-fire-progress', kindObserved: ev.kind, deltaMs,
+					withinCounterfactualWindow: deltaMs <= POST_FIRE_RECOVERY_WINDOW_MS,
+					shadowEvidence: 'first-fire',
+					attemptEpoch: this.state.attemptEpoch,
+					transportEpoch: this.state.currentTransportEpoch,
+					clientEpoch: this.state.currentClientEpoch,
+				});
+			}
+			if (this.awaitingFunctional && ev.kind === 'userVisibleResponse') {
+				this.awaitingProgress = false;
+				this.awaitingFunctional = false;
+				this.ledger.append({
+					row: 'post-fire-functional', deltaMs,
+					withinCounterfactualWindow: deltaMs <= POST_FIRE_RECOVERY_WINDOW_MS,
+					shadowEvidence: 'first-fire',
+					attemptEpoch: this.state.attemptEpoch,
+					transportEpoch: this.state.currentTransportEpoch,
+					clientEpoch: this.state.currentClientEpoch,
+				});
+			}
 		}
 		const r = reduceRecovery(this.state, ev);
 		this.state = r.state;
@@ -281,8 +315,11 @@ export class VoiceWatchdogShadow {
 					this.state.firstSpeechAt === null ? null : input.at - this.state.firstSpeechAt,
 				atMs: input.at,
 			});
-			this.lastFireAt = input.at;
-			this.awaitingPostFire = true;
+			if (first) {
+				this.lastFireAt = input.at; // synthetic follow-ups never move it
+				this.awaitingProgress = true;
+				this.awaitingFunctional = true;
+			}
 			const r2 = reduceRecovery(this.state, {
 				kind: 'shadowRestarted', attemptEpoch: this.state.attemptEpoch, at: input.at,
 			});

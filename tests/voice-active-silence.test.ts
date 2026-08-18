@@ -133,7 +133,7 @@ function armed(t0: number): RecoveryState {
 	for (let i = 1; i <= 3; i++) s = reduceRecovery(s, tick(60_000 + i * T)).state;
 	check('restarting after authorization', s.phase, 'restarting');
 	const ae = s.attemptEpoch;
-	let r = reduceRecovery(s, ev({ kind: 'dialFailed', attemptEpoch: ae, at: 200_000 }));
+	const r = reduceRecovery(s, ev({ kind: 'dialFailed', attemptEpoch: ae, at: 200_000 }));
 	check('dialFailed → waiting-retry with schedule-retry effect', [r.state.phase, r.effect], ['waiting-retry', 'schedule-retry']);
 	check('retryNotBefore respects the 60s cooldown', r.state.retryNotBefore !== null && r.state.retryNotBefore >= (r.state.lastActionAt ?? 0) + 60_000, true);
 	// early retryDue is inert
@@ -143,7 +143,7 @@ function armed(t0: number): RecoveryState {
 	r2 = reduceRecovery(r.state, ev({ kind: 'retryDue', attemptEpoch: ae, at: (r.state.retryNotBefore ?? 0) + 1 }));
 	check('due retry restarts and consumes attempt 2', [r2.effect, r2.state.episodeAttempts, r2.state.phase], ['restart', 2, 'restarting']);
 	// detached at delivery: inert, re-scheduled on attach
-	let sd = reduceRecovery(r.state, ev({ kind: 'clientDetached', clientEpoch: 1, at: 200_100 })).state;
+	const sd = reduceRecovery(r.state, ev({ kind: 'clientDetached', clientEpoch: 1, at: 200_100 })).state;
 	const rDet = reduceRecovery(sd, ev({ kind: 'retryDue', attemptEpoch: ae, at: (r.state.retryNotBefore ?? 0) + 1 }));
 	check('retryDue while detached is inert', rDet.effect, 'none');
 	const rAtt = reduceRecovery(rDet.state, ev({ kind: 'clientAttached', clientEpoch: 2, at: (r.state.retryNotBefore ?? 0) + 5_000 }));
@@ -203,12 +203,12 @@ function armed(t0: number): RecoveryState {
 
 // ── Epoch fencing ────────────────────────────────────────────────────────
 {
-	let s = armed(0);
+	const s = armed(0);
 	const r1 = reduceRecovery(s, ev({ kind: 'modelEvent', at: 70_000, transportEpoch: 99 }));
 	check('stale-transport model event is record-only', [r1.effect, r1.state.silenceAnchorAt], ['record-only', s.silenceAnchorAt]);
 	const r2 = reduceRecovery(s, ev({ kind: 'userVisibleResponse', at: 70_000, transportEpoch: 1, clientEpoch: 42, channel: 'audio-egress' }));
 	check('wrong-client uVR is record-only', r2.effect, 'record-only');
-	let sd = reduceRecovery(s, ev({ kind: 'clientDetached', clientEpoch: 1, at: 71_000 })).state;
+	const sd = reduceRecovery(s, ev({ kind: 'clientDetached', clientEpoch: 1, at: 71_000 })).state;
 	const r3 = reduceRecovery(sd, ev({ kind: 'userVisibleResponse', at: 72_000, transportEpoch: 1, clientEpoch: 1, channel: 'audio-egress' }));
 	check('detached uVR is record-only despite matching fence', r3.effect, 'record-only');
 	const r4 = reduceRecovery(s, ev({ kind: 'transportActive', transportEpoch: 1, attemptEpoch: null, at: 73_000 }));

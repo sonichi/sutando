@@ -164,7 +164,12 @@ const voiceWatchdogShadow = new VoiceWatchdogShadow({
 	voiceSessionId: SESSION_ID,
 	ledger: new WatchdogLedger({
 		path: join(WORKSPACE_DIR, 'logs', 'voice-watchdog.jsonl'),
-		meta: { detectorVersion: DETECTOR_VERSION, capabilitySet: CAPABILITY_SET, pid: process.pid },
+		meta: {
+			detectorVersion: DETECTOR_VERSION,
+			capabilitySet: CAPABILITY_SET,
+			capabilitySetId: JSON.stringify(CAPABILITY_SET),
+			pid: process.pid,
+		},
 		onError: (err) => console.error(`${new Date().toISOString().slice(11, 23)} [SilenceShadow] ledger write failed: ${err.message}`),
 	}),
 });
@@ -398,6 +403,7 @@ function applyModeRequest() {
 		const want = req === 'meeting';
 		if (meetingActive === want && presenterActive === wantPresenter) return; // no-op if already in that mode
 		meetingActive = want;
+		voiceWatchdogShadow.noteMeetingMode(want);
 		presenterActive = wantPresenter;
 		writeVoiceModeSentinel();
 		syncPresenterSentinel();
@@ -415,6 +421,7 @@ try {
 		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 		if (parseInt(inMeeting) >= 2) {
 			meetingActive = true;
+			voiceWatchdogShadow.noteMeetingMode(true);
 			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
 		}
 	}
@@ -445,6 +452,7 @@ const switchModeTool: ToolDefinition = {
 	async execute(args) {
 		const { mode } = args as { mode: 'active' | 'meeting' | 'presenter' };
 		meetingActive = mode === 'meeting';
+		voiceWatchdogShadow.noteMeetingMode(meetingActive);
 		presenterActive = mode === 'presenter';
 		syncPresenterSentinel();
 		// Sync the on-disk sentinel so menu-bar consumers (Sutando.app
@@ -1022,9 +1030,11 @@ async function main() {
 				// Auto-switch meeting mode on join/dismiss
 				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
 					meetingActive = true;
+					voiceWatchdogShadow.noteMeetingMode(true);
 					console.log(`${ts()} [Meeting] Auto-activated by ${e.toolName}`);
 				} else if (e.toolName === 'dismiss') {
 					meetingActive = false;
+					voiceWatchdogShadow.noteMeetingMode(false);
 					console.log(`${ts()} [Meeting] Ended by dismiss`);
 				}
 			},

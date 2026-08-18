@@ -206,6 +206,77 @@ const dir = mkdtempSync(join(tmpdir(), 'watchdog-shadow-'));
 	check('epoch change installs the new client epoch', sh.snapshotState.currentClientEpoch, 2);
 }
 
+// ── Fresh new-epoch speech survives the reload boundary (r2 blocker 1) ───
+{
+	const ledger = new WatchdogLedger({ path: join(dir, 'reload2.jsonl'), meta: {} });
+	const sh = new VoiceWatchdogShadow({ ledger, env: {} as NodeJS.ProcessEnv, log: () => {} });
+	sh.observeTick({
+		at: 130_000, sessionState: 'ACTIVE', clientConnected: true, meetingMode: false,
+		snapshot: snap({ epoch: 1 }), facts: facts({ speechInWindow: false, speechObservedAt: null }),
+	});
+	// Reload between ticks; the NEW epoch's snapshot carries speech at 145s.
+	sh.observeTick({
+		at: 160_000, sessionState: 'ACTIVE', clientConnected: true, meetingMode: false,
+		snapshot: snap({ epoch: 2, onsetAt: 145_000, lastAboveFloorAt: 146_000 }),
+		facts: facts({ speechObservedAt: 145_000 }),
+	});
+	check('reload: new-epoch speech is latched, not cleared by the boundary',
+		[sh.snapshotState.currentClientEpoch, sh.snapshotState.speechLatched], [2, true]);
+}
+
+// ── Stale-generation tool settle emits nothing (r2 blocker 2) ────────────
+{
+	const ledger = new WatchdogLedger({ path: join(dir, 'staletool.jsonl'), meta: {} });
+	const clock = { t: 130_000 };
+	const sh = new VoiceWatchdogShadow({ ledger, env: {} as NodeJS.ProcessEnv, log: () => {}, nowFn: () => clock.t });
+	sh.observeTick({
+		at: 130_000, sessionState: 'ACTIVE', clientConnected: true, meetingMode: false,
+		snapshot: snap({ epoch: 1, onsetAt: 110_000, lastAboveFloorAt: 111_500, lastModelEventAt: 100_000 }),
+		facts: facts({ speechObservedAt: 110_000 }),
+	});
+	sh.noteToolCall('t9');
+	// Transport bounces: CLOSED then ACTIVE again → new engine epoch.
+	sh.observeTick({
+		at: 160_000, sessionState: 'CLOSED', clientConnected: true, meetingMode: false,
+		snapshot: snap({ epoch: 1 }), facts: facts({ factsAvailable: false, speechInWindow: false, speechObservedAt: null, ingressAdvanced: false, modelSilentFor15s: false }),
+	});
+	sh.observeTick({
+		at: 190_000, sessionState: 'ACTIVE', clientConnected: true, meetingMode: false,
+		snapshot: snap({ epoch: 1 }), facts: facts({ speechInWindow: false, speechObservedAt: null }),
+	});
+	const anchorBefore = sh.snapshotState.silenceAnchorAt;
+	clock.t = 200_000;
+	sh.noteToolSettled('t9'); // stale generation: must NOT enqueue an outcome
+	sh.observeTick({
+		at: 220_000, sessionState: 'ACTIVE', clientConnected: true, meetingMode: false,
+		snapshot: snap({ epoch: 1 }), facts: facts({ speechInWindow: false, speechObservedAt: null }),
+	});
+	check('stale tool settle does not advance the anchor', sh.snapshotState.silenceAnchorAt, anchorBefore);
+}
+
+// ── Meeting flip between ticks is seen via the mutation hook (r2 blocker 5) ──
+{
+	const ledger = new WatchdogLedger({ path: join(dir, 'meet.jsonl'), meta: {} });
+	const clock = { t: 129_000 };
+	const logs: string[] = [];
+	const sh = new VoiceWatchdogShadow({ ledger, env: {} as NodeJS.ProcessEnv, log: (l) => logs.push(l), nowFn: () => clock.t });
+	sh.observeTick({
+		at: 130_000, sessionState: 'ACTIVE', clientConnected: true, meetingMode: false,
+		snapshot: snap({ epoch: 1, lastModelEventAt: 100_000 }), facts: facts({ speechInWindow: false, speechObservedAt: null }),
+	});
+	clock.t = 131_000; sh.noteMeetingMode(true);   // meeting starts…
+	clock.t = 155_000; sh.noteMeetingMode(false);  // …and ends between ticks
+	// Meeting-window speech appears in the next snapshot; it must not latch
+	// because the mutation-hook replay clears it chronologically… speech at
+	// 140s falls INSIDE the meeting window (131–155s).
+	sh.observeTick({
+		at: 160_000, sessionState: 'ACTIVE', clientConnected: true, meetingMode: false,
+		snapshot: snap({ epoch: 1, lastModelEventAt: 100_000, onsetAt: 140_000, lastAboveFloorAt: 141_000 }),
+		facts: facts({ speechObservedAt: 140_000 }),
+	});
+	check('meeting-window speech does not survive as evidence', sh.snapshotState.speechLatched, false);
+}
+
 // ── Ledger bounds ────────────────────────────────────────────────────────
 {
 	const path = join(dir, 'cap.jsonl');
