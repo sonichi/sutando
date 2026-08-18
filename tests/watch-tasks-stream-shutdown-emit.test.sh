@@ -118,6 +118,35 @@ check "the two failure messages name different destinations" \
 check "...and the fallback names stdout" \
       "1" "$(printf '%s\n%s\n' "$err" "$err_fb" | grep -c 'on stdout after a handler fallback' || true)"
 
+# ── ordering: the shutdown sentinel must be written FIRST in cleanup() (#3025) ──
+# The drain and queue guards read `$DISPATCH_DIR/shutting-down`, so any release,
+# kill or sweep that runs before it exists can still promote a worker (#2934).
+cleanup_code=$(awk '/^cleanup\(\) \{/,/^\}/' "$WATCHER" | grep -vE '^[[:space:]]*#')
+check "cleanup() body is extractable (else every ordering check below is vacuous)" \
+      "yes" "$([ -n "$cleanup_code" ] && echo yes || echo no)"
+
+line_of() { printf '%s\n' "$cleanup_code" | grep -n -- "$1" | head -1 | cut -d: -f1; }
+sent=$(line_of 'shutting-down')
+rel=$(line_of 'sentinel_release_if_owner')
+kil=$(line_of 'kill -TERM')
+fbk=$(line_of 'fallback_outstanding_handlers')
+
+# Each anchor must EXIST: a missing one yields an empty var, and `[ "" -lt n ]`
+# is an error, not a pass — but an unguarded test would still read as ok.
+for pair in "sentinel:$sent" "release:$rel" "kill:$kil" "fallback:$fbk"; do
+    check "cleanup() still contains the ${pair%%:*} anchor" \
+          "yes" "$([ -n "${pair#*:}" ] && echo yes || echo no)"
+done
+
+if [ -n "$sent" ] && [ -n "$rel" ] && [ -n "$kil" ] && [ -n "$fbk" ]; then
+    check "the shutting-down sentinel precedes sentinel_release_if_owner" \
+          "yes" "$([ "$sent" -lt "$rel" ] && echo yes || echo no)"
+    check "...precedes the first kill" \
+          "yes" "$([ "$sent" -lt "$kil" ] && echo yes || echo no)"
+    check "...precedes the handler-fallback sweep" \
+          "yes" "$([ "$sent" -lt "$fbk" ] && echo yes || echo no)"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "Results: FAILED"; exit 1
 fi
