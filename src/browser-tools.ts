@@ -12,6 +12,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { readCaptureToken } from './util_paths.js';
+import { setupHint } from './osascript-setup-hint.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -66,6 +67,12 @@ export const scrollTool: ToolDefinition = {
 			console.log(`${ts()} [Scroll] frontApp=${frontApp} direction=${direction} isChrome=${isChrome}`);
 
 			let _scrollMoved: boolean | null = null;  // null = couldn't determine (no AppleEvent result)
+			// Setup faults the OS already explained, surfaced when nothing scrolled.
+			const _hints: string[] = [];
+			const _noteHint = (e: unknown) => {
+				const h = setupHint(e instanceof Error ? e.message : String(e));
+				if (h && !_hints.includes(h)) _hints.push(h);
+			};
 			if (isChrome && !target) {
 				// Chrome: try EACH scrollable element (widest first) until one ACTUALLY
 				// MOVES, then fall back to window scroll. The old code scrolled only the
@@ -92,7 +99,7 @@ export const scrollTool: ToolDefinition = {
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				let _out = '';
 				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
-				catch (e) { console.log(`${ts()} [Scroll] osascript error: ${e instanceof Error ? e.message : e}`); }
+				catch (e) { _noteHint(e); console.log(`${ts()} [Scroll] osascript error: ${e instanceof Error ? e.message : e}`); }
 				try { unlinkSync(tmpScroll); } catch {}
 				if (_out) {
 					try {
@@ -119,7 +126,7 @@ export const scrollTool: ToolDefinition = {
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				let _out = '';
 				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
-				catch (e) { console.log(`${ts()} [Scroll] osascript error (target branch): ${e instanceof Error ? e.message : e}`); }
+				catch (e) { _noteHint(e); console.log(`${ts()} [Scroll] osascript error (target branch): ${e instanceof Error ? e.message : e}`); }
 				try { unlinkSync(tmpScroll); } catch {}
 				try {
 					const d = JSON.parse(_out);
@@ -132,9 +139,14 @@ export const scrollTool: ToolDefinition = {
 			const keyCode = direction === 'down' ? '121' : direction === 'up' ? '116' : direction === 'top' ? '115 using command down' : '119 using command down';
 			try {
 				execSync(`osascript -e 'tell application "System Events" to key code ${keyCode}'`, { timeout: 3_000 });
-			} catch { /* keyboard fallback is best-effort */ }
+			} catch (e) { _noteHint(e); /* best-effort, but a denial is reportable */ }
 
 			console.log(`${ts()} [Scroll] ${direction} (app: ${frontApp})`);
+			// A denial is not a scroll: report the fix the OS named instead.
+			if (_scrollMoved !== true && _hints.length > 0) {
+				return { status: 'setup_required', direction, app: frontApp, moved: false, steps: _hints,
+				         message: 'The scroll did not go through — a one-time setup step is needed. Tell the user that, then read the "steps" to them verbatim, in order. Do not add steps of your own.' };
+			}
 			// Honest result: if the JS pass found nothing moved (page already at the
 			// direction's limit), say so instead of falsely claiming a scroll — so the
 			// model can tell the user "looks like we're at the bottom" rather than insist.
