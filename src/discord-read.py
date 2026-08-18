@@ -32,12 +32,9 @@ REPLY_CLIP = 110
 
 
 def _load_token(env):
-    """Populate DISCORD_BOT_TOKEN from the channel .env (if present) and return it."""
-    for line in (env.read_text().splitlines() if env.exists() else []):
-        k, _, v = line.partition("=")
-        if k.strip() == "DISCORD_BOT_TOKEN" and v.strip():
-            os.environ.setdefault("DISCORD_BOT_TOKEN", v.strip())
-    return os.environ.get("DISCORD_BOT_TOKEN", "")
+    """Resolve DISCORD_BOT_TOKEN via the shared policy: env -> `env` file -> vault."""
+    from channel_token import resolve_channel_token
+    return resolve_channel_token("DISCORD_BOT_TOKEN", env_file=env)
 
 
 def _fetch(extra, channel_id, page, headers):

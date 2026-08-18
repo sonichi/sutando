@@ -82,17 +82,19 @@ def voice_connected() -> bool:
 
 
 def _load_token() -> str:
-    """Read DISCORD_BOT_TOKEN from the first env file that has it."""
-    for env_path in [
-        claude_home_path("channels", "discord", ".env"),
-        REPO / ".env",
-    ]:
-        if not env_path.exists():
-            continue
-        for line in env_path.read_text().splitlines():
-            if line.startswith("DISCORD_BOT_TOKEN="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return ""
+    """Resolve DISCORD_BOT_TOKEN via the shared policy: env -> channel .env -> vault.
+
+    The repo-root .env is kept as a final legacy tier (this file historically
+    read it; no other Discord path does) via the shared parser."""
+    from channel_token import resolve_channel_token, token_from_env_file
+    tok = resolve_channel_token("DISCORD_BOT_TOKEN",
+                                env_file=claude_home_path("channels", "discord", ".env"))
+    legacy = token_from_env_file("DISCORD_BOT_TOKEN", REPO / ".env")
+    if tok and legacy and tok != legacy:
+        # divergence is logged (never the values) so the flip is visible.
+        print("[dm-result] DISCORD_BOT_TOKEN: repo-root .env differs from the "
+              "resolved source; using the resolved one", file=sys.stderr)
+    return tok or legacy
 
 
 def _discord_api(method, path, token, body=None):
