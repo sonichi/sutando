@@ -46,6 +46,28 @@ beforeEach(() => {
 });
 
 describe('P7 D7.4 vision egress controls', () => {
+	it('the push-path minimum send interval enforces the documented 1 fps cap', async () => {
+		// MAX_FPS clamps only the pull ticker; the push path is bounded by
+		// VISION_MIN_SEND_INTERVAL_MS alone. A frame 950 ms after the last
+		// send must be parked — 1/MAX_FPS is 1000 ms (#3089 deferred this
+		// gate to #3090, which never landed it).
+		const { session, sent } = fakeSession('ACTIVE');
+		setVisionSession(session);
+		startStreaming('browser', undefined, 'push');
+		const r1 = submitFrame(frameBuf(1));
+		assert.equal(r1.ok, true);
+		assert.equal(sent.length, 1);
+		await delay(950);
+		const r2 = submitFrame(frameBuf(2));
+		assert.equal(r2.deferred, true, '950 ms after the last send is above 1 fps — must park');
+		assert.equal(sent.length, 1);
+		// The derivation the gate must never undercut:
+		assert.ok(
+			VISION_MIN_SEND_INTERVAL_MS >= 1000 / MAX_FPS,
+			`gate ${VISION_MIN_SEND_INTERVAL_MS}ms undercuts the ${MAX_FPS} fps cap`,
+		);
+	});
+
 	it('browser push rides the central gate: ACTIVE sends, non-ACTIVE defers to the latest-frame slot', async () => {
 		const { session, sent } = fakeSession('CONNECTING');
 		setVisionSession(session);
