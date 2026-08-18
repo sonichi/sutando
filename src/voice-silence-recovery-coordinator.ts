@@ -160,6 +160,10 @@ export class VoiceSilenceRecoveryCoordinator {
 		null;
 	/** stop() latch: no dispatch, push or timer may run after shutdown. */
 	private stopped = false;
+	/** Last seen transport epoch, for the successor-generation tool prune. */
+	private stPrevTransportEpoch: number | null = null;
+	/** Canary telemetry: first upstream progress after the latest restart. */
+	private firstProgressSeenForAttempt = true;
 
 	constructor(opts: CoordinatorOptions) {
 		this.opts = opts;
@@ -232,6 +236,15 @@ export class VoiceSilenceRecoveryCoordinator {
 			this.stalledEnteredAtUnixMs = this.wallNow();
 			this.parkedRetry = null;
 		}
+		// Any admitted successor generation strands the previous generation's
+		// tools: their results can no longer reach this session (bodhi drops
+		// them), so a lingering entry must not veto recovery forever.
+		if (ev.kind === 'transportActive' && state.currentTransportEpoch !== this.stPrevTransportEpoch) {
+			for (const [key, epoch] of this.pendingTools) {
+				if (epoch !== state.currentTransportEpoch) this.pendingTools.delete(key);
+			}
+		}
+		this.stPrevTransportEpoch = state.currentTransportEpoch;
 		switch (effect) {
 			case 'restart':
 				this.executeRestart(ev.kind === 'retry' ? 'human-retry' : 'active-silence');
@@ -271,6 +284,11 @@ export class VoiceSilenceRecoveryCoordinator {
 			return;
 		}
 		this.bodhiAttemptByReducerEpoch.set(reducerEpoch, result.attemptEpoch);
+		this.firstProgressSeenForAttempt = false;
+		void result.incumbentClosed.then((outcome) => {
+			if (this.stopped) return;
+			this.record({ row: 'incumbent-closed', outcome, attemptEpoch: reducerEpoch, at: this.now() });
+		});
 		// Bound the correlation map to the live episode's attempts.
 		if (this.bodhiAttemptByReducerEpoch.size > 8) {
 			const oldest = this.bodhiAttemptByReducerEpoch.keys().next().value;
@@ -445,6 +463,15 @@ export class VoiceSilenceRecoveryCoordinator {
 	handleModelEvent(transportGeneration?: number): void {
 		const epoch = transportGeneration ?? this.st.currentTransportEpoch;
 		if (epoch === null) return;
+		if (!this.firstProgressSeenForAttempt && epoch === this.st.currentTransportEpoch) {
+			this.firstProgressSeenForAttempt = true;
+			this.record({
+				row: 'first-upstream-progress',
+				attemptEpoch: this.st.attemptEpoch,
+				transportEpoch: epoch,
+				at: this.now(),
+			});
+		}
 		this.dispatch({ kind: 'modelEvent', at: this.now(), transportEpoch: epoch });
 	}
 
@@ -460,25 +487,24 @@ export class VoiceSilenceRecoveryCoordinator {
 	}
 
 	noteToolSettled(toolCallId: string): void {
-		// Prefer the current generation's entry; a stale generation's entry is
-		// removed silently — its outcome must not touch the current anchor.
-		const currentKey = `${this.st.currentTransportEpoch}:${toolCallId}`;
-		if (this.pendingTools.has(currentKey)) {
-			this.pendingTools.delete(currentKey);
-			if (this.st.currentTransportEpoch !== null) {
-				this.dispatch({
-					kind: 'toolOutcome',
-					at: this.now(),
-					transportEpoch: this.st.currentTransportEpoch,
-				});
-			}
-			return;
+		// The settle hook carries no generation, so resolve by STORED epoch,
+		// oldest entry first: completions overwhelmingly arrive in issue
+		// order, and a late old-generation completion must consume ITS OWN
+		// entry — never the current generation's veto — and must not advance
+		// the current anchor.
+		let match: { key: string; epoch: number | null } | null = null;
+		for (const [key, epoch] of this.pendingTools) {
+			if (!key.endsWith(`:${toolCallId}`)) continue;
+			if (match === null || (epoch ?? -1) < (match.epoch ?? -1)) match = { key, epoch };
 		}
-		for (const key of this.pendingTools.keys()) {
-			if (key.endsWith(`:${toolCallId}`)) {
-				this.pendingTools.delete(key);
-				return;
-			}
+		if (match === null) return;
+		this.pendingTools.delete(match.key);
+		if (match.epoch !== null && match.epoch === this.st.currentTransportEpoch) {
+			this.dispatch({
+				kind: 'toolOutcome',
+				at: this.now(),
+				transportEpoch: match.epoch,
+			});
 		}
 	}
 
@@ -500,28 +526,49 @@ export class VoiceSilenceRecoveryCoordinator {
 			this.lastSpeechAt = input.lastAboveFloorAt;
 			this.dispatch({ kind: 'speechObserved', at: input.lastAboveFloorAt });
 		}
-		// Per-epoch delivered baseline. A NEW epoch's reset-from-zero counters
-		// that are already positive count as delivery — a response landing
-		// before the first tick of its epoch must not be forgotten. Speech is
-		// replayed before delivery deliberately: when the 30 s window cannot
-		// order them, unlatching (fullReset) is the conservative side — the
-		// watchdog can only under-arm, never re-arm on stale evidence.
+		// Per-epoch delivered baseline. Only CLIENT-CONFIRMED playback
+		// (heartbeat chunksEnded) can clear terminal — server egress is audio
+		// SENT, not delivered, and its epoch is uncorrelated, so it counts
+		// only as model activity (anchor advance) below. A NEW epoch's
+		// reset-from-zero counters that are already positive still count — a
+		// response landing before its epoch's first tick must not be lost.
+		// Speech is replayed before delivery deliberately: when the 30 s
+		// window cannot order them, unlatching (fullReset) is the conservative
+		// side — the watchdog can only under-arm, never re-arm on stale
+		// evidence.
 		const d = input.delivered;
-		let deliveredAdvanced: boolean;
-		if (this.deliveredBaseline === null || this.deliveredBaseline.epoch !== d.epoch) {
-			deliveredAdvanced = d.heartbeatSeen ? d.chunksEnded > 0 : d.egressFrames > 0;
-		} else {
-			deliveredAdvanced = d.heartbeatSeen
-				? d.chunksEnded > this.deliveredBaseline.chunksEnded
-				: d.egressFrames > this.deliveredBaseline.egressFrames;
-		}
+		const fresh = this.deliveredBaseline === null || this.deliveredBaseline.epoch !== d.epoch;
+		const playbackAdvanced = d.heartbeatSeen
+			? fresh
+				? d.chunksEnded > 0
+				: d.chunksEnded > (this.deliveredBaseline as { chunksEnded: number }).chunksEnded
+			: false;
+		const egressAdvanced = fresh
+			? d.egressFrames > 0
+			: d.egressFrames > (this.deliveredBaseline as { egressFrames: number }).egressFrames;
 		this.deliveredBaseline = { epoch: d.epoch, chunksEnded: d.chunksEnded, egressFrames: d.egressFrames };
+		if (egressAdvanced && !playbackAdvanced && this.st.currentTransportEpoch !== null) {
+			this.dispatch({
+				kind: 'modelEvent',
+				at: input.at,
+				transportEpoch: this.st.currentTransportEpoch,
+			});
+		}
+		const wasNonIdle = this.st.phase !== 'idle' || this.st.origin !== null;
 		if (
-			deliveredAdvanced &&
+			playbackAdvanced &&
 			this.st.clientAttached &&
 			this.st.currentTransportEpoch !== null &&
 			this.st.currentClientEpoch !== null
 		) {
+			if (wasNonIdle) {
+				this.record({
+					row: 'first-user-visible-response',
+					phaseBefore: this.st.phase,
+					attemptEpoch: this.st.attemptEpoch,
+					at: input.at,
+				});
+			}
 			this.dispatch({
 				kind: 'userVisibleResponse',
 				at: input.at,

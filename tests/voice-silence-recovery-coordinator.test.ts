@@ -449,16 +449,26 @@ describe('recovery coordinator: review-round regressions', () => {
 		assert.equal(h.restarts.length, 1);
 	});
 
-	it('a stale-generation tool completion neither settles current tools nor advances the anchor', async () => {
+	it('an admitted successor generation prunes stranded tools; their late completions are inert', async () => {
 		const h = makeHarness();
 		h.coord.handleClientConnected();
 		h.setupOk(1, 1);
 		h.coord.noteToolCall('t1', 'inline'); // issued under generation 1
 		h.setupOk(1, 2); // bodhi-internal reconnect: ordinary activation, gen 2
-		const rowsBefore = h.rows.filter((r) => r.event === 'toolOutcome').length;
-		h.coord.noteToolSettled('t1'); // completion from the dead generation
-		assert.equal(h.rows.filter((r) => r.event === 'toolOutcome').length, rowsBefore);
-		assert.equal(h.coord.pendingToolCount, 0); // entry removed silently
+		// The stranded generation-1 tool must not veto recovery forever…
+		assert.equal(h.coord.pendingToolCount, 0);
+		const anchorBefore = h.coord.state.silenceAnchorAt;
+		h.advance(5_000);
+		h.coord.noteToolSettled('t1'); // its late completion is inert
+		assert.equal(h.coord.state.silenceAnchorAt, anchorBefore); // anchor untouched
+		// …and a CURRENT-generation tool with the same reused id keeps its
+		// veto, settling only on its own completion (which advances the anchor).
+		h.coord.noteToolCall('t1', 'inline'); // generation 2 reuses the id
+		assert.equal(h.coord.pendingToolCount, 1);
+		h.advance(5_000);
+		h.coord.noteToolSettled('t1');
+		assert.equal(h.coord.pendingToolCount, 0);
+		assert.equal(h.coord.state.silenceAnchorAt, h.nowOf()); // anchor advanced
 	});
 
 	it('an accepted ack survives unbounded non-accepted churn (dedup never forgets accepts)', async () => {
@@ -497,12 +507,38 @@ describe('recovery coordinator: review-round regressions', () => {
 		assert.equal(h.sent.filter((m) => m.type === 'voice.retryUpstream.ack').length, 0);
 	});
 
-	it('first tick of a fresh epoch with positive counters counts as delivery', async () => {
+	it('first tick of a fresh epoch with positive PLAYBACK counters counts as delivery', async () => {
 		const h = makeHarness();
 		await driveToTerminal(h);
 		// Baseline was epoch null; the new epoch resets counters from zero and
-		// already shows playback — the response landed before this tick.
+		// already shows client-confirmed playback — the response landed before
+		// this tick.
 		h.tick({ delivered: { epoch: 9, chunksEnded: 1, egressFrames: 1, heartbeatSeen: true } });
 		assert.equal(h.coord.phase, 'idle');
+		const rows = h.rows.filter((r) => r.row === 'first-user-visible-response');
+		assert.equal(rows.length, 1);
+	});
+
+	it('server egress without heartbeat confirmation NEVER clears terminal (sent is not delivered)', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.tick({ delivered: { epoch: 9, chunksEnded: 0, egressFrames: 5, heartbeatSeen: false } });
+		assert.equal(h.coord.phase, 'terminal');
+		h.tick({ delivered: { epoch: 9, chunksEnded: 0, egressFrames: 9, heartbeatSeen: false } });
+		assert.equal(h.coord.phase, 'terminal');
+		assert.equal(h.coord.state.episodeAttempts, 3); // budget untouched
+	});
+
+	it('ownsRecovery spans the whole episode, not just terminal', async () => {
+		const h = makeHarness();
+		assert.equal(h.coord.ownsRecovery, false);
+		await fireOnce(h);
+		assert.equal(h.coord.ownsRecovery, true); // restarting
+		h.setupOk(h.restarts[0].dialGen, 2);
+		assert.equal(h.coord.phase, 'idle');
+		assert.equal(h.coord.ownsRecovery, true); // recovered origin retained
+		// Functional recovery (client-confirmed playback) releases ownership.
+		h.tick({ delivered: { epoch: 3, chunksEnded: 2, egressFrames: 2, heartbeatSeen: true } });
+		assert.equal(h.coord.ownsRecovery, false);
 	});
 });

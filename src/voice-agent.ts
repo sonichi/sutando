@@ -991,10 +991,12 @@ async function main() {
 		},
 		onClientDisconnected: () => voiceRecoveryCoordinator?.handleClientDisconnected(),
 		onConnectionLifecycle: (event) => voiceRecoveryCoordinator?.handleLifecycleEvent(event),
-		// While terminal, ordinary attach auto-actions (greeting, context
-		// replay, the CLOSED auto-reconnect) would be uncounted bypasses of
-		// the attempt budget — bodhi gates them on this predicate.
-		suppressClientAutoActions: () => voiceRecoveryCoordinator?.isTerminal ?? false,
+		// Whenever the coordinator owns the episode (restarting, waiting-retry,
+		// terminal, or a recovered origin), bodhi's attach auto-actions —
+		// greeting, context replay and especially the CLOSED auto-reconnect —
+		// would be uncounted bypasses of the attempt budget. The synthetic hold
+		// already gates the injection paths post-recovery; this gates the dial.
+		suppressClientAutoActions: () => voiceRecoveryCoordinator?.ownsRecovery ?? false,
 		...(VOICE_SHADOW_STT
 			? {
 					shadowSttProvider: new GeminiBatchSTTProvider({
@@ -1249,7 +1251,10 @@ async function main() {
 			// upstream issue persists. Without this, a 1011 credit-depleted
 			// loop produces ~6 log lines / 60s indefinitely.
 			voiceFatalBackoffUntil = Date.now() + 5 * 60 * 1000;
-			voiceRecoveryCoordinator?.handleFatalBackoff(voiceFatalBackoffUntil);
+			// The reducer clock domain is MONOTONIC — the wall-time deadline
+			// above (kept for agent-state/UI) must not cross into it, or the
+			// backoff never expires in reducer time.
+			voiceRecoveryCoordinator?.handleFatalBackoff(performance.now() + 5 * 60 * 1000);
 			emitAgentState();
 			if (notifiedCategories.has(c.category)) return;
 			notifiedCategories.add(c.category);
