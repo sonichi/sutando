@@ -153,8 +153,10 @@ enum GracefulRestartInvocation {
             return "Restart stopped before the kill — prep failed, "
                  + "so the core is STILL RUNNING. Nothing was killed."
         case 4:
+            // The lock is released on every exit, dry runs included, so a
+            // lingering one means a crashed holder — reaped at LOCK_STALE_S.
             return "Another restart is already in progress — this one deferred. "
-                 + "(A recent --dry-run holds the lock for up to 15 min.)"
+                 + "(A lock left by a crashed run is reaped after 15 min.)"
         case 5:
             // Rehearsal reaches the same success path having killed nothing,
             // so exit 0 here would report an action that did not happen.
