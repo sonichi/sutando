@@ -4217,10 +4217,8 @@ def core_env_has_proxy_url(
     if len(matches) != 1:
         return None
     tokens = matches[0].split()
-    # `ps eww` prints argv THEN the environment. On a process whose env we are not
-    # permitted to read it prints argv alone, which contains no KEY=VALUE pairs — and
-    # "no pairs" is indistinguishable from "an empty environment". Requiring at least
-    # one pair is what keeps an unreadable env reporting None instead of False.
+    # `ps eww` prints argv alone when the env is unreadable, so "no KEY=VALUE pair"
+    # is what keeps an unreadable env reporting None rather than an empty env.
     env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
     if not env_pairs:
         return None
@@ -4513,9 +4511,8 @@ def _keychain_service_exists(service: str) -> bool:
         return False
 
 
-# Distinct from None and from "": the proxy's environment could not be read at
-# all. "" means "read it, there is no CLAUDE_CONFIG_DIR" (the proxy then resolves
-# the vanilla item), which is a comparable answer; unreadable is not.
+# Distinct from None and from "": the environment could not be READ at all.
+# "" means read-but-unset, which is a comparable answer; unreadable is not.
 _PROXY_ENV_UNREADABLE = object()
 
 
@@ -4549,14 +4546,12 @@ def _proxy_config_dir_from_process(pid_finder=None, ps_runner=None):
     if proc is None or getattr(proc, "returncode", 1) != 0:
         return _PROXY_ENV_UNREADABLE
     out = proc.stdout or ""
-    # `ps eww` prints argv THEN the environment, space-separated, and prints argv
-    # ALONE for a process whose env we may not read. Requiring one KEY=VALUE pair
-    # is what keeps that case UNREADABLE instead of "no CLAUDE_CONFIG_DIR".
+    # `ps eww` prints argv ALONE when the env is unreadable, so requiring one
+    # KEY=VALUE pair keeps that case UNREADABLE, not "no CLAUDE_CONFIG_DIR".
     if not re.search(r"(?:^| )[A-Za-z_][A-Za-z0-9_]*=", out):
         return _PROXY_ENV_UNREADABLE
-    # Capture to the next ` KEY=` rather than the next space: this value is a path
-    # under "~/Library/Application Support", so a whitespace split truncates it at
-    # "…/Library/Application" and silently hashes the wrong directory.
+    # Capture to the next ` KEY=`, not the next space: the value is a path
+    # containing spaces, and a whitespace split hashes the wrong directory.
     m = re.search(
         r"(?:^| )CLAUDE_CONFIG_DIR=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)", out, re.S)
     return m.group(1) if m else ""
@@ -4798,10 +4793,8 @@ def _quota_identity_verdict(name: str, core_cfg: Optional[str],
                 f"Fix: pin CLAUDE_CONFIG_DIR in "
                 f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
                 if source == "plist" else
-                # The process path is reached whenever the LISTENER's env is
-                # readable — which says nothing about who started it. Claiming
-                # "not launchd-managed" here asserts state never checked, and
-                # under KeepAlive a plain restart is silently undone.
+                # Reaching the process path says nothing about who STARTED it,
+                # so "not launchd-managed" would assert state never checked.
                 f"this reading came from the running process, which inherited "
                 f"{'no CLAUDE_CONFIG_DIR' if not proxy_cfg else repr(proxy_cfg)}. "
                 + (
