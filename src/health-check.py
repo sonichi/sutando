@@ -5571,27 +5571,57 @@ def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | 
         return True
 
 
-def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
-    """Task filenames a running delegated worker is currently processing.
+def _parse_etime(raw: str) -> "float | None":
+    """ps ELAPSED -> seconds. `MM:SS`, `HH:MM:SS`, `D-HH:MM:SS`; None if unparseable."""
+    raw = (raw or "").strip()
+    days = 0
+    if "-" in raw:
+        head, _, raw = raw.partition("-")
+        if not head.isdigit():
+            return None
+        days = int(head)
+    parts = raw.split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    nums = [int(p) for p in parts]
+    hours, minutes, seconds = ([0] + nums) if len(nums) == 2 else nums
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
-    A team task stays in tasks/ for the whole run — the worker only removes it
+
+def _worker_holdings(ps_output: "str | None" = None) -> dict:
+    """{task filename: worker RUNTIME in seconds, or None if unreadable}.
+
+    A team task stays in tasks/ for the whole run — the worker removes it only
     when it publishes a result — so an in-flight task and an abandoned one are
     byte-identical on disk. Only the worker's argv separates them.
+
+    The runtime comes from the worker PROCESS, not the task file: a task can sit
+    queued for hours before a worker claims it, and claiming does not touch the
+    file, so file age answers a different question than "has this worker
+    outlived its deadline".
     """
     if ps_output is None:
         try:
-            ps_output = subprocess.run(["ps", "-Ao", "args="], capture_output=True,
+            ps_output = subprocess.run(["ps", "-Ao", "etime=,args="], capture_output=True,
                                        text=True, timeout=5).stdout
         except Exception:  # noqa: BLE001 — a probe failure must not fail the check
-            return set()
-    held = set()
+            return {}
+    held: dict = {}
     for line in (ps_output or "").splitlines():
         if "session-worker.py" not in line:
             continue
-        for tok in line.split():
+        fields = line.split()
+        # Callers may pass argv-only output; then the first field is not an etime.
+        age = _parse_etime(fields[0]) if fields else None
+        for tok in fields:
             if tok.endswith(".txt") and "/tasks/" in tok:
-                held.add(Path(tok).name)
+                held[Path(tok).name] = age
     return held
+
+
+def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
+    """Filenames only — the set form, for callers that do not need the runtime."""
+    return set(_worker_holdings(ps_output))
 
 
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
@@ -5610,18 +5640,24 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     now = time.time()
     # An in-flight task looks exactly like a stalled one on disk; the worker's
     # argv is the only thing that tells them apart.
-    held = _tasks_held_by_a_worker()
-    inflight = sum(1 for f in files if f.name in held)
+    holdings = _worker_holdings()
+    inflight = sum(1 for f in files if f.name in holdings)
     held_note = f", {inflight} in flight with a worker" if inflight else ""
     oldest = min(files, key=lambda p: p.stat().st_mtime)
     oldest_age = int(now - oldest.stat().st_mtime)
-    # Bound the suppression by the WORKER's own deadline, not the queue's: past
-    # it a live holder has outlived the limit it enforces on itself.
+    # Deadline vs the WORKER's runtime, never the file's age: a task can queue
+    # for hours before a worker claims it, and claiming does not touch the file.
     all_held = inflight == len(files)
     held_deadline = int(_worker_hard_timeout_s())
-    held_is_progress = all_held and oldest_age <= held_deadline
-    wedged_note = (f" — still held by a live worker past its own {held_deadline}s "
-                   "hard deadline, so the WORKER is wedged, not the watcher")
+    ages = [holdings.get(f.name) for f in files if f.name in holdings]
+    # An unreadable runtime cannot establish progress — refuse to go quiet on it.
+    worker_age = None if (not ages or any(a is None for a in ages)) else int(max(ages))
+    held_is_progress = all_held and worker_age is not None and worker_age <= held_deadline
+    wedged_note = (f" — still held by a live worker running {worker_age}s, past its own "
+                   f"{held_deadline}s hard deadline, so the WORKER is wedged, not the watcher"
+                   if worker_age is not None else
+                   " — held by a live worker whose runtime could not be read, so progress "
+                   "cannot be established")
     held_verdict = (" — all held by a live worker, not stalled" if held_is_progress
                     else wedged_note if all_held else None)
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
@@ -6058,11 +6094,8 @@ def check_task_watcher() -> dict:
     argv = _proc_argv(pid)
     if not argv:
         if roots:
-            # The sentinel tracks only the MOST RECENT start (the script writes
-            # $$ at startup), so a dead sentinel does NOT mean nothing is
-            # draining tasks/ — an older watcher can still be running. Saying
-            # "not running" here would be false, and restarting on that basis is
-            # what produces the duplicates in the first place.
+            # The sentinel tracks only the MOST RECENT start, so a dead one does
+            # NOT mean nothing drains tasks/ — restarting here makes duplicates.
             return {"name": name, "status": "warn",
                     "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
                               f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "

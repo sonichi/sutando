@@ -80,8 +80,13 @@ import time as _time
 ALERTABLE = ("down", "missing", "not_loaded", "fail", "stale", "warn")
 
 
-def probe(n_tasks, n_held, age_sec, real_lookup=False):
+def probe(n_tasks, n_held, age_sec, real_lookup=False, worker_age=None):
     """Run the real check_task_queue against a temp workspace.
+
+    age_sec is the TASK FILE's age; worker_age is the holder's RUNTIME. They are
+    independent by construction, which is the whole point — a queued task can be
+    old while the worker that just claimed it has run for seconds. worker_age
+    defaults to age_sec so the pre-existing cases keep their original meaning.
 
     real_lookup keeps the shipped worker lookup so a broken `ps` is exercised.
     """
@@ -94,15 +99,22 @@ def probe(n_tasks, n_held, age_sec, real_lookup=False):
         old_t = _time.time() - age_sec
         os.utime(f, (old_t, old_t))
         names.append(f.name)
-    held = set(names[:n_held])
-    orig_ws, orig_held = hc.WORKSPACE_DIR, hc._tasks_held_by_a_worker
+    ages = age_sec if worker_age is None else worker_age
+    holdings = {n: ages for n in names[:n_held]}
+    # Stub whichever lookup the module has, so this file also runs against a
+    # merge-base that predates _worker_holdings and FAILs rather than raising.
+    attr = "_worker_holdings" if hasattr(hc, "_worker_holdings") else "_tasks_held_by_a_worker"
+    stub = (lambda ps_output=None: holdings) if attr == "_worker_holdings" \
+        else (lambda ps_output=None: set(holdings))
+    orig_ws, orig_hold = hc.WORKSPACE_DIR, getattr(hc, attr)
     hc.WORKSPACE_DIR = tmp
     if not real_lookup:
-        hc._tasks_held_by_a_worker = lambda ps_output=None: held
+        setattr(hc, attr, stub)
     try:
         return hc.check_task_queue()
     finally:
-        hc.WORKSPACE_DIR, hc._tasks_held_by_a_worker = orig_ws, orig_held
+        hc.WORKSPACE_DIR = orig_ws
+        setattr(hc, attr, orig_hold)
 
 # The ordinary case this PR exists for: held, and still inside the deadline.
 r = probe(1, 1, 400)
@@ -228,6 +240,70 @@ if hasattr(hc, "_worker_hard_timeout_s"):
 with hard_timeout("7200"):
     check(hc._task_claim_thresholds() == (14400.0, 57600.0),
           f"claim thresholds track the configured deadline (got {hc._task_claim_thresholds()})")
+
+# ---- the deadline is the WORKER's RUNTIME, not the task file's age ------------
+# A queued task ages while no worker is running; file age is a different question.
+
+# BEHAVIOURAL first, using only probe(), so they FAIL at the merge-base.
+with hard_timeout("900"):
+    r = probe(1, 1, 1000, worker_age=5)
+    check(r["status"] == "ok",
+          f"file 1000s old, worker running 5s -> ok (got {r['status']!r})")
+    check("wedged" not in r["detail"], "and it is not called wedged")
+
+# The reciprocal. At the merge-base it passes for the WRONG reason (file age),
+# so the PAIR discriminates, not either half alone.
+with hard_timeout("900"):
+    r = probe(1, 1, 1200, worker_age=1200)
+    check(r["status"] == "warn",
+          f"worker running 1200s past a 900s deadline -> warn (got {r['status']!r})")
+    check("running 1200s" in r["detail"],
+          f"the detail quotes the WORKER's runtime (got {r['detail'][-70:]!r})")
+
+check(hasattr(hc, "_worker_holdings"),
+      "a named helper returns holder RUNTIME, so file age and worker age cannot be confused")
+check(hasattr(hc, "_parse_etime"), "ps ELAPSED has a parser of its own")
+
+if hasattr(hc, "_parse_etime"):
+    check(hc._parse_etime("00:42") == 42, "etime MM:SS")
+    check(hc._parse_etime("01:00:00") == 3600, "etime HH:MM:SS")
+    check(hc._parse_etime("2-03:04:05") == 2 * 86400 + 3 * 3600 + 4 * 60 + 5, "etime D-HH:MM:SS")
+    for bad in ("", "   ", "abc", "1:2:3:4", "x-01:00", "1:aa"):
+        check(hc._parse_etime(bad) is None, f"etime {bad!r} is unreadable, not zero")
+
+if hasattr(hc, "_worker_holdings"):
+    PS_AGED = ("  900:01 /usr/bin/python3 /r/skills/task-workstream-sessions/scripts/"
+               "session-worker.py --task-file /w/tasks/task-old.txt\n")
+    PS_FRESH = ("    00:03 /usr/bin/python3 /r/skills/task-workstream-sessions/scripts/"
+                "session-worker.py --task-file /w/tasks/task-new.txt\n")
+    check(hc._worker_holdings(PS_AGED) == {"task-old.txt": 54001.0},
+          f"runtime parsed off the ps row (got {hc._worker_holdings(PS_AGED)})")
+    check(hc._worker_holdings(PS_FRESH) == {"task-new.txt": 3.0},
+          "a fresh holder reads as seconds")
+    # argv-only output (no ELAPSED column) must still yield the filename, age unknown.
+    check(hc._worker_holdings(PS) == {"task-aaa.txt": None, "task-bbb.txt": None},
+          f"argv-only ps -> names with unknown age (got {hc._worker_holdings(PS)})")
+
+check(hc._tasks_held_by_a_worker(PS) == {"task-aaa.txt", "task-bbb.txt"},
+      "the set form is unchanged for its existing callers")
+
+# A runtime we cannot read must not buy silence — unknown is not progress.
+if hasattr(hc, "_worker_holdings"):
+    with hard_timeout("900"):
+        d = Path(tempfile.mkdtemp()); (d / "tasks").mkdir()
+        f = d / "tasks" / "task-000.txt"; f.write_text("x")
+        os.utime(f, (_time.time() - 400, _time.time() - 400))
+        ows, orig = hc.WORKSPACE_DIR, hc._worker_holdings
+        hc.WORKSPACE_DIR = d
+        hc._worker_holdings = lambda ps_output=None: {"task-000.txt": None}
+        try:
+            ru = hc.check_task_queue()
+        finally:
+            hc.WORKSPACE_DIR, hc._worker_holdings = ows, orig
+        check(ru["status"] == "warn",
+              f"unreadable worker runtime -> warn, never quiet (got {ru['status']!r})")
+        check("could not be read" in ru["detail"],
+              "and it says why progress cannot be established")
 
 print()
 if failures:
