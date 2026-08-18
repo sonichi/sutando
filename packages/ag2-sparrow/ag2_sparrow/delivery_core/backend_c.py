@@ -150,6 +150,8 @@ class DesignCClaimBackend:
     def publish(self, item_id: str, payload: bytes) -> bool:
         key = _safe_key(item_id)
         with self._lock(key):
+            # RAW tokens block on purpose: a dead ghost holding the slot is
+            # the verified harmless-by-construction recover-window semantics.
             if self._tokens(key):
                 return False
             tmp = self._d(TMP) / f"{key}{SEP}{os.getpid()}{SEP}{time.time_ns()}"
@@ -244,8 +246,9 @@ class DesignCClaimBackend:
                                  str(time.time_ns()))
 
     def recover(self) -> RecoverReport:
-        """DEAD owners' items return to ready/; ALIVE/UNKNOWN never touched.
-        A dead token whose key has a LIVE holder quarantines (CE-1/CE-2)."""
+        """Dead OWNERS' items return to ready/; UNKNOWN never touched. The
+        owner is the INCARNATION, not the pid: an ALIVE pid whose birth
+        mismatches the token is a reused pid — the claimant is dead."""
         rep = RecoverReport()
         for f in sorted(self._d(INFLIGHT).iterdir()):
             parts = f.name.split(SEP)
@@ -253,10 +256,12 @@ class DesignCClaimBackend:
                 continue
             key = parts[0]
             ident = outbox.process_identity(int(parts[2]))
-            if ident.state is not outbox.OwnerState.DEAD:
+            if ident.state is outbox.OwnerState.UNKNOWN:
                 continue
-            if ident.start_usec is not None and str(ident.start_usec) != parts[3]:
-                continue
+            if ident.state is not outbox.OwnerState.DEAD and (
+                    ident.start_usec is None
+                    or str(ident.start_usec) == parts[3]):
+                continue                    # genuinely the live holder
             with self._lock(key):
                 if not f.exists():
                     continue

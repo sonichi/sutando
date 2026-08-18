@@ -126,6 +126,29 @@ def main() -> int:
               any("max-attempts" in p.name for p in parked))
 
 
+
+    # PID-REUSE (Codex blocking finding): an ALIVE pid whose birth mismatches
+    # the token is a reused pid — the claimant is dead; recover must re-arm.
+    with tempfile.TemporaryDirectory() as td:
+        b = DesignCClaimBackend(Path(td))
+        key = backend_c._safe_key(ITEM)
+        reused = b.root / "inflight" / SEP.join(
+            (key, "ghost", str(os.getpid()), "1", "0"))   # alive pid, wrong birth
+        reused.write_text("{}", encoding="utf-8")
+        rep = b.recover()
+        check("pid-reuse: reused-pid token re-arms", key in rep.recovered)
+        check("pid-reuse: item claimable again",
+              b.claim(ITEM, "drainer-B") is not None)
+        # control: a token carrying THIS process's REAL birth is a live
+        # holder and must never be recovered.
+        ident = backend_c.outbox.process_identity(os.getpid())
+        live = b.root / "inflight" / SEP.join(
+            (key + "x", "w", str(os.getpid()), str(ident.start_usec), "g1"))
+        live.write_text("{}", encoding="utf-8")
+        rep = b.recover()
+        check("pid-reuse control: genuine live holder untouched",
+              (key + "x") not in rep.recovered and live.exists())
+
     # cleanup must not reset a LIVE item's park ceiling (air's #3104 nit).
     with tempfile.TemporaryDirectory() as td:
         b = DesignCClaimBackend(Path(td))
