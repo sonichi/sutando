@@ -748,7 +748,10 @@ const mainAgent: MainAgent = {
 // ($CLAUDE_CONFIG_DIR/projects/-{slug}/memory). Failure-silent: a missing memory
 // dir should never block voice startup.
 function bootstrapMemoryDir(): void {
-	const slug = claudeProjectSlug(WORKSPACE_DIR.replace(/\/$/, ''));
+	// Claude Code keys its project dir on the REPO it was launched in, not on the
+	// workspace. Passing WORKSPACE_DIR derives a slug no project dir ever has, so
+	// this silently created an empty memory dir beside the real one.
+	const slug = claudeProjectSlug(dirname(_voiceAgentDir).replace(/\/$/, ''));
 	const memDir = process.env.SUTANDO_MEMORY_DIR || claudeHomePath('projects', slug, 'memory');
 	try {
 		mkdirSync(memDir, { recursive: true });
