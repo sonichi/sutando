@@ -77,10 +77,7 @@ def gate(serving_channel_id, target_channel_id, token, guild_resolver=None,
                 f"channel {serving_channel_id} (channel-level entry)")
     guild = resolver(target_channel_id, token)
     if guild is None:
-        # FAIL-CLOSED: the serving channel HAS a blacklist but we cannot verify
-        # which guild the target belongs to (resolve failed / no access). A
-        # privacy gate must not fetch what it cannot clear — if the target were
-        # in a blacklisted guild, fetching would leak. Refuse.
+        # FAIL-CLOSED: a privacy gate must not fetch what it cannot clear.
         return (f"could not verify the guild of #{target_channel_id}; the serving "
                 f"channel {serving_channel_id} has a contextNotFrom blacklist, so "
                 f"refusing rather than risk reading a blacklisted guild (fail-closed)")
