@@ -31,11 +31,7 @@ import uuid
 
 from discord_http import request_json
 from outbox_adapter import DeliveryReceipt, classify_response
-
-try:
-    from outbox import RetrySafety
-except ImportError:  # pragma: no cover
-    from .outbox import RetrySafety  # type: ignore
+from outbox import RetrySafety
 
 API = "https://discord.com/api/v10"
 UA = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
