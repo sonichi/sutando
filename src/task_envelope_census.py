@@ -67,11 +67,14 @@ def census(workspace: Path | None = None, days: float = 7.0) -> dict:
         if not d.is_dir():
             continue
         for p in sorted(d.rglob("task-*.txt")):
+            # One failure boundary for read AND stat: the archiver can move
+            # the file between them, and a vanished file is a skip, not an abort.
             try:
                 text = p.read_text(encoding="utf-8")
+                mtime = p.stat().st_mtime
             except OSError:
                 continue
-            if _task_epoch(p.name, text, p.stat().st_mtime) < cutoff:
+            if _task_epoch(p.name, text, mtime) < cutoff:
                 continue
             scanned += 1
             v = verify_text(text, ws)["verdict"]

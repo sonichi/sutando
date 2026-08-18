@@ -568,6 +568,13 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
     """Persist the Slack route before exposing its task file to the core."""
     _set_pending_reply(task_id, info)
     try:
+        # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+        # fail-open so a stamping error costs the stamp and never the task.
+        try:
+            from task_envelope import stamp_text  # sibling module (src/ on sys.path)
+            content = stamp_text(content, REPO)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception:
         _pop_pending_reply(task_id)
