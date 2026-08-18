@@ -340,6 +340,56 @@ with tempfile.TemporaryDirectory() as td:
         failures.append(f"guide control failed to flag: out={r.stdout!r} err={r.stderr[-300:]!r}")
 
 
+# --- The verdict TOKEN must carry the scope, not just the parenthetical:
+# a reader keys on the first word and never reaches the caveat.
+with tempfile.TemporaryDirectory() as td:
+    body = "# one\n# two\nV = 1\n"
+    (pathlib.Path(td) / "a.py").write_text(body)
+    guide = pathlib.Path(td) / "GUIDE.md"
+    guide.write_text("```yaml\nchecks:\n  prose-cap:\n    prose_cap: 2\n"
+                     "    prose_exts: ['.py']\n```\n")
+
+    def run(index_sha):
+        d = (f"diff --git a/a.py b/a.py\nindex 0000000..{index_sha} 100644\n"
+             f"--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n"
+             + "".join("+" + l + "\n" for l in body.splitlines()))
+        return subprocess.run(["bash", str(ROOT / "scripts" / "review-checks.sh"),
+                               "--guide", str(guide)], input=d,
+                              capture_output=True, text=True, cwd=td)
+
+    # Post-image present and matching: the gate ran, so the token is PASS.
+    r = run(blob_sha(body))
+    if r.returncode == 0 and r.stdout.startswith("review-checks: PASS ("):
+        print("  ok: a fully-scanned run still leads with PASS")
+    else:
+        failures.append(f"scanned run lost its PASS token: rc={r.returncode} out={r.stdout!r}")
+
+    # Same diff, index sha of a different blob: prose-cap cannot scan.
+    r = run(blob_sha("# other\nV = 2\n"))
+    if not r.stdout.startswith("review-checks: PARTIAL ("):
+        failures.append("a skipped gate still led with a clean-looking token: "
+                        f"out={r.stdout!r} err={r.stderr[-200:]!r}")
+    elif "prose-cap SKIPPED" not in r.stdout:
+        failures.append(f"PARTIAL verdict dropped the scope wording: out={r.stdout!r}")
+    elif r.returncode != 0:
+        failures.append(f"PARTIAL must keep exit 0 — a skip is not a failure: rc={r.returncode}")
+    else:
+        print("  ok: a skipped gate reports PARTIAL, keeps the scope, and exits 0")
+
+    # A FAIL must still outrank a skip: a real finding is not a partial scan.
+    over = "# one\n# two\n# three\nV = 1\n"
+    (pathlib.Path(td) / "b.py").write_text(over)
+    d = (f"diff --git a/b.py b/b.py\nindex 0000000..{blob_sha(over)} 100644\n"
+         f"--- a/b.py\n+++ b/b.py\n@@ -1,4 +1,4 @@\n"
+         + "".join("+" + l + "\n" for l in over.splitlines()))
+    r = subprocess.run(["bash", str(ROOT / "scripts" / "review-checks.sh"),
+                        "--guide", str(guide)], input=d, capture_output=True, text=True, cwd=td)
+    if r.returncode == 1 and "PARTIAL" not in r.stdout and "PASS" not in r.stdout:
+        print("  ok: a real finding still fails — PARTIAL did not soften it")
+    else:
+        failures.append(f"a finding was reported as a verdict token: rc={r.returncode} out={r.stdout!r}")
+
+
 if failures:
     print("\nFAILURES:")
     for f in failures:

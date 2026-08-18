@@ -147,10 +147,13 @@ PROSE_HITS="$(printf '%s' "$DIFF" | RC_PROSE_CAP="$PROSE_CAP" RC_PROSE_EXTS="$PR
 PROSE_RC=$?
 cat "$PROSE_ERR" >&2
 # A diff detached from its tree (`gh pr diff`) leaves prose-cap nothing to read.
-# That is not a failure, but the summary must not report it as a clean scan.
+# Not a failure, but the verdict TOKEN must carry it — readers key on the first word.
 PROSE_SCOPE="hardcoded-paths + root-artifacts + prose-cap clean"
-grep -q '^prose-cap: SKIPPED' "$PROSE_ERR" &&
+VERDICT="PASS"
+if grep -q '^prose-cap: SKIPPED' "$PROSE_ERR"; then
     PROSE_SCOPE="hardcoded-paths + root-artifacts clean; prose-cap SKIPPED — no post-image"
+    VERDICT="PARTIAL"
+fi
 # Fail-closed is asserted AFTER the other scanners report. Exiting here would
 # suppress real hardcoded-path/root-artifact findings already in hand.
 
@@ -178,5 +181,5 @@ if [[ $PROSE_RC -ne 0 ]]; then
     exit 2
 fi
 [[ $FAILED -eq 1 ]] && exit 1
-echo "review-checks: PASS ($PROSE_SCOPE)"
+echo "review-checks: $VERDICT ($PROSE_SCOPE)"
 exit 0
