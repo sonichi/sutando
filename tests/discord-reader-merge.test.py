@@ -92,9 +92,8 @@ def main() -> int:
     check("--operator: explicit privileged fetch, gate not consulted",
           rc == 0 and fetched == [1])
 
-    # 1c. Production callers are wired: the bridge's emitted instruction and
-    #     the repo skill doc both pass --serving. (Template/doc text is the
-    #     DATA those surfaces emit — this pins content, not behavior spelling.)
+    # 1c. Production callers wired: the bridge instruction template and the
+    #     skill doc are the DATA those surfaces emit — content pins, not spelling.
     bridge_src = (SRC / "discord-bridge.py").read_text()
     check("bridge instruction passes --serving",
           "src/discord-read.py {channel_id_str} --serving {channel_id_str}" in bridge_src)
