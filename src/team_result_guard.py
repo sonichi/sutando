@@ -16,16 +16,28 @@ import re
 import sys
 from pathlib import Path
 
-# Delivery-control markers. A Team sender must never be able to redirect a reply
-# to another channel, attach a file, or suppress the reply, via result text.
+# A marker is a control only WHERE result_markers executes it: [channel:] at
+# line start, attach aliases anywhere (their regex is unanchored).
 TEAM_RESULT_CONTROL = re.compile(
-    r"\[(?:channel|file|send|attach|dm-only|no-send|replied|deduped)\s*(?::|\])",
+    r"(?m:^\s*\[channel\s*(?::|\]))|\[(?:file|send|attach)\s*(?::|\])",
     re.IGNORECASE,
+)
+
+# Suppressive markers are controls at BODY START only (the router's reach) and
+# stay withheld there: a guarded sender must not close its own lease silently.
+TEAM_SUPPRESS_CONTROL = re.compile(
+    r"\A\s*\[(?:no-send\]|replied\]|deduped\s*:)", re.IGNORECASE,
 )
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
     "contain sensitive information. The owner can review the work locally."
+)
+
+TEAM_SUPPRESS_RESULT = (
+    "Task handled. The agent marked this reply as not-for-delivery; suppression "
+    "markers are not honoured on Team-tier results, so this notice is delivered "
+    "in its place. Nothing was withheld for content reasons."
 )
 
 # Only `owner` is exempt — markers are a feature for the owner and a capability
@@ -103,6 +115,8 @@ def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
     if TEAM_RESULT_CONTROL.search(body):
         raise TeamResultLeakError("result delivery control marker")
+    if TEAM_SUPPRESS_CONTROL.match(body or ""):
+        raise TeamResultLeakError("suppressive delivery marker")
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)
@@ -124,6 +138,8 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None):
     try:
         return scan_team_result(body, repo, secret_filter), None
     except TeamResultLeakError as exc:
+        if str(exc) == "suppressive delivery marker":
+            return TEAM_SUPPRESS_RESULT, str(exc)
         return TEAM_LEAK_RESULT, str(exc)
     except Exception as exc:
         # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
