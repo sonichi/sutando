@@ -166,6 +166,20 @@ and loads whichever repo it reviews.
     made the previous default unrestorable without deleting the guard. Pin behaviour under
     the flag, never the absence of a string.
 
+12. **Cut the diff against the merge-base, not against `main`.** `git diff origin/main <pr>`
+    on a branch that is behind renders `main`'s own newer commits as *removals* by the PR,
+    so a reviewer reads deletions the author never wrote. Use
+    `git diff $(git merge-base origin/main <pr>) <pr>`, and for a stacked PR review the
+    child-only commit as well as the cumulative result — the child layer is what this PR
+    is being asked to add.
+    *Grounded by:* #3020 (2026-08-17). Diffing it against `main` showed ~20 removed lines
+    in `check_cron_runner`, a function the PR does not touch; the topic diff against its
+    merge-base is 2 files, +105/-4. Verify a stated stack rather than trusting the body:
+    `git merge-base --is-ancestor <parent-head> <child>` confirmed #2995's head really is
+    an ancestor, which is what makes "merge the parent first" load-bearing rather than
+    a courtesy — and what makes `--delete-branch` on the parent dangerous while the child
+    is open.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
