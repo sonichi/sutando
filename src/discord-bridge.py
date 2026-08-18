@@ -110,6 +110,10 @@ except ModuleNotFoundError:
     raise
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Entrypoint-owned path setup: ``import ag2_sparrow`` resolves uninstalled (5b).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow")  # lint-workspace-resolution: allow-repo-root — locates the CODE package (gateway-shim parity)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
