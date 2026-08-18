@@ -804,12 +804,8 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 	// frame draining into a later session is exactly the backlog rule's target.
 	deferredSlot = null;
 	stopDrainTimer();
-	// Push-mode frames accumulate in Gemini Live's conversation context.
-	// Without this hint, "what do you see?" after the user stops sharing
-	// gets answered from the last frame still in context (model recalls
-	// from memory instead of calling send_vision_frame to grab a fresh
-	// view). This hint does NOT evict the frames and is not silent: the
-	// transport ignores turnComplete, so the model may answer it aloud.
+	// Stale frames STAY in context — this only tells the model they are stale.
+	// turnComplete is ignored by the transport, so it may answer the hint aloud.
 	if (wasPush) {
 		const transport = sessionRef?.transport;
 		// Call as a method (not via an extracted reference) so `this` binds
