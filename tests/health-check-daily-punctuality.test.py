@@ -286,5 +286,44 @@ class TestConditionalProducers(unittest.TestCase):
         self.assertEqual(r["status"], "warn", r["detail"])
 
 
+
+class TestMidnightBoundary(unittest.TestCase):
+    """A nightly scheduled just before midnight finishes just after it. Comparing
+    raw minute-of-day makes those runs read as ~23h EARLY instead of minutes late."""
+
+    def test_2342_schedule_landing_after_midnight_is_LATE_not_early(self):
+        """The reviewer's production-shaped control: talk-events-nightly at 23:42
+        with artifacts at 00:05/00:07/00:09 scored deltas of -1417 and returned ok."""
+        arts = [("2026-08-16", 5), ("2026-08-17", 7), ("2026-08-18", 9)]
+        r = hc._interpret_daily_punctuality(
+            [job("talk-events-nightly", 23, 42, arts, today_seen=True)])
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("+25 min late", r["detail"])
+
+    def test_genuinely_early_same_day_artifact_stays_early(self):
+        """The guard on the fix: wrapping must not turn an artifact that beat its
+        schedule into a next-day run. 23:20 against 23:42 is 22 min EARLY."""
+        arts = [(f"2026-08-{d:02d}", 23 * 60 + 20) for d in range(10, 17)]
+        r = hc._interpret_daily_punctuality(
+            [job("talk-events-nightly", 23, 42, arts, today_seen=True)])
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_after_midnight_schedule_with_previous_day_artifact_stays_early(self):
+        """The mirror case: a 00:05 job whose output lands 23:50 the day before is
+        early, and must not wrap into +1435 late."""
+        arts = [(f"2026-08-{d:02d}", 23 * 60 + 50) for d in range(10, 17)]
+        r = hc._interpret_daily_punctuality(
+            [job("early-bird", 0, 5, arts, today_seen=True)])
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_ordinary_midday_lateness_is_unchanged(self):
+        """The wrap must not perturb the common case it does not apply to."""
+        arts = [(f"2026-08-{d:02d}", 6 * 60 + 50 + 40) for d in range(10, 17)]
+        r = hc._interpret_daily_punctuality(
+            [job("daily-insight", 6, 50, arts, today_seen=True)])
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("+40 min late", r["detail"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

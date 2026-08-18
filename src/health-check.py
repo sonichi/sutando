@@ -5180,7 +5180,9 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         if not j["artifacts"]:
             unknown.append(j["name"])
             continue
-        deltas = sorted(w - due for _, w in j["artifacts"])
+        # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
+        # -1417 early. The filename date is logical, often a day off the mtime.
+        deltas = sorted(((w - due + 720) % 1440) - 720 for _, w in j["artifacts"])
         median = statistics.median(deltas)
         if median > DAILY_LATE_TOLERANCE_MIN:
             late.append((j["name"], median, len(deltas)))
