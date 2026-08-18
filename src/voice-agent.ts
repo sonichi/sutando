@@ -77,6 +77,12 @@ import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_pa
 import { nextConnectingTick } from './voice-connect-watchdog.js';
 import { VoiceWatchdogShadow, DETECTOR_VERSION, CAPABILITY_SET } from './voice-watchdog-shadow.js';
 import { WatchdogLedger } from './voice-watchdog-ledger.js';
+import { parseActiveSilenceMode, parseActiveSilenceTicks } from './voice-active-silence-watchdog.js';
+import {
+	VoiceSilenceRecoveryCoordinator,
+	recoverySurfaceSupported,
+	type RecoverySessionSurface,
+} from './voice-silence-recovery-coordinator.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -173,6 +179,14 @@ const voiceWatchdogShadow = new VoiceWatchdogShadow({
 		onError: (err) => console.error(`${new Date().toISOString().slice(11, 23)} [SilenceShadow] ledger write failed: ${err.message}`),
 	}),
 });
+
+// ACTIVE-silence recovery, Phase 1 (armed): explicit opt-in via
+// VOICE_ACTIVE_SILENCE_MODE=armed; everything else stays Phase 0a shadow.
+const ACTIVE_SILENCE_MODE = parseActiveSilenceMode(process.env.VOICE_ACTIVE_SILENCE_MODE);
+const ACTIVE_SILENCE_TICKS = parseActiveSilenceTicks(process.env.VOICE_ACTIVE_SILENCE_TICKS);
+let voiceRecoveryCoordinator: VoiceSilenceRecoveryCoordinator | null = null;
+let voiceRecoveryLedger: WatchdogLedger | null = null;
+let recoveryEgressBaseline: { epoch: number | null; chunksEnded: number; egressFrames: number } | null = null;
 
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
@@ -404,6 +418,7 @@ function applyModeRequest() {
 		if (meetingActive === want && presenterActive === wantPresenter) return; // no-op if already in that mode
 		meetingActive = want;
 		voiceWatchdogShadow.noteMeetingMode(want);
+		voiceRecoveryCoordinator?.noteMeetingMode(want);
 		presenterActive = wantPresenter;
 		writeVoiceModeSentinel();
 		syncPresenterSentinel();
@@ -453,6 +468,7 @@ const switchModeTool: ToolDefinition = {
 		const { mode } = args as { mode: 'active' | 'meeting' | 'presenter' };
 		meetingActive = mode === 'meeting';
 		voiceWatchdogShadow.noteMeetingMode(meetingActive);
+		voiceRecoveryCoordinator?.noteMeetingMode(meetingActive);
 		presenterActive = mode === 'presenter';
 		syncPresenterSentinel();
 		// Sync the on-disk sentinel so menu-bar consumers (Sutando.app
@@ -963,6 +979,12 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
+		// makes every forward a no-op.
+		onClientCommand: (message) => voiceRecoveryCoordinator?.handleClientCommand(message),
+		onClientConnected: () => voiceRecoveryCoordinator?.handleClientConnected(),
+		onClientDisconnected: () => voiceRecoveryCoordinator?.handleClientDisconnected(),
+		onConnectionLifecycle: (event) => voiceRecoveryCoordinator?.handleLifecycleEvent(event),
 		...(VOICE_SHADOW_STT
 			? {
 					shadowSttProvider: new GeminiBatchSTTProvider({
@@ -1015,6 +1037,7 @@ async function main() {
 			onToolCall: (e) => {
 				audioHealth.noteModelEvent(); // P7 D7.1: a tool call is model activity
 				voiceWatchdogShadow.noteToolCall(e.toolCallId, e.execution);
+				voiceRecoveryCoordinator?.noteToolCall(e.toolCallId, e.execution);
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				// tool_call event push removed per #1052 — canonical record
 				// is the surface-table row written in onToolResult via
@@ -1031,15 +1054,18 @@ async function main() {
 				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
 					meetingActive = true;
 					voiceWatchdogShadow.noteMeetingMode(true);
+					voiceRecoveryCoordinator?.noteMeetingMode(true);
 					console.log(`${ts()} [Meeting] Auto-activated by ${e.toolName}`);
 				} else if (e.toolName === 'dismiss') {
 					meetingActive = false;
 					voiceWatchdogShadow.noteMeetingMode(false);
+					voiceRecoveryCoordinator?.noteMeetingMode(false);
 					console.log(`${ts()} [Meeting] Ended by dismiss`);
 				}
 			},
 			onToolResult: (e) => {
 				voiceWatchdogShadow.noteToolSettled(e.toolCallId);
+				voiceRecoveryCoordinator?.noteToolSettled(e.toolCallId);
 				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
 				recorder.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				// tool_result event push removed per #1052 — recordToolCall
@@ -1060,6 +1086,33 @@ async function main() {
 	});
 
 	sessionRef = session;
+
+	// Armed only with the full bodhi recovery surface; anything less falls
+	// back to shadow with a loud line (the design's capability-validation rule).
+	if (ACTIVE_SILENCE_MODE === 'armed' && ACTIVE_SILENCE_TICKS > 0) {
+		if (recoverySurfaceSupported(session)) {
+			voiceRecoveryLedger = new WatchdogLedger({
+				path: join(WORKSPACE_DIR, 'logs', 'voice-recovery.jsonl'),
+				meta: { detectorVersion: DETECTOR_VERSION, mode: 'armed', pid: process.pid },
+				onError: (err) => console.error(`${ts()} [SilenceRecovery] ledger write failed: ${err.message}`),
+			});
+			voiceRecoveryCoordinator = new VoiceSilenceRecoveryCoordinator({
+				voiceSessionId: SESSION_ID,
+				session: session as unknown as RecoverySessionSurface,
+				requiredTicks: ACTIVE_SILENCE_TICKS,
+				log: (m) => console.log(`${ts()} [SilenceRecovery] ${m}`),
+				record: (row) => voiceRecoveryLedger?.append(row),
+			});
+			// Seed startup-detected meeting state — the coordinator was not
+			// alive when the boot-time Zoom probe ran.
+			voiceRecoveryCoordinator.noteMeetingMode(meetingActive);
+			console.log(`${ts()} [SilenceRecovery] ARMED (ticks=${ACTIVE_SILENCE_TICKS})`);
+		} else {
+			console.warn(`${ts()} [SilenceRecovery] armed requested but the bodhi surface lacks the recovery capabilities — staying in shadow`);
+		}
+	} else if (ACTIVE_SILENCE_MODE === 'armed') {
+		console.warn(`${ts()} [SilenceRecovery] armed requested but VOICE_ACTIVE_SILENCE_TICKS=0 disables the watchdog — staying in shadow`);
+	}
 
 	// P7 D7.1: install the session-layer ledger wraps (audio ingress count +
 	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
@@ -1183,6 +1236,7 @@ async function main() {
 			// upstream issue persists. Without this, a 1011 credit-depleted
 			// loop produces ~6 log lines / 60s indefinitely.
 			voiceFatalBackoffUntil = Date.now() + 5 * 60 * 1000;
+			voiceRecoveryCoordinator?.handleFatalBackoff(voiceFatalBackoffUntil);
 			emitAgentState();
 			if (notifiedCategories.has(c.category)) return;
 			notifiedCategories.add(c.category);
@@ -1339,6 +1393,8 @@ async function main() {
 		console.log(`\n${ts()} Shutting down...`);
 		recorder.flush();
 		await voiceWatchdogShadow.flush().catch(() => {});
+		voiceRecoveryCoordinator?.stop();
+		await voiceRecoveryLedger?.flush().catch(() => {});
 		setVisionSession(null);
 		setSessionToolUpdater(null, []);
 		stopVisionControlServer();
@@ -1686,6 +1742,7 @@ async function main() {
 		// issue was fixed.
 		if (state === 'ACTIVE' && voiceFatalBackoffUntil > 0) {
 			voiceFatalBackoffUntil = 0;
+			voiceRecoveryCoordinator?.handleFatalBackoffCleared();
 		}
 		// A connect that HANGS never returns to CLOSED, so the recovery guard below
 		// — which only fires from CLOSED — can never see it. Observed live: 23min
@@ -1716,7 +1773,7 @@ async function main() {
 		// is bodhi's internal entry point for this exact scenario (CLOSED + client
 		// present → transition to CONNECTING, reconnect fire-and-forget).
 		// TODO: drop the (session as any) cast once bodhi exposes a public API.
-		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil) {
+		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil && !(voiceRecoveryCoordinator?.isTerminal ?? false)) {
 			lastReconnectAt = Date.now();
 			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
 			try {
@@ -1735,6 +1792,28 @@ async function main() {
 			snapshot,
 			facts: matrix.facts,
 		});
+		// Armed coordinator (Phase 1): live feed. Functional-recovery evidence
+		// prefers client-confirmed playback; server egress is the fallback
+		// when no heartbeat visibility exists. Baselines reset per epoch.
+		if (voiceRecoveryCoordinator) {
+			const ended = snapshot.clientTotals.chunksEnded;
+			const egress = snapshot.egressFrames;
+			let deliveredAdvanced = false;
+			if (recoveryEgressBaseline !== null && recoveryEgressBaseline.epoch === snapshot.epoch) {
+				deliveredAdvanced = snapshot.lastHeartbeat !== null
+					? ended > recoveryEgressBaseline.chunksEnded
+					: egress > recoveryEgressBaseline.egressFrames;
+			}
+			recoveryEgressBaseline = { epoch: snapshot.epoch, chunksEnded: ended, egressFrames: egress };
+			voiceRecoveryCoordinator.observeTick({
+				at: Date.now(),
+				sessionState: state,
+				facts: matrix.facts,
+				lastAboveFloorAt: snapshot.speech.lastAboveFloorAt,
+				pendingToolCount: 0,
+				deliveredAdvanced,
+			});
+		}
 	}, 30_000);
 
 	// P7 D7.1: periodic ledger persistence — a try-enqueue into the worker's
