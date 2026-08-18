@@ -51,7 +51,10 @@ and loads whichever repo it reviews.
    Sutando's users from this PR, and how do we mitigate it?"** (Chi 2026-07-25.) Concretely
    check: opt-in vs always-on; on-disk state-format/migration compatibility across the
    rolling-upgrade window; new hard-required config that breaks current installs;
-   process-global patches with wide blast radius; and — per #1898 — for any auto-action,
+   removal or rename of a path, command or flag that something outside the repo invokes —
+   a registered cron, plist or saved prompt holds its own copy, so an in-repo grep answers
+   about the wrong population (#3005); process-global patches with wide blast radius;
+   and — per #1898 — for any auto-action,
    *what code or state does it act on* (does it verify the target is canonical, or run
    whatever's there?). A PR is not merge-ready until that worst case is named and mitigated.
    *Grounded by:* #1898 itself — the live test verified the claimed behavior, but the
@@ -162,6 +165,20 @@ and loads whichever repo it reviews.
     PR's own new test asserted the removed strings appear *nowhere* in `startup.sh`, which
     made the previous default unrestorable without deleting the guard. Pin behaviour under
     the flag, never the absence of a string.
+
+12. **Cut the diff against the merge-base, not against `main`.** `git diff origin/main <pr>`
+    on a branch that is behind renders `main`'s own newer commits as *removals* by the PR,
+    so a reviewer reads deletions the author never wrote. Use
+    `git diff $(git merge-base origin/main <pr>) <pr>`, and for a stacked PR review the
+    child-only commit as well as the cumulative result — the child layer is what this PR
+    is being asked to add.
+    *Grounded by:* #3020 (2026-08-17). Diffing it against `main` showed ~20 removed lines
+    in `check_cron_runner`, a function the PR does not touch; the topic diff against its
+    merge-base is 2 files, +105/-4. Verify a stated stack rather than trusting the body:
+    `git merge-base --is-ancestor <parent-head> <child>` confirmed #2995's head really is
+    an ancestor, which is what makes "merge the parent first" load-bearing rather than
+    a courtesy — and what makes `--delete-branch` on the parent dangerous while the child
+    is open.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
