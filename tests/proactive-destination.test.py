@@ -187,6 +187,39 @@ def main() -> int:
         check("test-harness report is telegram-destined",
               proactive_destination(out.name) == "telegram" and out.exists())
 
+    # Strand visibility is a MECHANISM: the health probe names aged
+    # destined files no bridge claimed, per strand class.
+    import importlib.util as _hilu
+    import os as _hos
+    import time as _htime
+    _hspec = _hilu.spec_from_file_location("hc_dest_test", REPO / "src" / "health-check.py")
+    _hc = _hilu.module_from_spec(_hspec)
+    try:
+        _hspec.loader.exec_module(_hc)
+    except SystemExit:
+        pass
+    with tempfile.TemporaryDirectory() as td:
+        _hc.WORKSPACE_DIR = Path(td)
+        res = (Path(td) / "results"); res.mkdir()
+        old_ts = _htime.time() - _hc._STRAND_MIN_AGE_S - 60
+        # a: unrecognized tag; b: known tag, no claimant; c: undestined.
+        for nm in ("proactive-a.to-futurechan.txt",
+                   "proactive-b.to-telegram.txt", "proactive-c.txt"):
+            (res / nm).write_text("x")
+            _hos.utime(res / nm, (old_ts, old_ts))
+        (res / "proactive-d.to-discord.txt").write_text("x")  # fresh: within grace
+        out = _hc.check_stranded_destined_proactive()
+        check("strand probe warns on aged destined files",
+              out["status"] == "warn" and "2 destined" in out["detail"], out["detail"])
+        check("strand probe names the unrecognized tag as the cause",
+              "unrecognized destination" in out["detail"]
+              or "futurechan" in out["detail"], out["detail"])
+        for nm in ("proactive-a.to-futurechan.txt", "proactive-b.to-telegram.txt"):
+            (res / nm).unlink()
+        out2 = _hc.check_stranded_destined_proactive()
+        check("strand probe is quiet for fresh/undestined files only",
+              out2["status"] == "ok", out2["detail"])
+
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)
         return 1
