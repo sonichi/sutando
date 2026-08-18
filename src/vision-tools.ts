@@ -290,10 +290,8 @@ function resolveSource(name?: string): VisionSource {
 interface MinimalSession {
 	transport?: {
 		sendFile?: (base64: string, mimeType: string) => void;
-		// Inject a hidden conversation turn (no generation trigger when
-		// turnComplete=false) so the model sees a context update without
-		// the user hearing audio. Used to evict stale push frames from
-		// Gemini Live's context when screen sharing ends.
+		// turnComplete is IGNORED by the transport — it always sends realtime
+		// input, so the model may answer this injection aloud.
 		sendContent?: (turns: Array<{ role: 'user' | 'assistant'; text: string }>, turnComplete?: boolean) => void;
 		isConnected?: boolean;
 	};
@@ -804,9 +802,8 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 	// Without this hint, "what do you see?" after the user stops sharing
 	// gets answered from the last frame still in context (model recalls
 	// from memory instead of calling send_vision_frame to grab a fresh
-	// view). Inject a silent user-role turn (turnComplete=false → no
-	// generation triggered) so the next user turn carries the context
-	// shift: visual frames are stale.
+	// view). This hint does NOT evict the frames and is not silent: the
+	// transport ignores turnComplete, so the model may answer it aloud.
 	if (wasPush) {
 		const transport = sessionRef?.transport;
 		// Call as a method (not via an extracted reference) so `this` binds
