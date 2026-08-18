@@ -43,6 +43,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from util_paths import claude_home_path  # canonical ~/.claude/ resolver (no hand-rolled paths)
 from discord_http import request_json  # 429 Retry-After + 5xx backoff wrapper
+from chat_secret_filter import filter_chat_secrets  # same filters the bridge applies
+from vault_intercept import redact_vault_commands  # (order matters — see _redact)
 
 ACCESS_FILE = claude_home_path("channels", "discord", "access.json")
 ENV_FILE = claude_home_path("channels", "discord", ".env")
@@ -64,18 +66,9 @@ def load_channel_context_blacklist(serving_channel_id):
 
 
 def _bot_token():
-    """Read DISCORD_BOT_TOKEN from the channel .env (never printed)."""
-    tok = os.environ.get("DISCORD_BOT_TOKEN")
-    if tok:
-        return tok
-    try:
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("DISCORD_BOT_TOKEN="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return None
+    """Resolve DISCORD_BOT_TOKEN via the shared policy (never printed). None = absent."""
+    from channel_token import resolve_channel_token
+    return resolve_channel_token("DISCORD_BOT_TOKEN", env_file=ENV_FILE) or None
 
 
 def _api_get(path, token):
@@ -101,6 +94,19 @@ def resolve_guild(target_channel_id, token):
         return None
 
 
+def _redact(text):
+    """The bridge's two filters, in the bridge's order.
+
+    The contextNotFrom gate above decides WHICH channel may be read; it says
+    nothing about what is in the text. A permitted channel can still carry a
+    credential, and this is the reader CLAUDE.md tells the agent to prefer — so
+    it needs the same redaction as `discord-read.py`, not just the same gate.
+    """
+    if not text:
+        return text
+    return redact_vault_commands(filter_chat_secrets(text).text)
+
+
 def fetch_messages(target_channel_id, n, token):
     """Return a printable string of the N most recent messages. Isolated so the
     test can stub it."""
@@ -108,7 +114,7 @@ def fetch_messages(target_channel_id, n, token):
     out = []
     for m in reversed(msgs):  # oldest-first reads naturally
         author = (m.get("author") or {}).get("username", "?")
-        content = m.get("content", "")
+        content = _redact(m.get("content", ""))
         out.append(f"[{author}] {content}")
     return "\n".join(out) if out else "(no messages)"
 
