@@ -18,8 +18,8 @@ def _load():
 
 
 def _tmpdir():
-    # Teardown is not under test: rmtree of a git worktree can lose a race and
-    # raise ENOTEMPTY on '.git', reddening a suite whose assertions all passed.
+    # Teardown is not under test: rmtree of a git worktree can race to ENOTEMPTY on
+    # '.git'. Suppression is deliberate and UNBOUNDED — a later fd leak goes quiet too.
     return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
 
