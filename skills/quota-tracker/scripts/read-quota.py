@@ -297,14 +297,16 @@ def main():
 
     # Stated once: a second copy of this predicate drifts the moment either is
     # extended, and the two fields then contradict each other in one payload.
-    # Composition of two policies: trust the proxy's flag over the status string,
-    # AND fail closed when this session is not routed through the proxy.
-    available = resolve_available(status, data.get("available")) and routed
+    # Composition of three policies: trust the proxy's flag over the status string,
+    # AND fail closed when this session is not routed through the proxy or when the
+    # file is too old to describe now — a routed proxy that stopped writing leaves
+    # `routed` true while every number is a fossil.
+    available = resolve_available(status, data.get("available")) and routed and not stale
 
     result = {
         "status": status,
-        # Fails closed when unrouted: --gate exits on this field, and a machine
-        # consumer is the one that never sees the human NOT ROUTED banner.
+        # Fails closed when unrouted OR stale: --gate exits on this field, and a
+        # machine consumer never sees the human NOT ROUTED / STALE banner.
         "available": available,
         "utilization_5h": util_5h,
         "utilization_7d": util_7d,
@@ -313,10 +315,12 @@ def main():
         "state_age_seconds": int(age_s),
         "stale": stale,
         "routed": routed,
-        # Distinguishes "not this session's data" from "quota exhausted"; both
-        # are unavailable, and a caller retries only one of them.
+        # Distinguishes "not this session's data" from "too old to describe now"
+        # from "quota exhausted"; all three are unavailable and a caller's remedy
+        # differs. not-routed outranks stale: a foreign file's age says nothing.
         "unavailable_reason": None if available
-                              else ("not-routed" if not routed else "exhausted"),
+                              else ("not-routed" if not routed
+                                    else "stale" if stale else "exhausted"),
     }
 
     if reset_5h:
