@@ -125,6 +125,20 @@ def main() -> int:
     except Exception as e:  # pragma: no cover — loader env drift, not the predicate
         check("slack bridge loadable for predicate checks", False, str(e))
 
+    # Third recovery grammar: the private .recover-<pid>-<seq> claim must
+    # round-trip the tag by contract — driven through the production sweep.
+    from proactive_recovery import recover_orphan_sending_files
+    with tempfile.TemporaryDirectory() as td:
+        orphan = Path(td) / "proactive-9.to-discord.sending"
+        orphan.write_text("orphaned destined body")
+        recover_orphan_sending_files(Path(td))
+        restored = Path(td) / "proactive-9.to-discord.txt"
+        check("private recovery grammar restores the destined name",
+              restored.exists() and restored.read_text() == "orphaned destined body",
+              str(sorted(_p.name for _p in Path(td).iterdir())))
+        check("restored name still parses its destination",
+              proactive_destination(restored.name) == "discord")
+
     # Catch-all fallback gate (discord's poll_dm_fallback wiring): undestined
     # and own-destination names are sweepable; foreign/unknown tags never are.
     check("fallback sweeps undestined cron artifacts",
