@@ -130,17 +130,23 @@ RUN_MARK_DIR = Path("state") / "task-workstream-runs"
 
 @contextmanager
 def _run_mark(workspace: Path, task_name: str):
-    """Stamp when the PROVIDER run starts, so a reader can tell it from lock wait.
+    """Stamp WHO started the provider run and when, so a reader can tell it from
+    lock wait, from a mark this process did not write, and from no mark at all.
 
-    Absent mark + live process = still waiting on the workstream lock, which is
-    progress, not a stall. Best-effort: a mark that cannot be written must never
-    stop the run it is only describing.
+    Written atomically and carrying the owning pid: a `finally` does not survive
+    SIGKILL, so a mark outliving its worker must be identifiable as another
+    run's rather than inherited by the next one.
     """
     mark = workspace / RUN_MARK_DIR / f"{task_name}.started"
+    payload = json.dumps({"pid": os.getpid(), "started": round(time.time(), 3)})
     try:
         mark.parent.mkdir(parents=True, exist_ok=True)
-        mark.write_text(f"{time.time():.3f}\n", encoding="utf-8")
+        tmp = mark.with_name(f"{mark.name}.{os.getpid()}.tmp")
+        tmp.write_text(payload + "\n", encoding="utf-8")
+        os.replace(tmp, mark)
     except OSError as exc:
+        # Not fatal here, but never silent: the health reader treats an absent
+        # mark past the deadline as unknown, so this cannot buy quiet.
         print(f"workstream session worker: could not write run mark: {exc}", file=sys.stderr)
     try:
         yield
@@ -629,8 +635,8 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
         with _locked(workspace / "state" / "task-workstream-session-locks" / f"{lock_name}.lock"):
             if _completed_result_exists(results_dir, task_file.name):
                 return 0
-            # Lock wait is not run time. Health checks compare the hard deadline
-            # to THIS mark, never to process age (sonichi/sutando#3059).
+            # Lock wait is not run time: the health deadline is compared to THIS
+            # mark, never to process age.
             with _run_mark(workspace, task_file.name):
                 body = (
                     _run_claude(workspace, workstream_id, _prompt(task_file), repo)

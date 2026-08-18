@@ -5611,12 +5611,15 @@ def _worker_holdings(ps_output: "str | None" = None) -> dict:
         if "session-worker.py" not in line:
             continue
         fields = line.split()
-        # Callers may pass argv-only output; then the first field is not an etime.
-        proc_age = _parse_etime(fields[0]) if fields else None
+        # Callers may pass argv-only output; then the leading fields are argv.
+        pid = int(fields[0]) if fields and fields[0].isdigit() else None
+        proc_age = _parse_etime(fields[1]) if len(fields) > 1 else None
+        if pid is None:
+            proc_age = _parse_etime(fields[0]) if fields else None
         for tok in fields:
             if tok.endswith(".txt") and "/tasks/" in tok:
                 name = Path(tok).name
-                held[name] = _provider_runtime(name, proc_age)
+                held[name] = _provider_runtime(name, proc_age, pid)
     return held
 
 
@@ -5626,23 +5629,35 @@ WORKER_RUN_MARK_DIR = Path("state") / "task-workstream-runs"
 WAITING_FOR_LOCK = "waiting"
 
 
-def _provider_runtime(task_name: str, proc_age: "float | None"):
+def _provider_runtime(task_name: str, proc_age: "float | None",
+                      pid: "int | None" = None):
     """Seconds the PROVIDER has run, `WAITING_FOR_LOCK`, or None if unreadable.
 
-    Process age is the wrong quantity: the dispatcher starts handlers
-    concurrently and same-workstream tasks serialize on a lock taken AFTER the
-    process starts, so a fresh run can inherit a long-lived pid.
+    Process age is the wrong quantity — same-workstream tasks serialize on a lock
+    taken AFTER the process starts — but it still BOUNDS how long an absent mark
+    can innocently mean "waiting".
     """
     mark = WORKSPACE_DIR / WORKER_RUN_MARK_DIR / f"{task_name}.started"
     try:
-        started = float(mark.read_text().strip())
+        rec = json.loads(mark.read_text())
+        started = float(rec["started"])
+        owner = int(rec["pid"])
     except FileNotFoundError:
-        # No mark and a live process: the provider has not started yet.
-        return WAITING_FOR_LOCK if proc_age is not None else None
-    except (OSError, ValueError):
+        rec = None
+    except (OSError, ValueError, TypeError, KeyError):
         return None
-    age = time.time() - started
-    return age if age >= 0 else 0.0
+    else:
+        # A mark from a different process is a corpse a SIGKILLed worker left;
+        # inheriting its clock would age a run that has not started.
+        if pid is None or owner == pid:
+            age = time.time() - started
+            return age if age >= 0 else 0.0
+        rec = None
+    if proc_age is None:
+        return None
+    # No usable mark is innocent only while the process is younger than the
+    # deadline; past that, a failed write and a wedged provider look identical.
+    return WAITING_FOR_LOCK if proc_age <= _worker_hard_timeout_s() else None
 
 
 def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:

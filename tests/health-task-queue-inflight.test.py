@@ -14,6 +14,7 @@ of this probe would go quiet forever.
 """
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -276,15 +277,14 @@ if hasattr(hc, "_worker_holdings"):
                "session-worker.py --task-file /w/tasks/task-old.txt\n")
     PS_FRESH = ("    00:03 /usr/bin/python3 /r/skills/task-workstream-sessions/scripts/"
                 "session-worker.py --task-file /w/tasks/task-new.txt\n")
-    # SUPERSEDED semantics, kept as an assertion rather than deleted: the value
-    # is the PROVIDER runtime, so a live process with no run mark reads WAITING.
-    check(hasattr(hc, "WAITING_FOR_LOCK") and
-          hc._worker_holdings(PS_AGED) == {"task-old.txt": hc.WAITING_FOR_LOCK},
-          f"a 900:01 pid with no run mark is WAITING, not 54001s "
+    # SUPERSEDED semantics, asserted rather than deleted: past the deadline,
+    # "waiting" can no longer explain an absent mark.
+    check(hc._worker_holdings(PS_AGED) == {"task-old.txt": None},
+          f"an over-deadline pid with no mark is UNKNOWN, not 54001s and not waiting "
           f"(got {hc._worker_holdings(PS_AGED)})")
     check(hasattr(hc, "WAITING_FOR_LOCK") and
           hc._worker_holdings(PS_FRESH) == {"task-new.txt": hc.WAITING_FOR_LOCK},
-          "same for a fresh pid — process age is no longer the runtime")
+          "a 3s pid with no mark is still innocently WAITING — process age is not the runtime")
     check(hc._parse_etime("900:01") == 54001.0,
           "the ps ELAPSED parser itself is unchanged and still tested")
     # argv-only output (no ELAPSED column) must still yield the filename, age unknown.
@@ -314,37 +314,46 @@ if hasattr(hc, "_worker_holdings"):
 
 # ---- lock WAIT is not run time ------------------------------------------------
 # Same-workstream tasks serialize on a lock taken AFTER the process starts.
-def _runtime_for(name, proc_age):
+MARK_PID = 4242
+
+
+def _runtime_for(name, proc_age, pid=MARK_PID):
     """The module's own notion of runtime, or process age on a build that has
     none — so these cases FAIL at the merge-base instead of raising there."""
-    return hc._provider_runtime(name, proc_age) if hasattr(hc, "_provider_runtime") else proc_age
+    if not hasattr(hc, "_provider_runtime"):
+        return proc_age
+    try:
+        return hc._provider_runtime(name, proc_age, pid)
+    except TypeError:      # a build whose reader has no pid parameter
+        return hc._provider_runtime(name, proc_age)
 
 
-def mark_probe(file_age, mark_age, deadline="900"):
+def mark_probe(file_age, mark_age, deadline="900", proc_age=9999):
     """mark_age None = no run mark on disk, i.e. still waiting for the lock."""
     tmp = Path(tempfile.mkdtemp()); (tmp / "tasks").mkdir()
     f = tmp / "tasks" / "task-000.txt"; f.write_text("x")
     t0 = _time.time() - file_age; os.utime(f, (t0, t0))
     if mark_age is not None:
         md = tmp / "state" / "task-workstream-runs"; md.mkdir(parents=True)
-        (md / "task-000.txt.started").write_text(f"{_time.time() - mark_age:.3f}\n")
+        (md / "task-000.txt.started").write_text(json.dumps(
+            {"pid": MARK_PID, "started": round(_time.time() - mark_age, 3)}) + "\n")
     ows, oh = hc.WORKSPACE_DIR, hc._worker_holdings
     hc.WORKSPACE_DIR = tmp
     # Only `ps` is stubbed; the REAL mark reader decides the runtime, with a
     # deliberately huge process age so a regression to pid-age cannot pass.
     hc._worker_holdings = lambda ps_output=None: {
-        "task-000.txt": _runtime_for("task-000.txt", 9999)}
+        "task-000.txt": _runtime_for("task-000.txt", proc_age, MARK_PID)}
     try:
         with hard_timeout(deadline):
             return hc.check_task_queue()
     finally:
         hc.WORKSPACE_DIR, hc._worker_holdings = ows, oh
 
-# THE PAIR the reviewer asked for, BEHAVIOURAL and unguarded. Both carry a
-# 9999s process age, so a build that uses pid age fails both.
-r = mark_probe(5000, None)
+# THE PAIR, behavioural and unguarded. Innocent only INSIDE the deadline: past
+# it, absent-mark and failed-write are indistinguishable.
+r = mark_probe(5000, None, proc_age=300)
 check(r["status"] == "ok",
-      f"waiting for the lock (no run mark) -> ok (got {r['status']!r})")
+      f"waiting for the lock, process under the deadline -> ok (got {r['status']!r})")
 check("wedged" not in r["detail"], "and a waiter is never called wedged")
 
 r = mark_probe(5000, 1200)
@@ -393,6 +402,70 @@ if hasattr(hc, "_provider_runtime"):
         hc.WORKSPACE_DIR, hc._worker_holdings = ows, oh
     check(rmix["status"] == "warn",
           f"one waiter + one wedged sibling -> warn (got {rmix['status']!r})")
+
+# ---- the mark identifies its OWNER, and absence must not buy silence ---------
+# A `finally` does not survive SIGKILL; a failed write leaves no mark at all.
+def owner_probe(proc_age, mark, deadline="900"):
+    """mark: None, or (owner_pid, age_seconds)."""
+    tmp = Path(tempfile.mkdtemp()); (tmp / "tasks").mkdir()
+    f = tmp / "tasks" / "task-000.txt"; f.write_text("x")
+    t0 = _time.time() - 5000; os.utime(f, (t0, t0))
+    if mark is not None:
+        owner, age = mark
+        md = tmp / "state" / "task-workstream-runs"; md.mkdir(parents=True)
+        (md / "task-000.txt.started").write_text(json.dumps(
+            {"pid": owner, "started": round(_time.time() - age, 3)}) + "\n")
+    ows, oh = hc.WORKSPACE_DIR, hc._worker_holdings
+    hc.WORKSPACE_DIR = tmp
+    hc._worker_holdings = lambda ps_output=None: {
+        "task-000.txt": _runtime_for("task-000.txt", proc_age, MARK_PID)}
+    try:
+        with hard_timeout(deadline):
+            return hc.check_task_queue()
+    finally:
+        hc.WORKSPACE_DIR, hc._worker_holdings = ows, oh
+
+# THE PAIR: a failed write must never read as healthy...
+r = owner_probe(1200, None)
+check(r["status"] == "warn",
+      f"no mark + a 1200s process past a 900s deadline -> warn (got {r['status']!r})")
+# ...while a genuinely waiting worker inside the deadline still does.
+r = owner_probe(300, None)
+check(r["status"] == "ok",
+      f"no mark + a 300s process under the deadline -> ok (got {r['status']!r})")
+
+# A mark another pid left behind must not age a fresh run.
+r = owner_probe(5, (9999, 1200))
+check(r["status"] == "ok",
+      f"stale mark from pid 9999 + a 5s worker -> ok (got {r['status']!r})")
+r = owner_probe(1300, (MARK_PID, 1200))
+check(r["status"] == "warn",
+      f"own mark, provider 1200s -> warn (got {r['status']!r})")
+
+_PID_AWARE = False
+if hasattr(hc, "_provider_runtime"):
+    import inspect as _inspect
+    _PID_AWARE = len(_inspect.signature(hc._provider_runtime).parameters) >= 3
+check(_PID_AWARE, "the runtime reader takes the OWNING pid, so a stale mark cannot be inherited")
+
+if _PID_AWARE:
+    d = Path(tempfile.mkdtemp()); md = d / "state" / "task-workstream-runs"
+    md.mkdir(parents=True)
+    ows = hc.WORKSPACE_DIR; hc.WORKSPACE_DIR = d
+    try:
+        (md / "own.txt.started").write_text(json.dumps({"pid": 7, "started": _time.time() - 30}))
+        check(abs(hc._provider_runtime("own.txt", 100, 7) - 30) < 5,
+              "a mark owned by the asking pid yields its runtime")
+        check(hc._provider_runtime("own.txt", 100, 8) == hc.WAITING_FOR_LOCK,
+              "the same mark asked by ANOTHER pid is not inherited")
+        (md / "junk.txt.started").write_text("not json")
+        check(hc._provider_runtime("junk.txt", 100, 7) is None,
+              "an unparseable mark is unknown, never zero and never waiting")
+        (md / "nopid.txt.started").write_text(json.dumps({"started": _time.time()}))
+        check(hc._provider_runtime("nopid.txt", 100, 7) is None,
+              "a mark without an owner is unusable, not trusted")
+    finally:
+        hc.WORKSPACE_DIR = ows
 
 print()
 if failures:
