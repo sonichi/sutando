@@ -181,9 +181,8 @@ def main() -> int:
         assert v.kind == kind, (body, tier, v)
         wrapped = guard.guard_result_for_tier(body, tier, REPO, secret_filter=filt)
         assert wrapped == (v.body, v.reason), (body, tier, "wrapper diverged from verdict")
-    # Cross-verdict consistency: a stub verdict NEVER contradicts classify --
-    # every body the journaled path may close silently is one classify calls
-    # suppress, and no influenced bytes ride in the stub (literals + id only).
+    # Every stub verdict must also be a suppress verdict, and no influenced
+    # bytes may ride in the stub (fixed literals + grammar-checked id only).
     for body, tier, stub in (
         ("[no-send]", "team", "[no-send]"),
         ("[no-send]\nhidden content", "team", "[no-send]"),
