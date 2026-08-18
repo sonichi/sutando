@@ -120,7 +120,12 @@ def _control_marker_families(body: str) -> "list[str]":
     attach unanchored, dm-only anywhere). Deriving detection from the same
     parser keeps the guard exactly as wide as every consumer, per family —
     a mid-prose MENTION of an anchored marker is prose, not an action."""
-    from result_markers import parse_markers
+    # Dual-form: this file ships byte-identical in src/ (flat) and in
+    # packages/ag2-sparrow (package), so no single import form works in both.
+    try:
+        from .result_markers import parse_markers
+    except ImportError:
+        from result_markers import parse_markers
     seen: list[str] = []
     for action in parse_markers(body).actions:
         if action.kind not in seen:

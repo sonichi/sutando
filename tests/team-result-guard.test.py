@@ -228,12 +228,60 @@ def structural() -> list:
     return fails
 
 
+def packaged() -> list:
+    """The bundled copy must work with ONLY packages/ag2-sparrow on sys.path.
+
+    The suite's own `sys.path.insert(src)` is what masked the bare-import
+    failure: every in-process call runs in a context a packaged deployment
+    never has. So this check runs in a subprocess whose path has no src/."""
+    import subprocess
+    fails = []
+    pkg = REPO / "packages" / "ag2-sparrow"
+    code = (
+        "import sys, types\n"
+        f"sys.path.insert(0, {str(pkg)!r})\n"
+        "assert not any(p.endswith('/src') for p in sys.path), 'src leaked onto path'\n"
+        "from ag2_sparrow.team_result_guard import scan_team_result\n"
+        "scan = lambda b: types.SimpleNamespace(detected=False, secret_types=[])\n"
+        "body = 'a clean team answer with no markers'\n"
+        "out = scan_team_result(body, None, secret_filter=scan)\n"
+        "assert out == body, f'clean body was altered or withheld: {out!r}'\n"
+        "print('OK')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd="/")
+    if proc.returncode != 0 or "OK" not in proc.stdout:
+        fails.append(
+            "package-only import path must deliver a clean body untouched: "
+            + (proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else proc.stdout))
+
+    # Fail-closed when the grammar truly cannot be imported: poisoning the
+    # module entry makes both import forms raise, and the guard must withhold.
+    poisoned = sys.modules.pop("result_markers", None)
+    sys.modules["result_markers"] = None
+    try:
+        try:
+            guard.scan_team_result("clean body", REPO, secret_filter=lambda b: _Scan(False))
+            fails.append("grammar-unavailable must raise TeamResultLeakError, not deliver")
+        except guard.TeamResultLeakError as exc:
+            if "marker grammar unavailable" not in str(exc):
+                fails.append(f"grammar-unavailable raised the wrong reason: {exc}")
+        except Exception as exc:
+            fails.append(f"grammar-unavailable must fail CLOSED via TeamResultLeakError, got {type(exc).__name__}")
+    finally:
+        if poisoned is not None:
+            sys.modules["result_markers"] = poisoned
+        else:
+            sys.modules.pop("result_markers", None)
+    return fails
+
+
 def main() -> int:
     for path in (BRIDGE, WORKER):
         if not path.exists():
             print(f"FAIL: missing {path}")
             return 1
-    fails = behavioral() + structural()
+    fails = behavioral() + structural() + packaged()
     if fails:
         print("FAIL: team result guard has issues:")
         for f in fails:
