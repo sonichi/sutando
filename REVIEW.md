@@ -212,8 +212,9 @@ and loads whichever repo it reviews.
     outright (guard the call with `if (false && …)` and every token the regex matches is
     still present), and it goes red on a rename that changes nothing. Worked examples of
     the extraction convention already in-tree: `src/channel_token.py` (token-resolution
-    policy extracted from four script consumers, tested behaviorally) and the `setupHint`
-    split in browser-tools. When only content emitted verbatim is being pinned (an
+    policy extracted from four script consumers, tested behaviorally) and
+    `src/result_markers.py` (marker grammar extracted from per-bridge private parsers,
+    driven behaviorally by the bridge-marker-no-leak and dedup suites). When only content emitted verbatim is being pinned (an
     instruction template, a doc line), say so explicitly — that is a data pin, and it
     must be labeled as one, not passed off as a behavior test.
     *Grounded by:* three independent instances across unrelated subsystems in one evening
