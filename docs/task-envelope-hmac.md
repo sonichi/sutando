@@ -22,6 +22,24 @@ it. The invariant it builds toward:
 > Filesystem presence is not authority. Only authenticated promotion into the
 > trusted mailbox grants a task eligibility for privileged execution.
 
+Two companion invariants, permanent across all phases:
+
+> **Verify-use identity.** The bytes interpreted for privileged execution
+> MUST be the exact bytes whose HMAC was verified. A consumer MUST NOT
+> verify by path and subsequently re-read that path for execution — the
+> file can be replaced between the two reads, and the HMAC never fails
+> because it was never re-checked. Read once → immutable in-memory bytes →
+> verify AND parse/execute from those same bytes.
+
+> **The seal authenticates a trusted writer's decision; it does not make
+> producer-supplied claims authoritative.** HMAC proves a trusted writer
+> sealed these bytes. It does not prove `access_tier` was correctly
+> derived, the sender was correctly authenticated, or the policy decision
+> was right — a buggy gateway seals its bug perfectly. Authoritative
+> metadata must be DERIVED (transport-authenticated identity → authority
+> derivation → policy → serialize → seal), never accepted from the
+> producer and then sealed into authority.
+
 **The precise security claim (current state):** only processes in the host
 trusted-writer domain — those able to read the signing key — can generate a
 task that verifies. A producer with *write access to `tasks/` but no key
@@ -89,6 +107,18 @@ property. Execution uniqueness is Phase 3.
   parity is pinned by a cross-language test that stamps in TS and verifies
   through the real Python verifier.
 
+## Key lifecycle (v1 contract)
+
+**v1 = one active host key, no rotation protocol.** The stamp format
+`v1:<mac>` carries no key id, so after a key replacement, previously sealed
+files verify against the new key as `invalid` — indistinguishable from
+tamper. Stated non-goals for v1, so the behavior is defined rather than
+discovered: v1 does not provide historical verification across key
+replacement, and does not provide compromise recovery. The compatible
+upgrade path is a versioned stamp with a key id
+(`envelope_hmac: v2:<key_id>:<mac>`, `key_id` → verification key), which can
+coexist with v1 during a migration window.
+
 ## Current status — Phase 1 live
 
 Every known writer on both lineages stamps: the remote gateway bridge,
@@ -115,9 +145,9 @@ non-bypassable by the processes it constrains.**
 | Phase | What ships | Status |
 |---|---|---|
 | 1 | HMAC telemetry: all writers stamp; census counts verdicts | **Live, soaking** |
-| 2 | Privileged fail-closed on **authenticity only**: `verified` → eligible; `unsigned`/`invalid`/`unverifiable` → the fail-closed arms (no privileged processing / quarantine / fail closed) | After soak window, owner sign-off |
-| 3 | Explicit replay ledger: `task_id` → terminal disposition (completed / rejected / expired / cancelled); a re-appearing terminal id gets a first-class `REPLAYED`/`ALREADY_TERMINAL` verdict. The id names an **execution identity**, not a filename — rename, move, or re-serialization never resets uniqueness | Planned (order with 4 swappable) |
-| 4 | `drop/` → trusted sealer → `ready/`: untrusted producers write `drop/` only; one sealer validates, binds identity, seals, and atomically promotes. Directories encode lifecycle (`drop/` untrusted input, `ready/` authenticated, `archive/` completed history), inspectable with `ls` | Planned |
+| 2 | Privileged fail-closed on **authenticity only**: `verified` → eligible; `unsigned`/`invalid`/`unverifiable` → the fail-closed arms (no privileged processing / quarantine / fail closed). Enforces authenticity **relative to the current trusted-writer domain — it does not narrow that domain**: same-UID key readers can still mint `verified` until Phase 5 | After soak window, owner sign-off |
+| 3 | Explicit replay ledger: `task_id` → terminal disposition (completed / rejected / expired / cancelled); a re-appearing terminal id gets a first-class `REPLAYED`/`ALREADY_TERMINAL` verdict. The id names an **execution identity**, not a filename — rename, move, or re-serialization never resets uniqueness. The ledger guarantees **execution-admission uniqueness, not exactly-once external effects** — a crash between side effect and ledger write still needs idempotency keys / outcome observation / OUTCOME_UNKNOWN reconciliation, the delivery runtime's existing problem class | Planned (order with 4 swappable) |
+| 4 | `drop/` → trusted sealer → `ready/`: untrusted producers write `drop/` only; one sealer validates, binds identity, and constructs a **new sealed object** (never editing the drop file in place — untrusted inode ≠ trusted inode, so the producer can't mutate the object mid-seal), fsyncs if durability requires, then atomically renames into `ready/`. Directories encode lifecycle (`drop/` untrusted input, `ready/` authenticated, `archive/` completed history), inspectable with `ls` | Planned |
 | 5 | Remove same-UID key exposure: the sealer alone reads the key; delegated subprocesses run without key or `ready/` access | Planned |
 
 Phase 4/5 acceptance is mechanical — the capability matrix below is the
@@ -145,7 +175,10 @@ The boundary is real only when three conditions hold simultaneously for an
 untrusted process: cannot read the key, cannot write `ready/`, can only
 write `drop/` — and their three complements hold for the sealer. Protecting
 the key alone is insufficient: the authenticated namespace itself must be
-protected, or sealed files can simply be replaced or deleted in place.
+protected against **create / replace / rename / mutate / delete**. The first
+four are integrity/authority attacks (forge or alter what runs privileged);
+delete is an availability attack (cannot forge privilege, can deny it) —
+Phase 5 protects both, with different security consequences.
 
 Four-layer threat model the phases build toward:
 
@@ -158,6 +191,27 @@ L3  privileged core execution
 
 Authority rises only along: remote → `drop/` → validation + policy → HMAC
 seal → `ready/` → privileged processing → replay ledger → side effects.
+
+## Security properties and non-goals
+
+Properties (phase in which each becomes true):
+
+- **P1** Mutation of sealed bytes is detectable. *(Phase 1 — live)*
+- **P2** Privileged execution requires `verified`. *(Phase 2)*
+- **P3** A terminal execution identity cannot be admitted again. *(Phase 3)*
+- **P4** Only the sealer can promote untrusted input. *(Phase 4)*
+- **P5** Untrusted local processes cannot mint or modify authenticated
+  input. *(Phase 5)*
+
+Non-goals:
+
+- **N1** HMAC does not encrypt task contents.
+- **N2** HMAC does not establish freshness or prevent replay by itself.
+- **N3** HMAC does not prove producer claims are truthful.
+- **N4** v1 does not identify which trusted writer signed a task.
+- **N5** Before Phase 5, HMAC does not defend against arbitrary same-UID code.
+- **N6** Replay admission control does not imply exactly-once external
+  effects.
 
 ## PR trail
 
