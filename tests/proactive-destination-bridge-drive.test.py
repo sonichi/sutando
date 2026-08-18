@@ -131,9 +131,11 @@ def drive_slack_watcher():
     sb.STATE_DIR = Path(tempfile.mkdtemp(prefix="dest-drive-slack-state-"))
     sb.presenter_mode_active = lambda *_a, **_k: False
 
+    # Spy on the SHARED owner symbol, not the adapter wrapper: this pins that
+    # the watcher's decision actually delegates to proactive_routing.
     seen = {}
-    real = sb._slack_claims_name
-    sb._slack_claims_name = lambda n: seen.setdefault(n, real(n))
+    real = sb.fallback_claims_name
+    sb.fallback_claims_name = lambda n, ch: seen.setdefault((n, ch), real(n, ch))
 
     def _sleep(_secs):
         raise _Sentinel()
@@ -147,10 +149,10 @@ def drive_slack_watcher():
         check("slack watcher: loop pass completed", True)
     finally:
         sb.time.sleep = orig_sleep
-        sb._slack_claims_name = real
+        sb.fallback_claims_name = real
 
-    check("slack watcher: claim predicate consulted in-flow",
-          seen.get("proactive-9.to-discord.txt") is False, str(seen))
+    check("slack watcher: shared routing owner consulted in-flow",
+          seen.get(("proactive-9.to-discord.txt", "slack")) is False, str(seen))
     check("slack watcher: foreign-destined file left unclaimed",
           (td / "proactive-9.to-discord.txt").exists())
 

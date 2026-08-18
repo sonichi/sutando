@@ -64,13 +64,13 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import proactive_destination  # noqa: E402
+from proactive_routing import fallback_claims_name  # noqa: E402
 
 
 def _slack_claims_name(name: str) -> bool:
-    """Filename-level claim decision: an explicit destination for another
-    bridge is skipped; undestined and slack-destined names stay claimable."""
-    return proactive_destination(name) in (None, "slack")
+    """Filename-level claim decision — the policy lives in proactive_routing;
+    this adapter only binds its channel."""
+    return fallback_claims_name(name, "slack")
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine

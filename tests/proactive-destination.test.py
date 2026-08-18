@@ -76,8 +76,8 @@ def main() -> int:
     claimed = Path(n).with_suffix(".sending.4242")
     check("claim rename keeps the destination tag",
           ".to-discord." in claimed.name)
-    # Model the PRODUCTION recovery expression (both recovery sites use
-    # name.split(".sending")[0] + ".txt"), not with_suffix.
+    # Model the GATEWAY's production recovery expression
+    # (name.split(".sending")[0] + ".txt"), not with_suffix.
     recovered = claimed.name.split(".sending")[0] + ".txt"
     check("recovery rename restores a claimable destined name",
           recovered == n and proactive_destination(recovered) == "discord")
@@ -131,13 +131,23 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         orphan = Path(td) / "proactive-9.to-discord.sending"
         orphan.write_text("orphaned destined body")
+        # The actual third grammar: a crashed recoverer's private claim,
+        # dead pid (4194303 > default pid_max), matched by _PRIVATE_CLAIM_RE.
+        private = Path(td) / "proactive-y.to-discord.sending.recover-4194303-1"
+        private.write_text("crashed private claim body")
         recover_orphan_sending_files(Path(td))
         restored = Path(td) / "proactive-9.to-discord.txt"
-        check("private recovery grammar restores the destined name",
+        check("bare .sending grammar restores the destined name",
               restored.exists() and restored.read_text() == "orphaned destined body",
               str(sorted(_p.name for _p in Path(td).iterdir())))
-        check("restored name still parses its destination",
-              proactive_destination(restored.name) == "discord")
+        restored_priv = Path(td) / "proactive-y.to-discord.txt"
+        check("private .recover-<pid>-<seq> grammar restores the destined name",
+              restored_priv.exists()
+              and restored_priv.read_text() == "crashed private claim body",
+              str(sorted(_p.name for _p in Path(td).iterdir())))
+        check("both restored names still parse their destination",
+              proactive_destination(restored.name) == "discord"
+              and proactive_destination(restored_priv.name) == "discord")
 
     # Catch-all fallback gate (discord's poll_dm_fallback wiring): undestined
     # and own-destination names are sweepable; foreign/unknown tags never are.
