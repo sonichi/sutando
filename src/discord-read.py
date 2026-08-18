@@ -115,9 +115,8 @@ def _render(msg, clip=CLIP):
     from the 200-char clip — the clip exists to keep ordinary chatter scannable,
     and a forward is usually carrying the substance someone moved deliberately.
     """
-    # Redact BEFORE clipping, never after: the 200-char clip can land in the
-    # middle of a token, and half a secret still printed is still a leak — the
-    # pattern would no longer match to catch it.
+    # Redact BEFORE clipping: the clip can land mid-token, and half a secret is
+    # still a leak that the pattern would no longer match.
     body = _redact((msg.get("content") or "").strip())
     snaps = msg.get("message_snapshots") or []
     if not snaps:

@@ -132,9 +132,8 @@ class ReaderRedaction(unittest.TestCase):
         never appeared in the clipped window and the case passed on the parent
         commit AND against a clip-then-redact implementation. It asserted nothing.
         """
-        # The separating space is load-bearing: `redact_vault_commands` matches on
-        # a word boundary, so padding glued directly to "vault" defeats the
-        # grammar and the fixture would fail for a reason that is not the clip.
+        # The separating space is load-bearing: the matcher needs a word boundary,
+        # so padding glued to "vault" would fail the fixture for the wrong reason.
         prefix = " vault set Z "
         pad = "x" * (dr.CLIP - len(prefix) - 8)      # 8 token chars land inside
         out = dr._render(msg(pad + prefix + FAKE_TOKEN), clip=dr.CLIP)
