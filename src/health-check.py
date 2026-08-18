@@ -959,6 +959,48 @@ def _cron_can_never_fire(expr: str) -> bool:
     return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
 
 
+def _one_shot_already_spent(entry: dict, now: float) -> bool:
+    """True when a `recurring: false` one-shot's target date is in the past.
+
+    CronCreate auto-deletes a one-shot after it fires — correct behavior, not
+    a registration failure. `session-crons`' `expected` count didn't know
+    that, so a spent one-shot (e.g. a same-day deadline reminder that already
+    fired this morning) stayed counted as expected-but-missing forever,
+    observed 2026-08-18 as a false "11/12 registered" warn the same pass that
+    fixed the real gap (installing the launchd runner for the OTHER one-shots
+    that hadn't fired yet). crons.json carries no year, so the singleton
+    minute/hour/day/month is anchored to THIS YEAR; a ranged or listed field
+    is left alone (still counted as expected) rather than risk a wrong verdict
+    on an unusual entry.
+    """
+    if entry.get("recurring") is not False:
+        return False
+    cron_expr = entry.get("cron")
+    if not isinstance(cron_expr, str):
+        return False
+    parts = cron_expr.split()
+    if len(parts) != 5:
+        return False
+    minute_f, hour_f, dom_f, month_f, _dow_f = parts
+    minutes = _cron_field_values(minute_f, 0, 59)
+    hours = _cron_field_values(hour_f, 0, 23)
+    doms = _cron_field_values(dom_f, 1, 31)
+    months = _cron_field_values(month_f, 1, 12)
+    if not (minutes and hours and doms and months):
+        return False
+    if len(minutes) != 1 or len(hours) != 1 or len(doms) != 1 or len(months) != 1:
+        return False
+    minute, hour, dom, month = (
+        next(iter(minutes)), next(iter(hours)), next(iter(doms)), next(iter(months)),
+    )
+    year = time.localtime(now).tm_year
+    try:
+        target = time.mktime((year, month, dom, hour, minute, 0, 0, 0, -1))
+    except (OverflowError, ValueError):
+        return False
+    return target < now
+
+
 def _entry_marked_parked(entry: dict) -> bool:
     """True when the entry carries an explicit "deliberately disabled" signal.
 
@@ -1018,6 +1060,8 @@ def check_session_cron_registration(
     if not isinstance(crons, list):
         return {"name": name, "status": "warn", "detail": "crons.json is not a list"}
 
+    now_ts = time.time() if now is None else now
+
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
             return False
@@ -1033,6 +1077,8 @@ def check_session_cron_registration(
             # `0 0 31 2 *`): /schedule-crons cannot register it, so counting it
             # as expected warns forever. An impossible date WITHOUT a disabled
             # marker is an active typo and must still warn.
+            return False
+        if _one_shot_already_spent(entry, now_ts):
             return False
         return True
 
