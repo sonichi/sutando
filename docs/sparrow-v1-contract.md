@@ -37,10 +37,14 @@ is not in v1.
 ## Provider capability declarations
 
 ```python
-class ProviderCapabilities(NamedTuple):
-    reconcile_capable: bool   # can answer "did item X arrive?" after UNKNOWN
-    idempotent_send: bool     # provider dedupes on the idempotency key
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    reconcile_capable: bool = False  # receipt queryable after UNKNOWN
+    idempotent_send: bool = False    # key-deduped; safe-resend on UNKNOWN
 ```
+
+(Shipped shape — `delivery_core/contract.py`. Both fields default to `False`:
+a provider that declares nothing gets the conservative park-on-UNKNOWN path.)
 
 **v1 fix (from #3095 review, rui):** the Protocol must declare `capabilities`
 as an attribute/property, not a method — a literal implementer handing the
@@ -52,10 +56,16 @@ it as an attribute (`core.py`); the Protocol text follows the core.
 - **Per-part receipts**: a multi-part send (chunks, file batches) earns a
   receipt per part; the first non-CONFIRMED part stops the send and reports
   progress (`sent_chunks`) so the caller's budget sees partial delivery.
-- **ACK policy**: UNKNOWN is retried only through the policy's capped
-  transient class (`send_failure_policy.UnconfirmedDelivery`) — bounded,
-  budget-visible, then parked loudly. Unbounded retry of an UNKNOWN is the
-  duplicate-send machine (2026-08-16, one message delivered 12×).
+- **ACK policy**: in `DeliveryCore`, only a confirmed NOT_DELIVERED
+  auto-retries; UNKNOWN parks unless the provider's capabilities license
+  another step — `reconcile_capable` (resolve the receipt, act on it) or
+  `idempotent_send` (one safe re-send). Ambiguous is never auto-relabeled
+  NOT_DELIVERED. The capped transient class
+  (`send_failure_policy.UnconfirmedDelivery`) is the bridge-migration
+  adapters' bounded analog on legs not yet driven by the core (e.g. #3098's
+  proactive text leg) — budget-visible, then parked loudly. Unbounded retry
+  of an UNKNOWN is the duplicate-send machine (2026-08-16, one message
+  delivered 12×).
 - **Durability policy**: intent is durable before side effects; side-effect
   markers (`.sending` claims) are evidence, not proof — written post-call,
   crash window acknowledged.
