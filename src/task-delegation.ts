@@ -33,6 +33,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { findRepoRoot } from './sutando_config.js';
+import { tryStampText } from './task_envelope.js';
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
@@ -94,8 +95,11 @@ export class LocalTaskBackend implements TaskDelegationService {
 	) {}
 
 	submitTask(taskId: string, content: string): void {
-		writeFileSync(join(this.taskDir, `${taskId}.txt`), content);
-		emitTaskProcessed(content);
+		// HMAC envelope (#3014 writer census): stamp at this writer's edge,
+		// fail-open so a stamping error never costs the delegation.
+		const stamped = tryStampText(content, dirname(this.taskDir));
+		writeFileSync(join(this.taskDir, `${taskId}.txt`), stamped);
+		emitTaskProcessed(stamped);
 	}
 
 	listResultFiles(): string[] {
