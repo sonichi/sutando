@@ -101,6 +101,12 @@ def main() -> int:
         "allowFrom is mixed": {"allowFrom": ["U1", 7]},
     }
     cases.update(permissive)
+    # A list of STRINGS passes the type check and can still authorize nobody.
+    blanks = {
+        "allowFrom is one empty string": {"allowFrom": [""]},
+        "allowFrom is whitespace only": {"allowFrom": ["  "]},
+    }
+    cases.update(blanks)
     expected_state = {
         "absent": slack_access.UNCONFIGURED,
         "empty allowFrom": slack_access.LOCKED,
@@ -112,6 +118,7 @@ def main() -> int:
         "allowFrom holds objects": slack_access.UNKNOWN,
     }
     expected_state.update(dict.fromkeys(permissive, slack_access.UNKNOWN))
+    expected_state.update(dict.fromkeys(blanks, slack_access.LOCKED))
     for label, payload in cases.items():
         p = tmp / (label.replace(" ", "_") + ".json")
         if payload is None:
@@ -185,6 +192,22 @@ def main() -> int:
           "an empty allowFrom is a set (deliberate lockout), never None")
     check(_bridge_load_allowed(tmp / "unreadable.json") == set(),
           "an unreadable record fails CLOSED to a set, never to None")
+
+    # A blank entry must not survive beside a real one, and must not take the
+    # real one down with it.
+    q2 = tmp / "mixed_blank.json"
+    q2.write_text(json.dumps({"allowFrom": ["U0123ABCD", "", "  "]}))
+    check(slack_access.read_access(q2).allowed == {"U0123ABCD"},
+          "a blank entry is dropped and the real id keeps working")
+    check(slack_access.access_state(q2) == slack_access.ENROLLED,
+          "so the record stays ENROLLED rather than being rejected wholesale")
+    check(_bridge_load_allowed(q2) == {"U0123ABCD"},
+          "and the bridge gate agrees, because it reads through the same helper")
+    q3 = tmp / "allowFrom_is_one_empty_string.json"
+    check(slack_access.access_state(q3) == slack_access.LOCKED,
+          "a bare [\"\"] reads LOCKED — whose remedy is 'add an allowed user id'")
+    check(slack_access.access_state(q3) != slack_access.ENROLLED,
+          "and never ENROLLED, which would send the operator to Event Subscriptions")
 
     print()
     if FAILS:

@@ -59,7 +59,9 @@ def read_access(access_file) -> SlackAccess:
     if allow is None:
         allowed: Set[str] = set()   # absent key: the bridge's own `.get(..., [])`
     elif isinstance(allow, list) and all(isinstance(u, str) for u in allow):
-        allowed = set(allow)
+        # Drop blanks per ENTRY, not per record: `["U1", ""]` must keep U1 working,
+        # and a bare `[""]` then reads LOCKED, whose remedy is "add an allowed id".
+        allowed = {u.strip() for u in allow if u.strip()}
     else:
         return SlackAccess(set(), None)
     # record is not None ONLY on a genuine parse; that is what separates a real
