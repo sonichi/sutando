@@ -19,6 +19,8 @@ import urllib.parse
 import urllib.request
 
 from discord_http import request_json
+from chat_secret_filter import filter_chat_secrets
+from vault_intercept import redact_vault_commands
 
 # Runaway backstop only (not a depth target — depth is governed by --until):
 # 200 pages * 100 = 20k messages before we refuse to loop forever.
@@ -42,6 +44,19 @@ def _fetch(extra, channel_id, page, headers, rj=None):
     # request_json honors 429 Retry-After + retries transient 5xx, so a rate
     # limit mid-pagination no longer aborts the read (2026-07-24 truncation fix).
     return (rj or request_json)(req, timeout=10)
+
+
+def _redact(text):
+    """The same two filters `discord-bridge.py` applies, in the same order (#2893).
+
+    The bridge redacts what it writes into a task file, but these readers read
+    the channel raw, so a secret the bridge had just stripped came straight back
+    through the other door. One copy HERE covers both CLIs — the fix landed on
+    main as per-CLI copies; the extraction folds them to the shared renderer.
+    """
+    if not text:
+        return text
+    return redact_vault_commands(filter_chat_secrets(text).text)
 
 
 def _reply_context(msg, clip=REPLY_CLIP):
@@ -90,7 +105,9 @@ def _render(msg, clip=CLIP):
     from the 200-char clip — the clip exists to keep ordinary chatter scannable,
     and a forward is usually carrying the substance someone moved deliberately.
     """
-    body = (msg.get("content") or "").strip()
+    # Redact BEFORE clipping: the clip can land mid-token, and half a secret is
+    # still a leak that the pattern would no longer match.
+    body = _redact((msg.get("content") or "").strip())
     snaps = msg.get("message_snapshots") or []
     if not snaps:
         return body[:clip] if clip is not None else body
@@ -101,7 +118,9 @@ def _render(msg, clip=CLIP):
         extra.append(f"<attachment: {a.get('filename', '?')}>")
     for e in fwd.get("embeds") or []:
         extra.append(f"<embed: {e.get('title') or e.get('type') or '?'}>")
-    inner = " ".join(x for x in (fwd_body, *extra) if x) or "(forward with no readable body)"
+    # Redact the COMPOSED inner: filenames and embed titles are user-supplied too.
+    inner = _redact(" ".join(x for x in (fwd_body, *extra) if x)) \
+        or "(forward with no readable body)"
     prefix = f"{body} " if body else ""
     return f"{prefix}[forwarded] {inner}"
 
