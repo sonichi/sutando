@@ -421,15 +421,15 @@ def main() -> int:
 
     # w1) THE GAP: one commit behind, changing a source whose service is live.
     with tempfile.TemporaryDirectory() as td:
-        work = _mk_clone_behind_paths(Path(td), ["src/discord-bridge.py"])
-        real = _with_live(["src/discord-bridge.py"])
+        work = _mk_clone_behind_paths(Path(td), ["src/example-service.py"])
+        real = _with_live(["src/example-service.py"])
         try:
             r = hc.check_live_checkout_branch(work)
         finally:
             hc._running_service_sources = real
         check(r["status"] == "warn",
               f"w1) 1 behind changing a running service's source -> warn, got {r['status']}")
-        check("touch src/discord-bridge.py" in r["detail"],
+        check("touch src/example-service.py" in r["detail"],
               f"w1) must name the commit so it is actionable, got {r['detail'][:150]}")
         check("ON DISK" in r["detail"],
               f"w1) must say WHY no stale probe caught it, got {r['detail'][:200]}")
@@ -438,7 +438,7 @@ def main() -> int:
     #     stay ok. src/ moves several times a day, so warning on every src/
     #     commit re-creates the alert fatigue the 10-commit threshold prevents.
     with tempfile.TemporaryDirectory() as td:
-        work = _mk_clone_behind_paths(Path(td), ["src/discord-bridge.py"])
+        work = _mk_clone_behind_paths(Path(td), ["src/example-service.py"])
         real = _with_live([])
         try:
             r = hc.check_live_checkout_branch(work)
@@ -451,7 +451,7 @@ def main() -> int:
     #     show the warning needs BOTH halves, so neither alone can fire it.
     with tempfile.TemporaryDirectory() as td:
         work = _mk_clone_behind_paths(Path(td), ["docs/whatever.md"])
-        real = _with_live(["src/discord-bridge.py"])
+        real = _with_live(["src/example-service.py"])
         try:
             r = hc.check_live_checkout_branch(work)
         finally:
@@ -477,8 +477,8 @@ def main() -> int:
     #     warnings cannot be returned from one probe, and a nondeterministic
     #     choice would make the detail untestable.
     with tempfile.TemporaryDirectory() as td:
-        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md", "src/discord-bridge.py"])
-        real = _with_live(["src/discord-bridge.py"])
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md", "src/example-service.py"])
+        real = _with_live(["src/example-service.py"])
         try:
             r = hc.check_live_checkout_branch(work)
         finally:
@@ -519,7 +519,7 @@ def main() -> int:
         got = hc._running_service_sources()
     finally:
         hc.subprocess.run, hc._filter_pids_this_checkout = real_run2, real_filter
-    check(got and "src/discord-bridge.py" in got,
+    check(got and "src/voice-agent.ts" in got,
           f"w7) control: a pgrep HIT yields the source path, got {got[:3]}")
 
     # w8) A hit from a DIFFERENT checkout is not evidence about this one. The
