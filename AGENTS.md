@@ -289,6 +289,27 @@ Tasks arrive from multiple channels via the same file bridge:
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
 - To send files in replies, include `[file: /path/to/file]` in the result text
 
+**Peer-communication termination discipline (owner rule 2026-08-18).** Replies
+between duty-bound agents form loops: every reply becomes a task on the peer's
+side, which must produce a reply back. Three rules break the loop:
+
+1. **Pure-ack messages get NO reply.** Acknowledgements, "noted/封版", guard
+   withheld-notices, and restatements carrying no new information are archived
+   locally (move the task file to `tasks/archive/`) with no result written on
+   surfaces that post every result verbatim (e.g. AG2 Space, where dedup
+   markers are unusable — the team-result guard withholds bracketed markers).
+   Silence is the termination signal.
+2. **Parallel same-topic peer threads get ONE consolidated reply** on the most
+   substantive thread; sibling task files are archived locally. Never post the
+   same sentence per-thread.
+3. **A settled topic ends without response hooks** — no "what do you think",
+   no "waiting for your reply". Reply only when there is new information.
+
+On surfaces whose bridge parses markers (voice/Discord), `[deduped:]` remains
+the mechanism; the rules above are for surfaces without one. The structural
+fix (consolidation as a result-envelope field the gateway absorbs silently) is
+tracked at ag2-space/ag2space-backend#678.
+
 **Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Use them when multiple related tasks should produce ONE user-facing reply instead of N separate ones:
 - `[deduped: task-<other-id>]` — both voice (task-bridge) and Discord (discord-bridge) silently archive this task as done, no narration, no DM. Put the full reply in the other task's result file and put this marker in each superseded task's result. The canonical way to handle thread-consolidated replies (e.g. when voice over-delegates 3 tasks for the same continuation utterance — see `src/task-bridge.ts:527`).
 - `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
