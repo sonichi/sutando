@@ -75,7 +75,8 @@ def main() -> int:
         check("full: positive control — modes are distinguishable",
               "ACTIVE=True" in full.stdout)
         check("full: hex rule fires in full mode too", "HEX_HIT=True" in full.stdout)
-        check("full: mode announced as full", "full (detect-secrets active)" in full.stderr)
+        check("full: healthy path is SILENT (no mode line)",
+              "[secret-scanner]" not in full.stderr)
 
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)

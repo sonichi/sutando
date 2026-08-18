@@ -37,11 +37,11 @@ except ImportError:
     transient_settings = None
     DETECT_SECRETS_ACTIVE = False
 
-# Loud at import: a degraded host previously had NO artifact saying so.
-print("[secret-scanner] mode: "
-      + ("full (detect-secrets active)" if DETECT_SECRETS_ACTIVE else
-         "DEGRADED — detect-secrets missing; repo-local whole-line rules only"),
-      file=sys.stderr)
+# Loud ONLY when degraded (healthy paths stay silent — repo convention,
+# pinned by DegradedRedactorAnnouncesItself.test_the_healthy_path_is_silent).
+if not DETECT_SECRETS_ACTIVE:
+    print("[secret-scanner] mode: DEGRADED — detect-secrets missing; "
+          "repo-local whole-line rules only", file=sys.stderr)
 
 
 # Plugins enabled for the scan. detect-secrets v1.5+ ships these out of the
