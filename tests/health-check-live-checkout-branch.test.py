@@ -74,6 +74,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -261,9 +262,9 @@ def main() -> int:
     # deliberately 10 and case k) pins that 1 behind stays ok — both correct for
     # alert fatigue. But a count cannot distinguish one commit that rewrites a
     # skill from nine that touch docs, and skills are the one case with no other
-    # detector: `src/` needs a restart, so the `*-stale` probes catch it by
-    # comparing a running process to its source; a skill has no process, since
-    # the agent re-reads the markdown from this checkout on every invocation.
+    # detector at all: the agent re-reads the markdown from this checkout on
+    # every invocation. (This used to add that `src/` was covered by the
+    # `*-stale` probes. It is not -- see the w-block below.)
     #
     # Observed on this node: exactly ONE commit behind, this probe reporting ok,
     # while the live `context-reconstruct` still instructed writing the shared
@@ -398,6 +399,142 @@ def main() -> int:
         r = hc.check_live_checkout_branch(work)
         check(r["status"] == "ok",
               f"v7) and must not warn on reversible history, got {r['status']} / {r['detail'][:100]}")
+
+    # ---- src/ behind, for a service that is RUNNING ------------------------
+    # The v1-v7 block above rests on "skills are the one case with no other
+    # detector: src/ needs a restart, so the *-stale probes catch it." They do
+    # not. They compare a process against the file ON DISK, which answers
+    # "pulled but not restarted" and cannot answer "not pulled" -- while the
+    # checkout is behind, process and file agree byte for byte and every
+    # staleness probe correctly reports ok.
+    #
+    # Observed 2026-08-17: 7 behind (under the threshold, so this probe said ok),
+    # of which two changed source backing a RUNNING process -- #2997 in
+    # src/discord-bridge.py and #3011 in the gateway package. Both bridges were
+    # up, both reported healthy, and both were missing a delivery fix: 4 parked
+    # proactives and 140 orphaned results on disk at the time.
+    def _with_live(paths):
+        """Pin the running-service set; the real one reads this host's pgrep."""
+        real = hc._running_service_sources
+        hc._running_service_sources = lambda: list(paths)
+        return real
+
+    # w1) THE GAP: one commit behind, changing a source whose service is live.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["src/discord-bridge.py"])
+        real = _with_live(["src/discord-bridge.py"])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "warn",
+              f"w1) 1 behind changing a running service's source -> warn, got {r['status']}")
+        check("touch src/discord-bridge.py" in r["detail"],
+              f"w1) must name the commit so it is actionable, got {r['detail'][:150]}")
+        check("ON DISK" in r["detail"],
+              f"w1) must say WHY no stale probe caught it, got {r['detail'][:200]}")
+
+    # w2) The gate is the whole design: the same drift with nothing running must
+    #     stay ok. src/ moves several times a day, so warning on every src/
+    #     commit re-creates the alert fatigue the 10-commit threshold prevents.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["src/discord-bridge.py"])
+        real = _with_live([])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "ok",
+              f"w2) same drift, service NOT running -> ok, got {r['status']} / {r['detail'][:90]}")
+
+    # w3) Running, but the drift is elsewhere -> ok. Pairs with w2: together they
+    #     show the warning needs BOTH halves, so neither alone can fire it.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["docs/whatever.md"])
+        real = _with_live(["src/discord-bridge.py"])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "ok",
+              f"w3) live service but unrelated drift -> ok, got {r['status']} / {r['detail'][:90]}")
+
+    # w4) A directory entry must cover the files under it -- the gateway runs
+    #     from a package, so a change to any module in it is a change to the
+    #     running service. A file-equality check would miss every one of them.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(
+            Path(td), ["packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"])
+        real = _with_live(["packages/ag2-sparrow/ag2_sparrow/"])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "warn",
+              f"w4) a directory entry covers files beneath it, got {r['status']}")
+
+    # w5) Both stale at once -> the skills message wins, deterministically. Two
+    #     warnings cannot be returned from one probe, and a nondeterministic
+    #     choice would make the detail untestable.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md", "src/discord-bridge.py"])
+        real = _with_live(["src/discord-bridge.py"])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "warn" and "skills/" in r["detail"],
+              f"w5) both stale -> skills message, got {r['detail'][:110]}")
+        check("2 commit(s) behind" in r["detail"],
+              f"w5) and the TOTAL is still 2, got {r['detail'][:130]}")
+
+    # w6) A broken pgrep must yield an empty set, not a warning. This is the
+    #     measurement-failure branch: the running-service list is the gate, so a
+    #     failure that returned everything would warn on every src/ commit.
+    real_run = hc.subprocess.run
+
+    def _boom_on_pgrep(argv, *a, **kw):
+        if argv and "pgrep" in str(argv[0]):
+            raise OSError("pgrep vanished")
+        return real_run(argv, *a, **kw)
+
+    hc.subprocess.run = _boom_on_pgrep
+    try:
+        got = hc._running_service_sources()
+    finally:
+        hc.subprocess.run = real_run
+    check(got == [], f"w6) a failed pgrep yields no live services, got {got}")
+
+    # w7) POSITIVE CONTROL for w6. An empty result only means "the failure path
+    #     degrades" if the same function can return non-empty; without this, a
+    #     function that always returned [] would pass w6. Asserting against the
+    #     host's real process table would make the control pass or fail on
+    #     whether a bridge happens to be up, so pgrep is stubbed to a hit.
+    real_run2, real_filter = hc.subprocess.run, hc._filter_pids_this_checkout
+    hc.subprocess.run = lambda argv, *a, **kw: (
+        types.SimpleNamespace(stdout="4242\n", returncode=0)
+        if argv and "pgrep" in str(argv[0]) else real_run2(argv, *a, **kw))
+    hc._filter_pids_this_checkout = lambda pids: pids
+    try:
+        got = hc._running_service_sources()
+    finally:
+        hc.subprocess.run, hc._filter_pids_this_checkout = real_run2, real_filter
+    check(got and "src/discord-bridge.py" in got,
+          f"w7) control: a pgrep HIT yields the source path, got {got[:3]}")
+
+    # w8) A hit from a DIFFERENT checkout is not evidence about this one. The
+    #     helper's own comment says an unfiltered pgrep gives a perpetual
+    #     "stale" whenever two clones coexist; this pins that the filter runs.
+    real_run3, real_filter3 = hc.subprocess.run, hc._filter_pids_this_checkout
+    hc.subprocess.run = lambda argv, *a, **kw: (
+        types.SimpleNamespace(stdout="4242\n", returncode=0)
+        if argv and "pgrep" in str(argv[0]) else real_run3(argv, *a, **kw))
+    hc._filter_pids_this_checkout = lambda pids: []
+    try:
+        got = hc._running_service_sources()
+    finally:
+        hc.subprocess.run, hc._filter_pids_this_checkout = real_run3, real_filter3
+    check(got == [], f"w8) a foreign-clone pid is filtered out, got {got[:3]}")
 
     # v7b) The TREE-DIFF call has its own failure branch, distinct from the log
     #      call's (v5). It runs FIRST and is the gate, so if it raises and the
@@ -611,8 +748,6 @@ def main() -> int:
     #    merged tree of both heads `resolve_git` was imported and used elsewhere
     #    while this probe still shelled the literal, so the cumulative state
     #    kept the CLT shim modal #2469 removes. Pin both directions.
-    import types
-
     real_mod = sys.modules.get("git_binary")
     try:
         # z1) resolver present and returning a path -> BOTH calls use that path
