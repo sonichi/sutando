@@ -16,6 +16,19 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+# Hermetic (module level, before any bridge import): the slack bridge resolves
+# channel config at import — point it at a seeded temp dir, never the real one.
+import os
+
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="proactive-dest-ccd-")
+_SLACK_CFG = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_SLACK_CFG.mkdir(parents=True, exist_ok=True)
+(_SLACK_CFG / "access.json").write_text('{"allowFrom": ["U000TEST"]}')
+os.environ["SUTANDO_WORKSPACE"] = tempfile.mkdtemp(prefix="proactive-dest-ws-")
+os.environ.setdefault("SUTANDO_TEST_MODE", "1")
+os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
+os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
+
 from proactive_routing import (PROACTIVE_DESTINATIONS, proactive_destination,
                                proactive_filename,
                                should_claim_proactive_file)
@@ -98,11 +111,6 @@ def main() -> int:
             mod.App = type("App", (), {"__init__": lambda self, **k: None,
                                        "event": lambda self, *_a, **_k: (lambda f: f)})
         sys.modules[_m] = mod
-    import os as _os
-    import tempfile as _tf
-    _os.environ.setdefault("SUTANDO_TEST_MODE", "1")
-    _os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
-    _os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
     _spec = _ilu.spec_from_file_location("slackbridge_dest_test",
                                          REPO / "src" / "slack-bridge.py")
     _sb = _ilu.module_from_spec(_spec)
