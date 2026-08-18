@@ -101,10 +101,8 @@ class DesignCClaimBackend:
         with _ACTIVATE_GUARD:
             if rk in _ACTIVATED:
                 return
-            # Assert, don't perform: striping activation is a migration whose
-            # contract requires quiescence — constructing an object is not a
-            # deploy step. The fence must already exist unless the deploy
-            # path passes activate=True (yixuan, #3104).
+            # Assert, don't perform: activation is a quiescence-requiring
+            # migration; only the deploy path (activate=True) may run it.
             if activate:
                 outbox.activate_lock_striping(self.root)
             elif not outbox._fence_path(self.root).exists():
