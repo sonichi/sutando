@@ -8,7 +8,8 @@
 // tick; the caller logs the verdict and notes it into the ledger for
 // persistence.
 
-import type { AudioHealthSnapshot } from './voice-audio-health.js';
+import type { AudioHealthSnapshot, LedgerCoverage } from './voice-audio-health.js';
+import { observesUpstreamSend } from './voice-audio-health.js';
 
 export type MatrixVerdict =
   | 'reconnect-window'
@@ -17,7 +18,8 @@ export type MatrixVerdict =
   | 'server-accounting-inconsistency' // row 2 [needs native counters]
   | 'server-discarding' // row 3 [needs native counters]
   | 'upstream-send-dead' // row 4 [needs native counters]
-  | 'model-silent' // row 5 (the honest F4 residue)
+  | 'upstream-send-failing' // row 4b — attempts happened, none succeeded
+  | 'post-sdk-silent' // row 5 (renamed from the aspirational 'model-silent')
   | 'client-send-backpressure' // row 6
   | 'egress-backpressure' // row 7a
   | 'client-playback-failure' // row 7b
@@ -38,6 +40,12 @@ export interface MatrixBaseline {
   chunksScheduled: number;
   chunksEnded: number;
   chunksCancelled: number;
+  /** Upstream (agent→SDK) counters — null while unobserved. Deltas NEVER cross
+   *  a transport generation; the structural guard downgrades that window. */
+  transportGeneration: number | null;
+  audioAttempted: number;
+  audioQueued: number;
+  echoSuppressed: number;
   ctxTimeMs: number | null;
   bufferedAmount: number | null;
   serverBufferedAmount: number | null;
@@ -56,6 +64,10 @@ export interface MatrixInput {
   serverBufferedAmount?: number | null;
   /** Last model event timestamp (row 5); absent ⇒ unknown. */
   lastModelEventAt?: number | null;
+  /** Coverage the EVALUATOR runs at. Defaults to the snapshot's own level; the
+   *  Phase-1 shadow passes 'session+egress' to exercise rows 4/4b/5 without
+   *  touching the live verdict stream. */
+  effectiveCoverage?: LedgerCoverage;
   now: number;
 }
 
@@ -92,6 +104,10 @@ function makeBaseline(input: MatrixInput): MatrixBaseline {
     chunksScheduled: s.clientTotals.chunksScheduled,
     chunksEnded: s.clientTotals.chunksEnded,
     chunksCancelled: s.clientTotals.chunksCancelled,
+    transportGeneration: s.transportGeneration,
+    audioAttempted: s.upstream?.audio.attempted ?? 0,
+    audioQueued: s.upstream?.audio.queued ?? 0,
+    echoSuppressed: s.echoSuppressed,
     ctxTimeMs: hb?.ctxTimeMs ?? (sameEpoch ? (input.prev?.ctxTimeMs ?? null) : null),
     bufferedAmount: hb?.bufferedAmount ?? null,
     serverBufferedAmount: input.serverBufferedAmount ?? null,
@@ -129,6 +145,18 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
       'insufficient-evidence',
       !hb ? 'no-client-heartbeat' : !prev ? 'first-tick-no-baseline' : 'epoch-boundary',
     );
+  }
+  const coverage = input.effectiveCoverage ?? s.coverage;
+  // ── Structural guard, BEFORE every delta-based row: upstream counters reset
+  // per transport generation, so every delta and last…At is garbage across a
+  // reconnect — row 5 as much as row 4 (design §1.5). ──
+  if (
+    observesUpstreamSend(coverage) &&
+    prev.transportGeneration !== null &&
+    s.transportGeneration !== null &&
+    s.transportGeneration !== prev.transportGeneration
+  ) {
+    return out('insufficient-evidence', 'transport-generation-changed');
   }
   const hbStale = now - hb.receivedAt > 8_000;
 
@@ -182,16 +210,45 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
     }
   }
 
-  // ── Rows 2–4: native server dispositions — unreachable at session-only ──
-  if (s.coverage !== ('full' as string)) {
-    // The patterns these rows need (received/buffered/eligible/sdkSend
-    // counters) do not exist yet; if the observable half of the pattern is
-    // present, say WHY the verdict cannot be issued.
+  // ── Rows 2–3: server-side dispositions — unreachable below 'full' ──
+  if (coverage !== 'full') {
+    // The patterns these rows need (received/buffered/eligible counters) do
+    // not exist; if the observable half of the pattern is present, say WHY
+    // the verdict cannot be issued.
     if ((dCapCallbacks > 0 || dBytesSent > 0) && dDelivered === 0 && !muted && !hbStale) {
       return out(
         'insufficient-evidence',
         'client-sending-but-session-delivery-stalled',
         'server-ingress-chain-unobserved(coverage:session-only)',
+      );
+    }
+  }
+
+  // ── Rows 4/4b: the agent→SDK hop (design §1.5) — need 'session+egress' ──
+  const au = s.upstream?.audio ?? null;
+  const dAttemptedAudio = au ? Math.max(0, au.attempted - prev.audioAttempted) : 0;
+  const dQueuedAudio = au ? Math.max(0, au.queued - prev.audioQueued) : 0;
+  const dEchoSuppressed = Math.max(0, s.echoSuppressed - prev.echoSuppressed);
+  if (
+    observesUpstreamSend(coverage) &&
+    au !== null &&
+    input.sessionState === 'ACTIVE' &&
+    !muted &&
+    dDelivered > 0 &&
+    dEchoSuppressed === 0
+  ) {
+    if (dAttemptedAudio === 0) {
+      // Eligible ingress arrived and the agent never even called sendAudio —
+      // a DEAD call path, not a failing one. In-process defect.
+      return out('upstream-send-dead', `delivered+=${dDelivered}`, 'attempted+=0');
+    }
+    if (dQueuedAudio === 0) {
+      return out(
+        'upstream-send-failing',
+        `attempted+=${dAttemptedAudio}`,
+        'queued+=0',
+        `skippedNoSession=${au.skippedNoSession}`,
+        `threw=${au.threw}`,
       );
     }
   }
@@ -208,17 +265,38 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
     const modelSilent =
       input.lastModelEventAt == null || now - input.lastModelEventAt > 15_000;
     if (modelSilent) {
-      if (s.coverage !== ('full' as string)) {
+      if (!observesUpstreamSend(coverage) || au === null) {
         // Speech reached the session and nothing came back — but the
-        // upstream-send hop is unobserved, so blaming the model would be a
-        // guess (the design's honesty rule).
+        // upstream-send hop is unobserved, so blaming anything past the
+        // agent would be a guess (the design's honesty rule).
         return out(
           'insufficient-evidence',
           'speech-without-model-event',
           'upstream-hop-unobserved(coverage:session-only)',
         );
       }
-      return out('model-silent', 'speech-in-window', 'no-model-event');
+      // Lossless-window proof (design §1.5): aggregate counters cannot say
+      // WHICH frame queued, so require that NOTHING was dropped — then the
+      // speech-bearing frames were necessarily queued.
+      const lossless = dAttemptedAudio >= dDelivered && dQueuedAudio === dAttemptedAudio;
+      const queuedAfterSpeech =
+        au.lastQueuedAt !== null &&
+        speech.lastAboveFloorAt !== null &&
+        au.lastQueuedAt >= speech.lastAboveFloorAt;
+      if (lossless && queuedAfterSpeech && dEchoSuppressed === 0) {
+        return out(
+          'post-sdk-silent',
+          'speech-in-window',
+          'lossless-window',
+          `queued+=${dQueuedAudio}`,
+          'no-model-event',
+        );
+      }
+      return out(
+        'insufficient-evidence',
+        'speech-without-model-event',
+        lossless ? 'speech-queue-order-unproven' : 'lossy-window',
+      );
     }
   }
 

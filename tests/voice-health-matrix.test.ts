@@ -42,6 +42,13 @@ function hb(over: Partial<ClientHeartbeat> = {}): ClientHeartbeat {
 function snap(over: Partial<AudioHealthSnapshot> = {}): AudioHealthSnapshot {
 	return {
 		coverage: 'session-only',
+		upstream: null,
+		transportGeneration: null,
+		echoSuppressed: 0,
+		logicalSessionId: 1,
+		lineageState: 'fresh',
+		contextTokens: null,
+		contextTokensAt: null,
 		epoch: 12345,
 		nonce: 'n0n0n0n0',
 		deliveredFrames: 1000,
@@ -77,6 +84,34 @@ function snap(over: Partial<AudioHealthSnapshot> = {}): AudioHealthSnapshot {
 }
 
 /** A previous-tick baseline consistent with `snap()` minus the given deltas. */
+function upstreamFix(audio: {
+	attempted: number;
+	queued: number;
+	skippedNoSession?: number;
+	threw?: number;
+	lastQueuedAt?: number | null;
+}) {
+	const slot = {
+		attempted: audio.attempted,
+		queued: audio.queued,
+		skippedNoSession: audio.skippedNoSession ?? 0,
+		threw: audio.threw ?? 0,
+		attemptedRawBytes: 0,
+		queuedRawBytes: 0,
+		attemptedWireBytesEstimate: 0,
+		queuedWireBytesEstimate: 0,
+		lastAttemptedAt: audio.lastQueuedAt ?? null,
+		lastQueuedAt: audio.lastQueuedAt ?? null,
+		lastSkippedAt: null,
+		lastThrewAt: null,
+	};
+	return {
+		audio: slot,
+		video: { ...slot, attempted: 0, queued: 0, skippedNoSession: 0, threw: 0, unsupportedMime: 0 },
+		text: { ...slot, attempted: 0, queued: 0, skippedNoSession: 0, threw: 0, skippedEmpty: 0 },
+	};
+}
+
 function baselineBefore(s: AudioHealthSnapshot, deltas: Partial<MatrixBaseline> = {}): MatrixBaseline {
 	return {
 		at: NOW - 30_000,
@@ -89,6 +124,10 @@ function baselineBefore(s: AudioHealthSnapshot, deltas: Partial<MatrixBaseline> 
 		chunksScheduled: s.clientTotals.chunksScheduled,
 		chunksEnded: s.clientTotals.chunksEnded,
 		chunksCancelled: s.clientTotals.chunksCancelled,
+		transportGeneration: s.transportGeneration,
+		audioAttempted: s.upstream?.audio.attempted ?? 0,
+		audioQueued: s.upstream?.audio.queued ?? 0,
+		echoSuppressed: s.echoSuppressed,
 		ctxTimeMs: s.lastHeartbeat?.ctxTimeMs ?? null,
 		bufferedAmount: s.lastHeartbeat?.bufferedAmount ?? null,
 		serverBufferedAmount: null,
@@ -151,14 +190,129 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 		assert.ok(r.reasons.some((x) => x.includes('upstream-hop-unobserved')));
 	});
 
-	it('the same speech-silence pattern at FULL coverage reaches model-silent (the F4 residue)', () => {
+	it('speech-silence at session+egress with a LOSSLESS queued-after-speech window → post-sdk-silent', () => {
 		const s = snap({
-			coverage: 'full' as never,
 			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
 		});
-		const prev = baselineBefore(s, { deliveredFrames: s.deliveredFrames - 100 });
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'post-sdk-silent');
+		assert.ok(r.reasons.includes('lossless-window'));
+	});
+
+	it('a LOSSY window can never be post-sdk-silent — the speech may have been dropped locally', () => {
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			// 100 delivered, only 60 attempted: something swallowed frames.
+			upstream: upstreamFix({ attempted: 1060, queued: 1060, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.includes('lossy-window'));
+	});
+
+	it('a transport-generation change inside the window is structural insufficient-evidence', () => {
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 40, queued: 40, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 4, // reconnected mid-window
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			transportGeneration: 3,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.includes('transport-generation-changed'));
+	});
+
+	it('row 4: eligible ingress with ZERO attempts is upstream-send-dead (dead call path)', () => {
+		const s = snap({
+			upstream: upstreamFix({ attempted: 1000, queued: 1000, lastQueuedAt: NOW - 40_000 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.equal(r.verdict, 'upstream-send-dead');
+	});
+
+	it('row 4b: attempts with zero queued is upstream-send-failing, named by guard outcome', () => {
+		const s = snap({
+			upstream: upstreamFix({
+				attempted: 1100,
+				queued: 1000,
+				skippedNoSession: 100,
+				lastQueuedAt: NOW - 40_000,
+			}),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.equal(r.verdict, 'upstream-send-failing');
+	});
+
+	it('echo suppression in the window excludes rows 4/4b — suppression looks like a dead path', () => {
+		const s = snap({
+			upstream: upstreamFix({ attempted: 1000, queued: 1000, lastQueuedAt: NOW - 40_000 }),
+			transportGeneration: 3,
+			echoSuppressed: 5,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+			echoSuppressed: 0,
+		});
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.notEqual(r.verdict, 'upstream-send-dead');
+		assert.notEqual(r.verdict, 'upstream-send-failing');
+	});
+
+	it('the LIVE evaluator at session-only still downgrades — the shadow rows change nothing', () => {
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
 		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
-		assert.equal(r.verdict, 'model-silent');
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.some((x) => x.includes('upstream-hop-unobserved')));
 	});
 });
 
@@ -330,16 +484,22 @@ describe('P7 D7.2 matrix — round-3 honesty + ordering fixes', () => {
 
 	it('row 5 outranks row 6: speech with no model event wins over backpressure (D7.2 order)', () => {
 		const s = snap({
-			coverage: 'full' as never,
 			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
 			lastHeartbeat: hb({ bufferedAmount: 500_000 }),
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
 		});
 		const prev = baselineBefore(s, {
 			deliveredFrames: s.deliveredFrames - 100,
 			bufferedAmount: 50_000,
+			audioAttempted: 1000,
+			audioQueued: 1000,
 		});
-		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
-		assert.equal(r.verdict, 'model-silent');
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'post-sdk-silent');
 	});
 
 	it('a stale client speech EPISODE alone is not current speech evidence (canonical tracker only)', () => {
@@ -352,7 +512,7 @@ describe('P7 D7.2 matrix — round-3 honesty + ordering fixes', () => {
 			capCallbacks: s.clientTotals.capCallbacks - 700,
 		});
 		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
-		assert.notEqual(r.verdict, 'model-silent');
+		assert.notEqual(r.verdict, 'post-sdk-silent');
 		assert.ok(!r.reasons.includes('speech-without-model-event'));
 	});
 
