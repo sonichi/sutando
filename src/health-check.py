@@ -2859,17 +2859,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # moves several times a day. But one commit that rewrites a skill outranks
     # nine that touch docs, and a count cannot tell them apart.
     #
-    # Skills have no other detector at all: the agent re-reads the markdown from
-    # THIS checkout on every invocation, so a merged skill fix that has not been
-    # pulled is simply not in effect, with nothing anywhere to compare.
-    #
-    # This block used to add that `src/` was already covered, "so the `*-stale`
-    # probes catch it by comparing a running process against its source". They
-    # compare the process against the source ON DISK, which answers "pulled but
-    # not restarted" and cannot answer "not pulled": while the checkout is
-    # behind, the process and the file agree byte for byte and every staleness
-    # probe correctly reports ok. So `src/` shares the skills blind spot exactly
-    # whenever the commit has not landed here — see _running_service_sources.
+    # `src/` shares the skills blind spot: `*-stale` probes compare a process to
+    # the file ON DISK, which agree byte for byte while the checkout is behind.
     #
     # Observed 2026-08-03 on this node: exactly ONE commit behind — far under the
     # threshold, so this probe reported ok — while the live `context-reconstruct`
@@ -2885,9 +2876,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # the destruction to: the point is that the running skill and the merged one
     # disagreed invisibly, and that is true of any content difference.
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
-    # Only sources with a LIVE process: `src/` moves several times a day, so
-    # gating on the running set is what keeps this from becoming the alert
-    # fatigue the 10-commit threshold exists to avoid.
+    # LIVE processes only: `src/` moves several times a day, so the running set
+    # is what keeps this from becoming the alert fatigue the threshold prevents.
     live_sources = _running_service_sources()
     stale_services = (_behind_commits_changing(repo, expected, live_sources, git_bin)
                       if live_sources else [])
