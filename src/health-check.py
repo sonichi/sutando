@@ -109,8 +109,8 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # How much of MEMORY.md a session actually loads. These are the RUNTIME's
 # documented numbers, not this repo's guess:
 #
-#   "Claude Code reads the first 200 lines or 25KB of a memory file, whichever
-#    comes first" — content BEYOND that point is dropped; the prefix still
+#   "The first 200 lines of MEMORY.md, or the first 25KB, whichever comes
+#    first" — and ONLY MEMORY.md. Content beyond it is dropped; the prefix still
 #    loads. YAML frontmatter and block-level HTML comments are stripped before
 #    those limits are measured.
 #   https://code.claude.com/docs/en/memory#how-it-works
@@ -5269,8 +5269,12 @@ def check_gateway_bridge() -> "dict | None":
                 "detail": f"running; last poll did not succeed, last one that did "
                           f"was {age_h * 3600:.0f}s ago (transient)",
             }
-        since = ("last successful poll UNKNOWN" if age_h is None
-                 else f"last successful poll {age_h:.1f}h ago")
+        # Seconds below an hour: `{age_h:.1f}h` renders a 106s age as "0.0h ago",
+        # the self-refuting line the transient branch above exists to remove.
+        age_s = None if age_h is None or age_h < 0 else age_h * 3600
+        since = ("last successful poll UNKNOWN" if age_s is None
+                 else f"last successful poll {age_s:.0f}s ago" if age_s < 3600
+                 else f"last successful poll {age_s / 3600:.1f}h ago")
         return {
             "name": "gateway-bridge",
             "status": "warn",
@@ -6289,7 +6293,7 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         # Age-INDEPENDENT and definitive, so it is checked FIRST: nothing can
         # release a claim whose owner is gone, whatever the ledger says.
         if pid is not None and not _pid_alive(pid):
-            leaked.append((age or 0.0, entry.name, "owner process gone"))
+            leaked.append((age, entry.name, "owner process gone"))
         elif not task_live:
             # Archival and claim release are ASYNCHRONOUS; only past that window
             # is an absent task evidence that nothing will release the claim.
@@ -6311,11 +6315,16 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no held task-handler claims"}
 
     if leaked:
-        leaked.sort(reverse=True)
+        # Unknown first — nothing can vouch for it — then genuinely oldest. The
+        # negation matters: a plain ascending key names the YOUNGEST leak "oldest".
+        leaked.sort(key=lambda r: (r[0] is not None, -(r[0] or 0.0)))
         age, who, why = leaked[0]
+        oldest = ("age unknown" if age is None
+                  else f"oldest {age:.0f}s" if age < 3600
+                  else f"oldest {age / 3600:.1f}h")
         return {"name": name, "status": "down",
                 "detail": f"{len(leaked)} of {held} held claim(s) leaked — {why}, "
-                          f"oldest {age / 3600:.1f}h ({who}); nothing will release "
+                          f"{oldest} ({who}); nothing will release "
                           "them, and each publishes a user-visible failure when the "
                           "watcher next exits"}
     if bounded:
