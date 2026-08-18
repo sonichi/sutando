@@ -62,8 +62,10 @@ from outbox import DeliveryOutcome  # noqa: E402
 
 
 def _client(token):
-    # Seam: tests inject a stub client here.
-    return DiscordRestClient(token)
+    # Seam: tests inject a stub client here. timeout=30 preserves the retired
+    # multipart path's cap — multipart is slower than JSON, and a longer
+    # timeout on a single-attempt send only delays the verdict.
+    return DiscordRestClient(token, timeout=30)
 
 
 
