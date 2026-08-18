@@ -85,18 +85,19 @@ describe('task-bridge.ts — [no-send]/[REPLIED] skip-marker handling (#1381)', 
 		);
 	});
 
-	it('skip-marker guard has file.startsWith("task-") guard (mirrors [deduped:] block)', () => {
-		// The guard must only apply to task files, not proactive-result-*.txt or
-		// other result files that could have marker-like content. Without this guard
-		// a proactive-result file beginning with [no-send] would be swallowed here
-		// instead of reaching discord-bridge's poll_proactive delivery path.
-		// Look backward from the log line to find the enclosing if-condition.
-		const beforeSkip = SRC.slice(0, SRC.indexOf('has skip marker'));
+	it('skip-marker guard delegates to the ownership predicate', () => {
+		// The `task-` prefix check moved into src/skip_marker_ownership.ts along
+		// with the ownership gate it was missing (#3018): a prefix match is not
+		// ownership, and results/ is shared by every consumer. The behavior is
+		// tested directly in task-bridge-skip-marker-ownership.test.ts; here we
+		// only pin that the branch still routes through that predicate.
+		const after = afterBlock('has skip marker; archiving silently');
+		const beforeSkip = SRC.slice(0, SRC.length - after.length);
 		const lastIfBeforeSkip = beforeSkip.lastIndexOf('if (');
 		const ifCondition = SRC.slice(lastIfBeforeSkip, lastIfBeforeSkip + 120);
 		assert.ok(
-			ifCondition.includes('file.startsWith('),
-			`skip-marker if-condition must include file.startsWith() guard; got: ${ifCondition.slice(0, 80)}`
+			ifCondition.includes('mayRetireSkipMarked('),
+			`skip-marker if-condition must delegate to mayRetireSkipMarked(); got: ${ifCondition.slice(0, 80)}`
 		);
 	});
 
