@@ -105,7 +105,9 @@ class DesignCClaimBackend:
             # migration; only the deploy path (activate=True) may run it.
             if activate:
                 outbox.activate_lock_striping(self.root)
-            elif not outbox._fence_path(self.root).exists():
+            # _stripe_mode validates the fence (corrupt JSON / stripe-count
+            # mismatch raise there); bare path-existence would accept both.
+            elif not outbox._stripe_mode(self.root):
                 raise RuntimeError(
                     f"outbox root {self.root} is not stripe-fenced: run "
                     "activation during a deploy window (no other consumer "

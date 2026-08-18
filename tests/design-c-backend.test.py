@@ -11,6 +11,7 @@ beyond the backend-agnostic contract suite:
 
 Run: python3 tests/design-c-backend.test.py"""
 # ruff: noqa: E402 — imports follow the sys.path insert below
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -68,6 +69,30 @@ def main() -> int:
               backend_c.outbox._fence_path(Path(td)).exists())
         check("fenced root then constructs without activate",
               DesignCClaimBackend(Path(td)) is not None)
+
+    # Fence VALIDITY, not existence (Codex, #3104): a corrupt fence and a
+    # wrong-stripe-count fence must both fail construction closed.
+    with tempfile.TemporaryDirectory() as td:
+        fp = backend_c.outbox._fence_path(Path(td))
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text("not-json")
+        try:
+            DesignCClaimBackend(Path(td))
+            check("corrupt fence refused at construction", False)
+        except RuntimeError as e:
+            check("corrupt fence refused at construction",
+                  "unreadable stripes fence" in str(e))
+    with tempfile.TemporaryDirectory() as td:
+        fp = backend_c.outbox._fence_path(Path(td))
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(json.dumps(
+            {"stripes": backend_c.outbox.LOCK_STRIPES + 1}))
+        try:
+            DesignCClaimBackend(Path(td))
+            check("mismatched stripe-count fence refused", False)
+        except RuntimeError as e:
+            check("mismatched stripe-count fence refused",
+                  "migration required" in str(e))
 
     # CE-6: complete -> republish -> reclaim; the stale token must be inert.
     with tempfile.TemporaryDirectory() as td:
