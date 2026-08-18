@@ -16,6 +16,8 @@ released -> re-claimed -> released ~21x/min, unbounded and undelivered.
   c) no target + no default       -> skipped WITHOUT claiming (a claim would spin)
   d) no target + a default        -> delivered to the default (unchanged)
   e) foreign target + no default  -> left for its own bridge, never claimed
+  f) RESTART: a dead-pid claim recovers to .txt and then delivers to its named room
+  g) a LIVE pid's in-flight claim is still never stolen
 
 Run: python3 tests/gateway-proactive-explicit-room-without-default.test.py
 Exit: 0 on pass, 1 on fail.
@@ -47,6 +49,14 @@ def check(cond: bool, msg: str) -> None:
     print(("  ok   " if cond else "  FAIL ") + msg)
     if not cond:
         FAILS.append(msg)
+
+
+def _dead_pid() -> int:
+    """A pid that is certainly not running: spawn one and reap it."""
+    import subprocess as sp
+    pr = sp.Popen([sys.executable, "-c", "pass"])
+    pr.wait()
+    return pr.pid
 
 
 def drain(body: str, default_room: str):
@@ -106,6 +116,51 @@ def main() -> int:
     posts, left = drain(f"[channel: {DISCORD_ID}]\nfor discord\n", "")
     check(posts == [], f"e) foreign target -> nothing sent, got {len(posts)}")
     check(left == ["proactive-1.txt"], f"e) and left for its own bridge, got {left}")
+
+    # f) RESTART PATH. This PR also removed the no-default early return from
+    #    _recover_orphan_proactive, and only the drain was covered until now.
+    tmp = Path(tempfile.mkdtemp(prefix="gw-proactive-recover-"))
+    (tmp / "archive").mkdir()
+    dead = _dead_pid()
+    claim = tmp / f"proactive-9.sending.{dead}"
+    claim.write_text(f"[channel: {ROOM}]\nrecovered body\n", encoding="utf-8")
+    posts: list = []
+
+    saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
+             gb._req, gb.PROACTIVE_CLAIM_GATE)
+    gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp, tmp / "archive"
+    gb.PROACTIVE_ROOM = ""
+    gb._req = lambda m, path, payload=None, timeout=None: (
+        posts.append(payload) or {"ok": True, "event_id": "$evt"})
+    gb.PROACTIVE_CLAIM_GATE = None
+    try:
+        gb._recover_orphan_proactive()
+        recovered = (tmp / "proactive-9.txt").exists()
+        gb._post_proactive()
+    finally:
+        (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
+         gb._req, gb.PROACTIVE_CLAIM_GATE) = saved
+
+    check(recovered, "f) a dead-pid claim recovers to .txt with no default room")
+    check(len(posts) == 1, f"f) and the next drain delivers it, got {len(posts)} post(s)")
+    check(posts and posts[0].get("room_id") == ROOM,
+          f"f) to its NAMED room, got {posts[0].get('room_id') if posts else None}")
+    check(sorted(q.name for q in tmp.iterdir() if q.is_file()) == [],
+          "f) nothing left behind in results/")
+
+    # g) A LIVE pid's claim is still never stolen — the guard this PR did not touch,
+    #    asserted here because f) is the first test to exercise this function at all.
+    tmp2 = Path(tempfile.mkdtemp(prefix="gw-proactive-live-"))
+    live = tmp2 / f"proactive-10.sending.{os.getpid()}"
+    live.write_text(f"[channel: {ROOM}]\nin flight\n", encoding="utf-8")
+    saved_dir = gb.RESULTS_DIR
+    gb.RESULTS_DIR = tmp2
+    try:
+        gb._recover_orphan_proactive()
+    finally:
+        gb.RESULTS_DIR = saved_dir
+    check(live.exists() and not (tmp2 / "proactive-10.txt").exists(),
+          "g) a LIVE pid's in-flight claim is left alone")
 
     print()
     if FAILS:
