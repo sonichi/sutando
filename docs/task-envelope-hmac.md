@@ -106,13 +106,40 @@ one rollout cannot be confused with the other:
 - **A — authenticity**: a privileged task must be `verified`.
 - **B — uniqueness**: a terminal `task_id` must never execute again.
 
+One-line intent per phase — *observe authenticity, enforce authenticity,
+enforce execution uniqueness, make the trust transition explicit, make the
+trust boundary OS-enforced*. The last two differ precisely: **Phase 4 makes
+authority explicit in the architecture; Phase 5 makes that boundary
+non-bypassable by the processes it constrains.**
+
 | Phase | What ships | Status |
 |---|---|---|
 | 1 | HMAC telemetry: all writers stamp; census counts verdicts | **Live, soaking** |
 | 2 | Privileged fail-closed on **authenticity only**: `verified` → eligible; `unsigned`/`invalid`/`unverifiable` → the fail-closed arms (no privileged processing / quarantine / fail closed) | After soak window, owner sign-off |
-| 3 | Explicit replay ledger: `task_id` → terminal disposition (completed / rejected / expired / cancelled); a re-appearing terminal id gets a first-class `REPLAYED`/`ALREADY_TERMINAL` verdict | Planned (order with 4 swappable) |
+| 3 | Explicit replay ledger: `task_id` → terminal disposition (completed / rejected / expired / cancelled); a re-appearing terminal id gets a first-class `REPLAYED`/`ALREADY_TERMINAL` verdict. The id names an **execution identity**, not a filename — rename, move, or re-serialization never resets uniqueness | Planned (order with 4 swappable) |
 | 4 | `drop/` → trusted sealer → `ready/`: untrusted producers write `drop/` only; one sealer validates, binds identity, seals, and atomically promotes. Directories encode lifecycle (`drop/` untrusted input, `ready/` authenticated, `archive/` completed history), inspectable with `ls` | Planned |
 | 5 | Remove same-UID key exposure: the sealer alone reads the key; delegated subprocesses run without key or `ready/` access | Planned |
+
+Phase 4/5 acceptance is mechanical — the capability matrix below is the
+integration-test specification, each row an OS-enforced check, not a
+convention:
+
+```
+delegated subprocess:  read task-hmac.key → DENIED
+                       write ready/       → DENIED
+                       write drop/        → ALLOWED
+trusted sealer:        read task-hmac.key → ALLOWED
+                       read drop/         → ALLOWED
+                       write ready/       → ALLOWED
+consumer:              read ready/        → ALLOWED
+                       privileged exec    → only VERIFIED
+```
+
+Note the cwd-isolation work (spawn-cwd resolver) is Phase-5-*adjacent* only:
+not inheriting the repo cwd reduces accidental coupling, but a same-UID
+subprocess can still read the key at its absolute path. Phase 5's acceptance
+is OS-enforceable capability separation, never "the subprocess doesn't know
+where the key is."
 
 The boundary is real only when three conditions hold simultaneously for an
 untrusted process: cannot read the key, cannot write `ready/`, can only
@@ -138,6 +165,5 @@ seal → `ready/` → privileged processing → replay ledger → side effects.
 - Census: `src/task_envelope_census.py`
 - Contract + falsifier tests: `tests/task-envelope.test.py`,
   `tests/task-envelope-ts.test.ts`, `tests/task-envelope-census.test.py`
-- Related boundary work: the mailbox design supersedes per-writer trust
-  in `docs/architecture-boundaries.md` terms; the delegated-subprocess
-  isolation work (spawn-cwd resolver) is Phase-5-adjacent.
+- Related boundary work: `docs/architecture-boundaries.md`; the
+  delegated-subprocess cwd isolation (Phase-5-adjacent, see above).
