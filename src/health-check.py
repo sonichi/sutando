@@ -5615,24 +5615,34 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     held_note = f", {inflight} in flight with a worker" if inflight else ""
     oldest = min(files, key=lambda p: p.stat().st_mtime)
     oldest_age = int(now - oldest.stat().st_mtime)
+    # A live holder is only reassuring while the worker is inside its own
+    # deadline. SUTANDO_TIER_HARD_TIMEOUT defaults to 900s, so past that a
+    # holder has outlived the limit it enforces on itself: wedged, not working.
+    all_held = inflight == len(files)
+    held_is_progress = all_held and oldest_age <= stuck_age_sec
+    wedged_note = (f" — still held by a live worker past its own {stuck_age_sec}s "
+                   "hard deadline, so the WORKER is wedged, not the watcher")
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
             # ok, not warn: every `warn` is alertable (emit_task_for_failures /
             # notify_for_failures), so rewording alone still fires the false alert.
-            "status": "ok" if inflight == len(files) else "warn",
+            "status": "ok" if held_is_progress else "warn",
             "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
-                       + (" — all held by a live worker, not stalled"
-                          if inflight == len(files) else " — watcher or core may be stuck")),
+                       + (" — all held by a live worker, not stalled" if held_is_progress
+                          else wedged_note if all_held
+                          else " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
     # message could sit indefinitely while this probe printed its age under "ok".
     if oldest_age > stuck_age_sec:
         return {
             "name": name,
-            "status": "ok" if inflight == len(files) else "warn",
+            # held_is_progress is False here by construction (oldest_age >
+            # stuck_age_sec), so an all-held pile warns rather than going quiet.
+            "status": "ok" if held_is_progress else "warn",
             "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
-                       + (" — all held by a live worker, not stalled" if inflight == len(files)
+                       + (wedged_note if all_held
                           else f" — undrained past {stuck_age_sec}s")),
         }
     return {"name": name, "status": "ok",

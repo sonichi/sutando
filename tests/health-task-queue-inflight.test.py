@@ -5,6 +5,12 @@ A delegated team task stays in `tasks/` for its whole run — the worker removes
 it only when it publishes a result — so an in-flight task and an abandoned one
 are byte-identical on disk. The probe warned "watcher or core may be stuck" on
 both, which fires on ordinary operation and trains the reader to ignore it.
+
+The suppression is BOUNDED by the worker's own hard deadline. Past
+SUTANDO_TIER_HARD_TIMEOUT (session-worker.py:249, default 900s) a live holder
+has outlived the limit it enforces on itself, so "held" stops meaning "working"
+and starts meaning "wedged" — and that is precisely when an unbounded version
+of this probe would go quiet forever.
 """
 
 import importlib.util
@@ -61,8 +67,8 @@ src = (REPO / "src" / "health-check.py").read_text()
 i = src.index("def check_task_queue")
 body = src[i:i + 2600]
 check("held_note" in body, "the probe threads the in-flight count into its detail")
-check("inflight == len(files)" in body,
-      "the stuck wording is suppressed only when EVERY queued task is held")
+check("held_is_progress" in body,
+      "suppression is gated on a single named predicate, not an inline comparison")
 check("not stalled" in body, "the all-held case says so explicitly")
 
 # BEHAVIOURAL: a reworded detail with status="warn" still alerts, which no
@@ -98,12 +104,26 @@ def probe(n_tasks, n_held, age_sec, real_lookup=False):
     finally:
         hc.WORKSPACE_DIR, hc._tasks_held_by_a_worker = orig_ws, orig_held
 
-# The exact shape from the review: one task, 1000s old, held by a worker.
-r = probe(1, 1, 1000)
-check(r["status"] == "ok", f"all-held + past stuck age -> ok (got {r['status']!r})")
+# The ordinary case this PR exists for: held, and still inside the deadline.
+r = probe(1, 1, 400)
+check(r["status"] == "ok", f"held + UNDER deadline -> ok (got {r['status']!r})")
 check(r["status"] not in ALERTABLE,
       "all-held does NOT reach emit_task_for_failures / notify_for_failures")
-check("not stalled" in r["detail"], "the detail still explains why it is quiet")
+# No wording claim here: one task under both thresholds reaches neither branch,
+# so it takes the plain fall-through. The reassuring wording is asserted below,
+# on the count+age branch, which is the only place it is still reachable.
+
+# THE BOUND. 1000s is past the worker's own hard deadline
+# (SUTANDO_TIER_HARD_TIMEOUT, session-worker.py:249, default 900), so "a live
+# worker holds it" has stopped being evidence that anything is progressing.
+# Without this the suppression is unbounded and a wedged worker is invisible.
+r = probe(1, 1, 1000)
+check(r["status"] == "warn", f"held + PAST deadline -> warn (got {r['status']!r})")
+check(r["status"] in ALERTABLE, "a wedged worker reaches the notifier")
+check("WORKER is wedged" in r["detail"],
+      "the detail points at the worker, not the watcher")
+check("not stalled" not in r["detail"],
+      "and it drops the reassurance it can no longer support")
 
 # A genuinely stalled queue must be unchanged — this is the probe's real job.
 r = probe(1, 0, 1000)
@@ -115,9 +135,19 @@ r = probe(4, 2, 400)
 check(r["status"] == "warn", f"mixed queue -> warn (got {r['status']!r})")
 check("2 in flight with a worker" in r["detail"], "mixed reports how many are accounted for")
 
-# Count+age branch, fully held.
+# Count+age branch, fully held, inside the deadline.
 r = probe(4, 4, 400)
 check(r["status"] == "ok", f"count+age branch, all held -> ok (got {r['status']!r})")
+check("not stalled" in r["detail"], "the detail still explains why it is quiet")
+
+# The count+age branch carried the SAME unbounded suppression and returns before
+# the stuck_age_sec branch is reached, so bounding only the latter would leave a
+# 4-task all-held pile quiet at any age.
+r = probe(4, 4, 1000)
+check(r["status"] == "warn",
+      f"count+age branch, all held PAST deadline -> warn (got {r['status']!r})")
+check("WORKER is wedged" in r["detail"],
+      "count+age branch also names the worker once past the deadline")
 
 # A broken `ps` is two questions, not one: does it stay quiet, and does the
 # silence it buys disable the probe? Both are asserted; the second is the point.
