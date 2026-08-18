@@ -142,6 +142,11 @@ def main() -> int:
         "dealfinder_scan_dest_test", REPO / "skills" / "deal-finder" / "scripts" / "scan.py")
     _dmod = _wilu.module_from_spec(_dspec)
     _dspec.loader.exec_module(_dmod)
+    # Un-overridden: the writer must target the RESOLVED workspace results/
+    # (the dir bridges poll), not the repo-root guess it used to make.
+    from workspace_default import resolve_workspace as _rw
+    check("deal-finder writes where bridges poll (resolved workspace)",
+          _dmod.RESULTS_DIR == _rw() / "results", str(_dmod.RESULTS_DIR))
     with tempfile.TemporaryDirectory() as td:
         _dmod.RESULTS_DIR = Path(td)
         check("deal-finder writes a telegram-destined proactive file",
