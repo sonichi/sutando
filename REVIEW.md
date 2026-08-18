@@ -217,6 +217,15 @@ and loads whichever repo it reviews.
     driven behaviorally by the bridge-marker-no-leak and dedup suites). When only content emitted verbatim is being pinned (an
     instruction template, a doc line), say so explicitly — that is a data pin, and it
     must be labeled as one, not passed off as a behavior test.
+    Second exception: a source assertion is legitimate when the property is *structural*
+    — a policy must not be duplicated, a path literal must not appear — because behavior
+    cannot observe a duplicate that currently agrees (two copies in sync pass every
+    behavioral test; the defect IS the duplication). This covers negative scans (no
+    private parser, no `json.loads` in an adapter) and positive delegation pins (the
+    adapter calls the shared owner — the form CLAUDE.md's "pin every adapter's
+    delegation" already mandates), and it is what this file's own `checks:` block does.
+    Pair it with the behavioral test of the extracted unit; never let it substitute
+    for one.
     *Grounded by:* three independent instances across unrelated subsystems in one evening
     (2026-08-18) — the #3088 scroll-reporting test asserted on `browser-tools.ts` source
     text, and disabling the fix outright left its suite 5/5 green (verified via the
