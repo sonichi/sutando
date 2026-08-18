@@ -255,9 +255,9 @@ def should_notify(key=None):
 
 def notify_macos(count, titles):
     """Returns True only if osascript actually accepted the notification."""
-    # macOS truncates the body, so send SLUGS not whole titles: a title carries
-    # its ask, and three of them overran the body at 388 chars on a live host.
-    names = [t.split(",", 1)[0].strip() for t in titles[:3]]
+    # macOS truncates the body, so send a bounded NAME per title. The cap is the
+    # bound: a title need not contain a comma, and some hosts produce none.
+    names = [t.split(",", 1)[0].strip()[:40] for t in titles[:3]]
     extra = f" (+{count - len(names)} more)" if count > len(names) else ""
     msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(names)}{extra}"
     # AppleScript string literal: backslashes and double quotes in question

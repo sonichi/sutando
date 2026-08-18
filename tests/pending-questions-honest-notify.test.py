@@ -244,12 +244,19 @@ class TestReviewFindings(unittest.TestCase):
         """A title carries its ask; three of them overran the macOS body."""
         sent = []
         self.m.subprocess = _Capture(sent)
-        titles = [f"slug-{i}, 2026-08-18 — " + ("x" * 90) for i in range(26)]
+        # A real no-comma title from another host leads: the shape this notifier
+        # sees is not guaranteed to be `slug, date`, so the cap must be the bound.
+        titles = ["[2026-08-17 14:4x ET] relay/ never carried by vault — 30 handoff "
+                  "notes exist only on this machine " + ("y" * 60)]
+        titles += [f"slug-{i}, 2026-08-18 — " + ("x" * 90) for i in range(25)]
         self.m.notify_macos(26, titles)
         body = sent[0]
         self.assertLess(len(body), 160, f"body must stay short, got {len(body)}: {body}")
-        for i in range(3):
-            self.assertIn(f"slug-{i}", body, "the first three slugs identify the queue")
+        # The comma-less title is bounded by the cap, not by a delimiter it lacks.
+        self.assertIn("[2026-08-17 14:4x ET] relay/ never carri", body, "comma-less title still identifies")
+        self.assertNotIn("yyyyyyyyyy", body, "a title without a comma must still be capped")
+        for i in range(2):
+            self.assertIn(f"slug-{i}", body, "the remaining names identify the queue")
         self.assertNotIn("xxxxxxxxxx", body, "no title prose may ride in the body")
         self.assertIn("(+23 more)", body, "the remainder must be counted, not dropped silently")
 
