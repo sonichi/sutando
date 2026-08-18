@@ -54,7 +54,14 @@ function makeHarness(opts: { requiredTicks?: number } = {}) {
 			sent.push(m);
 		},
 		getRecoveryCapabilities() {
-			return { version: 1, recoverUpstream: true, transportGenerations: true };
+			return {
+				version: 1,
+				recoverUpstream: true,
+				reconnectBoundary: true,
+				turnStartPublication: true,
+				transportGenerations: true,
+				syntheticHold: true,
+			};
 		},
 	};
 	const coord = new VoiceSilenceRecoveryCoordinator({
@@ -90,14 +97,20 @@ function makeHarness(opts: { requiredTicks?: number } = {}) {
 		modelSilentFor15s: true,
 		...over,
 	});
-	const tick = (over: { lastAboveFloorAt?: number | null; pendingToolCount?: number; deliveredAdvanced?: boolean; sessionState?: string } = {}) => {
+	const tick = (over: {
+		lastAboveFloorAt?: number | null;
+		pendingToolCount?: number;
+		delivered?: { epoch: number | null; chunksEnded: number; egressFrames: number; heartbeatSeen: boolean };
+		sessionState?: string;
+	} = {}) => {
 		coord.observeTick({
 			at: now,
 			sessionState: over.sessionState ?? 'ACTIVE',
 			facts: facts(),
 			lastAboveFloorAt: over.lastAboveFloorAt ?? null,
 			pendingToolCount: over.pendingToolCount ?? 0,
-			deliveredAdvanced: over.deliveredAdvanced ?? false,
+			delivered:
+				over.delivered ?? { epoch: null, chunksEnded: 0, egressFrames: 0, heartbeatSeen: false },
 		});
 	};
 	const setupOk = (dial: number, gen: number) =>
@@ -303,19 +316,29 @@ describe('recovery coordinator: human retry wire', () => {
 		assert.equal(h.sent.filter((m) => m.type === 'voice.retryUpstream.ack').length, 0);
 	});
 
-	it('retry during fatal backoff parks (accepted), then dials when it clears', async () => {
+	it('retry during fatal backoff parks silently, then dials as human-retry with the minted epoch', async () => {
 		const h = makeHarness();
 		await driveToTerminal(h);
 		h.advance(120_000);
 		h.coord.handleFatalBackoff(h.nowOf() + 300_000);
 		h.coord.handleClientCommand(retryCmd());
-		const ack = h.sent.filter((m) => m.type === 'voice.retryUpstream.ack');
-		assert.equal(ack[0].disposition, 'accepted');
-		assert.equal(h.restarts.length, 3); // parked — no dial yet
+		// Parked: NO ack yet — an accepted naming a stale epoch would hide the
+		// client banner against the wrong attempt.
+		assert.equal(h.sent.filter((m) => m.type === 'voice.retryUpstream.ack').length, 0);
+		assert.equal(h.restarts.length, 3); // no dial yet
 		assert.equal(h.coord.phase, 'waiting-retry');
+		// A duplicate of the parked request stays silent too (its ack is pending).
+		h.coord.handleClientCommand(retryCmd());
+		assert.equal(h.sent.filter((m) => m.type === 'voice.retryUpstream.ack').length, 0);
 		h.advance(300_001);
 		assert.equal(h.restarts.length, 4); // dialed once the backoff cleared
-		assert.equal(h.restarts[3].reason, 'active-silence');
+		assert.equal(h.restarts[3].reason, 'human-retry'); // provenance preserved
+		const ack = h.sent.filter((m) => m.type === 'voice.retryUpstream.ack');
+		assert.equal(ack.length, 1);
+		assert.equal(ack[0].disposition, 'accepted');
+		// The acknowledged epoch IS the authorization's minted epoch.
+		assert.equal(ack[0].acceptedAttemptEpoch, h.coord.state.attemptEpoch);
+		assert.equal(ack[0].requestId, 'req-1');
 	});
 });
 
@@ -323,7 +346,7 @@ describe('recovery coordinator: terminal clears', () => {
 	it('a current-epoch user-visible response clears terminal (functional recovery)', async () => {
 		const h = makeHarness();
 		await driveToTerminal(h);
-		h.tick({ deliveredAdvanced: true });
+		h.tick({ delivered: { epoch: 7, chunksEnded: 3, egressFrames: 3, heartbeatSeen: true } });
 		assert.equal(h.coord.phase, 'idle');
 		assert.equal(h.coord.isTerminal, false);
 		assert.equal(h.coord.state.episodeAttempts, 0);
@@ -340,18 +363,43 @@ describe('recovery coordinator: terminal clears', () => {
 });
 
 describe('capability validation and schema', () => {
-	it('recoverySurfaceSupported requires the full armed surface', () => {
+	it('recoverySurfaceSupported requires version 1 and every normative capability', () => {
+		const caps = {
+			version: 1,
+			recoverUpstream: true,
+			reconnectBoundary: true,
+			turnStartPublication: true,
+			transportGenerations: true,
+			syntheticHold: true,
+		};
 		const full = {
 			recoverUpstream() {},
 			sendJsonToClient() {},
-			getRecoveryCapabilities: () => ({ version: 1, recoverUpstream: true, transportGenerations: true }),
+			getRecoveryCapabilities: () => ({ ...caps }),
 		};
 		assert.equal(recoverySurfaceSupported(full), true);
 		assert.equal(recoverySurfaceSupported({ ...full, recoverUpstream: undefined }), false);
+		assert.equal(recoverySurfaceSupported({ ...full, sendJsonToClient: undefined }), false);
+		for (const field of [
+			'recoverUpstream',
+			'reconnectBoundary',
+			'turnStartPublication',
+			'transportGenerations',
+			'syntheticHold',
+		] as const) {
+			assert.equal(
+				recoverySurfaceSupported({
+					...full,
+					getRecoveryCapabilities: () => ({ ...caps, [field]: false }),
+				}),
+				false,
+				`descriptor with ${field}=false must not arm`,
+			);
+		}
 		assert.equal(
 			recoverySurfaceSupported({
 				...full,
-				getRecoveryCapabilities: () => ({ version: 1, recoverUpstream: false, transportGenerations: true }),
+				getRecoveryCapabilities: () => ({ ...caps, version: 99 }),
 			}),
 			false,
 		);
@@ -373,5 +421,88 @@ describe('capability validation and schema', () => {
 		assert.equal(parseRetryUpstreamCommand(retryCmd({ stalledAttemptEpoch: 0 })), null);
 		assert.ok(parseRetryUpstreamCommand(retryCmd({ requestId: '\u{1F600}'.repeat(65) })));
 		assert.equal(parseRetryUpstreamCommand(retryCmd({ requestId: '\u{1F600}'.repeat(129) })), null);
+	});
+});
+
+describe('recovery coordinator: review-round regressions', () => {
+	it('model progress resets the streak (generation-fenced anchor advance)', async () => {
+		const h = makeHarness();
+		h.coord.handleClientConnected();
+		h.setupOk(1, 1);
+		h.advance(10_000);
+		const speechAt = h.nowOf();
+		h.advance(20_000);
+		h.tick({ lastAboveFloorAt: speechAt }); // streak 1
+		h.advance(30_000);
+		h.tick({ lastAboveFloorAt: speechAt }); // streak 2
+		h.coord.handleModelEvent(1); // model spoke — anchor advances, streak 0
+		h.advance(30_000);
+		h.tick({ lastAboveFloorAt: speechAt }); // would have been the firing tick
+		assert.equal(h.restarts.length, 0);
+		// A stale-generation model event must NOT touch the anchor: rebuild the
+		// streak and confirm the fire still happens on schedule.
+		h.advance(30_000);
+		h.tick({ lastAboveFloorAt: speechAt });
+		h.coord.handleModelEvent(99); // unknown/stale generation — record-only
+		h.advance(30_000);
+		h.tick({ lastAboveFloorAt: speechAt });
+		assert.equal(h.restarts.length, 1);
+	});
+
+	it('a stale-generation tool completion neither settles current tools nor advances the anchor', async () => {
+		const h = makeHarness();
+		h.coord.handleClientConnected();
+		h.setupOk(1, 1);
+		h.coord.noteToolCall('t1', 'inline'); // issued under generation 1
+		h.setupOk(1, 2); // bodhi-internal reconnect: ordinary activation, gen 2
+		const rowsBefore = h.rows.filter((r) => r.event === 'toolOutcome').length;
+		h.coord.noteToolSettled('t1'); // completion from the dead generation
+		assert.equal(h.rows.filter((r) => r.event === 'toolOutcome').length, rowsBefore);
+		assert.equal(h.coord.pendingToolCount, 0); // entry removed silently
+	});
+
+	it('an accepted ack survives unbounded non-accepted churn (dedup never forgets accepts)', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		h.advance(120_000);
+		h.coord.handleClientCommand(retryCmd({ requestId: 'req-accepted' }));
+		const accepted = h.sent.filter((m) => m.type === 'voice.retryUpstream.ack')[0];
+		assert.equal(accepted.disposition, 'accepted');
+		for (let i = 0; i < 70; i += 1) {
+			h.coord.handleClientCommand(
+				retryCmd({ voiceSessionId: 'someone-else', requestId: `noise-${i}` }),
+			);
+		}
+		const restartsBefore = h.restarts.length;
+		h.coord.handleClientCommand(retryCmd({ requestId: 'req-accepted' }));
+		assert.equal(h.restarts.length, restartsBefore); // never redials twice
+		const replays = h.sent.filter(
+			(m) => m.type === 'voice.retryUpstream.ack' && m.requestId === 'req-accepted',
+		);
+		assert.equal(replays.length, 2);
+		assert.deepEqual(replays[1], replays[0]);
+	});
+
+	it('stop() is terminal: late rejections, lifecycle events and commands are inert', async () => {
+		const h = makeHarness();
+		await fireOnce(h);
+		h.coord.stop();
+		h.restarts[0].reject(new Error('late dial failure'));
+		await h.flush();
+		assert.equal(h.coord.phase, 'restarting'); // frozen, not waiting-retry
+		assert.equal(h.timers.filter((t) => !t.cleared && !t.fired).length, 0);
+		h.coord.handleLifecycleEvent({ kind: 'generation-close', transportGeneration: 1 });
+		h.coord.handleClientCommand(retryCmd());
+		assert.equal(h.sent.filter((m) => m.type === 'voice-stalled').length, 0);
+		assert.equal(h.sent.filter((m) => m.type === 'voice.retryUpstream.ack').length, 0);
+	});
+
+	it('first tick of a fresh epoch with positive counters counts as delivery', async () => {
+		const h = makeHarness();
+		await driveToTerminal(h);
+		// Baseline was epoch null; the new epoch resets counters from zero and
+		// already shows playback — the response landed before this tick.
+		h.tick({ delivered: { epoch: 9, chunksEnded: 1, egressFrames: 1, heartbeatSeen: true } });
+		assert.equal(h.coord.phase, 'idle');
 	});
 });

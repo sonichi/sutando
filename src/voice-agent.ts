@@ -186,7 +186,10 @@ const ACTIVE_SILENCE_MODE = parseActiveSilenceMode(process.env.VOICE_ACTIVE_SILE
 const ACTIVE_SILENCE_TICKS = parseActiveSilenceTicks(process.env.VOICE_ACTIVE_SILENCE_TICKS);
 let voiceRecoveryCoordinator: VoiceSilenceRecoveryCoordinator | null = null;
 let voiceRecoveryLedger: WatchdogLedger | null = null;
-let recoveryEgressBaseline: { epoch: number | null; chunksEnded: number; egressFrames: number } | null = null;
+/** True while the legacy CLOSED guard is inside its cast-call reconnect —
+ *  bodhi fires onClientConnected synchronously in there, and that fake
+ *  attach must not mint a coordinator client epoch. */
+let legacyReconnectInFlight = false;
 
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
@@ -982,9 +985,16 @@ async function main() {
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => voiceRecoveryCoordinator?.handleClientCommand(message),
-		onClientConnected: () => voiceRecoveryCoordinator?.handleClientConnected(),
+		onClientConnected: () => {
+			if (legacyReconnectInFlight) return; // not a real attach edge
+			voiceRecoveryCoordinator?.handleClientConnected();
+		},
 		onClientDisconnected: () => voiceRecoveryCoordinator?.handleClientDisconnected(),
 		onConnectionLifecycle: (event) => voiceRecoveryCoordinator?.handleLifecycleEvent(event),
+		// While terminal, ordinary attach auto-actions (greeting, context
+		// replay, the CLOSED auto-reconnect) would be uncounted bypasses of
+		// the attempt budget — bodhi gates them on this predicate.
+		suppressClientAutoActions: () => voiceRecoveryCoordinator?.isTerminal ?? false,
 		...(VOICE_SHADOW_STT
 			? {
 					shadowSttProvider: new GeminiBatchSTTProvider({
@@ -1100,6 +1110,9 @@ async function main() {
 				voiceSessionId: SESSION_ID,
 				session: session as unknown as RecoverySessionSurface,
 				requiredTicks: ACTIVE_SILENCE_TICKS,
+				// Reducer clock domain is MONOTONIC; only wire frames and the
+				// ledger use wall time (wallNowFn default).
+				nowFn: () => performance.now(),
 				log: (m) => console.log(`${ts()} [SilenceRecovery] ${m}`),
 				record: (row) => voiceRecoveryLedger?.append(row),
 			});
@@ -1386,6 +1399,11 @@ async function main() {
 	// P7 D7.1: the model hop is EVENTS — a text/tool-first turn must count
 	// as model activity even before any audio frame lands.
 	session.eventBus.subscribe('turn.start', () => audioHealth.noteModelEvent());
+	// Armed coordinator: model progress advances the reducer's silence anchor,
+	// generation-fenced by the event's own transport generation (bodhi #35).
+	session.eventBus.subscribe('turn.start', (e: { transportGeneration?: number }) =>
+		voiceRecoveryCoordinator?.handleModelEvent(e?.transportGeneration),
+	);
 	session.eventBus.subscribe('turn.end', () => _duck('off'));
 	session.eventBus.subscribe('turn.interrupted', () => _duck('off'));
 
@@ -1773,13 +1791,16 @@ async function main() {
 		// is bodhi's internal entry point for this exact scenario (CLOSED + client
 		// present → transition to CONNECTING, reconnect fire-and-forget).
 		// TODO: drop the (session as any) cast once bodhi exposes a public API.
-		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil && !(voiceRecoveryCoordinator?.isTerminal ?? false)) {
+		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil && !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
 			lastReconnectAt = Date.now();
 			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
 			try {
+				legacyReconnectInFlight = true;
 				(session as any).handleClientConnected();
 			} catch (err) {
 				console.error(`${ts()} [Health] Reconnect trigger failed:`, (err as Error)?.message ?? err);
+			} finally {
+				legacyReconnectInFlight = false;
 			}
 		}
 		// ACTIVE-silence shadow observation (Phase 0a): diagnostic only — no
@@ -1792,26 +1813,26 @@ async function main() {
 			snapshot,
 			facts: matrix.facts,
 		});
-		// Armed coordinator (Phase 1): live feed. Functional-recovery evidence
-		// prefers client-confirmed playback; server egress is the fallback
-		// when no heartbeat visibility exists. Baselines reset per epoch.
+		// Armed coordinator (Phase 1): live feed on the MONOTONIC clock — a
+		// wall-clock jump must not strand waiting-retry or bypass cooldowns.
+		// Snapshot speech timestamps are wall-domain; translate by age.
 		if (voiceRecoveryCoordinator) {
-			const ended = snapshot.clientTotals.chunksEnded;
-			const egress = snapshot.egressFrames;
-			let deliveredAdvanced = false;
-			if (recoveryEgressBaseline !== null && recoveryEgressBaseline.epoch === snapshot.epoch) {
-				deliveredAdvanced = snapshot.lastHeartbeat !== null
-					? ended > recoveryEgressBaseline.chunksEnded
-					: egress > recoveryEgressBaseline.egressFrames;
-			}
-			recoveryEgressBaseline = { epoch: snapshot.epoch, chunksEnded: ended, egressFrames: egress };
+			const mono = performance.now();
+			const wallAboveFloor = snapshot.speech.lastAboveFloorAt;
+			const monoAboveFloor =
+				wallAboveFloor === null ? null : mono - Math.max(0, Date.now() - wallAboveFloor);
 			voiceRecoveryCoordinator.observeTick({
-				at: Date.now(),
+				at: mono,
 				sessionState: state,
 				facts: matrix.facts,
-				lastAboveFloorAt: snapshot.speech.lastAboveFloorAt,
+				lastAboveFloorAt: monoAboveFloor,
 				pendingToolCount: 0,
-				deliveredAdvanced,
+				delivered: {
+					epoch: snapshot.epoch,
+					chunksEnded: snapshot.clientTotals.chunksEnded,
+					egressFrames: snapshot.egressFrames,
+					heartbeatSeen: snapshot.lastHeartbeat !== null,
+				},
 			});
 		}
 	}, 30_000);

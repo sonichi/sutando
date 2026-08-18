@@ -27,7 +27,10 @@ export interface RecoverySessionSurface {
 	getRecoveryCapabilities(): {
 		version: number;
 		recoverUpstream: boolean;
+		reconnectBoundary: boolean;
+		turnStartPublication: boolean;
 		transportGenerations: boolean;
+		syntheticHold: boolean;
 	};
 }
 
@@ -40,7 +43,14 @@ export function recoverySurfaceSupported(session: unknown): boolean {
 	if (typeof s.getRecoveryCapabilities !== 'function') return false;
 	try {
 		const caps = s.getRecoveryCapabilities();
-		return caps.recoverUpstream === true && caps.transportGenerations === true;
+		return (
+			caps.version === 1 &&
+			caps.recoverUpstream === true &&
+			caps.reconnectBoundary === true &&
+			caps.turnStartPublication === true &&
+			caps.transportGenerations === true &&
+			caps.syntheticHold === true
+		);
 	} catch {
 		return false;
 	}
@@ -91,8 +101,15 @@ export interface CoordinatorTickInput {
 	/** Newest above-floor speech time from the audio-health ledger (null: none). */
 	lastAboveFloorAt: number | null;
 	pendingToolCount: number;
-	/** Client-delivered audio advanced this window (functional-recovery clear). */
-	deliveredAdvanced: boolean;
+	/** Delivered-audio counters for the functional-recovery clear. The
+	 *  coordinator owns the per-epoch baseline: a fresh epoch's reset-from-
+	 *  zero counters that are already positive still count as delivery. */
+	delivered: {
+		epoch: number | null;
+		chunksEnded: number;
+		egressFrames: number;
+		heartbeatSeen: boolean;
+	};
 }
 
 export interface CoordinatorOptions {
@@ -127,10 +144,22 @@ export class VoiceSilenceRecoveryCoordinator {
 	private stalledEnteredAtUnixMs: number | null = null;
 	/** reducer attemptEpoch -> bodhi dial attemptEpoch, for setup-ok correlation. */
 	private readonly bodhiAttemptByReducerEpoch = new Map<number, number>();
-	/** Pending non-background tool calls (veto input). */
-	private readonly pendingTools = new Set<string>();
-	/** requestId -> ack frame; duplicates re-send the original ack verbatim. */
+	/** Pending non-background tool calls, keyed `${transportEpoch}:${id}` so a
+	 *  stale-generation completion can never settle a reused current id. */
+	private readonly pendingTools = new Map<string, number | null>();
+	/** requestId -> ack frame; duplicates re-send the original ack verbatim.
+	 *  accepted acks are never evicted — "duplicates never redial twice" has
+	 *  no expiry; the cap bounds only non-accepted entries. */
 	private readonly ackByRequestId = new Map<string, Record<string, unknown>>();
+	/** A human retry accepted-but-parked on fatal backoff: the ack waits for
+	 *  the authorization that mints the real epoch (design: accepted names
+	 *  the new attempt epoch), and the deferred dial keeps its provenance. */
+	private parkedRetry: { requestId: string; clientEpoch: number; stalledAttemptEpoch: number } | null =
+		null;
+	private deliveredBaseline: { epoch: number | null; chunksEnded: number; egressFrames: number } | null =
+		null;
+	/** stop() latch: no dispatch, push or timer may run after shutdown. */
+	private stopped = false;
 
 	constructor(opts: CoordinatorOptions) {
 		this.opts = opts;
@@ -143,6 +172,13 @@ export class VoiceSilenceRecoveryCoordinator {
 	/** Terminal latch — voice-agent gates the ordinary CLOSED guard on this. */
 	get isTerminal(): boolean {
 		return this.st.phase === 'terminal';
+	}
+
+	/** True while the coordinator owns CLOSED-state recovery: any non-idle
+	 *  phase, or an idle episode it recovered (origin retained). The legacy
+	 *  CLOSED guard must stand down here or it bypasses the attempt budget. */
+	get ownsRecovery(): boolean {
+		return this.st.phase !== 'idle' || this.st.origin === 'active-silence';
 	}
 
 	get phase(): RecoveryState['phase'] {
@@ -159,6 +195,7 @@ export class VoiceSilenceRecoveryCoordinator {
 	}
 
 	stop(): void {
+		this.stopped = true;
 		if (this.retryTimer !== null) {
 			this.clearTimer(this.retryTimer);
 			this.retryTimer = null;
@@ -174,6 +211,7 @@ export class VoiceSilenceRecoveryCoordinator {
 	}
 
 	private dispatch(ev: RecoveryEvent): RecoveryEffect {
+		if (this.stopped) return 'none';
 		const { state, effect } = reduceRecovery(this.st, ev);
 		const prevPhase = this.st.phase;
 		this.st = state;
@@ -192,6 +230,7 @@ export class VoiceSilenceRecoveryCoordinator {
 		}
 		if (state.phase === 'terminal' && prevPhase !== 'terminal') {
 			this.stalledEnteredAtUnixMs = this.wallNow();
+			this.parkedRetry = null;
 		}
 		switch (effect) {
 			case 'restart':
@@ -211,6 +250,14 @@ export class VoiceSilenceRecoveryCoordinator {
 
 	private executeRestart(reason: 'active-silence' | 'human-retry'): void {
 		const reducerEpoch = this.st.attemptEpoch;
+		const parked = this.parkedRetry;
+		if (parked !== null) {
+			// The deferred human retry is dialing now: honest provenance, and
+			// the accepted ack can finally name the freshly minted epoch.
+			reason = 'human-retry';
+			this.parkedRetry = null;
+			this.sendAck(parked, 'accepted', reducerEpoch);
+		}
 		let result: ReturnType<RecoverySessionSurface['recoverUpstream']>;
 		try {
 			result = this.opts.session.recoverUpstream({
@@ -311,8 +358,39 @@ export class VoiceSilenceRecoveryCoordinator {
 		}
 	}
 
+	/** Build, cache and send one ack. accepted entries are never evicted
+	 *  (dedup has no expiry); the cap bounds only non-accepted entries. */
+	private sendAck(
+		cmd: { requestId: string; clientEpoch: number; stalledAttemptEpoch: number },
+		disposition: 'accepted' | 'stale' | 'not-terminal',
+		acceptedAttemptEpoch: number | null,
+	): void {
+		const ack: Record<string, unknown> = {
+			type: 'voice.retryUpstream.ack',
+			version: 1,
+			voiceSessionId: this.opts.voiceSessionId,
+			clientEpoch: cmd.clientEpoch,
+			requestId: cmd.requestId,
+			stalledAttemptEpoch: cmd.stalledAttemptEpoch,
+			disposition,
+			acceptedAttemptEpoch,
+		};
+		this.ackByRequestId.set(cmd.requestId, ack);
+		if (this.ackByRequestId.size > ACK_CACHE_CAP) {
+			for (const [key, cached] of this.ackByRequestId) {
+				if (cached.disposition !== 'accepted') {
+					this.ackByRequestId.delete(key);
+					break;
+				}
+			}
+		}
+		this.opts.session.sendJsonToClient(ack);
+		this.record({ row: 'retry-ack', disposition, requestId: cmd.requestId, at: this.now() });
+	}
+
 	/** Client protocol command hook (bodhi onClientCommand). */
 	handleClientCommand(msg: Record<string, unknown>): void {
+		if (this.stopped) return;
 		if (msg?.type !== 'voice.retryUpstream') return;
 		const cmd = parseRetryUpstreamCommand(msg);
 		if (!cmd) {
@@ -326,49 +404,48 @@ export class VoiceSilenceRecoveryCoordinator {
 			this.opts.session.sendJsonToClient(cached);
 			return;
 		}
-		let disposition: 'accepted' | 'stale' | 'not-terminal';
-		let acceptedAttemptEpoch: number | null = null;
+		// A duplicate of the currently PARKED request has no ack yet — stay
+		// silent; its accepted ack goes out when the deferred dial authorizes.
+		if (this.parkedRetry !== null && this.parkedRetry.requestId === cmd.requestId) return;
 		if (cmd.voiceSessionId !== this.opts.voiceSessionId) {
-			disposition = 'stale';
-		} else if (this.st.phase !== 'terminal') {
-			disposition = 'not-terminal';
-		} else {
-			const effect = this.dispatch({
-				kind: 'retry',
-				stalledAttemptEpoch: cmd.stalledAttemptEpoch,
-				clientEpoch: cmd.clientEpoch,
-				requestId: cmd.requestId,
-				at: this.now(),
-			});
-			if (effect === 'restart') {
-				disposition = 'accepted';
-				acceptedAttemptEpoch = this.st.attemptEpoch;
-			} else if (effect === 'schedule-retry') {
-				// Parked on fatal backoff: the episode restarted; the next dial
-				// mints its epoch at retryDue. Accepted names the episode's epoch.
-				disposition = 'accepted';
-				acceptedAttemptEpoch = this.st.attemptEpoch;
-			} else {
-				disposition = 'stale';
-			}
+			this.sendAck(cmd, 'stale', null);
+			return;
 		}
-		const ack: Record<string, unknown> = {
-			type: 'voice.retryUpstream.ack',
-			version: 1,
-			voiceSessionId: this.opts.voiceSessionId,
+		if (this.st.phase !== 'terminal') {
+			this.sendAck(cmd, 'not-terminal', null);
+			return;
+		}
+		const effect = this.dispatch({
+			kind: 'retry',
+			stalledAttemptEpoch: cmd.stalledAttemptEpoch,
 			clientEpoch: cmd.clientEpoch,
 			requestId: cmd.requestId,
-			stalledAttemptEpoch: cmd.stalledAttemptEpoch,
-			disposition,
-			acceptedAttemptEpoch,
-		};
-		this.ackByRequestId.set(cmd.requestId, ack);
-		if (this.ackByRequestId.size > ACK_CACHE_CAP) {
-			const oldest = this.ackByRequestId.keys().next().value;
-			if (oldest !== undefined) this.ackByRequestId.delete(oldest);
+			at: this.now(),
+		});
+		if (effect === 'restart') {
+			// executeRestart already ran inside dispatch; the epoch is minted.
+			this.sendAck(cmd, 'accepted', this.st.attemptEpoch);
+		} else if (effect === 'schedule-retry') {
+			// Parked on fatal backoff (residue 6): defer the accepted ack until
+			// authorization mints the real epoch — an ack naming a stale epoch
+			// would make the client hide the banner against the wrong attempt.
+			this.parkedRetry = {
+				requestId: cmd.requestId,
+				clientEpoch: cmd.clientEpoch,
+				stalledAttemptEpoch: cmd.stalledAttemptEpoch,
+			};
+			this.record({ row: 'retry-parked', requestId: cmd.requestId, at: this.now() });
+		} else {
+			this.sendAck(cmd, 'stale', null);
 		}
-		this.opts.session.sendJsonToClient(ack);
-		this.record({ row: 'retry-ack', disposition, requestId: cmd.requestId, at: this.now() });
+	}
+
+	/** Model activity (turn.start): generation-fenced by the reducer — the
+	 *  event's own transport generation is used when it carries one. */
+	handleModelEvent(transportGeneration?: number): void {
+		const epoch = transportGeneration ?? this.st.currentTransportEpoch;
+		if (epoch === null) return;
+		this.dispatch({ kind: 'modelEvent', at: this.now(), transportEpoch: epoch });
 	}
 
 	noteMeetingMode(active: boolean): void {
@@ -379,17 +456,29 @@ export class VoiceSilenceRecoveryCoordinator {
 
 	noteToolCall(toolCallId: string, execution: string | undefined): void {
 		if (execution === 'background') return;
-		this.pendingTools.add(toolCallId);
+		this.pendingTools.set(`${this.st.currentTransportEpoch}:${toolCallId}`, this.st.currentTransportEpoch);
 	}
 
 	noteToolSettled(toolCallId: string): void {
-		if (!this.pendingTools.delete(toolCallId)) return;
-		if (this.st.currentTransportEpoch !== null) {
-			this.dispatch({
-				kind: 'toolOutcome',
-				at: this.now(),
-				transportEpoch: this.st.currentTransportEpoch,
-			});
+		// Prefer the current generation's entry; a stale generation's entry is
+		// removed silently — its outcome must not touch the current anchor.
+		const currentKey = `${this.st.currentTransportEpoch}:${toolCallId}`;
+		if (this.pendingTools.has(currentKey)) {
+			this.pendingTools.delete(currentKey);
+			if (this.st.currentTransportEpoch !== null) {
+				this.dispatch({
+					kind: 'toolOutcome',
+					at: this.now(),
+					transportEpoch: this.st.currentTransportEpoch,
+				});
+			}
+			return;
+		}
+		for (const key of this.pendingTools.keys()) {
+			if (key.endsWith(`:${toolCallId}`)) {
+				this.pendingTools.delete(key);
+				return;
+			}
 		}
 	}
 
@@ -411,8 +500,24 @@ export class VoiceSilenceRecoveryCoordinator {
 			this.lastSpeechAt = input.lastAboveFloorAt;
 			this.dispatch({ kind: 'speechObserved', at: input.lastAboveFloorAt });
 		}
+		// Per-epoch delivered baseline. A NEW epoch's reset-from-zero counters
+		// that are already positive count as delivery — a response landing
+		// before the first tick of its epoch must not be forgotten. Speech is
+		// replayed before delivery deliberately: when the 30 s window cannot
+		// order them, unlatching (fullReset) is the conservative side — the
+		// watchdog can only under-arm, never re-arm on stale evidence.
+		const d = input.delivered;
+		let deliveredAdvanced: boolean;
+		if (this.deliveredBaseline === null || this.deliveredBaseline.epoch !== d.epoch) {
+			deliveredAdvanced = d.heartbeatSeen ? d.chunksEnded > 0 : d.egressFrames > 0;
+		} else {
+			deliveredAdvanced = d.heartbeatSeen
+				? d.chunksEnded > this.deliveredBaseline.chunksEnded
+				: d.egressFrames > this.deliveredBaseline.egressFrames;
+		}
+		this.deliveredBaseline = { epoch: d.epoch, chunksEnded: d.chunksEnded, egressFrames: d.egressFrames };
 		if (
-			input.deliveredAdvanced &&
+			deliveredAdvanced &&
 			this.st.clientAttached &&
 			this.st.currentTransportEpoch !== null &&
 			this.st.currentClientEpoch !== null
