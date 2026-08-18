@@ -516,6 +516,42 @@ def main() -> int:
         hc.subprocess.run, hc._filter_pids_this_checkout = real_run3, real_filter3
     check(got == [], f"w8) a foreign-clone pid is filtered out, got {got[:3]}")
 
+    # w9) COST: an up-to-date checkout must not pay for the census at all. Ten
+    #     sequential pgreps at a 5s timeout is ~50s worst case on the common path.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), [])   # cloned, nothing added upstream
+        _git(work, "fetch", "-q", "origin")
+
+        def _must_not_run():
+            raise AssertionError("_running_service_sources called with behind == 0")
+
+        real = hc._running_service_sources
+        hc._running_service_sources = _must_not_run
+        try:
+            r = hc.check_live_checkout_branch(work)
+            reached = False
+        except AssertionError:
+            r, reached = None, True
+        finally:
+            hc._running_service_sources = real
+        check(not reached, "w9) the census is NOT invoked for an up-to-date checkout")
+        check(r and r["status"] == "ok", f"w9) and the verdict is still ok, got {r}")
+        check(r and "commits behind" not in r["detail"],
+              f"w9) detail unchanged from the pre-PR wording, got {r['detail'] if r else None!r}")
+
+    # w10) The short-circuit keys on `behind == 0`, NOT on falsiness — `None`
+    #      (shallow / no merge-base) is unanswerable and must still be probed.
+    with tempfile.TemporaryDirectory() as td:
+        repo = _mk_repo(Path(td))            # no origin -> _commits_behind returns None
+        called = []
+        real = hc._running_service_sources
+        hc._running_service_sources = lambda: called.append(1) or []
+        try:
+            hc.check_live_checkout_branch(repo)
+        finally:
+            hc._running_service_sources = real
+        check(called == [1], f"w10) behind is None still reaches the census, calls={len(called)}")
+
     # v7b) The TREE-DIFF call has its own failure branch, distinct from the log
     #      call's (v5). It runs FIRST and is the gate, so if it raises and the
     #      code fell through to history, the net-zero false positive would come

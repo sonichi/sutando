@@ -2875,6 +2875,12 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # peer INTO its own branch. The example still lands, because it never needed
     # the destruction to: the point is that the running skill and the merged one
     # disagreed invisibly, and that is true of any content difference.
+
+    # behind==0 => empty tree diff => both probes below are provably empty, and the
+    # census costs ten 5s-timeout pgreps to say so. None is unanswerable, so it probes.
+    if behind == 0:
+        return {"name": name, "status": "ok",
+                "detail": f"live checkout on {expected!r}"}
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     # LIVE processes only: `src/` moves several times a day, so the running set
     # is what keeps this from becoming the alert fatigue the threshold prevents.
