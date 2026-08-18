@@ -291,6 +291,64 @@ if hasattr(hc, "_worker_holdings"):
     check(hc._worker_holdings(PS) == {"task-aaa.txt": None, "task-bbb.txt": None},
           f"argv-only ps -> names with unknown age (got {hc._worker_holdings(PS)})")
 
+    # Every ownership case above hands _provider_runtime a pid directly; the
+    # live `ps` never did, so the corpse check could not run in production.
+    _pr = Path(tempfile.mkdtemp(prefix="prodfmt-"))
+    (_pr / "tasks").mkdir()
+    (_pr / "state" / "task-workstream-runs").mkdir(parents=True)
+    (_pr / "state" / "task-workstream-runs" / "task-live.txt.started").write_text(
+        json.dumps({"pid": 999999, "started": _time.time() - 4000}) + "\n")
+    _ows = hc.WORKSPACE_DIR
+    hc.WORKSPACE_DIR = _pr
+    try:
+        with hard_timeout("900"):
+            # (a) the format production actually requests: a FOREIGN owner's mark
+            #     must not age a worker that has run 3 seconds.
+            prod = ("  4242    00:03 /usr/bin/python3 /r/skills/task-workstream-sessions/"
+                    "scripts/session-worker.py --task-file /w/tasks/task-live.txt\n")
+            got = hc._worker_holdings(prod)
+            check(got == {"task-live.txt": hc.WAITING_FOR_LOCK},
+                  f"a stale mark from pid 999999 is not inherited by pid 4242 (got {got})")
+
+            # (b) No pid column -> owner unknowable. An unverifiable owner is
+            #     not a matching one, so the corpse is still not trusted.
+            noid = ("    00:03 /usr/bin/python3 /r/skills/task-workstream-sessions/"
+                    "scripts/session-worker.py --task-file /w/tasks/task-live.txt\n")
+            got = hc._worker_holdings(noid)
+            check(got == {"task-live.txt": hc.WAITING_FOR_LOCK},
+                  f"an UNIDENTIFIED owner does not inherit the mark either (got {got})")
+
+            # (c) and the positive half, so (a)/(b) are not passing on a dead read.
+            (_pr / "state" / "task-workstream-runs" / "task-live.txt.started").write_text(
+                json.dumps({"pid": 4242, "started": _time.time() - 4000}) + "\n")
+            got = hc._worker_holdings(prod)
+            age = got.get("task-live.txt")
+            check(isinstance(age, float) and 3900 < age < 4100,
+                  f"its OWN mark still hands over the clock (got {age})")
+    finally:
+        hc.WORKSPACE_DIR = _ows
+
+    # The production invocation is pinned by BEHAVIOUR, not by a source regex:
+    # parse a line in the format the live call requests and require a pid back.
+    _seen = {}
+    _real = hc.subprocess.run
+
+    def _capture(cmd, *a, **kw):
+        if cmd[:2] == ["ps", "-Ao"]:
+            _seen["fmt"] = cmd[2]
+        return _real(cmd, *a, **kw)
+
+    hc.subprocess.run = _capture
+    try:
+        hc._worker_holdings()
+    finally:
+        hc.subprocess.run = _real
+    fmt = _seen.get("fmt", "")
+    probe_line = _real(["ps", "-Ao", fmt], capture_output=True, text=True).stdout if fmt else ""
+    first = next((l for l in probe_line.splitlines() if l.split()), "")
+    check(bool(first) and first.split()[0].isdigit(),
+          f"the live ps format {fmt!r} yields a pid the parser can read (got {first.split()[:1]})")
+
 check(hc._tasks_held_by_a_worker(PS) == {"task-aaa.txt", "task-bbb.txt"},
       "the set form is unchanged for its existing callers")
 

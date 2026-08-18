@@ -5602,7 +5602,7 @@ def _worker_holdings(ps_output: "str | None" = None) -> dict:
     """
     if ps_output is None:
         try:
-            ps_output = subprocess.run(["ps", "-Ao", "etime=,args="], capture_output=True,
+            ps_output = subprocess.run(["ps", "-Ao", "pid=,etime=,args="], capture_output=True,
                                        text=True, timeout=5).stdout
         except Exception:  # noqa: BLE001 — a probe failure must not fail the check
             return {}
@@ -5647,9 +5647,9 @@ def _provider_runtime(task_name: str, proc_age: "float | None",
     except (OSError, ValueError, TypeError, KeyError):
         return None
     else:
-        # A mark from a different process is a corpse a SIGKILLed worker left;
-        # inheriting its clock would age a run that has not started.
-        if pid is None or owner == pid:
+        # Only a POSITIVELY matched owner may hand over its clock. A foreign pid
+        # is a SIGKILLed worker's corpse; an unknown one cannot rule that out.
+        if pid is not None and owner == pid:
             age = time.time() - started
             return age if age >= 0 else 0.0
         rec = None
