@@ -218,6 +218,97 @@ def _claim_path(root: Path, item_id: str) -> Path:
 
 _HELD = threading.local()
 
+# Bounds the lock namespace. Changing it remaps item->stripe, so mixed-value
+# processes would not mutually exclude: a migration (restart world), not tuning.
+LOCK_STRIPES = 64
+
+
+def _lock_stripe(item_id: str) -> int:
+    return int(hashlib.sha256(item_id.encode("utf-8")).hexdigest(), 16) % LOCK_STRIPES
+
+
+STRIPES_FENCE = "stripes-active.json"
+
+
+def _fence_path(root: Path) -> Path:
+    return Path(root) / LOCKS_DIR / STRIPES_FENCE
+
+
+_STRIPE_MODE: dict[str, bool] = {}
+
+
+def _root_key(root: Path) -> str:
+    """Canonical identity for a root. Every cache/guard keyed by root uses
+    this: raw path spellings (dot-dot, symlinks) of one directory must never
+    occupy separate entries, or aliases straddle lock namespaces."""
+    return os.path.realpath(str(root))
+
+
+def _stripe_mode(root: Path) -> bool:
+    """True iff this root has been migrated to striped locking.
+
+    The fence is the enforceable exclusivity proof: pre-striping processes
+    lock per-item files, striped ones lock stripe files, and the two cannot
+    exclude each other — so stripe mode is entered only via a fence written
+    under whole-engine quiescence (activate_lock_striping). No fence = the
+    pre-striping namespace, byte-compatible with older writers.
+
+    Memoized per root for the process lifetime: activation happens only
+    across a restart, so one process uses exactly one namespace — caching
+    enforces that (no mid-flight namespace flip) and keeps lock acquisition
+    free of per-call fence I/O. Only successful reads are cached; a corrupt
+    fence keeps raising until it is fixed.
+    """
+    cached = _STRIPE_MODE.get(_root_key(root))
+    if cached is not None:
+        return cached
+    fp = _fence_path(root)
+    try:
+        data = json.loads(fp.read_text())
+    except FileNotFoundError:
+        _STRIPE_MODE[_root_key(root)] = False
+        return False
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"unreadable stripes fence {fp}: {e}") from e
+    if data.get("stripes") != LOCK_STRIPES:
+        # Mixed stripe counts are the same defect class as mixed namespaces.
+        raise RuntimeError(
+            f"stripes fence {fp} declares {data.get('stripes')!r}, this build "
+            f"uses {LOCK_STRIPES}: migration required, refusing to guess")
+    _STRIPE_MODE[_root_key(root)] = True
+    return True
+
+
+def activate_lock_striping(root: Path) -> bool:
+    """Migrate this root to striped locking. True if this call activated it.
+
+    CONTRACT: call ONLY while no other consumer of `root` runs (the deploy
+    restart window) — the fence asserts that pre-striping lock holders are
+    gone for good, which no runtime probe can prove. Idempotent; a fence
+    declaring a different stripe count raises instead of being overwritten.
+    """
+    if _stripe_mode(root):                     # raises on count mismatch
+        return False
+    d = Path(root) / LOCKS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".{STRIPES_FENCE}.{os.getpid()}"
+    tmp.write_text(json.dumps({"stripes": LOCK_STRIPES}))
+    os.replace(str(tmp), str(_fence_path(root)))
+    _STRIPE_MODE[_root_key(root)] = True
+    return True
+
+
+def _sweep_legacy_locks(d: Path) -> None:
+    """One-shot upgrade sweep: pre-striping code left one `<key>.lock` per item.
+    Runs only in stripe mode, whose fence contract guarantees no pre-striping
+    process can still hold (or ever re-open) these files."""
+    try:
+        for f in d.iterdir():
+            if f.name.endswith(".lock") and not f.name.startswith("stripe-"):
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass
+
 
 @contextlib.contextmanager
 def _item_lock(root: Path, item_id: str):
@@ -227,20 +318,42 @@ def _item_lock(root: Path, item_id: str):
     can be rebound between the check and the act. flock closes the window
     outright, and the kernel drops it when the holder dies, so a crash cannot
     leave the item locked.
+
+    Two namespaces, fence-selected: before activate_lock_striping runs, the
+    pre-striping per-item files are used (cross-version safe during rolling
+    upgrades); after, item -> stripe file bounds the namespace at LOCK_STRIPES
+    inodes. Two items sharing a stripe serialize against each other — a
+    contention cost, never a correctness one, because the stripe lock strictly
+    contains the item lock.
     """
-    key = (str(root), item_id)
+    striped = _stripe_mode(root)
+    if striped:
+        stripe = _lock_stripe(item_id)
+        key = (_root_key(root), "stripe", stripe)
+        lock_name = f"stripe-{stripe:02d}.lock"
+    else:
+        # Pre-migration: same per-item inode as pre-striping builds, so a
+        # rolling-upgrade mix still mutually excludes. Unbounded until fenced.
+        key = (_root_key(root), "item", item_id)
+        lock_name = f"{_safe_key(item_id)}.lock"
     held = getattr(_HELD, "keys", None)
     if held is None:
         held = _HELD.keys = set()
     if key in held:
-        # Re-entry would have to bypass the lock to avoid self-deadlock, and a
-        # bypass is exactly the hole this primitive exists to close.
-        raise RuntimeError(f"re-entrant claim operation on {item_id!r}")
+        # Re-entry (same item, or a stripe-mate) would have to bypass the lock
+        # to avoid self-deadlock, and a bypass is the hole this primitive closes.
+        raise RuntimeError(f"re-entrant claim operation on {item_id!r} ({key[1]})")
     # Locks live outside the claims directory: a lock file sharing that
     # namespace is picked up by anything globbing claim names.
     d = Path(root) / LOCKS_DIR
     d.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(d / f"{_safe_key(item_id)}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    if striped:
+        if not getattr(_HELD, "swept_roots", None):
+            _HELD.swept_roots = set()
+        if _root_key(root) not in _HELD.swept_roots:
+            _HELD.swept_roots.add(_root_key(root))
+            _sweep_legacy_locks(d)
+    fd = os.open(str(d / lock_name), os.O_CREAT | os.O_RDWR, 0o644)
     held.add(key)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)

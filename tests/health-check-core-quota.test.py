@@ -92,7 +92,45 @@ class TestCoreQuotaExhausted(unittest.TestCase):
 
     def test_available_is_ok(self):
         self._write(available=True, status="allowed")
-        self.assertEqual(self.hc.check_core_quota_exhausted()["status"], "ok")
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "ok")
+        # Control for the staleness case below: a FRESH reading carries no
+        # hedge, so the hedge there cannot be an unconditional suffix.
+        self.assertNotIn("old", c["detail"])
+
+    def test_stale_available_is_ok_but_says_it_is_stale(self):
+        # Status must stay ok — a stale allowed is not a warning, quota-telemetry
+        # owns that — but the detail may not state it as current.
+        self._write(available=True, status="allowed", age_sec=4000)
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("66m old", c["detail"])
+        self.assertNotIn("core-quota", [f["name"] for f in self.hc._slack_failures([c])])
+
+    def test_available_age_unreadable_says_currency_unknown(self):
+        # Same FakePath shape as test_unreadable_age_does_not_page below: a
+        # blanket Path.stat mock breaks status_read_path's own exists() first.
+        payload = json.dumps({"available": True, "headers": {
+            "anthropic-ratelimit-unified-status": "allowed"}})
+
+        class FakePath:
+            def exists(self_):
+                return True
+
+            def read_text(self_):
+                return payload
+
+            def stat(self_):
+                raise OSError("stat failed")
+
+        orig = self.hc.status_read_path
+        self.hc.status_read_path = lambda *a, **k: FakePath()
+        try:
+            c = self.hc.check_core_quota_exhausted()
+        finally:
+            self.hc.status_read_path = orig
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("currency is unknown", c["detail"])
 
     def test_status_not_allowed_even_if_available_flag_true(self):
         # Defensive: trust the unified status header, not just the bool.

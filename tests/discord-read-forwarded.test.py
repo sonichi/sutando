@@ -108,7 +108,7 @@ dr._fetch = lambda extra, channel_id, page, headers: list(_SAMPLE)
 
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    rc = dr.main(["1532071853219385394"])
+    rc = dr.main(["1532071853219385394", "--operator"])
 printed = buf.getvalue()
 
 check("E1 main() exits 0 with a stubbed fetch", rc == 0, f"rc={rc}")
