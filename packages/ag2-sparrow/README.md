@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/sonichi/sutando/main/packages/ag2-sparrow/assets/icon-charcoal-512.png" alt="AG2 Sparrow" width="128" height="128">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sonichi/sutando/main/packages/ag2-sparrow/assets/mark-on-dark-512.png">
+    <img src="https://raw.githubusercontent.com/sonichi/sutando/main/packages/ag2-sparrow/assets/mark-on-light-512.png" alt="AG2 Sparrow" width="140">
+  </picture>
 </p>
 
 <h1 align="center">AG2 Sparrow</h1>
