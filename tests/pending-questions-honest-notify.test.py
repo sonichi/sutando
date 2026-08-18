@@ -22,6 +22,17 @@ def _load(results_dir):
     return m
 
 
+class _Capture:
+    """Records the AppleScript body notify_macos hands to osascript."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def run(self, argv, **kw):
+        self.sink.append(argv[-1])
+        return type("R", (), {"returncode": 0})()
+
+
 class TestUndrainedDetection(unittest.TestCase):
     def setUp(self):
         import tempfile
@@ -227,6 +238,20 @@ class TestReviewFindings(unittest.TestCase):
         self._age(f"{self.m.PROACTIVE_PREFIX}abc.txt", self.m.UNDRAINED_AGE_S + 60)
         self.assertEqual(self.m.undrained_proactive_files(),
                          [f"{self.m.PROACTIVE_PREFIX}abc.txt"])
+
+    # --- finding 3: the body is bounded by TITLE COUNT and title LENGTH ---
+    def test_f_notify_body_sends_slugs_not_whole_titles(self):
+        """A title carries its ask; three of them overran the macOS body."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        titles = [f"slug-{i}, 2026-08-18 — " + ("x" * 90) for i in range(26)]
+        self.m.notify_macos(26, titles)
+        body = sent[0]
+        self.assertLess(len(body), 160, f"body must stay short, got {len(body)}: {body}")
+        for i in range(3):
+            self.assertIn(f"slug-{i}", body, "the first three slugs identify the queue")
+        self.assertNotIn("xxxxxxxxxx", body, "no title prose may ride in the body")
+        self.assertIn("(+23 more)", body, "the remainder must be counted, not dropped silently")
 
     def test_d_written_name_matches_the_scanned_prefix(self):
         """Writer and detector must agree, or the check silently never fires."""
