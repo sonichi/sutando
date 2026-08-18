@@ -207,9 +207,11 @@ Full core-memory index: `<workspace>/.claude-sutando/projects/<slug>/memory/MEMO
 
 Key files:
 - User profile: `<workspace>/.claude-sutando/projects/<slug>/memory/user_profile.md`
-- Feedback (response style): `<workspace>/.claude-sutando/projects/<slug>/memory/feedback_response_style.md`
-- Feedback (operating principle): `<workspace>/.claude-sutando/projects/<slug>/memory/feedback_minimal_cost_max_value.md`
 - Build log (what's built, what's next): `<workspace>/build_log.md`
+
+Everything else is reached through `MEMORY.md` above, not named here. Memory filenames are per-host
+and written as things are learned, so a filename pinned in this file is guaranteed absent on a fresh
+install and drifts on an established one — `MEMORY.md` is the index that is maintained on every write.
 
 Read relevant core-memory files when user preferences or history would improve task quality. Write new core memory when you learn something durable about the user or the project.
 
