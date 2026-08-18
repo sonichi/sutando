@@ -12,6 +12,7 @@ import {
 	getVisionState,
 	resetVisionEgressForTests,
 	VISION_MIN_SEND_INTERVAL_MS,
+	MAX_FPS,
 } from '../src/vision-tools.js';
 
 /** Fake VoiceSession exposing exactly what the vision egress path reads. */
@@ -134,17 +135,41 @@ describe('P7 D7.4 vision egress controls', () => {
 		stopStreaming();
 	});
 
-	it('pull cadence is capped by the egress send interval', () => {
+	it('pull cadence is capped at the API-documented 1 fps, not at the send interval', () => {
 		const { session } = fakeSession();
 		setVisionSession(session);
 		registerSource({ name: 'fps-cap-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
 		const r = startStreaming('fps-cap-source', 2, 'pull');
 		assert.equal(r.status, 'streaming');
 		if (r.status === 'streaming') {
-			assert.equal(r.intervalMs, VISION_MIN_SEND_INTERVAL_MS);
-			assert.equal(r.fps, 1000 / VISION_MIN_SEND_INTERVAL_MS);
+			// Deriving the cap from the 900ms send interval yielded 1.11 fps — above
+			// the 1 fps Gemini Live documents for video frames.
+			assert.equal(r.fps, MAX_FPS);
+			assert.equal(r.fps, 1);
+			assert.equal(r.intervalMs, 1000);
 		}
 		stopStreaming();
+	});
+
+	it('sub-0.5 fps is reachable — the cost/cadence experiments need it', () => {
+		const { session } = fakeSession();
+		setVisionSession(session);
+		registerSource({ name: 'fps-floor-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
+		const r = startStreaming('fps-floor-source', 0.25, 'pull');
+		assert.equal(r.status, 'streaming');
+		if (r.status === 'streaming') {
+			assert.equal(r.fps, 0.25, '0.25 must survive the clamp; the old 0.5 floor swallowed it');
+			assert.equal(r.intervalMs, 4000);
+		}
+		stopStreaming();
+	});
+
+	it('the send-interval gate still bounds bursts independently of the fps cap', () => {
+		// The two limits are separate: MAX_FPS bounds the pull ticker, while
+		// VISION_MIN_SEND_INTERVAL_MS bounds any source's back-to-back sends.
+		assert.equal(VISION_MIN_SEND_INTERVAL_MS, 900);
+		assert.ok(1000 / VISION_MIN_SEND_INTERVAL_MS > MAX_FPS,
+			'the send gate is looser than the fps cap, so it cannot enforce it for push sources');
 	});
 
 	it('stopStreaming fences an in-flight pull capture — the stale frame never sends', async () => {
