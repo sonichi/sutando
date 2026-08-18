@@ -95,7 +95,9 @@ class TestWarnDetail(unittest.TestCase):
         short, long = self._detail(0.1), self._detail(13.5)
         self.assertNotEqual(short, long,
                             "a 6-minute and a 13-hour outage produced identical text")
-        self.assertIn("0.1h", short)
+        # Sub-hour outages now read in seconds; the property under test is that
+        # the two lines DIFFER and each names its own duration.
+        self.assertIn("360s", short)
         self.assertIn("13.5h", long)
 
     def test_an_unknown_start_says_so_rather_than_implying_freshness(self):
