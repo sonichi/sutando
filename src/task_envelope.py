@@ -52,13 +52,26 @@ def key_path(workspace: Path | None = None) -> Path:
     return (workspace or resolve_workspace()) / _KEY_RELPATH
 
 
+def _parse_key(text: str, p: Path) -> bytes:
+    """Exactly 64 hex chars / 32 bytes, or ValueError. bytes.fromhex('')
+    returns b'' without raising, so an EMPTY key file otherwise stamps and
+    verifies under a zero-length key — mirrored guard in task_envelope.ts."""
+    key = bytes.fromhex(text)
+    if len(text) != 64 or len(key) != 32:
+        raise ValueError(
+            f"invalid task-hmac key at {p} (want 64 hex chars, got {len(text)})")
+    return key
+
+
 def load_key(workspace: Path | None = None) -> "bytes | None":
     """Read-only: None when no key exists. Verification MUST use this —
     minting a key from a verify path turns a fresh/restored host's first
-    verification of a good file into a false `invalid` (review finding)."""
+    verification of a good file into a false `invalid` (review finding).
+    A PRESENT-but-corrupt key raises ValueError (verify_text maps it to
+    'unverifiable' — the key is at fault, not the file being judged)."""
+    p = key_path(workspace)
     try:
-        return bytes.fromhex(
-            key_path(workspace).read_text(encoding="utf-8").strip())
+        return _parse_key(p.read_text(encoding="utf-8").strip(), p)
     except FileNotFoundError:
         return None
 
@@ -66,7 +79,7 @@ def load_key(workspace: Path | None = None) -> "bytes | None":
 def load_or_create_key(workspace: Path | None = None) -> bytes:
     p = key_path(workspace)
     try:
-        return bytes.fromhex(p.read_text(encoding="utf-8").strip())
+        return _parse_key(p.read_text(encoding="utf-8").strip(), p)
     except FileNotFoundError:
         pass
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +96,7 @@ def load_or_create_key(workspace: Path | None = None) -> bytes:
         pass
     finally:
         tmp.unlink(missing_ok=True)
-    return bytes.fromhex(p.read_text(encoding="utf-8").strip())
+    return _parse_key(p.read_text(encoding="utf-8").strip(), p)
 
 
 def _strip_stamp(text: str) -> tuple[str, str | None]:
@@ -127,7 +140,11 @@ def verify_text(text: str, workspace: Path | None = None) -> dict:
     stripped, mac = _strip_stamp(text)
     if mac is None:
         return {"verdict": "unsigned", "reason": "no stamp line"}
-    key = load_key(workspace)
+    try:
+        key = load_key(workspace)
+    except ValueError:
+        return {"verdict": "unverifiable",
+                "reason": "corrupt local key — cannot judge; treat as warn"}
     if key is None:
         return {"verdict": "unverifiable",
                 "reason": "no local key — cannot judge; treat as warn"}

@@ -7,12 +7,12 @@ name = "ag2-sparrow"
 # Single-sourced from ag2_sparrow.__version__ (see [tool.setuptools.dynamic]) so the
 # packaged dist version and the importable __version__ can never drift.
 dynamic = ["version"]
-description = "Transport client that connects a local agent to AG2 Space: long-polls the task gateway for your agent's tasks and posts results back."
+description = "A channel-neutral local delivery runtime for AI agents: durable task and event transport, plus a transactional-outbox delivery-core library (crash-safe claims, recovery, provider adapters)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "AG2 Space" }]
-keywords = ["ag2", "agent", "relay", "gateway", "matrix"]
+keywords = ["ag2", "agent", "relay", "gateway", "matrix", "delivery", "outbox", "runtime"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",

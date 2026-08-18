@@ -2370,6 +2370,12 @@ def check_memory_sync() -> dict:
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
 
 
+def _age_phrase(age_s) -> str:
+    """None means the writer gave no usable timestamp — say so rather than
+    printing a number a reader cannot tell apart from a real age."""
+    return "age unknown" if age_s is None else f"{age_s}s ago"
+
+
 def check_onboarding_status() -> "dict | None":
     """Read the desktop checklist's agent surface (onboarding v2 spec,
     ag2space-cinny-desktop#165 S4).
@@ -2396,17 +2402,25 @@ def check_onboarding_status() -> "dict | None":
         if not isinstance(data, dict) or not isinstance(data.get("rows"), dict):
             return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
         rows = data["rows"]
-        todo = sorted(k for k, v in rows.items() if isinstance(v, dict) and v.get("state") == "todo")
-        age_s = max(0, int(time.time()) - int(data.get("updated_at", 0) or 0))
+        # Carry each row's own detail: "gateway" alone cannot distinguish "not
+        # running" from a reconnect. `str()` because a separate repo writes this.
+        todo = [f"{k} ({d})" if (d := str(v.get("detail") or "").strip()[:120]) else k
+                for k, v in sorted(rows.items())
+                if isinstance(v, dict) and v.get("state") == "todo"]
+        # Absent/null/0 updated_at is UNKNOWN, not the epoch — int(None or 0)
+        # rendered the whole unix time as an age (~56 years) on both lines.
+        _updated = int(data.get("updated_at", 0) or 0)
+        age_s = max(0, int(time.time()) - _updated) if _updated > 0 else None
     except (ValueError, OSError, TypeError):
         return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
     if todo:
         return {
             "name": name,
             "status": "warn",
-            "detail": f"user-facing setup incomplete: {', '.join(todo)} (as of {age_s}s ago)",
+            "detail": f"user-facing setup incomplete: {', '.join(todo)} ({_age_phrase(age_s)})",
         }
-    return {"name": name, "status": "ok", "detail": f"all checklist rows satisfied ({age_s}s ago)"}
+    return {"name": name, "status": "ok",
+            "detail": f"all checklist rows satisfied ({_age_phrase(age_s)})"}
 
 
 def check_host_subtrees() -> dict:
