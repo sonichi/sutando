@@ -9314,18 +9314,24 @@ CRON_STALE_SEC = int(os.environ.get("SUTANDO_CRON_STALE_SEC", "1800"))
 
 
 CORE_HEARTBEAT_MAX_AGE_S = 90.0
+# Callers snapshot `now` BEFORE they stat, so an atomic heartbeat rewrite in
+# between yields a slightly newer mtime; cross-host sync adds small clock skew.
+CORE_HEARTBEAT_FUTURE_TOLERANCE_S = 5.0
 
 
 def heartbeat_is_fresh(mtime: float, now: float,
                        max_age_s: float = CORE_HEARTBEAT_MAX_AGE_S) -> bool:
-    """A `state/cores/*.alive` heartbeat is fresh only inside [0, max_age_s).
+    """A `state/cores/*.alive` heartbeat is fresh only inside
+    [-CORE_HEARTBEAT_FUTURE_TOLERANCE_S, max_age_s).
 
-    Bounded from BELOW as well: a future-dated file has a negative age, and every
+    Bounded from BELOW as well: a far-future file has a negative age, and every
     one-sided `age >= max` test accepts that as fresh — so a clock step or a bad
-    write reads as a live core forever.
+    write reads as a live core forever. The bound is a tolerance, not zero: a
+    strictly non-negative test discards a live heartbeat that was atomically
+    rewritten between a caller's `now` snapshot and its stat (sub-ms in practice).
     """
     age = now - mtime
-    return 0.0 <= age < max_age_s
+    return -CORE_HEARTBEAT_FUTURE_TOLERANCE_S <= age < max_age_s
 
 
 def _live_core_socket(workspace: Optional[Path] = None) -> str:

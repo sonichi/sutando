@@ -63,6 +63,28 @@ def test_helper_rejects_both_ends():
     assert hc.heartbeat_is_fresh(now, now) is True, "age 0 is fresh"
 
 
+def test_helper_tolerates_a_just_rewritten_heartbeat():
+    # Callers snapshot `now` before they stat; an atomic rewrite in between makes
+    # the mtime slightly NEWER than `now`. That interleave is normal, not corrupt.
+    now = 1_000_000.0
+    assert hc.heartbeat_is_fresh(now + 0.001, now) is True, (
+        "sub-ms writer/reader interleave must not read as a dead core")
+    assert hc.heartbeat_is_fresh(now + 1.0, now) is True, "small sync/clock skew tolerated"
+    edge = hc.CORE_HEARTBEAT_FUTURE_TOLERANCE_S
+    assert hc.heartbeat_is_fresh(now + edge + 0.001, now) is False, (
+        "beyond the tolerance is still rejected — the bound is bounded")
+
+
+def test_any_core_alive_survives_a_concurrent_heartbeat_rewrite():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        _write_alive(cores, "rewritten", age_s=-0.5)
+        assert hc._any_core_alive(workspace=ws) is True, (
+            "a heartbeat 0.5s ahead of the reader snapshot is a live core mid-rewrite")
+
+
 def test_live_core_socket_rejects_a_future_dated_heartbeat():
     with tempfile.TemporaryDirectory() as tmp:
         ws = Path(tmp)
