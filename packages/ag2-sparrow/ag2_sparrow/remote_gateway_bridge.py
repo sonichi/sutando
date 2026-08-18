@@ -192,6 +192,10 @@ from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROV
 from .outbox import DeliveryOutcome
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
+from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
+                            RetryPolicy)
+from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
+from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
@@ -2527,6 +2531,49 @@ def _dedup_plan(tid: str, holder_id: str | None):
     return action, payload, room
 
 
+_DELIVERY_CORE: "DeliveryCore | None" = None
+
+
+def _delivery_core() -> DeliveryCore:
+    """The outbound result leg behind the ClaimBackend/DeliveryProvider seam:
+    claim, retry, ambiguity and crash-recovery semantics live in DeliveryCore;
+    this bridge keeps presentation (guard, markers, attachments) and the
+    resolved dirs. max_attempts=None preserves the legacy semantics — a failed
+    POST retries on every pass, never parks. The one narrowing: UNKNOWN on
+    both the send and its idempotent re-send parks the item
+    ("outcome-unknown"); the NOT_CLAIMED log names the operator recipe."""
+    global _DELIVERY_CORE
+    if _DELIVERY_CORE is None:
+        _DELIVERY_CORE = DeliveryCore(
+            DesignAClaimBackend(_STATE / f"remote-outbox{_INST_SUFFIX}"),
+            # Late-bound so token rotation reassigning module globals (and the
+            # test harness's _req double) reach the provider mid-process.
+            AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)),
+            policy=RetryPolicy(max_attempts=None),
+            worker="gateway-result-drain")
+    return _DELIVERY_CORE
+
+
+def _deliver_result_payload(tid: str, broker_tid: str, body: str) -> bool:
+    """One outbound result POST through the delivery core. True = the
+    gateway confirmed (server lease closed; caller archives). False = not
+    confirmed this pass; leave the result file for the next one."""
+    core = _delivery_core()
+    payload = json.dumps({"id": broker_tid, "body": body}).encode("utf-8")
+    core.backend.publish(broker_tid, payload)   # False = already live: retry pass
+    res = core.deliver_one(broker_tid, payload)
+    if res.status is DrainStatus.NOT_CLAIMED:
+        _log(f"result {tid}: outbox item not claimable "
+             f"(attempts={core.backend.attempts(broker_tid)}) — parked or "
+             "contested; requeue with delivery_core force_release if parked")
+        return False
+    if res.outcome is CoreDeliveryOutcome.CONFIRMED:
+        return True
+    _log(f"result POST not confirmed for {tid} "
+         f"({res.outcome.value if res.outcome else '?'}) — will retry")
+    return False
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -2565,14 +2612,10 @@ def _post_ready_results(inflight: set[str]) -> None:
                     if _delivery is None:
                         _log(f"dedup report deferred for {tid} — ledger unreadable")
                         continue
-                    try:
-                        _req("POST", "/v1/results",
-                             {"id": _broker_tid(_delivery), "body": payload})
-                    except (urllib.error.URLError, urllib.error.HTTPError,
-                            TimeoutError) as exc:
-                        # The report IS the delivery here. Archiving now would
-                        # strand the ask exactly as the unreported dedup did.
-                        _log(f"dedup report POST failed for {tid}: {exc} — will retry")
+                    # The report IS the delivery: archiving before confirm
+                    # would strand the ask exactly as the unreported dedup did.
+                    if not _deliver_result_payload(tid, _broker_tid(_delivery),
+                                                  payload):
                         continue
                 _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
                 _archive_result(rfile, tid)
@@ -2586,18 +2629,11 @@ def _post_ready_results(inflight: set[str]) -> None:
         if skip:
             # Skip markers still POST: only add_result closes the server lease;
             # the server suppresses their user-facing delivery.
-            try:
-                _delivery = _delivery_tid(tid)
-                if _delivery is None:
-                    _log(f"delivery deferred for {tid} — alias ledger unreadable")
-                    continue
-                _req("POST", "/v1/results",
-                     {"id": _broker_tid(_delivery), "body": body})
-            except urllib.error.HTTPError as e:
-                _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
+            _delivery = _delivery_tid(tid)
+            if _delivery is None:
+                _log(f"delivery deferred for {tid} — alias ledger unreadable")
                 continue
-            except (urllib.error.URLError, TimeoutError) as e:
-                _log(f"result POST network error for {tid}: {e} — will retry")
+            if not _deliver_result_payload(tid, _broker_tid(_delivery), body):
                 continue
             _archive_result(rfile, tid)
             # Retire the provenance WITH the result, never at read: this line is
@@ -2639,18 +2675,11 @@ def _post_ready_results(inflight: set[str]) -> None:
                     _log(f"attachment skipped for {tid}: {fp} ({reason})")
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
-        try:
-            _delivery = _delivery_tid(tid)
-            if _delivery is None:
-                _log(f"delivery deferred for {tid} — alias ledger unreadable")
-                continue
-            _req("POST", "/v1/results",
-                 {"id": _broker_tid(_delivery), "body": out_body})
-        except urllib.error.HTTPError as e:
-            _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
+        _delivery = _delivery_tid(tid)
+        if _delivery is None:
+            _log(f"delivery deferred for {tid} — alias ledger unreadable")
             continue
-        except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"result POST network error for {tid}: {e} — will retry")
+        if not _deliver_result_payload(tid, _broker_tid(_delivery), out_body):
             continue
         _archive_result(rfile, tid)
         inflight.discard(tid)

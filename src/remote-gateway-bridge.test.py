@@ -39,7 +39,8 @@ STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
          "force_room_ok_only": False,
-         "force_heartbeat_404": False, "force_media_redirect": False}
+         "force_heartbeat_404": False, "force_media_redirect": False,
+         "force_results_502_once": False, "force_results_400": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -80,6 +81,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return
         if self.path == "/v1/results":
+            if STATE["force_results_502_once"]:
+                STATE["force_results_502_once"] = False
+                self.send_response(502); self.end_headers(); return
+            if STATE["force_results_400"]:
+                self.send_response(400); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["results"].append(json.loads(self.rfile.read(n).decode()))
             self.send_response(200); self.end_headers()
@@ -547,6 +553,34 @@ def main() -> int:
           "[no-send] marker POSTed (closes the lease) and archived")
     check(bool(_posted) and "[no-send]" in (_posted[0].get("body") or ""),
           "[no-send] body keeps its marker so the server suppresses delivery")
+
+    # DeliveryCore wiring, proven by side effects only the seam produces:
+    # outbox attempt accounting + UNKNOWN resolved by the idempotent re-send.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
+        "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
+    STATE["force_results_400"] = True
+    rtc._post_ready_results({"task-CORE1"})
+    check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
+          and len(STATE["results"]) == _before,
+          "refused POST leaves the result file for the next pass")
+    check(rtc._delivery_core().backend.attempts("task-CORE1") == 1,
+          "the refusal is recorded in the outbox (drain ran through the seam)")
+    STATE["force_results_400"] = False
+    STATE["force_results_502_once"] = True
+    _ifc = {"task-CORE1"}
+    rtc._post_ready_results(_ifc)
+    check(len(STATE["results"]) == _before + 1
+          and STATE["results"][-1]["id"] == "task-CORE1"
+          and STATE["results"][-1]["body"] == "core answer"
+          and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
+          "ambiguous 502 resolved by the idempotent re-send in ONE pass "
+          "(delivered + archived)")
+    check(not _ifc, "confirmed delivery retires the task from inflight")
+    STATE["results"].pop()
+    (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content

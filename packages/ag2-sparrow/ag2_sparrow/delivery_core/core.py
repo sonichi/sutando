@@ -21,7 +21,9 @@ from .contract import (ClaimBackend, DeliveryOutcome, DeliveryProvider,
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    max_attempts: int = 3
+    """None removes the park ceiling: every confirmed NOT_DELIVERED stays
+    retryable (an adapter keeping legacy retry-every-pass semantics)."""
+    max_attempts: "int | None" = 3
 
 
 def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:
