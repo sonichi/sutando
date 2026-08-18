@@ -23,6 +23,7 @@ sys.modules["designC"] = C
 spec.loader.exec_module(C)
 
 fails = []
+checks = []   # counted, never asserted: a hardcoded total goes stale silently
 
 # --- every mutating entry point must refuse an uninitialized root -----------
 for name, call in (
@@ -30,13 +31,17 @@ for name, call in (
     ("claim",         lambda r: C.claim(r, "i", "w")),
     ("complete",      lambda r: C.complete(r, C.SEP.join(("k", "w", "1", "1", "g")))),
     ("force_requeue", lambda r: C.force_requeue(r, "i")),
+    # Both reached _item_lock only inside a loop, so an EMPTY root skipped the
+    # guard entirely and they returned [] / 0 — a no-op that reads as success.
+    ("recover",       lambda r: C.recover(r)),
+    ("cleanup",       lambda r: C.cleanup(r, 0)),
 ):
     root = tempfile.mkdtemp(prefix="init-guard-")
     try:
         call(root)
         fails.append(f"{name}: silently accepted an uninitialized root")
     except C.NotInitialized:
-        print(f"  ok: {name} refuses an uninitialized root")
+        checks.append(name); print(f"  ok: {name} refuses an uninitialized root")
     except Exception as e:
         fails.append(f"{name}: wrong error {type(e).__name__}: {e}")
     finally:
@@ -55,11 +60,11 @@ try:
         elif C.complete(root, tok) is not True:
             fails.append("control: complete failed after init()")
         else:
-            print("  ok: control — publish/claim/complete all succeed after init()")
+            checks.append("control"); print("  ok: control — publish/claim/complete all succeed after init()")
     C.init(root)  # idempotent
-    print("  ok: init() is idempotent")
+    checks.append("idempotent"); print("  ok: init() is idempotent")
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
-print("\nFAIL: " + "; ".join(fails) if fails else "\nPASS — activation guard (5 checks)")
+print("\nFAIL: " + "; ".join(fails) if fails else f"\nPASS — activation guard ({len(checks)} checks: {', '.join(checks)})")
 sys.exit(1 if fails else 0)

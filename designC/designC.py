@@ -117,13 +117,19 @@ def init(root) -> None:
         _INIT.add(rk)
 
 
-def _item_lock(root, key: str):
-    """Serialize one item's transitions. Keyed on safe_key, NOT the raw id:
-    recover only ever sees the key, and two spellings would stripe apart."""
+def _require_init(root) -> None:
+    """Every mutator asserts this, not just the ones that reach a lock: a scan
+    that finds nothing never enters its loop, so the guard would never fire."""
     if os.path.realpath(str(root)) not in _INIT:
         raise NotInitialized(
             f"init({root!r}) was never called; activating striping now would "
             f"race any thread that has already cached the unstriped verdict")
+
+
+def _item_lock(root, key: str):
+    """Serialize one item's transitions. Keyed on safe_key, NOT the raw id:
+    recover only ever sees the key, and two spellings would stripe apart."""
+    _require_init(root)
     return ob._item_lock(Path(root), key)
 
 
@@ -247,6 +253,7 @@ def complete(root, token: str, terminal: str = ARCHIVE) -> bool:
 
 def recover(root):
     """Return DEAD owners' items to ready/. UNKNOWN/ALIVE are never touched."""
+    _require_init(root)
     moved = []
     for f in sorted(_d(root, INFLIGHT).iterdir()):
         parts = f.name.split(SEP)
@@ -298,6 +305,7 @@ def force_requeue(root, item_id: str) -> bool:
 def cleanup(root, max_age_s: float, now: float | None = None) -> int:
     """Bound on-disk state: prune archive/ + undelivered/ entries older than
     max_age_s, and sweep tmp/ debris (torn publishes) on the same clock."""
+    _require_init(root)
     now = time.time() if now is None else now
     pruned = 0
     for d in (ARCHIVE, PARKED, TMP):
