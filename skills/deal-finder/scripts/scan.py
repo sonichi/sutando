@@ -318,12 +318,18 @@ def send_sms(env: dict, body: str) -> tuple[bool, str]:
 
 
 def send_telegram(body: str) -> bool:
-    """Drop a proactive- file for the telegram-bridge to pick up."""
+    """Drop a Telegram-destined proactive file for the telegram-bridge.
+
+    The destination rides in the filename (typed constructor, the only legal
+    spelling) so the intended channel — not whichever bridge polls first —
+    claims it."""
     try:
+        sys.path.insert(0, str(SKILL_DIR.parents[1] / "src"))
+        from proactive_routing import proactive_filename
         RESULTS_DIR.mkdir(exist_ok=True)
-        ts = int(time.time() * 1000)
-        path = RESULTS_DIR / f"proactive-deal-finder-{ts}.txt"
-        path.write_text(body)
+        name = proactive_filename(f"deal-finder-{int(time.time() * 1000)}",
+                                  channel="telegram")
+        (RESULTS_DIR / name).write_text(body)
         return True
     except Exception:
         return False

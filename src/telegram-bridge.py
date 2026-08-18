@@ -1000,7 +1000,7 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import proactive_destination, should_claim_proactive_file
+        from proactive_routing import should_claim_proactive_file
         try:
             if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
@@ -1013,12 +1013,10 @@ def main():  # pragma: no cover
                 # of which bridge is the active channel.
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
                 def _tg_claims(name: str) -> bool:
-                    # Destination outranks activity routing; the other
-                    # prefixes only skip a foreign tag defensively.
-                    if name.startswith("proactive-"):
-                        return should_claim_proactive_file(
-                            name, OWNER_ACTIVITY_FILE, "telegram")
-                    return proactive_destination(name) in (None, "telegram")
+                    # Destination outranks activity routing, uniformly;
+                    # discord's DM fallback stays the after-grace catch-all.
+                    return should_claim_proactive_file(
+                        name, OWNER_ACTIVITY_FILE, "telegram")
 
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \

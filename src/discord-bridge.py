@@ -5495,6 +5495,7 @@ async def poll_dm_fallback():
     GRACE_SECONDS = 90
     MAX_RETRY_AGE_SECONDS = 86400  # 24h: give up on stale files so the loop drains
     FALLBACK_PREFIXES = ("task-", "question-", "briefing-", "insight-", "friction-")
+    from proactive_routing import fallback_claims_name as _routing_fallback_claims  # noqa: E402
     while True:
         try:
             now = time.time()
@@ -5502,6 +5503,9 @@ async def poll_dm_fallback():
                 if f.suffix != ".txt":
                     continue
                 if not any(f.name.startswith(p) for p in FALLBACK_PREFIXES):
+                    continue
+                # Foreign/unknown .to-<channel> tags are never swept here.
+                if not _routing_fallback_claims(f.name, "discord"):
                     continue
                 # Skip anything Discord is already tracking for reply.
                 task_id = f.stem  # e.g. "task-1776286725412"

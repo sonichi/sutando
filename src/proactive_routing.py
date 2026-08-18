@@ -141,3 +141,11 @@ def should_claim_proactive_file(name, state_file_path: Path,
     if dest is not None:
         return dest == this_channel
     return should_claim_proactive(state_file_path, this_channel)
+
+
+def fallback_claims_name(name, this_channel: str) -> bool:
+    """Per-file gate for a channel's catch-all fallback (no activity routing):
+    a foreign or unknown .to-<channel> tag is never claimed — an explicit
+    destination strands visibly rather than falling into another channel's
+    fallback sweep."""
+    return proactive_destination(name) in (None, this_channel)

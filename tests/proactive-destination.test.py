@@ -29,7 +29,8 @@ os.environ.setdefault("SUTANDO_TEST_MODE", "1")
 os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
 os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
 
-from proactive_routing import (PROACTIVE_DESTINATIONS, proactive_destination,
+from proactive_routing import (PROACTIVE_DESTINATIONS, fallback_claims_name,
+                               proactive_destination,
                                proactive_filename,
                                should_claim_proactive_file)
 
@@ -123,6 +124,39 @@ def main() -> int:
               _sb._slack_claims_name(proactive_filename(1, "discord")) is False)
     except Exception as e:  # pragma: no cover — loader env drift, not the predicate
         check("slack bridge loadable for predicate checks", False, str(e))
+
+    # Catch-all fallback gate (discord's poll_dm_fallback wiring): undestined
+    # and own-destination names are sweepable; foreign/unknown tags never are.
+    check("fallback sweeps undestined cron artifacts",
+          fallback_claims_name("briefing-2026-08-18.txt", "discord"))
+    check("fallback sweeps its own destination",
+          fallback_claims_name("briefing-1.to-discord.txt", "discord"))
+    check("fallback never sweeps a foreign destination",
+          fallback_claims_name("briefing-1.to-telegram.txt", "discord") is False)
+    check("fallback never sweeps an unknown tag",
+          fallback_claims_name("insight-1.to-futurechan.txt", "discord") is False)
+
+    # Production writers with declared channel intent emit destined names.
+    import importlib.util as _wilu
+    _dspec = _wilu.spec_from_file_location(
+        "dealfinder_scan_dest_test", REPO / "skills" / "deal-finder" / "scripts" / "scan.py")
+    _dmod = _wilu.module_from_spec(_dspec)
+    _dspec.loader.exec_module(_dmod)
+    with tempfile.TemporaryDirectory() as td:
+        _dmod.RESULTS_DIR = Path(td)
+        check("deal-finder writes a telegram-destined proactive file",
+              _dmod.send_telegram("test body") and any(
+                  proactive_destination(f.name) == "telegram"
+                  for f in Path(td).iterdir()))
+    _rspec = _wilu.spec_from_file_location(
+        "harness_report_dest_test",
+        REPO / "skills" / "voice-agent-test-harness" / "scripts" / "report.py")
+    _rmod = _wilu.module_from_spec(_rspec)
+    _rspec.loader.exec_module(_rmod)
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(_rmod.deliver("report body", workspace=td))
+        check("test-harness report is telegram-destined",
+              proactive_destination(out.name) == "telegram" and out.exists())
 
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)
