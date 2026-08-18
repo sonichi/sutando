@@ -109,14 +109,11 @@ r = probe(1, 1, 400)
 check(r["status"] == "ok", f"held + UNDER deadline -> ok (got {r['status']!r})")
 check(r["status"] not in ALERTABLE,
       "all-held does NOT reach emit_task_for_failures / notify_for_failures")
-# No wording claim here: one task under both thresholds reaches neither branch,
-# so it takes the plain fall-through. The reassuring wording is asserted below,
-# on the count+age branch, which is the only place it is still reachable.
+# One task under both thresholds reaches neither branch, so no wording claim
+# here; it is asserted below on the count+age branch, the only place it survives.
 
-# THE BOUND. 1000s is past the worker's own hard deadline
-# (SUTANDO_TIER_HARD_TIMEOUT, session-worker.py:249, default 900), so "a live
-# worker holds it" has stopped being evidence that anything is progressing.
-# Without this the suppression is unbounded and a wedged worker is invisible.
+# THE BOUND: 1000s is past the worker's own hard deadline (default 900), so
+# "a live worker holds it" is no longer evidence that anything is progressing.
 r = probe(1, 1, 1000)
 check(r["status"] == "warn", f"held + PAST deadline -> warn (got {r['status']!r})")
 check(r["status"] in ALERTABLE, "a wedged worker reaches the notifier")
@@ -140,9 +137,8 @@ r = probe(4, 4, 400)
 check(r["status"] == "ok", f"count+age branch, all held -> ok (got {r['status']!r})")
 check("not stalled" in r["detail"], "the detail still explains why it is quiet")
 
-# The count+age branch carried the SAME unbounded suppression and returns before
-# the stuck_age_sec branch is reached, so bounding only the latter would leave a
-# 4-task all-held pile quiet at any age.
+# The count+age branch carries the SAME suppression and returns FIRST, so
+# bounding only stuck_age_sec would leave a 4-task all-held pile quiet at any age.
 r = probe(4, 4, 1000)
 check(r["status"] == "warn",
       f"count+age branch, all held PAST deadline -> warn (got {r['status']!r})")
