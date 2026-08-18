@@ -139,8 +139,12 @@ One entry per agent-facing module.
 - **`task-emit.sh`** — TASK_FILE emitters — sourceable so a test can invoke them in isolation.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
+- **`task_envelope.py`** — Task-envelope authentication: an HMAC stamp that makes access_tier a verified claim instead of an honor-system header.
+- **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
+- **`team_guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
+- **`team_result_guard.py`** — Final scan applied to a Team-tier result before any router reads its markers.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
@@ -160,6 +164,7 @@ One entry per agent-facing module.
 - **`voice-config-switch.ts`** — Voice tool: switch voice-agent's model + googleSearch preset at runtime.
 - **`voice-config.ts`** — Per-surface voice configuration loader.
 - **`voice-connect-resolver.ts`** — Transparent voice-connection tier resolution — picks the best reachable endpoint for "call your agent" so the user never chooses a tier.
+- **`voice-connect-watchdog.ts`** — Stuck-CONNECTING recovery policy for the voice health monitor (#2963).
 - **`voice-context.ts`** — Builds a system prompt for the Claude Code subprocess that injects Sutando identity and user context from the memory system.
 - **`voice-continuity.ts`** — voice-continuity — P7 D7.3 continuity helpers (Tranche A engine-side): the stale-repeat goodbye guard and the centralized conversation-clear.
 - **`voice-error-classifier.ts`** — Classify Gemini Live transport close events into actionable categories.
