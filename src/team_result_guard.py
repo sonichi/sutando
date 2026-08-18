@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # A marker is a control only where the shared parser EXECUTES it, so the guard
 # derives its classification from parse_markers rather than a parallel grammar.
@@ -123,21 +124,47 @@ def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
     return body
 
 
+VERDICT_DELIVER = "deliver"
+VERDICT_LEAK = "leak"
+VERDICT_SUPPRESS = "suppress"
+
+
+class TeamResultVerdict(NamedTuple):
+    """kind: deliver | leak | suppress. body: what a notice-mechanics adapter
+    delivers; an adapter with a durable transport journal may realise SUPPRESS
+    as a journaled silent close instead -- the record requirement is the policy."""
+    kind: str
+    body: str
+    reason: "str | None"
+
+
+def classify_result_for_tier(body: str, tier, repo: Path,
+                             secret_filter=None) -> TeamResultVerdict:
+    """The guard-owned policy verdict. Adapters apply transport mechanics only;
+    re-deciding (or bypassing) this classification in a bridge is a boundary
+    violation, not an implementation choice."""
+    if not is_guarded_tier(tier):
+        return TeamResultVerdict(VERDICT_DELIVER, body, None)
+    try:
+        return TeamResultVerdict(
+            VERDICT_DELIVER, scan_team_result(body, repo, secret_filter), None)
+    except TeamResultLeakError as exc:
+        if str(exc) == "suppressive delivery marker":
+            return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT, str(exc))
+        return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT, str(exc))
+    except Exception as exc:
+        # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
+        # withheld, never delivered on the assumption that it was probably fine.
+        return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT,
+                                 f"scanner unavailable: {exc}")
+
+
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
-    by catching an exception — the safe body is the only one it is handed.
+    by catching an exception -- the safe body is the only one it is handed.
+    Derived from classify_result_for_tier so the verdict has exactly one owner.
     """
-    if not is_guarded_tier(tier):
-        return body, None
-    try:
-        return scan_team_result(body, repo, secret_filter), None
-    except TeamResultLeakError as exc:
-        if str(exc) == "suppressive delivery marker":
-            return TEAM_SUPPRESS_RESULT, str(exc)
-        return TEAM_LEAK_RESULT, str(exc)
-    except Exception as exc:
-        # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
-        # withheld, never delivered on the assumption that it was probably fine.
-        return TEAM_LEAK_RESULT, f"scanner unavailable: {exc}"
+    verdict = classify_result_for_tier(body, tier, repo, secret_filter)
+    return verdict.body, verdict.reason

@@ -168,6 +168,21 @@ def main() -> int:
             print(f"  - {f}")
         return 1
     print("PASS: non-owner results are scanned before any marker is interpreted.")
+    # Verdict ownership: the wrapper must DERIVE from classify (one owner).
+    for body, tier, filt, kind in (
+        ("plain reply", "team", _clean, guard.VERDICT_DELIVER),
+        ("plain reply", "owner", _leaky, guard.VERDICT_DELIVER),
+        ("[no-send]\nhide", "team", _clean, guard.VERDICT_SUPPRESS),
+        ("**[core: 1]**\n[no-send]\nhide", "team", _clean, guard.VERDICT_SUPPRESS),
+        ("[attach: /etc/passwd]", "team", _clean, guard.VERDICT_LEAK),
+        ("secret text", "team", _leaky, guard.VERDICT_LEAK),
+    ):
+        v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
+        assert v.kind == kind, (body, tier, v)
+        wrapped = guard.guard_result_for_tier(body, tier, REPO, secret_filter=filt)
+        assert wrapped == (v.body, v.reason), (body, tier, "wrapper diverged from verdict")
+    print("  [verdict] classify_result_for_tier owns the three-way decision;")
+    print("            guard_result_for_tier provably derives from it")
     print("  [behavioral] owner passes through; redirect/attach/no-send/secret withheld;")
     print("               unknown tier guarded; a raising scanner fails CLOSED")
     print("  [structural] guard precedes parse_markers in the delivery loop, unknown tier")
