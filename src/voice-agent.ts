@@ -247,7 +247,7 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // because the web client's code-heavy workload prefers 3.1 and the (key,
 // 3.1, googleSearch) combo trips a 1011 close on the VOICE key when search
 // is true. Phone inherits the package default (2.5+search).
-import { loadVoiceConfig } from './voice-config.js';
+import { loadVoiceConfig, resolveSessionTuning } from './voice-config.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
 if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
@@ -271,6 +271,20 @@ const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
 // "divergenceCorrection": true additionally speaks a self-correction when
 // the shadow pass disagrees. Requires shadowStt.
 const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
+// Phase 0.5 seams (design §2.1/§2.2): OFF unless configured — with nothing
+// set the VoiceSession config carries neither key and the wire behaviour is
+// byte-identical to the previous build (the Phase 0.5 gate). A half-set or
+// inverted threshold pair throws HERE, failing startup loudly.
+const VOICE_SESSION_TUNING = resolveSessionTuning(VOICE_AGENT_CONFIG);
+console.log(
+	`${new Date().toISOString().slice(11, 23)} [voice-agent] session tuning: compression=${
+		VOICE_SESSION_TUNING.compressionConfig === undefined
+			? 'off'
+			: VOICE_SESSION_TUNING.compressionConfig.triggerTokens === undefined
+				? 'server-defaults'
+				: `trigger=${VOICE_SESSION_TUNING.compressionConfig.triggerTokens},target=${VOICE_SESSION_TUNING.compressionConfig.targetTokens}`
+	} mediaResolution=${VOICE_SESSION_TUNING.mediaResolution ?? 'unset'}`,
+);
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
@@ -959,6 +973,14 @@ async function main() {
 					.promptTokensDetails,
 			),
 		onConnectionLifecycle: (e) => audioHealth.noteLifecycleEvent(e),
+		// Phase 0.5 seams — spread for REAL key absence (design §2.1: an absent
+		// key lets the server default apply; `undefined` is not absent).
+		...(VOICE_SESSION_TUNING.compressionConfig !== undefined
+			? { compressionConfig: VOICE_SESSION_TUNING.compressionConfig }
+			: {}),
+		...(VOICE_SESSION_TUNING.mediaResolution !== undefined
+			? { mediaResolution: VOICE_SESSION_TUNING.mediaResolution }
+			: {}),
 		...(VOICE_SHADOW_STT
 			? {
 					shadowSttProvider: new GeminiBatchSTTProvider({
