@@ -93,15 +93,27 @@ class DesignCClaimBackend:
 
     capabilities = BackendCapabilities(supports_force_release=True)
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, activate: bool = False):
         self.root = Path(root)
         for name in (TMP, READY, INFLIGHT, ARCHIVE, PARKED, ATTEMPTS):
             self._d(name)
         rk = os.path.realpath(str(self.root))
         with _ACTIVATE_GUARD:
-            if rk not in _ACTIVATED:
+            if rk in _ACTIVATED:
+                return
+            # Assert, don't perform: striping activation is a migration whose
+            # contract requires quiescence — constructing an object is not a
+            # deploy step. The fence must already exist unless the deploy
+            # path passes activate=True (yixuan, #3104).
+            if activate:
                 outbox.activate_lock_striping(self.root)
-                _ACTIVATED.add(rk)
+            elif not outbox._fence_path(self.root).exists():
+                raise RuntimeError(
+                    f"outbox root {self.root} is not stripe-fenced: run "
+                    "activation during a deploy window (no other consumer "
+                    "of this root running), e.g. "
+                    "DesignCClaimBackend(root, activate=True)")
+            _ACTIVATED.add(rk)
 
     # ── namespace helpers ───────────────────────────────────────────────
     def _d(self, name: str) -> Path:

@@ -52,9 +52,26 @@ def main() -> int:
     except ProcessLookupError:
         pass
 
+    # Assert-don't-perform (yixuan, #3104): constructing on an unfenced root
+    # must refuse with the migration instruction, never write the fence.
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            DesignCClaimBackend(Path(td))
+            check("unfenced root refused without activate=True", False)
+        except RuntimeError as e:
+            check("unfenced root refused without activate=True",
+                  "not stripe-fenced" in str(e))
+        check("refusal did not write the fence",
+              not backend_c.outbox._fence_path(Path(td)).exists())
+        b = DesignCClaimBackend(Path(td), activate=True)
+        check("deploy-path activation fences the root",
+              backend_c.outbox._fence_path(Path(td)).exists())
+        check("fenced root then constructs without activate",
+              DesignCClaimBackend(Path(td)) is not None)
+
     # CE-6: complete -> republish -> reclaim; the stale token must be inert.
     with tempfile.TemporaryDirectory() as td:
-        b = DesignCClaimBackend(Path(td))
+        b = DesignCClaimBackend(Path(td), activate=True)
         check("publish", b.publish(ITEM, b"v1"))
         t1 = b.claim(ITEM, "drainer-A")
         check("claim epoch 1", t1 is not None)
@@ -70,7 +87,7 @@ def main() -> int:
 
     # GHOST: dead token beside a live claim — anticipated, never a raise.
     with tempfile.TemporaryDirectory() as td:
-        b = DesignCClaimBackend(Path(td))
+        b = DesignCClaimBackend(Path(td), activate=True)
         b.publish(ITEM, b"x")
         plant_dead_ghost(b, ITEM)
         try:
@@ -89,7 +106,7 @@ def main() -> int:
 
     # GHOST-2: dead token with NO live holder re-arms to ready.
     with tempfile.TemporaryDirectory() as td:
-        b = DesignCClaimBackend(Path(td))
+        b = DesignCClaimBackend(Path(td), activate=True)
         plant_dead_ghost(b, ITEM)
         rep = b.recover()
         check("ghost-2: lone dead token re-arms",
@@ -99,7 +116,7 @@ def main() -> int:
 
     # SLOT: publish refused while the id is live in either namespace.
     with tempfile.TemporaryDirectory() as td:
-        b = DesignCClaimBackend(Path(td))
+        b = DesignCClaimBackend(Path(td), activate=True)
         check("slot: first publish", b.publish(ITEM, b"x"))
         check("slot: second publish refused (ready occupied)",
               b.publish(ITEM, b"x") is False)
@@ -112,7 +129,7 @@ def main() -> int:
 
     # attempts + park ceiling through the contract surface.
     with tempfile.TemporaryDirectory() as td:
-        b = DesignCClaimBackend(Path(td))
+        b = DesignCClaimBackend(Path(td), activate=True)
         b.publish(ITEM, b"x")
         t = b.claim(ITEM, "w")
         b.complete(t, DeliveryOutcome.NOT_DELIVERED, park_at_attempts=2)
@@ -130,7 +147,7 @@ def main() -> int:
     # PID-REUSE (Codex blocking finding): an ALIVE pid whose birth mismatches
     # the token is a reused pid — the claimant is dead; recover must re-arm.
     with tempfile.TemporaryDirectory() as td:
-        b = DesignCClaimBackend(Path(td))
+        b = DesignCClaimBackend(Path(td), activate=True)
         key = backend_c._safe_key(ITEM)
         reused = b.root / "inflight" / SEP.join(
             (key, "ghost", str(os.getpid()), "1", "0"))   # alive pid, wrong birth
@@ -151,7 +168,7 @@ def main() -> int:
 
     # cleanup must not reset a LIVE item's park ceiling (air's #3104 nit).
     with tempfile.TemporaryDirectory() as td:
-        b = DesignCClaimBackend(Path(td))
+        b = DesignCClaimBackend(Path(td), activate=True)
         b.publish(ITEM, b"x")
         t = b.claim(ITEM, "w")
         b.complete(t, DeliveryOutcome.NOT_DELIVERED, park_at_attempts=5)

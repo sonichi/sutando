@@ -35,7 +35,7 @@ def _a_backend(tmp: Path):
 
 
 def _c_backend(tmp: Path):
-    return DesignCClaimBackend(tmp)
+    return DesignCClaimBackend(tmp, activate=True)
 
 
 BACKENDS = {
