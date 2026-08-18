@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
-Only the PURE shared utilities (task_archive/local_task_protocol/result_markers) are
-bundled verbatim from sonichi/sutando `src/` (option A). The transport-specific
-modules (remote_gateway_bridge, _dirs, send_allowlist) are package-canonical and
-intentionally diverge from src (dir-interface, no workspace-resolution).
+Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
+canonical for those modules — currently 14 of them, including outbox.py and its
+transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
+and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
+dir-interface, no workspace-resolution).
+
+MAP is the authority on which is which. This docstring named three modules for a
+long time after MAP grew past them, so it read as "outbox is not covered" — the
+opposite of what --check does. When you add an entry, the count above is the only
+thing here that needs updating; better still, read MAP.
 
 The relay client lives canonically in sonichi/sutando `src/` (the core
 runs it directly). This package is a *distribution* of those exact files — never

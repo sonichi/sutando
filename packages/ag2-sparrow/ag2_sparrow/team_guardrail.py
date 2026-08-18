@@ -8,7 +8,8 @@ only thing that used to deliver it). Per the repo's adapter rule that shared
 policy lives in a dependency-light `src/` module, the text lives here once and
 neither adapter carries a copy.
 
-The prose is verbatim from the session worker's `_team_prompt` and is
+The prose was extracted verbatim from the session worker's Team path (since
+removed as unreachable) and is
 deliberately surface-neutral: it contains no "channel", "room", or provider
 noun, so it reads correctly on Discord, AG2 Space, and anything added later.
 Do not add surface-specific wording here — a caller that needs it should say so
