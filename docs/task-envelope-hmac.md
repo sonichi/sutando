@@ -3,6 +3,10 @@
 A host-local authenticity/integrity seal on the `tasks/` file boundary.
 Owner-ratified threat model and rollout phases: 2026-08-17/18 design thread.
 
+**Change control (owner directive 2026-08-18): this is a security-critical
+component — changes to the envelope, sealer, key handling, or enforcement
+behavior MUST be reviewed and approved by key maintainers before landing.**
+
 ## What it is (and is not)
 
 Every task file a trusted writer creates carries one stamp line:
