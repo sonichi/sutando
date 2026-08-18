@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/sonichi/sutando/main/packages/ag2-sparrow/assets/png/icon-charcoal-512.png" alt="AG2 Sparrow" width="128" height="128">
+  <img src="https://raw.githubusercontent.com/sonichi/sutando/main/packages/ag2-sparrow/assets/icon-charcoal-512.png" alt="AG2 Sparrow" width="128" height="128">
 </p>
 
 <h1 align="center">AG2 Sparrow</h1>
