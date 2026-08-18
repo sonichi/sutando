@@ -171,6 +171,40 @@ class DefensiveBranches(unittest.TestCase):
             self.stdout = out
             self.returncode = rc
 
+    def test_a_stopped_climb_is_named_so_the_deadline_is_not_read_as_live(self):
+        """The max window is the WORST one, by design — a compaction must not be
+        able to hide a climb. The cost is that `gain <= 0` discards every flat or
+        shrinking window, so once growth STOPS the only surviving evidence is the
+        old climb, and the note keeps quoting a deadline from a regime that ended.
+
+        Measured 2026-08-17 on the live index: writes were frozen at 09:5xZ and it
+        then FELL 273 B, while this note still read "+643 B over the last 10.9h,
+        ~15.3h of remaining headroom" off a window starting 05:39Z. Acting on that
+        urgency meant pre-empting a curation decision that was explicitly the
+        owner's to make.
+        """
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        # climbs 2000 B, then stops and gives some back — exactly the shape above
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(
+                Path(td), [cap - 3000, cap - 2000, cap - 1000, cap - 1200, cap - 1400])
+            note = m._index_growth_note(idx, cap - 1400)
+        self.assertIn("of remaining headroom at that rate", note)   # the old figure survives
+        self.assertIn("flat or shrinking", note)                    # and is qualified
+        self.assertIn("stale", note)
+
+    def test_a_still_climbing_history_carries_no_stale_caveat(self):
+        """The control. Without it the caveat could be unconditional, which would
+        mute the warning in exactly the case it is for."""
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [cap - 3000, cap - 2000, cap - 1000])
+            note = m._index_growth_note(idx, cap - 1000)
+        self.assertIn("of remaining headroom at that rate", note)
+        self.assertNotIn("flat or shrinking", note)
+
     def test_unparsable_log_line_is_skipped(self):
         m = _hc()
         calls = {"n": 0}
