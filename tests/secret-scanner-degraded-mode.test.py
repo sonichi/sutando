@@ -84,6 +84,18 @@ def in_process_degraded_arm():
         check("in-process: hex rule fires",
               any(h.secret_type == "Bare Hex Token" for h in hits))
         check("in-process: DEGRADED announced", "DEGRADED" in err.getvalue())
+        # The vault refusal must branch on capability, not import failure,
+        # and keep naming THIS interpreter (the repair instruction).
+        sys.modules.pop("vault_intercept", None)
+        import vault_intercept as vi
+        res = vi.intercept_vault_commands(
+            "vault set STRIPE_KEY sk-live-abc123XYZ")
+        out = res.text
+        check("vault refusal survives the guarded import (degraded)",
+              "REFUSED" in out and "detect-secrets not installed" in out)
+        check("refusal still names this interpreter",
+              sys.executable in out)
+        sys.modules.pop("vault_intercept", None)
     finally:
         sys.meta_path.remove(hook)
         sys.modules.pop("secret_scanner", None)
