@@ -40,7 +40,13 @@ const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
 export const VISION_MIN_SEND_INTERVAL_MS = 900;
-const MAX_FPS = 1000 / VISION_MIN_SEND_INTERVAL_MS;
+// https://ai.google.dev/gemini-api/docs/live-api — video is sampled at 1 fps.
+// Cite it: the repo states this rate nowhere else, so an uncited literal here
+// would be unfalsifiable for the next reader.
+export const MAX_FPS = 1.0;
+// Floor is deliberately below any shipping default: sub-0.5 rates exist so the
+// cost/cadence experiments can run, not because they are a good user default.
+export const MIN_FPS = 0.1;
 const MIN_INTERVAL_MS = 250;
 // TODO(roadmap §5 Now: cost posture): A 720p JPEG q=0.6 ≈ 80–150KB. At 1 fps
 // continuous that's ~6–9MB/min into Gemini Live's video slot, plus context-
@@ -927,7 +933,7 @@ function noteFrameFailure(msg: string): void {
 }
 
 function startStream(source: VisionSource, fps: number): { fps: number; intervalMs: number } {
-	const clamped = Math.max(0.5, Math.min(MAX_FPS, fps));
+	const clamped = Math.max(MIN_FPS, Math.min(MAX_FPS, fps));
 	const intervalMs = Math.max(MIN_INTERVAL_MS, Math.round(1000 / clamped));
 	if (ticker) clearInterval(ticker);
 	streamGen++;
@@ -989,7 +995,7 @@ export const startVisionTool: ToolDefinition = {
 		'Prefer send_vision_frame for one-off "look at this" questions. Instant.',
 	parameters: z.object({
 		source: z.string().optional().describe("Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."),
-		fps: z.number().optional().describe('Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.'),
+		fps: z.number().optional().describe('Frames per second, 0.1–1.0 (Gemini Live caps video at 1 fps). Default 1. Webcam may not keep up above 0.5.'),
 	}),
 	execution: 'inline',
 	async execute(args) {

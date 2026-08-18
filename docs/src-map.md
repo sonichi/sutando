@@ -57,6 +57,7 @@ One entry per agent-facing module.
 - **`discord_context_policy.py`** — contextNotFrom gate — the single policy deciding whether a serving channel may pull another Discord channel's content into context.
 - **`discord_http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
 - **`discord_reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
+- **`discord_rest_client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
@@ -87,6 +88,7 @@ One entry per agent-facing module.
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
 - **`orphan_result_routes.py`** — Routes for results whose task a bridge never saw.
+- **`osascript-setup-hint.ts`** — Extract the user-actionable sentence from an osascript failure.
 - **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
 - **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
