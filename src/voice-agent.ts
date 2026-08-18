@@ -33,7 +33,7 @@ import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
-import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence } from './vision-tools.js';
+import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
@@ -924,6 +924,16 @@ async function main() {
 		sessionId: SESSION_ID,
 		persist: (row) => healthPersistence.tryEnqueue(row),
 		log: (m) => console.log(`${ts()} ${m}`),
+		// Samples bodhi's getDiagnostics on ledger ticks. `session` is assigned
+		// below; the try/catch — not the typeof — is what covers a tick racing
+		// construction, since typeof on a const in its TDZ still throws.
+		getSessionDiagnostics: () => {
+			try {
+				return typeof session !== 'undefined' ? (session.getDiagnostics?.() ?? null) : null;
+			} catch {
+				return null;
+			}
+		},
 	});
 
 	const session = new VoiceSession({
@@ -938,6 +948,17 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
+		// context occupancy and connection lineage (design §1.1/§1.4).
+		// The per-modality breakdown rides the same message (design §1.4) but is
+		// provider-specific, so bodhi types only the shared fields — cast to read.
+		onUsageMetadata: (u) =>
+			audioHealth.noteUsageMetadata(
+				u.promptTokenCount,
+				(u as { promptTokensDetails?: Array<{ modality?: string; tokenCount?: number }> })
+					.promptTokensDetails,
+			),
+		onConnectionLifecycle: (e) => audioHealth.noteLifecycleEvent(e),
 		...(VOICE_SHADOW_STT
 			? {
 					shadowSttProvider: new GeminiBatchSTTProvider({
@@ -1442,6 +1463,12 @@ async function main() {
 	if (origDisconnect) {
 		(session as any).handleClientDisconnected = () => {
 			origDisconnect();
+			// No listener left, so frames only burn capture + quota. Reason is
+			// terminal: a browser push driver must tear down, not re-arm.
+			const stopped = stopVisionStreaming('no-client');
+			if (stopped.status === 'stopped') {
+				console.log(`${ts()} [Vision] stopped on client disconnect (${stopped.frames} frame(s))`);
+			}
 			recorder.flush();
 			writeVoiceState(false);
 			// P7 D7.1: final ledger row for the departing epoch — written NOW
@@ -1594,6 +1621,11 @@ async function main() {
 	let lastLoggedStatus = '';
 	let matrixBaseline: MatrixBaseline | null = null;
 	let lastMatrixVerdict = '';
+	// Phase-1 shadow: the 'session+egress' ruleset runs in parallel and is
+	// telemetry-only — canary 3a later compares live vs shadow on identical
+	// input, which is impossible if the shadow never ran.
+	let shadowBaseline: MatrixBaseline | null = null;
+	let lastShadowVerdict = '';
 	let lastFailedWrites = 0;
 	setInterval(() => {
 		const state = session.sessionManager.state ?? 'unknown';
@@ -1626,7 +1658,27 @@ async function main() {
 			now: Date.now(),
 		});
 		matrixBaseline = matrix.baseline;
-		audioHealth.noteMatrixVerdict(matrix.verdict);
+		const shadow = evaluateMatrix({
+			sessionState: state,
+			clientConnected,
+			snapshot,
+			prev: shadowBaseline,
+			serverBufferedAmount,
+			lastModelEventAt: snapshot.lastModelEventAt,
+			effectiveCoverage: 'session+egress',
+			now: Date.now(),
+		});
+		shadowBaseline = shadow.baseline;
+		if (
+			shadow.verdict !== lastShadowVerdict &&
+			(shadow.verdict !== 'healthy-idle' || lastShadowVerdict)
+		) {
+			console.log(
+				`${ts()} [Matrix-shadow] ${shadow.verdict}${shadow.reasons.length ? ' (' + shadow.reasons.join('; ') + ')' : ''}`,
+			);
+		}
+		lastShadowVerdict = shadow.verdict;
+		audioHealth.noteMatrixVerdict(matrix.verdict, matrix.facts, matrix.reasons);
 		if (matrix.verdict !== lastMatrixVerdict && (matrix.verdict !== 'healthy-idle' || lastMatrixVerdict)) {
 			console.log(`${ts()} [Matrix] ${matrix.verdict}${matrix.reasons.length ? ' (' + matrix.reasons.join('; ') + ')' : ''}`);
 		}
@@ -1640,10 +1692,16 @@ async function main() {
 		// Rate windows advance EVERY tick (a suppressed streak must not turn
 		// the next logged line into a long-window average).
 		const seg = audioHealth.healthSegments(clientConnected, serverBufferedAmount);
+		// Whether the vision throttle engaged was previously unknowable from the
+		// log — deferredBudget existed but was never surfaced (investigation F2).
+		const eg = getVisionEgressStats();
+		const visionSeg = isStreaming()
+			? ` vision={sent:${eg.sent},defB:${eg.deferredBudget},defG:${eg.deferredGate},disp:${eg.displaced}}`
+			: '';
 		if (state !== 'ACTIVE' || status !== lastLoggedStatus || anomaly.anomalous || persistFailed) {
 			const why = anomaly.anomalous ? ` anomaly=${anomaly.reasons.join(',')}` : '';
 			const pf = persistFailed ? ` persistFail=${healthPersistence.failedWrites}` : '';
-			console.log(`${ts()} [Health] ${status}${clientConnected ? ' ' + seg : ''}${why}${pf}`);
+			console.log(`${ts()} [Health] ${status}${clientConnected ? ' ' + seg : ''}${visionSeg}${why}${pf}`);
 			lastLoggedStatus = status;
 		}
 		audioHealth.clearTickLatches();

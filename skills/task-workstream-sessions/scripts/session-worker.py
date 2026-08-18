@@ -38,6 +38,7 @@ _GUARD_ROOT = next(
 if _GUARD_ROOT is not None and str(_GUARD_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_GUARD_ROOT / "src"))
 from team_result_guard import (  # noqa: E402
+
     resolve_access_tier,
 )
 
