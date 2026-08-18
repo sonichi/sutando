@@ -346,7 +346,7 @@
     "contributors",
     "maintainers"
    ],
-   "status": "current",
+   "status": "canonical",
    "canonical_for": "the task-envelope HMAC mechanism, its precise security claim, the four-verdict state machine, and the owner-ratified five-phase mailbox-authority rollout",
    "last_verified": "2026-08-18"
   }
