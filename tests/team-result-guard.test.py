@@ -54,16 +54,29 @@ def behavioral() -> list:
     fails = []
     cases = [
         # name, body, tier, filter, expect_withheld
-        ("owner keeps its markers", "see [channel: 123]", "owner", _clean, False),
+        #
+        # Detection derives from result_markers.parse_markers, so the guard is
+        # exactly as wide as every consumer PER FAMILY: anchored families
+        # (skip/redirect) only count in their canonical slot; attach and
+        # dm-only count anywhere, matching their consumers.
+        ("owner keeps its markers", "[channel: 123]\nsee this", "owner", _clean, False),
         ("owner keeps an attach", "[attach: /tmp/x.png]", "owner", _clean, False),
-        ("team redirect withheld", "see [channel: 123]", "team", _clean, True),
+        ("team redirect (body start) withheld", "[channel: 123]\nthe reply", "team", _clean, True),
+        ("team redirect mid-prose is a MENTION, passes", "see [channel: 123]", "team", _clean, False),
         ("team attach withheld", "[attach: /etc/passwd]", "team", _clean, True),
-        ("team no-send withheld", "[no-send]", "team", _clean, True),
+        ("team attach mid-prose STILL withheld (unanchored family)",
+         "docs mention [file: /etc/passwd] here", "team", _clean, True),
+        ("team no-send (body start) withheld", "[no-send]", "team", _clean, True),
+        ("team no-send mid-prose is a MENTION, passes",
+         "the [no-send] marker suppresses delivery", "team", _clean, False),
+        ("team deduped mid-prose passes", "about [deduped: task-1] semantics", "team", _clean, False),
+        ("team dm-only ANYWHERE withheld (fail-safe family)",
+         "prose then [dm-only] later", "team", _clean, True),
         ("team secret withheld", "ordinary text", "team", _leaky, True),
         ("team clean text passes", "ordinary text", "team", _clean, False),
-        ("guest guarded like team", "[channel: 9]", "guest", _clean, True),
-        ("unknown tier guarded", "[channel: 9]", "", _clean, True),
-        ("None tier guarded", "[channel: 9]", None, _clean, True),
+        ("guest guarded like team", "[channel: 9]\nx", "guest", _clean, True),
+        ("unknown tier guarded", "[channel: 9]\nx", "", _clean, True),
+        ("None tier guarded", "[channel: 9]\nx", None, _clean, True),
     ]
     for name, body, tier, filt, expect in cases:
         out, why = guard.guard_result_for_tier(body, tier, REPO, secret_filter=filt)
@@ -84,7 +97,7 @@ def behavioral() -> list:
 
     # The caller is handed only the safe body — it cannot deliver the raw text
     # by swallowing an exception.
-    out, _ = guard.guard_result_for_tier("[channel: 5] secret", "team", REPO, secret_filter=_clean)
+    out, _ = guard.guard_result_for_tier("[channel: 5]\nsecret", "team", REPO, secret_filter=_clean)
     if "[channel:" in out:
         fails.append("the withheld body still carried the control marker")
 
@@ -95,6 +108,52 @@ def behavioral() -> list:
             fails.append(f"tier {tier!r} must be guarded (only exact 'owner' is exempt)")
     if not guard.is_guarded_tier("Owner "):
         pass  # case/space-insensitive owner is intentionally exempt
+
+    # Wideness invariant: any body the CONSUMER grammar acts on must be
+    # withheld for a guarded tier — derived over every family the parser
+    # can emit, so a new marker family cannot silently bypass the guard.
+    from result_markers import parse_markers
+    family_uses = {
+        "skip": "[no-send]\nbody",
+        "redirect": "[channel: 123]\nbody",
+        "attach": "mid prose [file: /tmp/f] ok",
+        "dm-only": "prose [dm-only] prose",
+    }
+    for family, body in family_uses.items():
+        acted = [a.kind for a in parse_markers(body).actions]
+        if not acted:
+            fails.append(f"invariant fixture stale: {family} body yields no consumer action")
+            continue
+        _, why = guard.guard_result_for_tier(body, "team", REPO, secret_filter=_clean)
+        if why is None:
+            fails.append(f"consumer acts on {family} but the guard passed it")
+
+    # Withheld bodies are persisted for owner review — the placeholder's
+    # claim must be TRUE (pre-fix the body was silently dropped).
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["SUTANDO_WORKSPACE_FOR_TEST"] = td
+        import workspace_default as wd
+        real_resolve = wd.resolve_workspace
+        wd.resolve_workspace = lambda: Path(td)
+        try:
+            secret_body = "[channel: 5]\nthe withheld payload"
+            out, why = guard.guard_result_for_tier(secret_body, "team", REPO, secret_filter=_clean)
+            saved = list((Path(td) / "state" / "withheld-team-results").glob("withheld-*.txt"))
+            if len(saved) != 1:
+                fails.append(f"withheld body was not persisted (found {len(saved)})")
+            else:
+                content = saved[0].read_text()
+                if "the withheld payload" not in content or "withheld_reason:" not in content:
+                    fails.append("persisted file missing body or reason header")
+                if (saved[0].stat().st_mode & 0o777) != 0o600:
+                    fails.append("persisted withheld file must be 0600")
+            if "withheld-team-results" not in out:
+                fails.append("placeholder must name the review location")
+        finally:
+            wd.resolve_workspace = real_resolve
+            os.environ.pop("SUTANDO_WORKSPACE_FOR_TEST", None)
     return fails
 
 
