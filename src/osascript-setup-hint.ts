@@ -30,15 +30,17 @@ export type ScrollOutcome =
 export function scrollOutcome(o: {
 	scrollMoved: boolean | null; keyDenied: boolean; hints: string[]; direction: string;
 }): ScrollOutcome {
-	// keyDenied is load-bearing: `osascript key code` exits 0 whether or not
-	// anything handled the key, so only a THROW proves the fallback never ran.
-	if (o.scrollMoved !== true && o.keyDenied && o.hints.length > 0) {
-		return { status: 'setup_required', moved: false, steps: o.hints,
-		         message: 'The scroll did not go through — a one-time setup step is needed. Tell the user that, then read the "steps" to them verbatim, in order. Do not add steps of your own.' };
-	}
+	// JS is authoritative: `false` means the page really is at its limit, so that
+	// answer outranks a keystroke denial, which says nothing about the page.
 	if (o.scrollMoved === false) {
 		return { status: 'at_limit', moved: false,
 		         message: `Nothing scrolled — the page appears to be at the ${o.direction === 'down' ? 'bottom' : o.direction === 'up' ? 'top' : o.direction}. Tell the user it can't scroll further that way.` };
+	}
+	// keyDenied is load-bearing: `osascript key code` exits 0 whether or not
+	// anything handled the key, so only a THROW proves the fallback never ran.
+	if (o.scrollMoved === null && o.keyDenied && o.hints.length > 0) {
+		return { status: 'setup_required', moved: false, steps: o.hints,
+		         message: 'The scroll did not go through — a one-time setup step is needed. Tell the user that, then read the "steps" to them verbatim, in order. Do not add steps of your own.' };
 	}
 	return { status: 'scrolled', moved: o.scrollMoved };
 }

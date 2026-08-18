@@ -72,6 +72,14 @@ describe('scroll reporting', () => {
 		assert.doesNotMatch(JSON.stringify(r), /did not go through/);
 	});
 
+	it('JS says at-limit and the keystroke was DENIED -> at_limit, not setup_required', () => {
+		// JS is authoritative: it ran and reported the page did not move. A keystroke
+		// denial says nothing about the page, so it must not override that answer.
+		const r = scrollOutcome({ scrollMoved: false, keyDenied: true, hints: HINT, direction: 'down' });
+		assert.equal(r.status, 'at_limit');
+		assert.equal(r.moved, false);
+	});
+
 	it('JS reported no movement and nothing was denied -> at_limit', () => {
 		const r = scrollOutcome({ scrollMoved: false, keyDenied: false, hints: [], direction: 'down' });
 		assert.equal(r.status, 'at_limit');
