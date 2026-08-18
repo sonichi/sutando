@@ -116,6 +116,21 @@ def main() -> int:
     check("upload content-type is multipart",
           "multipart/form-data" in (req.get_header("Content-type") or ""))
 
+    # 8b. Adversarial filename: quote+CRLF must not become part headers
+    #     (reviewer's control on 7d3e80e5, now permanent).
+    t = Transport((200, {"id": "333"}))
+    evil = 'safe.txt"\r\nX-Sutando-Injected: yes\r\nContent-Type: text/html'
+    drc.DiscordRestClient("tok", transport=t).upload_files("c", {}, [(evil, b"B")])
+    body = t.calls[0].data
+    check("filename injection neutralized (no injected header line)",
+          b"\r\nX-Sutando-Injected:" not in body)
+    check("filename injection: quotes/CRLF replaced",
+          b'filename="safe.txt___X-Sutando-Injected: yes__Content-Type: text/html"' in body)
+    empty = drc.DiscordRestClient("tok", transport=Transport((200, {"id": "3"})))
+    t2 = Transport((200, {"id": "3"}))
+    drc.DiscordRestClient("tok", transport=t2).upload_files("c", {}, [("", b"B")])
+    check("empty filename falls back", b'filename="file-0"' in t2.calls[0].data)
+
     # 9. Reads delegate to the retried helper (429/5xx policy lives there).
     seen = {}
     real = drc.request_json

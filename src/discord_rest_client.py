@@ -134,9 +134,13 @@ class DiscordRestClient:
                  f'name="payload_json"\r\nContent-Type: application/json\r\n\r\n'
                  f"{json.dumps(payload)}\r\n".encode()]
         for i, (name, blob) in enumerate(files):
+            # CR/LF/quote in a caller-supplied filename would inject multipart
+            # headers; same policy as dm-result / _safe_attachment_basename.
+            safe = (str(name).replace("\r", "_").replace("\n", "_")
+                    .replace('"', "_"))[:80] or f"file-{i}"
             parts.append(
                 f"--{boundary}\r\nContent-Disposition: form-data; "
-                f'name="files[{i}]"; filename="{name}"\r\n'
+                f'name="files[{i}]"; filename="{safe}"\r\n'
                 f"Content-Type: application/octet-stream\r\n\r\n".encode()
                 + blob + b"\r\n")
         parts.append(f"--{boundary}--\r\n".encode())
