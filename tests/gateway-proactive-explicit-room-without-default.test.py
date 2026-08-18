@@ -163,11 +163,8 @@ def main() -> int:
     check(live.exists() and not (tmp2 / "proactive-10.txt").exists(),
           "g) a LIVE pid's in-flight claim is left alone")
 
-    # h) THE POST-CLAIM HAND-BACK. `_proactive_route` runs TWICE per file — once
-    #    to peek before claiming, once after — because the peek can observe a
-    #    writer mid-write. So the target present at peek can be absent after, and
-    #    with no default that would POST room_id=None and lose the body. Nothing
-    #    in a-g reaches that disjunct: no case makes the two calls disagree.
+    # h) `_proactive_route` runs twice per file (peek, then post-claim), so a
+    #    target can be present at peek and gone after. a-g never make them differ.
     tmp3 = Path(tempfile.mkdtemp(prefix="gw-proactive-vanish-"))
     (tmp3 / "archive").mkdir()
     (tmp3 / "proactive-11.txt").write_text(
