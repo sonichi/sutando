@@ -52,6 +52,8 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Architecture and decisions
 
 - [Architecture boundaries](architecture-boundaries.md)
+- [Task-envelope HMAC](task-envelope-hmac.md) — the tasks/ integrity seal:
+  mechanism, security claim, and the phased mailbox-authority plan
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
