@@ -317,8 +317,6 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
-# Load token — env var takes precedence (allows test injection without a real .env file)
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 # Tighten perms whenever the token file exists — even when the token is already
 # in process env — so a world-readable .env never survives startup.
 channels_env = claude_home_path("channels", "discord", ".env")
@@ -330,16 +328,11 @@ if channels_env.exists():
         # restore/sync, or an ACL-restricted file must NOT crash the bridge at
         # startup — the file may still be perfectly readable. Warn and continue.
         print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
-if not TOKEN and channels_env.exists():
-    for line in channels_env.read_text().splitlines():
-        if line.startswith("DISCORD_BOT_TOKEN="):
-            TOKEN = line.split("=", 1)[1].strip()
-
-if not TOKEN:
-    # Last resort: the Keychain vault. Before this, no bridge read it, so
-    # `vault set DISCORD_BOT_TOKEN` stored the value and changed nothing.
-    from channel_token import token_from_vault  # noqa: E402
-    TOKEN = token_from_vault("DISCORD_BOT_TOKEN")
+# env var takes precedence (test injection without a real .env), then the
+# channel .env, then the Keychain vault — discord's native order, now resolved
+# by the shared policy so quoting/emptiness rules cannot drift per consumer.
+from channel_token import resolve_channel_token  # noqa: E402
+TOKEN = resolve_channel_token("DISCORD_BOT_TOKEN", env_file=channels_env)
 
 if not TOKEN:
     print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env "

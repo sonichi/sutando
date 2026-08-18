@@ -64,18 +64,9 @@ def load_channel_context_blacklist(serving_channel_id):
 
 
 def _bot_token():
-    """Read DISCORD_BOT_TOKEN from the channel .env (never printed)."""
-    tok = os.environ.get("DISCORD_BOT_TOKEN")
-    if tok:
-        return tok
-    try:
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("DISCORD_BOT_TOKEN="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return None
+    """Resolve DISCORD_BOT_TOKEN via the shared policy (never printed). None = absent."""
+    from channel_token import resolve_channel_token
+    return resolve_channel_token("DISCORD_BOT_TOKEN", env_file=ENV_FILE) or None
 
 
 def _api_get(path, token):
