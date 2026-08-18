@@ -81,7 +81,19 @@ def _generation() -> str:
 
 def _item_lock(root, key: str):
     """Serialize one item's transitions. Keyed on safe_key, NOT the raw id:
-    recover only ever sees the key, and two spellings would stripe apart."""
+    recover only ever sees the key, and two spellings would stripe apart.
+
+    ⚠ SINGLE-THREADED FALLBACK ONLY. Lazy claim-path activation is UNSOUND
+    under same-process concurrency, and unfixably so: (a) the fence tmp is
+    pid-suffixed — thread-shared — so racing activators crash on os.replace
+    (ClaimMachine CE 2026-08-18, 2-op schedule); (b) worse, ob._stripe_mode
+    negatively memoizes per process BY DESIGN (no mid-flight namespace flip),
+    so a losing thread keeps the cached "unstriped" verdict and locks
+    per-item files while the winner locks stripes — NO mutual exclusion,
+    silently. A mutex deadlocks the gated harness; verify-on-race dies on the
+    cache. The only sound placement is CONSTRUCTOR-TIME activation, before
+    any thread's first fence read for the root — which is what the real
+    DesignCClaimBackend must do and what run_c_machine.py does per example."""
     rk = os.path.realpath(str(root))
     if rk not in _STRIPED:
         _d(root, INFLIGHT)
