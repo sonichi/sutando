@@ -8,7 +8,10 @@
 
 /** Returns the actionable sentence, or null when it is not a setup problem. */
 export function setupHint(raw: string): string | null {
-	const m = /execution error:\s*([\s\S]*?)\s*\((-?\d+)\)/.exec(raw || '');
+	// Line-scoped and greedy so a parenthesised number inside the sentence cannot
+	// truncate it; the multiline form is the fallback for errors that wrap.
+	const m = /execution error:\s*([^\n]*)\s*\((-?\d+)\)/.exec(raw || '')
+		?? /execution error:\s*([\s\S]*?)\s*\((-?\d+)\)/.exec(raw || '');
 	if (!m) return null;
 	// The text is spoken aloud, so drop the trailing support URL.
 	const text = m[1].replace(/\s*For more information:\s*\S+/i, '').replace(/\s+/g, ' ').trim();

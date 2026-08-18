@@ -42,6 +42,13 @@ describe('setupHint', () => {
 		);
 	});
 
+	it('is not truncated by a parenthesised number inside the sentence', () => {
+		assert.equal(
+			setupHint('0:0: execution error: Custom thing failed (see item (2) above) in dialog. (99)'),
+			'Custom thing failed (see item (2) above) in dialog.',
+		);
+	});
+
 	it('returns null for an ordinary failure, so normal errors are untouched', () => {
 		assert.equal(setupHint('Command failed: osascript /tmp/x.scpt\nsomething unrelated'), null);
 		assert.equal(setupHint(''), null);
