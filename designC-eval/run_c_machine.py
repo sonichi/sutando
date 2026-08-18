@@ -27,6 +27,73 @@ import time as _time
 from pathlib import Path
 from claim_machine_harness import OsProxy, GatedPath, FcntlProxy
 
+class _NoExclusionFcntl:
+    """SINGLE-VARIABLE control: LOCK_EX acquisition becomes a no-op, so the
+    lock exists, the fence exists, activation runs, the sweep runs, lock
+    FILES are still created — but exclusion is gone. C_NEUTER_FLOCK=1 arms
+    it. Removing exactly one mechanism is what lets a control failure NAME
+    what it falsified; the old B_NEUTER path removed lock+activation+fence
+    together and could only claim "the composite is load-bearing"."""
+    def __init__(self, real):
+        self._real = real
+    def __getattr__(self, name):
+        val = getattr(self._real, name)
+        if name != "flock" or not callable(val):
+            return val
+        def flock(fd, op):
+            if op & self._real.LOCK_EX and not op & self._real.LOCK_UN:
+                return None                      # acquisition no-ops: no exclusion
+            return val(fd, op)
+        return flock
+
+_NEUTER_FLOCK = os.environ.get("C_NEUTER_FLOCK") == "1"
+_NEUTER_LINK = os.environ.get("C_NEUTER_LINK") == "1"
+_NEUTER_RENAME = os.environ.get("C_NEUTER_RENAME") == "1"
+
+
+class _NonAtomicRename:
+    """SINGLE-VARIABLE control #3: os.rename loses atomicity — becomes
+    read + write-dst + unlink-src, with gated boundaries between the steps.
+    Motivated by controls #1/#2 both passing: C's claim is a single atomic
+    rename (ready/key -> inflight/token), so single-owner rests on THIS
+    mechanism; flock guards multi-step transitions and link serves other
+    legs. This is the control that matches the single-owner invariant."""
+    def __init__(self, real_os):
+        self._os = real_os
+    def __getattr__(self, name):
+        val = getattr(self._os, name)
+        if name != "rename" or not callable(val):
+            return val
+        def rename(src, dst, **kw):
+            with open(src, "rb") as fh:          # raises ENOENT like rename
+                data = fh.read()
+            with open(dst, "wb") as fh:
+                fh.write(data)
+            self._os.unlink(src)
+        return rename
+
+
+class _NoExclusionLink:
+    """SINGLE-VARIABLE control #2: os.link loses create-if-absent — on
+    FileExistsError the destination is overwritten, so a losing claimer
+    "wins" too. Everything else (flock, fence, activation, sweep) intact.
+    Motivated by the flock-only control PASSING at 800x60: C's single-owner
+    invariant rests on the link primitive, not the stripe lock — so the
+    control for THAT invariant must neuter THIS mechanism."""
+    def __init__(self, real_os):
+        self._os = real_os
+    def __getattr__(self, name):
+        val = getattr(self._os, name)
+        if name != "link" or not callable(val):
+            return val
+        def link(src, dst, **kw):
+            try:
+                return val(src, dst, **kw)
+            except FileExistsError:
+                self._os.unlink(dst)
+                return val(src, dst, **kw)
+        return link
+
 _orig_init = M.BClaimDriver.__init__
 def _init(self, *a, **k):
     _orig_init(self, *a, **k)
@@ -37,7 +104,15 @@ def _init(self, *a, **k):
     self.in_flock = {a2: False for a2 in M.ACTORS}
     mod.ob.os = OsProxy(os, self.gate, self._root_holder)
     mod.ob.Path = GatedPath           # class attrs already bound by _orig_init
-    mod.ob.fcntl = FcntlProxy(_real_fcntl, self)
+    if _NEUTER_FLOCK:
+        mod.ob.fcntl = _NoExclusionFcntl(_real_fcntl)
+    else:
+        mod.ob.fcntl = FcntlProxy(_real_fcntl, self)
+    if _NEUTER_LINK:
+        # layer over the OsProxy the driver just installed on designC
+        mod.os = _NoExclusionLink(mod.os)
+    if _NEUTER_RENAME:
+        mod.os = _NonAtomicRename(mod.os)
     # Constructor-time activation (the landing rule): before any thread's
     # first fence read for this root.
     mod.ob.activate_lock_striping(Path(self.root))
