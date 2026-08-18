@@ -52,10 +52,11 @@ def _parse_args(argv):
     parser.add_argument("--full", action="store_true",
                         help="Do not clip bodies. Use when the read is a VERIFICATION instrument ('did my message land?') rather than a scan: a grep past the 200-char clip returns 0 for text that WAS delivered, and a false negative there causes a duplicate send.")
     parser.add_argument("--until", default=None, help="Snowflake ID or ISO date/time (e.g. 2026-06-24T23:25) — page BACKWARD until reaching this boundary, then stop. Condition-based depth, NOT a message count: use to reconstruct context however far back the referent / conversational boundary is.")
-    parser.add_argument("--serving", default=None,
-                        help="Origin channel_id of the task being served. Runs the contextNotFrom gate BEFORE any fetch; exit 2 on block.")
-    parser.add_argument("--operator", action="store_true",
-                        help="Explicit privileged mode: no serving context (core monitoring). Mutually exclusive with --serving.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--serving", default=None,
+                      help="Origin channel_id of the task being served. Runs the contextNotFrom gate BEFORE any fetch; exit 2 on block.")
+    mode.add_argument("--operator", action="store_true",
+                      help="Explicit operator mode: no serving context (core monitoring). Mutually exclusive with --serving.")
     return parser.parse_args(argv)
 
 
