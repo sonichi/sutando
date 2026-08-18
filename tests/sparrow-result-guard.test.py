@@ -120,6 +120,19 @@ with tempfile.TemporaryDirectory() as td:
     check(any(a.kind == "skip" for a in m.parse_markers(other_notice).actions),
           "a different thread is also kept out of the shared room")
 
+    # Explicit opt-out skips secret detection, while marker controls remain guarded.
+    write_task(
+        tasks, "task-team-filter-off", "team",
+        collaborator="true", sensitive_data_filter="false")
+    plain, plain_withheld = m._guarded_result_body(
+        "task-team-filter-off", "intentional ghp_" + "a" * 36)
+    check(plain_withheld is None and plain.startswith("intentional ghp_"),
+          "an explicit filter opt-out passes token-like result text")
+    controlled, controlled_withheld = m._guarded_result_body(
+        "task-team-filter-off", BODY_WITH_MARKERS)
+    check(controlled_withheld is not None and controlled != BODY_WITH_MARKERS,
+          "filter opt-out does not disable delivery-control protection")
+
     # Absence is NOT owner provenance — a month-archived Team task is exactly
     # the case that would otherwise fall open.
     for _baseline in ("owner", "team"):
