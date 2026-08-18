@@ -29,9 +29,8 @@ FAILURES: list[str] = []
 REFUSAL_MARK = "could not safely process"
 INTERRUPTED = "was interrupted"
 
-# Reuse the sibling suite's watcher harness rather than restating it. A copied
-# harness drifts from the script it drives; this one is import-safe (its own
-# scenarios run only under __main__).
+# Import the sibling suite's harness (import-safe) rather than restating it:
+# a copied harness drifts from the script it drives.
 _spec = importlib.util.spec_from_file_location(
     "_reap_harness", REPO / "tests" / "watch-tasks-stream-dead-worker-reap.test.py")
 _reap = importlib.util.module_from_spec(_spec)
