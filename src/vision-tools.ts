@@ -487,6 +487,10 @@ export function setVisionSpeechEvidence(fn: (() => { active: boolean }) | null):
 	speechEvidenceFn = fn;
 }
 
+/** Why the last stop happened. 'no-client' is TERMINAL: the browser must tear
+ *  its push session down rather than treat the stop as a server-side glitch. */
+let lastStopReason: string | null = null;
+
 let bucketBytes = VISION_BUCKET_MAX_BYTES;
 let bucketRefillAt = Date.now();
 let lastFrameSentAt = 0;
@@ -672,6 +676,9 @@ export interface VisionState {
 	frames: number;
 	durationMs: number;
 	sessionReady: boolean;
+	/** Why streaming last stopped, when it was stopped deliberately. 'no-client'
+	 *  is terminal — a push driver seeing it must tear down, not re-arm. */
+	stoppedReason: string | null;
 	/** P7 D7.4 egress diagnostics: real sends vs gate/budget deferrals and
 	 *  displaced (dropped) slot frames. */
 	egress: {
@@ -696,6 +703,7 @@ export function getVisionState(): VisionState {
 		frames: frameCount,
 		durationMs: streaming && startedAt ? Date.now() - startedAt : 0,
 		sessionReady: getSendFile() !== null,
+		stoppedReason: streaming ? null : lastStopReason,
 		egress: getVisionEgressStats(),
 	};
 }
@@ -730,6 +738,7 @@ export function startStreaming(
 			// Push mode — caller (web-client, Mentra bridge, glasses webhook,
 			// etc.) captures frames and POSTs them to /vision/frame. No ticker.
 			stopStream();
+			lastStopReason = null; // a new push session supersedes any terminal stop
 			pushMode = true;
 			pushSourceName = lower;
 			frameCount = 0;
@@ -776,8 +785,9 @@ export function startStreaming(
 }
 
 /** Programmatic stop (used by the HTTP control server / button). */
-export function stopStreaming(): { status: 'stopped' | 'idle'; source: string | null; frames: number; durationMs: number } {
+export function stopStreaming(reason?: string): { status: 'stopped' | 'idle'; source: string | null; frames: number; durationMs: number } {
 	const r = stopStream();
+	if (r.wasRunning) lastStopReason = reason ?? null;
 	return { status: r.wasRunning ? 'stopped' : 'idle', source: r.source, frames: r.frames, durationMs: r.durationMs };
 }
 
@@ -933,6 +943,7 @@ function noteFrameFailure(msg: string): void {
 }
 
 function startStream(source: VisionSource, fps: number): { fps: number; intervalMs: number } {
+	lastStopReason = null; // a new stream supersedes any terminal stop
 	const clamped = Math.max(MIN_FPS, Math.min(MAX_FPS, fps));
 	const intervalMs = Math.max(MIN_INTERVAL_MS, Math.round(1000 / clamped));
 	if (ticker) clearInterval(ticker);

@@ -183,6 +183,34 @@ describe('P7 D7.4 vision egress controls', () => {
 		assert.equal(sent.length, 0, 'stop semantics beat a slow source');
 	});
 
+	it('a no-client stop is reported as terminal so a push driver tears down', () => {
+		const { session } = fakeSession();
+		setVisionSession(session);
+		registerSource({ name: 'term-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
+		startStreaming('term-source', 1, 'pull');
+		assert.equal(getVisionState().stoppedReason, null, 'no reason while streaming');
+		stopStreaming('no-client');
+		assert.equal(getVisionState().stoppedReason, 'no-client');
+		// A user-initiated stop must NOT look terminal — the browser may legitimately
+		// re-arm after one, and conflating the two would break recovery.
+		startStreaming('term-source', 1, 'pull');
+		stopStreaming();
+		assert.equal(getVisionState().stoppedReason, null);
+		stopStreaming();
+	});
+
+	it('starting again clears a terminal stop', () => {
+		const { session } = fakeSession();
+		setVisionSession(session);
+		registerSource({ name: 'clear-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
+		startStreaming('clear-source', 1, 'pull');
+		stopStreaming('no-client');
+		assert.equal(getVisionState().stoppedReason, 'no-client');
+		startStreaming('clear-source', 1, 'pull');
+		assert.equal(getVisionState().stoppedReason, null, 'a fresh stream supersedes the terminal stop');
+		stopStreaming();
+	});
+
 	it('getVisionState exposes the egress diagnostics', () => {
 		const st = getVisionState();
 		assert.equal(typeof st.egress.sent, 'number');

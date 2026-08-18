@@ -2364,7 +2364,12 @@ function applyVisionState(state) {
   // is gone, just tear down our side.
   var ourSideStale = _visionPushActive && (!streaming || state.source !== 'browser');
   if (ourSideStale) {
-    if (_visionStream && _visionStream.active) {
+    // A terminal stop is a decision, not a glitch — re-arming would restart the
+    // capture the server just stopped, and the voice session it fed is gone.
+    if (state.stoppedReason === 'no-client') {
+      console.log('[Vision] server stopped push mode: no voice client — tearing down');
+      teardownPushSession();
+    } else if (_visionStream && _visionStream.active) {
       rearmPushMode();
     } else {
       teardownPushSession();
