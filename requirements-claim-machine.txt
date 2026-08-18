@@ -1,0 +1,4 @@
+# ClaimMachine nightly ONLY — test-scope dependency, never in the production
+# dependency graph. Exact pin: the nightly must not silently test a different
+# search/shrink engine each day; upgrades are deliberate PRs, not drift.
+hypothesis==6.165.10

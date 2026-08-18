@@ -21,8 +21,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install hypothesis (required — absence fails the run)
-        run: python3 -m pip install hypothesis
+      - name: Install hypothesis (required — absence fails the run; exact pin
+              so the nightly engine only changes by deliberate PR)
+        run: python3 -m pip install -r requirements-claim-machine.txt
       - name: Deterministic frozen-schedule regressions (sanity)
         run: python3 tests/outbox-claim-regressions.test.py
       - name: ClaimMachine exploration
