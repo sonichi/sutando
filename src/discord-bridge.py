@@ -331,6 +331,7 @@ if channels_env.exists():
         print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
 # env -> channel .env -> vault; shared policy so quoting rules cannot drift.
 from channel_token import resolve_channel_token  # noqa: E402
+import discord_proactive_send  # noqa: E402  — proactive text send-leg (5b stage 1)
 TOKEN = resolve_channel_token("DISCORD_BOT_TOKEN", env_file=channels_env)
 
 if not TOKEN:
@@ -5109,6 +5110,22 @@ async def poll_progress():
         await asyncio.sleep(3)
 
 
+_PROACTIVE_PROVIDER = None
+
+
+def _proactive_provider():
+    """Shared DeliveryProvider for the proactive text send-leg (5b stage 1).
+    Lazy so import cost lands on first use, single so receipts share one
+    client (and its 30s upload timeout pin)."""
+    global _PROACTIVE_PROVIDER
+    if _PROACTIVE_PROVIDER is None:
+        from discord_rest_client import DiscordRestClient
+        from discord_delivery_provider import DiscordDeliveryProvider
+        _PROACTIVE_PROVIDER = DiscordDeliveryProvider(
+            DiscordRestClient(TOKEN, timeout=30))
+    return _PROACTIVE_PROVIDER
+
+
 async def poll_proactive():
     """Poll results/ for proactive messages and send to owner's DM.
 
@@ -5273,8 +5290,11 @@ async def poll_proactive():
                             if _target_ch is not None and hasattr(_target_ch, 'send'):
                                 try:
                                     if _redirect_text:
-                                        for chunk in _chunk_for_discord(_redirect_text):
-                                            await _target_ch.send(chunk)
+                                        await asyncio.to_thread(
+                                            discord_proactive_send.deliver_text,
+                                            _proactive_provider(), _target_id,
+                                            _redirect_text, f.stem,
+                                            _chunk_for_discord)
                                     for fpath in files:
                                         fpath = os.path.expanduser(fpath.strip())
                                         if _is_path_sendable(fpath):
@@ -5314,9 +5334,11 @@ async def poll_proactive():
                             # Fall through to DM with the marker INTACT: the visible `[channel: <id>]` is
                             # the loud-failure signal. This except wraps the chunk AND attachment loops.
                         if clean_text:
-                            for chunk in _chunk_for_discord(clean_text):
-                                await dm.send(chunk)
-                                _sent_any = True  # pragma: no cover
+                            _n = await asyncio.to_thread(
+                                discord_proactive_send.deliver_text,
+                                _proactive_provider(), dm.id, clean_text,
+                                f.stem, _chunk_for_discord)
+                            _sent_any = _sent_any or _n > 0  # pragma: no cover
                             try:
                                 import outbox_log
                                 _user_name = getattr(user, "name", None)
@@ -5351,7 +5373,8 @@ async def poll_proactive():
                         # Glue only: the decision AND the file move are one unit in
                         # send_failure_policy.resolve_failed_send.
                         _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
-                            f, e, _transient_send_attempts, progressed=_sent_any)
+                            f, e, _transient_send_attempts,
+                            progressed=_sent_any or bool(getattr(e, "sent_chunks", 0)))
                         print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover
                               f"{f.with_suffix('.txt').name}", flush=True)
                         if _outcome == "retried":  # pragma: no cover
