@@ -950,7 +950,14 @@ async function main() {
 		inputAudioTranscription: true,
 		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
 		// context occupancy and connection lineage (design §1.1/§1.4).
-		onUsageMetadata: (u) => audioHealth.noteUsageMetadata(u.promptTokenCount),
+		// The per-modality breakdown rides the same message (design §1.4) but is
+		// provider-specific, so bodhi types only the shared fields — cast to read.
+		onUsageMetadata: (u) =>
+			audioHealth.noteUsageMetadata(
+				u.promptTokenCount,
+				(u as { promptTokensDetails?: Array<{ modality?: string; tokenCount?: number }> })
+					.promptTokensDetails,
+			),
 		onConnectionLifecycle: (e) => audioHealth.noteLifecycleEvent(e),
 		...(VOICE_SHADOW_STT
 			? {
@@ -1671,7 +1678,7 @@ async function main() {
 			);
 		}
 		lastShadowVerdict = shadow.verdict;
-		audioHealth.noteMatrixVerdict(matrix.verdict);
+		audioHealth.noteMatrixVerdict(matrix.verdict, matrix.facts, matrix.reasons);
 		if (matrix.verdict !== lastMatrixVerdict && (matrix.verdict !== 'healthy-idle' || lastMatrixVerdict)) {
 			console.log(`${ts()} [Matrix] ${matrix.verdict}${matrix.reasons.length ? ' (' + matrix.reasons.join('; ') + ')' : ''}`);
 		}

@@ -45,6 +45,10 @@ export interface MatrixBaseline {
   transportGeneration: number | null;
   audioAttempted: number;
   audioQueued: number;
+  /** Row 4b names the guard outcome from WINDOW deltas, not
+   *  generation-lifetime totals — these are the diff sources. */
+  audioSkippedNoSession: number;
+  audioThrew: number;
   echoSuppressed: number;
   ctxTimeMs: number | null;
   bufferedAmount: number | null;
@@ -71,9 +75,24 @@ export interface MatrixInput {
   now: number;
 }
 
+/** Upstream observations as FACTS (design §1.5): the watchdog integration
+ *  reads only facts, never verdict strings, so verdict-independence holds
+ *  under every coverage mode. Every field is false whenever the window
+ *  cannot prove it (unobserved upstream, no valid baseline, early
+ *  structural returns). A type alias, not an interface, so it satisfies
+ *  Record<string, boolean> consumers structurally. */
+export type MatrixFacts = {
+  attemptedAudioAdvanced: boolean;
+  queuedAudioAdvanced: boolean;
+  losslessWindowWithSpeechQueued: boolean;
+  transportGenerationChanged: boolean;
+  echoSuppressedAdvanced: boolean;
+};
+
 export interface MatrixResult {
   verdict: MatrixVerdict;
   reasons: string[];
+  facts: MatrixFacts;
   baseline: MatrixBaseline;
 }
 
@@ -107,6 +126,8 @@ function makeBaseline(input: MatrixInput): MatrixBaseline {
     transportGeneration: s.transportGeneration,
     audioAttempted: s.upstream?.audio.attempted ?? 0,
     audioQueued: s.upstream?.audio.queued ?? 0,
+    audioSkippedNoSession: s.upstream?.audio.skippedNoSession ?? 0,
+    audioThrew: s.upstream?.audio.threw ?? 0,
     echoSuppressed: s.echoSuppressed,
     ctxTimeMs: hb?.ctxTimeMs ?? (sameEpoch ? (input.prev?.ctxTimeMs ?? null) : null),
     bufferedAmount: hb?.bufferedAmount ?? null,
@@ -124,9 +145,19 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
   const { snapshot: s, prev, now } = input;
   const hb = s.lastHeartbeat;
   const baseline = makeBaseline(input);
+  // Facts start all-false and are set as the window proves them, so early
+  // structural returns carry an honest "nothing proven" set.
+  const facts: MatrixFacts = {
+    attemptedAudioAdvanced: false,
+    queuedAudioAdvanced: false,
+    losslessWindowWithSpeechQueued: false,
+    transportGenerationChanged: false,
+    echoSuppressedAdvanced: false,
+  };
   const out = (verdict: MatrixVerdict, ...reasons: string[]): MatrixResult => ({
     verdict,
     reasons,
+    facts,
     baseline,
   });
 
@@ -156,6 +187,7 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
     s.transportGeneration !== null &&
     s.transportGeneration !== prev.transportGeneration
   ) {
+    facts.transportGenerationChanged = true;
     return out('insufficient-evidence', 'transport-generation-changed');
   }
   const hbStale = now - hb.receivedAt > 8_000;
@@ -171,6 +203,45 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
   const muted = hb.muted;
   const ingressStalled =
     s.lastDeliveredAt === null || now - s.lastDeliveredAt > MATRIX_INGRESS_STALL_MS;
+
+  // ── Upstream (agent→SDK) window: deltas + facts (design §1.5) — computed
+  // BEFORE any row can return, so every result carries honest facts. A
+  // baseline that never observed the transport (generation null) has no
+  // valid window: diffing counters against its placeholder zeros would
+  // fabricate deltas out of generation-lifetime totals. ──
+  const au = s.upstream?.audio ?? null;
+  const upstreamWindowValid =
+    observesUpstreamSend(coverage) && au !== null && prev.transportGeneration !== null;
+  const dAttemptedAudio =
+    upstreamWindowValid && au !== null ? Math.max(0, au.attempted - prev.audioAttempted) : 0;
+  const dQueuedAudio =
+    upstreamWindowValid && au !== null ? Math.max(0, au.queued - prev.audioQueued) : 0;
+  const dSkippedNoSession =
+    upstreamWindowValid && au !== null
+      ? Math.max(0, au.skippedNoSession - prev.audioSkippedNoSession)
+      : 0;
+  const dThrewAudio =
+    upstreamWindowValid && au !== null ? Math.max(0, au.threw - prev.audioThrew) : 0;
+  const dEchoSuppressed = Math.max(0, s.echoSuppressed - prev.echoSuppressed);
+  const speech = s.speech;
+  const speechInWindow =
+    speech.active || (speech.lastAboveFloorAt !== null && now - speech.lastAboveFloorAt < 30_000);
+  const queuedAfterSpeech =
+    au !== null &&
+    au.lastQueuedAt !== null &&
+    speech.lastAboveFloorAt !== null &&
+    au.lastQueuedAt >= speech.lastAboveFloorAt;
+  const lossless = dAttemptedAudio >= dDelivered && dQueuedAudio === dAttemptedAudio;
+  facts.attemptedAudioAdvanced = dAttemptedAudio > 0;
+  facts.queuedAudioAdvanced = dQueuedAudio > 0;
+  facts.echoSuppressedAdvanced = dEchoSuppressed > 0;
+  facts.losslessWindowWithSpeechQueued =
+    upstreamWindowValid &&
+    speechInWindow &&
+    dDelivered > 0 &&
+    lossless &&
+    queuedAfterSpeech &&
+    dEchoSuppressed === 0;
 
   // ── Row 1: client capture dead/suspended ──
   // A CURRENT-epoch, UNEXPIRED gap (or the open gap itself) whose interval
@@ -224,14 +295,10 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
     }
   }
 
-  // ── Rows 4/4b: the agent→SDK hop (design §1.5) — need 'session+egress' ──
-  const au = s.upstream?.audio ?? null;
-  const dAttemptedAudio = au ? Math.max(0, au.attempted - prev.audioAttempted) : 0;
-  const dQueuedAudio = au ? Math.max(0, au.queued - prev.audioQueued) : 0;
-  const dEchoSuppressed = Math.max(0, s.echoSuppressed - prev.echoSuppressed);
+  // ── Rows 4/4b: the agent→SDK hop (design §1.5) — need 'session+egress'
+  // AND a valid window (an unobserved baseline proves nothing). ──
   if (
-    observesUpstreamSend(coverage) &&
-    au !== null &&
+    upstreamWindowValid &&
     input.sessionState === 'ACTIVE' &&
     !muted &&
     dDelivered > 0 &&
@@ -243,12 +310,14 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
       return out('upstream-send-dead', `delivered+=${dDelivered}`, 'attempted+=0');
     }
     if (dQueuedAudio === 0) {
+      // Named by THIS window's guard outcome — lifetime totals would let
+      // earlier skips masquerade as the current failure mode.
       return out(
         'upstream-send-failing',
         `attempted+=${dAttemptedAudio}`,
         'queued+=0',
-        `skippedNoSession=${au.skippedNoSession}`,
-        `threw=${au.threw}`,
+        `skippedNoSession+=${dSkippedNoSession}`,
+        `threw+=${dThrewAudio}`,
       );
     }
   }
@@ -258,9 +327,6 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
   // Speech evidence is the CANONICAL server-ingress tracker only — a stale
   // client speech episode idempotently re-sent in the heartbeat window is
   // NOT current-window evidence.
-  const speech = s.speech;
-  const speechInWindow =
-    speech.active || (speech.lastAboveFloorAt !== null && now - speech.lastAboveFloorAt < 30_000);
   if (speechInWindow && dDelivered > 0) {
     const modelSilent =
       input.lastModelEventAt == null || now - input.lastModelEventAt > 15_000;
@@ -275,15 +341,20 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
           'upstream-hop-unobserved(coverage:session-only)',
         );
       }
+      if (!upstreamWindowValid) {
+        // Upstream is observed NOW but was not at the baseline: there is no
+        // valid window — diffing counters against placeholder zeros would
+        // fabricate a `post-sdk-silent` from generation-lifetime totals.
+        return out(
+          'insufficient-evidence',
+          'speech-without-model-event',
+          'upstream-baseline-unobserved',
+        );
+      }
       // Lossless-window proof (design §1.5): aggregate counters cannot say
       // WHICH frame queued, so require that NOTHING was dropped — then the
       // speech-bearing frames were necessarily queued.
-      const lossless = dAttemptedAudio >= dDelivered && dQueuedAudio === dAttemptedAudio;
-      const queuedAfterSpeech =
-        au.lastQueuedAt !== null &&
-        speech.lastAboveFloorAt !== null &&
-        au.lastQueuedAt >= speech.lastAboveFloorAt;
-      if (lossless && queuedAfterSpeech && dEchoSuppressed === 0) {
+      if (facts.losslessWindowWithSpeechQueued) {
         return out(
           'post-sdk-silent',
           'speech-in-window',
@@ -295,7 +366,11 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
       return out(
         'insufficient-evidence',
         'speech-without-model-event',
-        lossless ? 'speech-queue-order-unproven' : 'lossy-window',
+        dEchoSuppressed > 0
+          ? 'echo-suppressed-window'
+          : lossless
+            ? 'speech-queue-order-unproven'
+            : 'lossy-window',
       );
     }
   }

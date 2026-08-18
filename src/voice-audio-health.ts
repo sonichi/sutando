@@ -114,7 +114,10 @@ export interface HealthRow {
   sessionId: string;
   epoch: number | null;
   nonce: string | null;
-  reason: 'timer' | 'anomaly' | 'final';
+  /** 'lineage' rows are §1.1 generation→lineage reconciliation records —
+   *  offline analysis re-attributes earlier rows from them instead of
+   *  trusting a stale in-row id. */
+  reason: 'timer' | 'anomaly' | 'final' | 'lineage';
   payload: string;
 }
 
@@ -131,6 +134,11 @@ export interface AudioHealthSnapshot {
   /** Latest server-reported standing prompt size (promptTokenCount). */
   contextTokens: number | null;
   contextTokensAt: number | null;
+  /** Per-modality breakdown of the standing prompt (promptTokensDetails,
+   *  design §1.4) — what separates "video filled the context" from
+   *  "conversation did". Held and reset with the lineage, like the scalar
+   *  it details. Null until reported. */
+  contextTokensDetails: Record<string, number> | null;
   epoch: number | null;
   nonce: string | null;
   deliveredFrames: number;
@@ -166,9 +174,13 @@ export interface AudioHealthSnapshot {
   /** Receipt-time approximation of the client epoch's start on the engine
    *  clock (null before the first heartbeat). */
   epochStartApproxMs: number | null;
-  /** Last D7.2 matrix verdict noted via noteMatrixVerdict (persisted with
-   *  every row). */
+  /** Last D7.2 matrix result noted via noteMatrixVerdict (persisted with
+   *  every row). Facts + reasons make the row a RECORDED DECISION (design
+   *  §1.6 option 2): even a stripped row replays as the decision taken.
+   *  Facts are structural (Record) to avoid a ledger→matrix import cycle. */
   lastMatrixVerdict: string | null;
+  lastMatrixFacts: Record<string, boolean> | null;
+  lastMatrixReasons: string[] | null;
 }
 
 export interface AudioHealthLedger {
@@ -201,10 +213,16 @@ export interface AudioHealthLedger {
   /** Try-enqueue one row into the persistence mailbox; a busy mailbox skips
    *  the sample (samplesSkipped), never queues (§D7.0b). */
   persistTick(reason: 'timer' | 'anomaly' | 'final', clientConnected: boolean): void;
-  /** D7.2: record the latest matrix verdict so every persisted row carries it. */
-  noteMatrixVerdict(verdict: string): void;
-  /** Server-reported standing prompt size (bodhi onUsageMetadata). */
-  noteUsageMetadata(promptTokenCount: number | null | undefined): void;
+  /** D7.2: record the latest matrix result — verdict plus facts and reasons
+   *  (the recorded decision, design §1.6 option 2) — so every persisted row
+   *  carries it. */
+  noteMatrixVerdict(verdict: string, facts?: Record<string, boolean>, reasons?: string[]): void;
+  /** Server-reported standing prompt size + per-modality breakdown (bodhi
+   *  onUsageMetadata; design §1.4). */
+  noteUsageMetadata(
+    promptTokenCount: number | null | undefined,
+    promptTokensDetails?: ReadonlyArray<{ modality?: string; tokenCount?: number }> | null,
+  ): void;
   /** Lineage derivation input (bodhi onConnectionLifecycle) — design §1.1. */
   noteLifecycleEvent(event: ConnectionLifecycleEvent): void;
   /** Exposed for tests (the wrap routes here). */
@@ -307,6 +325,8 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
    *  approximate. */
   let epochStartApproxMs: number | null = null;
   let lastMatrixVerdict: string | null = null;
+  let lastMatrixFacts: Record<string, boolean> | null = null;
+  let lastMatrixReasons: string[] | null = null;
 
   // ── lineage + context (design §1.1/§1.4; lineage OUTLIVES client epochs) ──
   let logicalSessionId = 0;
@@ -314,6 +334,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
   let lastAttemptHandleSupplied = false;
   let contextTokens: number | null = null;
   let contextTokensAt: number | null = null;
+  let contextTokensDetails: Record<string, number> | null = null;
   // per-tick upstream rate window (30 s tick only — never the frame path)
   let prevUpTick: {
     generation: number | null;
@@ -390,6 +411,8 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     nonce = null;
     epochStartApproxMs = null;
     lastMatrixVerdict = null;
+    lastMatrixFacts = null;
+    lastMatrixReasons = null;
     deliveredFrames = 0;
     deliveredBytes = 0;
     lastDeliveredAt = null;
@@ -651,6 +674,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
         lineageState,
         contextTokens,
         contextTokensAt,
+        contextTokensDetails: contextTokensDetails ? { ...contextTokensDetails } : null,
         epoch,
         nonce,
         deliveredFrames,
@@ -672,17 +696,33 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
         inputHealth: inputHealth(clientConnected),
         epochStartApproxMs,
         lastMatrixVerdict,
+        lastMatrixFacts: lastMatrixFacts ? { ...lastMatrixFacts } : null,
+        lastMatrixReasons: lastMatrixReasons ? [...lastMatrixReasons] : null,
       };
     },
 
-    noteMatrixVerdict(verdict: string): void {
+    noteMatrixVerdict(verdict: string, facts?: Record<string, boolean>, reasons?: string[]): void {
       lastMatrixVerdict = verdict;
+      lastMatrixFacts = facts ?? null;
+      lastMatrixReasons = reasons ?? null;
     },
 
-    noteUsageMetadata(promptTokenCount: number | null | undefined): void {
+    noteUsageMetadata(
+      promptTokenCount: number | null | undefined,
+      promptTokensDetails?: ReadonlyArray<{ modality?: string; tokenCount?: number }> | null,
+    ): void {
       if (typeof promptTokenCount === 'number' && Number.isFinite(promptTokenCount)) {
         contextTokens = promptTokenCount;
         contextTokensAt = now();
+      }
+      if (Array.isArray(promptTokensDetails)) {
+        const details: Record<string, number> = {};
+        for (const d of promptTokensDetails) {
+          if (d && typeof d.modality === 'string' && typeof d.tokenCount === 'number') {
+            details[d.modality] = (details[d.modality] ?? 0) + d.tokenCount;
+          }
+        }
+        if (Object.keys(details).length > 0) contextTokensDetails = details;
       }
     },
 
@@ -692,24 +732,60 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       // observable can promote it — the promotion signal does not exist).
       if (event.kind === 'attempt') {
         lastAttemptHandleSupplied = event.handleSupplied;
-      } else if (event.kind === 'setup-ok') {
+        return;
+      }
+      let committed = false;
+      let generation: number | null = null;
+      if (event.kind === 'setup-ok') {
+        generation = event.transportGeneration;
         if (!lastAttemptHandleSupplied) {
           logicalSessionId++;
           lineageState = 'fresh';
           // Context occupancy belongs to the lineage — a fresh one starts unknown.
           contextTokens = null;
           contextTokensAt = null;
+          contextTokensDetails = null;
         } else if (lineageState !== 'suspected-sever') {
           lineageState = 'resumed';
         }
+        committed = true; // every successful setup commits the attempt to a lineage
       } else if (event.kind === 'setup-failed' && lastAttemptHandleSupplied) {
         lineageState = 'suspected-sever';
+        committed = true;
       } else if (
         event.kind === 'generation-close' &&
         lastAttemptHandleSupplied &&
         event.code === 1008
       ) {
+        generation = event.transportGeneration;
         lineageState = 'suspected-sever';
+        committed = true;
+      }
+      if (!committed) return;
+      // §1.1: a lineage can be re-labelled after rows are already persisted —
+      // emit a generation→lineage reconciliation record (attempt, generation,
+      // resolved lineage, final state) so offline analysis re-attributes
+      // earlier rows instead of trusting a stale in-row id. Connection-rate,
+      // never the frame path; a busy mailbox skips it like any sample.
+      log(
+        `[AudioHealth] lineage ${lineageState} id=${logicalSessionId} ` +
+          `attempt=${event.connectAttemptId} gen=${generation ?? 'n/a'}`,
+      );
+      if (opts.persist) {
+        const ok = opts.persist({
+          tsUnix: Math.floor(now() / 1000),
+          sessionId: opts.sessionId,
+          epoch,
+          nonce,
+          reason: 'lineage',
+          payload: JSON.stringify({
+            connectAttemptId: event.connectAttemptId,
+            transportGeneration: generation,
+            logicalSessionId,
+            lineageState,
+          }),
+        });
+        if (!ok) samplesSkipped++;
       }
     },
 
@@ -740,15 +816,26 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
           drop:
             a.skippedNoSession + a.threw + v.skippedNoSession + v.threw + v.unsupportedMime,
         };
-        const sameGen = prevUpTick !== null && prevUpTick.generation === cur.generation;
-        const base = sameGen && prevUpTick ? prevUpTick : { aQ: 0, aW: 0, vQ: 0, vW: 0, drop: 0 };
-        const d = (x: number, y: number) => Math.max(0, x - y);
-        up =
-          `up={aQ/s:${(d(cur.aQ, base.aQ) / dt).toFixed(1)},` +
-          `aKB/s:${(d(cur.aW, base.aW) / dt / 1024).toFixed(0)}w,` +
-          `vQ/s:${(d(cur.vQ, base.vQ) / dt).toFixed(1)},` +
-          `vKB/s:${(d(cur.vW, base.vW) / dt / 1024).toFixed(0)}w,` +
-          `drop:${d(cur.drop, base.drop)},buf:n/a}`;
+        if (prevUpTick === null) {
+          // First observed tick, or the tick after a missed sample: no
+          // adjacent baseline exists, and cumulative totals over one dt
+          // would fabricate a rate. Baseline now; rates start next tick.
+          up = 'up=n/a(baselining)';
+        } else {
+          // A generation change WITH an adjacent observed tick renders from
+          // zero — the new generation's counters span at most this window.
+          const base =
+            prevUpTick.generation === cur.generation
+              ? prevUpTick
+              : { aQ: 0, aW: 0, vQ: 0, vW: 0, drop: 0 };
+          const d = (x: number, y: number) => Math.max(0, x - y);
+          up =
+            `up={aQ/s:${(d(cur.aQ, base.aQ) / dt).toFixed(1)},` +
+            `aKB/s:${(d(cur.aW, base.aW) / dt / 1024).toFixed(0)}w,` +
+            `vQ/s:${(d(cur.vQ, base.vQ) / dt).toFixed(1)},` +
+            `vKB/s:${(d(cur.vW, base.vW) / dt / 1024).toFixed(0)}w,` +
+            `drop:${d(cur.drop, base.drop)},buf:n/a}`;
+        }
         prevUpTick = cur;
       } else {
         prevUpTick = null;
@@ -823,31 +910,46 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       let payload = JSON.stringify(snapshot);
       if (Buffer.byteLength(payload) > PERSIST_PAYLOAD_MAX_BYTES) {
         // Never slice a JSON document mid-string: over budget, persist a
-        // reduced-but-VALID snapshot with the truncation named.
-        // The reduced row must still be REPLAYABLE by the matrix (design §1.6):
-        // every evaluator input rides along — they are numbers, cheap.
-        const au = snapshot.upstream?.audio;
-        payload = JSON.stringify({
+        // reduced-but-VALID row. Design §1.6: the reduced row must still be
+        // REPLAYABLE — so it keeps every matrix-evaluator input SNAPSHOT-
+        // SHAPED (option 1: same names, same nesting, so a replay feeds it
+        // to evaluateMatrix directly) plus the recorded decision (option 2);
+        // what it drops is the prose/latency extras the evaluator never reads.
+        const reduced: Record<string, unknown> = {
           truncated: true,
           coverage: snapshot.coverage,
           epoch: snapshot.epoch,
           nonce: snapshot.nonce,
           inputHealth: snapshot.inputHealth,
-          deliveredFrames: snapshot.deliveredFrames,
-          egressFrames: snapshot.egressFrames,
           samplesSkipped: snapshot.samplesSkipped,
-          lastMatrixVerdict: snapshot.lastMatrixVerdict,
+          upstream: snapshot.upstream,
           transportGeneration: snapshot.transportGeneration,
+          echoSuppressed: snapshot.echoSuppressed,
           logicalSessionId: snapshot.logicalSessionId,
           lineageState: snapshot.lineageState,
           contextTokens: snapshot.contextTokens,
-          echoSuppressed: snapshot.echoSuppressed,
-          audioAttempted: au?.attempted ?? null,
-          audioQueued: au?.queued ?? null,
-          audioLastQueuedAt: au?.lastQueuedAt ?? null,
-          audioLastSkippedAt: au?.lastSkippedAt ?? null,
-          audioLastThrewAt: au?.lastThrewAt ?? null,
-        });
+          contextTokensAt: snapshot.contextTokensAt,
+          contextTokensDetails: snapshot.contextTokensDetails,
+          deliveredFrames: snapshot.deliveredFrames,
+          lastDeliveredAt: snapshot.lastDeliveredAt,
+          egressFrames: snapshot.egressFrames,
+          speech: snapshot.speech,
+          lastHeartbeat: snapshot.lastHeartbeat,
+          clientTotals: snapshot.clientTotals,
+          epochStartApproxMs: snapshot.epochStartApproxMs,
+          lastModelEventAt: snapshot.lastModelEventAt,
+          lastMatrixVerdict: snapshot.lastMatrixVerdict,
+          lastMatrixFacts: snapshot.lastMatrixFacts,
+          lastMatrixReasons: snapshot.lastMatrixReasons,
+        };
+        payload = JSON.stringify(reduced);
+        if (Buffer.byteLength(payload) > PERSIST_PAYLOAD_MAX_BYTES && snapshot.lastHeartbeat) {
+          // Still over: the episode list is the only unbounded-ish input.
+          // Strip it LAST and say so — the recorded decision still rides.
+          reduced.lastHeartbeat = { ...snapshot.lastHeartbeat, episodes: [] };
+          reduced.episodesStripped = true;
+          payload = JSON.stringify(reduced);
+        }
       }
       const row: HealthRow = {
         tsUnix: Math.floor(now() / 1000),
