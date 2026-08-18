@@ -11,9 +11,9 @@ cd "$(dirname "$0")"
 Q="${*:-where do I commit here?}"
 
 # 1. build overlay if needed
-if [ ! -x ./pointer-overlay ] || [ pointer-overlay.swift -nt ./pointer-overlay ]; then
+if [ ! -x ./pointer-overlay ] || [ Sources/pointer-overlay/main.swift -nt ./pointer-overlay ]; then
   echo "· building overlay…"
-  swiftc pointer-overlay.swift -o pointer-overlay
+  bash build.sh
 fi
 
 # 2. ensure overlay running
