@@ -32,8 +32,8 @@ def check(cond, label):
 # The log shape the probe keys on: a zero-event warning with nothing after it.
 TAIL = ["[slack-bridge] connected", "[slack-bridge] 60s elapsed with zero events"]
 
-enrolled = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_enrolled=True)
-tofu = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_enrolled=False)
+enrolled = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_state="enrolled")
+tofu = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_state="unconfigured")
 
 check(enrolled is not None and enrolled[0] == "warn", "enrolled host still warns")
 check(tofu is not None and tofu[0] == "warn", "TOFU host still warns (status unchanged)")
@@ -48,13 +48,32 @@ check("BOTH" in tofu[1], "TOFU remedy says both are required")
 check("access.json absent" in tofu[1], "TOFU remedy states the evidence it branched on")
 check(enrolled[1] != tofu[1], "the two hosts get materially different remedies")
 
+# NEW — the third and fourth states. `.exists()` could not tell these from
+# `enrolled`, so a locked-down workspace was told to enable Event Subscriptions
+# and stayed silent afterwards.
+locked = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_state="locked")
+unknown = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_state="unknown")
+
+check(locked is not None and locked[0] == "warn", "locked-down host still warns")
+check("allows nobody" in locked[1], "locked remedy states the evidence it branched on")
+check("add an allowed user id" in locked[1], "locked remedy names the step that unblocks it")
+check("DM the bot" not in locked[1],
+      "locked remedy does NOT tell the operator to use a TOFU code that is closed")
+check(locked[1] != enrolled[1] and locked[1] != tofu[1],
+      "locked gets its own remedy, not one of the other two")
+
+# Fail-safe direction preserved: an unreadable record must not manufacture an
+# enrollment instruction, so it reads as enrolled here.
+check(unknown is not None and unknown[1] == enrolled[1],
+      "unreadable record falls back to the enrolled remedy (no invented step)")
+
 # A host with events flowing after the warning must not be flagged at all.
 ok_tail = TAIL + ["[slack-bridge] Wrote task-abc.txt"]
-check(hc.bridge_log_content_status("slack-bridge", "ok", ok_tail, slack_enrolled=False) is None,
+check(hc.bridge_log_content_status("slack-bridge", "ok", ok_tail, slack_state="unconfigured") is None,
       "events after the warning -> no override, regardless of enrollment")
 
 # Other bridges must be untouched by this branch.
-check(hc.bridge_log_content_status("telegram-bridge", "ok", TAIL, slack_enrolled=False) is None,
+check(hc.bridge_log_content_status("telegram-bridge", "ok", TAIL, slack_state="unconfigured") is None,
       "the slack branch does not fire for telegram")
 
 # Default path: omitting the flag must still work. Patch the resolver so this
@@ -86,7 +105,7 @@ check("DM the bot" not in r[1],
 
 # The remedy must name the log THIS check read, not a literal workspace path.
 custom = pathlib.Path("/srv/some where/ws/logs/slack-bridge.log")
-r = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_enrolled=False,
+r = hc.bridge_log_content_status("slack-bridge", "ok", TAIL, slack_state="unconfigured",
                                  log_path=custom)
 check("/srv/some where/ws/logs/slack-bridge.log" in r[1].replace("'", ""),
       "remedy names the RESOLVED log path on a custom workspace")

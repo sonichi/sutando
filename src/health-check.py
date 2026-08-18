@@ -54,6 +54,7 @@ from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
@@ -6921,7 +6922,7 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
 
 def bridge_log_content_status(name: str, status: str, tail: list[str],
                               detail: str = "",
-                              slack_enrolled: "bool | None" = None,
+                              slack_state: "str | None" = None,
                               log_path: Optional[Path] = None) -> Optional[tuple[str, str]]:
     """Check a bridge's recent log lines for known failure-mode signatures.
 
@@ -6964,18 +6965,27 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
             if not events_after:
                 # Event Subscriptions alone is the whole fix ONLY when an owner
                 # is already enrolled; in TOFU state the code gate also blocks.
-                if slack_enrolled is None:
+                if slack_state is None:
                     try:
-                        slack_enrolled = channel_access_path("slack").exists()
+                        slack_state = slack_access.access_state(
+                            channel_access_path("slack"))
                     except Exception:  # noqa: BLE001 — a probe must not fail the check
-                        slack_enrolled = True
-                if slack_enrolled:
+                        slack_state = slack_access.UNKNOWN
+                # UNKNOWN takes the enrolled branch deliberately: an unreadable
+                # record cannot justify telling the operator to enroll.
+                if slack_state in (slack_access.ENROLLED, slack_access.UNKNOWN):
                     return "warn", ("connected but events not arriving — enable Event "
                                     "Subscriptions at api.slack.com/apps")
                 # Name the log this check actually read — the workspace is
                 # configurable, so a literal path can point at no such file.
                 resolved = Path(log_path) if log_path else (
                     WORKSPACE_DIR / "logs" / "slack-bridge.log")
+                if slack_state == slack_access.LOCKED:
+                    return "warn", ("connected but events not arriving, and access.json "
+                                    "allows nobody (empty allowFrom) — Event Subscriptions "
+                                    "alone leaves Slack silent because no user may reach "
+                                    "it: add an allowed user id to "
+                                    f"{shlex.quote(str(channel_access_path('slack')))} too")
                 return "warn", ("connected but events not arriving, and no owner is enrolled "
                                 "(access.json absent) — BOTH are needed: enable Event "
                                 "Subscriptions at api.slack.com/apps, then DM the bot the code "
