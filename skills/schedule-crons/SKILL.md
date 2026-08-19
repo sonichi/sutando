@@ -57,7 +57,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
      and every cheap check agreed the config was right.
      Observed on a long-lived core: it booted 2026-07-30, the `pr-flag` entry gained
      `--stand "<stand>"` on 2026-08-03, and the registered job kept firing the pre-edit text for two
-     days. That flag is what makes `pr_flag.py` populate `is_mine` (it is deliberately `null`
+     days. That flag is what makes the pr-triage skill's `pr_flag.py` populate `is_mine` (it is deliberately `null`
      without one), so the cron's own instruction — "judge from `ci/mergeable/review/approvals/
      is_mine`" — was reading a field that was structurally always null, with a correct script *and*
      a correct config file. Re-registering fixed it: `is_mine` went from null on all 27 PRs to

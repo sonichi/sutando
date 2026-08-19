@@ -17,6 +17,7 @@ ALIVE="$WS/state/cores/$HOST.alive"
 STATUS="$WS/state/core-status.json"
 STALE_S=90                                     # matches core_heartbeat's documented liveness threshold
 STATUS_TTL_S="${GR_STATUS_TTL_S:-900}"         # "running" older than this = wedged, not busy (test override)
+STATUS_REREADS="${GR_STATUS_REREADS:-5}"       # empty-read retries before treating the status as absent
 POLL_S="${GR_POLL_S:-2}"                       # test override
 
 log() { echo "graceful-restart[$RID]: $*"; }
@@ -110,9 +111,20 @@ alive_age() {
 # Busy = core-status.json claims "running" AND its self-reported ts is fresh.
 busy() {
   [ -f "$STATUS" ] || return 1
-  grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$STATUS" 2>/dev/null || return 1
+  # Every writer is a `>` truncate-then-write, so a read can land on an EMPTY
+  # file. Empty is unknown, not idle — re-read instead of authorising the kill.
+  local raw="" i=0
+  while :; do
+    raw="$(cat "$STATUS" 2>/dev/null || true)"
+    [ -n "$raw" ] && break
+    i=$((i + 1))
+    [ "$i" -ge "$STATUS_REREADS" ] && return 1
+    sleep 0.05
+  done
+  printf '%s' "$raw" | grep -q '"status"[[:space:]]*:[[:space:]]*"running"' || return 1
   local ts
-  ts="$(grep -o '"ts"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$STATUS" 2>/dev/null | grep -o '[0-9][0-9]*$' || true)"
+  ts="$(printf '%s' "$raw" | grep -o '"ts"[[:space:]]*:[[:space:]]*[0-9][0-9]*' \
+        | grep -o '[0-9][0-9]*$' || true)"
   [ -n "$ts" ] || return 1
   [ "$(( $(date +%s) - ts ))" -le "$STATUS_TTL_S" ]
 }

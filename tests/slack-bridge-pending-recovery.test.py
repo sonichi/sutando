@@ -79,13 +79,47 @@ class TestSlackPendingRecovery(unittest.TestCase):
             task_file.parent.mkdir(exist_ok=True)
 
             bridge._write_routed_task(task_file, "task body", task_id, route)
-            self.assertEqual(task_file.read_text(), "task body")
+            written = task_file.read_text()
+            # The route write now carries the #3014 envelope, so exact-equality
+            # would pin the absence of a stamp. Body intact + verifies is stronger.
+            from task_envelope import verify_text
+            self.assertIn("task body", written)
+            self.assertEqual(verify_text(written, workspace)["verdict"], "verified")
             self.assertIn(task_id, bridge.pending_replies)
 
             failing_id = f"task-{int(time.time() * 1000) + 1}"
             with self.assertRaises(IsADirectoryError):
                 bridge._write_routed_task(workspace, "cannot write", failing_id, route)
             self.assertNotIn(failing_id, bridge.pending_replies)
+
+    def test_route_write_survives_a_raising_stamper(self):
+        # Fail-open is the contract: a stamping error costs the stamp, never the
+        # task. Without the guard the raise escapes and the task is lost.
+        with tempfile.TemporaryDirectory(prefix="slack-pending-stamp-") as raw:
+            workspace = Path(raw)
+            bridge = _load_bridge(workspace)
+            task_id = f"task-{int(time.time() * 1000)}"
+            route = {"channel": "D123", "thread_ts": None}
+            task_file = workspace / "tasks" / f"{task_id}.txt"
+            task_file.parent.mkdir(exist_ok=True)
+
+            import task_envelope
+
+            original = task_envelope.stamp_text
+
+            def boom(*_args, **_kwargs):
+                raise RuntimeError("keychain on fire")
+
+            task_envelope.stamp_text = boom
+            try:
+                bridge._write_routed_task(task_file, "task body", task_id, route)
+            finally:
+                task_envelope.stamp_text = original
+
+            written = task_file.read_text()
+            self.assertIn("task body", written)
+            self.assertNotIn("envelope_hmac:", written)
+            self.assertIn(task_id, bridge.pending_replies)
 
     def test_entries_older_than_seven_days_are_aged_out(self):
         with tempfile.TemporaryDirectory(prefix="slack-pending-old-") as raw:
