@@ -8,7 +8,11 @@
 //     0 < target < trigger — anything else throws (a half-set or inverted
 //     pair is a silently-degrading misconfiguration and must fail startup);
 //   - env (VOICE_CTX_TRIGGER_TOKENS/VOICE_CTX_TARGET_TOKENS) beats the file
-//     and on its own enables compression.
+//     and on its own enables compression;
+//   - null/false is DELIBERATELY DISABLED, distinct from absent: both resolve
+//     to real key absence today, but only the explicit form survives the value
+//     becoming a built-in default (design Phase 3, step 3e — without it the
+//     user-side rollback after release is downgrading the app).
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -183,6 +187,51 @@ describe('P7 Phase 0.5 — resolveSessionTuning', () => {
 				),
 			/mediaResolution must be one of/,
 		);
+	});
+
+	it('null/false disables a seam explicitly — resolved as real key absence', () => {
+		for (const off of [null, false] as const) {
+			const out = resolveSessionTuning(
+				cfg({
+					compressionConfig: off as VoiceConfig['compressionConfig'],
+					mediaResolution: off as VoiceConfig['mediaResolution'],
+				}),
+				NO_ENV,
+			);
+			assert.deepEqual(out, {}, `${JSON.stringify(off)} disables both seams`);
+			assert.equal('compressionConfig' in out, false);
+			assert.equal('mediaResolution' in out, false);
+		}
+	});
+
+	it('a disabled seam never throws the shape error meant for garbage', () => {
+		// Before the off-switch, null hit "must be an object" — which would have
+		// left app-downgrade as the only rollback once the value is a default.
+		assert.doesNotThrow(() =>
+			resolveSessionTuning(
+				cfg({ compressionConfig: null as VoiceConfig['compressionConfig'] }),
+				NO_ENV,
+			),
+		);
+		// Garbage still throws, naming both enabling and disabling forms.
+		assert.throws(
+			() =>
+				resolveSessionTuning(
+					cfg({ compressionConfig: 'on' as unknown as VoiceConfig['compressionConfig'] }),
+					NO_ENV,
+				),
+			/null\/false disables/,
+		);
+	});
+
+	it('env thresholds still win over a file-disabled compression seam', () => {
+		// Precedence is unchanged by the off-switch: the env pair is the
+		// operator's most explicit statement and still enables.
+		const out = resolveSessionTuning(
+			cfg({ compressionConfig: null as VoiceConfig['compressionConfig'] }),
+			{ VOICE_CTX_TRIGGER_TOKENS: '4000', VOICE_CTX_TARGET_TOKENS: '2000' },
+		);
+		assert.deepEqual(out.compressionConfig, { triggerTokens: 4000, targetTokens: 2000 });
 	});
 
 	it('the shipped example template stays valid JSON with the seams OFF', async () => {
