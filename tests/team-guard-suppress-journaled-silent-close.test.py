@@ -95,6 +95,29 @@ def main() -> int:
     out = guard.materialize_suppressed_verdict(silent, body, state, "task-77")
     check(out == silent, "f) an already-silent suppress is not re-journaled")
 
+    # g) The WRITE raises after the directory exists. Case (d) fails at mkdir and
+    #    takes the earlier OSError guard, so this branch was untested.
+    ok_dir = pathlib.Path(tempfile.mkdtemp(prefix="tg-suppress-raise-"))
+    saved_writer = guard._write_artifact
+    guard._write_artifact = lambda *a, **k: (_ for _ in ()).throw(OSError("disk gone"))
+    try:
+        got_g, _ = guard.guard_result_for_tier(
+            body, "team", REPO, suppress_journal=(ok_dir, "task-raise"))
+    finally:
+        guard._write_artifact = saved_writer
+    check(got_g == guard.TEAM_SUPPRESS_RESULT,
+          f"g) a RAISING journal write -> notice stands, got {got_g[:40]!r}")
+
+    # h) The write reports failure without raising -- same requirement, different path.
+    guard._write_artifact = lambda *a, **k: False
+    try:
+        got_h, _ = guard.guard_result_for_tier(
+            body, "team", REPO, suppress_journal=(ok_dir, "task-false"))
+    finally:
+        guard._write_artifact = saved_writer
+    check(got_h == guard.TEAM_SUPPRESS_RESULT,
+          f"h) an UNSUCCESSFUL journal write -> notice stands, got {got_h[:40]!r}")
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED: " + "; ".join(FAILS))
