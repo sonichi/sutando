@@ -5778,6 +5778,100 @@ def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | 
         return True
 
 
+def _parse_etime(raw: str) -> "float | None":
+    """ps ELAPSED -> seconds. `MM:SS`, `HH:MM:SS`, `D-HH:MM:SS`; None if unparseable."""
+    raw = (raw or "").strip()
+    days = 0
+    if "-" in raw:
+        head, _, raw = raw.partition("-")
+        if not head.isdigit():
+            return None
+        days = int(head)
+    parts = raw.split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    nums = [int(p) for p in parts]
+    hours, minutes, seconds = ([0] + nums) if len(nums) == 2 else nums
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _worker_holdings(ps_output: "str | None" = None) -> dict:
+    """{task filename: worker RUNTIME in seconds, or None if unreadable}.
+
+    A team task stays in tasks/ for the whole run — the worker removes it only
+    when it publishes a result — so an in-flight task and an abandoned one are
+    byte-identical on disk. Only the worker's argv separates them.
+
+    The runtime comes from the worker PROCESS, not the task file: a task can sit
+    queued for hours before a worker claims it, and claiming does not touch the
+    file, so file age answers a different question than "has this worker
+    outlived its deadline".
+    """
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(["ps", "-Ao", "pid=,etime=,args="], capture_output=True,
+                                       text=True, timeout=5).stdout
+        except Exception:  # noqa: BLE001 — a probe failure must not fail the check
+            return {}
+    held: dict = {}
+    for line in (ps_output or "").splitlines():
+        if "session-worker.py" not in line:
+            continue
+        fields = line.split()
+        # Callers may pass argv-only output; then the leading fields are argv.
+        pid = int(fields[0]) if fields and fields[0].isdigit() else None
+        proc_age = _parse_etime(fields[1]) if len(fields) > 1 else None
+        if pid is None:
+            proc_age = _parse_etime(fields[0]) if fields else None
+        for tok in fields:
+            if tok.endswith(".txt") and "/tasks/" in tok:
+                name = Path(tok).name
+                held[name] = _provider_runtime(name, proc_age, pid)
+    return held
+
+
+#: The worker stamps this after acquiring its workstream lock; see
+#: session-worker.py::_run_mark. Absent + alive = still waiting for the lock.
+WORKER_RUN_MARK_DIR = Path("state") / "task-workstream-runs"
+WAITING_FOR_LOCK = "waiting"
+
+
+def _provider_runtime(task_name: str, proc_age: "float | None",
+                      pid: "int | None" = None):
+    """Seconds the PROVIDER has run, `WAITING_FOR_LOCK`, or None if unreadable.
+
+    Process age is the wrong quantity — same-workstream tasks serialize on a lock
+    taken AFTER the process starts — but it still BOUNDS how long an absent mark
+    can innocently mean "waiting".
+    """
+    mark = WORKSPACE_DIR / WORKER_RUN_MARK_DIR / f"{task_name}.started"
+    try:
+        rec = json.loads(mark.read_text())
+        started = float(rec["started"])
+        owner = int(rec["pid"])
+    except FileNotFoundError:
+        rec = None
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    else:
+        # Only a POSITIVELY matched owner may hand over its clock. A foreign pid
+        # is a SIGKILLed worker's corpse; an unknown one cannot rule that out.
+        if pid is not None and owner == pid:
+            age = time.time() - started
+            return age if age >= 0 else 0.0
+        rec = None
+    if proc_age is None:
+        return None
+    # No usable mark is innocent only while the process is younger than the
+    # deadline; past that, a failed write and a wedged provider look identical.
+    return WAITING_FOR_LOCK if proc_age <= _worker_hard_timeout_s() else None
+
+
+def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
+    """Filenames only — the set form, for callers that do not need the runtime."""
+    return set(_worker_holdings(ps_output))
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -5792,23 +5886,53 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
     now = time.time()
+    # An in-flight task looks exactly like a stalled one on disk; the worker's
+    # argv is the only thing that tells them apart.
+    holdings = _worker_holdings()
+    inflight = sum(1 for f in files if f.name in holdings)
+    held_note = f", {inflight} in flight with a worker" if inflight else ""
     oldest = min(files, key=lambda p: p.stat().st_mtime)
     oldest_age = int(now - oldest.stat().st_mtime)
+    # Deadline vs the WORKER's runtime, never the file's age: a task can queue
+    # for hours before a worker claims it, and claiming does not touch the file.
+    all_held = inflight == len(files)
+    held_deadline = int(_worker_hard_timeout_s())
+    ages = [holdings.get(f.name) for f in files if f.name in holdings]
+    # A holder still waiting for its workstream lock has not started running, so
+    # it can never be past its own deadline — that wait is progress, not a stall.
+    running = [a for a in ages if isinstance(a, (int, float))]
+    unreadable = any(a is None for a in ages)
+    worker_age = None if (unreadable or not ages) else (int(max(running)) if running else 0)
+    held_is_progress = all_held and worker_age is not None and worker_age <= held_deadline
+    wedged_note = (f" — still held by a live worker running {worker_age}s, past its own "
+                   f"{held_deadline}s hard deadline, so the WORKER is wedged, not the watcher"
+                   if worker_age is not None else
+                   " — held by a live worker whose runtime could not be read, so progress "
+                   "cannot be established")
+    held_verdict = (" — all held by a live worker, not stalled" if held_is_progress
+                    else wedged_note if all_held else None)
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
-            "status": "warn",
-            "detail": f"{len(files)} tasks queued, oldest {oldest_age}s — watcher or core may be stuck",
+            # ok, not warn: every `warn` is alertable (emit_task_for_failures /
+            # notify_for_failures), so rewording alone still fires the false alert.
+            "status": "ok" if held_is_progress else "warn",
+            "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
+                       + (held_verdict or " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
     # message could sit indefinitely while this probe printed its age under "ok".
-    if oldest_age > stuck_age_sec:
+    # A worker configured SHORTER than stuck_age_sec is already overdue here, so
+    # the age test alone would let it fall through to "ok" and hide it.
+    if oldest_age > stuck_age_sec or (all_held and not held_is_progress):
         return {
             "name": name,
-            "status": "warn",
-            "detail": f"{len(files)} task(s) queued, oldest {oldest_age}s — undrained past {stuck_age_sec}s",
+            "status": "ok" if held_is_progress else "warn",
+            "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
+                       + (held_verdict or f" — undrained past {stuck_age_sec}s")),
         }
-    return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(files)} task(s){held_note}, oldest {oldest_age}s"}
 
 
 def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
@@ -5922,6 +6046,77 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         "detail": (f"{len(orphans)} result(s) with no consumer coming — never delivered; "
                    f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
     }
+
+
+def check_stranded_destined_proactive() -> dict:
+    """A destined proactive file no bridge will claim, named while it can still act.
+
+    The destination grammar (proactive_routing) has a two-tier rule: a known
+    `.to-<channel>` tag is claimed only by that bridge; an unrecognized tag is
+    claimed by NO bridge — deliberate (a file aimed at a channel this install
+    lacks must never fall into another bridge's race), but without a reader
+    the strand is silent, and unlike the pre-fix activity strand it cannot
+    self-heal: the tag never becomes recognized. Same principle as
+    check_proactive_quarantine — preservation without a reader reaches no one
+    — in the directory that probe deliberately does not scan.
+
+    Ages past _STRAND_MIN_AGE_S only: a destined file's target bridge may
+    legitimately be seconds from its next poll.
+    """
+    name = "stranded-destined-proactive"
+    results = WORKSPACE_DIR / "results"
+    if not results.is_dir():
+        return {"name": name, "status": "ok", "detail": "no results/ directory"}
+    try:
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from presenter_mode import presenter_mode_active
+        from proactive_routing import PROACTIVE_DESTINATIONS, proactive_destination
+    except ImportError as e:
+        return {"name": name, "status": "warn",
+                "detail": f"could not load proactive_routing: {e}"}
+    # Presenter mode intentionally holds ALL proactive deliveries — an aged
+    # destined file is the bridge waiting for the talk to end, not a strand.
+    if presenter_mode_active(WORKSPACE_DIR):
+        return {"name": name, "status": "ok",
+                "detail": "presenter mode active — deliveries intentionally held"}
+    now = time.time()
+    stranded: list[tuple[str, str, int]] = []
+    for path in results.glob("proactive-*.txt"):
+        dest = proactive_destination(path.name)
+        if dest is None:
+            continue  # undestined: activity routing owns it, self-heals
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age < _STRAND_MIN_AGE_S:
+            continue
+        kind = ("unrecognized destination" if dest not in PROACTIVE_DESTINATIONS
+                else f"destination '{dest}' bridge not claiming")
+        stranded.append((path.name, kind, int(age)))
+    if not stranded:
+        return {"name": name, "status": "ok",
+                "detail": "no aged destined proactive files awaiting a claim"}
+    # Unrecognized tags outrank age in the headline: that class never
+    # self-heals, so it must be the one a human sees first.
+    stranded.sort(key=lambda item: (not item[1].startswith("unrecognized"), -item[2]))
+    fname, kind, age = stranded[0]
+    unrec = sum(1 for item in stranded if item[1].startswith("unrecognized"))
+    mix = (f"{unrec} with an unrecognized tag, "
+           f"{len(stranded) - unrec} with an unclaimed known destination — "
+           if 0 < unrec < len(stranded) else "")
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(stranded)} destined proactive file(s) older than "
+                   f"{_STRAND_MIN_AGE_S // 60}m that no bridge has claimed — "
+                   f"{mix}worst {fname} ({kind}, {age // 3600}h{age % 3600 // 60}m); "
+                   f"an unrecognized .to-<tag> never self-heals: fix the tag or "
+                   f"start the named bridge"),
+    }
+
+
+_STRAND_MIN_AGE_S = 1800
 
 
 def check_proactive_quarantine() -> dict:
@@ -6221,11 +6416,8 @@ def check_task_watcher() -> dict:
     argv = _proc_argv(pid)
     if not argv:
         if roots:
-            # The sentinel tracks only the MOST RECENT start (the script writes
-            # $$ at startup), so a dead sentinel does NOT mean nothing is
-            # draining tasks/ — an older watcher can still be running. Saying
-            # "not running" here would be false, and restarting on that basis is
-            # what produces the duplicates in the first place.
+            # The sentinel tracks only the MOST RECENT start, so a dead one does
+            # NOT mean nothing drains tasks/ — restarting here makes duplicates.
             return {"name": name, "status": "warn",
                     "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
                               f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
@@ -6253,16 +6445,24 @@ _TASK_CLAIM_WARN_MULTIPLE = 2
 _TASK_CLAIM_DOWN_MULTIPLE = 8
 
 
-def _task_claim_thresholds() -> tuple[float, float]:
-    """(warn, down) seconds from the handler's configured hard timeout, falling back to
-    its default on anything unparseable so a threshold never pages a permitted run."""
+def _worker_hard_timeout_s() -> float:
+    """session-worker.py's own per-run deadline (`SUTANDO_TIER_HARD_TIMEOUT`).
+
+    Non-positive or unparseable makes the worker refuse to start
+    (session-worker.py:249-252), so the default is the only value a RUNNING
+    worker can hold — falling back to it never pages a permitted run.
+    """
     raw = os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "")
     try:
         hard = float(raw)
     except (TypeError, ValueError):
-        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
-    if hard <= 0:
-        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+        return _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+    return hard if hard > 0 else _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+
+
+def _task_claim_thresholds() -> tuple[float, float]:
+    """(warn, down) seconds from the handler's configured hard timeout."""
+    hard = _worker_hard_timeout_s()
     return hard * _TASK_CLAIM_WARN_MULTIPLE, hard * _TASK_CLAIM_DOWN_MULTIPLE
 
 
@@ -8607,6 +8807,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
     checks.append(check_proactive_quarantine())
+    checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
