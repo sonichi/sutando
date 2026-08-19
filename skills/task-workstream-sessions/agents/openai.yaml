@@ -1,4 +1,0 @@
-interface:
-  display_name: "Task Workstream Sessions"
-  short_description: "Isolate selected-core context by workstream"
-  default_prompt: "Maintain durable, isolated provider sessions for already-assigned task workstreams."

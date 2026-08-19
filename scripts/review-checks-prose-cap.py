@@ -79,13 +79,16 @@ def post_image_matches(path, sha):
 
 
 def violations(diff_text, cap, exts, root="."):
-    """(found, unreadable, detached). found = (path, first_line, length) per run over cap.
-    Detached and unreadable are split because only one of them is a fault."""
+    """(found, unreadable, detached, in_scope). found = (path, first_line, length)
+    per run over cap; in_scope counts ext-matching files with added lines, so the
+    caller can tell "scanned clean" from "nothing was ever in scope"."""
     found, unreadable, detached = [], [], []
+    in_scope = 0
     by_file, shas = added_by_file(diff_text)
     for path, added in by_file.items():
         if not added or not any(path.endswith(e) for e in exts):
             continue
+        in_scope += 1
         full = Path(root) / path
         # A diff can legitimately arrive without its tree (`gh pr diff > pr.diff`),
         # and a tree at another revision is worse: its line numbers still resolve.
@@ -111,7 +114,7 @@ def violations(diff_text, cap, exts, root="."):
             run.append(n)
         if len(run) > cap:
             found.append((path, run[0], len(run)))
-    return found, unreadable, detached
+    return found, unreadable, detached, in_scope
 
 
 def _config():
@@ -143,7 +146,7 @@ def main():
     if not diff_text.strip():
         print("prose-cap: empty diff; nothing scanned, so this is NOT a pass", file=sys.stderr)
         return 2
-    found, unreadable, detached = violations(diff_text, cap, exts)
+    found, unreadable, detached, in_scope = violations(diff_text, cap, exts)
     for path, line, length in found:
         print(f"prose-cap: {path}:{line} comment block is {length} lines (cap {cap})")
     # A file that IS here and still would not parse is a fault: it was meant to be
@@ -164,6 +167,10 @@ def main():
             print(f"prose-cap: {path} has no matching post-image here; NOT scanned", file=sys.stderr)
         print(f"prose-cap: SKIPPED — {len(detached)} in-scope file(s) are not this tree's revision",
               file=sys.stderr)
+    elif in_scope == 0:
+        # A gate with nothing in scope cannot fail; PASS would read as "checked".
+        print(f"prose-cap: no in-scope files (exts {','.join(exts)}); nothing "
+              "was scanned", file=sys.stderr)
     else:
         print(f"prose-cap: PASS (comment blocks within cap {cap}, exts {','.join(exts)})",
               file=sys.stderr)

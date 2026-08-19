@@ -312,14 +312,36 @@ keeper10=$!
 ( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
     >"$TMP/ws10_A.out" 2>&1 ) &
 A=$!
-sleep 2                      # let A acquire the lock and enter the gate
-kill -STOP "$A" 2>/dev/null  # stall A past the stale threshold
-sleep 4
-( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
-    >"$TMP/ws10_B.out" 2>&1 ) &
-B=$!
-sleep 3                      # B reaps the stale lock and takes it
-kill -CONT "$A" 2>/dev/null  # A resumes holding a lease it no longer owns
+# Barriers on $LOCKDIR/rid — the value own_lock() compares — not fixed sleeps.
+# Unverified sleeps made this case UNDECIDABLE: if A had not yet acquired, or B
+# had not yet reaped, the lease-loss scenario never occurred and the assertion
+# still printed "N restart decisions", identical to a real concurrent restart.
+LOCK10="$WS10/state/locks/graceful-restart.lock"
+B=""   # set -u: the setup-failure path still reaches `wait "$B"`
+rid_A=""
+for _ in $(seq 1 100); do
+  rid_A="$(cat "$LOCK10/rid" 2>/dev/null || echo '')"
+  [ -n "$rid_A" ] && break
+  sleep 0.1
+done
+if [ -z "$rid_A" ]; then
+  say FAIL "case 10 SETUP: A never acquired the lease — scenario not exercised (not a concurrency bug)"
+else
+  kill -STOP "$A" 2>/dev/null  # stall A past the stale threshold
+  sleep 4                      # real wait: must exceed GR_LOCK_STALE_S=2 so B reaps
+  ( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
+      >"$TMP/ws10_B.out" 2>&1 ) &
+  B=$!
+  rid_B=""
+  for _ in $(seq 1 100); do
+    rid_B="$(cat "$LOCK10/rid" 2>/dev/null || echo '')"
+    [ -n "$rid_B" ] && [ "$rid_B" != "$rid_A" ] && break
+    sleep 0.1
+  done
+  [ -n "$rid_B" ] && [ "$rid_B" != "$rid_A" ] \
+    || say FAIL "case 10 SETUP: B never took the lease from A — scenario not exercised (not a concurrency bug)"
+  kill -CONT "$A" 2>/dev/null  # A resumes holding a lease it no longer owns
+fi
 touch "$TMP/ws10_goidle"     # release both from the busy gate
 wait "$A" 2>/dev/null; wait "$B" 2>/dev/null
 kill "$keeper10" 2>/dev/null || true; wait "$keeper10" 2>/dev/null || true
@@ -485,6 +507,44 @@ decisions16=$(grep -- "--restart" "$TMP/ws16.argv" 2>/dev/null | wc -l | tr -d '
   || say FAIL "$decisions16 restart decision(s) survived TERM — force + waiter would restart twice"
 [ ! -d "$LOCK16" ] && say ok "TERM'd waiter released the lock, so the forced replacement won't defer" \
   || say FAIL "lock survived TERM — a forced restart would hit exit 4"
+echo "17. an EMPTY core-status.json is the truncate WINDOW, not idle — re-read, do not kill through it"
+# Every writer is a `>` truncate-then-write, so a poll can land between the two.
+# Modelled deterministically: empty now, "running" well inside the re-read budget.
+WS17="$TMP/ws17"; mkws "$WS17"
+: > "$WS17/state/core-status.json"          # the window: readable, empty
+( for _ in $(seq 1 40); do touch "$WS17/state/cores/$HOST.alive"; sleep 0.5; done ) &
+keeper17=$!
+( sleep 0.15
+  printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS17/state/core-status.json" ) &
+writer17=$!
+( GR_WS="$WS17" GR_SYNC_CMD="true" GR_POLL_S=1 GR_STATUS_REREADS=5 bash "$GR" --dry-run \
+    > "$TMP/ws17.out" 2>&1 ) &
+gr17=$!
+wait "$writer17" 2>/dev/null
+sleep 3
+if kill -0 "$gr17" 2>/dev/null; then
+  say ok "the gate re-read the window and stayed in the busy wait"
+else
+  say FAIL "the gate decided through the truncate window: $(grep -h 'would exec' "$TMP/ws17.out" | head -1)"
+fi
+printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS17/state/core-status.json"
+wait "$gr17" 2>/dev/null
+kill "$keeper17" 2>/dev/null || true; wait "$keeper17" 2>/dev/null || true
+grep -q "would exec" "$TMP/ws17.out" \
+  && say ok "and it proceeded once the core reported idle" \
+  || say FAIL "the gate never proceeded on a readable idle status — over-corrected into a hang"
+
+echo "18. an ABSENT core-status.json still reads as not-busy (no regression)"
+WS18="$TMP/ws18"; mkws "$WS18"
+rm -f "$WS18/state/core-status.json"
+touch "$WS18/state/cores/$HOST.alive"
+( for _ in $(seq 1 20); do touch "$WS18/state/cores/$HOST.alive"; sleep 0.5; done ) &
+k18=$!
+GR_WS="$WS18" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run > "$TMP/ws18.out" 2>&1 || true
+kill "$k18" 2>/dev/null || true; wait "$k18" 2>/dev/null || true
+grep -q "would exec" "$TMP/ws18.out" \
+  && say ok "absent status = nothing running = proceed" \
+  || say FAIL "absent status now blocks the restart — the empty-read fix over-reached"
 
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
