@@ -83,20 +83,20 @@ class FullBody(unittest.TestCase):
         return buf.getvalue()
 
     def test_main_clips_by_default(self):
-        out = self._run_main(["123"], [msg(LONG)])
+        out = self._run_main(["123", "--operator"], [msg(LONG)])
         self.assertNotIn("NEEDLE_PAST_THE_CLIP", out)
 
     def test_main_under_full_prints_the_whole_body(self):
         """Fails if the flag exists but main() never passes it through."""
-        out = self._run_main(["123", "--full"], [msg(LONG)])
+        out = self._run_main(["123", "--full", "--operator"], [msg(LONG)])
         self.assertIn("NEEDLE_PAST_THE_CLIP", out)
 
     def test_main_under_full_also_lifts_the_reply_target(self):
         ref = {"content": LONG, "author": {"username": "sonichi"}}
         m = {"id": "1001", "content": "2 merge", "author": {"username": "sonichi"},
              "referenced_message": ref}
-        self.assertNotIn("NEEDLE_PAST_THE_CLIP", self._run_main(["123"], [m]))
-        self.assertIn("NEEDLE_PAST_THE_CLIP", self._run_main(["123", "--full"], [m]))
+        self.assertNotIn("NEEDLE_PAST_THE_CLIP", self._run_main(["123", "--operator"], [m]))
+        self.assertIn("NEEDLE_PAST_THE_CLIP", self._run_main(["123", "--full", "--operator"], [m]))
 
     def test_argparse_accepts_it(self):
         args = dr._parse_args(["123", "--full"])

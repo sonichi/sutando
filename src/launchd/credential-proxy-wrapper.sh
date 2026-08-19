@@ -40,12 +40,19 @@ do
     break   # first (highest-priority) node wins — don't stack multiple node dirs
 done
 
-# Resolve the credential-proxy script path. Honors $CLAUDE_CONFIG_DIR if the
-# launchd plist exports it (claude-sutando installs); otherwise falls back to
-# ~/.claude. launchd itself doesn't inherit shell env, so this fallback is the
-# vanilla-claude default unless the plist's EnvironmentVariables sets it.
-# (REPO_ROOT is resolved above, before the node-candidate loop.)
-PROXY_SCRIPT="$(bash "$REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+# Prefer THIS checkout's copy so the proxy resolves the same workspace as the core;
+# launchd inherits no env, so claude-home falls back to ~/.claude unless the plist pins it.
+PROXY_SCRIPT="$REPO_ROOT/skills/quota-tracker/scripts/credential-proxy.ts"
+if [ ! -f "$PROXY_SCRIPT" ]; then
+    PROXY_SCRIPT="$(bash "$REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+fi
+
+# Test probe: print the resolved target and exit, so the suite can assert launchd-env
+# resolution without exec'ing a real proxy. No production caller passes arguments.
+if [ "${1:-}" = "--resolve-only" ]; then
+    echo "$PROXY_SCRIPT"
+    exit 0
+fi
 
 # Resolve npx — launchd doesn't inherit the user's shell PATH.
 resolve_npx() {

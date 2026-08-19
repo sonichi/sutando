@@ -3,13 +3,16 @@
 // Polls the IPC command file; on a new Target, flies a triangle there along a
 // Clicky-style quadratic bezier, shows the label, holds, fades.
 //
-// build: swiftc pointer-overlay.swift -o pointer-overlay
-// run  : ./pointer-overlay &
-// IPC  : /tmp/pointer-cmd.json  {"nx","ny","label","say","ts"}
+// build: bash build.sh          (SwiftPM; produces ./pointer-overlay)
+// run  : SUTANDO_POINTER_CMD=<workspace>/state/pointer-cmd.json ./pointer-overlay &
+// IPC  : $SUTANDO_POINTER_CMD   {"nx","ny","label","say","ts"}
 
 import Cocoa
 
-let CMD = "/tmp/pointer-cmd.json"
+// The production `point_at` tool publishes to <workspace>/state/pointer-cmd.json,
+// not /tmp — so the path is injected. Without this the overlay builds, runs, and
+// watches a file nothing writes, which looks identical to the tool being broken.
+let CMD = ProcessInfo.processInfo.environment["SUTANDO_POINTER_CMD"] ?? "/tmp/pointer-cmd.json"
 let BLUE = NSColor(calibratedRed: 0.20, green: 0.62, blue: 1.0, alpha: 1.0)
 
 final class PointerView: NSView {
@@ -99,7 +102,11 @@ final class Overlay: NSObject {
         win.contentView = view
         win.orderFrontRegardless()
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in self.poll() }
-        FileManager.default.createFile(atPath: CMD, contents: Data("{}".utf8))
+        // Never truncate an existing command file — the production writer owns it, and
+        // clobbering it discards a pointer command already in flight.
+        if !FileManager.default.fileExists(atPath: CMD) {
+            FileManager.default.createFile(atPath: CMD, contents: Data("{}".utf8))
+        }
         NSLog("pointer-overlay up on \(Int(f.width))x\(Int(f.height)) — watching \(CMD)")
     }
 
