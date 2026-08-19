@@ -100,6 +100,7 @@ One entry per agent-facing module.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
+- **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
 - **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
