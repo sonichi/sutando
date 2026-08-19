@@ -25,17 +25,36 @@ printf '#!/bin/sh\necho ran >> "%s/stub-ran"\nexit 1\n' "$lab" > "$lab/bin/pytho
 chmod +x "$lab/bin/python3"
 
 # A REAL interpreter offered via SUTANDO_PY, the way the desktop launcher does.
-REAL_PY="$(command -v python3 || true)"
-if [ -z "$REAL_PY" ]; then
-	echo "  skip — no real python3 on this host to offer as SUTANDO_PY"
+# `command -v python3` cannot certify one: on a Mac without Command Line Tools it
+# returns Apple's stub, and resolve_python trusts an executable SUTANDO_PY before
+# applying its own stub guard — so the stub would be promoted to the thing under test.
+# shellcheck source=scripts/python-binary.sh
+. "$REPO/scripts/python-binary.sh"
+REAL_PY="$(SUTANDO_PY= resolve_python "$REPO" || true)"
+if [ -z "$REAL_PY" ] || [ ! -x "$REAL_PY" ]; then
+	echo "  skip — no real interpreter resolves on this host to offer as SUTANDO_PY"
+	rm -rf "$lab"
 	exit 0
 fi
 
+# SUTANDO_TEST_MODE=1 + SUTANDO_WORKSPACE is the ONLY supported workspace seam
+# (src/sutando_config.py). Without it the wrapper writes the probe payload into
+# the checkout's real workspace, falsifying owner-facing progress and making
+# graceful-restart's busy gate wait for a transition that is not happening.
 out=$(cd "$REPO" && env PATH="$lab/bin:/usr/bin:/bin" \
 	SUTANDO_PY="$REAL_PY" \
-	SUTANDO_WORKSPACE_OVERRIDE="$lab/ws" \
+	SUTANDO_TEST_MODE=1 \
+	SUTANDO_WORKSPACE="$lab/ws" \
 	bash scripts/core-status.sh running "resolution probe" 2>&1)
 rc=$?
+
+# Assert the isolation rather than trusting it: the payload must be INSIDE $lab.
+probe="$lab/ws/state/core-status.json"
+if [ -f "$probe" ] && grep -q "resolution probe" "$probe"; then
+	ok "the probe payload lands inside the test lab, not the checkout workspace"
+else
+	bad "the probe payload lands inside the test lab" "nothing at $probe"
+fi
 
 if [ -f "$lab/stub-ran" ]; then
 	bad "the poisoned PATH python3 is never executed" "stub ran $(wc -l < "$lab/stub-ran") time(s)"
