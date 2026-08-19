@@ -289,6 +289,10 @@ B_PATH="${SUTANDO_MIGRATE_SRC_B:-$HOME/.sutando/workspace}"
 
 # Source C — env override (env or .env)
 # (TEST hook: SUTANDO_MIGRATE_SRC_C overrides for E2E fixtures)
+# A source is a sutando CODE checkout only if it carries the repo-only resolver
+# module; scripts/sutando-config.sh alone is a tool a workspace may legitimately own.
+_is_sutando_repo() { [ -f "$1/src/sutando_config.py" ]; }
+
 detect_C() {
     local c=""
     if [ -n "${SUTANDO_MIGRATE_SRC_C:-}" ]; then
@@ -417,12 +421,12 @@ scan_source() {
     # source path IS a sutando repo checkout (by content, not by tag) — if
     # so, skip dirs that exist as repo code rather than workspace data
     # (docs/, agents/, etc.). Detection: presence of `src/sutando_config.py`
-    # (or the same-shape sutando-config.sh) at source root. Owner clarified
+    # at source root — NOT scripts/sutando-config.sh, which a workspace may own. Owner clarified
     # 2026-06-02 07:29: "We should only EXCLUDE them when they are in the
     # sutando repo root." A custom workspace path that happens to live
     # inside a sutando checkout should ALSO get the exclude.
     local IS_SUTANDO_REPO=0
-    if [ -f "$src/src/sutando_config.py" ] || [ -f "$src/scripts/sutando-config.sh" ]; then
+    if _is_sutando_repo "$src"; then
         IS_SUTANDO_REPO=1
     fi
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
@@ -1391,12 +1395,12 @@ commit_source() {
     # source path IS a sutando repo checkout (by content, not by tag) — if
     # so, skip dirs that exist as repo code rather than workspace data
     # (docs/, agents/, etc.). Detection: presence of `src/sutando_config.py`
-    # (or the same-shape sutando-config.sh) at source root. Owner clarified
+    # at source root — NOT scripts/sutando-config.sh, which a workspace may own. Owner clarified
     # 2026-06-02 07:29: "We should only EXCLUDE them when they are in the
     # sutando repo root." A custom workspace path that happens to live
     # inside a sutando checkout should ALSO get the exclude.
     local IS_SUTANDO_REPO=0
-    if [ -f "$src/src/sutando_config.py" ] || [ -f "$src/scripts/sutando-config.sh" ]; then
+    if _is_sutando_repo "$src"; then
         IS_SUTANDO_REPO=1
     fi
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do

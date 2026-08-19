@@ -87,9 +87,17 @@ echo "B tool v1" > "$B/scripts/my-tool.sh"
 echo "C tool v2" > "$C/scripts/my-tool.sh"
 touch -t 202605011000 "$B/scripts/my-tool.sh"   # older — loses the collision
 touch -t 202606011000 "$C/scripts/my-tool.sh"   # newer — canonical
+# (#3036 P1) A workspace may legitimately OWN scripts/sutando-config.sh without
+# being a repo checkout. B carries it plus a B-only tool: the tool must survive.
+echo "# workspace-owned helper" > "$B/scripts/sutando-config.sh"
+echo "B only tool" > "$B/scripts/b-only-tool.sh"
 echo "repo code, not data" > "$A/scripts/repo-code.sh"
 # The repo marker lives in the very dir being excluded — matches a real
 # checkout, and flips IS_SUTANDO_REPO=1 so SOURCE_A_EXCLUDE actually applies.
+# Source A is a real checkout: the repo-only resolver module is the marker.
+# (scripts/sutando-config.sh alone must NOT count — see 6e-bis.)
+mkdir -p "$A/src"
+echo "# repo resolver" > "$A/src/sutando_config.py"
 echo "# repo marker" > "$A/scripts/sutando-config.sh"
 mkdir -p "$C/.claude-sutando/skills/custom" "$C/.claude-sutando/hooks"
 echo "custom skill body" > "$C/.claude-sutando/skills/custom/SKILL.md"
@@ -140,7 +148,7 @@ if [ ! -f "$DEST/notes/divergent.md" ]; then
 else
     body="$(cat "$DEST/notes/divergent.md")"
     # Sidecar uses glob: divergent.md.legacy-prior-from-A-<timestamp>
-    sidecar_path="$(ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null | head -1)"
+    sidecar_path="$( { ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null || true; } | head -1 )"
     if [ -z "$sidecar_path" ]; then
         echo "  FAIL: .legacy-prior-from-A-<ts> sidecar missing"; fail=1
     elif [ "$body" != "divergent A-version" ]; then
@@ -174,8 +182,8 @@ fi
 # 3b. 3-way collision (Mini #3): ALL 3 versions preserved uniquely.
 # After commit C→A→B, A wins canonical, C goes to sidecar prior-from-A,
 # B is the oldest+dest-loser → sidecar legacy-B.
-side_a="$(ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null | head -1)"
-side_b="$(ls "$DEST/notes/divergent.md.legacy-B-"*-p* 2>/dev/null | head -1)"
+side_a="$( { ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null || true; } | head -1 )"
+side_b="$( { ls "$DEST/notes/divergent.md.legacy-B-"*-p* 2>/dev/null || true; } | head -1 )"
 if [ -z "$side_a" ] || [ -z "$side_b" ]; then
     echo "  FAIL: 3-way collision: missing one of the sidecars (prior-from-A=$side_a, legacy-B=$side_b)"
     fail=1
@@ -227,7 +235,7 @@ if [ ! -f "$DEST/scripts/my-tool.sh" ]; then
 elif [ "$(cat "$DEST/scripts/my-tool.sh")" != "C tool v2" ]; then
     echo "  FAIL: scripts/my-tool.sh should hold C's newer version, got: $(cat "$DEST/scripts/my-tool.sh")"; fail=1
 else
-    tool_sidecar="$(ls "$DEST/scripts/my-tool.sh.legacy-"* 2>/dev/null | head -1)"
+    tool_sidecar="$( { ls "$DEST/scripts/my-tool.sh.legacy-"* 2>/dev/null || true; } | head -1 )"
     if [ -z "$tool_sidecar" ]; then
         echo "  FAIL: scripts/my-tool.sh conflicting B version not preserved (no legacy sidecar)"; fail=1
     elif [ "$(cat "$tool_sidecar")" != "B tool v1" ]; then
@@ -251,6 +259,16 @@ if [ -e "$DEST/legacy/C/quarantine/.claude-sutando" ]; then
     echo "  FAIL: .claude-sutando was quarantined — breaks hooks/skills/memory (#3036)"; fail=1
 fi
 [ "$fail" = "0" ] && echo "  OK: .claude-sutando nested skill+hook migrated to canonical relpaths"
+
+# 6e-bis. (#3036 P1) a workspace-owned scripts/sutando-config.sh must NOT make
+# B look like a repo checkout and swallow its scripts/ surface.
+if [ ! -f "$DEST/scripts/b-only-tool.sh" ]; then
+    echo "  FAIL: B scripts/b-only-tool.sh dropped — workspace-owned sutando-config.sh triggered the repo exclusion (#3036 P1)"; fail=1
+elif [ "$(cat "$DEST/scripts/b-only-tool.sh")" != "B only tool" ]; then
+    echo "  FAIL: B scripts/b-only-tool.sh content wrong: $(cat "$DEST/scripts/b-only-tool.sh")"; fail=1
+else
+    echo "  OK: workspace-owned sutando-config.sh does not exclude B scripts/"
+fi
 
 # 6f. (#3036) repo-root Source A scripts/ is CODE — excluded, not migrated, not quarantined
 if [ -f "$DEST/scripts/repo-code.sh" ]; then
