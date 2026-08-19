@@ -298,7 +298,7 @@
       ],
       "status": "active",
       "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, ambient taskify provenance",
-      "last_verified": "2026-08-17"
+      "last_verified": "2026-08-18"
     },
     "docs/migration-transition-window.md": {
       "title": "Migration transition window (moved from CLAUDE.md)",
