@@ -206,10 +206,7 @@ intact = ["```python" in c and c.rstrip().endswith("```") and c.count("```") == 
 check("fence: whole block lands intact in one chunk",
       len(intact) == 1 and intact[0], str([c[:40] for c in fchunks]))
 
-# Length invariant, asserted across EVERY fixture above. Invariant 1 in this
-# file's own docstring was the only one never checked, so a paragraph cut that
-# retained a tail and then appended a line shipped a 2250-char chunk at
-# max_len=1900 — past Discord's 2000 ceiling — through a fully green run.
+# Invariant 1 of this file's docstring, asserted across every fixture above.
 for _label, _chunks, _cap in [
     ("inline", out_inline, 1900),
     ("big_fenced", chunks, 120),
@@ -224,9 +221,8 @@ for _label, _chunks, _cap in [
     _over = [len(c) for c in _chunks if len(c) > _cap]
     check("len<=max_len: %s" % _label, not _over, "over-limit: %s (cap %d)" % (_over, _cap))
 
-# Regression: a paragraph cut inside the lookback window followed by a long
-# line. The cut retains a tail, so the appended line must not push the buffer
-# past max_len. Checked at two caps — the bug scaled with max_len//4.
+# A cut retains a tail, so the line that follows must not overflow the buffer.
+# Two caps: the overflow scales with max_len//4.
 for _cap in (1900, 4000):
     _a = "\n".join("A" * 99 for _ in range(14))
     _b = "\n".join("B" * 99 for _ in range(4))
