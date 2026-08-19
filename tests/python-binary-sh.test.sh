@@ -246,9 +246,14 @@ fi
 
 # ── 12. Every Python-backed service the reviewer named owns an explicit skip
 # branch. Counted per service, so covering one does not vouch for the rest.
+# "gateway bridge"'s skip line lives in start_gateway_lanes() in
+# src/startup-runtime.sh (startup.sh's own inline gateway block moved there so
+# it can also run standalone via scripts/restart-gateway-lanes.sh) — search
+# both files rather than only startup.sh, since startup.sh still calls it.
 missing=""
 for svc in "core heartbeat" "services-status emitter" "screen capture" "gateway bridge"; do
-  grep -qF "⊘ $svc skipped — no runnable python3" "$REPO/src/startup.sh" || missing="${missing}[$svc] "
+  grep -qF "⊘ $svc skipped — no runnable python3" "$REPO/src/startup.sh" "$REPO/src/startup-runtime.sh" \
+    || missing="${missing}[$svc] "
 done
 if [ -z "$missing" ]; then
   ok "each Python-backed service prints an explicit ⊘ skip when \$PY is empty"
@@ -266,11 +271,13 @@ fi
 #     "gateway bridge", so the PRIMARY gateway's skip branch vouched for all of
 #     them.
 # A name-based scan cannot distinguish per-instance output, so run the loop
-# instead of reading it. The block is lifted out of src/startup.sh at test time
-# rather than copied here, so the test cannot drift from the source it pins.
-gw_block=$(awk '/for _gw_var in /{f=1} f{print} f&&/^[[:space:]]*done[[:space:]]*$/{exit}' "$REPO/src/startup.sh")
+# instead of reading it. The block is lifted out of start_gateway_lanes() in
+# src/startup-runtime.sh at test time (moved out of startup.sh's inline body
+# so it can also run standalone via scripts/restart-gateway-lanes.sh) rather
+# than copied here, so the test cannot drift from the source it pins.
+gw_block=$(awk '/for _gw_var in /{f=1} f{print} f&&/^[[:space:]]*done[[:space:]]*$/{exit}' "$REPO/src/startup-runtime.sh")
 if [ -z "$gw_block" ]; then
-  bad "named-gateway loop is extractable from startup.sh" "no 'for _gw_var in' block found"
+  bad "named-gateway loop is extractable from startup-runtime.sh" "no 'for _gw_var in' block found"
 else
   gw_out=$(env -i PATH="/usr/bin:/bin" AG2_REMOTE_TOKEN_DEV=tok-dev \
     bash -c 'PY=""; REPO="'"$REPO"'"; LOGS_DIR="$(mktemp -d)"

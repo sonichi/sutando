@@ -102,6 +102,12 @@ assert_class "agents/foo.json" "structural" || fail=1
 assert_class "docs/design.md" "structural" || fail=1
 assert_class "email-drafts/task-email.txt" "structural" || fail=1
 assert_class "agent-inbox/processed/x.json" "structural" || fail=1
+# Owner-custom tooling surface (report c8310df7): workspace scripts/ is data
+assert_class "scripts/zoom_schedule.py" "collision-keep-both" || fail=1
+assert_class "scripts/lib/helper.py" "collision-keep-both" || fail=1
+# Agent config tree (report 9de2a03d): quarantining it broke skill/hook paths
+assert_class ".claude-sutando/skills/email-triage/scripts/gmail-drafts.py" "structural" || fail=1
+assert_class ".claude-sutando/settings.json" "structural" || fail=1
 
 # Ordering check: state/auth/X.json should match state/auth/* BEFORE state/*.json|newest-mtime.
 # This is Mini's #2 catch — without explicit ordering, auth files would be newest-mtime'd
