@@ -1,4 +1,4 @@
-"""Sparrow Outbox: durable delivery claims for an already-created outbound item.
+"""Sparrow Outbox: durable claims and terminal receipts for outbound items.
 
 The production boundary starts at an OutboundItem. Deciding which agents receive
 a room event, and which items therefore exist, is upstream server-side semantics
@@ -26,17 +26,27 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
+import stat
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 CLAIMS_DIR = ".claims"
 LOCKS_DIR = ".claim-locks"
 ITEMS_DIR = ".items"
+TERMINAL_RECEIPTS_DIR = ".terminal-receipts"
+TERMINAL_RECEIPT_SCHEMA = 1
+TERMINAL_RECEIPT_TTL_S = 30 * 86400.0
+TERMINAL_RECEIPT_MAX_RECORDS = 100_000
+TERMINAL_RECEIPT_MAX_BYTES = 16 * 1024
+TERMINAL_RECEIPT_SHARDS = 256
+TERMINAL_RECEIPT_SWEEP_BATCH = 512
 
 
 # -- three-state process identity ---------------------------------------------
@@ -722,3 +732,478 @@ def requeue_item(root: Path, item_id: str) -> None:
     d["reason"] = None
     _write_item(Path(root), item_id, d)
     release_delivery_claim(Path(root), item_id, force=True)
+
+
+# -- terminal receipts --------------------------------------------------------
+
+class TerminalDisposition(str, Enum):
+    DELIVERED = "delivered"
+    NO_SEND = "no_send"
+    DEDUPED = "deduped"
+    REDIRECTED = "redirected"
+
+
+class TerminalReceiptState(str, Enum):
+    ABSENT = "ABSENT"
+    TERMINAL = "TERMINAL"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class TerminalReceipt:
+    state: TerminalReceiptState
+    item_id: str
+    generation: int
+    disposition: Optional[TerminalDisposition] = None
+    recorded_at: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        terminal = self.state is TerminalReceiptState.TERMINAL
+        if ((self.disposition is not None) is not terminal
+                or (self.recorded_at is not None) is not terminal):
+            raise ValueError("a terminal state has a disposition and timestamp")
+
+
+@dataclass(frozen=True)
+class TerminalReceiptCleanup:
+    expired: int = 0
+    overflow: int = 0
+    stale_temps: int = 0
+    unknown: int = 0
+    kept: int = 0
+    incomplete: bool = False
+
+
+def _terminal_identity(item_id: str, generation: int) -> bytes:
+    if not isinstance(item_id, str) or not item_id:
+        raise ValueError("item_id must be a non-empty string")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError("generation must be a non-negative integer")
+    return json.dumps([item_id, generation], ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _terminal_digest(item_id: str, generation: int) -> str:
+    return hashlib.sha256(_terminal_identity(item_id, generation)).hexdigest()
+
+
+def _terminal_receipts_dir(root: Path) -> Path:
+    return Path(root) / TERMINAL_RECEIPTS_DIR
+
+
+def _terminal_receipt_shard(root: Path, digest: str) -> Path:
+    return _terminal_receipts_dir(root) / digest[:2]
+
+
+def _terminal_receipt_path(root: Path, item_id: str, generation: int) -> Path:
+    digest = _terminal_digest(item_id, generation)
+    return _terminal_receipt_shard(root, digest) / f"{digest}.json"
+
+
+def _terminal_payload(item_id: str, generation: int,
+                      disposition: TerminalDisposition, recorded_at: float) -> dict:
+    base = {
+        "schema": TERMINAL_RECEIPT_SCHEMA,
+        "item_id": item_id,
+        "generation": generation,
+        "disposition": disposition.value,
+        "recorded_at": recorded_at,
+    }
+    canonical = json.dumps(base, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {**base, "checksum": hashlib.sha256(canonical).hexdigest()}
+
+
+def _terminal_bytes(data: dict) -> bytes:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _unknown_terminal(item_id: Optional[str], generation: Optional[int]) -> TerminalReceipt:
+    return TerminalReceipt(TerminalReceiptState.UNKNOWN, item_id or "",
+                           generation if generation is not None else 0)
+
+
+def _read_terminal_path(path: Path, item_id: Optional[str] = None,
+                        generation: Optional[int] = None) -> TerminalReceipt:
+    try:
+        flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(str(path), flags)
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return _unknown_terminal(item_id, generation)
+            raw = fh.read(TERMINAL_RECEIPT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return TerminalReceipt(TerminalReceiptState.ABSENT, item_id or "",
+                                   generation if generation is not None else 0)
+        except OSError:
+            return _unknown_terminal(item_id, generation)
+        return _unknown_terminal(item_id, generation)
+    except OSError:
+        return _unknown_terminal(item_id, generation)
+    if len(raw) > TERMINAL_RECEIPT_MAX_BYTES:
+        return _unknown_terminal(item_id, generation)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _unknown_terminal(item_id, generation)
+    fields = {"schema", "item_id", "generation", "disposition",
+              "recorded_at", "checksum"}
+    if not isinstance(data, dict) or set(data) != fields:
+        return _unknown_terminal(item_id, generation)
+    if data.get("schema") != TERMINAL_RECEIPT_SCHEMA:
+        return _unknown_terminal(item_id, generation)
+    stored_item = data.get("item_id")
+    stored_generation = data.get("generation")
+    recorded_at = data.get("recorded_at")
+    if not isinstance(stored_item, str) or not stored_item:
+        return _unknown_terminal(item_id, generation)
+    if (isinstance(stored_generation, bool)
+            or not isinstance(stored_generation, int) or stored_generation < 0):
+        return _unknown_terminal(item_id, generation)
+    if (isinstance(recorded_at, bool) or not isinstance(recorded_at, (int, float))
+            or not math.isfinite(float(recorded_at))):
+        return _unknown_terminal(item_id, generation)
+    if item_id is not None and stored_item != item_id:
+        return _unknown_terminal(item_id, generation)
+    if generation is not None and stored_generation != generation:
+        return _unknown_terminal(item_id, generation)
+    try:
+        disposition = TerminalDisposition(data.get("disposition"))
+    except (TypeError, ValueError):
+        return _unknown_terminal(item_id, generation)
+    expected_name = f"{_terminal_digest(stored_item, stored_generation)}.json"
+    if path.name != expected_name or path.parent.name != expected_name[:2]:
+        return _unknown_terminal(item_id, generation)
+    base = {k: data[k] for k in fields if k != "checksum"}
+    canonical = json.dumps(base, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), allow_nan=False).encode("utf-8")
+    checksum = data.get("checksum")
+    if not isinstance(checksum, str) or checksum != hashlib.sha256(canonical).hexdigest():
+        return _unknown_terminal(item_id, generation)
+    return TerminalReceipt(TerminalReceiptState.TERMINAL, stored_item,
+                           stored_generation, disposition, float(recorded_at))
+
+
+def _terminal_clock_and_ttl(now: Optional[float],
+                            ttl_seconds: float) -> tuple[float, float]:
+    clock = time.time() if now is None else float(now)
+    ttl = float(ttl_seconds)
+    if not math.isfinite(clock):
+        raise ValueError("now must be finite")
+    if not math.isfinite(ttl) or ttl < 0:
+        raise ValueError("ttl_seconds must be finite and non-negative")
+    return clock, ttl
+
+
+def read_terminal_receipt(
+    root: Path,
+    item_id: str,
+    generation: int = 0,
+    now: Optional[float] = None,
+    ttl_seconds: float = TERMINAL_RECEIPT_TTL_S,
+) -> TerminalReceipt:
+    """O(1) lookup. Corrupt or unreadable state is UNKNOWN, never ABSENT."""
+    clock, ttl = _terminal_clock_and_ttl(now, ttl_seconds)
+    receipt = _read_terminal_path(
+        _terminal_receipt_path(Path(root), item_id, generation), item_id, generation)
+    if (receipt.state is TerminalReceiptState.TERMINAL
+            and clock - receipt.recorded_at >= ttl):
+        return TerminalReceipt(TerminalReceiptState.ABSENT, item_id, generation)
+    return receipt
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(str(path), flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _ensure_terminal_root(root: Path) -> Path:
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    _fsync_directory(root.parent)
+    return root
+
+
+def _ensure_terminal_receipts_dir(root: Path, digest: str) -> Path:
+    root = Path(root)
+    directory = _terminal_receipts_dir(root)
+    try:
+        directory.mkdir()
+    except FileExistsError:
+        if not directory.is_dir():
+            raise
+    else:
+        _fsync_directory(root)
+    shard = _terminal_receipt_shard(root, digest)
+    try:
+        shard.mkdir()
+    except FileExistsError:
+        if not shard.is_dir():
+            raise
+    else:
+        _fsync_directory(directory)
+    return shard
+
+
+def record_terminal_receipt(
+    root: Path,
+    item_id: str,
+    disposition: Union[TerminalDisposition, str],
+    generation: int = 0,
+    now: Optional[float] = None,
+    ttl_seconds: float = TERMINAL_RECEIPT_TTL_S,
+) -> TerminalReceipt:
+    """Persist one terminal outcome. The first valid or corrupt record wins."""
+    _terminal_identity(item_id, generation)
+    try:
+        terminal = TerminalDisposition(disposition)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid terminal disposition: {disposition!r}") from exc
+    recorded_at, ttl = _terminal_clock_and_ttl(now, ttl_seconds)
+    root = Path(root)
+    digest = _terminal_digest(item_id, generation)
+    shard_name = digest[:2]
+    path = _terminal_receipt_shard(root, digest) / f"{digest}.json"
+    encoded = _terminal_bytes(
+        _terminal_payload(item_id, generation, terminal, recorded_at))
+    if len(encoded) > TERMINAL_RECEIPT_MAX_BYTES:
+        raise ValueError("terminal receipt exceeds the durable record size limit")
+    capacity = _terminal_shard_capacity(
+        shard_name, TERMINAL_RECEIPT_MAX_RECORDS)
+    if capacity == 0:
+        return _unknown_terminal(item_id, generation)
+    _ensure_terminal_root(root)
+    with _item_lock(root, _terminal_shard_lock_id(shard_name)):
+        current = _read_terminal_path(path, item_id, generation)
+        if current.state is TerminalReceiptState.UNKNOWN:
+            _cleanup_terminal_receipt_shard_locked(
+                root, shard_name, recorded_at, ttl, capacity,
+                protected_name=path.name)
+            return current
+        if current.state is TerminalReceiptState.TERMINAL:
+            if recorded_at - current.recorded_at < ttl:
+                _cleanup_terminal_receipt_shard_locked(
+                    root, shard_name, recorded_at, ttl, capacity,
+                    protected_name=path.name)
+                return current
+            try:
+                path.unlink()
+                _fsync_directory(path.parent)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return _unknown_terminal(item_id, generation)
+        cleanup = _cleanup_terminal_receipt_shard_locked(
+            root, shard_name, recorded_at, ttl, max(0, capacity - 1))
+        if cleanup.incomplete or cleanup.kept >= capacity:
+            return _unknown_terminal(item_id, generation)
+        directory = _ensure_terminal_receipts_dir(root, digest)
+        fd, tmp_name = tempfile.mkstemp(dir=str(directory),
+                                        prefix=f".{digest}.", suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(encoded)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                os.link(str(tmp), str(path))
+            except FileExistsError:
+                return _read_terminal_path(path, item_id, generation)
+            _fsync_directory(directory)
+            return TerminalReceipt(TerminalReceiptState.TERMINAL, item_id,
+                                   generation, terminal, recorded_at)
+        finally:
+            tmp.unlink(missing_ok=True)
+            _fsync_directory(directory)
+
+
+def _terminal_filename_digest(path: Path) -> Optional[str]:
+    name = path.name
+    if len(name) != 69 or not name.endswith(".json"):
+        return None
+    digest = name[:-5]
+    return digest if all(c in "0123456789abcdef" for c in digest) else None
+
+
+def _terminal_temp_digest(path: Path) -> Optional[str]:
+    parts = path.name.split(".")
+    if len(parts) != 4 or parts[0] or parts[-1] != "tmp":
+        return None
+    digest = parts[1]
+    if len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
+        return None
+    return digest
+
+
+def _terminal_shard_lock_id(shard_name: str) -> str:
+    return f"terminal-receipt-shard:{shard_name}"
+
+
+def _terminal_shard_capacity(shard_name: str, max_records: int) -> int:
+    quotient, remainder = divmod(max_records, TERMINAL_RECEIPT_SHARDS)
+    return quotient + (int(shard_name, 16) < remainder)
+
+
+def _same_stat(path: Path, observed) -> bool:
+    try:
+        current = path.lstat()
+    except OSError:
+        return False
+    return (current.st_dev, current.st_ino) == (observed.st_dev, observed.st_ino)
+
+
+def _cleanup_terminal_receipt_shard_locked(
+    root: Path,
+    shard_name: str,
+    clock: float,
+    ttl: float,
+    max_records: int,
+    protected_name: Optional[str] = None,
+    scan_all: bool = False,
+) -> TerminalReceiptCleanup:
+    directory = _terminal_receipts_dir(root) / shard_name
+    scan_limit = max_records + TERMINAL_RECEIPT_SWEEP_BATCH
+    paths = []
+    incomplete = False
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not scan_all and len(paths) >= scan_limit:
+                    incomplete = True
+                    break
+                paths.append(Path(entry.path))
+    except FileNotFoundError:
+        return TerminalReceiptCleanup()
+    except OSError:
+        return TerminalReceiptCleanup(unknown=1, incomplete=True)
+
+    expired = overflow = stale_temps = unknown = 0
+    survivors = []
+    changed = False
+    for path in paths:
+        temp_digest = _terminal_temp_digest(path)
+        if temp_digest is not None and temp_digest[:2] == shard_name:
+            try:
+                observed = path.lstat()
+                if _same_stat(path, observed):
+                    path.unlink()
+                    stale_temps += 1
+                    changed = True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                unknown += 1
+                incomplete = True
+            continue
+        digest = _terminal_filename_digest(path)
+        if digest is None or digest[:2] != shard_name:
+            continue
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unknown += 1
+            incomplete = True
+            continue
+        result = _read_terminal_path(path)
+        if result.state is TerminalReceiptState.UNKNOWN:
+            unknown += 1
+            recorded_at = observed.st_mtime
+            indeterminate = True
+        elif result.state is TerminalReceiptState.TERMINAL:
+            recorded_at = result.recorded_at
+            indeterminate = False
+        else:
+            continue
+        protected = indeterminate or path.name == protected_name
+        if not protected and clock - recorded_at >= ttl and _same_stat(path, observed):
+            try:
+                path.unlink()
+                expired += 1
+                changed = True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                unknown += 1
+                survivors.append((recorded_at, path.name, path, digest, observed, protected))
+            continue
+        survivors.append((recorded_at, path.name, path, digest, observed, protected))
+
+    remove_count = max(0, len(survivors) - max_records)
+    removable = sorted(entry for entry in survivors if not entry[-1])
+    for _recorded_at, _name, path, _digest, observed, _protected in removable[:remove_count]:
+        if not _same_stat(path, observed):
+            continue
+        try:
+            path.unlink()
+            overflow += 1
+            changed = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            unknown += 1
+    if changed:
+        _fsync_directory(directory)
+    kept = max(0, len(survivors) - overflow)
+    incomplete = incomplete or kept > max_records
+    return TerminalReceiptCleanup(
+        expired, overflow, stale_temps, unknown, kept, incomplete)
+
+
+def cleanup_terminal_receipts(
+    root: Path,
+    ttl_seconds: float = TERMINAL_RECEIPT_TTL_S,
+    max_records: int = TERMINAL_RECEIPT_MAX_RECORDS,
+    *,
+    now: Optional[float] = None,
+) -> TerminalReceiptCleanup:
+    """Expire receipts and enforce bounded per-shard quotas conservatively."""
+    clock, ttl = _terminal_clock_and_ttl(now, ttl_seconds)
+    if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records < 0:
+        raise ValueError("max_records must be a non-negative integer")
+    root = Path(root)
+    directory = _terminal_receipts_dir(root)
+    try:
+        directory.lstat()
+    except FileNotFoundError:
+        return TerminalReceiptCleanup()
+    except OSError:
+        return TerminalReceiptCleanup(unknown=1, incomplete=True)
+    if not directory.is_dir():
+        return TerminalReceiptCleanup(unknown=1, incomplete=True)
+    expired = overflow = stale_temps = unknown = kept = 0
+    incomplete = False
+    for index in range(TERMINAL_RECEIPT_SHARDS):
+        shard_name = f"{index:02x}"
+        shard = directory / shard_name
+        try:
+            shard.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unknown += 1
+            incomplete = True
+            continue
+        capacity = _terminal_shard_capacity(shard_name, max_records)
+        with _item_lock(root, _terminal_shard_lock_id(shard_name)):
+            result = _cleanup_terminal_receipt_shard_locked(
+                root, shard_name, clock, ttl, capacity, scan_all=True)
+        expired += result.expired
+        overflow += result.overflow
+        stale_temps += result.stale_temps
+        unknown += result.unknown
+        kept += result.kept
+        incomplete = incomplete or result.incomplete
+    return TerminalReceiptCleanup(
+        expired, overflow, stale_temps, unknown, kept, incomplete)

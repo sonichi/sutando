@@ -40,7 +40,7 @@ def _load(tasks_archive, results_archive):
     return archive
 
 
-def _load_pair(tasks_archive, results_archive, tasks_dir, cleared):
+def _load_pair(tasks_archive, results_archive, tasks_dir, cleared, durable=True):
     """Exec archive_path + archive_file + _archive_delivered_pair together, so
     the shared cleanup policy is exercised rather than pattern-matched."""
     tree = ast.parse(SRC.read_text())
@@ -53,6 +53,7 @@ def _load_pair(tasks_archive, results_archive, tasks_dir, cleared):
     ns = {"Path": Path, "os": os, "TASKS_DIR": tasks_dir,
           "find_task_file": _task_archive.find_task_file,
           "archive_file": _load(tasks_archive, results_archive),
+          "_has_durable_terminal_receipt": lambda _t: durable,
           "_clear_delivered": lambda t: cleared.append(t)}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SRC), "exec"), ns)
     return ns["_archive_delivered_pair"]
@@ -211,6 +212,17 @@ class CallersHonourTheReturn(unittest.TestCase):
         self.assertEqual(cleared, [], "a result still under its live name must KEEP its "
                                       "sentinel — clearing it permits a second send")
         self.assertTrue(Path(res).exists(), "a failed archive must never delete the result")
+
+    def test_the_pair_keeps_fallback_sentinel_without_a_durable_receipt(self):
+        cleared = []
+        tasks = self.d / "tasks"; tasks.mkdir()
+        pair = _load_pair(self.d / "at", self.d / "ar", tasks, cleared,
+                          durable=False)
+        res = self.d / "task-2b.txt"; res.write_text("r")
+        pair(res, "task-2b")
+        self.assertEqual(cleared, [],
+                         "legacy protection stays until shared persistence succeeds")
+        self.assertFalse(res.exists(), "the archived result must leave the live queue")
 
     def test_the_pair_resolves_a_CLAIMED_task_not_a_rebuilt_bare_name(self):
         cleared = []

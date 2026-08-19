@@ -61,6 +61,7 @@ from workspace_layout import inspect_layout  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+import outbox  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -6335,6 +6336,32 @@ def check_proactive_quarantine() -> dict:
     }
 
 
+def check_terminal_receipts() -> dict:
+    """Surface terminal receipts that require a human delivery decision."""
+    name = "terminal-receipts"
+    root = WORKSPACE_DIR / "results" / ".outbox-discord-task-results"
+    try:
+        report = outbox.cleanup_terminal_receipts(root)
+    except Exception as exc:  # noqa: BLE001 — a blind probe must warn, not abort health
+        return {"name": name, "status": "warn",
+                "detail": f"could not inspect Discord terminal receipts: {exc}"}
+    if report.unknown or report.incomplete:
+        findings = []
+        if report.unknown:
+            findings.append(f"{report.unknown} unreadable or corrupt receipt entr{'y' if report.unknown == 1 else 'ies'}")
+        if report.incomplete:
+            findings.append("receipt inspection incomplete")
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"{'; '.join(findings)} — Discord task results remain held "
+                       "fail-closed; confirm the delivery outcome, then remove only "
+                       "the affected receipt under results/.outbox-discord-task-results/"),
+        }
+    return {"name": name, "status": "ok",
+            "detail": f"{report.kept} terminal receipt(s) retained; no reconciliation needed"}
+
+
 def _ps_snapshot() -> "str | None":
     """One `ps -Ao pid,ppid,args` for callers classifying several pids at once."""
     try:
@@ -8956,6 +8983,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
+    checks.append(check_terminal_receipts())
     checks.append(check_proactive_quarantine())
     checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
