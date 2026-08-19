@@ -193,6 +193,7 @@ VERDICT_DELIVER = "deliver"
 VERDICT_LEAK = "leak"
 VERDICT_SUPPRESS = "suppress"
 WITHHELD_RESULT_DIR = "withheld-team-results"
+SUPPRESSED_RESULT_DIR = "suppressed-team-results"
 
 
 class TeamResultVerdict(NamedTuple):
@@ -279,6 +280,50 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; pending private owner review")
 
 
+def suppressed_record_path(state_dir: Path, task_id: str) -> Path:
+    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
+
+
+def materialize_suppressed_verdict(verdict: TeamResultVerdict, body: str,
+                                   state_dir: Path, task_id: str, context=None,
+                                   agent_id: str = "", now=None) -> TeamResultVerdict:
+    """Realise a notice-bearing SUPPRESS as a journaled silent close.
+
+    The record requirement is the policy, not the notice: once the suppression
+    is durably journaled, posting prose about marker mechanics into a human
+    channel is noise. Fail-CLOSED -- if the journal cannot be written the
+    notice stands, so the record is never silently dropped.
+    """
+    if verdict.kind != VERDICT_SUPPRESS or verdict.body != TEAM_SUPPRESS_RESULT:
+        return verdict                     # already silent, or not a suppress
+    timestamp = float(time.time() if now is None else now)
+    directory = Path(state_dir) / SUPPRESSED_RESULT_DIR
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    except OSError:
+        return verdict
+    payload = {
+        "schema_version": 1,
+        "record_id": withheld_review_id(task_id),
+        "status": "suppressed_silent_close",
+        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "reason": verdict.reason,
+        "context": _bounded_context(context),
+        "suppressed_body": body,
+    }
+    try:
+        saved = _write_artifact(suppressed_record_path(state_dir, task_id), payload)
+    except Exception:  # noqa: BLE001 -- storage failure must remain fail-closed
+        saved = False
+    if not saved:
+        return verdict
+    return TeamResultVerdict(
+        VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; journaled silent close")
+
+
 def classify_result_for_tier(body: str, tier, repo: Path,
                              secret_filter=None,
                              scan_sensitive_data: bool = True) -> TeamResultVerdict:
@@ -304,13 +349,21 @@ def classify_result_for_tier(body: str, tier, repo: Path,
 
 
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
-                          scan_sensitive_data: bool = True):
+                          scan_sensitive_data: bool = True, *,
+                          suppress_journal=None):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
     by catching an exception -- the safe body is the only one it is handed.
     Derived from classify_result_for_tier so the verdict has exactly one owner.
+
+    suppress_journal: `(state_dir, task_id)` from an adapter whose surface is a
+    human channel. The notice becomes a journaled silent close there; adapters
+    that omit it keep the posted notice.
     """
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data)
+    if suppress_journal is not None:
+        state_dir, task_id = suppress_journal
+        verdict = materialize_suppressed_verdict(verdict, body, state_dir, task_id)
     return verdict.body, verdict.reason
