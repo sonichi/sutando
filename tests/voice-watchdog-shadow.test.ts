@@ -291,7 +291,7 @@ const dir = mkdtempSync(join(tmpdir(), 'watchdog-shadow-'));
 // public entry sits on a live path whose uncaughtException handler is crash-only.
 {
 	const boom = () => { throw new Error('reducer exploded'); };
-	const led = new WatchdogLedger(join(dir, 'containment.jsonl'), { onError: () => {} });
+	const led = new WatchdogLedger({ path: join(dir, 'containment.jsonl'), meta: {}, onError: () => {} });
 	const sh = new VoiceWatchdogShadow({ ledger: led, now: () => 1_000 });
 
 	// Force a throw from inside the reducer path the tick drives.

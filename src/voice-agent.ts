@@ -33,7 +33,7 @@ import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
-import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence } from './vision-tools.js';
+import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
@@ -83,6 +83,9 @@ import {
 	recoverySurfaceSupported,
 	type RecoverySessionSurface,
 } from './voice-silence-recovery-coordinator.js';
+import {
+	initialRedialState, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
+} from './voice-redial-scheduler.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -286,7 +289,7 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // because the web client's code-heavy workload prefers 3.1 and the (key,
 // 3.1, googleSearch) combo trips a 1011 close on the VOICE key when search
 // is true. Phone inherits the package default (2.5+search).
-import { loadVoiceConfig } from './voice-config.js';
+import { loadVoiceConfig, resolveSessionTuning } from './voice-config.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
 if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
@@ -310,6 +313,20 @@ const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
 // "divergenceCorrection": true additionally speaks a self-correction when
 // the shadow pass disagrees. Requires shadowStt.
 const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
+// Phase 0.5 seams (design §2.1/§2.2): OFF unless configured — with nothing
+// set the VoiceSession config carries neither key and the wire behaviour is
+// byte-identical to the previous build (the Phase 0.5 gate). A half-set or
+// inverted threshold pair throws HERE, failing startup loudly.
+const VOICE_SESSION_TUNING = resolveSessionTuning(VOICE_AGENT_CONFIG);
+console.log(
+	`${new Date().toISOString().slice(11, 23)} [voice-agent] session tuning: compression=${
+		VOICE_SESSION_TUNING.compressionConfig === undefined
+			? 'off'
+			: VOICE_SESSION_TUNING.compressionConfig.triggerTokens === undefined
+				? 'server-defaults'
+				: `trigger=${VOICE_SESSION_TUNING.compressionConfig.triggerTokens},target=${VOICE_SESSION_TUNING.compressionConfig.targetTokens}`
+	} mediaResolution=${VOICE_SESSION_TUNING.mediaResolution ?? 'unset'}`,
+);
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
@@ -896,6 +913,55 @@ async function main() {
 	// it — Step 12's `backoff` upstream mapping.)
 	let voiceFatalBackoffUntil = 0;
 
+	// F5: event-driven redial with exponential backoff (voice-redial-scheduler.ts).
+	// The 30s tick below remains the safety net; these fire on bodhi's
+	// connection-lifecycle events instead of waiting up to 60s of dead air.
+	// Declared before the VoiceSession constructor because the constructor's
+	// onConnectionLifecycle option feeds them; session access is late-bound
+	// via sessionRef (assigned right after construction, before any event).
+	let redialState = initialRedialState();
+	let redialTimer: ReturnType<typeof setTimeout> | null = null;
+	// Shared with the 30s tick's throttle + the CONNECTING watchdog below.
+	let lastReconnectAt = 0;
+	const fireEventRedial = (): void => {
+		redialTimer = null;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const s = sessionRef as any;
+		if (!s) return;
+		const now = Date.now();
+		const state = String(s.sessionManager?.state ?? 'unknown');
+		const clientConnected = Boolean(s.clientConnected);
+		if (!shouldEventDial({ state, clientConnected, now, nextDialAt: redialState.nextDialAt, fatalBackoffUntil: voiceFatalBackoffUntil })) {
+			// Blocked by the fatal gate alone → re-arm for when it lifts.
+			// Any other veto drops the dial: the next lifecycle event or the
+			// 30s tick takes over.
+			if (redialState.nextDialAt > 0 && now <= voiceFatalBackoffUntil && state === 'CLOSED' && clientConnected) {
+				armRedialTimer(voiceFatalBackoffUntil - now + 100);
+			}
+			return;
+		}
+		// While the armed coordinator owns the episode, F5 stands down: its
+		// dial would be an uncounted attempt, and the fake attach below must
+		// not mint a coordinator client epoch. Lifecycle events resume F5
+		// naturally once the episode resolves.
+		if (voiceRecoveryCoordinator?.ownsRecovery ?? false) return;
+		redialState = noteDialed(redialState);
+		lastReconnectAt = now;
+		console.log(`${ts()} [Redial] event-driven reconnect (failures=${redialState.failures})`);
+		try {
+			legacyReconnectInFlight = true;
+			s.handleClientConnected();
+		} catch (err) {
+			console.error(`${ts()} [Redial] reconnect trigger failed:`, (err as Error)?.message ?? err);
+		} finally {
+			legacyReconnectInFlight = false;
+		}
+	};
+	const armRedialTimer = (delayMs: number): void => {
+		if (redialTimer) clearTimeout(redialTimer);
+		redialTimer = setTimeout(fireEventRedial, delayMs);
+	};
+
 	// Declared outside the classifier IIFE below so the recovery hook can read it
 	// too; a banner already shown is what makes a recovery notice owed.
 	const voiceNotifiedCategories = new Set<string>();
@@ -968,6 +1034,16 @@ async function main() {
 		sessionId: SESSION_ID,
 		persist: (row) => healthPersistence.tryEnqueue(row),
 		log: (m) => console.log(`${ts()} ${m}`),
+		// Samples bodhi's getDiagnostics on ledger ticks. `session` is assigned
+		// below; the try/catch — not the typeof — is what covers a tick racing
+		// construction, since typeof on a const in its TDZ still throws.
+		getSessionDiagnostics: () => {
+			try {
+				return typeof session !== 'undefined' ? (session.getDiagnostics?.() ?? null) : null;
+			} catch {
+				return null;
+			}
+		},
 	});
 
 	const session = new VoiceSession({
@@ -990,13 +1066,45 @@ async function main() {
 			voiceRecoveryCoordinator?.handleClientConnected();
 		},
 		onClientDisconnected: () => voiceRecoveryCoordinator?.handleClientDisconnected(),
-		onConnectionLifecycle: (event) => voiceRecoveryCoordinator?.handleLifecycleEvent(event),
 		// Whenever the coordinator owns the episode (restarting, waiting-retry,
 		// terminal, or a recovered origin), bodhi's attach auto-actions —
 		// greeting, context replay and especially the CLOSED auto-reconnect —
 		// would be uncounted bypasses of the attempt budget. The synthetic hold
 		// already gates the injection paths post-recovery; this gates the dial.
 		suppressClientAutoActions: () => voiceRecoveryCoordinator?.ownsRecovery ?? false,
+		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
+		// context occupancy and connection lineage (design §1.1/§1.4).
+		// The per-modality breakdown rides the same message (design §1.4) but is
+		// provider-specific, so bodhi types only the shared fields — cast to read.
+		onUsageMetadata: (u) =>
+			audioHealth.noteUsageMetadata(
+				u.promptTokenCount,
+				(u as { promptTokensDetails?: Array<{ modality?: string; tokenCount?: number }> })
+					.promptTokensDetails,
+			),
+		// One lifecycle stream, THREE consumers: the ledger derives lineage and
+		// context facts; F5's redial scheduler reacts to terminal losses; the
+		// armed coordinator correlates activations and closes. While the
+		// coordinator owns the episode, F5 keeps tracking state but must not
+		// arm a dial — that would be an uncounted attempt outside the budget.
+		onConnectionLifecycle: (ev) => {
+			audioHealth.noteLifecycleEvent(ev);
+			voiceRecoveryCoordinator?.handleLifecycleEvent(ev);
+			const r = noteLifecycle(redialState, ev, { now: Date.now(), fatalBackoffUntil: voiceFatalBackoffUntil });
+			redialState = r.state;
+			if (r.scheduleDelayMs !== null && !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
+				console.log(`${ts()} [Redial] ${ev.kind}${'code' in ev && ev.code !== undefined ? ` code=${ev.code}` : ''} — dial in ${r.scheduleDelayMs}ms (failures=${redialState.failures})`);
+				armRedialTimer(r.scheduleDelayMs);
+			}
+		},
+		// Phase 0.5 seams — spread for REAL key absence (design §2.1: an absent
+		// key lets the server default apply; `undefined` is not absent).
+		...(VOICE_SESSION_TUNING.compressionConfig !== undefined
+			? { compressionConfig: VOICE_SESSION_TUNING.compressionConfig }
+			: {}),
+		...(VOICE_SESSION_TUNING.mediaResolution !== undefined
+			? { mediaResolution: VOICE_SESSION_TUNING.mediaResolution }
+			: {}),
 		...(VOICE_SHADOW_STT
 			? {
 					shadowSttProvider: new GeminiBatchSTTProvider({
@@ -1551,6 +1659,12 @@ async function main() {
 	if (origDisconnect) {
 		(session as any).handleClientDisconnected = () => {
 			origDisconnect();
+			// No listener left, so frames only burn capture + quota. Reason is
+			// terminal: a browser push driver must tear down, not re-arm.
+			const stopped = stopVisionStreaming('no-client');
+			if (stopped.status === 'stopped') {
+				console.log(`${ts()} [Vision] stopped on client disconnect (${stopped.frames} frame(s))`);
+			}
 			recorder.flush();
 			writeVoiceState(false);
 			// P7 D7.1: final ledger row for the departing epoch — written NOW
@@ -1697,12 +1811,17 @@ async function main() {
 	// CLOSED→CONNECTING inline before kicking off the async connect. So the next
 	// 30s tick sees state=CONNECTING (not CLOSED) and skips the guard. If the
 	// connect fails fast and bodhi flips back to CLOSED, the 60s lastReconnectAt
-	// throttle prevents a tight retry loop.
-	let lastReconnectAt = 0;
+	// throttle prevents a tight retry loop. (lastReconnectAt is declared with
+	// the F5 redial machinery above — the event-driven path shares it.)
 	let connectingSince = 0;
 	let lastLoggedStatus = '';
 	let matrixBaseline: MatrixBaseline | null = null;
 	let lastMatrixVerdict = '';
+	// Phase-1 shadow: the 'session+egress' ruleset runs in parallel and is
+	// telemetry-only — canary 3a later compares live vs shadow on identical
+	// input, which is impossible if the shadow never ran.
+	let shadowBaseline: MatrixBaseline | null = null;
+	let lastShadowVerdict = '';
 	let lastFailedWrites = 0;
 	setInterval(() => {
 		const state = session.sessionManager.state ?? 'unknown';
@@ -1735,7 +1854,27 @@ async function main() {
 			now: Date.now(),
 		});
 		matrixBaseline = matrix.baseline;
-		audioHealth.noteMatrixVerdict(matrix.verdict);
+		const shadow = evaluateMatrix({
+			sessionState: state,
+			clientConnected,
+			snapshot,
+			prev: shadowBaseline,
+			serverBufferedAmount,
+			lastModelEventAt: snapshot.lastModelEventAt,
+			effectiveCoverage: 'session+egress',
+			now: Date.now(),
+		});
+		shadowBaseline = shadow.baseline;
+		if (
+			shadow.verdict !== lastShadowVerdict &&
+			(shadow.verdict !== 'healthy-idle' || lastShadowVerdict)
+		) {
+			console.log(
+				`${ts()} [Matrix-shadow] ${shadow.verdict}${shadow.reasons.length ? ' (' + shadow.reasons.join('; ') + ')' : ''}`,
+			);
+		}
+		lastShadowVerdict = shadow.verdict;
+		audioHealth.noteMatrixVerdict(matrix.verdict, matrix.facts, matrix.reasons);
 		if (matrix.verdict !== lastMatrixVerdict && (matrix.verdict !== 'healthy-idle' || lastMatrixVerdict)) {
 			console.log(`${ts()} [Matrix] ${matrix.verdict}${matrix.reasons.length ? ' (' + matrix.reasons.join('; ') + ')' : ''}`);
 		}
@@ -1749,10 +1888,16 @@ async function main() {
 		// Rate windows advance EVERY tick (a suppressed streak must not turn
 		// the next logged line into a long-window average).
 		const seg = audioHealth.healthSegments(clientConnected, serverBufferedAmount);
+		// Whether the vision throttle engaged was previously unknowable from the
+		// log — deferredBudget existed but was never surfaced (investigation F2).
+		const eg = getVisionEgressStats();
+		const visionSeg = isStreaming()
+			? ` vision={sent:${eg.sent},defB:${eg.deferredBudget},defG:${eg.deferredGate},disp:${eg.displaced}}`
+			: '';
 		if (state !== 'ACTIVE' || status !== lastLoggedStatus || anomaly.anomalous || persistFailed) {
 			const why = anomaly.anomalous ? ` anomaly=${anomaly.reasons.join(',')}` : '';
 			const pf = persistFailed ? ` persistFail=${healthPersistence.failedWrites}` : '';
-			console.log(`${ts()} [Health] ${status}${clientConnected ? ' ' + seg : ''}${why}${pf}`);
+			console.log(`${ts()} [Health] ${status}${clientConnected ? ' ' + seg : ''}${visionSeg}${why}${pf}`);
 			lastLoggedStatus = status;
 		}
 		audioHealth.clearTickLatches();
@@ -1795,9 +1940,15 @@ async function main() {
 		// Recover when session is CLOSED and a client is waiting. handleClientConnected
 		// is bodhi's internal entry point for this exact scenario (CLOSED + client
 		// present → transition to CONNECTING, reconnect fire-and-forget).
+		// F5: this is now the SAFETY NET behind the event-driven redial —
+		// tickMayDial defers to a pending scheduled dial so the tick cannot
+		// preempt the backoff.
 		// TODO: drop the (session as any) cast once bodhi exposes a public API.
-		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil && !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
+		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
+			&& tickMayDial({ now: Date.now(), nextDialAt: redialState.nextDialAt })
+			&& !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
 			lastReconnectAt = Date.now();
+			redialState = noteDialed(redialState);
 			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
 			try {
 				legacyReconnectInFlight = true;
