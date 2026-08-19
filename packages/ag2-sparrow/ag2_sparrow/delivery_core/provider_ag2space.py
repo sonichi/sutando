@@ -21,8 +21,9 @@ import json
 import urllib.error
 from typing import Callable, Optional
 
-from .contract import (DeliveryOutcome, DeliveryReceipt, ProviderCapabilities,
-                       ProviderIndeterminate, ProviderRefused)
+from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt,
+                       ProviderCapabilities, ProviderIndeterminate,
+                       ProviderRefused)
 
 RESULTS_PATH = "/v1/results"
 
@@ -70,6 +71,7 @@ class AG2SpaceResultProvider:
             provider_ref="duplicate" if resp.get("duplicate") else "accepted",
             detail="rid-deduped resend" if resp.get("duplicate") else "")
 
-    def reconcile(self, item_id: str,
-                  idempotency_key: str) -> Optional[DeliveryReceipt]:
+    def reconcile(self, attempt: DeliveryAttempt) -> Optional[DeliveryReceipt]:
+        # Declines to answer: the gateway exposes no read-back, so ambiguity is
+        # resolved by this provider's idempotent re-send, not by reconciliation.
         return None

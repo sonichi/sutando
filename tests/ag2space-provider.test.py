@@ -17,10 +17,10 @@ sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 import json
 
-from ag2_sparrow.delivery_core import (DeliveryCore, DeliveryOutcome,
-                                       DesignAClaimBackend, DrainStatus,
-                                       ProviderIndeterminate, ProviderRefused,
-                                       RetryPolicy)
+from ag2_sparrow.delivery_core import (DeliveryAttempt, DeliveryCore,
+                                       DeliveryOutcome, DesignAClaimBackend,
+                                       DrainStatus, ProviderIndeterminate,
+                                       ProviderRefused, RetryPolicy)
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider
 
 FAILS = []
@@ -110,7 +110,7 @@ def main() -> int:
     check("capabilities: idempotent_send licensed by rid-dedup, no reconcile",
           p.capabilities.idempotent_send and not p.capabilities.reconcile_capable)
     check("reconcile answers None (no receipt-read endpoint)",
-          p.reconcile("task-X", "task-X#0") is None)
+          p.reconcile(DeliveryAttempt("task-X", b"{}", "task-X#0")) is None)
 
     # Timeout on the send, duplicate:true on the idempotent re-send: the
     # FIRST attempt landed; the resend's dedup answer confirms it.
