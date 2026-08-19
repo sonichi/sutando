@@ -12,8 +12,14 @@ their own tier lookup and delivery; they must not restate any of it.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 import sys
+import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -27,6 +33,12 @@ except ImportError:
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
     "contain sensitive information. The owner can review the work locally."
+)
+
+TEAM_LEAK_RESULT_UNSAVED = (
+    "I completed the Team task, but the response was withheld because it may "
+    "contain sensitive information or delivery-control markers. Preparing the "
+    "private owner review failed; the result remains withheld and will retry."
 )
 
 TEAM_SUPPRESS_RESULT = (
@@ -154,6 +166,7 @@ def suppression_stub_for_tier(body: str, tier) -> "str | None":
 VERDICT_DELIVER = "deliver"
 VERDICT_LEAK = "leak"
 VERDICT_SUPPRESS = "suppress"
+WITHHELD_RESULT_DIR = "withheld-team-results"
 
 
 class TeamResultVerdict(NamedTuple):
@@ -163,6 +176,81 @@ class TeamResultVerdict(NamedTuple):
     kind: str
     body: str
     reason: "str | None"
+
+
+def _bounded_context(context) -> dict:
+    if not isinstance(context, dict):
+        return {}
+    keys = ("source", "channel_id", "reply_to_event", "source_message_id", "user_id")
+    return {key: str(context.get(key) or "")[:512] for key in keys}
+
+
+def withheld_review_id(task_id: str) -> str:
+    identity = task_id.encode() if task_id else os.urandom(32)
+    return f"wr_{hashlib.sha256(identity).hexdigest()[:16]}"
+
+
+def withheld_review_path(state_dir: Path, task_id: str) -> Path:
+    return Path(state_dir) / WITHHELD_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
+
+
+def _write_artifact(path: Path, payload: dict) -> bool:
+    if path.is_file():
+        return True
+    fd, temporary = tempfile.mkstemp(prefix=".withheld-", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+        return path.is_file()
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
+                                 state_dir: Path, task_id: str, context=None,
+                                 agent_id: str = "", now=None) -> TeamResultVerdict:
+    """Persist a leak verdict for private owner review and suppress the room post."""
+    if verdict.kind != VERDICT_LEAK:
+        return verdict
+    timestamp = float(time.time() if now is None else now)
+    directory = Path(state_dir) / WITHHELD_RESULT_DIR
+    bounded = _bounded_context(context)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    except OSError:
+        return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
+    artifact = withheld_review_path(state_dir, task_id)
+    payload = {
+        "schema_version": 2,
+        "review_id": withheld_review_id(task_id),
+        "status": "pending_dm",
+        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "reason": verdict.reason,
+        "context": bounded,
+        "withheld_body": body,
+    }
+    try:
+        saved = _write_artifact(artifact, payload)
+    except Exception:  # noqa: BLE001 — storage failure must remain fail-closed
+        saved = False
+    if not saved:
+        return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
+    return TeamResultVerdict(
+        VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; pending private owner review")
 
 
 def classify_result_for_tier(body: str, tier, repo: Path,
