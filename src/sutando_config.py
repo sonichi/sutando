@@ -60,11 +60,14 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "health_check",
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
+    "delivery",       # outbound delivery: claim_backend, …
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
 
 _DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
+
+_CLAIM_BACKENDS = {"a", "c"}
 
 
 def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
@@ -75,6 +78,20 @@ def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
     configured = str(hc.get("down_bridge_action") or "alert").strip().lower()
     action = os.environ.get("SUTANDO_DOWN_BRIDGE_ACTION", "").strip().lower() or configured
     return action if action in _DOWN_BRIDGE_ACTIONS else "alert"
+
+
+def resolve_claim_backend(repo_root: Optional[Path] = None) -> str:
+    """Which ClaimBackend the outbound legs construct: "a" (default) or "c".
+
+    Selection is POLICY and lives here; mapping the name to a class is the
+    adapter's job, so this module stays free of delivery-core imports.
+    An unrecognised value resolves to "a" rather than raising — a typo in
+    config must not take the proactive leg down.
+    """
+    delivery = load_config(repo_root).get("delivery") or {}
+    configured = str(delivery.get("claim_backend") or "a").strip().lower()
+    chosen = os.environ.get("SUTANDO_CLAIM_BACKEND", "").strip().lower() or configured
+    return chosen if chosen in _CLAIM_BACKENDS else "a"
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:

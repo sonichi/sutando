@@ -5141,9 +5141,22 @@ def _proactive_fence():
     if _PROACTIVE_FENCE is None:
         from proactive_claim_fence import ProactiveClaimFence
         from ag2_sparrow.delivery_core import DesignAClaimBackend
+        from sutando_config import resolve_claim_backend
+        # The NAME is policy (sutando_config); mapping it to a class is this
+        # adapter's job, which keeps delivery-core imports out of the config module.
+        root = RESULTS_DIR / ".outbox-discord-proactive"
+        backend = DesignAClaimBackend(root)
+        if resolve_claim_backend() == "c":
+            from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
+            try:
+                backend = DesignCClaimBackend(root)
+            except RuntimeError as exc:
+                # Backend C refuses an un-activated root (striping is a
+                # quiescence-requiring migration). Say so and keep delivering.
+                print(f"  [proactive] claim_backend=c requested but unusable: "
+                      f"{exc} — running on Design A this cycle", flush=True)
         _PROACTIVE_FENCE = ProactiveClaimFence(
-            DesignAClaimBackend(RESULTS_DIR / ".outbox-discord-proactive"),
-            RESULTS_DIR, worker="discord-proactive")
+            backend, RESULTS_DIR, worker="discord-proactive")
     return _PROACTIVE_FENCE
 
 
