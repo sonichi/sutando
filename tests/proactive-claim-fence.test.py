@@ -10,6 +10,8 @@ when it ships):
   PARK    partial delivery parks (never re-sends confirmed chunks); the
           backend record parks with it.
   RECOVER a crash between file move and backend transition reconciles.
+  DEGRADE a backend that refuses EVERY call still delivers, file-only — the
+          docstring's fail-open promise, whose branches are all pragma'd.
 
 Run: python3 tests/proactive-claim-fence.test.py"""
 # ruff: noqa: E402 — imports follow the sys.path inserts below
@@ -141,6 +143,97 @@ def main() -> int:
         claim = fence2.claim(body)
         check("re-written body starts with zero attempts",
               fence2.attempts(claim) == 0)
+
+    # DEGRADE: the documented "backend refusal degrades to file-only" promise
+    # had no test. Persistent refusal is the case — it degrades EVERY item.
+    class _DeadBackend:
+        """Refuses every call — a misconfigured or unreachable outbox."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def _die(self, *a, **k):
+            self.calls += 1
+            raise RuntimeError("outbox unreachable")
+
+        publish = claim = complete = park = attempts = recover = _die
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        dead = _DeadBackend()
+        body = root / "proactive-dead.txt"
+        body.write_text("owner-facing text")
+        fence = ProactiveClaimFence(dead, root, worker="t")
+
+        claim = fence.claim(body)
+        check("dead backend still yields a claim (file-only)",
+              claim == root / "proactive-dead.sending" and claim.exists())
+        check("the body left the polling glob exactly as when the backend works",
+              not body.exists())
+        check("attempts() answers 0 rather than propagating the refusal",
+              fence.attempts(claim) == 0)
+
+        # Failing open is the point: losing durability for one item is
+        # recoverable, losing the owner's message is not.
+        fence.confirm(claim)
+        check("confirm consumes the file with no backend at all",
+              not claim.exists())
+        check("the dead backend was actually exercised (not silently skipped)",
+              dead.calls > 0)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        body = root / "proactive-dead2.txt"
+        body.write_text("park me")
+        fence = ProactiveClaimFence(_DeadBackend(), root, worker="t")
+        claim = fence.claim(body)
+        out = fence.fail(claim, _Boom(), progressed=False)
+        check("a permanent failure still parks under a dead backend", out == "parked")
+        parked = root / "undelivered" / "proactive-dead2.txt"
+        check("parked body is byte-preserved with no backend",
+              parked.exists() and parked.read_text() == "park me")
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        body = root / "proactive-dead3.txt"
+        body.write_text("stranded")
+        fence = ProactiveClaimFence(_DeadBackend(), root, worker="t")
+        fence.claim(body)                      # token dropped = crashed process
+        recovered = ProactiveClaimFence(_DeadBackend(), root, worker="t").recover()
+        check("recover() sweeps the file half even when backend.recover() raises",
+              recovered == 1 and body.exists())
+
+    # HALF-DEAD: claim succeeds, then the outbox dies — a token EXISTS, so the
+    # complete/park branches run (unreachable with _DeadBackend).
+    class _HalfDead(DesignAClaimBackend):
+        def complete(self, *a, **k):
+            raise RuntimeError("outbox died after claim")
+
+        def park(self, *a, **k):
+            raise RuntimeError("outbox died after claim")
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        body = root / "proactive-half.txt"
+        body.write_text("half")
+        fence = ProactiveClaimFence(_HalfDead(root / ".outbox-half"), root, worker="t")
+        claim = fence.claim(body)
+        check("half-dead backend still grants a token", fence.attempts(claim) == 0)
+        out = fence.fail(claim, _Boom(), progressed=False)
+        check("park survives a backend that dies AFTER granting the claim",
+              out == "parked")
+        parked = root / "undelivered" / "proactive-half.txt"
+        check("half-dead park still preserves the body",
+              parked.exists() and parked.read_text() == "half")
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        body = root / "proactive-half2.txt"
+        body.write_text("h2")
+        fence = ProactiveClaimFence(_HalfDead(root / ".outbox-half2"), root, worker="t")
+        claim = fence.claim(body)
+        fence.confirm(claim)
+        check("confirm survives a complete() that raises", not claim.exists())
 
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)

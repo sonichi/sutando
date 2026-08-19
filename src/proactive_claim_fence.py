@@ -65,7 +65,7 @@ class ProactiveClaimFence:
             if token is None:
                 self._backend.recover()
                 token = self._backend.claim(item, self._worker)
-        except Exception as exc:  # pragma: no cover - defensive: never lose the body
+        except Exception as exc:  # never lose the body: degrade to file-only
             print(f"  [fence] backend claim degraded for {claim.name}: {exc}",
                   flush=True)
         if token is None:
@@ -102,7 +102,7 @@ class ProactiveClaimFence:
             return 0
         try:
             return self._backend.attempts(item)
-        except Exception:  # pragma: no cover - degraded cycle
+        except Exception:  # degraded cycle: no durable count to report
             return 0
 
     def fail(self, claim: Path, exc: BaseException, progressed: bool,
@@ -131,7 +131,7 @@ class ProactiveClaimFence:
                 self._backend.complete(token, DeliveryOutcome.NOT_DELIVERED)
                 self._backend.park(item, "partial-delivery" if progressed
                                    else "permanent-failure")
-            except Exception as e:  # pragma: no cover - defensive
+            except Exception as e:
                 print(f"  [fence] park record failed for {body_name}: {e}",
                       flush=True)
         return "parked"
@@ -146,7 +146,7 @@ class ProactiveClaimFence:
         """
         try:
             self._backend.recover()
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             print(f"  [fence] backend recover failed: {exc}", flush=True)
         return recover_orphan_sending_files(self._results_dir)
 
@@ -156,6 +156,6 @@ class ProactiveClaimFence:
             return
         try:
             self._backend.complete(token, outcome)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             print(f"  [fence] backend complete failed for {claim.name}: {exc}",
                   flush=True)
