@@ -26,6 +26,7 @@ from ag2_sparrow.delivery_core import (  # noqa: E402
     DesignAClaimBackend, DrainStatus, ProviderCapabilities,
     ProviderIndeterminate, ProviderRefused, RetryPolicy, idempotency_key)
 from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend  # noqa: E402
+from ag2_sparrow import outbox  # noqa: E402
 
 ITEM = "room-evt-1"
 
@@ -261,9 +262,15 @@ class CorePolicy(unittest.TestCase):
                       "the item reached a transition; it is not stuck behind a live claim")
         self.assertEqual(len(p.reconcile_calls), 1)
 
-    def test_reconcile_resend_refused_reaches_NOT_DELIVERED(self):
-        """A definite refusal during reconcile is retry accounting, not
-        ambiguity — the opposite classification from the case above."""
+    def test_reconcile_REFUSED_must_not_relabel_the_original_ambiguity(self):
+        """A refused reconcile says the SECOND call never dispatched. It says
+        nothing about a first send that may already have crossed the boundary.
+
+        This case previously asserted NOT_DELIVERED and so pinned the bug:
+        complete() would count a retry, leave the item READY, and a later
+        drain re-sends — a duplicate user-visible delivery whenever the
+        original send actually succeeded (idempotent_send=False permits it).
+        """
         class _RefusingReconciler(_Recorder):
             def reconcile(self, attempt):
                 self.reconcile_calls.append(attempt.item_id)
@@ -271,8 +278,63 @@ class CorePolicy(unittest.TestCase):
         p = _RefusingReconciler([ProviderIndeterminate("timeout after send")],
                                 ProviderCapabilities(reconcile_capable=True))
         r = self._core(p).deliver_one(ITEM, b"x")
-        self.assertIs(r.outcome, DeliveryOutcome.NOT_DELIVERED)
+        self.assertIs(r.outcome, DeliveryOutcome.OUTCOME_UNKNOWN,
+                      "a refused reconcile is not evidence about the first send")
         self.assertIs(r.status, DrainStatus.ATTEMPTED)
+        self.assertEqual(len(p.reconcile_calls), 1)
+
+    def test_reconcile_RECEIPT_of_not_delivered_MAY_resolve_the_ambiguity(self):
+        """The discriminator: a receipt is a positive statement ABOUT the
+        original attempt, so it alone may replace OUTCOME_UNKNOWN."""
+        class _ReportingReconciler(_Recorder):
+            def reconcile(self, attempt):
+                self.reconcile_calls.append(attempt.item_id)
+                return DeliveryReceipt(outcome=DeliveryOutcome.NOT_DELIVERED,
+                                       detail="server never accepted it")
+        p = _ReportingReconciler([ProviderIndeterminate("timeout after send")],
+                                 ProviderCapabilities(reconcile_capable=True))
+        r = self._core(p).deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.NOT_DELIVERED,
+                      "an explicit receipt DOES resolve the original attempt")
+
+    def test_lost_response_then_refused_reconcile_does_not_redeliver(self):
+        """End-to-end against the REAL DesignA backend: the case the unit
+        assertions above only describe. Before the fix this drained twice and
+        the user saw the message twice."""
+        class _LostThenRefused:
+            capabilities = ProviderCapabilities(reconcile_capable=True,
+                                                idempotent_send=False)
+
+            def __init__(self):
+                self.effects = 0
+                self.n = 0
+
+            def deliver(self, item_id, payload, key):
+                self.n += 1
+                self.effects += 1          # the side effect HAS happened
+                if self.n == 1:
+                    raise ProviderIndeterminate("response lost after send")
+                return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
+                                       provider_ref="duplicate")
+
+            def reconcile(self, attempt):
+                raise ProviderRefused("refused before dispatch")
+
+        root = Path(tempfile.mkdtemp()) / ".outbox"
+        backend = DesignAClaimBackend(root)
+        prov = _LostThenRefused()
+        core = DeliveryCore(backend, prov, policy=RetryPolicy(max_attempts=3),
+                            worker="w1")
+        backend.publish(ITEM, b"body")
+        first = core.deliver_one(ITEM, b"body")
+        self.assertIs(first.outcome, DeliveryOutcome.OUTCOME_UNKNOWN)
+        self.assertEqual(outbox._read_item(root, ITEM).get("status"), "PARKED",
+                         "ambiguity parks for a human; it does not stay READY")
+        second = core.deliver_one(ITEM, b"body")
+        self.assertIs(second.status, DrainStatus.NOT_CLAIMED,
+                      "a parked item is not re-drained")
+        self.assertEqual(prov.effects, 1,
+                         "exactly one user-visible delivery, not two")
 
     def test_reconcile_untyped_error_still_propagates(self):
         """Only the typed taxonomy is classified. A programming error must

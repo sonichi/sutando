@@ -53,15 +53,21 @@ class DeliveryCore:
             return DeliveryOutcome.NOT_DELIVERED
 
     def _reconcile(self, item_id: str, payload: bytes, key: str):
-        """reconcile() is licensed to RE-SEND, so it raises the same typed
-        failures as deliver() and must be classified by the same rules."""
+        """Resolve a prior ambiguity, or None when reconciliation resolved
+        NOTHING — the caller keeps the outcome it already had.
+
+        A raise here describes the RECONCILE call, not the original send.
+        ProviderRefused proves only that this second call never dispatched;
+        the first may already have crossed the side-effect boundary. Only a
+        reconciliation RECEIPT is a statement about the original attempt, so
+        only a receipt may replace OUTCOME_UNKNOWN (sparrow-v1-contract:
+        "Ambiguous is never auto-relabeled NOT_DELIVERED").
+        """
         try:
             resolved = self.provider.reconcile(
                 DeliveryAttempt(item_id, payload, key))
-        except ProviderIndeterminate:
-            return DeliveryOutcome.OUTCOME_UNKNOWN
-        except ProviderRefused:
-            return DeliveryOutcome.NOT_DELIVERED
+        except (ProviderIndeterminate, ProviderRefused):
+            return None
         return None if resolved is None else resolved.outcome
 
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
