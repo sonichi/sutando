@@ -5150,11 +5150,12 @@ def _proactive_fence():
             from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
             try:
                 backend = DesignCClaimBackend(root)
-            except RuntimeError as exc:
-                # Backend C refuses an un-activated root (striping is a
-                # quiescence-requiring migration). Say so and keep delivering.
+            except (RuntimeError, OSError) as exc:
+                # C refuses an un-activated root (RuntimeError) and its namespace
+                # mkdirs raise OSError; both must fall back, not reach on_ready.
                 print(f"  [proactive] claim_backend=c requested but unusable: "
-                      f"{exc} — running on Design A this cycle", flush=True)
+                      f"{type(exc).__name__}: {exc} — running on Design A this cycle",
+                      flush=True)
         _PROACTIVE_FENCE = ProactiveClaimFence(
             backend, RESULTS_DIR, worker="discord-proactive")
     return _PROACTIVE_FENCE

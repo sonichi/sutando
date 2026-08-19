@@ -105,7 +105,7 @@ sys.modules["dbridge_sel"] = db
 _spec.loader.exec_module(db)
 
 
-def _fence_with(env, *, activate=False):
+def _fence_with(env, *, activate=False, malform=False):
     """Build the fence the way the bridge does, and report what it chose."""
     saved_env = os.environ.get("SUTANDO_CLAIM_BACKEND")
     saved_results, saved_fence = db.RESULTS_DIR, db._PROACTIVE_FENCE
@@ -117,6 +117,10 @@ def _fence_with(env, *, activate=False):
             os.environ["SUTANDO_CLAIM_BACKEND"] = env
         db.RESULTS_DIR = Path(td)
         db._PROACTIVE_FENCE = None
+        if malform:
+            # A file where C's namespace mkdir expects a directory.
+            (Path(td) / ".outbox-discord-proactive").mkdir()
+            (Path(td) / ".outbox-discord-proactive" / "tmp").write_text("not a dir")
         if activate:
             from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
             DesignCClaimBackend(Path(td) / ".outbox-discord-proactive",
@@ -149,6 +153,42 @@ check(kind == "DesignAClaimBackend",
       f"c on an UN-activated root falls back to Design A (got {kind})")
 check("Design A" in out and "claim_backend=c" in out,
       "and the fallback is announced — the operator asked for C and got A")
+
+# C's namespace mkdirs raise OSError, not RuntimeError. on_ready() builds the
+# fence before the poll loops start, so an escape kills every result poller.
+kind, out = _fence_with("c", malform=True)
+check(kind == "DesignAClaimBackend",
+      f"c on a MALFORMED root falls back to Design A (got {kind})")
+check("claim_backend=c" in out and "Design A" in out,
+      "the filesystem failure is announced like the activation refusal")
+check(any(n in out for n in ("Error", "error")),
+      f"and the announcement names the failure class, not just 'unusable': {out.strip()[:90]!r}")
+
+# The whole point of the fallback: delivery keeps working on the same root.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    (root / ".outbox-discord-proactive").mkdir()
+    (root / ".outbox-discord-proactive" / "tmp").write_text("a file where a dir belongs")
+    saved_env = os.environ.get("SUTANDO_CLAIM_BACKEND")
+    saved_results, saved_fence = db.RESULTS_DIR, db._PROACTIVE_FENCE
+    try:
+        os.environ["SUTANDO_CLAIM_BACKEND"] = "c"
+        db.RESULTS_DIR, db._PROACTIVE_FENCE = root, None
+        body = root / "proactive-malformed.txt"
+        body.write_text("delivery survives a malformed C root")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fence = db._proactive_fence()
+            claim = fence.claim(body)
+            moved = claim is not None and claim.exists() and not body.exists()
+            fence.confirm(claim)
+        check(moved and not claim.exists(),
+              "claim+confirm still round-trips on the malformed root")
+    finally:
+        db.RESULTS_DIR, db._PROACTIVE_FENCE = saved_results, saved_fence
+        if saved_env is None:
+            os.environ.pop("SUTANDO_CLAIM_BACKEND", None)
+        else:
+            os.environ["SUTANDO_CLAIM_BACKEND"] = saved_env
 
 print("4. both backends satisfy what the fence needs")
 from ag2_sparrow.delivery_core import DesignAClaimBackend
