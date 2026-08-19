@@ -180,8 +180,11 @@ export class VoiceSilenceRecoveryCoordinator {
 
 	/** True while the coordinator owns CLOSED-state recovery: any non-idle
 	 *  phase, or an idle episode it recovered (origin retained). The legacy
-	 *  CLOSED guard must stand down here or it bypasses the attempt budget. */
+	 *  CLOSED guard must stand down here or it bypasses the attempt budget.
+	 *  A stopped coordinator owns nothing — otherwise stopping mid-episode
+	 *  stands legacy redial down against something that can no longer dial. */
 	get ownsRecovery(): boolean {
+		if (this.stopped) return false;
 		return this.st.phase !== 'idle' || this.st.origin === 'active-silence';
 	}
 

@@ -541,4 +541,16 @@ describe('recovery coordinator: review-round regressions', () => {
 		h.tick({ delivered: { epoch: 3, chunksEnded: 2, egressFrames: 2, heartbeatSeen: true } });
 		assert.equal(h.coord.ownsRecovery, false);
 	});
+
+	it('a stopped coordinator owns nothing, even mid-episode', async () => {
+		const h = makeHarness();
+		await fireOnce(h);
+		assert.equal(h.coord.ownsRecovery, true, 'precondition: an episode is in flight');
+		// stop() today is only reached from shutdown(), which exits the process --
+		// so this is latent. Any other caller would leave legacy F5 redial stood
+		// down (voice-agent.ts) against a coordinator that can no longer dial,
+		// and neither side would recover the session.
+		h.coord.stop();
+		assert.equal(h.coord.ownsRecovery, false, 'stopped must release ownership');
+	});
 });
