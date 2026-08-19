@@ -28,7 +28,7 @@ Non-owner tasks MUST be processed by their tier handler, never directly by the l
 
 This gate is **narrow**: it does NOT restrict channel API calls in general (posting, reactions, listing, reading public channels) — it only gates *reading a channel's messages into context* (`…/channels/<id>/messages`), and only when the source is **blacklisted for the channel you're serving**.
 
-The `context-source-guard` PreToolUse hook blocks a message-read **only when** the target channel (or its guild) is in the *serving* channel's `contextNotFrom` (the serving channel = the `channel_id` of the task you're processing). Everything else reads normally — fail-open. So:
+The `context-source-guard` PreToolUse hook — **which is deployed per node, not automatically; see [`hooks/README.md`](../hooks/README.md) and verify it is registered before relying on it** — blocks a message-read **only when** the target channel (or its guild) is in the *serving* channel's `contextNotFrom` (the serving channel = the `channel_id` of the task you're processing). Everything else reads normally — fail-open. So:
 - serving #pr-review → reading #pr-review is fine (serving-relative).
 - serving a public channel whose `contextNotFrom` lists the private guild → reading #pr-review is BLOCKED; reading another public channel is fine.
 
