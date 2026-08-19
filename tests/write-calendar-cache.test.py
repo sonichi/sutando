@@ -482,6 +482,64 @@ def test_unrendered_api_object_is_refused():
        rendered)
 
 
+def test_outer_element_shape_is_enforced():
+    """The sibling branch: a non-dict OUTER element was `str()`-ified unchecked.
+
+    The dict branch guarded `raw`, so the same connector object shipped its repr
+    by arriving one level out — `[[api_event]]` — or as a bare scalar.
+    """
+    api_event = {"id": "35s817abc", "status": "confirmed", "summary": "Standup",
+                 "start": {"dateTime": "2026-08-20T08:30:00-07:00"}}
+    for label, payload in (
+        ("a nested connector list", [[api_event]]),
+        ("a bare dict-free scalar (int)", [7]),
+        ("a bare bool", [True]),
+    ):
+        raised = False
+        try:
+            wcc.normalize_events(payload)
+        except TypeError:
+            raised = True
+        ok(f"{label} as an outer element is refused", raised)
+
+    for label, payload in (
+        ("`raw`", [{"raw": 7}]),
+        ("`calendar`", [{"raw": "8:30am Standup", "calendar": {"id": "x"}}]),
+        ("`start`", [{"raw": "8:30am Standup", "start": [1]}]),
+    ):
+        raised = False
+        try:
+            wcc.normalize_events(payload)
+        except TypeError:
+            raised = True
+        ok(f"a non-string {label} is refused", raised)
+
+    # Both documented shapes, and the drop-the-blanks behaviour, must survive.
+    out = wcc.normalize_events(["9am Standup", {"raw": "12:30 Sync", "calendar": "work"},
+                                {"raw": "  "}, {}, "  "])
+    ok("documented string+dict elements still normalize, blanks still dropped",
+       out == [{"raw": "9am Standup", "calendar": ""},
+               {"raw": "12:30 Sync", "calendar": "work"}], out)
+
+
+def test_cli_refuses_nested_connector_list_and_keeps_prior_cache():
+    """CLI level: the refusal must exit nonzero, not traceback, and certify nothing."""
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "calendar-today.json"
+        prior = json.dumps({"date": "1999-01-01", "events": [{"raw": "OLD", "calendar": ""}]})
+        cache.write_text(prior)
+        nested = json.dumps([[{"id": "35s817abc", "status": "confirmed", "summary": "Standup"}]])
+        err = io.StringIO()
+        with unittest.mock.patch.object(wcc, "cache_path", lambda: cache), \
+             unittest.mock.patch("sys.stderr", err):
+            rc = wcc.main(["--events-json", nested])
+        ok("a nested connector list exits nonzero at the CLI", rc != 0, f"rc={rc}")
+        ok("and it does so by message, not an uncaught traceback",
+           "must be a display string" in err.getvalue(), err.getvalue())
+        ok("and the prior cache is left byte-identical",
+           cache.read_text() == prior, f"cache was rewritten to {cache.read_text()}")
+
+
 test_from_gws_binary_missing_raises()
 test_from_gws_nonzero_raises()
 test_from_gws_api_error_object_raises()
@@ -500,6 +558,8 @@ test_from_gws_success_path_writes_the_cache_and_exits_zero()
 test_from_gws_cli_failure_leaves_prior_cache_untouched()
 test_event_to_raw_shapes()
 test_unrendered_api_object_is_refused()
+test_outer_element_shape_is_enforced()
+test_cli_refuses_nested_connector_list_and_keeps_prior_cache()
 
 print()
 if _failed:
