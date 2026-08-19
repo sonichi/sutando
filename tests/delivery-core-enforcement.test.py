@@ -426,5 +426,43 @@ class CreateExclusive(unittest.TestCase):
                                  "destination must hold the winner's bytes")
 
 
+class ReconcileSignatureAgreesWithContract(unittest.TestCase):
+    """Every `reconcile` in the tree takes the DeliveryAttempt the contract declares.
+
+    A Protocol check cannot catch this: `isinstance(obj, DeliveryProvider)`
+    is True for a provider whose `reconcile` still takes `(item_id, key)`, so
+    the mismatch only surfaces as a TypeError at call time — after the claim is
+    held and before `backend.complete()`, which wedges the item. It is also
+    invisible to a branch's own CI, because the stale adapter can arrive on main
+    while the contract change sits on the topic.
+    """
+
+    def test_no_bare_id_reconcile_survives_anywhere(self):
+        repo = Path(__file__).resolve().parent.parent
+        roots = [repo / "src", repo / "packages", repo / "tests"]
+        offenders, scanned = [], 0
+        for root in roots:
+            for path in root.rglob("*.py"):
+                try:
+                    tree = ast.parse(path.read_text(encoding="utf-8"))
+                except (SyntaxError, UnicodeDecodeError):
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    if node.name != "reconcile":
+                        continue
+                    scanned += 1
+                    args = [a.arg for a in node.args.args if a.arg != "self"]
+                    if args != ["attempt"]:
+                        offenders.append(
+                            f"{path.relative_to(repo)}:{node.lineno} takes {args}")
+        # A zero scan would pass vacuously; the contract itself is one definition.
+        self.assertGreater(scanned, 1,
+                           "scanner found almost no reconcile defs — it narrowed")
+        self.assertEqual(offenders, [],
+                         "reconcile must take (self, attempt): " + "; ".join(offenders))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
