@@ -188,11 +188,9 @@ paras = ["para %d line one is quite long %s\npara %d line two %s" % (i, "w" * 15
          for i in range(8)]
 para_text = "\n\n".join(paras)
 pchunks = list(chunk_message(para_text, 1900))
-check("para: splits land at paragraph boundaries",
-      len(pchunks) > 1 and all(c.split("\n")[-1].endswith(("w" * 10, "v" * 10)) is False or
-                               c.split("\n")[-1].startswith("para") for c in pchunks[:-1]))
-# Stronger form: each non-final chunk's last line is a paragraph's SECOND line
-# (ends with the v-run), never a first line (w-run) — a mid-paragraph cut.
+check("para: multiple chunks generated", len(pchunks) > 1)
+# Each non-final chunk's last line is a paragraph's SECOND line (ends with the
+# v-run), never a first line (w-run) — a mid-paragraph cut.
 check("para: no chunk ends mid-paragraph",
       all(c.split("\n")[-1].endswith("v" * 10) for c in pchunks[:-1]),
       str([c.split("\n")[-1][-20:] for c in pchunks[:-1]]))

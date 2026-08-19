@@ -81,11 +81,6 @@ def _closes_fence(closer: str, opener: str) -> bool:
     )
 
 
-# Blank-line lookback from a forced split: a quarter of the budget, so chunks
-# stay near max_len (no half-empty sends).
-_PARA_LOOKBACK = 475
-
-
 def chunk_message(text: str, max_len: int = 1900):
     """Yield chunks <= max_len chars, preserving Markdown code fences.
 
@@ -139,10 +134,10 @@ def chunk_message(text: str, max_len: int = 1900):
         # A fence block that fits a chunk alone must not be entered near the
         # cap — that forces a close/reopen split inside the block.
         if opener_on_line is not None and fence_opener is None and buf:
-            block_len = 0
-            for look in lines[idx:]:
+            block_len = len(line) + 1
+            for look in lines[idx + 1:]:
                 block_len += len(look) + 1
-                if look is not line and _is_fence_open_line(look) is not None \
+                if _is_fence_open_line(look) is not None \
                         and _closes_fence(look.strip(), opener_on_line):
                     break
             else:
@@ -168,7 +163,9 @@ def chunk_message(text: str, max_len: int = 1900):
                 scanned = 0
                 for j in range(len(buf) - 1, 0, -1):
                     scanned += len(buf[j]) + 1
-                    if scanned > _PARA_LOOKBACK:
+                    # Lookback is a quarter of the budget so chunks stay near
+                    # max_len (no half-empty sends) at ANY cap, not only 1900.
+                    if scanned > max_len // 4:
                         break
                     if buf[j] == "":
                         cut = j
