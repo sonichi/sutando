@@ -20,15 +20,27 @@ STATUS="${1:?usage: core-status.sh <status> [step]}"
 STEP="${2-}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec python3 - "$STATUS" "$STEP" <<PY
-import importlib.util, sys
+
+# Bare `python3` is Apple's stub on a Mac without Command Line Tools: executing
+# it raises the install modal, and this wrapper runs on EVERY status transition.
+. "$REPO_ROOT/scripts/python-binary.sh"
+PY_BIN="$(resolve_python "$REPO_ROOT")"
+if [ -z "$PY_BIN" ]; then
+	echo "core-status: no runnable python3 — status NOT written" >&2
+	exit 1
+fi
+
+# Quoted heredoc + argv: REPO_ROOT is data, never spliced into Python source.
+exec "$PY_BIN" - "$REPO_ROOT" "$STATUS" "$STEP" <<'PY'
+import importlib.util, sys, time
 from pathlib import Path
-spec = importlib.util.spec_from_file_location("wd", "$REPO_ROOT/src/workspace_default.py")
+
+repo_root, status, step = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location(
+    "wd", str(Path(repo_root) / "src" / "workspace_default.py"))
 wd = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wd)
 
-import time
-status, step = sys.argv[1], sys.argv[2]
 payload = {"status": status, "ts": int(time.time())}
 if step:
     payload["step"] = step
