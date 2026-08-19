@@ -237,6 +237,48 @@ class CorePolicy(unittest.TestCase):
         # both offers carried the SAME derived key: dedup identity held.
         self.assertEqual(p.deliver_calls[0], p.deliver_calls[1])
 
+    def test_reconcile_resend_that_stays_ambiguous_reaches_UNKNOWN(self):
+        """reconcile() may re-send, so its typed failures are the SAME
+        taxonomy as deliver()'s. Unclassified they escape deliver_one before
+        backend.complete(), leaving the claim owned and attempts unchanged."""
+        class _AmbiguousReconciler(_Recorder):
+            def reconcile(self, attempt):
+                self.reconcile_calls.append(attempt.item_id)
+                raise ProviderIndeterminate("timeout on the reconcile re-send")
+        p = _AmbiguousReconciler([ProviderIndeterminate("timeout after send")],
+                                 ProviderCapabilities(reconcile_capable=True))
+        core = self._core(p)
+        r = core.deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.OUTCOME_UNKNOWN,
+                      "a second ambiguity is still ambiguity — park, do not relabel")
+        self.assertIs(r.status, DrainStatus.ATTEMPTED,
+                      "the item reached a transition; it is not stuck behind a live claim")
+        self.assertEqual(len(p.reconcile_calls), 1)
+
+    def test_reconcile_resend_refused_reaches_NOT_DELIVERED(self):
+        """A definite refusal during reconcile is retry accounting, not
+        ambiguity — the opposite classification from the case above."""
+        class _RefusingReconciler(_Recorder):
+            def reconcile(self, attempt):
+                self.reconcile_calls.append(attempt.item_id)
+                raise ProviderRefused("payload rejected on the re-send")
+        p = _RefusingReconciler([ProviderIndeterminate("timeout after send")],
+                                ProviderCapabilities(reconcile_capable=True))
+        r = self._core(p).deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.NOT_DELIVERED)
+        self.assertIs(r.status, DrainStatus.ATTEMPTED)
+
+    def test_reconcile_untyped_error_still_propagates(self):
+        """Only the typed taxonomy is classified. A programming error must
+        stay loud rather than be laundered into a delivery outcome."""
+        class _BrokenReconciler(_Recorder):
+            def reconcile(self, attempt):
+                raise KeyError("config key missing")
+        p = _BrokenReconciler([ProviderIndeterminate("timeout after send")],
+                              ProviderCapabilities(reconcile_capable=True))
+        with self.assertRaises(KeyError):
+            self._core(p).deliver_one(ITEM, b"x")
+
     def test_unknown_resends_only_with_idempotent_send(self):
         p = _Recorder([ProviderIndeterminate("timeout after send"),
                        DeliveryOutcome.CONFIRMED],

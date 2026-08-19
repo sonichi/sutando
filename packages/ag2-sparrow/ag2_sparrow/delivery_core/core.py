@@ -52,6 +52,18 @@ class DeliveryCore:
         except ProviderRefused:
             return DeliveryOutcome.NOT_DELIVERED
 
+    def _reconcile(self, item_id: str, payload: bytes, key: str):
+        """reconcile() is licensed to RE-SEND, so it raises the same typed
+        failures as deliver() and must be classified by the same rules."""
+        try:
+            resolved = self.provider.reconcile(
+                DeliveryAttempt(item_id, payload, key))
+        except ProviderIndeterminate:
+            return DeliveryOutcome.OUTCOME_UNKNOWN
+        except ProviderRefused:
+            return DeliveryOutcome.NOT_DELIVERED
+        return None if resolved is None else resolved.outcome
+
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
         """Claim -> deliver -> classify -> complete, with retry accounting."""
         token = self.backend.claim(item_id, self.worker)
@@ -64,10 +76,9 @@ class DeliveryCore:
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
-                resolved = self.provider.reconcile(
-                    DeliveryAttempt(item_id, payload, key))
+                resolved = self._reconcile(item_id, payload, key)
                 if resolved is not None:
-                    outcome = resolved.outcome
+                    outcome = resolved
             elif caps.idempotent_send:
                 outcome = self._attempt(item_id, payload, key)
         # The ceiling rides WITH the completion: parking after the claim
