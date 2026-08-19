@@ -49,6 +49,23 @@ describe('withScheme', () => {
 		assert.throws(() => new URL('NBA.com'));
 		assert.equal(new URL(withScheme('NBA.com')).origin, 'https://nba.com');
 	});
+
+	// The port rule keeps `host:port` out of the scheme bucket by refusing a
+	// digit after the colon — which also caught opaque schemes whose content is
+	// digits, mangling them silently into `https://tel:911`.
+	it('leaves digit-opaque schemes alone (tel/sms/callto)', () => {
+		assert.equal(withScheme('tel:911'), 'tel:911');
+		assert.equal(withScheme('tel:5551234'), 'tel:5551234');
+		assert.equal(withScheme('sms:5551234'), 'sms:5551234');
+		assert.equal(withScheme('callto:5551234'), 'callto:5551234');
+		assert.equal(withScheme('TEL:911'), 'TEL:911', 'scheme match is case-insensitive');
+	});
+
+	it('still qualifies host:port, which is what the digit rule exists for', () => {
+		assert.equal(withScheme('localhost:3000'), 'https://localhost:3000');
+		assert.equal(withScheme('127.0.0.1:8080'), 'https://127.0.0.1:8080');
+		assert.equal(withScheme('example.com:8080/x'), 'https://example.com:8080/x');
+	});
 });
 
 describe('open_url wiring', () => {
