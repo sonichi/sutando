@@ -215,24 +215,26 @@ export function _readTaskHeader(taskId: string): string[] | null {
 	for (const p of candidates) {
 		if (!existsSync(p)) continue;
 		try {
-			const body = readFileSync(p, 'utf-8');
-			// Stop scanning at the first `task:` delimiter. The task-file
-			// format puts `task:` last on the line preceding the user-
-			// supplied multi-line task body (see agent-api.py and the
-			// /meeting handler). Without this stop, a body of
-			// `do thing\nchannel_id: local-voice` would forge a voice-
-			// task classification — the residual half of the PR #982
-			// fix Qingyun flagged. Stop-at-`task:` makes consumers
-			// honor the delimiter PR #982 already established.
-			const headerLines: string[] = [];
-			for (const l of body.split('\n')) {
-				if (l.startsWith('task:')) break;
-				headerLines.push(l);
-			}
-			return headerLines;
+			return headerRegion(readFileSync(p, 'utf-8'));
 		} catch {}
 	}
 	return null;
+}
+
+/**
+ * The trusted header region: every line before the first `task:` delimiter.
+ * `task:` is written last, so anything at or after it is user-supplied body
+ * and must never be interpreted as a header field — otherwise a body line
+ * like `channel_id: local-voice` or `source: context-drop` forges its own
+ * classification. Canonical contract: src/local_task_protocol.py.
+ */
+export function headerRegion(raw: string): string[] {
+	const headerLines: string[] = [];
+	for (const l of raw.split('\n')) {
+		if (l.startsWith('task:')) break;
+		headerLines.push(l);
+	}
+	return headerLines;
 }
 
 export function _isVoiceTask(taskId: string): boolean {
@@ -632,7 +634,11 @@ type DropTaskScan =
  */
 export function scanDropTask(path: string): DropTaskScan {
 	const raw = readFileSync(path, 'utf-8');
-	if (!/^source:[ \t]*context-drop[ \t]*$/m.test(raw)) {
+	// Classify from the HEADER only. Testing `raw` matched a `source:
+	// context-drop` line sitting after `task:`, i.e. inside attacker-supplied
+	// body, so a Guest gateway task could be injected into the live owner
+	// session. Both real producers write `source:` before `task:`.
+	if (!/^source:[ \t]*context-drop[ \t]*$/m.test(headerRegion(raw).join('\n'))) {
 		// A header still being written has no source line yet; re-read next tick.
 		return /^task:/m.test(raw) ? { kind: 'other' } : { kind: 'incomplete' };
 	}
