@@ -110,6 +110,10 @@ except ModuleNotFoundError:
     raise
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Entrypoint-owned path setup: ``import ag2_sparrow`` resolves uninstalled (5b).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow")  # lint-workspace-resolution: allow-repo-root — locates the CODE package (gateway-shim parity)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
@@ -117,11 +121,10 @@ from util_paths import channel_access_path, claude_home_path, personal_path, sha
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
 import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
 
-# Transient send failures per result body, keyed by its `.txt` name. In-memory on
-# purpose: a bridge restart re-polls the file anyway, so a fresh count is correct.
+# poll_approved's transient counter only. The proactive leg's attempts are
+# durable in the fence's outbox (5b); this stays in-memory for the marker leg.
 _transient_send_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
@@ -207,6 +210,7 @@ from task_body_guard import confine_user_content  # noqa: E402
 from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_redaction import redact_chat_body  # noqa: E402
 from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
@@ -317,8 +321,6 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
-# Load token — env var takes precedence (allows test injection without a real .env file)
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 # Tighten perms whenever the token file exists — even when the token is already
 # in process env — so a world-readable .env never survives startup.
 channels_env = claude_home_path("channels", "discord", ".env")
@@ -330,16 +332,10 @@ if channels_env.exists():
         # restore/sync, or an ACL-restricted file must NOT crash the bridge at
         # startup — the file may still be perfectly readable. Warn and continue.
         print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
-if not TOKEN and channels_env.exists():
-    for line in channels_env.read_text().splitlines():
-        if line.startswith("DISCORD_BOT_TOKEN="):
-            TOKEN = line.split("=", 1)[1].strip()
-
-if not TOKEN:
-    # Last resort: the Keychain vault. Before this, no bridge read it, so
-    # `vault set DISCORD_BOT_TOKEN` stored the value and changed nothing.
-    from channel_token import token_from_vault  # noqa: E402
-    TOKEN = token_from_vault("DISCORD_BOT_TOKEN")
+# env -> channel .env -> vault; shared policy so quoting rules cannot drift.
+from channel_token import resolve_channel_token  # noqa: E402
+import discord_proactive_send  # noqa: E402  — proactive text send-leg (5b stage 1)
+TOKEN = resolve_channel_token("DISCORD_BOT_TOKEN", env_file=channels_env)
 
 if not TOKEN:
     print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env "
@@ -2546,8 +2542,9 @@ async def list_channel_members(channel_id: int) -> list[dict]:
 
 
 def _recover_orphan_sending_files() -> int:
-    """Recover this adapter's stranded proactive delivery claims."""
-    return recover_orphan_sending_files(RESULTS_DIR)
+    """Recover this adapter's stranded proactive delivery claims.
+    Via the fence: backend recover (dead-incarnation re-arm) + file sweep."""
+    return _proactive_fence().recover()
 
 
 # Guards the once-only startup of the long-lived poll loops below. `on_ready`
@@ -3041,7 +3038,7 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    safe_log_text = redact_vault_commands(initial_secret_filter.text)
+    safe_log_text = redact_chat_body(text)   # the shared chain; see src/chat_redaction.py
     print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
@@ -4073,7 +4070,7 @@ async def _handle_discord_message(message, force=False):
         # self-contained-judgment form (root-cause 2026-06-25).
         lines.append(
             f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
-            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str}` — '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str}` — '
             f'and read it back (everyone\'s messages including your own prior replies) '
             f'until this message stands on its own, then answer from the reconstructed '
             f'thread, NOT from memory. Do this every time; do NOT skip it because the '
@@ -5117,6 +5114,39 @@ async def poll_progress():
         await asyncio.sleep(3)
 
 
+_PROACTIVE_PROVIDER = None
+
+
+def _proactive_provider():
+    """Shared DeliveryProvider for the proactive text send-leg (5b stage 1).
+    Lazy so import cost lands on first use, single so receipts share one
+    client (and its 30s upload timeout pin)."""
+    global _PROACTIVE_PROVIDER
+    if _PROACTIVE_PROVIDER is None:
+        from discord_rest_client import DiscordRestClient
+        from discord_delivery_provider import DiscordDeliveryProvider
+        _PROACTIVE_PROVIDER = DiscordDeliveryProvider(
+            DiscordRestClient(TOKEN, timeout=30))
+    return _PROACTIVE_PROVIDER
+
+
+_PROACTIVE_FENCE = None
+
+
+def _proactive_fence():
+    """Claim fence for the proactive leg (5b): outbox-backed lifecycle.
+    Lazy like the provider; the root is RESULTS_DIR-scoped so tests binding
+    RESULTS_DIR get a hermetic outbox for free."""
+    global _PROACTIVE_FENCE
+    if _PROACTIVE_FENCE is None:
+        from proactive_claim_fence import ProactiveClaimFence
+        from ag2_sparrow.delivery_core import DesignAClaimBackend
+        _PROACTIVE_FENCE = ProactiveClaimFence(
+            DesignAClaimBackend(RESULTS_DIR / ".outbox-discord-proactive"),
+            RESULTS_DIR, worker="discord-proactive")
+    return _PROACTIVE_FENCE
+
+
 async def poll_proactive():
     """Poll results/ for proactive messages and send to owner's DM.
 
@@ -5150,14 +5180,14 @@ async def poll_proactive():
             # decision rule (last-active channel from
             # state/last-owner-activity.json; default discord on missing
             # state).
-            from proactive_routing import should_claim_proactive  # noqa: E402
-            if not should_claim_proactive(
-                STATE_DIR / "last-owner-activity.json", "discord"
-            ):
-                await asyncio.sleep(3)
-                continue
+            from proactive_routing import should_claim_proactive_file  # noqa: E402
             for f in RESULTS_DIR.iterdir():
-                if f.name.startswith("proactive-") and f.suffix == ".txt":
+                # Per-FILE decision: an explicit .to-<channel> destination
+                # outranks activity routing (see proactive_routing).
+                if f.name.startswith("proactive-") and f.suffix == ".txt" \
+                        and should_claim_proactive_file(
+                            f.name, STATE_DIR / "last-owner-activity.json",
+                            "discord"):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram
@@ -5168,15 +5198,15 @@ async def poll_proactive():
                     # had no exclusive claim. Rename is atomic on POSIX
                     # same-filesystem; FileNotFoundError from the rename
                     # means another iteration already claimed it.
-                    claim = f.with_suffix(".sending")
-                    try:
-                        f.rename(claim)
-                    except FileNotFoundError:
+                    # 5b fence: file move keeps peers' globs blind; the
+                    # outbox record makes attempts durable across restarts.
+                    claim = _proactive_fence().claim(f)
+                    if claim is None:
                         continue
                     f = claim  # subsequent reads + unlink operate on the claim path
                     text = read_ready_result(f)
                     if text is None:
-                        release_claim(f)
+                        _proactive_fence().release(f)
                         continue
                     # Parse ONCE, here, and reuse below: a second grammar would
                     # miss what parse_markers peels (D7 `**[core: N]**` headers).
@@ -5188,7 +5218,7 @@ async def poll_proactive():
                         print(f"  [proactive] {f.name} targets "
                               f"{str(_early_redirect.value).strip()!r} — not a Discord "
                               f"channel id; releasing for its own bridge", flush=True)
-                        release_claim(f)
+                        _proactive_fence().release(f)
                         continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
@@ -5225,7 +5255,7 @@ async def poll_proactive():
                                 continue
                     if owner_id is None:
                         print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
-                        f.unlink(missing_ok=True)
+                        _proactive_fence().drop(f, "no human user in allowFrom")
                         continue
                     # Bound BEFORE the try: the handler reads it, so a failure in
                     # fetch_user/create_dm would raise UnboundLocalError instead.
@@ -5281,8 +5311,11 @@ async def poll_proactive():
                             if _target_ch is not None and hasattr(_target_ch, 'send'):
                                 try:
                                     if _redirect_text:
-                                        for chunk in _chunk_for_discord(_redirect_text):
-                                            await _target_ch.send(chunk)
+                                        await asyncio.to_thread(
+                                            discord_proactive_send.deliver_text,
+                                            _proactive_provider(), _target_id,
+                                            _redirect_text, f.stem,
+                                            _chunk_for_discord)
                                     for fpath in files:
                                         fpath = os.path.expanduser(fpath.strip())
                                         if _is_path_sendable(fpath):
@@ -5311,7 +5344,7 @@ async def poll_proactive():
                                         f"to channel {_target_id}",
                                         flush=True,
                                     )
-                                    f.unlink(missing_ok=True)
+                                    _proactive_fence().confirm(f)
                                     continue
                                 except Exception as _exc:
                                     print(
@@ -5322,9 +5355,11 @@ async def poll_proactive():
                             # Fall through to DM with the marker INTACT: the visible `[channel: <id>]` is
                             # the loud-failure signal. This except wraps the chunk AND attachment loops.
                         if clean_text:
-                            for chunk in _chunk_for_discord(clean_text):
-                                await dm.send(chunk)
-                                _sent_any = True  # pragma: no cover
+                            _n = await asyncio.to_thread(
+                                discord_proactive_send.deliver_text,
+                                _proactive_provider(), dm.id, clean_text,
+                                f.stem, _chunk_for_discord)
+                            _sent_any = _sent_any or _n > 0  # pragma: no cover
                             try:
                                 import outbox_log
                                 _user_name = getattr(user, "name", None)
@@ -5351,15 +5386,15 @@ async def poll_proactive():
                                 _sent_any = True  # pragma: no cover
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
-                        f.unlink(missing_ok=True)
+                        _proactive_fence().confirm(f)
                     except Exception as e:  # pragma: no cover — live send path
                         # Quarantine rather than retry, and ONLY for a failure a retry cannot fix: a
                         # 413 never becomes a 200, a 503 does on the very next poll.
                         print(f"  [proactive] failed to DM {owner_id}: {e}")  # pragma: no cover — live send path
-                        # Glue only: the decision AND the file move are one unit in
-                        # send_failure_policy.resolve_failed_send.
-                        _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
-                            f, e, _transient_send_attempts, progressed=_sent_any)
+                        # decide_failed_send decides; the fence moves + records.
+                        _outcome = _proactive_fence().fail(  # pragma: no cover
+                            f, e,
+                            progressed=_sent_any or bool(getattr(e, "sent_chunks", 0)))
                         print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover
                               f"{f.with_suffix('.txt').name}", flush=True)
                         if _outcome == "retried":  # pragma: no cover
@@ -5503,6 +5538,7 @@ async def poll_dm_fallback():
     GRACE_SECONDS = 90
     MAX_RETRY_AGE_SECONDS = 86400  # 24h: give up on stale files so the loop drains
     FALLBACK_PREFIXES = ("task-", "question-", "briefing-", "insight-", "friction-")
+    from proactive_routing import fallback_claims_name as _routing_fallback_claims  # noqa: E402
     while True:
         try:
             now = time.time()
@@ -5510,6 +5546,9 @@ async def poll_dm_fallback():
                 if f.suffix != ".txt":
                     continue
                 if not any(f.name.startswith(p) for p in FALLBACK_PREFIXES):
+                    continue
+                # Foreign/unknown .to-<channel> tags are never swept here.
+                if not _routing_fallback_claims(f.name, "discord"):
                     continue
                 # Skip anything Discord is already tracking for reply.
                 task_id = f.stem  # e.g. "task-1776286725412"

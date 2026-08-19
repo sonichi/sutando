@@ -40,7 +40,13 @@ const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
 export const VISION_MIN_SEND_INTERVAL_MS = 900;
-const MAX_FPS = 1000 / VISION_MIN_SEND_INTERVAL_MS;
+// https://ai.google.dev/gemini-api/docs/live-api — video is sampled at 1 fps.
+// Cite it: the repo states this rate nowhere else, so an uncited literal here
+// would be unfalsifiable for the next reader.
+export const MAX_FPS = 1.0;
+// Floor is deliberately below any shipping default: sub-0.5 rates exist so the
+// cost/cadence experiments can run, not because they are a good user default.
+export const MIN_FPS = 0.1;
 const MIN_INTERVAL_MS = 250;
 // TODO(roadmap §5 Now: cost posture): A 720p JPEG q=0.6 ≈ 80–150KB. At 1 fps
 // continuous that's ~6–9MB/min into Gemini Live's video slot, plus context-
@@ -290,10 +296,8 @@ function resolveSource(name?: string): VisionSource {
 interface MinimalSession {
 	transport?: {
 		sendFile?: (base64: string, mimeType: string) => void;
-		// Inject a hidden conversation turn (no generation trigger when
-		// turnComplete=false) so the model sees a context update without
-		// the user hearing audio. Used to evict stale push frames from
-		// Gemini Live's context when screen sharing ends.
+		// turnComplete is IGNORED by the transport — it always sends realtime
+		// input, so the model may answer this injection aloud.
 		sendContent?: (turns: Array<{ role: 'user' | 'assistant'; text: string }>, turnComplete?: boolean) => void;
 		isConnected?: boolean;
 	};
@@ -483,6 +487,10 @@ export function setVisionSpeechEvidence(fn: (() => { active: boolean }) | null):
 	speechEvidenceFn = fn;
 }
 
+/** Why the last stop happened. 'no-client' is TERMINAL: the browser must tear
+ *  its push session down rather than treat the stop as a server-side glitch. */
+let lastStopReason: string | null = null;
+
 let bucketBytes = VISION_BUCKET_MAX_BYTES;
 let bucketRefillAt = Date.now();
 let lastFrameSentAt = 0;
@@ -668,6 +676,9 @@ export interface VisionState {
 	frames: number;
 	durationMs: number;
 	sessionReady: boolean;
+	/** Why streaming last stopped, when it was stopped deliberately. 'no-client'
+	 *  is terminal — a push driver seeing it must tear down, not re-arm. */
+	stoppedReason: string | null;
 	/** P7 D7.4 egress diagnostics: real sends vs gate/budget deferrals and
 	 *  displaced (dropped) slot frames. */
 	egress: {
@@ -692,6 +703,7 @@ export function getVisionState(): VisionState {
 		frames: frameCount,
 		durationMs: streaming && startedAt ? Date.now() - startedAt : 0,
 		sessionReady: getSendFile() !== null,
+		stoppedReason: streaming ? null : lastStopReason,
 		egress: getVisionEgressStats(),
 	};
 }
@@ -726,6 +738,7 @@ export function startStreaming(
 			// Push mode — caller (web-client, Mentra bridge, glasses webhook,
 			// etc.) captures frames and POSTs them to /vision/frame. No ticker.
 			stopStream();
+			lastStopReason = null; // a new push session supersedes any terminal stop
 			pushMode = true;
 			pushSourceName = lower;
 			frameCount = 0;
@@ -772,8 +785,9 @@ export function startStreaming(
 }
 
 /** Programmatic stop (used by the HTTP control server / button). */
-export function stopStreaming(): { status: 'stopped' | 'idle'; source: string | null; frames: number; durationMs: number } {
+export function stopStreaming(reason?: string): { status: 'stopped' | 'idle'; source: string | null; frames: number; durationMs: number } {
 	const r = stopStream();
+	if (r.wasRunning) lastStopReason = reason ?? null;
 	return { status: r.wasRunning ? 'stopped' : 'idle', source: r.source, frames: r.frames, durationMs: r.durationMs };
 }
 
@@ -800,13 +814,8 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 	// frame draining into a later session is exactly the backlog rule's target.
 	deferredSlot = null;
 	stopDrainTimer();
-	// Push-mode frames accumulate in Gemini Live's conversation context.
-	// Without this hint, "what do you see?" after the user stops sharing
-	// gets answered from the last frame still in context (model recalls
-	// from memory instead of calling send_vision_frame to grab a fresh
-	// view). Inject a silent user-role turn (turnComplete=false → no
-	// generation triggered) so the next user turn carries the context
-	// shift: visual frames are stale.
+	// Stale frames STAY in context — this only tells the model they are stale.
+	// turnComplete is ignored by the transport, so it may answer the hint aloud.
 	if (wasPush) {
 		const transport = sessionRef?.transport;
 		// Call as a method (not via an extracted reference) so `this` binds
@@ -934,7 +943,8 @@ function noteFrameFailure(msg: string): void {
 }
 
 function startStream(source: VisionSource, fps: number): { fps: number; intervalMs: number } {
-	const clamped = Math.max(0.5, Math.min(MAX_FPS, fps));
+	lastStopReason = null; // a new stream supersedes any terminal stop
+	const clamped = Math.max(MIN_FPS, Math.min(MAX_FPS, fps));
 	const intervalMs = Math.max(MIN_INTERVAL_MS, Math.round(1000 / clamped));
 	if (ticker) clearInterval(ticker);
 	streamGen++;
@@ -996,7 +1006,7 @@ export const startVisionTool: ToolDefinition = {
 		'Prefer send_vision_frame for one-off "look at this" questions. Instant.',
 	parameters: z.object({
 		source: z.string().optional().describe("Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."),
-		fps: z.number().optional().describe('Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.'),
+		fps: z.number().optional().describe('Frames per second, 0.1–1.0 (Gemini Live caps video at 1 fps). Default 1. Webcam may not keep up above 0.5.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
@@ -1101,7 +1111,10 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 				if (!buf) return respond(413, { status: 'failed', error: 'frame body too large' });
 				const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
 				const r = submitFrame(buf, mime);
-				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
+				// The 409 carries stoppedReason so the client can distinguish a
+				// terminal stop from a lost flag without awaiting the 2s poll.
+				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409,
+					r.ok ? { status: 'sent' } : { status: 'failed', error: r.error, stoppedReason: lastStopReason });
 			});
 			return;
 		}

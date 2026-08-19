@@ -132,5 +132,49 @@ class OnboardingStatusCheckTest(unittest.TestCase):
         self.assertIn("core", out["detail"])
         self.assertNotIn("core (", out["detail"])
 
+    # --- age rendering: an unknown timestamp must not read as a number -------
+
+    def test_a_missing_updated_at_is_unknown_not_the_whole_epoch(self):
+        """`int(None or 0)` made the age the unix time itself — the warn line
+        read "as of 1786962010s ago" (~56 years) as though it were measured."""
+        for payload in ({"rows": {"gateway": {"state": "todo"}}},
+                        {"updated_at": None, "rows": {"gateway": {"state": "todo"}}},
+                        {"updated_at": 0, "rows": {"gateway": {"state": "todo"}}}):
+            self._with_workspace(payload)
+            out = hc.check_onboarding_status()
+            self.assertEqual(out["status"], "warn", out)
+            self.assertIn("age unknown", out["detail"], payload)
+            self.assertNotIn("s ago", out["detail"], payload)
+
+    def test_the_ok_line_carries_the_same_guard(self):
+        """The all-satisfied line rendered it too, and that is the line a reader
+        is least likely to question — it says everything is fine."""
+        self._with_workspace({"updated_at": 0, "rows": {"gateway": {"state": "done"}}})
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "ok", out)
+        self.assertIn("age unknown", out["detail"])
+
+    def test_a_real_timestamp_still_renders_as_seconds(self):
+        """Control: without this, returning "age unknown" unconditionally passes
+        both tests above while destroying the age the probe exists to report."""
+        import time
+        for state, want_status in (("todo", "warn"), ("done", "ok")):
+            self._with_workspace({"updated_at": int(time.time()) - 42,
+                                  "rows": {"gateway": {"state": state}}})
+            out = hc.check_onboarding_status()
+            self.assertEqual(out["status"], want_status, out)
+            self.assertIn("s ago", out["detail"])
+            self.assertNotIn("age unknown", out["detail"])
+
+    def test_an_unusable_updated_at_TYPE_still_reads_as_unreadable(self):
+        """Pins what this change does NOT touch: a non-numeric updated_at keeps
+        raising into the existing handler rather than degrading to unknown."""
+        self._with_workspace({"updated_at": {"a": 1},
+                              "rows": {"gateway": {"state": "todo"}}})
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("unreadable", out["detail"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

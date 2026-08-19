@@ -52,6 +52,7 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Architecture and decisions
 
 - [Architecture boundaries](architecture-boundaries.md)
+- [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [Task-envelope HMAC](task-envelope-hmac.md) — the tasks/ integrity seal:
   mechanism, security claim, and the phased mailbox-authority plan
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
