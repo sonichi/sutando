@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shlex
+import statistics
 import shutil
 import tempfile
 import socket
@@ -5467,6 +5468,136 @@ DISK_WARN_GIB = 10.0
 DISK_FAIL_GIB = 2.0
 
 
+DAILY_LATE_TOLERANCE_MIN = 15
+DAILY_MISS_GRACE_MIN = 60
+
+
+def _interpret_daily_punctuality(jobs: list) -> dict:
+    """Score LATENESS, not presence: a file produced daily by another path looks
+    identical to one produced by a working schedule."""
+    name = "daily-cron-punctuality"
+    late, missed, unknown = [], [], []
+    for j in jobs:
+        due = j["hour"] * 60 + j["minute"]
+        if not j["artifacts"]:
+            unknown.append(j["name"])
+            continue
+        # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
+        # -1417 early. The filename date is logical, often a day off the mtime.
+        deltas = sorted(((w - due + 720) % 1440) - 720 for _, w in j["artifacts"])
+        median = statistics.median(deltas)
+        if median > DAILY_LATE_TOLERANCE_MIN:
+            late.append((j["name"], median, len(deltas)))
+        if (not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN
+                and not j.get("conditional")
+                and (j.get("stem_declared") or j["artifacts"])):
+            missed.append((j["name"], j["minutes_since_due"]))
+    if not late and not missed:
+        seen = len(jobs) - len(unknown)
+        detail = f"{seen} of {len(jobs)} daily job(s) observable"
+        detail += ", all on schedule" if seen else ""
+        if unknown:
+            detail += (f"; UNCHECKED (no dated artifact, cannot tell whether it ran): "
+                       f"{', '.join(sorted(unknown))}")
+        if unknown:
+            # `ok` would certify jobs nobody measured: on a 1-of-5 host the four
+            # UNCHECKED ones miss forever behind green. Coverage gates the verdict.
+            scope = "no coverage on this host" if not seen else \
+                    f"{len(unknown)} of {len(jobs)} unverifiable — status cannot be ok"
+            return {"name": name, "status": "warn", "detail": f"{detail} — {scope}"}
+        return {"name": name, "status": "ok", "detail": detail}
+    bits = []
+    for n, m, c in late:
+        bits.append(f"{n}: {c} run(s), median +{m} min late — the schedule is not what "
+                    f"produced these; something else is covering for it")
+    for n, m in missed:
+        bits.append(f"{n}: no output today, {m} min past due")
+    if unknown:
+        bits.append(f"unverifiable (no dated artifact): {', '.join(sorted(unknown))}")
+    return {"name": name, "status": "warn", "detail": "; ".join(bits)}
+
+
+def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
+    """(date, minute-of-day-written) for the newest `<stem>-YYYY-MM-DD.*` files."""
+    from datetime import datetime
+    out = []
+    if not results.is_dir():
+        return out
+    # rglob, not glob: delivered results are archived into MONTH buckets
+    # (results/archive/YYYY-MM/), so the durable copies sit two levels down.
+    for f in results.rglob(f"{stem}-20*"):
+        m = re.match(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})", f.name)
+        if not m:
+            continue
+        lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((m.group(1), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def check_daily_cron_punctuality() -> dict:
+    """Report a daily job whose output never arrives at its scheduled time."""
+    from datetime import datetime, time as dtime
+    name = "daily-cron-punctuality"
+    ws = WORKSPACE_DIR
+    cfg = ws / "hosts" / _host_label() / "crons.json"
+    if not cfg.is_file():
+        return {"name": name, "status": "ok", "detail": "no per-host crons.json — skipped"}
+    try:
+        raw = json.loads(cfg.read_text())
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "ok", "detail": f"crons.json unreadable ({e}) — skipped"}
+    if isinstance(raw, list):
+        entries = raw
+    elif isinstance(raw, dict):
+        entries = raw.get("crons") or raw.get("jobs") or []
+    else:
+        # `1` is valid JSON: .get() on it aborted the whole always-on health run.
+        return {"name": name, "status": "ok",
+                "detail": f"crons.json root is {type(raw).__name__}, not a list or "
+                          f"object — skipped"}
+    now = datetime.now()
+    jobs, malformed = [], []
+    for e in entries:
+        if not isinstance(e, dict) or e.get("launchd") or e.get("execution") == "codex-task":
+            continue
+        f = str(e.get("cron") or "").split()
+        if len(f) != 5 or not f[0].isdigit() or not f[1].isdigit():
+            continue
+        if f[2] != "*" or f[3] != "*" or f[4] != "*":
+            continue                       # not a plain every-day schedule
+        jname = str(e.get("name") or "?")
+        try:
+            # "61 24 * * *" is all digits and still invalid; dtime() would raise
+            # ValueError out of the always-on run_all_checks() path.
+            due = datetime.combine(now.date(), dtime(int(f[1]), int(f[0])))
+        except ValueError:
+            malformed.append(f"{jname} ({' '.join(f[:2])})")
+            continue
+        # A NAME is not an artifact: "talk-events-nightly" infers stem "nightly"
+        # and never sees its real fleet-growth-<date>.mp4 output.
+        declared = str(e.get("artifact") or "").strip()
+        stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
+        arts = _daily_artifact_minutes(ws / "results", stem)
+        jobs.append({
+            "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
+            "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
+            "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
+            "stem": stem, "stem_declared": bool(declared),
+            # Renders only when new input exists, so a quiet day produces nothing
+            # and absence is evidence of nothing rather than of a miss.
+            "conditional": bool(e.get("conditional")),
+        })
+    if malformed:
+        return {"name": name, "status": "warn",
+                "detail": f"unparseable daily cron time(s): {', '.join(malformed)} — "
+                          f"fix the crons.json entry; punctuality unchecked for "
+                          f"{len(malformed)} job(s)"}
+    if not jobs:
+        return {"name": name, "status": "ok", "detail": "no session-owned daily jobs — skipped"}
+    return _interpret_daily_punctuality(jobs)
+
+
 def check_disk_space() -> dict:
     """Free space on the volume(s) the core actually writes to.
 
@@ -8833,6 +8964,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
+    checks.append(check_daily_cron_punctuality())
     checks.append(check_disk_space())
 
     return checks
