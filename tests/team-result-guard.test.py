@@ -176,6 +176,9 @@ def main() -> int:
         ("**[core: 1]**\n[no-send]\nhide", "team", _clean, guard.VERDICT_SUPPRESS),
         ("[attach: /etc/passwd]", "team", _clean, guard.VERDICT_LEAK),
         ("secret text", "team", _leaky, guard.VERDICT_LEAK),
+        # Marker check precedes the secret scan: a secret-carrying skip body
+        # still SUPPRESSES — the leaky filter never gets a say on a stubbed body.
+        ("[no-send]\nsecret text", "team", _leaky, guard.VERDICT_SUPPRESS),
     ):
         v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
         assert v.kind == kind, (body, tier, v)
@@ -196,8 +199,11 @@ def main() -> int:
         got = guard.suppression_stub_for_tier(body, tier)
         assert got == stub, (body, tier, got)
         if got is not None:
-            v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=_clean)
-            assert v.kind == guard.VERDICT_SUPPRESS, (body, "stub without suppress verdict")
+            # stub⊆suppress holds regardless of filter: the marker check
+            # precedes the secret scan, so _leaky cannot flip a stub to LEAK.
+            for filt in (_clean, _leaky):
+                v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
+                assert v.kind == guard.VERDICT_SUPPRESS, (body, filt.__name__, "stub without suppress verdict")
             assert got == body[:len(got)] or got.startswith("[deduped:"), body
     print("  [stub] suppression_stub_for_tier: inert bytes only, subset of suppress")
     print("  [verdict] classify_result_for_tier owns the three-way decision;")
