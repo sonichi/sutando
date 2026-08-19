@@ -2190,8 +2190,24 @@ def check_memory_index_integrity() -> "dict | None":
     loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
     truncated = len(loaded_text) < len(effective_text)
 
+    # An index that outgrows the load budget compacts its entries to prefix
+    # abbreviations (`f:` for feedback_, `r:` for reference_, `p:` for project_).
+    _INDEX_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
+
     def _referenced_in(hay: str, name: str) -> bool:
-        return name in hay or name[:-3] in hay
+        stem = name[:-3] if name.endswith(".md") else name
+        if name in hay or stem in hay:
+            return True
+        # Without this the probe calls an indexed file unindexed, and the
+        # "fix" it invites — expanding the index — is what blows the read limit.
+        for full, short in _INDEX_ABBREV.items():
+            if not stem.startswith(full):
+                continue
+            token = short + stem[len(full):]
+            # Trailing boundary so `f:foo` is not satisfied by `f:foobar`.
+            if re.search(re.escape(token) + r"(?![\w-])", hay):
+                return True
+        return False
 
     # MEMORY.md is not the only index. Once a corpus outgrows the load budget the
     # overflow moves to sibling HUB indexes (MEMORY-reference.md, MEMORY-wire.md,
