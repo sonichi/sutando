@@ -180,6 +180,59 @@ and loads whichever repo it reviews.
     a courtesy — and what makes `--delete-branch` on the parent dangerous while the child
     is open.
 
+13. **An unknown must not render as a value in the slot a measurement occupies.** When a
+    field can be absent, unreadable, or unmeasurable, printing a number there is worse
+    than printing nothing: the reader has no way to tell a measurement from a default, and
+    the plausible ones are never questioned. Ask of any patch that formats a quantity:
+    what does this print when the input is missing, zero-as-sentinel, or negative — and is
+    that distinguishable from a real reading? The fix is always the same shape: carry the
+    unknown (`None`) to the render site and say so there, rather than substituting a value
+    upstream.
+    *Grounded by:* five instances in one week, each found by a different reviewer and each
+    resolved identically. (a) #2991 — a negative age rendered `-0.2h ago`; impossible, but
+    it has the shape of a measurement, so nothing flags it. (b) #2994 — `age or 0.0`
+    collapsed an unknown claim age into `oldest 0.0h`, one line above a formatter that
+    cannot represent anything under 3.6 minutes anyway. (c) #3000 — a freshness guard
+    existed only on the *exhausted* branch, so the reassuring reading was stated as current
+    at any age; the guard sat where the author felt risk, and the branch without it was the
+    one that lied. (d) #3020 — `int(data.get("updated_at", 0) or 0)` made an absent
+    timestamp the whole unix epoch, printing `as of 1786962010s ago` (~56 years) on both
+    the warn line *and* the all-satisfied line, which is the one a reader is least likely
+    to question. (e) #3027 — `analyze_dev_activity` returned `None` for three distinct
+    conditions, only one documented, with `subprocess.TimeoutExpired` invisible inside a
+    generic `SubprocessError` handler; the same file already handled a sibling field
+    correctly (`if landed is None: # Cannot tell what landed, so do not use the word`).
+    The tell: the same expression supplies both the default and the measurement, usually as
+    `x or 0`, `.get(k, 0)`, or an `except` that returns the empty case.
+
+14. **Never assert on source text as a stand-in for a behavioral claim.** When a module
+    cannot be imported by tests (import-time side effects, heavy SDK deps), extract the
+    decision into an importable unit and test THAT — do not regex the file. A source-text
+    assertion fails in both directions: it stays green when the behavior is disabled
+    outright (guard the call with `if (false && …)` and every token the regex matches is
+    still present), and it goes red on a rename that changes nothing. Worked examples of
+    the extraction convention already in-tree: `src/channel_token.py` (token-resolution
+    policy extracted from four script consumers, tested behaviorally) and
+    `src/result_markers.py` (marker grammar extracted from per-bridge private parsers,
+    driven behaviorally by the bridge-marker-no-leak and dedup suites). When only content emitted verbatim is being pinned (an
+    instruction template, a doc line), say so explicitly — that is a data pin, and it
+    must be labeled as one, not passed off as a behavior test.
+    Second exception: a source assertion is legitimate when the property is *structural*
+    — a policy must not be duplicated, a path literal must not appear — because behavior
+    cannot observe a duplicate that currently agrees (two copies in sync pass every
+    behavioral test; the defect IS the duplication). This covers negative scans (no
+    private parser, no `json.loads` in an adapter) and positive delegation pins (the
+    adapter calls the shared owner — the form CLAUDE.md's "pin every adapter's
+    delegation" already mandates), and it is what this file's own `checks:` block does.
+    Pair it with the behavioral test of the extracted unit; never let it substitute
+    for one.
+    *Grounded by:* three independent instances across unrelated subsystems in one evening
+    (2026-08-18) — the #3088 scroll-reporting test asserted on `browser-tools.ts` source
+    text, and disabling the fix outright left its suite 5/5 green (verified via the
+    if-false control during review); the same construct had just been found blocking a
+    team-guard follow-up and in one earlier review the same night. Three authors, one
+    evening: a missing convention, not a personal habit. (Lesson: air + 001.)
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
