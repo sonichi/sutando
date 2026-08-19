@@ -10,6 +10,15 @@ on:
 env:
   SUTANDO_TELEMETRY: "0"
 
+# A superseded push previously kept its runner until completion, so an active
+# branch could hold several full CI runs at once and starve the ones that
+# matter. Observed 2026-08-19: `fix/gateway-lane-restart-without-watcher-reap`
+# held two in-flight CI runs at different heads simultaneously.
+# `main` is deliberately NOT cancelled — every commit on it should be tested.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   typecheck-and-test:
     name: typecheck + node & shell tests
@@ -163,8 +172,16 @@ jobs:
           timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
           timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py
 
-      - name: Run tests
-        run: npm test
+      # TypeScript only. `npm test` also chains `npm run test:py`, and the
+      # dedicated `python-standalone-tests` job below runs the identical
+      # `find tests -name '*.test.py'` set — so calling `npm test` here ran all
+      # 554 Python suites TWICE per CI run, in two jobs, doubling both wall
+      # clock and the chance of meeting a flake. Measured on run 32204234502:
+      # `python standalone tests` succeeded while this job failed, on the same
+      # commit, with `python: 554 file(s) ran, failed: ...` — the same suite,
+      # one run, two outcomes. Local `npm test` still runs both halves.
+      - name: Run TypeScript tests
+        run: npm run test:ts
         if: hashFiles('tests/**/*.test.ts') != ''
 
 
@@ -321,7 +338,20 @@ jobs:
       - name: Require every test job to have succeeded
         run: |
           set -euo pipefail
-          echo "typecheck-and-test:      ${{ needs.typecheck-and-test.result }}"
-          echo "python-standalone-tests: ${{ needs.python-standalone-tests.result }}"
-          [ "${{ needs.typecheck-and-test.result }}" = "success" ] || exit 1
-          [ "${{ needs.python-standalone-tests.result }}" = "success" ] || exit 1
+          # A cancelled job still blocks the merge — an unfinished run is not a
+          # pass — but it must not READ as a test failure. A job cancelled at its
+          # timeout-minutes cap, or by the new concurrency rule, is a CAPACITY
+          # outcome; reporting it identically to an assertion failure is what let
+          # #3146's incidents be counted as flaky tests.
+          rc=0
+          check() {
+            case "$2" in
+              success)   echo "  $1: success" ;;
+              cancelled) echo "::warning::$1 was CANCELLED (job cap or superseded run) — capacity, not a test failure"; rc=1 ;;
+              skipped)   echo "::error::$1 was SKIPPED — a dependency failed, so nothing ran"; rc=1 ;;
+              *)         echo "::error::$1 FAILED ($2)"; rc=1 ;;
+            esac
+          }
+          check "typecheck-and-test"      "${{ needs.typecheck-and-test.result }}"
+          check "python-standalone-tests" "${{ needs.python-standalone-tests.result }}"
+          exit "$rc"
