@@ -136,9 +136,35 @@ _D7_HEADER_RE = re.compile(
     r"\A\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*"
 )
 
-# Attach markers — file/send/attach aliases, matched anywhere EXCEPT inside a
-# markdown code span: a backticked marker is prose, not a directive.
+# Attach markers — file/send/attach aliases, matched anywhere EXCEPT inside
+# markdown code: a marker being SHOWN is prose, not a directive. The lookarounds
+# cover inline spans; _code_lines covers fenced and indented blocks, which is how
+# the marker is most often documented.
 _ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]+)\](?!`)")
+
+_FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
+
+# Inline code spans: a run of N backticks closed by the same run. Matching the
+# SPAN (rather than testing the characters either side of a marker) is what
+# catches a marker sitting in the middle of a longer span.
+_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\1).)+?\1(?!`)", re.DOTALL)
+
+
+def _code_lines(text: str) -> set:
+    """Line indices inside a fenced or indented markdown code block.
+
+    An unclosed fence swallows the rest of the body on purpose: the alternative
+    is treating shown-but-unterminated example text as a live directive.
+    """
+    lines, out, fenced = text.split("\n"), set(), False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            fenced = not fenced
+            out.add(i)
+            continue
+        if fenced or line.startswith(("    ", "\t")):
+            out.add(i)
+    return out
 
 # DM-only privacy marker — matched ANYWHERE in the body (not anchored) so it
 # suppresses a [channel:] redirect regardless of which came first. All
@@ -244,12 +270,23 @@ def parse_markers(text: str) -> ParseResult:
 
     # 3. ATTACH — scan everywhere in the (possibly already-redirected) body.
     # Document-order paths.
-    for m in _ATTACH_RE.finditer(body):
-        path = m.group(1).strip()
-        actions.append(Action(kind="attach", value=path))
+    code = _code_lines(body)
+    spans = [(m.start(), m.end()) for m in _SPAN_RE.finditer(body)]
 
-    # Strip the attach markers from body so the user never sees them.
-    body = _ATTACH_RE.sub("", body).strip()
+    def _in_code(pos: int) -> bool:
+        if body.count("\n", 0, pos) in code:
+            return True
+        return any(a <= pos < b for a, b in spans)
+
+    for m in _ATTACH_RE.finditer(body):
+        if _in_code(m.start()):
+            continue
+        actions.append(Action(kind="attach", value=m.group(1).strip()))
+
+    # Strip only the markers we acted on — one shown in a code block stays
+    # visible, which is the whole point of showing it.
+    body = _ATTACH_RE.sub(
+        lambda m: "" if not _in_code(m.start()) else m.group(0), body).strip()
 
     return ParseResult(body=body, actions=actions)
 
