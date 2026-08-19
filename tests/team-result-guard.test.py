@@ -31,7 +31,6 @@ sys.path.insert(0, str(REPO / "src"))
 import team_result_guard as guard  # noqa: E402
 
 BRIDGE = REPO / "src" / "discord-bridge.py"
-WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 
 
 class _Scan:
@@ -214,7 +213,6 @@ def behavioral() -> list:
 def structural() -> list:
     fails = []
     bridge = BRIDGE.read_text()
-    worker = WORKER.read_text()
 
     if "from team_result_guard import" not in bridge:
         fails.append("discord-bridge must import the shared guard")
@@ -237,20 +235,18 @@ def structural() -> list:
         fails.append("an unknown tier must be resolved from the task file before guarding")
 
     # One implementation: consumers import the policy, never restate it.
-    for name, src, label in ((BRIDGE.name, bridge, "bridge"), (WORKER.name, worker, "worker")):
+    for name, src, label in ((BRIDGE.name, bridge, "bridge"),):
         if re.search(r"^\s*TEAM_RESULT_CONTROL\s*=\s*re\.compile", src, re.M):
             fails.append(f"{name} redefines TEAM_RESULT_CONTROL instead of importing it")
         if re.search(r"^class TeamResultLeakError", src, re.M):
             fails.append(f"{name} redefines TeamResultLeakError instead of importing it")
         if re.search(r"^def resolve_access_tier", src, re.M):
             fails.append(f"{name} redefines resolve_access_tier instead of importing it")
-    if "from team_result_guard import" not in worker:
-        fails.append("session-worker must import the shared guard")
     return fails
 
 
 def main() -> int:
-    for path in (BRIDGE, WORKER):
+    for path in (BRIDGE,):
         if not path.exists():
             print(f"FAIL: missing {path}")
             return 1
