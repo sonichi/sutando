@@ -53,20 +53,27 @@ export interface VoiceConfig {
 	divergenceCorrection: boolean;
 	/** Per-channel overrides, keyed by voice channel id. */
 	channels: Record<string, VoiceChannelConfig>;
-	/** Phase 0.5 seam (design §2.1): context-window compression. ABSENT = off
-	 *  (today's wire behaviour). `{}` = on with the SERVER's defaults (trigger
-	 *  at 80% of the model limit, target half the trigger). Explicit
+	/** Phase 0.5 seam (design §2.1): context-window compression. ABSENT = take
+	 *  whatever the built-in default says. `{}` = on with the SERVER's defaults
+	 *  (trigger at 80% of the model limit, target half the trigger). Explicit
 	 *  thresholds must be safe positive integers with
-	 *  0 < targetTokens < triggerTokens, both-or-neither. */
-	compressionConfig?: { triggerTokens?: number; targetTokens?: number };
+	 *  0 < targetTokens < triggerTokens, both-or-neither. `null`/`false` =
+	 *  DELIBERATELY DISABLED — the user-side off-switch that survives the value
+	 *  becoming a default (design §Phase 3, step 3e): once a default exists,
+	 *  deleting the key stops meaning "off", so absent and disabled must be
+	 *  distinguishable. */
+	compressionConfig?: { triggerTokens?: number; targetTokens?: number } | null | false;
 	/** Phase 0.5 seam (design §2.2): session-wide media token cost for
 	 *  realtime-input images (LOW = 64 tokens/frame). Session-wide means it
 	 *  reaches one-shot send_vision_frame too — realtime input has no
-	 *  per-send override. ABSENT = unset (server default). */
+	 *  per-send override. ABSENT = built-in default; `null`/`false` =
+	 *  deliberately disabled (same off-switch rule as compressionConfig). */
 	mediaResolution?:
 		| 'MEDIA_RESOLUTION_LOW'
 		| 'MEDIA_RESOLUTION_MEDIUM'
-		| 'MEDIA_RESOLUTION_HIGH';
+		| 'MEDIA_RESOLUTION_HIGH'
+		| null
+		| false;
 }
 
 export const VOICE_CONFIG_DEFAULTS: VoiceConfig = {
@@ -116,7 +123,18 @@ export function resolveOwnerMode(
  *  absent when off — `undefined` is not absent at the provider boundary. */
 export interface VoiceSessionTuning {
 	compressionConfig?: { triggerTokens?: number; targetTokens?: number };
-	mediaResolution?: VoiceConfig['mediaResolution'];
+	/** The RESOLVED value only ever carries a real enum member — a disabled or
+	 *  absent seam is real key absence here, never null. */
+	mediaResolution?: 'MEDIA_RESOLUTION_LOW' | 'MEDIA_RESOLUTION_MEDIUM' | 'MEDIA_RESOLUTION_HIGH';
+}
+
+/** The explicit off-switch: `null` or `false` means the operator disabled the
+ *  seam on purpose. Distinct from ABSENT, which defers to the built-in
+ *  default — a distinction that only starts to matter when a value graduates
+ *  into VOICE_CONFIG_DEFAULTS, and which has to exist BEFORE it does or the
+ *  only user-side rollback is downgrading the app (design Phase 3, step 3e). */
+function isDisabled(v: unknown): v is null | false {
+	return v === null || v === false;
 }
 
 const MEDIA_RESOLUTIONS = [
@@ -197,7 +215,10 @@ export function resolveSessionTuning(
 ): VoiceSessionTuning {
 	const out: VoiceSessionTuning = {};
 
-	if (config.mediaResolution !== undefined) {
+	// `null`/`false` = deliberately disabled: the key stays ABSENT from the
+	// session config, exactly as if unset, but a future built-in default
+	// cannot override the user's choice (design step 3e).
+	if (config.mediaResolution !== undefined && !isDisabled(config.mediaResolution)) {
 		if (!(MEDIA_RESOLUTIONS as readonly string[]).includes(config.mediaResolution as string)) {
 			throw new Error(
 				`[voice-config] mediaResolution must be one of ${MEDIA_RESOLUTIONS.join(' | ')}, ` +
@@ -217,12 +238,12 @@ export function resolveSessionTuning(
 			envTarget,
 			parseEnvThreshold,
 		);
-	} else if (config.compressionConfig !== undefined) {
+	} else if (config.compressionConfig !== undefined && !isDisabled(config.compressionConfig)) {
 		const cc = config.compressionConfig;
-		if (cc === null || typeof cc !== 'object' || Array.isArray(cc)) {
+		if (typeof cc !== 'object' || Array.isArray(cc)) {
 			throw new Error(
-				`[voice-config] compressionConfig must be an object ({} enables server defaults), ` +
-					`got ${JSON.stringify(cc)}`,
+				`[voice-config] compressionConfig must be an object ({} enables server defaults, ` +
+					`null/false disables), got ${JSON.stringify(cc)}`,
 			);
 		}
 		if (cc.triggerTokens === undefined && cc.targetTokens === undefined) {
