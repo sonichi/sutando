@@ -616,7 +616,17 @@ def main() -> int:
     STATE["force_results_400"] = False
     STATE["force_results_502_once"] = True
     _ifc = {"task-CORE1"}
-    rtc._post_ready_results(_ifc)
+    import contextlib
+    import io as _io
+    _cap = _io.StringIO()
+    with contextlib.redirect_stdout(_cap):
+        rtc._post_ready_results(_ifc)
+    _out = _cap.getvalue()
+    print(_out, end="")
+    check("delivered via DeliveryCore" in _out
+          and "AG2SpaceResultProvider" in _out,
+          "a CONFIRMED delivery announces the seam it went through "
+          "(the live-path evidence CONTRIBUTING asks for)")
     check(len(STATE["results"]) == _before + 1
           and STATE["results"][-1]["id"] == "task-CORE1"
           and STATE["results"][-1]["body"] == "core answer"

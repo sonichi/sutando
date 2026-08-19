@@ -2981,6 +2981,11 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
              f"(attempts={core.backend.attempts(broker_tid)}) — will retry")
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
+        # A confirmed send was otherwise silent, so nothing on the happy path
+        # told a live round trip apart from the legacy one it replaces.
+        _log(f"result {tid} delivered via DeliveryCore "
+             f"(provider={type(core.provider).__name__}, "
+             f"backend={type(core.backend).__name__}, worker={core.worker})")
         return True
     _log(f"result POST not confirmed for {tid} "
          f"({res.outcome.value if res.outcome else '?'}) — will retry")
