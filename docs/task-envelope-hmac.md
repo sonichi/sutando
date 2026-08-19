@@ -142,6 +142,17 @@ changes behavior on a verdict yet. (Phase 1 is complete when the PR-trail
 "open" rows land; the census's unsigned count is the live measure of the
 gap.)
 
+**Read that count with its window in mind.** The default invocation is
+`python3 src/task_envelope_census.py --days 7`, and it scans `tasks/` **and**
+`tasks/archive/`. So the unsigned population is dominated by *history* — tasks
+written before each writer's stamper merged — not by uncovered writers. Run bare,
+it shows a large unsigned count that looks like a coverage gap and is mostly
+backlog. To tell them apart, compare a row's **newest** unsigned timestamp against
+that writer's stamper merge date: if the newest unsigned predates the stamper, the
+row is draining, not uncovered. Worked example from a second host — newest unsigned
+`discord` task 2026-08-15T20:27Z against the stamper landing 2026-08-17T12:20Z
+(#3014), i.e. backlog.
+
 ## Phased plan
 
 Two independent invariants, deliberately shipped separately so a failure in
