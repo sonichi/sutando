@@ -12,7 +12,11 @@ import {
 	getVisionState,
 	resetVisionEgressForTests,
 	VISION_MIN_SEND_INTERVAL_MS,
+	MAX_FPS,
+	startVisionControlServer,
+	stopVisionControlServer,
 } from '../src/vision-tools.js';
+import type { AddressInfo } from 'node:net';
 
 /** Fake VoiceSession exposing exactly what the vision egress path reads. */
 function fakeSession(state = 'ACTIVE') {
@@ -134,15 +138,31 @@ describe('P7 D7.4 vision egress controls', () => {
 		stopStreaming();
 	});
 
-	it('pull cadence is capped by the egress send interval', () => {
+	it('pull cadence is capped at the API-documented 1 fps, not at the send interval', () => {
 		const { session } = fakeSession();
 		setVisionSession(session);
 		registerSource({ name: 'fps-cap-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
 		const r = startStreaming('fps-cap-source', 2, 'pull');
 		assert.equal(r.status, 'streaming');
 		if (r.status === 'streaming') {
-			assert.equal(r.intervalMs, VISION_MIN_SEND_INTERVAL_MS);
-			assert.equal(r.fps, 1000 / VISION_MIN_SEND_INTERVAL_MS);
+			// Deriving the cap from the 900ms send interval yielded 1.11 fps — above
+			// the 1 fps Gemini Live documents for video frames.
+			assert.equal(r.fps, MAX_FPS);
+			assert.equal(r.fps, 1);
+			assert.equal(r.intervalMs, 1000);
+		}
+		stopStreaming();
+	});
+
+	it('sub-0.5 fps is reachable — the cost/cadence experiments need it', () => {
+		const { session } = fakeSession();
+		setVisionSession(session);
+		registerSource({ name: 'fps-floor-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
+		const r = startStreaming('fps-floor-source', 0.25, 'pull');
+		assert.equal(r.status, 'streaming');
+		if (r.status === 'streaming') {
+			assert.equal(r.fps, 0.25, '0.25 must survive the clamp; the old 0.5 floor swallowed it');
+			assert.equal(r.intervalMs, 4000);
 		}
 		stopStreaming();
 	});
@@ -164,6 +184,62 @@ describe('P7 D7.4 vision egress controls', () => {
 		releaseCapture(); // slow source finally returns — AFTER the stop
 		await delay(10);
 		assert.equal(sent.length, 0, 'stop semantics beat a slow source');
+	});
+
+	it('a no-client stop is reported as terminal so a push driver tears down', () => {
+		const { session } = fakeSession();
+		setVisionSession(session);
+		registerSource({ name: 'term-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
+		startStreaming('term-source', 1, 'pull');
+		assert.equal(getVisionState().stoppedReason, null, 'no reason while streaming');
+		stopStreaming('no-client');
+		assert.equal(getVisionState().stoppedReason, 'no-client');
+		// A user-initiated stop must NOT look terminal — the browser may legitimately
+		// re-arm after one, and conflating the two would break recovery.
+		startStreaming('term-source', 1, 'pull');
+		stopStreaming();
+		assert.equal(getVisionState().stoppedReason, null);
+		stopStreaming();
+	});
+
+	it('a frame rejected after a terminal stop carries the reason on the 409', async () => {
+		// The client's 2s state poll loses this race at >=1fps: an in-flight frame
+		// POST returns 409 first, and a rearm on that 409 restarts the capture the
+		// server just stopped. The rejection has to carry the reason itself.
+		const { session } = fakeSession();
+		setVisionSession(session);
+		registerSource({ name: 'r409-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
+		startStreaming('r409-source', 1, 'push');
+		stopStreaming('no-client');
+
+		const srv = startVisionControlServer(0);
+		await new Promise<void>((r) => (srv.listening ? r() : srv.once('listening', () => r())));
+		const port = (srv.address() as AddressInfo).port;
+		try {
+			const res = await fetch(`http://127.0.0.1:${port}/vision/frame`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'image/jpeg' },
+				body: frameBuf(1),
+			});
+			assert.equal(res.status, 409, 'a frame after a stop is rejected');
+			const body = (await res.json()) as { stoppedReason?: string | null };
+			assert.equal(body.stoppedReason, 'no-client',
+				'the 409 must name the terminal stop, or the client re-arms past it');
+		} finally {
+			stopVisionControlServer();
+		}
+	});
+
+	it('starting again clears a terminal stop', () => {
+		const { session } = fakeSession();
+		setVisionSession(session);
+		registerSource({ name: 'clear-source', capture: async () => ({ data: frameBuf(1), mimeType: 'image/jpeg' }) });
+		startStreaming('clear-source', 1, 'pull');
+		stopStreaming('no-client');
+		assert.equal(getVisionState().stoppedReason, 'no-client');
+		startStreaming('clear-source', 1, 'pull');
+		assert.equal(getVisionState().stoppedReason, null, 'a fresh stream supersedes the terminal stop');
+		stopStreaming();
 	});
 
 	it('getVisionState exposes the egress diagnostics', () => {

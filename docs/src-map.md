@@ -88,6 +88,7 @@ One entry per agent-facing module.
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
 - **`orphan_result_routes.py`** — Routes for results whose task a bridge never saw.
+- **`osascript-setup-hint.ts`** — Extract the user-actionable sentence from an osascript failure.
 - **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
 - **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
@@ -131,6 +132,7 @@ One entry per agent-facing module.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
+- **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
@@ -144,6 +146,7 @@ One entry per agent-facing module.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
 - **`task_envelope.py`** — Task-envelope authentication: an HMAC stamp that makes access_tier a verified claim instead of an honor-system header.
+- **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
@@ -176,6 +179,7 @@ One entry per agent-facing module.
 - **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent, phone-conversation, and any plugin voice surface).
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
+- **`voice-redial-scheduler.ts`** — Event-driven redial scheduler with exponential backoff (F5).
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
