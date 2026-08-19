@@ -449,6 +449,39 @@ def test_event_to_raw_shapes():
     ok("an accepted invite is NOT marked declined", "[DECLINED]" not in wcc.event_to_raw(acc))
 
 
+def test_unrendered_api_object_is_refused():
+    """A caller that pipes the calendar API event straight through must fail loudly.
+
+    Observed 2026-08-09: `str()` on the API dict yields its repr, which passed the
+    non-empty check and was delivered as
+    `One meeting today: {'id': '35s817...', 'status': 'confirmed', ...}`.
+    """
+    api_event = {"id": "35s817abc", "status": "confirmed", "summary": "Standup",
+                 "start": {"dateTime": "2026-08-20T08:30:00-07:00"},
+                 "end": {"dateTime": "2026-08-20T09:30:00-07:00"}}
+    raised = False
+    try:
+        wcc.normalize_events([{"raw": api_event, "calendar": "work"}])
+    except TypeError:
+        raised = True
+    ok("an unrendered API dict as `raw` raises instead of shipping its repr", raised)
+
+    raised_list = False
+    try:
+        wcc.normalize_events([{"raw": [api_event], "calendar": "work"}])
+    except TypeError:
+        raised_list = True
+    ok("a LIST of events as `raw` is refused too", raised_list)
+
+    # The rendered form the real producer emits must still pass untouched.
+    rendered = wcc.event_to_raw(api_event)
+    out = wcc.normalize_events([{"raw": rendered, "calendar": "work"}])
+    ok("the rendered string the producer emits still normalizes",
+       out == [{"raw": rendered, "calendar": "work"}], out)
+    ok("and it is a real display string, not a repr", "8:30am" in rendered and "{" not in rendered,
+       rendered)
+
+
 test_from_gws_binary_missing_raises()
 test_from_gws_nonzero_raises()
 test_from_gws_api_error_object_raises()
@@ -466,6 +499,7 @@ test_cancelled_events_are_dropped_and_location_is_rendered()
 test_from_gws_success_path_writes_the_cache_and_exits_zero()
 test_from_gws_cli_failure_leaves_prior_cache_untouched()
 test_event_to_raw_shapes()
+test_unrendered_api_object_is_refused()
 
 print()
 if _failed:

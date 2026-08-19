@@ -65,11 +65,24 @@ def normalize_events(raw_events: list) -> list[dict]:
 
     Accepts strings or dicts; drops entries with no usable `raw` text so an
     empty/garbage element never becomes a blank calendar line.
+
+    Raises TypeError if `raw` is an unrendered calendar API object. `str()` on
+    one yields its repr, which reaches the owner's DM as
+    `One meeting today: {'id': '35s817...', 'status': 'confirmed', ...}`.
+    Refusing aborts the whole cache write, so the briefing reports it could not
+    read the calendar — an honest "unread" beats a plausible-looking wrong day.
     """
     events: list[dict] = []
     for ev in raw_events or []:
         if isinstance(ev, dict):
-            raw = str(ev.get("raw") or "").strip()
+            raw_val = ev.get("raw")
+            if isinstance(raw_val, (dict, list)):
+                raise TypeError(
+                    "calendar event `raw` must be a rendered display string "
+                    f"(e.g. '8:30am-9:30am Standup' from event_to_raw()), got "
+                    f"{type(raw_val).__name__}"
+                )
+            raw = str(raw_val or "").strip()
             cal = str(ev.get("calendar") or "").strip()
         else:
             raw, cal = str(ev).strip(), ""
