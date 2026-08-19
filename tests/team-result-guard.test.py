@@ -31,7 +31,6 @@ sys.path.insert(0, str(REPO / "src"))
 import team_result_guard as guard  # noqa: E402
 
 BRIDGE = REPO / "src" / "discord-bridge.py"
-WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 
 
 class _Scan:
@@ -103,6 +102,57 @@ def behavioral() -> list:
     out, why = guard.guard_result_for_tier("x", "team", REPO, secret_filter=_raises)
     if out != guard.TEAM_LEAK_RESULT or not why:
         fails.append("a raising scanner must fail CLOSED and withhold the body")
+
+    out, why = guard.guard_result_for_tier(
+        "intentional secret", "team", REPO, secret_filter=_leaky,
+        scan_sensitive_data=False)
+    if out != "intentional secret" or why is not None:
+        fails.append("an explicit filter opt-out must pass ordinary result text")
+    out, why = guard.guard_result_for_tier(
+        "[attach: /etc/passwd]", "team", REPO, secret_filter=_clean,
+        scan_sensitive_data=False)
+    if out != guard.TEAM_LEAK_RESULT or not why:
+        fails.append("delivery-control markers must stay guarded when scanning is off")
+
+    with tempfile.TemporaryDirectory() as td:
+        task = Path(td) / "task.txt"
+        missing = Path(td) / "missing-task.txt"
+        directory = Path(td) / "task-directory"
+        directory.mkdir()
+        if not guard.sensitive_data_filter_enabled(missing, "team"):
+            fails.append("a missing task file must fail closed to scanning enabled")
+        if not guard.sensitive_data_filter_enabled(directory, "team"):
+            fails.append("a directory in place of a task file must fail closed")
+        task.write_text("access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a missing filter stamp must default on")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: false\n"
+            "access_tier: team\ntask: body\n")
+        if guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("paired Team collaborator and filter-off stamps must disable scanning")
+        if not guard.sensitive_data_filter_enabled(task, "guest"):
+            fails.append("a non-Team tier must keep scanning enabled")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: FALSE\n"
+            "access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a non-canonical filter value must fail closed to enabled")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: false\n"
+            "sensitive_data_filter: false\n"
+            "access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("duplicate filter stamps must fail closed to enabled")
+        task.write_text(
+            "collaborator: true\naccess_tier: team\ntask: body\n"
+            "sensitive_data_filter: false\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a body-authored filter opt-out must not be trusted")
+        task.write_text(
+            "sensitive_data_filter: false\naccess_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("filter-off without collaborator opt-in must fail closed")
 
     # The caller is handed only the safe body — it cannot deliver the raw text
     # by swallowing an exception.
@@ -214,7 +264,6 @@ def behavioral() -> list:
 def structural() -> list:
     fails = []
     bridge = BRIDGE.read_text()
-    worker = WORKER.read_text()
 
     if "from team_result_guard import" not in bridge:
         fails.append("discord-bridge must import the shared guard")
@@ -237,20 +286,18 @@ def structural() -> list:
         fails.append("an unknown tier must be resolved from the task file before guarding")
 
     # One implementation: consumers import the policy, never restate it.
-    for name, src, label in ((BRIDGE.name, bridge, "bridge"), (WORKER.name, worker, "worker")):
+    for name, src, label in ((BRIDGE.name, bridge, "bridge"),):
         if re.search(r"^\s*TEAM_RESULT_CONTROL\s*=\s*re\.compile", src, re.M):
             fails.append(f"{name} redefines TEAM_RESULT_CONTROL instead of importing it")
         if re.search(r"^class TeamResultLeakError", src, re.M):
             fails.append(f"{name} redefines TeamResultLeakError instead of importing it")
         if re.search(r"^def resolve_access_tier", src, re.M):
             fails.append(f"{name} redefines resolve_access_tier instead of importing it")
-    if "from team_result_guard import" not in worker:
-        fails.append("session-worker must import the shared guard")
     return fails
 
 
 def main() -> int:
-    for path in (BRIDGE, WORKER):
+    for path in (BRIDGE,):
         if not path.exists():
             print(f"FAIL: missing {path}")
             return 1

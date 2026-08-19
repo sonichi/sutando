@@ -308,14 +308,36 @@ keeper10=$!
 ( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
     >"$TMP/ws10_A.out" 2>&1 ) &
 A=$!
-sleep 2                      # let A acquire the lock and enter the gate
-kill -STOP "$A" 2>/dev/null  # stall A past the stale threshold
-sleep 4
-( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
-    >"$TMP/ws10_B.out" 2>&1 ) &
-B=$!
-sleep 3                      # B reaps the stale lock and takes it
-kill -CONT "$A" 2>/dev/null  # A resumes holding a lease it no longer owns
+# Barriers on $LOCKDIR/rid — the value own_lock() compares — not fixed sleeps.
+# Unverified sleeps made this case UNDECIDABLE: if A had not yet acquired, or B
+# had not yet reaped, the lease-loss scenario never occurred and the assertion
+# still printed "N restart decisions", identical to a real concurrent restart.
+LOCK10="$WS10/state/locks/graceful-restart.lock"
+B=""   # set -u: the setup-failure path still reaches `wait "$B"`
+rid_A=""
+for _ in $(seq 1 100); do
+  rid_A="$(cat "$LOCK10/rid" 2>/dev/null || echo '')"
+  [ -n "$rid_A" ] && break
+  sleep 0.1
+done
+if [ -z "$rid_A" ]; then
+  say FAIL "case 10 SETUP: A never acquired the lease — scenario not exercised (not a concurrency bug)"
+else
+  kill -STOP "$A" 2>/dev/null  # stall A past the stale threshold
+  sleep 4                      # real wait: must exceed GR_LOCK_STALE_S=2 so B reaps
+  ( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
+      >"$TMP/ws10_B.out" 2>&1 ) &
+  B=$!
+  rid_B=""
+  for _ in $(seq 1 100); do
+    rid_B="$(cat "$LOCK10/rid" 2>/dev/null || echo '')"
+    [ -n "$rid_B" ] && [ "$rid_B" != "$rid_A" ] && break
+    sleep 0.1
+  done
+  [ -n "$rid_B" ] && [ "$rid_B" != "$rid_A" ] \
+    || say FAIL "case 10 SETUP: B never took the lease from A — scenario not exercised (not a concurrency bug)"
+  kill -CONT "$A" 2>/dev/null  # A resumes holding a lease it no longer owns
+fi
 touch "$TMP/ws10_goidle"     # release both from the busy gate
 wait "$A" 2>/dev/null; wait "$B" 2>/dev/null
 kill "$keeper10" 2>/dev/null || true; wait "$keeper10" 2>/dev/null || true
@@ -388,6 +410,59 @@ GR_WS="$WS13c" GR_SYNC_CMD="true" GR_POLL_S=1 GR_RETAIN_LOCK_ON_DECISION=1 bash 
 [ -d "$WS13c/state/locks/graceful-restart.lock" ] \
   && say ok "GR_RETAIN_LOCK_ON_DECISION=1 still retains (models production exec)" \
   || say FAIL "retain mode did not retain — the concurrency test no longer models production"
+
+echo "14. an EMPTY core-status.json is the truncate WINDOW, not idle — re-read, do not kill through it"
+# Every writer is a `>` truncate-then-write, so a poll can land between the two.
+# Modelled deterministically: empty now, "running" well inside the re-read budget.
+# Write well inside the 5x50ms re-read budget. A loaded runner can stretch
+# either side, so keep the margin visible and overridable rather than implicit.
+GR_T14_WRITE_DELAY="${GR_T14_WRITE_DELAY:-0.10}"
+WS14="$TMP/ws14"; mkws "$WS14"
+: > "$WS14/state/core-status.json"          # the window: readable, empty
+( for _ in $(seq 1 40); do touch "$WS14/state/cores/$HOST.alive"; sleep 0.5; done ) &
+keeper14=$!
+( sleep "$GR_T14_WRITE_DELAY"
+  printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS14/state/core-status.json" ) &
+writer14=$!
+( GR_WS="$WS14" GR_SYNC_CMD="true" GR_POLL_S=1 GR_STATUS_REREADS=5 bash "$GR" --dry-run \
+    > "$TMP/ws14.out" 2>&1 ) &
+gr14=$!
+wait "$writer14" 2>/dev/null
+sleep 3
+if kill -0 "$gr14" 2>/dev/null; then
+  say ok "the gate re-read the window and stayed in the busy wait"
+else
+  say FAIL "the gate decided through the truncate window: $(grep -h 'would exec' "$TMP/ws14.out" | head -1)"
+fi
+printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS14/state/core-status.json"
+# Bounded, not `wait`: a gate that never returns must fail AS case 14, not as an
+# anonymous job timeout — the attribution defect case 10 exists to prevent.
+gr14_done=0
+for _ in $(seq 1 60); do
+  kill -0 "$gr14" 2>/dev/null || { gr14_done=1; break; }
+  sleep 0.5
+done
+if [ "$gr14_done" = 0 ]; then
+  kill -9 "$gr14" 2>/dev/null || true
+  say FAIL "case 14: the gate never returned within 30s of a readable idle status — hung, not merely slow"
+fi
+wait "$gr14" 2>/dev/null
+kill "$keeper14" 2>/dev/null || true; wait "$keeper14" 2>/dev/null || true
+grep -q "would exec" "$TMP/ws14.out" \
+  && say ok "and it proceeded once the core reported idle" \
+  || say FAIL "the gate never proceeded on a readable idle status — over-corrected into a hang"
+
+echo "15. an ABSENT core-status.json still reads as not-busy (no regression)"
+WS15="$TMP/ws15"; mkws "$WS15"
+rm -f "$WS15/state/core-status.json"
+touch "$WS15/state/cores/$HOST.alive"
+( for _ in $(seq 1 20); do touch "$WS15/state/cores/$HOST.alive"; sleep 0.5; done ) &
+k15=$!
+GR_WS="$WS15" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run > "$TMP/ws15.out" 2>&1 || true
+kill "$k15" 2>/dev/null || true; wait "$k15" 2>/dev/null || true
+grep -q "would exec" "$TMP/ws15.out" \
+  && say ok "absent status = nothing running = proceed" \
+  || say FAIL "absent status now blocks the restart — the empty-read fix over-reached"
 
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
