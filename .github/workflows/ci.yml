@@ -113,8 +113,8 @@ jobs:
       # detect-secrets, and only as a TEST/dev dep — the runtime soft-imports it
       # (vault degrades gracefully when it's absent). Installed inline here rather
       # than via a requirements.txt: it's a single dev-only package, so the file
-      # was pure indirection. Must run BEFORE `npm test`: the `test` script chains
-      # `npm run test:py`, so Python tests execute inside the "Run tests" step.
+      # was pure indirection. Still required after the test:ts split: the out-of-tree
+      # Python steps above need these deps, even though this job no longer runs test:py.
       - name: Install Python test deps
         run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
@@ -205,14 +205,16 @@ jobs:
             # `output=$(bash "$f")` would abort the whole step on the first failing
             # suite — losing this step's diagnostics and masking every later suite.
             #
-            # `timeout -k 5 120` bounds each suite: a hanging suite (e.g. a bounded-
+            # `timeout -k 5 300` bounds each suite: a hanging suite (e.g. a bounded-
             # runner test whose --max backstop misfires under CI) would otherwise
             # burn the whole job's timeout-minutes budget and get the job *canceled*
             # mid-suite — masking every later suite AND this step's own diagnostics,
             # the very failure this loop was written to avoid. On overrun timeout
             # SIGTERMs (then SIGKILLs after 5s) and returns 124, so the suite fails
             # loudly and in isolation instead of hanging CI.
-            if ! output=$(timeout -k 5 120 bash "$f" 2>&1); then
+            # 300s, not 120s: graceful-restart.test.sh measures 73s on an idle dev
+            # box, leaving under 2x headroom on a slower, contended CI runner.
+            if ! output=$(timeout -k 5 300 bash "$f" 2>&1); then
               echo "✖ shell test failed: $f"
               echo "$output"
               # Only gate CI if this suite is not in the known-failures allowlist.
