@@ -26,15 +26,22 @@ class RunnerGlobTest(unittest.TestCase):
         return pkg.get("scripts", {})
 
     def test_ts_glob_is_recursive(self) -> None:
-        test_script = self._scripts().get("test", "")
+        # Search EVERY test* script, not just "test". The glob lives wherever the
+        # TS runner is defined, and that moved to "test:ts" when CI stopped calling
+        # `npm test` (which chained the Python half and ran it twice). Keying on one
+        # script name made this guard fail on a refactor that preserved the property
+        # it exists to protect. Scanning the union is also strictly STRONGER: the
+        # flat-glob prohibition now covers test:ts and test:py too.
+        scripts = self._scripts()
+        joined = " ".join(v for k, v in scripts.items() if k.startswith("test"))
         self.assertIn(
             "tests/**/*.test.ts",
-            test_script,
+            joined,
             "TS test glob must be recursive (tests/**/*.test.ts) so nested tests run",
         )
         self.assertNotIn(
             "tests/*.test.ts",
-            test_script,
+            joined,
             "non-recursive tests/*.test.ts would skip every relocated test",
         )
 
