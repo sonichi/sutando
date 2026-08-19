@@ -30,6 +30,12 @@ export type ScrollOutcome =
  * Decide what a scroll attempt reports. Extracted so the decision is reachable
  * by a test — in-place it could be disabled without any assertion failing.
  */
+/** Fallback step when macOS refuses a keystroke without text setupHint can parse.
+ *  Deliberately hedged: the throw proves refusal, not which grant is missing. */
+const UNEXPLAINED_DENIAL_STEP =
+	'macOS refused the keystroke without saying why. Check System Settings > Privacy & Security '
+	+ '> Accessibility for AG2 Space, turn it on if it is off, then quit and reopen AG2 Space.';
+
 export function scrollOutcome(o: {
 	scrollMoved: boolean | null; keyDenied: boolean; hints: string[]; direction: string;
 }): ScrollOutcome {
@@ -41,8 +47,11 @@ export function scrollOutcome(o: {
 	}
 	// keyDenied is load-bearing: `osascript key code` exits 0 whether or not
 	// anything handled the key, so only a THROW proves the fallback never ran.
-	if (o.scrollMoved === null && o.keyDenied && o.hints.length > 0) {
-		return { status: 'setup_required', moved: false, steps: o.hints,
+	if (o.scrollMoved === null && o.keyDenied) {
+		// An unparseable denial is still a denial: the JS gave no answer and the
+		// keystroke threw, so reporting `scrolled` would assert a move nothing saw.
+		return { status: 'setup_required', moved: false,
+		         steps: o.hints.length > 0 ? o.hints : [UNEXPLAINED_DENIAL_STEP],
 		         message: 'The scroll did not go through — a one-time setup step is needed. Tell the user that, then read the "steps" to them verbatim, in order. Do not add steps of your own.' };
 	}
 	return { status: 'scrolled', moved: o.scrollMoved };
