@@ -67,6 +67,19 @@ members are trusted with that environment. Future AG2 Space monitoring can add
 telemetry, injection/anomaly detection, alerts, and revocation as defense in
 depth; those are not current guarantees.
 
+When that final scan withholds a result, the gateway saves a mode-0600 review
+record under `state/withheld-team-results/` and sends the candidate body to the
+agent's registered owner in a Matrix direct room. Nothing is posted to the
+originating shared room. The private message is bound to a stable review id and
+offers two decisions: **Yes** confirms that the result is sensitive and keeps it
+private; **No** records a false positive and republishes the exact result to the
+originating room. A bare Yes/No is accepted only as a reply to that review
+message; the explicit `Yes wr_…` / `No wr_…` form is also accepted in the same
+owner DM. Sender tier, owner MXID, DM room, and review id/reply event must all
+match. Review DMs, publication retries, and decision-result acknowledgements
+are durable and idempotent, so a retry neither spams the owner nor publishes the
+result twice.
+
 ## Ambient (events-promotion) access control
 
 Tasks with `access_tier: ambient` are **taskify promotions** — the events
@@ -92,4 +105,3 @@ promotion_reason + cursor range).
   — or tasks without an access_tier field — get full processing") already
   fails it closed; this section makes the mapping explicit rather than
   implicit (sonichi#2292 P1-1 follow-through).
-
