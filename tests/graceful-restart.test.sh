@@ -411,6 +411,45 @@ GR_WS="$WS13c" GR_SYNC_CMD="true" GR_POLL_S=1 GR_RETAIN_LOCK_ON_DECISION=1 bash 
   && say ok "GR_RETAIN_LOCK_ON_DECISION=1 still retains (models production exec)" \
   || say FAIL "retain mode did not retain — the concurrency test no longer models production"
 
+echo "14. an EMPTY core-status.json is the truncate WINDOW, not idle — re-read, do not kill through it"
+# Every writer is a `>` truncate-then-write, so a poll can land between the two.
+# Modelled deterministically: empty now, "running" well inside the re-read budget.
+WS14="$TMP/ws14"; mkws "$WS14"
+: > "$WS14/state/core-status.json"          # the window: readable, empty
+( for _ in $(seq 1 40); do touch "$WS14/state/cores/$HOST.alive"; sleep 0.5; done ) &
+keeper14=$!
+( sleep 0.15
+  printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS14/state/core-status.json" ) &
+writer14=$!
+( GR_WS="$WS14" GR_SYNC_CMD="true" GR_POLL_S=1 GR_STATUS_REREADS=5 bash "$GR" --dry-run \
+    > "$TMP/ws14.out" 2>&1 ) &
+gr14=$!
+wait "$writer14" 2>/dev/null
+sleep 3
+if kill -0 "$gr14" 2>/dev/null; then
+  say ok "the gate re-read the window and stayed in the busy wait"
+else
+  say FAIL "the gate decided through the truncate window: $(grep -h 'would exec' "$TMP/ws14.out" | head -1)"
+fi
+printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS14/state/core-status.json"
+wait "$gr14" 2>/dev/null
+kill "$keeper14" 2>/dev/null || true; wait "$keeper14" 2>/dev/null || true
+grep -q "would exec" "$TMP/ws14.out" \
+  && say ok "and it proceeded once the core reported idle" \
+  || say FAIL "the gate never proceeded on a readable idle status — over-corrected into a hang"
+
+echo "15. an ABSENT core-status.json still reads as not-busy (no regression)"
+WS15="$TMP/ws15"; mkws "$WS15"
+rm -f "$WS15/state/core-status.json"
+touch "$WS15/state/cores/$HOST.alive"
+( for _ in $(seq 1 20); do touch "$WS15/state/cores/$HOST.alive"; sleep 0.5; done ) &
+k15=$!
+GR_WS="$WS15" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run > "$TMP/ws15.out" 2>&1 || true
+kill "$k15" 2>/dev/null || true; wait "$k15" 2>/dev/null || true
+grep -q "would exec" "$TMP/ws15.out" \
+  && say ok "absent status = nothing running = proceed" \
+  || say FAIL "absent status now blocks the restart — the empty-read fix over-reached"
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else
