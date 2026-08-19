@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.delivery_core import backend_a
+from ag2_sparrow.delivery_core.contract import DeliveryAttempt
 from ag2_sparrow.delivery_core.contract import DeliveryOutcome as CO
 from ag2_sparrow.delivery_core.core import DeliveryCore
 from outbox import DeliveryOutcome as TO, RetrySafety
@@ -106,6 +107,21 @@ def main() -> int:
         res = core2.deliver_one("item-2", payload("999", "will be unknown"))
         check("core drain: UNKNOWN with caps off stays UNKNOWN (no blind resend)",
               res.outcome is CO.OUTCOME_UNKNOWN and len(client2.calls) == 1)
+
+    # 4. reconcile takes the contract's DeliveryAttempt. Called directly, because
+    # isinstance(p, DeliveryProvider) is True for a stale (item_id, key) signature.
+    p = ddp.DiscordDeliveryProvider(StubClient(TO.CONFIRMED))
+    attempt = DeliveryAttempt("i1", payload(), "i1#0")
+    check("reconcile accepts a DeliveryAttempt positionally",
+          p.reconcile(attempt) is None)
+    check("and by keyword, so the parameter is named `attempt`",
+          p.reconcile(attempt=attempt) is None)
+    try:
+        p.reconcile("i1", "i1#0")
+        check("the OLD (item_id, key) call is rejected", False,
+              "stale two-arg call still succeeded")
+    except TypeError:
+        check("the OLD (item_id, key) call is rejected", True)
 
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)

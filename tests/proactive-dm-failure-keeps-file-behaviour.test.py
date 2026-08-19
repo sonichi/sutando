@@ -126,7 +126,7 @@ def _run_one_pass(results: Path, send):
             return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
                                    provider_ref="m1")
 
-        def reconcile(self, item_id, key):
+        def reconcile(self, attempt):
             return None
 
     db._PROACTIVE_PROVIDER = _Provider()

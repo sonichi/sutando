@@ -157,7 +157,7 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
 
     def _root_tidy(self, hc):
         """Drives the SHIPPED probe: a local iterdir() copy would re-encode the
-        property under test and would drop WORKSPACE_ROOT_SENTINEL_GLOB."""
+        property under test and would drop WORKSPACE_ROOT_SENTINEL_GLOBS."""
         orig = hc.WORKSPACE_DIR
         hc.WORKSPACE_DIR = self.ws
         try:
@@ -185,7 +185,7 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
         self.assertIn(".last-pq-notify", result["detail"])
 
     def test_a_migration_sentinel_at_the_root_is_not_flagged(self):
-        """WORKSPACE_ROOT_SENTINEL_GLOB exempts `.*-migrated*`, so a sentinel that
+        """WORKSPACE_ROOT_SENTINEL_GLOBS exempts `.*-migrated*`, so a sentinel that
         production accepts must not be flagged."""
         hc = self._load_hc()
         cpq.write_notify_stamp([], now=1700000000)

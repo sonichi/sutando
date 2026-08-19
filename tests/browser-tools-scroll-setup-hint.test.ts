@@ -79,6 +79,28 @@ describe('scroll reporting', () => {
 		assert.doesNotMatch(JSON.stringify(r), /did not go through/);
 	});
 
+	it('a denial whose text setupHint cannot parse is STILL a denial, not a scroll', () => {
+		// The adjacent input to the case above: both paths failed, but the OS error
+		// carried no parseable sentence, so `hints` is empty. Reporting `scrolled`
+		// there asserts a move nothing observed.
+		const r = scrollOutcome({ scrollMoved: null, keyDenied: true, hints: [], direction: 'down' });
+		assert.equal(r.status, 'setup_required');
+		assert.equal(r.moved, false);
+		const steps = (r as { steps: string[] }).steps;
+		assert.equal(steps.length, 1, 'a hedged step still has to be actionable');
+		assert.match(steps[0], /Privacy & Security/);
+		assert.match(steps[0], /without saying why/, 'the copy must not claim to know which grant is missing');
+	});
+
+	it('the deliberate case stays untouched: keystroke SUCCEEDED is still not setup_required', () => {
+		// Guards the regression this change could plausibly cause. Chrome ships
+		// "Allow JavaScript from Apple Events" off, so null/false is the normal machine.
+		for (const hints of [[], ['some step']]) {
+			const r = scrollOutcome({ scrollMoved: null, keyDenied: false, hints, direction: 'down' });
+			assert.equal(r.status, 'scrolled', `keyDenied:false must never be setup_required (hints=${hints.length})`);
+		}
+	});
+
 	it('JS says at-limit and the keystroke was DENIED -> at_limit, not setup_required', () => {
 		// JS is authoritative: it ran and reported the page did not move. A keystroke
 		// denial says nothing about the page, so it must not override that answer.
