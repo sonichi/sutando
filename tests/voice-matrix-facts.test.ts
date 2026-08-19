@@ -163,19 +163,27 @@ function baseline(s: AudioHealthSnapshot, over: Partial<MatrixBaseline> = {}): M
 	check('epoch boundary: factsAvailable false', r.facts.factsAvailable, false);
 }
 
-// ── 7. Reconnect window / detached client also fail closed.
+// ── 7. Reconnect window / detached client: facts stay DATA-level.
+// `factsAvailable` reports "a same-epoch baseline exists", not "the session is
+// usable" — main's verdict-independence invariant (a structural early return
+// carries the same data-level facts) requires that. The structural gate is not
+// dropped, it is enforced once, at the consumer: the watchdog's tick branch
+// requires `ev.state === 'ACTIVE' && s.clientAttached` before it may fire.
+// Folding those into `factsAvailable` would be a second copy of the same gate.
 {
 	const s = snapshot({});
 	const r1 = evaluateMatrix({
 		sessionState: 'RECONNECTING', clientConnected: true, snapshot: s,
 		prev: baseline(s), lastModelEventAt: NOW - 40_000, now: NOW,
 	});
-	check('reconnect window: factsAvailable false', r1.facts.factsAvailable, false);
+	check('reconnect window: verdict is structural', r1.verdict, 'reconnect-window');
+	check('reconnect window: facts stay data-level', r1.facts.factsAvailable, true);
 	const r2 = evaluateMatrix({
 		sessionState: 'ACTIVE', clientConnected: false, snapshot: s,
 		prev: baseline(s), lastModelEventAt: NOW - 40_000, now: NOW,
 	});
-	check('no client: factsAvailable false', r2.facts.factsAvailable, false);
+	check('no client: verdict is healthy-idle', r2.verdict, 'healthy-idle');
+	check('no client: facts stay data-level', r2.facts.factsAvailable, true);
 }
 
 console.log(failed ? `FAILED: ${failed} check(s)` : 'voice matrix facts: all checks passed');

@@ -2136,6 +2136,17 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             note += (f"; +{grew:,} B over the last {hours:.1f}h"
                      + (f", which is ~{left / rate:.1f}h of remaining headroom at that rate"
                         if rate > 0 and left > 0 else ""))
+            # The max window is the worst case, so `gain <= 0` skips every flat one
+            # and a quoted deadline outlives its regime. Report the recent window too.
+            recent = next(((at, sz) for at, sz in reversed(points)
+                           if (newest_at - at) / 3600.0 >= 0.5), None)
+            if recent is not None:
+                r_span = (newest_at - recent[0]) / 3600.0
+                r_gain = effective_bytes - recent[1]
+                if r_gain <= 0:
+                    note += (f"; but the last {r_span:.1f}h show {r_gain:+,} B — flat or "
+                             f"shrinking, so the figure above spans a change in write rate "
+                             f"and its deadline is stale; re-measure before acting on it")
         return note
     except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
         return _TREND_UNAVAILABLE
@@ -4172,8 +4183,8 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
             continue                      # another machine's heartbeat
         try:
             mtime = alive_file.stat().st_mtime
-            if now - mtime >= 90.0:
-                continue                  # stale — not a live core
+            if not heartbeat_is_fresh(mtime, now):
+                continue                  # stale or future-dated — not a live core
             payload = json.loads(alive_file.read_text())
             if not isinstance(payload, dict):
                 continue
@@ -6444,9 +6455,11 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
                           f"claim AGE is unavailable for {age_unknown} of them (no "
                           "trusted observation store), so stale cannot be told from "
                           "fresh for those"}
+    # Reaching here with a bounded claim means it is inside its handler bound, so
+    # it is running; counting only in_flight renders working claims as "0 running".
     return {"name": name, "status": "ok",
-            "detail": f"{held} held claim(s), {in_flight} still queued or running; "
-                      "none leaked and none past its own execution contract"}
+            "detail": f"{held} held claim(s), {in_flight + len(bounded)} still queued "
+                      "or running; none leaked and none past its own execution contract"}
 
 
 def fix_task_watcher_sentinel(check: dict) -> str:
@@ -6528,7 +6541,7 @@ def _fresh_local_core_record(
         workspace = WORKSPACE_DIR
     alive_file = workspace / "state" / "cores" / f"{_host_label()}.alive"
     try:
-        if time.time() - alive_file.stat().st_mtime >= max_age_s:
+        if not heartbeat_is_fresh(alive_file.stat().st_mtime, time.time(), max_age_s):
             return None
         record = json.loads(alive_file.read_text())
     except (OSError, ValueError):
@@ -8577,7 +8590,7 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
     now = time.time()
     for alive_file in cores_dir.glob("*.alive"):
         try:
-            if now - alive_file.stat().st_mtime < max_age_s:
+            if heartbeat_is_fresh(alive_file.stat().st_mtime, now, max_age_s):
                 return True
         except OSError:
             pass
@@ -9214,8 +9227,8 @@ def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: 
     youngest_start = None
     for alive_file in cores_dir.glob("*.alive"):
         try:
-            if now - alive_file.stat().st_mtime >= 90.0:
-                continue  # stale heartbeat — not a live core
+            if not heartbeat_is_fresh(alive_file.stat().st_mtime, now):
+                continue  # stale or future-dated — not a live core
             data = json.loads(alive_file.read_text())
         except (OSError, ValueError):
             continue
@@ -9486,6 +9499,27 @@ def recover_core_if_wedged(
 CRON_STALE_SEC = int(os.environ.get("SUTANDO_CRON_STALE_SEC", "1800"))
 
 
+CORE_HEARTBEAT_MAX_AGE_S = 90.0
+# Callers snapshot `now` BEFORE they stat, so an atomic heartbeat rewrite in
+# between yields a slightly newer mtime; cross-host sync adds small clock skew.
+CORE_HEARTBEAT_FUTURE_TOLERANCE_S = 5.0
+
+
+def heartbeat_is_fresh(mtime: float, now: float,
+                       max_age_s: float = CORE_HEARTBEAT_MAX_AGE_S) -> bool:
+    """A `state/cores/*.alive` heartbeat is fresh only inside
+    [-CORE_HEARTBEAT_FUTURE_TOLERANCE_S, max_age_s).
+
+    Bounded from BELOW as well: a far-future file has a negative age, and every
+    one-sided `age >= max` test accepts that as fresh — so a clock step or a bad
+    write reads as a live core forever. The bound is a tolerance, not zero: a
+    strictly non-negative test discards a live heartbeat that was atomically
+    rewritten between a caller's `now` snapshot and its stat (sub-ms in practice).
+    """
+    age = now - mtime
+    return -CORE_HEARTBEAT_FUTURE_TOLERANCE_S <= age < max_age_s
+
+
 def _live_core_socket(workspace: Optional[Path] = None) -> str:
     """Tmux socket of the freshest LIVE core heartbeat — the runtime-authored
     `socket` field of `state/cores/<host>.alive` (the same source
@@ -9504,8 +9538,8 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
     for alive_file in cores_dir.glob("*.alive"):
         try:
             mtime = alive_file.stat().st_mtime
-            if now - mtime >= 90.0:
-                continue  # stale heartbeat — not a live core
+            if not heartbeat_is_fresh(mtime, now):
+                continue  # stale or future-dated — not a live core
             payload = json.loads(alive_file.read_text())
             # A heartbeat that decodes to a NON-OBJECT (`null`, `[]`, `"x"`, `3`)
             # raises AttributeError on `.get`, which this handler does not catch —
