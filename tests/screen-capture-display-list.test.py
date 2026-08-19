@@ -12,6 +12,7 @@ aspect ratio is what makes the name land on the right display.
 Run: python3 tests/screen-capture-display-list.py
 """
 import importlib.util
+import json
 import os
 import struct
 import sys
@@ -100,6 +101,213 @@ check("zero-size display is left unnamed", zero.get("name"), None)
 
 # --- profiler parsing is failure-tolerant ------------------------------------
 check("_profiler_display_names returns a list", isinstance(scs._profiler_display_names(), list), True)
+
+
+class _Run:
+    """Stand-in for subprocess.CompletedProcess."""
+
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def _with_run(fake):
+    """Swap the module's subprocess.run for the duration of a block."""
+    real = scs.subprocess.run
+    scs.subprocess.run = fake
+    return real
+
+
+# --- _profiler_display_names parses the profiler's own shape -----------------
+PROFILER_JSON = json.dumps({
+    "SPDisplaysDataType": [{
+        "spdisplays_ndrvs": [
+            {"_name": "Color LCD", "_spdisplays_resolution": "1512 x 982",
+             "spdisplays_main": "spdisplays_yes"},
+            {"_name": "U28E510", "spdisplays_pixelresolution": "1920x1080"},
+        ],
+    }],
+})
+
+_real = _with_run(lambda *a, **k: _Run(0, PROFILER_JSON))
+try:
+    got = scs._profiler_display_names()
+finally:
+    scs.subprocess.run = _real
+check("profiler yields one entry per monitor", len(got), 2)
+check("point resolution parses to an aspect", round(got[0]["aspect"], 4), round(1512 / 982, 4))
+check("main display flagged from spdisplays_main", got[0]["is_main"], True)
+check("second monitor is not main", got[1]["is_main"], False)
+check("pixelresolution key is honored too", round(got[1]["aspect"], 4), round(1920 / 1080, 4))
+
+# A monitor with no parseable resolution must not divide by zero.
+_real = _with_run(lambda *a, **k: _Run(0, json.dumps(
+    {"SPDisplaysDataType": [{"spdisplays_ndrvs": [{"_name": "Odd", "_spdisplays_resolution": "n/a"}]}]})))
+try:
+    odd_names = scs._profiler_display_names()
+finally:
+    scs.subprocess.run = _real
+check("unparseable resolution yields aspect 0.0, not a raise", odd_names[0]["aspect"], 0.0)
+check("unparseable entry still carries its name", odd_names[0]["name"], "Odd")
+
+# Non-zero exit and a hard raise both degrade to [] — names are decoration.
+_real = _with_run(lambda *a, **k: _Run(1, ""))
+try:
+    check("profiler non-zero exit yields []", scs._profiler_display_names(), [])
+finally:
+    scs.subprocess.run = _real
+
+
+def _boom(*a, **k):
+    raise OSError("system_profiler missing")
+
+
+_real = _with_run(_boom)
+try:
+    check("profiler raise yields [] rather than propagating", scs._profiler_display_names(), [])
+finally:
+    scs.subprocess.run = _real
+
+# --- list_displays probes screencapture and stops at the first gap -----------
+with tempfile.TemporaryDirectory() as probe_dir:
+    real_dir = scs.DIR
+    scs.DIR = probe_dir
+
+    SIZES = {1: (3024, 1964), 2: (3840, 2160)}   # two attached displays, then a gap
+
+    def fake_capture(argv, **kwargs):
+        if argv[0] == "system_profiler":
+            return _Run(0, PROFILER_JSON)
+        idx = int([a for a in argv if a.startswith("-D")][0][2:])
+        if idx not in SIZES:
+            return _Run(1, "")                    # display 3 does not exist
+        _png(argv[-1], *SIZES[idx])
+        return _Run(0, "")
+
+    _real = _with_run(fake_capture)
+    try:
+        found = scs.list_displays()
+        leftover = os.listdir(probe_dir)
+    finally:
+        scs.subprocess.run = _real
+        scs.DIR = real_dir
+
+    check("probing stops at the first missing display", len(found), 2)
+    check("index is the screencapture -D argument", [d["index"] for d in found], [1, 2])
+    check("dimensions come from the probe's real PNG bytes",
+          [(d["width"], d["height"]) for d in found], [(3024, 1964), (3840, 2160)])
+    check("profiler name lands on the retina panel by aspect", found[0].get("name"), "Color LCD")
+    check("profiler name lands on the 4K external", found[1].get("name"), "U28E510")
+    check("probe files are cleaned up", leftover, [])
+
+# The first gap ENDS the list — a display beyond it must not be picked up.
+# Without this case, `break` and `continue` are indistinguishable: displays past
+# the gap all fail anyway, so the result is [1,2] either way.
+with tempfile.TemporaryDirectory() as probe_dir:
+    real_dir = scs.DIR
+    scs.DIR = probe_dir
+    ISLAND = {1: (3024, 1964), 2: (3840, 2160), 4: (1280, 720)}   # 3 missing, 4 present
+
+    def fake_island(argv, **kwargs):
+        if argv[0] == "system_profiler":
+            return _Run(0, PROFILER_JSON)
+        idx = int([a for a in argv if a.startswith("-D")][0][2:])
+        if idx not in ISLAND:
+            return _Run(1, "")
+        _png(argv[-1], *ISLAND[idx])
+        return _Run(0, "")
+
+    _real = _with_run(fake_island)
+    try:
+        island = scs.list_displays()
+    finally:
+        scs.subprocess.run = _real
+        scs.DIR = real_dir
+    check("enumeration stops at the gap and ignores display 4",
+          [d["index"] for d in island], [1, 2])
+
+# A probe that raises must still clean up and must not take the listing down.
+with tempfile.TemporaryDirectory() as probe_dir:
+    real_dir = scs.DIR
+    scs.DIR = probe_dir
+    _real = _with_run(_boom)
+    try:
+        raised = None
+        try:
+            scs.list_displays()
+        except Exception as e:   # noqa: BLE001 - asserting it DOES propagate or not
+            raised = type(e).__name__
+    finally:
+        scs.subprocess.run = _real
+        scs.DIR = real_dir
+    check("a raising probe surfaces as OSError to the handler's try", raised, "OSError")
+
+# --- /displays route ---------------------------------------------------------
+class _FakeHandler(scs.Handler):
+    """Exercises _handle_displays without binding a socket."""
+
+    def __init__(self, authorized=True):    # noqa: D107 - deliberately skips BaseHTTPRequestHandler.__init__
+        self.sent = None
+        self._authorized = authorized
+
+    def _require_capture_token(self):
+        return self._authorized
+
+    def _send_json(self, status, payload):
+        self.sent = (status, payload)
+
+
+h = _FakeHandler()
+_real = _with_run(lambda *a, **k: _Run(1, ""))    # no displays probe successfully
+try:
+    h._handle_displays()
+finally:
+    scs.subprocess.run = _real
+check("/displays answers 200 with a status envelope", h.sent[0], 200)
+check("/displays reports ok", h.sent[1]["status"], "ok")
+check("/displays returns a displays list", isinstance(h.sent[1]["displays"], list), True)
+
+h_err = _FakeHandler()
+_real = _with_run(_boom)
+try:
+    h_err._handle_displays()
+finally:
+    scs.subprocess.run = _real
+check("enumeration failure answers 500, not a dead server", h_err.sent[0], 500)
+check("500 body names the failure", h_err.sent[1]["status"], "error")
+
+h_unauth = _FakeHandler(authorized=False)
+h_unauth._handle_displays()
+check("an unauthorized caller gets no display listing", h_unauth.sent, None)
+
+
+# --- do_GET routes /displays to the listing, not to a capture ----------------
+class _RouteHandler(scs.Handler):
+    """Records which route do_GET dispatched to, without binding a socket."""
+
+    def __init__(self, path):    # noqa: D107 - deliberately skips the base __init__
+        self.path = path
+        self.routed = None
+
+    def _handle_capture(self):
+        self.routed = "capture"
+
+    def _handle_capture_video(self):
+        self.routed = "capture-video"
+
+    def _handle_displays(self):
+        self.routed = "displays"
+
+
+for path, want in [
+    ("/displays", "displays"),
+    ("/displays?token=x", "displays"),
+    ("/capture", "capture"),
+    ("/capture-video", "capture-video"),
+]:
+    r = _RouteHandler(path)
+    r.do_GET()
+    check(f"do_GET routes {path}", r.routed, want)
 
 if failures:
     print(f"screen-capture display list: {len(failures)} FAILURE(S)")
