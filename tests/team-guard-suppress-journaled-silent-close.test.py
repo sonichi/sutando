@@ -118,6 +118,21 @@ def main() -> int:
     check(got_h == guard.TEAM_SUPPRESS_RESULT,
           f"h) an UNSUCCESSFUL journal write -> notice stands, got {got_h[:40]!r}")
 
+    # i) THE STUB IS PRESERVED, not flattened. An earlier revision of this change
+    #    returned a hardcoded "[no-send]", which drops the dedup target that
+    #    discord-bridge needs to validate the holder's CHANNEL and re-queue a
+    #    cross-channel dedup. The body must be whatever suppression_stub_for_tier
+    #    says -- the module's existing policy -- never a fresh literal.
+    for src_body, want in (("[no-send]\nx", "[no-send]"),
+                           ("[REPLIED]\nx", "[REPLIED]"),
+                           ("[deduped: task-abc123]\nx", "[deduped: task-abc123]")):
+        st = pathlib.Path(tempfile.mkdtemp(prefix="tg-suppress-stub-"))
+        got_i, _ = guard.guard_result_for_tier(
+            src_body, "team", REPO, suppress_journal=(st, "task-stub"))
+        check(got_i == want, f"i) {src_body.splitlines()[0]} -> {want!r}, got {got_i!r}")
+        check(got_i == guard.suppression_stub_for_tier(src_body, "team"),
+              "i) and it equals suppression_stub_for_tier (one policy, not two)")
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED: " + "; ".join(FAILS))

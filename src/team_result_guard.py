@@ -286,13 +286,16 @@ def suppressed_record_path(state_dir: Path, task_id: str) -> Path:
 
 def materialize_suppressed_verdict(verdict: TeamResultVerdict, body: str,
                                    state_dir: Path, task_id: str, context=None,
-                                   agent_id: str = "", now=None) -> TeamResultVerdict:
-    """Realise a notice-bearing SUPPRESS as a journaled silent close.
+                                   agent_id: str = "", now=None,
+                                   stub: str = "[no-send]") -> TeamResultVerdict:
+    """Realise a notice-bearing SUPPRESS as a journaled close carrying `stub`.
 
     The record requirement is the policy, not the notice: once the suppression
     is durably journaled, posting prose about marker mechanics into a human
-    channel is noise. Fail-CLOSED -- if the journal cannot be written the
-    notice stands, so the record is never silently dropped.
+    channel is noise. `stub` must come from suppression_stub_for_tier -- it is
+    the canonical, sender-uninfluenced body, and it preserves a dedup target
+    that a flat "[no-send]" would drop. Fail-CLOSED -- if the journal cannot be
+    written the notice stands, so the record is never silently dropped.
     """
     if verdict.kind != VERDICT_SUPPRESS or verdict.body != TEAM_SUPPRESS_RESULT:
         return verdict                     # already silent, or not a suppress
@@ -321,7 +324,7 @@ def materialize_suppressed_verdict(verdict: TeamResultVerdict, body: str,
     if not saved:
         return verdict
     return TeamResultVerdict(
-        VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; journaled silent close")
+        VERDICT_SUPPRESS, stub, f"{verdict.reason}; journaled silent close")
 
 
 def classify_result_for_tier(body: str, tier, repo: Path,
@@ -364,6 +367,12 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data)
     if suppress_journal is not None:
-        state_dir, task_id = suppress_journal
-        verdict = materialize_suppressed_verdict(verdict, body, state_dir, task_id)
+        # The stub is the module's existing policy for what a guarded
+        # suppression may say; this only adds the record that lets a
+        # non-journaled transport use it. Do not re-derive the body here.
+        stub = suppression_stub_for_tier(body, tier)
+        if stub is not None:
+            state_dir, task_id = suppress_journal
+            verdict = materialize_suppressed_verdict(
+                verdict, body, state_dir, task_id, stub=stub)
     return verdict.body, verdict.reason
