@@ -1328,7 +1328,9 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: documented family, exactly as `_STATUS_FILES` does. @qingyun-wu and
 #: @john-the-dev caught it before merge — a permanent WARN on every upgraded
 #: install would have trained operators to ignore the detector.
-WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
+#: `.legacy-notice-printed` is a LITERAL because this family has no shared name
+#: shape: written once, read AT the root by init.sh, never unlinked, no destination.
+WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 
 #: `personal_path()` resolves these at the workspace root and never under `state/`,
 #: so the probe's "state belongs under state/" remedy would break the reader.
@@ -1394,7 +1396,8 @@ def check_workspace_root_tidy() -> "dict | None":
             if p.is_file()
             and p.name not in WORKSPACE_ROOT_ALLOWED
             and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
-            and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
+            and not any(fnmatch.fnmatch(p.name, g)
+                        for g in WORKSPACE_ROOT_SENTINEL_GLOBS)
         )
     except OSError:
         return None                      # unreadable workspace is another probe's job
@@ -6048,6 +6051,77 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     }
 
 
+def check_stranded_destined_proactive() -> dict:
+    """A destined proactive file no bridge will claim, named while it can still act.
+
+    The destination grammar (proactive_routing) has a two-tier rule: a known
+    `.to-<channel>` tag is claimed only by that bridge; an unrecognized tag is
+    claimed by NO bridge — deliberate (a file aimed at a channel this install
+    lacks must never fall into another bridge's race), but without a reader
+    the strand is silent, and unlike the pre-fix activity strand it cannot
+    self-heal: the tag never becomes recognized. Same principle as
+    check_proactive_quarantine — preservation without a reader reaches no one
+    — in the directory that probe deliberately does not scan.
+
+    Ages past _STRAND_MIN_AGE_S only: a destined file's target bridge may
+    legitimately be seconds from its next poll.
+    """
+    name = "stranded-destined-proactive"
+    results = WORKSPACE_DIR / "results"
+    if not results.is_dir():
+        return {"name": name, "status": "ok", "detail": "no results/ directory"}
+    try:
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from presenter_mode import presenter_mode_active
+        from proactive_routing import PROACTIVE_DESTINATIONS, proactive_destination
+    except ImportError as e:
+        return {"name": name, "status": "warn",
+                "detail": f"could not load proactive_routing: {e}"}
+    # Presenter mode intentionally holds ALL proactive deliveries — an aged
+    # destined file is the bridge waiting for the talk to end, not a strand.
+    if presenter_mode_active(WORKSPACE_DIR):
+        return {"name": name, "status": "ok",
+                "detail": "presenter mode active — deliveries intentionally held"}
+    now = time.time()
+    stranded: list[tuple[str, str, int]] = []
+    for path in results.glob("proactive-*.txt"):
+        dest = proactive_destination(path.name)
+        if dest is None:
+            continue  # undestined: activity routing owns it, self-heals
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age < _STRAND_MIN_AGE_S:
+            continue
+        kind = ("unrecognized destination" if dest not in PROACTIVE_DESTINATIONS
+                else f"destination '{dest}' bridge not claiming")
+        stranded.append((path.name, kind, int(age)))
+    if not stranded:
+        return {"name": name, "status": "ok",
+                "detail": "no aged destined proactive files awaiting a claim"}
+    # Unrecognized tags outrank age in the headline: that class never
+    # self-heals, so it must be the one a human sees first.
+    stranded.sort(key=lambda item: (not item[1].startswith("unrecognized"), -item[2]))
+    fname, kind, age = stranded[0]
+    unrec = sum(1 for item in stranded if item[1].startswith("unrecognized"))
+    mix = (f"{unrec} with an unrecognized tag, "
+           f"{len(stranded) - unrec} with an unclaimed known destination — "
+           if 0 < unrec < len(stranded) else "")
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(stranded)} destined proactive file(s) older than "
+                   f"{_STRAND_MIN_AGE_S // 60}m that no bridge has claimed — "
+                   f"{mix}worst {fname} ({kind}, {age // 3600}h{age % 3600 // 60}m); "
+                   f"an unrecognized .to-<tag> never self-heals: fix the tag or "
+                   f"start the named bridge"),
+    }
+
+
+_STRAND_MIN_AGE_S = 1800
+
+
 def check_proactive_quarantine() -> dict:
     """Report proactive bodies that were SAVED from deletion and then forgotten.
 
@@ -8736,6 +8810,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
     checks.append(check_proactive_quarantine())
+    checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
