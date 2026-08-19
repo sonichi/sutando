@@ -26,15 +26,18 @@ class RunnerGlobTest(unittest.TestCase):
         return pkg.get("scripts", {})
 
     def test_ts_glob_is_recursive(self) -> None:
-        test_script = self._scripts().get("test", "")
+        # Positive assertion keys on test:ts — the script CI invokes. Joining every
+        # test* script would let an unrelated script satisfy it while CI skips tests.
+        scripts = self._scripts()
+        joined = " ".join(v for k, v in scripts.items() if k.startswith("test"))
         self.assertIn(
             "tests/**/*.test.ts",
-            test_script,
-            "TS test glob must be recursive (tests/**/*.test.ts) so nested tests run",
+            scripts.get("test:ts", ""),
+            "test:ts glob must be recursive (tests/**/*.test.ts) so nested tests run",
         )
         self.assertNotIn(
             "tests/*.test.ts",
-            test_script,
+            joined,
             "non-recursive tests/*.test.ts would skip every relocated test",
         )
 
