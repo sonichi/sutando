@@ -200,9 +200,8 @@ with tempfile.TemporaryDirectory() as probe_dir:
     check("profiler name lands on the 4K external", found[1].get("name"), "U28E510")
     check("probe files are cleaned up", leftover, [])
 
-# The first gap ENDS the list — a display beyond it must not be picked up.
-# Without this case, `break` and `continue` are indistinguishable: displays past
-# the gap all fail anyway, so the result is [1,2] either way.
+# A display PRESENT beyond the gap is what makes this load-bearing: without it,
+# `break` and `continue` both yield [1,2] because everything past the gap fails.
 with tempfile.TemporaryDirectory() as probe_dir:
     real_dir = scs.DIR
     scs.DIR = probe_dir
