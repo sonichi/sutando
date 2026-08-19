@@ -317,6 +317,19 @@ class TestReviewFindings(unittest.TestCase):
         self.assertLess(len(body), self.m.BODY_MAX,
                         f"three maximal names must still fit, got {len(body)}: {body}")
 
+    def test_f6_blank_names_are_dropped_not_joined_as_bare_commas(self):
+        """An empty or whitespace-only title contributes no name, so the join
+        cannot emit `, ,` with nothing between the separators."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        self.m.notify_macos(5, ["", "   ", "real-slug, 2026-08-19 — the ask"])
+        body = _notification_body(sent[0])
+        self.assertNotRegex(body, r",\s*,", f"blank names must not render as bare commas: {body}")
+        self.assertNotRegex(body, r":\s*,", f"body must not open on a separator: {body}")
+        self.assertIn("real-slug", body, "the surviving name still identifies the queue")
+        # Dropping two names moves them into the remainder rather than losing them.
+        self.assertIn("(+4 more)", body, "dropped blanks must be counted, not vanish")
+
     def test_f5_no_room_for_names_drops_them_rather_than_slicing_backwards(self):
         """A budget too small for the prefix must yield no names, not a negative
         slice: `joined[:room - 1]` at room==0 is `[:-1]`, which silently eats a char."""

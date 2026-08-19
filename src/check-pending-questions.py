@@ -260,9 +260,9 @@ BODY_MAX = 160
 
 def notify_macos(count, titles):
     """Returns True only if osascript actually accepted the notification."""
-    # macOS truncates the body, so send a bounded NAME per title. The cap is the
-    # bound: a title need not contain a comma, and some hosts produce none.
-    names = [t.split(",", 1)[0].strip()[:40] for t in titles[:3]]
+    # macOS truncates the body: the [:40] cap is the bound, since a title need
+    # not contain a comma; blanks are dropped so the join cannot emit a bare `, ,`.
+    names = [n for n in (t.split(",", 1)[0].strip()[:40] for t in titles[:3]) if n]
     extra = f" (+{count - len(names)} more)" if count > len(names) else ""
     head = f"{count} pending question{'s' if count > 1 else ''}: "
     # Cap the ASSEMBLED body, not just each name: the count and the overflow both
