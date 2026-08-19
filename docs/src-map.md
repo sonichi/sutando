@@ -114,6 +114,7 @@ One entry per agent-facing module.
 - **`remote-relay-bridge.py`** — remote-relay-bridge.py — DEPRECATED name; renamed to remote-gateway-bridge.py.
 - **`render_plist_template.py`** — Render a launchd plist: literal __TOKEN__ substitution, XML escaping, parse check.
 - **`reply_chain.py`** — Reply-context formatting (pure) — companion to ``discord-bridge.py``.
+- **`repo_root.sh`** — Resolve the DURABLE repo that supplies the running `src/` code.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
