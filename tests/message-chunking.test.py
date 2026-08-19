@@ -206,6 +206,36 @@ intact = ["```python" in c and c.rstrip().endswith("```") and c.count("```") == 
 check("fence: whole block lands intact in one chunk",
       len(intact) == 1 and intact[0], str([c[:40] for c in fchunks]))
 
+# Length invariant, asserted across EVERY fixture above. Invariant 1 in this
+# file's own docstring was the only one never checked, so a paragraph cut that
+# retained a tail and then appended a line shipped a 2250-char chunk at
+# max_len=1900 — past Discord's 2000 ceiling — through a fully green run.
+for _label, _chunks, _cap in [
+    ("inline", out_inline, 1900),
+    ("big_fenced", chunks, 120),
+    ("slack", slack_chunks, 4000),
+    ("longline", ll_chunks, 4000),
+    ("tilde", tilde_chunks, 100),
+    ("midfence", mf, 40),
+    ("nested", nc, 4000),
+    ("paragraph", pchunks, 1900),
+    ("fence_whole", fchunks, 1900),
+]:
+    _over = [len(c) for c in _chunks if len(c) > _cap]
+    check("len<=max_len: %s" % _label, not _over, "over-limit: %s (cap %d)" % (_over, _cap))
+
+# Regression: a paragraph cut inside the lookback window followed by a long
+# line. The cut retains a tail, so the appended line must not push the buffer
+# past max_len. Checked at two caps — the bug scaled with max_len//4.
+for _cap in (1900, 4000):
+    _a = "\n".join("A" * 99 for _ in range(14))
+    _b = "\n".join("B" * 99 for _ in range(4))
+    _tail_line = "L" * (_cap - 50)
+    _cut_chunks = list(chunk_message(_a + "\n\n" + _b + "\n" + _tail_line, _cap))
+    _over = [len(c) for c in _cut_chunks if len(c) > _cap]
+    check("para-cut then long line stays within cap %d" % _cap, not _over,
+          "over-limit: %s" % _over)
+
 # fits_one_message: the compose-time half of the cap.
 check("fits: short body is one message", mc.fits_one_message("hello"))
 check("fits: 3k body is not", not mc.fits_one_message("z\n" * 1500))

@@ -170,11 +170,18 @@ def chunk_message(text: str, max_len: int = 1900):
                     if buf[j] == "":
                         cut = j
                         break
+            tail_len = 0
+            if cut is not None:
+                tail_len = sum(len(t) + 1 for t in buf[cut + 1:])
+                # A cut must leave room for this line, or it trades a clean
+                # boundary for a chunk over max_len.
+                if tail_len + line_overhead + reserve > max_len:
+                    cut = None
             if cut is not None:
                 head, tail = buf[:cut], buf[cut + 1:]
                 yield "\n".join(head)
                 buf = tail
-                buf_len = sum(len(t) + 1 for t in buf)
+                buf_len = tail_len
             else:
                 chunk = flush()
                 if chunk is not None:
