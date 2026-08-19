@@ -308,14 +308,36 @@ keeper10=$!
 ( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
     >"$TMP/ws10_A.out" 2>&1 ) &
 A=$!
-sleep 2                      # let A acquire the lock and enter the gate
-kill -STOP "$A" 2>/dev/null  # stall A past the stale threshold
-sleep 4
-( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
-    >"$TMP/ws10_B.out" 2>&1 ) &
-B=$!
-sleep 3                      # B reaps the stale lock and takes it
-kill -CONT "$A" 2>/dev/null  # A resumes holding a lease it no longer owns
+# Barriers on $LOCKDIR/rid — the value own_lock() compares — not fixed sleeps.
+# Unverified sleeps made this case UNDECIDABLE: if A had not yet acquired, or B
+# had not yet reaped, the lease-loss scenario never occurred and the assertion
+# still printed "N restart decisions", identical to a real concurrent restart.
+LOCK10="$WS10/state/locks/graceful-restart.lock"
+B=""   # set -u: the setup-failure path still reaches `wait "$B"`
+rid_A=""
+for _ in $(seq 1 100); do
+  rid_A="$(cat "$LOCK10/rid" 2>/dev/null || echo '')"
+  [ -n "$rid_A" ] && break
+  sleep 0.1
+done
+if [ -z "$rid_A" ]; then
+  say FAIL "case 10 SETUP: A never acquired the lease — scenario not exercised (not a concurrency bug)"
+else
+  kill -STOP "$A" 2>/dev/null  # stall A past the stale threshold
+  sleep 4                      # real wait: must exceed GR_LOCK_STALE_S=2 so B reaps
+  ( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
+      >"$TMP/ws10_B.out" 2>&1 ) &
+  B=$!
+  rid_B=""
+  for _ in $(seq 1 100); do
+    rid_B="$(cat "$LOCK10/rid" 2>/dev/null || echo '')"
+    [ -n "$rid_B" ] && [ "$rid_B" != "$rid_A" ] && break
+    sleep 0.1
+  done
+  [ -n "$rid_B" ] && [ "$rid_B" != "$rid_A" ] \
+    || say FAIL "case 10 SETUP: B never took the lease from A — scenario not exercised (not a concurrency bug)"
+  kill -CONT "$A" 2>/dev/null  # A resumes holding a lease it no longer owns
+fi
 touch "$TMP/ws10_goidle"     # release both from the busy gate
 wait "$A" 2>/dev/null; wait "$B" 2>/dev/null
 kill "$keeper10" 2>/dev/null || true; wait "$keeper10" 2>/dev/null || true
