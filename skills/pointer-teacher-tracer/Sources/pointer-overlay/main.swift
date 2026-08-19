@@ -107,6 +107,11 @@ final class Overlay: NSObject {
         if !FileManager.default.fileExists(atPath: CMD) {
             FileManager.default.createFile(atPath: CMD, contents: Data("{}".utf8))
         }
+        // Prime lastTS so a stale command from a previous run doesn't fire on launch
+        // (same policy as setupPointerOverlay in src/Sutando/main.swift).
+        if let d = try? Data(contentsOf: URL(fileURLWithPath: CMD)),
+           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+           let t = o["ts"] as? Double { lastTS = t }
         NSLog("pointer-overlay up on \(Int(f.width))x\(Int(f.height)) — watching \(CMD)")
     }
 
@@ -116,6 +121,7 @@ final class Overlay: NSObject {
               let ts = o["ts"] as? Double, ts > lastTS,
               let nx = o["nx"] as? Double, let ny = o["ny"] as? Double else { return }
         lastTS = ts
+        NSLog("pointer-overlay accepted ts=\(ts) nx=\(nx) ny=\(ny)")
         let f = NSScreen.main!.frame
         // nx,ny = fraction of main display, top-left origin -> view coords (bottom-left)
         let target = CGPoint(x: CGFloat(nx) * f.width,
