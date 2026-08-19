@@ -35,6 +35,19 @@ export function injectText(session: any, text: string) {
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)
 const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite';
 
+/** Accessibility trust as System Events reports it, memoized per process.
+ *  OBSERVATION ONLY — nothing branches on this; see the call site's comment. */
+let _axTrustedCache: boolean | null | undefined;
+function axTrusted(): boolean | null {
+	if (_axTrustedCache !== undefined) return _axTrustedCache;
+	try {
+		const out = execSync(`osascript -e 'tell application "System Events" to return UI elements enabled'`,
+			{ timeout: 3_000 }).toString().trim();
+		_axTrustedCache = out === 'true' ? true : out === 'false' ? false : null;
+	} catch { _axTrustedCache = null; }
+	return _axTrustedCache;
+}
+
 // --- Scroll ---
 
 export const scrollTool: ToolDefinition = {
@@ -143,6 +156,12 @@ export const scrollTool: ToolDefinition = {
 			} catch (e) { _noteHint(e); _keyDenied = true; }
 
 			console.log(`${ts()} [Scroll] ${direction} (app: ${frontApp})`);
+			// Record the probe wherever the scroll was NOT positively confirmed: on a host
+			// with Accessibility off, `axTrusted=false moved=null denied=false` is the
+			// observation this bug cannot be fixed without.
+			if (_scrollMoved !== true) {
+				console.log(`${ts()} [Scroll] probe: axTrusted=${axTrusted()} moved=${_scrollMoved} denied=${_keyDenied} hints=${_hints.length}`);
+			}
 			return { ...scrollOutcome({ scrollMoved: _scrollMoved, keyDenied: _keyDenied, hints: _hints, direction }),
 			         direction, app: frontApp };
 		} catch (err) {
