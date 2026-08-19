@@ -5,7 +5,7 @@ Read Claude Code quota state from quota-state.json.
 Usage:
   python3 read-quota.py              # human readable
   python3 read-quota.py --json       # machine readable
-  python3 read-quota.py --gate       # exit 1 if exhausted OR not routed
+  python3 read-quota.py --gate       # exit 1 if exhausted, not routed, OR stale
 
 Burn-rate tracking (closes #1087):
   On each human/json read, tracks per-5min utilization delta via an EWMA

@@ -104,6 +104,40 @@ class StaleFailsClosedTest(unittest.TestCase):
         self.assertFalse(r["available"])
         self.assertEqual(r["unavailable_reason"], "not-routed")
 
+    # `--json` returns before the gate, so the cases above never reach it. A budget
+    # governor sees only the exit code and needs its own invocation.
+
+    def _gate_exit(self, age_seconds: float, base_url: str | None) -> int:
+        mod = _load_module(self.tmp, age_seconds)
+        if base_url is None:
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+        else:
+            os.environ["ANTHROPIC_BASE_URL"] = base_url
+        old = sys.argv
+        sys.argv = ["read-quota.py", "--gate"]
+        try:
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                mod.main()
+        except SystemExit as e:
+            return int(e.code or 0)
+        finally:
+            sys.argv = old
+        return 0
+
+    def test_stale_routed_gate_exits_nonzero(self) -> None:
+        """The reason this PR exists: a stale-but-routed session must fail the gate."""
+        self.assertEqual(self._gate_exit(13 * 86400, _PROXY), 1)
+
+    def test_just_past_threshold_gate_exits_nonzero(self) -> None:
+        self.assertEqual(self._gate_exit(31 * 60, _PROXY), 1)
+
+    def test_fresh_routed_gate_exits_zero(self) -> None:
+        """Control: the gate must still pass a healthy session, so the two cases
+        above cannot go green by refusing everything."""
+        self.assertEqual(self._gate_exit(5, _PROXY), 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
