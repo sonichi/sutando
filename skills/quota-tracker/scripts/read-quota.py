@@ -297,9 +297,7 @@ def main():
 
     # Stated once: a second copy of this predicate drifts the moment either is
     # extended, and the two fields then contradict each other in one payload.
-    # Composition of three policies: trust the proxy's flag over the status string,
-    # AND fail closed when this session is not routed through the proxy or when the
-    # file is too old to describe now — a routed proxy that stopped writing leaves
+    # Fails closed on unrouted or stale: a routed proxy that stopped writing keeps
     # `routed` true while every number is a fossil.
     available = resolve_available(status, data.get("available")) and routed and not stale
 
@@ -315,9 +313,8 @@ def main():
         "state_age_seconds": int(age_s),
         "stale": stale,
         "routed": routed,
-        # Distinguishes "not this session's data" from "too old to describe now"
-        # from "quota exhausted"; all three are unavailable and a caller's remedy
-        # differs. not-routed outranks stale: a foreign file's age says nothing.
+        # Three unavailable states, three different remedies; not-routed outranks
+        # stale because a foreign file's age says nothing about this session.
         "unavailable_reason": None if available
                               else ("not-routed" if not routed
                                     else "stale" if stale else "exhausted"),
