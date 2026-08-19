@@ -50,6 +50,22 @@ echo '{"new":"snapshot"}' > "$A/state/contextual-chips.json"
 touch -t 202606010600 "$C/state/contextual-chips.json"
 touch -t 202606012130 "$A/state/contextual-chips.json"
 
+# --- Fixture: union-json-array — the reported loss case ---
+# A fresh install writes an EMPTY allow-set and is NEWER; an older source holds
+# the real grants. Under newest-mtime the grants vanish; under structural they
+# survive only in a sidecar the Slack reader never opens. Either way the owner
+# is locked out, so the union must produce a populated active file.
+# `schemaVersion` is the unrelated-field control: it must survive from the newer
+# file rather than being dropped by the merge.
+cat > "$C/state/slack-allowed-recipients.json" <<'JSON'
+{"allowFrom": ["U_OLD_ONE", "U_SHARED"], "schemaVersion": 1}
+JSON
+cat > "$A/state/slack-allowed-recipients.json" <<'JSON'
+{"allowFrom": [], "schemaVersion": 2}
+JSON
+touch -t 202606010600 "$C/state/slack-allowed-recipients.json"   # older, populated
+touch -t 202606012130 "$A/state/slack-allowed-recipients.json"   # newer, empty
+
 # --- Fixture: in-flight task (newer than 60s guard, must be skipped) ---
 mkdir -p "$C/tasks"
 echo "id: live-task" > "$C/tasks/task-now.txt"  # mtime = now → inflight
@@ -203,6 +219,59 @@ elif [ ! -f "$DEST/tasks/archive/B/task-stale.txt" ]; then
     echo "  FAIL: stale task not routed to archive/B/"; fail=1
 else
     echo "  OK: stale task routed to tasks/archive/B/ (no watcher re-fire)"
+fi
+
+# 6c. union-json-array: newer-empty + older-populated must yield a POPULATED
+# active file. This is the whole reported bug — under newest-mtime or structural
+# this assertion fails, because neither merges within a file.
+UJ="$DEST/state/slack-allowed-recipients.json"
+if [ ! -f "$UJ" ]; then
+    echo "  FAIL: $UJ missing"; fail=1
+else
+    union_check="$(python3 - "$UJ" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+got = d.get("allowFrom")
+problems = []
+if sorted(got or []) != ["U_OLD_ONE", "U_SHARED"]:
+    problems.append(f"allowFrom={got!r}, expected the union of both sources")
+if len(got or []) != len(set(map(repr, got or []))):
+    problems.append(f"duplicate entries in allowFrom: {got!r}")
+if d.get("schemaVersion") != 2:
+    problems.append(f"schemaVersion={d.get('schemaVersion')!r}, expected 2 from the newer file")
+print("; ".join(problems) if problems else "OK")
+PY
+)"
+    if [ "$union_check" = "OK" ]; then
+        echo "  OK: allow-set unioned (grants survive a newer empty file; unrelated fields kept)"
+    else
+        echo "  FAIL: union-json-array — $union_check"; fail=1
+    fi
+fi
+
+# 6d. Union idempotency against the REAL script, not a reimplementation of the
+# rule: migrate the same populated source into a dest that already holds the
+# unioned result. A second pass must not duplicate entries or drop fields.
+IDEM_DEST="$TMP/dest-idem"
+mkdir -p "$IDEM_DEST/state"
+cp -p "$UJ" "$IDEM_DEST/state/slack-allowed-recipients.json"
+before_idem="$(cat "$IDEM_DEST/state/slack-allowed-recipients.json")"
+SUTANDO_MIGRATE_SRC_C="$C" SUTANDO_MIGRATE_DEST="$IDEM_DEST" \
+    bash "$MIGRATE" commit --source C --no-confirm >/dev/null 2>&1 || true
+after_idem="$(python3 - "$IDEM_DEST/state/slack-allowed-recipients.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(json.dumps({"allowFrom": sorted(d.get("allowFrom") or []),
+                  "schemaVersion": d.get("schemaVersion")}, sort_keys=True))
+PY
+)"
+expected_idem='{"allowFrom": ["U_OLD_ONE", "U_SHARED"], "schemaVersion": 2}'
+if [ "$after_idem" = "$expected_idem" ]; then
+    echo "  OK: union is idempotent (second pass adds no duplicates, keeps fields)"
+else
+    echo "  FAIL: union not idempotent — got $after_idem, expected $expected_idem"
+    echo "        (before: $before_idem)"
+    fail=1
 fi
 
 # 7. Per-source sentinels exist

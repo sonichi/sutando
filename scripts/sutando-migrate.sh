@@ -226,9 +226,10 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
-    # Accumulated grants, not a snapshot: newest-mtime discards the whole
-    # allow-set when a fresh install writes an empty one first, with no sidecar.
-    "state/slack-allowed-recipients.json|structural"
+    # Accumulated grants, not a snapshot. newest-mtime discards the whole
+    # allow-set when a fresh install writes an empty one first; structural only
+    # sidecars the loser, which the Slack reader never loads. Both lose access.
+    "state/slack-allowed-recipients.json|union-json-array"
     "state/*.json|newest-mtime"
     "state/*|structural"
     "notes/*|collision-keep-both"  # Mini #4: accretes cruft over N migrations;
@@ -376,7 +377,7 @@ scan_source() {
     # NOTE on portability: --base is not portable; we use absolute paths only.
     # Walk every non-ignored regular file under src.
     local file rel cls dest_path collision_kind="" size mtime_iso
-    local n_structural=0 n_append=0 n_newest=0 n_rehome=0 n_skip=0 n_inflight=0 n_collision=0 n_unknown=0 n_quarantine=0
+    local n_structural=0 n_append=0 n_newest=0 n_rehome=0 n_skip=0 n_inflight=0 n_collision=0 n_unknown=0 n_quarantine=0 n_union=0
     local bytes_total=0
 
     REPORT_LINES+=("")
@@ -533,6 +534,12 @@ scan_source() {
             newest-mtime)
                 n_newest=$((n_newest+1))
                 ;;
+            union-json-array)
+                # Reported separately: the whole point is that it does NOT
+                # resolve to one file, so folding it into structural or
+                # newest-mtime would make the dry-run describe the wrong action.
+                n_union=$((n_union+1))
+                ;;
             rehome-state)
                 # Target is <dest>/state/<basename>
                 n_rehome=$((n_rehome+1))
@@ -576,6 +583,7 @@ scan_source() {
     REPORT_LINES+=("    collision    (same path, diff content):$n_collision")
     REPORT_LINES+=("    append-merge (build_log/conv.log):    $n_append")
     REPORT_LINES+=("    newest-mtime (snapshots):             $n_newest")
+    REPORT_LINES+=("    union-json   (accumulated grant sets): $n_union")
     REPORT_LINES+=("    re-home      (loose JSON → state/):   $n_rehome")
     REPORT_LINES+=("    quarantine   (non-canonical → legacy/<src>/quarantine/): $n_quarantine")
     REPORT_LINES+=("    in-flight-skip (<${INFLIGHT_GUARD_SEC}s old):       $n_inflight")
@@ -946,6 +954,57 @@ copy_preserving_mtime() {
     cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"
 }
 
+# Merge an accumulated-grant JSON file into dest, in place of newest-wins.
+# Unions every top-level array field; non-array fields come from the newer file.
+# Malformed input returns non-zero rather than degrading to newest-wins — a
+# silent degrade is the access loss this class exists to prevent.
+union_json_arrays_into() {
+    local src="$1" dst="$2"
+    mkdir -p "$(dirname "$dst")"
+    local tmp="$dst.tmp.$$"
+    if python3 - "$src" "$dst" "$tmp" <<'PY'
+import json, os, sys
+
+src, dst, tmp = sys.argv[1:4]
+
+
+def load(path):
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: top level is {type(doc).__name__}, expected object")
+    return doc
+
+
+src_doc, dst_doc = load(src), load(dst)
+# Non-array fields follow the newer file; only the arrays accumulate.
+newer = src_doc if os.path.getmtime(src) > os.path.getmtime(dst) else dst_doc
+merged = dict(newer)
+for key in set(src_doc) | set(dst_doc):
+    a, b = dst_doc.get(key), src_doc.get(key)
+    if not isinstance(a, list) and not isinstance(b, list):
+        continue
+    if (a is not None and not isinstance(a, list)) or (b is not None and not isinstance(b, list)):
+        raise ValueError(f"{key}: array in one file and {type(a if b is None else b).__name__} in the other")
+    seen, out = set(), []
+    for entry in (a or []) + (b or []):
+        fp = json.dumps(entry, sort_keys=True)
+        if fp not in seen:
+            seen.add(fp)
+            out.append(entry)
+    merged[key] = out
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(merged, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+    then
+        mv -f "$tmp" "$dst"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 # Human-readable byte size: 1234 → "1.2 KB", 5242880 → "5.0 MB", etc.
 humanize_bytes() {
     local b="$1"
@@ -1067,6 +1126,29 @@ commit_one() {
     local dst_path
 
     case "$cls" in
+        union-json-array)
+            dst_path="$DEST_REAL/$rel"
+            if [ ! -e "$dst_path" ]; then
+                copy_preserving_mtime "$src_file" "$dst_path"
+                echo "copied"
+                return 0
+            fi
+            if sha_match "$src_file" "$dst_path"; then
+                echo "identical-drop"
+                return 0
+            fi
+            # Both sides exist and differ: accumulate rather than pick a winner.
+            # An unreadable or non-conforming file aborts the run — degrading to
+            # newest-wins here would silently drop grants, which is the bug.
+            if ! union_json_arrays_into "$src_file" "$dst_path"; then
+                echo "ERROR: $rel — cannot union $src_file into $dst_path (malformed JSON" >&2
+                echo "       or a field that is an array in one file and not the other)." >&2
+                echo "       Refusing to fall back to newest-wins; that would drop grants." >&2
+                return 1
+            fi
+            echo "unioned"
+            return 0
+            ;;
         structural|collision-keep-both)
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
@@ -1478,7 +1560,7 @@ commit_source() {
             fi
         fi
         case "$outcome" in
-            copied|src-wins-newer|src-newer|rehomed|rehomed-newer|merged|archived-stale|copied-stale)
+            copied|src-wins-newer|src-newer|rehomed|rehomed-newer|merged|unioned|archived-stale|copied-stale)
                 n_copied=$((n_copied+1)) ;;
             dest-wins-newer|dest-newer|rehomed-skip-older|skipped-collision-dest)
                 n_kept=$((n_kept+1)) ;;
@@ -2152,6 +2234,7 @@ explain_main() {
                             *) dest_hint="<dest>/state/$base" ;;
                         esac
                         ;;
+                    union-json-array) dest_hint="<dest>/$rel  (accumulated: top-level arrays unioned across sources, other fields from the newer file; malformed input aborts rather than picking a winner)" ;;
                     rehome-dated-snapshot) dest_hint="<dest>/notes/archive/$(basename "$rel")" ;;
                     rehome-narrative-log) dest_hint="<dest>/logs/workspace-narrative.log  (renamed to dodge logs/conversation.log collision)" ;;
                     inflight-guard) dest_hint="<dest>/$rel  (if >${INFLIGHT_GUARD_SEC}s old)  OR  <dest>/${rel%%/*}/archive/<src-tag>/$(basename "$rel")  (route-to-archive)" ;;
