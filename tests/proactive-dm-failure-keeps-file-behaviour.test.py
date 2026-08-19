@@ -98,6 +98,8 @@ def _run_one_pass(results: Path, send):
 
     routing = types.ModuleType("proactive_routing")
     routing.should_claim_proactive = lambda *_a, **_k: True
+    routing.should_claim_proactive_file = lambda *_a, **_k: True
+    routing.proactive_destination = lambda *_a, **_k: None
     sys.modules["proactive_routing"] = routing
 
     class _DM:
