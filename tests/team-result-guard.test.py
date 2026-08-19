@@ -103,6 +103,57 @@ def behavioral() -> list:
     if out != guard.TEAM_LEAK_RESULT or not why:
         fails.append("a raising scanner must fail CLOSED and withhold the body")
 
+    out, why = guard.guard_result_for_tier(
+        "intentional secret", "team", REPO, secret_filter=_leaky,
+        scan_sensitive_data=False)
+    if out != "intentional secret" or why is not None:
+        fails.append("an explicit filter opt-out must pass ordinary result text")
+    out, why = guard.guard_result_for_tier(
+        "[attach: /etc/passwd]", "team", REPO, secret_filter=_clean,
+        scan_sensitive_data=False)
+    if out != guard.TEAM_LEAK_RESULT or not why:
+        fails.append("delivery-control markers must stay guarded when scanning is off")
+
+    with tempfile.TemporaryDirectory() as td:
+        task = Path(td) / "task.txt"
+        missing = Path(td) / "missing-task.txt"
+        directory = Path(td) / "task-directory"
+        directory.mkdir()
+        if not guard.sensitive_data_filter_enabled(missing, "team"):
+            fails.append("a missing task file must fail closed to scanning enabled")
+        if not guard.sensitive_data_filter_enabled(directory, "team"):
+            fails.append("a directory in place of a task file must fail closed")
+        task.write_text("access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a missing filter stamp must default on")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: false\n"
+            "access_tier: team\ntask: body\n")
+        if guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("paired Team collaborator and filter-off stamps must disable scanning")
+        if not guard.sensitive_data_filter_enabled(task, "guest"):
+            fails.append("a non-Team tier must keep scanning enabled")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: FALSE\n"
+            "access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a non-canonical filter value must fail closed to enabled")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: false\n"
+            "sensitive_data_filter: false\n"
+            "access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("duplicate filter stamps must fail closed to enabled")
+        task.write_text(
+            "collaborator: true\naccess_tier: team\ntask: body\n"
+            "sensitive_data_filter: false\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a body-authored filter opt-out must not be trusted")
+        task.write_text(
+            "sensitive_data_filter: false\naccess_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("filter-off without collaborator opt-in must fail closed")
+
     # The caller is handed only the safe body — it cannot deliver the raw text
     # by swallowing an exception.
     out, _ = guard.guard_result_for_tier("[channel: 5] secret", "team", REPO, secret_filter=_clean)
