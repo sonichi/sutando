@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sutando — ag2.space gateway-bridge launchd job (template).
+
+  Role: keeps src/remote-gateway-bridge.py alive. That bridge carries ag2.space
+  MOBILE-app messages from the cloud gateway (chat.ag2.space/relay) down to the
+  local core, and pushes results back up. Without supervision it's a single
+  unmonitored process: on 2026-07-10 it was found DEAD since Jul 7 (it stopped
+  after a run of gateway 502s and nothing restarted it), so mobile messages
+  stranded in the cloud for 3 days. Health-check now REPORTS it down (PR #2067);
+  this job makes it RECOVER on its own.
+
+  Install:
+    bash src/install-gateway-bridge-launchd.sh
+
+  Design:
+    - RunAtLoad=true so it starts at login/boot.
+    - KeepAlive { Crashed: true, SuccessfulExit: false } → restart on crash,
+      OOM, or kill (any non-zero/signal exit), but NOT on a clean exit. The
+      wrapper exits 0 when no token is configured, so a de-configured install
+      stops cleanly instead of crash-looping.
+    - ThrottleInterval=10: ≤ one restart per 10s, so a genuine crash-loop
+      (e.g. a persistently-502ing gateway) doesn't burn CPU.
+    - Wrapper (gateway-bridge-wrapper.sh) loads the ag2space channel .env for
+      REMOTE_TASK_TOKEN — launchd doesn't source .env itself.
+    - StandardOut/Err → workspace logs so postmortems + the health-check log
+      probe keep working.
+
+  Placeholders substituted by install-gateway-bridge-launchd.sh:
+    __REPO__               — absolute path to the sutando repo checkout
+    __WORKSPACE__          — absolute path to the resolved workspace
+    __HOME__               — $HOME
+    __BREW_BIN__           — the Homebrew bin dir (Apple-Silicon or Intel prefix)
+    __CLAUDE_CONFIG_DIR__  — resolved CLAUDE_CONFIG_DIR (sutando-config.sh
+                             claude-home-path). launchd does NOT inherit the
+                             login-shell env, so without this baked in the
+                             wrapper's claude-home-path resolution falls back to
+                             the default Claude config dir and reads the WRONG
+                             channels/ag2space/.env
+                             on claude-sutando installs → no token → clean exit →
+                             KeepAlive never restarts → the supervisor silently
+                             no-ops (the exact failure this job exists to prevent).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.gateway-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/src/launchd/gateway-bridge-wrapper.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__BREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>SUTANDO_WORKSPACE</key>
+        <string>__WORKSPACE__</string>
+        <key>SUTANDO_REPO_DIR</key>
+        <string>__REPO__</string>
+        <key>CLAUDE_CONFIG_DIR</key>
+        <string>__CLAUDE_CONFIG_DIR__</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__WORKSPACE__/logs/remote-gateway-bridge.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__WORKSPACE__/logs/remote-gateway-bridge.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
