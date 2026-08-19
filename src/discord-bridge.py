@@ -433,6 +433,14 @@ def _chunk_for_discord(
         preview.append(chunk)
         if len(preview) > max_chunks:
             break
+    if len(preview) > 1:
+        # Compose-side feedback: a multi-chunk delivery means the body failed
+        # the one-message cap. The composer never sees the split otherwise.
+        print(
+            f"  [delivery-gate] body needed {len(preview)} chunk(s) "
+            f"({len(text)} chars > {max_len}) — compose-side cap missed",
+            flush=True,
+        )
     if len(preview) <= max_chunks:
         yield from preview
         return

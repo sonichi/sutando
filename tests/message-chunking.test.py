@@ -180,6 +180,40 @@ check("plain: empty input -> no chunks", mc.chunk_plain_text("", 4000) == [])
 check("plain: exact-limit input is one chunk",
       mc.chunk_plain_text("y" * 4000, 4000) == ["y" * 4000])
 
+# --- paragraph-aware splits + fence keep-whole (2026-08-19, "wider" gates) ---
+
+# Paragraph preference: paragraphs of ~400 chars; a forced split must land at a
+# blank line (chunk ends on a paragraph's last line), not mid-paragraph.
+paras = ["para %d line one is quite long %s\npara %d line two %s" % (i, "w" * 150, i, "v" * 150)
+         for i in range(8)]
+para_text = "\n\n".join(paras)
+pchunks = list(chunk_message(para_text, 1900))
+check("para: splits land at paragraph boundaries",
+      len(pchunks) > 1 and all(c.split("\n")[-1].endswith(("w" * 10, "v" * 10)) is False or
+                               c.split("\n")[-1].startswith("para") for c in pchunks[:-1]))
+# Stronger form: each non-final chunk's last line is a paragraph's SECOND line
+# (ends with the v-run), never a first line (w-run) — a mid-paragraph cut.
+check("para: no chunk ends mid-paragraph",
+      all(c.split("\n")[-1].endswith("v" * 10) for c in pchunks[:-1]),
+      str([c.split("\n")[-1][-20:] for c in pchunks[:-1]]))
+
+# Fence keep-whole: prose near the cap, then a 600-char fence block that fits a
+# chunk alone. The old chunker enters the fence and close/reopens it; the new
+# one starts the block in a fresh chunk, so no chunk carries a synthetic reopen.
+prose = "\n".join("prose line %d %s" % (i, "p" * 80) for i in range(18))
+fence_block = "```python\n" + "\n".join("code line %d" % i for i in range(30)) + "\n```"
+ftext = prose + "\n" + fence_block
+fchunks = list(chunk_message(ftext, 1900))
+intact = ["```python" in c and c.rstrip().endswith("```") and c.count("```") == 2
+          for c in fchunks if "code line" in c]
+check("fence: whole block lands intact in one chunk",
+      len(intact) == 1 and intact[0], str([c[:40] for c in fchunks]))
+
+# fits_one_message: the compose-time half of the cap.
+check("fits: short body is one message", mc.fits_one_message("hello"))
+check("fits: 3k body is not", not mc.fits_one_message("z\n" * 1500))
+check("fits: empty body is one message", mc.fits_one_message(""))
+
 if failures:
     print(f"\nFAIL — {len(failures)} check(s) failed: {failures}")
     raise SystemExit(1)
