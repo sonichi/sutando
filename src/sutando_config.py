@@ -86,9 +86,13 @@ def resolve_claim_backend(repo_root: Optional[Path] = None) -> str:
     Selection is POLICY and lives here; mapping the name to a class is the
     adapter's job, so this module stays free of delivery-core imports.
     An unrecognised value resolves to "a" rather than raising — a typo in
-    config must not take the proactive leg down.
+    config must not take the proactive leg down. That includes a `delivery`
+    of the wrong SHAPE: this loader is schema-lenient by design, so a scalar
+    or list there must degrade like a typo, not raise AttributeError.
     """
-    delivery = load_config(repo_root).get("delivery") or {}
+    delivery = load_config(repo_root).get("delivery")
+    if not isinstance(delivery, dict):
+        delivery = {}
     configured = str(delivery.get("claim_backend") or "a").strip().lower()
     chosen = os.environ.get("SUTANDO_CLAIM_BACKEND", "").strip().lower() or configured
     return chosen if chosen in _CLAIM_BACKENDS else "a"

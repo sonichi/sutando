@@ -74,6 +74,28 @@ check(_resolve(cfg="design-c") == "a", "unrecognised config value falls back to 
 check(_resolve(env="zzz") == "a", "unrecognised env value falls back to 'a'")
 check(_resolve(cfg="") == "a", "empty config value falls back to 'a'")
 
+
+def _resolve_raw_delivery(value):
+    """Set `delivery` ITSELF to `value` — _resolve only reaches claim_backend."""
+    saved_load, saved_env = sc.load_config, os.environ.get("SUTANDO_CLAIM_BACKEND")
+    try:
+        os.environ.pop("SUTANDO_CLAIM_BACKEND", None)
+        sc.load_config = lambda *a, **k: {"delivery": value}
+        return sc.resolve_claim_backend()
+    finally:
+        sc.load_config = saved_load
+        if saved_env is not None:
+            os.environ["SUTANDO_CLAIM_BACKEND"] = saved_env
+
+
+# A schema-lenient loader must degrade a wrong-SHAPE `delivery` like a typo:
+# `.get()` on a scalar raises AttributeError, outside every caller's boundary.
+for bad in ("c", ["c"], True, 3):
+    check(_resolve_raw_delivery(bad) == "a",
+          f"delivery={bad!r} (not an object) falls back to 'a'")
+check(_resolve_raw_delivery({"claim_backend": "c"}) == "c",
+      "control: a well-formed delivery object still selects 'c'")
+
 print("2. 'delivery' is a KNOWN top-level config key")
 # Otherwise a user who configures it gets an unknown-key warning telling them
 # the setting they just read about is not real.
@@ -105,7 +127,7 @@ sys.modules["dbridge_sel"] = db
 _spec.loader.exec_module(db)
 
 
-def _fence_with(env, *, activate=False, malform=False):
+def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False):
     """Build the fence the way the bridge does, and report what it chose."""
     saved_env = os.environ.get("SUTANDO_CLAIM_BACKEND")
     saved_results, saved_fence = db.RESULTS_DIR, db._PROACTIVE_FENCE
@@ -117,6 +139,12 @@ def _fence_with(env, *, activate=False, malform=False):
             os.environ["SUTANDO_CLAIM_BACKEND"] = env
         db.RESULTS_DIR = Path(td)
         db._PROACTIVE_FENCE = None
+        if corrupt_fence:
+            from ag2_sparrow import outbox as _o
+            r = Path(td) / ".outbox-discord-proactive"
+            (r / _o.LOCKS_DIR).mkdir(parents=True)
+            _o._fence_path(r).write_text("[]")
+            _o._STRIPE_MODE.pop(_o._root_key(r), None)
         if malform:
             # A file where C's namespace mkdir expects a directory.
             (Path(td) / ".outbox-discord-proactive").mkdir()
@@ -209,6 +237,28 @@ for name, mk in (("A", lambda r: DesignAClaimBackend(r)),
         fence.confirm(claim)
         check(ok and not claim.exists(),
               f"backend {name}: claim moves the body and confirm consumes it")
+
+print("4b. a structurally corrupt stripe fence refuses like any other bad fence")
+from ag2_sparrow import outbox as _ob
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / ".outbox"
+    (root / _ob.LOCKS_DIR).mkdir(parents=True)
+    _ob._fence_path(root).write_text("[]")          # valid JSON, wrong shape
+    _ob._STRIPE_MODE.pop(_ob._root_key(root), None)
+    raised = None
+    try:
+        DesignCClaimBackend(root)
+    except Exception as e:                           # noqa: BLE001 — classifying it IS the test
+        raised = e
+    check(isinstance(raised, RuntimeError),
+          f"non-object fence raises RuntimeError (got {type(raised).__name__})")
+    check(isinstance(raised, (RuntimeError, OSError)),
+          "so it lands inside the adapter's existing fail-open boundary")
+
+kind, out = _fence_with("c", corrupt_fence=True)
+check(kind == "DesignAClaimBackend",
+      f"c against a corrupt fence falls back to Design A (got {kind})")
+check("claim_backend=c" in out, "and the fallback is announced")
 
 print("5. selecting C against an UN-ACTIVATED root must not take the leg down")
 with tempfile.TemporaryDirectory() as td:
