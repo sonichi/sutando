@@ -103,8 +103,33 @@ def _run_one_pass(results: Path, send):
     sys.modules["proactive_routing"] = routing
 
     class _DM:
+        id = 4242
+
         async def send(self, *a, **kw):
             return send(*a, **kw)
+
+    # 5b: text rides the provider seam, not dm.send; `send` stays the
+    # switch — a raise becomes NOT_DELIVERED (parks), a return confirms.
+    from ag2_sparrow.delivery_core.contract import (
+        DeliveryOutcome, DeliveryReceipt, ProviderCapabilities)
+
+    class _Provider:
+        capabilities = ProviderCapabilities()
+
+        def deliver(self, item_id, payload, key):
+            body = json.loads(payload.decode("utf-8"))["content"]
+            try:
+                send(body)
+            except Exception as e:  # noqa: BLE001 — the injected failure
+                return DeliveryReceipt(outcome=DeliveryOutcome.NOT_DELIVERED,
+                                       detail=str(e))
+            return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
+                                   provider_ref="m1")
+
+        def reconcile(self, attempt):
+            return None
+
+    db._PROACTIVE_PROVIDER = _Provider()
 
     class _User:
         bot = False
