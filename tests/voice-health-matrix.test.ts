@@ -42,6 +42,14 @@ function hb(over: Partial<ClientHeartbeat> = {}): ClientHeartbeat {
 function snap(over: Partial<AudioHealthSnapshot> = {}): AudioHealthSnapshot {
 	return {
 		coverage: 'session-only',
+		upstream: null,
+		transportGeneration: null,
+		echoSuppressed: 0,
+		logicalSessionId: 1,
+		lineageState: 'fresh',
+		contextTokens: null,
+		contextTokensAt: null,
+		contextTokensDetails: null,
 		epoch: 12345,
 		nonce: 'n0n0n0n0',
 		deliveredFrames: 1000,
@@ -72,11 +80,41 @@ function snap(over: Partial<AudioHealthSnapshot> = {}): AudioHealthSnapshot {
 		inputHealth: 'ok',
 		epochStartApproxMs: NOW - 60_000,
 		lastMatrixVerdict: null,
+		lastMatrixFacts: null,
+		lastMatrixReasons: null,
 		...over,
 	};
 }
 
 /** A previous-tick baseline consistent with `snap()` minus the given deltas. */
+function upstreamFix(audio: {
+	attempted: number;
+	queued: number;
+	skippedNoSession?: number;
+	threw?: number;
+	lastQueuedAt?: number | null;
+}) {
+	const slot = {
+		attempted: audio.attempted,
+		queued: audio.queued,
+		skippedNoSession: audio.skippedNoSession ?? 0,
+		threw: audio.threw ?? 0,
+		attemptedRawBytes: 0,
+		queuedRawBytes: 0,
+		attemptedWireBytesEstimate: 0,
+		queuedWireBytesEstimate: 0,
+		lastAttemptedAt: audio.lastQueuedAt ?? null,
+		lastQueuedAt: audio.lastQueuedAt ?? null,
+		lastSkippedAt: null,
+		lastThrewAt: null,
+	};
+	return {
+		audio: slot,
+		video: { ...slot, attempted: 0, queued: 0, skippedNoSession: 0, threw: 0, unsupportedMime: 0 },
+		text: { ...slot, attempted: 0, queued: 0, skippedNoSession: 0, threw: 0, skippedEmpty: 0 },
+	};
+}
+
 function baselineBefore(s: AudioHealthSnapshot, deltas: Partial<MatrixBaseline> = {}): MatrixBaseline {
 	return {
 		at: NOW - 30_000,
@@ -89,6 +127,12 @@ function baselineBefore(s: AudioHealthSnapshot, deltas: Partial<MatrixBaseline> 
 		chunksScheduled: s.clientTotals.chunksScheduled,
 		chunksEnded: s.clientTotals.chunksEnded,
 		chunksCancelled: s.clientTotals.chunksCancelled,
+		transportGeneration: s.transportGeneration,
+		audioAttempted: s.upstream?.audio.attempted ?? null,
+		audioQueued: s.upstream?.audio.queued ?? null,
+		audioSkippedNoSession: s.upstream?.audio.skippedNoSession ?? null,
+		audioThrew: s.upstream?.audio.threw ?? null,
+		echoSuppressed: s.echoSuppressed,
 		ctxTimeMs: s.lastHeartbeat?.ctxTimeMs ?? null,
 		bufferedAmount: s.lastHeartbeat?.bufferedAmount ?? null,
 		serverBufferedAmount: null,
@@ -151,14 +195,374 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 		assert.ok(r.reasons.some((x) => x.includes('upstream-hop-unobserved')));
 	});
 
-	it('the same speech-silence pattern at FULL coverage reaches model-silent (the F4 residue)', () => {
+	it('speech-silence at session+egress with a LOSSLESS queued-after-speech window → post-sdk-silent', () => {
 		const s = snap({
-			coverage: 'full' as never,
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'post-sdk-silent');
+		assert.ok(r.reasons.includes('lossless-window'));
+	});
+
+	it('a LOSSY window can never be post-sdk-silent — the speech may have been dropped locally', () => {
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			// 100 delivered, only 60 attempted: something swallowed frames.
+			upstream: upstreamFix({ attempted: 1060, queued: 1060, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.includes('lossy-window'));
+	});
+
+	it('a transport-generation change inside the window is structural insufficient-evidence', () => {
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 40, queued: 40, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 4, // reconnected mid-window
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			transportGeneration: 3,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.includes('transport-generation-changed'));
+	});
+
+	it('row 4: eligible ingress with ZERO attempts is upstream-send-dead (dead call path)', () => {
+		const s = snap({
+			upstream: upstreamFix({ attempted: 1000, queued: 1000, lastQueuedAt: NOW - 40_000 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.equal(r.verdict, 'upstream-send-dead');
+	});
+
+	it('row 4b: attempts with zero queued is upstream-send-failing, named by guard outcome', () => {
+		const s = snap({
+			upstream: upstreamFix({
+				attempted: 1100,
+				queued: 1000,
+				skippedNoSession: 100,
+				lastQueuedAt: NOW - 40_000,
+			}),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+			audioSkippedNoSession: 0, // the 100 skips happened THIS window
+		});
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.equal(r.verdict, 'upstream-send-failing');
+		assert.ok(r.reasons.includes('skippedNoSession+=100'));
+		assert.ok(r.reasons.includes('threw+=0'));
+		assert.equal(r.facts.attemptedAudioAdvanced, true);
+		assert.equal(r.facts.queuedAudioAdvanced, false);
+	});
+
+	it('row 4b names the CURRENT window: earlier skips never masquerade as the live failure mode', () => {
+		// Generation lifetime: 100 old skips, then 50 throws in THIS window.
+		const s = snap({
+			upstream: upstreamFix({
+				attempted: 1250,
+				queued: 1100,
+				skippedNoSession: 100,
+				threw: 50,
+				lastQueuedAt: NOW - 40_000,
+			}),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1200,
+			audioQueued: 1100,
+			audioThrew: 0, // skips predate the window; throws are new
+		});
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.equal(r.verdict, 'upstream-send-failing');
+		assert.ok(r.reasons.includes('skippedNoSession+=0'), 'old skips do not resurface');
+		assert.ok(r.reasons.includes('threw+=50'));
+	});
+
+	it('echo suppression in the window excludes rows 4/4b — suppression looks like a dead path', () => {
+		const s = snap({
+			upstream: upstreamFix({ attempted: 1000, queued: 1000, lastQueuedAt: NOW - 40_000 }),
+			transportGeneration: 3,
+			echoSuppressed: 5,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+			echoSuppressed: 0,
+		});
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.notEqual(r.verdict, 'upstream-send-dead');
+		assert.notEqual(r.verdict, 'upstream-send-failing');
+	});
+
+	it('the LIVE evaluator at session-only still downgrades — the shadow rows change nothing', () => {
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.some((x) => x.includes('upstream-hop-unobserved')));
+		// §1.5: facts are DATA-level observations, identical under every
+		// coverage mode — only the VERDICT is coverage-gated (codex round-3 #1).
+		const shadow = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(shadow.verdict, 'post-sdk-silent');
+		assert.deepEqual(r.facts, shadow.facts, 'same input, same facts, different claim');
+		assert.equal(r.facts.losslessWindowWithSpeechQueued, true);
+	});
+
+	it('a baseline with a generation but NO upstream cannot fabricate a lossless window', () => {
+		// john-the-dev's finding: the previous tick's observedness was inferred
+		// from transportGeneration being non-null, but generation and upstream are
+		// independent fields off the same diag. A prev with a REAL generation and
+		// absent counters therefore passed the guard, and `?? 0` made the missing
+		// counters look like a real zero — so the delta became a lifetime total.
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 4000, queued: 4000, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 5,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			transportGeneration: 5, // NOT null — same generation, so genChanged is false
+			audioAttempted: null, // …but upstream was absent at that tick
+			audioQueued: null,
+			audioSkippedNoSession: null,
+			audioThrew: null,
+		});
+		const r = evalWith(s, prev);
+		assert.equal(
+			r.facts.losslessWindowWithSpeechQueued,
+			false,
+			'a window that was never measured must not read as lossless',
+		);
+		// NOT `r.facts.upstreamWindowObserved` — that is a local const, not a
+		// MatrixFacts member, so the assertion could never fail (john-the-dev).
+		assert.equal(r.facts.attemptedAudioAdvanced, false);
+		assert.equal(r.facts.queuedAudioAdvanced, false);
+	});
+
+	it('an unobserved echoSuppressed baseline cannot fabricate echoSuppressedAdvanced', () => {
+		// Same defect as the upstream counters, one field over: `?? 0` on a wholly
+		// null diag recorded a real zero, so the next observed tick turned a
+		// generation-lifetime total into a one-window delta on a fact the
+		// watchdog reads (john-the-dev, after 2af342d9 fixed only the siblings).
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 900, queued: 900, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 5,
+			echoSuppressed: 4000,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			transportGeneration: 5,
+			echoSuppressed: null, // the tick where diagnostics were absent entirely
+		});
+		const r = evalWith(s, prev);
+		assert.equal(
+			r.facts.echoSuppressedAdvanced,
+			false,
+			'a lifetime total across an unobserved baseline is not a window delta',
+		);
+	});
+
+	it('an unobserved BASELINE can never fabricate post-sdk-silent (null→observed transition)', () => {
+		// codex round-5 #3 repro: diagnostics were unobserved at the previous
+		// tick (generation null, counters placeholder zeros); observed now with
+		// generation-lifetime totals. Diffing would fabricate a lossless window.
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 900, queued: 900, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			transportGeneration: null,
+			audioAttempted: 0,
+			audioQueued: 0,
+			audioSkippedNoSession: 0,
+			audioThrew: 0,
+		});
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.ok(r.reasons.includes('upstream-window-unobserved'));
+		assert.equal(r.facts.losslessWindowWithSpeechQueued, false);
+
+		// The OTHER direction (codex round-3 #2): counters present but the
+		// CURRENT generation unobserved — the window is equally invalid.
+		const s2 = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 900, queued: 900, lastQueuedAt: NOW - 300 }),
+			transportGeneration: null,
+		});
+		const prev2 = baselineBefore(s2, {
+			deliveredFrames: s2.deliveredFrames - 100,
+			transportGeneration: 3,
+			audioAttempted: 100,
+			audioQueued: 100,
+		});
+		const r2 = evalWith(s2, prev2, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r2.verdict, 'insufficient-evidence');
+		assert.ok(r2.reasons.includes('upstream-window-unobserved'));
+		assert.equal(r2.facts.attemptedAudioAdvanced, false);
+	});
+
+	it('rows 4/4b need a valid window too — an unobserved baseline cannot prove a dead path', () => {
+		const s = snap({
+			upstream: upstreamFix({ attempted: 0, queued: 0 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			transportGeneration: null,
+		});
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.notEqual(r.verdict, 'upstream-send-dead');
+		assert.notEqual(r.verdict, 'upstream-send-failing');
+	});
+
+	it('facts (design §1.5): the recorded decision carries the upstream observations', () => {
+		const s = snap({
+			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
+		});
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'post-sdk-silent');
+		assert.deepEqual(r.facts, {
+			attemptedAudioAdvanced: true,
+			queuedAudioAdvanced: true,
+			losslessWindowWithSpeechQueued: true,
+			transportGenerationChanged: false,
+			echoSuppressedAdvanced: false,
+			// ACTIVE-silence family: this window HAS a same-epoch baseline, so
+			// factsAvailable holds and speech/ingress report what they observed.
+			factsAvailable: true,
+			speechInWindow: true,
+			speechObservedAt: r.facts.speechObservedAt,
+			ingressAdvanced: true,
+			modelSilentFor15s: true,
+		});
+		assert.equal(typeof r.facts.speechObservedAt, 'number');
+	});
+
+	it('facts: a generation change is a fact; a windowless tick carries all-false facts', () => {
+		const s = snap({
+			upstream: upstreamFix({ attempted: 40, queued: 40 }),
+			transportGeneration: 4,
+		});
+		const prev = baselineBefore(s, { transportGeneration: 3 });
+		const r = evalWith(s, prev, { effectiveCoverage: 'session+egress' });
+		assert.equal(r.verdict, 'insufficient-evidence');
+		assert.equal(r.facts.transportGenerationChanged, true);
+		assert.equal(r.facts.attemptedAudioAdvanced, false);
+		// The fact is coverage-independent: the live session-only evaluator
+		// records the same generation change (its verdict path just differs).
+		const live = evalWith(s, prev);
+		assert.deepEqual(live.facts, r.facts);
+		const first = evalWith(snap(), null);
+		assert.deepEqual(first.facts, {
+			attemptedAudioAdvanced: false,
+			queuedAudioAdvanced: false,
+			losslessWindowWithSpeechQueued: false,
+			transportGenerationChanged: false,
+			echoSuppressedAdvanced: false,
+			// No baseline ⇒ the ACTIVE-silence family fails closed as a unit.
+			factsAvailable: false,
+			speechInWindow: false,
+			speechObservedAt: null,
+			ingressAdvanced: false,
+			modelSilentFor15s: false,
+		});
+	});
+
+	it('facts are verdict-independent: an early return carries the same data-level facts', () => {
+		// Identical diagnostics, one tick evaluated ACTIVE and one CONNECTING:
+		// the verdicts differ (reconnect-window wins row 0) but the facts are
+		// the SAME set — the watchdog must behave identically (§1.5).
+		const s = snap({
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
 			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
 		});
-		const prev = baselineBefore(s, { deliveredFrames: s.deliveredFrames - 100 });
-		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
-		assert.equal(r.verdict, 'model-silent');
+		const prev = baselineBefore(s, {
+			deliveredFrames: s.deliveredFrames - 100,
+			audioAttempted: 1000,
+			audioQueued: 1000,
+		});
+		const active = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		const connecting = evalWith(s, prev, {
+			sessionState: 'CONNECTING',
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(active.verdict, 'post-sdk-silent');
+		assert.equal(connecting.verdict, 'reconnect-window');
+		assert.deepEqual(connecting.facts, active.facts);
 	});
 });
 
@@ -330,16 +734,22 @@ describe('P7 D7.2 matrix — round-3 honesty + ordering fixes', () => {
 
 	it('row 5 outranks row 6: speech with no model event wins over backpressure (D7.2 order)', () => {
 		const s = snap({
-			coverage: 'full' as never,
 			speech: { active: true, onsetAt: NOW - 3000, lastAboveFloorAt: NOW - 500 },
 			lastHeartbeat: hb({ bufferedAmount: 500_000 }),
+			upstream: upstreamFix({ attempted: 1100, queued: 1100, lastQueuedAt: NOW - 300 }),
+			transportGeneration: 3,
 		});
 		const prev = baselineBefore(s, {
 			deliveredFrames: s.deliveredFrames - 100,
 			bufferedAmount: 50_000,
+			audioAttempted: 1000,
+			audioQueued: 1000,
 		});
-		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
-		assert.equal(r.verdict, 'model-silent');
+		const r = evalWith(s, prev, {
+			lastModelEventAt: NOW - 60_000,
+			effectiveCoverage: 'session+egress',
+		});
+		assert.equal(r.verdict, 'post-sdk-silent');
 	});
 
 	it('a stale client speech EPISODE alone is not current speech evidence (canonical tracker only)', () => {
@@ -352,7 +762,7 @@ describe('P7 D7.2 matrix — round-3 honesty + ordering fixes', () => {
 			capCallbacks: s.clientTotals.capCallbacks - 700,
 		});
 		const r = evalWith(s, prev, { lastModelEventAt: NOW - 60_000 });
-		assert.notEqual(r.verdict, 'model-silent');
+		assert.notEqual(r.verdict, 'post-sdk-silent');
 		assert.ok(!r.reasons.includes('speech-without-model-event'));
 	});
 

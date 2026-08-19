@@ -64,7 +64,15 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
+from proactive_routing import fallback_claims_name  # noqa: E402
+
+
+def _slack_claims_name(name: str) -> bool:
+    """Filename-level claim decision — the policy lives in proactive_routing;
+    this adapter only binds its channel."""
+    return fallback_claims_name(name, "slack")
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
+import slack_access  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -306,14 +314,12 @@ def load_allowed():
 
     None vs empty-set: file-missing means never-configured (TOFU-eligible);
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        _update_access_cache(data)
-        return set(data.get("allowFrom", []))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return set()
+    access = slack_access.read_access(ACCESS_FILE)
+    # Only a record the shared reader accepted is worth caching; a malformed one
+    # would overwrite a good backup with a document nobody can authenticate from.
+    if access.record is not None:
+        _update_access_cache(access.record)
+    return access.allowed
 
 
 def load_tier_map() -> dict:
@@ -569,6 +575,13 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
     """Persist the Slack route before exposing its task file to the core."""
     _set_pending_reply(task_id, info)
     try:
+        # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+        # fail-open so a stamping error costs the stamp and never the task.
+        try:
+            from task_envelope import stamp_text  # sibling module (src/ on sys.path)
+            content = stamp_text(content, REPO)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception:
         _pop_pending_reply(task_id)
@@ -1603,6 +1616,9 @@ def result_watcher():
                         continue
                     if peek.startswith("[channel:") and \
                             re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                        continue
+                    # Explicit filename destination outranks the race.
+                    if not _slack_claims_name(f.name):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

@@ -1,10 +1,17 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh
+# Usage: bash src/startup.sh [--with-app]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job).
 
 set -e
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# --with-app is opt-in and parsed here so an unknown flag cannot silently do
+# nothing: every other argument is still ignored exactly as before.
+WITH_APP=0
+for _arg in "$@"; do
+    case "$_arg" in --with-app) WITH_APP=1 ;; esac
+done
 
 # Resolve python3 ONCE, refusing Apple's Xcode-CLT stub. On a Mac without the
 # developer tools `/usr/bin/python3` exists but raises a modal install dialog
@@ -713,16 +720,10 @@ fi
 _PROXY_LABEL="com.sutando.credential-proxy"
 _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
 if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
-  # Upgrade path (Codex re-review F1): an already-loaded job may carry a plist
-  # generated BEFORE SUTANDO_NODE existed (or with a different runtime) — a
-  # KeepAlive restart would then lose the pinned runtime. Compare the loaded
-  # plist's managed runtime to the current one and reinstall on drift (the
-  # installer bootout_if_loaded+bootstraps, so re-running over a live job is
-  # safe).
-  _PROXY_PLIST_DEST="$HOME/Library/LaunchAgents/$_PROXY_LABEL.plist"
-  _PROXY_PLIST_NODE="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:SUTANDO_NODE" "$_PROXY_PLIST_DEST" 2>/dev/null || true)"
-  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1 && [ "$_PROXY_PLIST_NODE" = "${SUTANDO_NODE:-}" ]; then
-    echo "  ✓ credential proxy (launchd-supervised, already loaded, runtime current)"
+  # An already-loaded job may carry a plist generated before the current pins existed;
+  # the installer owns that comparison because it owns what the plist renders.
+  if bash "$_PROXY_INSTALLER" is-current > /dev/null 2>&1; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded, config current)"
   else
     echo "  Installing launchd-supervised credential proxy (fresh or runtime drift)..."
     if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
@@ -743,7 +744,10 @@ if ! lsof -i :7846 > /dev/null 2>&1; then
   if [ "$BUNDLED_MODE" = "1" ]; then
     _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
   else
-    _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+    # Run the proxy from THIS checkout so it resolves the same workspace as the
+    # core/dashboard; fall back to the claude-home copy if the skill is absent.
+    _PROXY_SCRIPT="$REPO/skills/quota-tracker/scripts/credential-proxy.ts"
+    [ -f "$_PROXY_SCRIPT" ] || _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
   fi
   run_node_service credential-proxy "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
@@ -1341,6 +1345,20 @@ echo ""
 # must stay detached. Restoring /dev/tty there makes the runtime launcher try
 # to attach to sutando-core from inside tmux, which blocks startup forever and
 # leaves the old core running without completing recovery.
+# --with-app runs BEFORE the exec below (which replaces this process) and is
+# guarded: its installer must never take the core down (`set -e` is on).
+if [ "$WITH_APP" -eq 1 ]; then
+    # --launch, not --supervise: a login-persistent launchd job is a separate
+    # decision the user makes explicitly.
+    echo "→ menu-bar app (--with-app): building + launching" >&2
+    if bash "$REPO/scripts/install-menu-bar-app.sh" --launch; then
+        echo "  ✓ menu-bar app launched" >&2
+        echo "    auto-start at login is opt-in: bash scripts/install-menu-bar-app.sh --supervise" >&2
+    else
+        echo "  ✗ menu-bar app setup failed (exit $?) — the core is unaffected and still starting." >&2
+    fi
+fi
+
 if [ -t 0 ] && [ -z "${TMUX:-}" ]; then
     exec >/dev/tty 2>&1
 fi
