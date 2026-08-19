@@ -8,6 +8,8 @@ trap 'rm -rf "$TMP"' EXIT
 REPO="$TMP/repo"
 mkdir -p "$REPO/src" "$REPO/scripts" "$TMP/bin" "$TMP/home"
 cp "$REPO_REAL/src/startup-runtime.sh" "$REPO/src/startup-runtime.sh"
+# startup-runtime.sh sources its sibling resolver; a staged repo needs both.
+cp "$REPO_REAL/src/repo_root.sh" "$REPO/src/repo_root.sh"
 
 cat > "$REPO/scripts/sutando-config.sh" <<'SH'
 #!/bin/bash
