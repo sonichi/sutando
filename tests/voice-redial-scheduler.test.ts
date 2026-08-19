@@ -164,6 +164,20 @@ describe('noteLifecycle — pending-dial hygiene', () => {
 		assert.equal(r.state.failures, 1); // ladder survives the attempt
 	});
 
+	it('an attempt clears the stability credit — a new dial cannot inherit the old connection\'s', () => {
+		// The tick's safety-net dial reaches `attempt` with the PREVIOUS
+		// setupOkAt still set, because no close was observed to consume it.
+		// Preserving it made the next setup-failed look like a stable
+		// connection ending, resetting a 5-deep ladder to 1 (1s, not 32s) —
+		// exactly the churn the backoff exists to prevent.
+		let s: RedialState = { failures: 5, nextDialAt: 0, setupOkAt: 100_000 };
+		s = noteLifecycle(s, { kind: 'attempt' }, { now: 200_000, random: mid }).state;
+		assert.equal(s.setupOkAt, 0, 'credit from the dead connection must not carry');
+		const r = loss(s, 201_000, { kind: 'setup-failed' });
+		assert.equal(r.state.failures, 6, 'the ladder escalates, it does not reset');
+		assert.equal(r.scheduleDelayMs, 32_000);
+	});
+
 	it('setup-ok clears the pending dial', () => {
 		const s = loss(initialRedialState(), 100_000).state;
 		const r = noteLifecycle(s, { kind: 'setup-ok' }, { now: 100_500, random: mid });

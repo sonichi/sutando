@@ -74,7 +74,10 @@ export function noteLifecycle(
 	switch (ev.kind) {
 		case 'attempt':
 			// A dial is in flight — a stale pending dial must not fire under it.
-			return { state: { ...state, nextDialAt: 0 }, scheduleDelayMs: null };
+			// setupOkAt is cleared too: stability credit belongs to the connection
+			// that earned it, and the tick's safety-net dial reaches here with the
+			// previous setupOkAt still set (no close was observed to consume it).
+			return { state: { ...state, nextDialAt: 0, setupOkAt: 0 }, scheduleDelayMs: null };
 		case 'setup-ok':
 			return { state: { ...state, setupOkAt: o.now, nextDialAt: 0 }, scheduleDelayMs: null };
 		case 'attempt-close':
