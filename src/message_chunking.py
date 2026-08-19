@@ -81,9 +81,8 @@ def _closes_fence(closer: str, opener: str) -> bool:
     )
 
 
-# How far back from a forced split chunk_message searches for a blank line.
-# A quarter of the message budget: far enough to catch a paragraph break near
-# the boundary, small enough that chunks stay near max_len (no half-empty sends).
+# Blank-line lookback from a forced split: a quarter of the budget, so chunks
+# stay near max_len (no half-empty sends).
 _PARA_LOOKBACK = 475
 
 
@@ -137,9 +136,8 @@ def chunk_message(text: str, max_len: int = 1900):
         # Real fence-line detection (only at start of stripped line, not anywhere)
         opener_on_line = _is_fence_open_line(line)
 
-        # Keep a whole fence block together when it can fit in a chunk of its
-        # own: entering a fence near the cap forces a close/reopen split inside
-        # the block, which is the mid-evidence break readers actually notice.
+        # A fence block that fits a chunk alone must not be entered near the
+        # cap — that forces a close/reopen split inside the block.
         if opener_on_line is not None and fence_opener is None and buf:
             block_len = 0
             for look in lines[idx:]:
@@ -163,9 +161,8 @@ def chunk_message(text: str, max_len: int = 1900):
         reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
 
         if buf_len + line_overhead + reserve > max_len and buf:
-            # Outside a fence, prefer splitting at the last blank line within
-            # the lookback window over a hard line-budget cut: the paragraph is
-            # the unit a reader loses when a split lands inside it.
+            # Outside a fence, prefer the last blank line in the lookback
+            # window: the paragraph is what a reader loses to a mid-cut.
             cut = None
             if fence_opener is None:
                 scanned = 0

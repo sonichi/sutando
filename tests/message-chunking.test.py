@@ -197,9 +197,8 @@ check("para: no chunk ends mid-paragraph",
       all(c.split("\n")[-1].endswith("v" * 10) for c in pchunks[:-1]),
       str([c.split("\n")[-1][-20:] for c in pchunks[:-1]]))
 
-# Fence keep-whole: prose near the cap, then a 600-char fence block that fits a
-# chunk alone. The old chunker enters the fence and close/reopens it; the new
-# one starts the block in a fresh chunk, so no chunk carries a synthetic reopen.
+# Fence keep-whole: a block that fits alone must land intact in one chunk —
+# no synthetic close/reopen (the parent chunker's behavior).
 prose = "\n".join("prose line %d %s" % (i, "p" * 80) for i in range(18))
 fence_block = "```python\n" + "\n".join("code line %d" % i for i in range(30)) + "\n```"
 ftext = prose + "\n" + fence_block
