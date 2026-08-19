@@ -4065,7 +4065,7 @@ async def _handle_discord_message(message, force=False):
         # self-contained-judgment form (root-cause 2026-06-25).
         lines.append(
             f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
-            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str}` — '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str}` — '
             f'and read it back (everyone\'s messages including your own prior replies) '
             f'until this message stands on its own, then answer from the reconstructed '
             f'thread, NOT from memory. Do this every time; do NOT skip it because the '

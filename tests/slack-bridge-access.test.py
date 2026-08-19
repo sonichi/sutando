@@ -61,13 +61,20 @@ def main() -> int:
 
     src = BRIDGE.read_text()
 
-    # 1. load_allowed returns None on FileNotFoundError
+    # 1. load_allowed must not re-interpret the access record. Its None-vs-empty
+    #    -set behaviour is asserted in the shared-semantics suite instead.
     block = func_block(src, "load_allowed")
     if block is None:
         return fail("`load_allowed` function not found")
-    if not re.search(r"except\s+FileNotFoundError:\s*\n\s+return\s+None", block):
-        return fail("load_allowed must `return None` on FileNotFoundError "
-                    "(TOFU relies on None vs empty-set distinction)", block)
+    if not re.search(r"slack_access\.read_access\(", block):
+        return fail("load_allowed must read the record through slack_access, so the "
+                    "bridge and health-check cannot drift apart on what it means",
+                    block)
+    for pattern, what in ((r"json\.loads\(", "parses the record itself"),
+                          (r"set\(\s*data\.get\(", "re-interprets allowFrom itself")):
+        if re.search(pattern, block):
+            return fail(f"load_allowed still {what} — that policy belongs to "
+                        "slack_access, per the shared-adapter boundary", block)
 
     # 2. tofu_onboard exists with race-guard + 0o600 chmod
     tofu_block = func_block(src, "tofu_onboard")

@@ -159,8 +159,13 @@ class ReaderRedaction(unittest.TestCase):
     def test_filters_match_the_bridge(self):
         """Both consumers must apply the SAME two helpers from the SAME modules.
         `redact_vault_commands` exists in two modules with different defaults;
-        importing the wrong one silently diverges the reader from the bridge."""
-        src = SCRIPT.read_text()
+        importing the wrong one silently diverges the reader from the bridge.
+        Post-extraction the imports live ONCE in discord_reader; the CLI must
+        resolve the IDENTICAL function object (stronger than a source-string
+        match, which stays green when the call is disabled — REVIEW.md L13)."""
+        shared = sys.modules["discord_reader"]
+        self.assertIs(dr._redact, shared._redact)
+        src = (REPO / "src" / "discord_reader.py").read_text()
         self.assertIn("from chat_secret_filter import filter_chat_secrets", src)
         self.assertIn("from vault_intercept import redact_vault_commands", src)
 
@@ -212,11 +217,9 @@ class SiblingReaderRedaction(unittest.TestCase):
 
     def test_uses_the_same_two_helpers_as_the_bridge(self):
         """Both readers and the bridge must resolve the SAME policy, from the
-        same modules — `vault_set_grammar` exports a same-named function with a
-        different placeholder, so the import source is load-bearing."""
-        src = (REPO / "src" / "read_discord_channel.py").read_text()
-        self.assertIn("from chat_secret_filter import filter_chat_secrets", src)
-        self.assertIn("from vault_intercept import redact_vault_commands", src)
+        same modules. Post-extraction: identity against the shared module —
+        the import-source pin lives on discord_reader.py (one canonical file)."""
+        self.assertIs(self.rdc._redact, sys.modules["discord_reader"]._redact)
 
 
 if __name__ == "__main__":
