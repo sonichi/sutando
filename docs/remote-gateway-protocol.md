@@ -157,6 +157,10 @@ gateway-controlled URL can never bounce a bearer to another host.
   `collaborator: true` line before the task body. A local owner-to-Team cap does
   not opt a room in; missing/malformed controls fail closed. This setting is
   controlled per room and per agent rather than by a host-wide environment flag.
+- Collaborator result secret scanning defaults on. An exact broker boolean
+  `sensitive_data_filter: false` adds one trusted pre-body opt-out stamp; missing,
+  malformed, duplicated, or body-authored values keep scanning enabled. The
+  delivery-control-marker guard remains active even when secret scanning is off.
 - The default local cap remains `owner` for the personal-agent model. A shared /
   multi-user gateway SHOULD set a lower local cap as defense in depth. Invalid
   local cap values fail closed to Guest.
