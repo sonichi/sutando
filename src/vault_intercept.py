@@ -257,8 +257,12 @@ def intercept_vault_commands(text: str) -> InterceptResult:
         is_quoted = m.group(2) is not None or m.group(3) is not None or m.group(4) is not None
         if not is_quoted:
             try:
-                from secret_scanner import scan_secrets
+                from secret_scanner import DETECT_SECRETS_ACTIVE, scan_secrets
             except ImportError:
+                DETECT_SECRETS_ACTIVE = False
+            # Capability gate: the guarded import loads even when degraded,
+            # so an ImportError gate would skip this refusal (yixuan, #3103).
+            if not DETECT_SECRETS_ACTIVE:
                 # detect-secrets (the FP backstop) isn't installed. The vault-set
                 # regex is DELIBERATELY loose — it matches `vault set K V` anywhere,
                 # including mid-prose — and delegates false-positive rejection to

@@ -189,6 +189,7 @@ from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
 from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROVENANCE
+from . import team_result_guard
 from .outbox import DeliveryOutcome
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -205,6 +206,10 @@ GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled tas
 
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
+_WITHHELD_TASK_OUTPUT: "dict[str, tuple]" = {}
+_WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
+_WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
+_GATEWAY_OWNER_DM_HINT = ""
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
 # retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
@@ -554,10 +559,377 @@ def _token_from_vault_ag2space(vault_get=None):
 
 
 def _team_guard_fns():
-    """Return (guard_result_for_tier, resolve_access_tier) from the BUNDLED module.
-    Sibling import only — an installed wheel has no monorepo `src/` to walk to."""
-    from .team_result_guard import guard_result_for_tier, resolve_access_tier
-    return guard_result_for_tier, resolve_access_tier
+    """Load the BUNDLED guard; an installed wheel has no monorepo src/."""
+    from .team_result_guard import (
+        classify_result_for_tier,
+        materialize_withheld_verdict,
+        resolve_access_tier,
+        sensitive_data_filter_enabled,
+        withheld_review_path,
+    )
+    return (classify_result_for_tier, materialize_withheld_verdict,
+            resolve_access_tier, sensitive_data_filter_enabled,
+            withheld_review_path)
+
+
+def _atomic_private_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _read_private_json(path: Path) -> "dict | None":
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _gateway_owner() -> str:
+    global _GATEWAY_OWNER_DM_HINT
+    identity = _reenroll_identity()
+    answer = _req("GET", "/v1/agents")
+    agents = answer.get("agents") if isinstance(answer, dict) else None
+    if not isinstance(agents, list):
+        return ""
+    row = next((row for row in agents
+                if isinstance(row, dict) and row.get("id") == identity), None)
+    owner = str((row or {}).get("owner") or "")
+    hint = str((row or {}).get("owner_dm_room") or "")
+    _GATEWAY_OWNER_DM_HINT = hint if hint.startswith("!") else ""
+    return owner if owner.startswith("@") and ":" in owner else ""
+
+
+def _owner_review_dm(owner: str) -> str:
+    if _GATEWAY_OWNER_DM_HINT:
+        _atomic_private_json(_WITHHELD_DM_CACHE,
+                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT})
+        return _GATEWAY_OWNER_DM_HINT
+    cached = _read_private_json(_WITHHELD_DM_CACHE) or {}
+    room = str(cached.get("room_id") or "")
+    if cached.get("owner") == owner and room.startswith("!"):
+        return room
+    answer = _req("POST", "/v1/room", {
+        "op": "create", "invite": [owner], "is_direct": True,
+        "name": "Private result reviews",
+        "topic": "Owner-only review of results withheld from shared rooms.",
+    }, timeout=20)
+    room = str((answer or {}).get("room_id") or "")
+    if not room.startswith("!"):
+        raise RuntimeError("gateway did not return a private review room")
+    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room})
+    return room
+
+
+def _review_messages(record: dict) -> list[str]:
+    rid = str(record.get("review_id") or "")
+    origin = str((record.get("context") or {}).get("channel_id") or "")
+    body = str(record.get("withheld_body") or "")
+    header = (
+        f"**Private result review `{rid}`**\n\n"
+        "This result was withheld from the shared room because it may contain "
+        "sensitive information or delivery-control markers.\n\n"
+        f"Original room: `{origin}`\n\n")
+    decision = (
+        "Reply directly to this message with **Yes** to confirm it should stay "
+        "private, or **No** to mark it as a false positive and publish it to the "
+        f"original room. You can also reply `Yes {rid}` or `No {rid}`."
+    )
+    # Keep each /v1/room event below the homeserver ceiling. The last event is
+    # the decision prompt and bare Yes/No reply anchor.
+    chunk_chars = 12000
+    chunks = [body[i:i + chunk_chars] for i in range(0, len(body), chunk_chars)] or [""]
+    if len(chunks) == 1:
+        # The buttons renderer replaces its fallback body; keep the candidate
+        # in a preceding event so it remains visible for review.
+        return [header + "---\n" + chunks[0] + "\n---", decision]
+    messages = [header + f"Candidate result follows in {len(chunks)} parts."]
+    messages.extend(
+        f"**`{rid}` — part {index}/{len(chunks)}**\n\n{chunk}"
+        for index, chunk in enumerate(chunks, 1))
+    messages.append(f"**`{rid}` — review decision**\n\n{decision}")
+    return messages
+
+
+def _review_buttons(review_id: str) -> dict:
+    """A2UI button macros for the existing owner-decision grammar."""
+    return {
+        "version": "0.9",
+        "type": "buttons",
+        "prompt": "Does this result contain sensitive information?",
+        "options": [
+            {"label": "Yes — keep private", "action": f"Yes {review_id}"},
+            {"label": "No — publish to room", "action": f"No {review_id}"},
+        ],
+    }
+
+
+def _route_withheld_review(path: Path) -> bool:
+    record = _read_private_json(path)
+    if not record:
+        return False
+    if record.get("status") != "pending_dm":
+        return True
+    owner = _gateway_owner()
+    if not owner:
+        raise RuntimeError("gateway returned no registered owner")
+    room = _owner_review_dm(owner)
+    answer = None
+    messages = _review_messages(record)
+    for index, message in enumerate(messages, 1):
+        payload = {
+            "op": "message", "room_id": room, "body": message,
+            "mentions": [owner] if index == len(messages) else [],
+            "dedupe_key": f"withheld-review:{record['review_id']}:{index}",
+        }
+        if index == len(messages):
+            # Same additive content mechanism as the existing room-invite card.
+            # Non-AG2 clients ignore it and retain the typed Yes/No fallback.
+            payload["extra_content"] = {
+                "space.ag2.a2ui": _review_buttons(str(record["review_id"]))}
+        answer = _req("POST", "/v1/room", payload, timeout=20)
+        if not isinstance(answer, dict) or not answer.get("ok"):
+            raise RuntimeError(f"private review DM part {index}/{len(messages)} was not accepted")
+    record.update({"status": "awaiting_owner", "owner": owner, "dm_room_id": room,
+                   "dm_event_id": str(answer.get("event_id") or ""),
+                   "dm_sent_at": time.time()})
+    _atomic_private_json(path, record)
+    return True
+
+
+_REVIEW_DECISION_RE = re.compile(
+    r"^(yes|no)(?:\s+(wr_[0-9a-f]{16}))?[.!]?$", re.IGNORECASE)
+
+
+def _pending_review_records() -> list[tuple[Path, dict]]:
+    out = []
+    directory = _STATE / "withheld-team-results"
+    try:
+        paths = sorted(directory.glob("wr_*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        record = _read_private_json(path)
+        if record and record.get("status") in (
+                "awaiting_owner", "publish_pending", "kept_private", "published",
+                "publish_failed"):
+            out.append((path, record))
+    return out
+
+
+def _archive_resolved_review(path: Path, record: dict) -> bool:
+    if record.get("status") not in ("kept_private", "published", "publish_failed"):
+        return False
+    if record.get("card_resolution_pending"):
+        return False
+    archive = path.parent / "archive"
+    try:
+        archive.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(archive, 0o700)
+        path.replace(archive / path.name)
+    except OSError:
+        return False
+    return True
+
+
+def _decision_text(task: dict) -> str:
+    text = str(task.get("task") or "").strip()
+    # Button replies can follow the broker's quoted context envelope; only text
+    # after its exact closing marker is the decision.
+    text = re.sub(
+        r"^\[AG2 Space reply context;[^\]]*\].*?"
+        r"\[End AG2 Space reply context\]\s*",
+        "", text, count=1, flags=re.DOTALL)
+    text = re.sub(r"^\[AG2Space\s+[^\]]+\]\s*", "", text, count=1)
+    return text.strip()
+
+
+def _match_review_decision(task: dict) -> "tuple[Path, dict, str] | None":
+    # Re-resolve the owner tier, require the private room, and bind bare Yes/No
+    # to its review message. An explicit review id is still room-bound.
+    tier = _tier_for(task.get("user_id"), _normalized_tier(task.get("access_tier")))
+    if tier != "owner":
+        return None
+    match = _REVIEW_DECISION_RE.fullmatch(_decision_text(task))
+    if not match:
+        return None
+    answer, explicit_id = match.group(1).lower(), match.group(2)
+    room = str(task.get("channel_id") or "")
+    reply_to = str(task.get("reply_to_event") or "")
+    candidates = []
+    for path, record in _pending_review_records():
+        if room != str(record.get("dm_room_id") or ""):
+            continue
+        if str(task.get("user_id") or "") != str(record.get("owner") or ""):
+            continue
+        if explicit_id:
+            if explicit_id == record.get("review_id"):
+                candidates.append((path, record))
+        elif reply_to and reply_to == str(record.get("dm_event_id") or ""):
+            candidates.append((path, record))
+    return (*candidates[0], answer) if len(candidates) == 1 else None
+
+
+def _publish_review(path: Path, record: dict) -> bool:
+    context = record.get("context") or {}
+    room = str(context.get("channel_id") or "")
+    body = str(record.get("withheld_body") or "")
+    if not room.startswith("!") or not body:
+        record.update({"status": "publish_failed", "publish_error": "invalid origin/body",
+                       "card_resolution_pending": True})
+        _atomic_private_json(path, record)
+        return False
+    answer = _req("POST", "/v1/room", {
+        "op": "message", "room_id": room, "body": body,
+        "dedupe_key": f"withheld-publish:{record['review_id']}",
+    }, timeout=20)
+    if not isinstance(answer, dict) or not answer.get("ok"):
+        return False
+    record.update({"status": "published", "published_at": time.time(),
+                   "published_event_id": str(answer.get("event_id") or ""),
+                   "card_resolution_pending": True})
+    _atomic_private_json(path, record)
+    return True
+
+
+def _resolved_review_body(record: dict) -> str:
+    rid = str(record.get("review_id") or "")
+    decision = str(record.get("decision") or "")
+    status = str(record.get("status") or "")
+    if decision == "sensitive":
+        outcome = "Kept private — the owner confirmed it contains sensitive information."
+    elif status == "published":
+        outcome = "Published to the original room — the owner marked it as a false positive."
+    elif status == "publish_failed":
+        outcome = "False positive recorded, but publication failed and requires attention."
+    else:
+        outcome = "False positive recorded; publication to the original room is pending."
+    return f"**Private result review `{rid}` resolved**\n\n✓ {outcome}"
+
+
+def _resolve_review_card(path: Path, record: dict) -> bool:
+    room = str(record.get("dm_room_id") or "")
+    event_id = str(record.get("dm_event_id") or "")
+    if not room.startswith("!") or not event_id.startswith("$"):
+        return False
+    answer = _req("POST", "/v1/room", {
+        "op": "edit", "room_id": room, "event_id": event_id,
+        "body": _resolved_review_body(record),
+    }, timeout=20)
+    if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
+        return False
+    record.update({"card_resolution_pending": False,
+                   "card_resolved_at": time.time(),
+                   "card_resolution_event_id": str(answer.get("event_id") or "")})
+    _atomic_private_json(path, record)
+    _archive_resolved_review(path, record)
+    return True
+
+
+def _handle_review_decision(task: dict) -> bool:
+    task_id = str(task.get("id") or "")
+    if task_id and _control_result_path(task_id).is_file():
+        return True
+    matched = _match_review_decision(task)
+    if matched is None:
+        return False
+    path, record, answer = matched
+    if record.get("status") in ("kept_private", "published"):
+        _queue_review_control_result(task)
+        if record.get("card_resolution_pending"):
+            _resolve_review_card(path, record)
+        return True  # delivery retry of the same owner decision
+    if answer == "yes":
+        record.update({"status": "kept_private", "resolved_at": time.time(),
+                       "decision": "sensitive", "card_resolution_pending": True})
+        _atomic_private_json(path, record)
+        _queue_review_control_result(task)
+        try:
+            _resolve_review_card(path, record)
+        except Exception as exc:  # noqa: BLE001 — durable pending state retries
+            _log(f"withheld review {record.get('review_id')} card edit deferred: {exc}")
+        return True
+    # Persist release before the network call; pending retries use a stable
+    # dedupe key so they cannot duplicate the disclosure.
+    record.update({"status": "publish_pending", "resolved_at": time.time(),
+                   "decision": "false_positive", "card_resolution_pending": True})
+    _atomic_private_json(path, record)
+    _queue_review_control_result(task)
+    try:
+        _resolve_review_card(path, record)
+        if _publish_review(path, record):
+            _resolve_review_card(path, record)
+    except Exception as exc:  # noqa: BLE001 — durable pending state retries
+        _log(f"withheld review {record.get('review_id')} publish deferred: {exc}")
+    return True
+
+
+def _retry_pending_publications() -> None:
+    for path, record in _pending_review_records():
+        if record.get("status") != "publish_pending":
+            continue
+        try:
+            if not _publish_review(path, record):
+                _log(f"withheld review {record.get('review_id')} publish still pending")
+        except Exception as exc:  # noqa: BLE001 — next poll retries
+            _log(f"withheld review {record.get('review_id')} publish retry failed: {exc}")
+
+
+def _retry_review_card_resolutions() -> None:
+    for path, record in _pending_review_records():
+        if not record.get("card_resolution_pending"):
+            _archive_resolved_review(path, record)
+            continue
+        try:
+            if not _resolve_review_card(path, record):
+                _log(f"withheld review {record.get('review_id')} card edit still pending")
+        except Exception as exc:  # noqa: BLE001 — next poll retries
+            _log(f"withheld review {record.get('review_id')} card edit retry failed: {exc}")
+
+
+def _control_result_path(task_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)[:160]
+    return _WITHHELD_CONTROL_DIR / f"{safe}.json"
+
+
+def _queue_review_control_result(task: dict) -> None:
+    task_id = str(task.get("id") or "")
+    if not task_id:
+        return
+    path = _control_result_path(task_id)
+    if not path.is_file():
+        _atomic_private_json(path, {"id": task_id, "body": "[no-send]"})
+
+
+def _retry_review_control_results() -> None:
+    try:
+        paths = sorted(_WITHHELD_CONTROL_DIR.glob("*.json"))[:512]
+    except OSError:
+        return
+    for path in paths:
+        record = _read_private_json(path)
+        if not record or not record.get("id"):
+            continue
+        try:
+            _req("POST", "/v1/results", {
+                "id": record["id"], "body": record.get("body") or "[no-send]"})
+            path.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001 — next poll retries
+            _log(f"review control result {record.get('id')} retry deferred: {exc}")
 
 
 def _is_redelivery_control(body: str) -> bool:
@@ -577,8 +949,10 @@ def _guarded_result_body(tid: str, body: str):
     # not consume it — a deferred POST retries and needs the same provenance.
     if tid in _REDELIVERED and _is_redelivery_control(body):
         return body, None
+    if tid in _WITHHELD_TASK_OUTPUT:
+        return _WITHHELD_TASK_OUTPUT[tid]
     try:
-        guard, resolve = _team_guard_fns()
+        classify, materialize, resolve, filter_enabled, review_path = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
         return None, f"team_result_guard unavailable: {exc}"
@@ -586,7 +960,39 @@ def _guarded_result_body(tid: str, body: str):
     # Absence is not owner provenance: a month-archived Team task is exactly the
     # case that would otherwise fall open.
     tier = resolve(tfile) if tfile is not None else "guest"
-    return guard(body, tier, None, secret_filter=filter_chat_secrets)
+    scan_sensitive_data = filter_enabled(tfile, tier) if tfile is not None else True
+    context = {}
+    if tfile is not None:
+        try:
+            headers = local_task_protocol.parse_task_headers_trusted(
+                tfile.read_text(encoding="utf-8", errors="replace")).headers
+            context = {key: headers.get(key, "") for key in (
+                "source", "channel_id", "reply_to_event", "source_message_id", "user_id")}
+        except OSError:
+            pass
+    verdict = classify(
+        body, tier, None, secret_filter=filter_chat_secrets,
+        scan_sensitive_data=scan_sensitive_data)
+    is_leak = verdict.kind == "leak"
+    agent_id = _reenroll_identity()
+    verdict = materialize(
+        verdict, body, _STATE, tid, context=context, agent_id=agent_id,
+        now=time.time())
+    if is_leak:
+        artifact = review_path(_STATE, tid)
+        if not artifact.is_file():
+            return None, verdict.reason
+        try:
+            if not _route_withheld_review(artifact):
+                return None, f"{verdict.reason}; private owner review unavailable"
+        except Exception as exc:  # noqa: BLE001 — retain result file for retry
+            return None, f"{verdict.reason}; private owner review failed: {exc}"
+    result = (verdict.body, verdict.reason)
+    if verdict.reason is not None:
+        _WITHHELD_TASK_OUTPUT[tid] = result
+        if len(_WITHHELD_TASK_OUTPUT) > 512:
+            _WITHHELD_TASK_OUTPUT.pop(next(iter(_WITHHELD_TASK_OUTPUT)))
+    return result
 
 
 _VAULT_INTERCEPT_FNS: "tuple | None" = None
@@ -1839,6 +2245,8 @@ def _write_task(task: dict) -> str | None:
             # trusted execution-policy header before all untrusted body text.
             if collaborator_enabled:
                 lines.append("collaborator: true")
+                if task.get("sensitive_data_filter") is False:
+                    lines.append("sensitive_data_filter: false")
             # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
             # reaches the agent as body content (owner directive 2026-07-16) —
             # see _strip_room_ops_meta. Runs first so the stripped body is what
@@ -2230,9 +2638,8 @@ def _recover_orphan_proactive() -> None:
     claim (review blocker). Claims are pid-scoped (`.sending.<pid>`): a claim
     whose owner pid is alive is left alone; a dead owner's claim recovers
     immediately. Legacy bare `.sending` claims (no owner info) recover only
-    past an age threshold."""
-    if not PROACTIVE_ROOM:
-        return
+    past an age threshold. Runs without PROACTIVE_ROOM: a file naming its own room
+    is now drainable, so its orphan claims must recover too."""
     for f in list(RESULTS_DIR.glob("proactive-*.sending.*")) \
             + list(RESULTS_DIR.glob("proactive-*.sending")):
         name = f.name
@@ -2311,21 +2718,24 @@ def _post_proactive() -> None:
     file archives beside task results; a failed POST renames the claim back
     to `.txt` for retry on the next loop pass. Auth errors propagate to the
     caller (the poll loop owns auth handling); everything else is per-file
-    fail-open — one malformed nudge never blocks the rest. No-op without
-    PROACTIVE_ROOM. A host-injected PROACTIVE_CLAIM_GATE may defer a file
+    fail-open — one malformed nudge never blocks the rest. A file naming its own
+    Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
+    with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
     that belongs to another bridge (cross-bridge routing stays host policy)."""
-    if not PROACTIVE_ROOM:
-        return
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
         # claiming it here would leak the raw body (marker included) to the
         # gateway room and starve the real consumer (review blocker).
         try:
-            route, _, _ = _proactive_route(f.read_text(encoding="utf-8"))
+            route, peek_room, _ = _proactive_route(f.read_text(encoding="utf-8"))
         except OSError:
             continue  # racing consumer already claimed it
         if route == "foreign":
+            continue
+        # No target of its own AND no default: skip BEFORE claiming. Claiming it
+        # would spin (claim -> no destination -> hand back) on every pass.
+        if route == "send" and peek_room is None and not PROACTIVE_ROOM:
             continue
         if PROACTIVE_CLAIM_GATE is not None:
             try:
@@ -2362,9 +2772,10 @@ def _post_proactive() -> None:
                      f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
                      f"owner nudge stranded under live pid until restart")
             continue
-        if route == "foreign":
-            # A foreign destination that only became visible post-claim: hand
-            # the file back to its real consumer rather than eating it.
+        if route == "foreign" or (
+                route == "send" and room_override is None and not PROACTIVE_ROOM):
+            # Hand back rather than eat: a foreign target seen only post-claim,
+            # or one that vanished with no default (room_id=None loses the body).
             try:
                 claim.rename(f)
             except OSError:
@@ -2527,6 +2938,16 @@ def _dedup_plan(tid: str, holder_id: str | None):
     return action, payload, room
 
 
+def _result_tier(tid: str) -> "str | None":
+    """Resolve the task tier; unknown provenance stays on the guarded path."""
+    try:
+        tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+        return (team_result_guard.resolve_access_tier(tfile)
+                if tfile is not None else "guest")
+    except Exception:
+        return None
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -2535,13 +2956,18 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        body = read_ready_result(rfile)
-        if body is None:
+        raw = read_ready_result(rfile)
+        if raw is None:
             continue
-        # Non-owner output is scanned BEFORE any marker is interpreted:
-        # redirect/attach below are side effects on collaborator text.
-
-        body, _withheld = _guarded_result_body(tid, body)
+        # The guard owns the suppression verdict; this journaled transport
+        # applies it as a canonical stub with no collaborator-controlled bytes.
+        _tier = _result_tier(tid)
+        stub = (team_result_guard.suppression_stub_for_tier(raw, _tier)
+                if _tier is not None else None)
+        if stub is not None:
+            body, _withheld = stub, None
+        else:
+            body, _withheld = _guarded_result_body(tid, raw)
         if body is None:
             _log(f"result guard unavailable for {tid} — leaving for retry")
             continue
@@ -2592,7 +3018,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                     _log(f"delivery deferred for {tid} — alias ledger unreadable")
                     continue
                 _req("POST", "/v1/results",
-                     {"id": _broker_tid(_delivery), "body": body})
+                     {"id": _broker_tid(_delivery), "body": body,
+                      "no_send": True})
             except urllib.error.HTTPError as e:
                 _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
                 continue
@@ -3066,6 +3493,9 @@ def main() -> None:
                      "— exiting to avoid dual-poll")
                 return
             _post_heartbeat(inflight)
+            _retry_pending_publications()
+            _retry_review_card_resolutions()
+            _retry_review_control_results()
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
@@ -3078,6 +3508,11 @@ def main() -> None:
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
+                if _handle_review_decision(task):
+                    _queue_review_control_result(task)
+                    _retry_review_control_results()
+                    _log(f"consumed private review decision {task.get('id')}")
+                    continue
                 tid = _write_task(task)
                 if tid:
                     if tid not in inflight:
