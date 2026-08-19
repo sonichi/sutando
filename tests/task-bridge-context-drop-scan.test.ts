@@ -97,4 +97,14 @@ describe('scanDropTask', () => {
 			'task: User dropped context via hotkey. Process this:   \n');
 		assert.deepEqual(scanDropTask(p), { kind: 'incomplete' });
 	});
+
+	// Already handled: `\r` is a JS line terminator, so /m `$` matches before it.
+	// Pinned because `other` is permanent — a stricter rewrite would lose the drop.
+	it('a CRLF-written drop is a drop, not other', () => {
+		const p = write('task-1787158066666.txt',
+			'id: task-1787158066666\r\n' +
+			'source: context-drop\r\n' +
+			'task: User dropped context via hotkey. Process this: the selected paragraph\r\n');
+		assert.deepEqual(scanDropTask(p), { kind: 'drop', body: 'the selected paragraph' });
+	});
 });
