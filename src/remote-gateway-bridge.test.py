@@ -627,6 +627,13 @@ def main() -> int:
     STATE["results"].pop()
     (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
     (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    # Destined filenames outrank the gate's activity/grace logic entirely.
+    check(rtc._ag2space_proactive_claim_gate(
+              Path("proactive-1.to-ag2space.txt")) is True,
+          "gateway gate claims its own destined file unconditionally")
+    check(rtc._ag2space_proactive_claim_gate(
+              Path("proactive-1.to-discord.txt")) is False,
+          "gateway gate refuses a foreign destined file")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -1131,6 +1138,12 @@ def main() -> int:
     check((rtc.RESULTS_DIR / "proactive-t8.txt").exists(),
           "aged legacy .sending claim recovered")
     (rtc.RESULTS_DIR / "proactive-t8.txt").unlink()
+    # Destined names ride the same pid-scoped recovery unchanged (#3113).
+    (rtc.RESULTS_DIR / f"proactive-t9.to-discord.sending.{dead_pid}").write_text("destined orphan")
+    rtc._recover_orphan_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t9.to-discord.txt").exists(),
+          "dead-owner claim on a DESTINED name recovers with its tag intact")
+    (rtc.RESULTS_DIR / "proactive-t9.to-discord.txt").unlink()
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["body"] == "orphan nudge",
           "recovered orphan delivers on next drain")
