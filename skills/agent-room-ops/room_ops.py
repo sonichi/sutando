@@ -13,6 +13,7 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py unreact <room> <event_id> (--ack … | --key …) [--agent mxid]
     python3 room_ops.py join   <room> [--agent mxid]                 # accept own invite
     python3 room_ops.py rooms  [--agent mxid]                        # joined-rooms list
+    python3 room_ops.py members <room_id> [--agent mxid]             # room member list
     python3 room_ops.py events subscribe <room> --types a,b [--filters json]
     python3 room_ops.py events unsubscribe <room>
     python3 room_ops.py events list
@@ -38,7 +39,9 @@ import react as _react     # noqa: E402
 import join as _join       # noqa: E402
 import resolve as _resolve # noqa: E402
 import mention as _mention # noqa: E402
+import say as _say         # noqa: E402
 import rooms as _rooms     # noqa: E402
+import members as _members # noqa: E402
 import events as _events   # noqa: E402
 
 
@@ -135,6 +138,10 @@ def _main(argv):
     p = sub.add_parser("rooms", help="list this agent's joined rooms")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    p = sub.add_parser("members", help="list a room's members (user_id, display name, kind)")
+    p.add_argument("room_id")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
     p = sub.add_parser("events", help="event subscriptions + delivery (#184 client half)")
     esub = p.add_subparsers(dest="events_cmd", required=True)
     e = esub.add_parser("subscribe", help="subscribe this agent to a room's events")
@@ -166,6 +173,11 @@ def _main(argv):
     p.add_argument("handle")
     p.add_argument("message")
     p.add_argument("room_id")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
+    p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
+    p.add_argument("room_id")
+    p.add_argument("message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
@@ -210,6 +222,8 @@ def _main(argv):
         res = _join.join_room(a.room_id, a.agent_mxid)
     elif a.cmd == "rooms":
         res = _rooms.joined_rooms(a.agent_mxid)
+    elif a.cmd == "members":
+        res = _members.room_members(a.room_id, a.agent_mxid)
     elif a.cmd == "events":
         if a.events_cmd == "stream":
             return _events_stream(a)  # prints JSONL itself; summary is one line
@@ -218,6 +232,8 @@ def _main(argv):
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
         res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid)
+    elif a.cmd == "say":
+        res = _say.say(a.message, a.room_id, a.agent_mxid)
     elif a.cmd == "grant":
         import grant as _grant
         try:

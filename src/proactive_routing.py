@@ -30,6 +30,7 @@ duplicate to every configured bridge.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 # Channels whose bridges actually deliver `proactive-*.txt` files.
@@ -46,7 +47,11 @@ from pathlib import Path
 # `github-commits`, anything else) returned False for BOTH bridges,
 # silently stranding the proactive file in `results/` until the
 # next discord/telegram message restored a known activity channel.
-BRIDGE_CHANNELS = frozenset({"discord", "telegram"})
+#
+# `ag2space` is the desktop gateway bridge (remote-gateway-bridge's
+# owner-DM drain); its owner-activity writer stamps that channel on
+# every owner message from the AG2 Space app.
+BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space"})
 
 
 def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
@@ -62,7 +67,7 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
         messages right now. The decision rule:
 
           1. State file says ``data["channel"]`` is a known BRIDGE
-             channel (discord / telegram) → claim only when
+             channel (discord / telegram / ag2space) → claim only when
              ``last_channel == this_channel``. This is the message-
              routing match — owner was last reading there, follow-up
              goes there.
@@ -99,3 +104,50 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     # most recently interacted on a surface that doesn't deliver DMs.
     # Default Discord rather than strand the proactive file.
     return this_channel == "discord"
+
+
+# The .to-<channel> tag rides between stem and suffix (globs/claims keep it).
+# Unlike the [channel:] BODY marker (room redirect), it selects WHICH BRIDGE.
+
+# Slack is deliberately a destination but NOT a BRIDGE_CHANNEL: it races
+# without activity routing — aimable, never the undestined-activity winner.
+PROACTIVE_DESTINATIONS = frozenset(BRIDGE_CHANNELS | {"slack"})
+
+_DESTINATION_RE = re.compile(r"\.to-([a-z0-9_-]+)\.txt\Z")
+
+
+def proactive_filename(ts, channel: "str | None" = None) -> str:
+    """Typed constructor — the only way to spell a destined proactive name.
+    Writer and every claiming reader share this grammar (phone-key precedent:
+    a private spelling on either side re-creates the cross-bridge race)."""
+    if channel is None:
+        return f"proactive-{ts}.txt"
+    if channel not in PROACTIVE_DESTINATIONS:
+        raise ValueError(f"unknown proactive destination {channel!r}")
+    return f"proactive-{ts}.to-{channel}.txt"
+
+
+def proactive_destination(name) -> "str | None":
+    """The declared destination, or None for legacy/undestined names. An
+    unrecognized tag still reads as a destination: a file aimed at a channel
+    this install lacks must strand visibly, never fall into another
+    bridge's race."""
+    m = _DESTINATION_RE.search(Path(name).name)
+    return m.group(1) if m else None
+
+
+def should_claim_proactive_file(name, state_file_path: Path,
+                                this_channel: str) -> bool:
+    """Per-FILE claim decision: destination outranks activity routing."""
+    dest = proactive_destination(name)
+    if dest is not None:
+        return dest == this_channel
+    return should_claim_proactive(state_file_path, this_channel)
+
+
+def fallback_claims_name(name, this_channel: str) -> bool:
+    """Per-file gate for a channel's catch-all fallback (no activity routing):
+    a foreign or unknown .to-<channel> tag is never claimed — an explicit
+    destination strands visibly rather than falling into another channel's
+    fallback sweep."""
+    return proactive_destination(name) in (None, this_channel)

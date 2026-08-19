@@ -21,7 +21,7 @@ description: Re-anchor on the durable record (current-track, live owner thread, 
 
 Then, as the situation needs (pick what's *relevant*; skip what isn't):
 
-- **The live thread** — the channel(s) the owner is actually active on: `python3 src/discord-read.py <channel_id>` (Discord), telegram task `[Replying to…]` quotes (Telegram has no history fetch). Go **as deep as the thread needs** with `--until <id|iso>` — not a fixed message count. If unsure which channel is live, check the most recent task's `channel_id` / `state/last-owner-activity.json`.
+- **The live thread** — the channel(s) the owner is actually active on: `python3 src/discord-read.py <channel_id> --serving <task channel_id>` when serving a task (the contextNotFrom gate runs before the fetch), or `--operator` on autonomous passes with no serving context (Discord), telegram task `[Replying to…]` quotes (Telegram has no history fetch). Go **as deep as the thread needs** with `--until <id|iso>` — not a fixed message count. If unsure which channel is live, check the most recent task's `channel_id` / `state/last-owner-activity.json`.
 - **Open decisions** — per-host `pending-questions.md`.
 - **Recent judgment/decisions** — latest `relay/relay-*.md`.
 - **What's built / next** — `build_log.md` tail.
@@ -58,3 +58,49 @@ When the thing in front of you isn't self-contained — terse ("y", "no", "?", a
   **The guidance is unchanged — do not re-add the flat path — but the reason is cross-host CONTENT DELIVERY on a shared path, NOT data loss.** Keeping the wrong reason here mattered: this file is loaded on every proactive-loop pass via step 0.7, so it re-taught a claim the owner had already retracted, and on 2026-08-04 I repeated "destroyed a 1056-line anchor" back to Chi from it. A retraction has to reach the file that gets *read*, not only the file that learned it.
 
   Note the 2026-06-25 entry above is left as written — it was true then.
+
+- **2026-08-13 — the first entry here that is NOT "I did not read." I read, and the reader returned a
+  plausible partial result.** Every entry above assumes the agent is the unreliable part, and the fix
+  is always *go read the durable record*. This one is about the record's **reader** being unreliable,
+  and it defeats the whole step silently.
+
+  A history read returned only messages from a recent cutoff onward — at every limit up to 1000 —
+  while a local archive held months of earlier traffic from the same source. Probed with known ids
+  from before the cutoff: **0 returned**, with a positive control confirming the id field was
+  populated on every message it *did* return, so the zero was absence rather than an empty field.
+
+  **The property to carry: an agent cannot distinguish a plausible partial result from a complete
+  one.** A windowed read and a genuinely short thread are the same object from inside. So step 0.7's
+  "reconstruct the live thread" can report success while returning almost nothing, and felt
+  compliance is exactly as unreliable here as felt confidence is everywhere else in this file.
+
+  **What to do instead.** When a reconstruction returns fewer items than the situation implies, treat
+  the shortfall as *unexplained* until something **outside that reader** accounts for it. Three cheap
+  discriminating probes, in order:
+
+  1. **Ask for FEWER items than certainly exist.** This pins what any "complete" flag means. If the
+     flag is just `returned == requested`, it is not a truncation signal at all.
+  2. **Ask again after new activity.** Does the count grow, or does the window slide? A *wider*
+     window returning *fewer* results proves the reader is not enumerating.
+  3. **Check against an independent record of what arrived** — and verify that record measures the
+     thing you are about to name.
+
+  **Probe 3 is where the second mistake lives.** An outside record is not automatically trustworthy:
+
+  - **Match on the field, never a bare substring.** A substring search over a message corpus also
+    matches items that merely *quote* the identifier, which silently widens the population.
+  - **A file mtime is a proxy that is `>=` the event time, and its tail is brutal.** Calibrated over
+    2678 files carrying both a declared timestamp and an mtime: median lag **+1s**, maximum lag
+    **8.1 days**. An excellent proxy almost always and catastrophically wrong occasionally — the worst
+    possible shape, because a small sample lands in the well-behaved majority and reads as
+    confirmation. **Quote a max, never a rate**: measured across three populations the tail frequency
+    spans two orders of magnitude (0.1% / 5.5% / 20%), so the rate is a property of the corpus, not of
+    the archive. Name the corpus and the filter with any such number.
+  - Look for **an era or subset where ground truth was recorded for a different reason** — here, older
+    files still carried a declared timestamp that the current schema had dropped. That is usually
+    where calibration data hides when the present has none.
+
+  **And "two independent methods" must mean methods with different FAILURE MODES**, not two
+  invocations. Two calls that share a cutoff, a corpus, or a path convention can agree perfectly while
+  omitting the same thing. Independence is semantic, and the only way to establish it is to have seen
+  the two disagree on a case where you know the answer.
