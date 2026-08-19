@@ -286,8 +286,8 @@ def suppressed_record_path(state_dir: Path, task_id: str) -> Path:
 
 def materialize_suppressed_verdict(verdict: TeamResultVerdict, body: str,
                                    state_dir: Path, task_id: str, context=None,
-                                   agent_id: str = "", now=None,
-                                   stub: str = "[no-send]") -> TeamResultVerdict:
+                                   agent_id: str = "", now=None, *,
+                                   stub: str) -> TeamResultVerdict:
     """Realise a notice-bearing SUPPRESS as a journaled close carrying `stub`.
 
     The record requirement is the policy, not the notice: once the suppression

@@ -92,7 +92,8 @@ def main() -> int:
 
     # f) An already-silent suppress is returned untouched.
     silent = guard.TeamResultVerdict(guard.VERDICT_SUPPRESS, "[no-send]", "prior")
-    out = guard.materialize_suppressed_verdict(silent, body, state, "task-77")
+    out = guard.materialize_suppressed_verdict(
+        silent, body, state, "task-77", stub="[no-send]")
     check(out == silent, "f) an already-silent suppress is not re-journaled")
 
     # g) The WRITE raises after the directory exists. Case (d) fails at mkdir and
@@ -129,6 +130,19 @@ def main() -> int:
         check(got_i == want, f"i) {src_body.splitlines()[0]} -> {want!r}, got {got_i!r}")
         check(got_i == guard.suppression_stub_for_tier(src_body, "team"),
               "i) and it equals suppression_stub_for_tier (one policy, not two)")
+
+    # j) A default stub would let a future caller silently reinstate the
+    #    flattening. The signature, not the docstring, has to refuse.
+    try:
+        guard.materialize_suppressed_verdict(
+            guard.TeamResultVerdict(guard.VERDICT_SUPPRESS,
+                                    guard.TEAM_SUPPRESS_RESULT, "r"),
+            "[REPLIED]\nx", pathlib.Path(tempfile.mkdtemp(prefix="tg-suppress-j-")),
+            "task-j")
+    except TypeError:
+        check(True, "j) omitting stub is a TypeError, not a silent [no-send]")
+    else:
+        check(False, "j) omitting stub was ACCEPTED -- the default is back")
 
     print()
     if FAILS:
