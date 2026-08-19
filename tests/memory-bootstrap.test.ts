@@ -3,9 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, existsSync, readFileSync, mkdtempSync, rmSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
-import { claudeProjectSlug } from '../src/util_paths.js';
-
-const VOICE_AGENT = readFileSync(join(import.meta.dirname, '..', 'src', 'voice-agent.ts'), 'utf-8');
+import { claudeProjectSlug, voiceMemoryProjectSlug } from '../src/util_paths.js';
 
 /**
  * Tests for bootstrapMemoryDir() in src/voice-agent.ts.
@@ -100,12 +98,8 @@ describe('bootstrapMemoryDir — no-clobber on existing index', () => {
 
 describe('bootstrapMemoryDir — env override', () => {
 	it('derives the production slug from the repo root, not the workspace', () => {
-		assert.match(
-			VOICE_AGENT,
-			/const repoRoot = fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\)\.replace\(\/\[\\\\\/\]\+\$\//,
-		);
-		assert.match(VOICE_AGENT, /const slug = claudeProjectSlug\(repoRoot\)/);
-		assert.doesNotMatch(VOICE_AGENT, /claudeProjectSlug\(WORKSPACE_DIR/);
+		assert.equal(voiceMemoryProjectSlug('/Users/test/GitHub/sutando/src'), '-Users-test-GitHub-sutando');
+		assert.equal(voiceMemoryProjectSlug('Q:\\Repos\\sutando\\src'), 'Q--Repos-sutando');
 	});
 
 	it('uses SUTANDO_MEMORY_DIR when provided instead of the slug-derived default', () => {
@@ -150,7 +144,9 @@ describe('bootstrapMemoryDir — env override', () => {
 });
 
 describe('bootstrapMemoryDir — failure-silent', () => {
-	it('returns an error string instead of throwing when the parent is unwritable', () => {
+	it('returns an error string instead of throwing when the parent is unwritable', {
+		skip: process.platform === 'win32',
+	}, () => {
 		const lockedParent = join(scratch, 'locked');
 		mkdirSync(lockedParent, { recursive: true });
 		chmodSync(lockedParent, 0o500); // r-x — cannot create children

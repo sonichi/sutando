@@ -84,8 +84,8 @@ bootout_if_loaded() {
 }
 
 resolve_python() {
-    # Prefer Homebrew python3 — system /usr/bin/python3 is 3.9 on older Macs
-    # and cron-runner.py uses 3.10+ syntax (set[int] / int | None hints).
+    # Prefer Homebrew python3 — NOT for the version (cron-runner.py runs on 3.9)
+    # but because /usr/bin/python3 is the Xcode-CLT stub, REVIEW.md lesson 7.
     if [ -x /opt/homebrew/bin/python3 ]; then
         echo /opt/homebrew/bin/python3
     elif [ -x /usr/local/bin/python3 ]; then
