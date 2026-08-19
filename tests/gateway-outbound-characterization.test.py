@@ -32,16 +32,39 @@ class _Base(unittest.TestCase):
         root = Path(self.tmp.name)
         self._saved = {n: getattr(gw, n) for n in (
             "TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR",
-            "UNDELIVERABLE_RESULTS_DIR", "_req", "_delivery_tid", "_log",
-            "_broker_tid")}
+            "UNDELIVERABLE_RESULTS_DIR", "_STATE", "_WITHHELD_DM_CACHE",
+            "_WITHHELD_CONTROL_DIR", "_GATEWAY_OWNER_DM_HINT", "_req",
+            "_WITHHELD_TASK_OUTPUT", "_delivery_tid", "_log", "_broker_tid",
+            "_reenroll_identity")}
         gw.TASKS_DIR = root / "tasks"
         gw.RESULTS_DIR = root / "results"
         gw.ARCHIVE_RESULTS_DIR = gw.RESULTS_DIR / "archive"
         gw.UNDELIVERABLE_RESULTS_DIR = gw.RESULTS_DIR / "undelivered"
+        gw._STATE = root / "state"
+        gw._WITHHELD_DM_CACHE = gw._STATE / "withheld-review-dm.json"
+        gw._WITHHELD_CONTROL_DIR = gw._STATE / "withheld-review-control-results"
+        gw._GATEWAY_OWNER_DM_HINT = ""
+        gw._WITHHELD_TASK_OUTPUT = {}
         for d in (gw.TASKS_DIR, gw.RESULTS_DIR):
             d.mkdir(parents=True)
         self.posted = []
-        gw._req = lambda m, path, payload=None: self.posted.append((m, path, payload))
+        self.room_posts = []
+
+        def request(method, path, payload=None, **_kwargs):
+            if (method, path) == ("GET", "/v1/agents"):
+                return {"agents": [{
+                    "id": "agent-test",
+                    "owner": "@owner:example.test",
+                    "owner_dm_room": "!owner:example.test",
+                }]}
+            if (method, path) == ("POST", "/v1/room"):
+                self.room_posts.append(payload)
+                return {"ok": True, "event_id": "$owner-review"}
+            self.posted.append((method, path, payload))
+            return {"ok": True}
+
+        gw._req = request
+        gw._reenroll_identity = lambda: "agent-test"
         gw._delivery_tid = lambda tid: tid
         gw._broker_tid = lambda tid: tid
         gw._log = lambda m: None
@@ -119,12 +142,16 @@ class MarkerHandling(_Base):
 
     def test_missing_task_provenance_withholds_markers(self):
         """Absence is not owner provenance: with no task file the guard
-        resolves guest and marker bodies are withheld, not honoured."""
+        resolves guest, routes private owner review, and closes the lease
+        without honouring the marker in the shared room."""
         f = gw.RESULTS_DIR / f"{TID}.txt"
         f.write_text("[channel: C123ABC]\nthe reply")
         gw._post_ready_results({TID})
         self.assertEqual(len(self.posted), 1)
         self.assertNotIn("[channel: C123ABC]", self.posted[0][2]["body"])
+        self.assertEqual(self.posted[0][2]["body"], "[no-send]")
+        self.assertTrue(any("Private result review" in post["body"]
+                            for post in self.room_posts))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

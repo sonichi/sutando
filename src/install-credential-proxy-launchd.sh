@@ -9,6 +9,7 @@
 #   bash src/install-credential-proxy-launchd.sh             # install
 #   bash src/install-credential-proxy-launchd.sh --uninstall # remove
 #   bash src/install-credential-proxy-launchd.sh --status    # print job state
+#   bash src/install-credential-proxy-launchd.sh is-current  # exit 0 if loaded job matches
 #
 # Idempotent: re-running install bootouts the existing job and reloads so a
 # git pull that changes the template is picked up.
@@ -54,6 +55,54 @@ resolve_brew_bin() {
     fi
 }
 
+# Load the interpreter resolver once. Lazy, not top-level: `set -e` is on, so a
+# top-level source aborts before an earlier refusal can name its own reason.
+_load_python_helper() {
+    [ -n "${_PY_HELPER_LOADED:-}" ] && return 0
+    # shellcheck source=../scripts/python-binary.sh
+    . "$REPO/scripts/python-binary.sh" || return 1
+    _PY_HELPER_LOADED=1
+}
+
+# Render the template to $1 with this checkout's values. ONE renderer, shared with
+# is-current, so the check can never compare fewer fields than the install writes.
+render_plist() {
+    local _brew _ccd _py
+    _brew="$(resolve_brew_bin)"
+    # The RESOLVED dir, not the raw var: an unset var must pin the default the install
+    # validated, not an empty string.
+    _ccd="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
+    [ -n "$_ccd" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; return 1; }
+    _load_python_helper || return 1
+    _py="$(require_python "$REPO" "render the credential-proxy launchd plist")" || return 1
+    "$_py" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$1" \
+        "REPO=$REPO" \
+        "WORKSPACE=$WORKSPACE" \
+        "BREW_BIN=$_brew" \
+        "SUTANDO_NODE=${SUTANDO_NODE:-}" \
+        "CLAUDE_CONFIG_DIR=$_ccd" \
+        "HOME=$HOME"
+}
+
+# Semantic plist equality. plistlib, not PlistBuddy: the latter is macOS-only, so on
+# Linux CI every read returns empty and any comparison passes vacuously.
+# resolve_python, not require_python: is-current runs on every boot and must stay
+# silent — no interpreter means "cannot compare", which the caller treats as drift.
+plists_equal() {
+    local _py
+    _load_python_helper || return 1
+    _py="$(resolve_python "$REPO")"
+    [ -n "$_py" ] || return 1
+    "$_py" - "$1" "$2" <<'PLISTPY'
+import plistlib, sys
+try:
+    with open(sys.argv[1], "rb") as a, open(sys.argv[2], "rb") as b:
+        sys.exit(0 if plistlib.load(a) == plistlib.load(b) else 1)
+except Exception:
+    sys.exit(1)
+PLISTPY
+}
+
 bootout_if_loaded() {
     if launchctl print "$SERVICE" >/dev/null 2>&1; then
         echo "  Existing job found, removing first..."
@@ -95,7 +144,12 @@ case "$cmd" in
                 exit 1
             fi
         else
-            _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+            # Run the proxy from THIS checkout: it resolves its workspace file-relatively,
+            # so another clone's copy would write quota-state.json where nothing reads it.
+            _PROXY_SCRIPT="$REPO/skills/quota-tracker/scripts/credential-proxy.ts"
+            if [ ! -f "$_PROXY_SCRIPT" ]; then
+                _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+            fi
             if [ ! -f "$_PROXY_SCRIPT" ]; then
                 echo "ERROR: quota-tracker skill not found at $_PROXY_SCRIPT" >&2
                 echo "  Install it first — credential-proxy.ts is the proxy target." >&2
@@ -114,17 +168,7 @@ case "$cmd" in
         echo "  config:    $CLAUDE_CFG"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
-        # Escaping renderer + resolved interpreter: a bare python3 can be the
-        # Xcode-CLT stub, which passes an existence check and raises the dialog.
-        . "$REPO/scripts/python-binary.sh"
-        _PY="$(require_python "$REPO" "install the credential-proxy launchd job")" || exit 1
-        "$_PY" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$DEST" \
-            "REPO=$REPO" \
-            "WORKSPACE=$WORKSPACE" \
-            "BREW_BIN=$BREW_BIN" \
-            "SUTANDO_NODE=${SUTANDO_NODE:-}" \
-            "CLAUDE_CONFIG_DIR=$CLAUDE_CFG" \
-            "HOME=$HOME" || exit 1
+        render_plist "$DEST" || exit 1
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"
@@ -145,6 +189,17 @@ case "$cmd" in
         fi
         echo "Done."
         ;;
+    is-current|--is-current)
+        # Exit 0 only if the loaded plist equals what an install would render NOW.
+        # Whole-plist, not named fields: enumerating them is what missed the last two.
+        launchctl print "$SERVICE" >/dev/null 2>&1 || exit 1
+        [ -f "$DEST" ] || exit 1
+        [ -f "$TEMPLATE" ] || exit 1
+        _want="$(mktemp)"
+        trap 'rm -f "$_want"' EXIT
+        render_plist "$_want" || exit 1
+        plists_equal "$DEST" "$_want" || exit 1
+        ;;
     --status|status)
         echo "Service: $SERVICE"
         if launchctl print "$SERVICE" >/dev/null 2>&1; then
@@ -154,7 +209,7 @@ case "$cmd" in
         fi
         ;;
     *)
-        echo "Usage: $0 [install|--uninstall|--status]" >&2
+        echo "Usage: $0 [install|--uninstall|--status|is-current]" >&2
         exit 2
         ;;
 esac
