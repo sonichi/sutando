@@ -3,7 +3,10 @@
   "documents": {
     "docs/design-credential-capability-resolver.md": {
       "title": "Credential resolution by capability, not key (G8)",
-      "audience": ["contributors", "maintainers"],
+      "audience": [
+        "contributors",
+        "maintainers"
+      ],
       "status": "draft",
       "canonical_for": "the capability-not-key credential-resolver contract: tier order, managed-file schema, source observability, and the reader-sweep migration plan",
       "last_verified": "2026-08-05"
@@ -61,7 +64,7 @@
       ],
       "status": "canonical",
       "canonical_for": "built-in capability catalog",
-      "last_verified": "2026-07-29"
+      "last_verified": "2026-08-13"
     },
     "docs/codex-core.md": {
       "title": "Codex CLI as the Sutando core",
@@ -75,7 +78,10 @@
     },
     "docs/design-mediated-capability-layer.md": {
       "title": "Mediated capability layer",
-      "audience": ["contributors", "maintainers"],
+      "audience": [
+        "contributors",
+        "maintainers"
+      ],
       "status": "draft",
       "canonical_for": "proposed privileged-capability mediation, authorization, and audit model",
       "last_verified": "2026-08-04"
@@ -151,7 +157,7 @@
       "last_verified": null
     },
     "docs/runtime/claude-hook-contract-v1.md": {
-      "title": "Claude Code Hook Contract \u2014 v1",
+      "title": "Claude Code Hook Contract — v1",
       "audience": [
         "contributors",
         "maintainers"
@@ -283,6 +289,66 @@
       "status": "draft",
       "canonical_for": "the single authoritative severity-tagged core-health verdict and the report-vs-restart severity gate",
       "last_verified": "2026-08-02"
+    },
+    "docs/access-control.md": {
+      "title": "Channel access control (moved from CLAUDE.md)",
+      "audience": [
+        "agents",
+        "contributors"
+      ],
+      "status": "active",
+      "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, ambient taskify provenance",
+      "last_verified": "2026-08-18"
+    },
+    "docs/migration-transition-window.md": {
+      "title": "Migration transition window (moved from CLAUDE.md)",
+      "audience": [
+        "agents",
+        "contributors"
+      ],
+      "status": "active",
+      "canonical_for": "the 30-day reader-fallback policy after sutando-migrate commit and its cleanup step",
+      "last_verified": "2026-08-17"
+    },
+    "docs/learn-from-demonstration.md": {
+      "title": "Learn from demonstration (moved from CLAUDE.md)",
+      "audience": [
+        "agents",
+        "contributors"
+      ],
+      "status": "active",
+      "canonical_for": "the extract/classify/index/confirm procedure for owner-taught preferences and workflows",
+      "last_verified": "2026-08-17"
+    },
+    "docs/tutorial-delivery.md": {
+      "title": "Tutorial delivery (moved from CLAUDE.md)",
+      "audience": [
+        "agents",
+        "contributors"
+      ],
+      "status": "active",
+      "canonical_for": "the section-by-section voice-friendly tutorial walkthrough procedure",
+      "last_verified": "2026-08-17"
+    },
+    "docs/claude-md-moved-detail.md": {
+      "title": "CLAUDE.md moved detail (context-budget diet)",
+      "audience": [
+        "agents",
+        "contributors"
+      ],
+      "status": "active",
+      "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema",
+      "last_verified": "2026-08-17"
+    },
+    "docs/sparrow-v1-contract.md": {
+      "title": "ag2-sparrow v1 — the frozen delivery contract",
+      "audience": [
+        "contributors",
+        "maintainers"
+      ],
+      "status": "draft",
+      "canonical_for": "the v1 seven-link delivery chain, identity rules, provider capability declarations, and named v1 gaps",
+      "last_verified": "2026-08-18"
     }
   }
 }

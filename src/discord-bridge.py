@@ -30,6 +30,45 @@ from pathlib import Path
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
+
+class _NeverFatalStream:
+    """Logging must never take delivery down.
+
+    Because the streams above are LINE-buffered, every `print()` flushes at the
+    newline — so if the far end of stdout goes away (supervisor exits, pipe
+    closed, launcher reaped), that flush raises `BrokenPipeError` *inside
+    whatever code was logging*, not at some later flush point.
+
+    Swallow ONLY OSError (the EPIPE/EBADF class). A logging failure is not a
+    reason to stop delivering; anything else still propagates so real bugs are
+    not masked.
+    """
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except OSError:
+            # Report the write as accepted: callers must not branch on it.
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _NeverFatalStream(sys.stdout)
+sys.stderr = _NeverFatalStream(sys.stderr)
+
 # Self-rescue: this bridge HAS to keep running — Discord is the primary channel
 # the owner uses to reach Sutando. If `python3` on $PATH happens to resolve to
 # an interpreter that lacks `discord.py` (e.g. miniconda's python on a Mac that
@@ -94,10 +133,25 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
+from orphan_result_routes import orphan_result_routes  # noqa: E402
+
+
+# Round-robin position for the orphan-route scan, so a large unroutable
+# backlog cannot starve entries that sort after it.
+_orphan_route_cursor = ""
+
+
+def _is_discord_channel_id(value: str) -> bool:
+    """A snowflake, so a Telegram chat id or a Matrix room id can never be
+    mistaken for one. Shape only — resolution stays with fetch_channel."""
+    return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
+from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
-from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
+from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
@@ -113,10 +167,47 @@ REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
+
+#: Consecutive polls each result file has been present-but-empty. Bridge-owned
+#: state; threshold and wording live in result_router so the bridges cannot drift.
+_empty_result_polls: "dict[str, int]" = {}
+
+
+class EmptyResultError(Exception):
+    """A result file that stayed empty past the bound — never delivered."""
+
+
+async def _note_empty_result(task_id: str, result_file) -> None:
+    """At the bound: owner DM, audit row, drain `pending_replies`, archive. Below it a
+    no-op, because that window is indistinguishable from a normal partial write."""
+    notice = result_router.note_empty_result(
+        _empty_result_polls, task_id, str(result_file))
+    if not notice:
+        return                                    # still inside the write window
+    print(f"  {notice}", flush=True)
+    # Pop every task-scoped map the normal-delivery cleanup pops, or the task
+    # reports resolved while still visible to queue-health.
+    _empty_result_polls.pop(task_id, None)
+    channel = pending_replies.pop(task_id, None)  # stop re-polling it
+    _atomic_write_pending_replies(
+        {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
+    _progress_msgs.pop(task_id, None)             # else the placeholder never clears
+    tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
+    archive_file(result_file, "results", task_id)
+    # Archive the SOURCE TASK too. Without this the task file sits in tasks/
+    # forever: discovery re-reads it and queue health counts it as pending work.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+
+
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_redaction import redact_chat_body  # noqa: E402
 from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
@@ -227,8 +318,6 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
-# Load token — env var takes precedence (allows test injection without a real .env file)
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 # Tighten perms whenever the token file exists — even when the token is already
 # in process env — so a world-readable .env never survives startup.
 channels_env = claude_home_path("channels", "discord", ".env")
@@ -240,16 +329,9 @@ if channels_env.exists():
         # restore/sync, or an ACL-restricted file must NOT crash the bridge at
         # startup — the file may still be perfectly readable. Warn and continue.
         print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
-if not TOKEN and channels_env.exists():
-    for line in channels_env.read_text().splitlines():
-        if line.startswith("DISCORD_BOT_TOKEN="):
-            TOKEN = line.split("=", 1)[1].strip()
-
-if not TOKEN:
-    # Last resort: the Keychain vault. Before this, no bridge read it, so
-    # `vault set DISCORD_BOT_TOKEN` stored the value and changed nothing.
-    from channel_token import token_from_vault  # noqa: E402
-    TOKEN = token_from_vault("DISCORD_BOT_TOKEN")
+# env -> channel .env -> vault; shared policy so quoting rules cannot drift.
+from channel_token import resolve_channel_token  # noqa: E402
+TOKEN = resolve_channel_token("DISCORD_BOT_TOKEN", env_file=channels_env)
 
 if not TOKEN:
     print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env "
@@ -401,21 +483,30 @@ def archive_path(kind: str, task_id: str) -> "Path":
     return month_dir / f"{task_id}.txt"
 
 
-def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into the archive. Silent on failure — archive is for later
-    analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving"."""
-    try:
-        if src.exists():
-            import shutil
-            shutil.move(str(src), str(archive_path(kind, task_id)))
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        # Fall back to unlink so we don't leave stale files.
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+def archive_file(src: "Path", kind: str, task_id: str) -> bool:
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy in task_archive."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(m, flush=True))
+
+
+def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
+    """Archive a delivered task's result + task file, then retire its sentinel.
+
+    One owner for a policy both delivery paths need: the sentinel may only be
+    cleared once the result has actually left the live queue, because a
+    surviving result re-enters the poll loop and the sentinel is the only thing
+    standing between it and a second send.
+    """
+    gone = archive_file(result_file, "results", task_id)
+    # find_task_file, not a reconstructed bare name: a claimed task is
+    # `<id>.claimed-core-N.txt` and would strand forever.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
+    if gone:
+        _clear_delivered(task_id)
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
@@ -2404,6 +2495,7 @@ intents.message_content = True
 if os.environ.get("DISCORD_GUILD_MEMBERS_INTENT", "").lower() in ("1", "true", "yes"):
     intents.members = True
 client = discord.Client(intents=intents)
+_ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2454,16 +2546,64 @@ def _recover_orphan_sending_files() -> int:
 # re-fires on every gateway reconnect, so without this the loops accumulate.
 _poll_loops_started = False
 
+# Restart delay after a poll loop crashes. Long enough that a persistently
+# failing loop can't spin, short enough that delivery resumes on its own.
+POLL_LOOP_RESTART_SEC = 5
+
+# Returned by a poll loop that declined to run because its feature is off.
+# Not a failure, so the supervisor must stop rather than restart it forever.
+LOOP_DISABLED = object()
+
+
+async def _supervise_loop(coro_fn, name):
+    """Keep a poll loop alive across crashes.
+
+    Each `poll_*` coroutine is an unbounded `while True`, so an exception that
+    escapes its body ends that loop *permanently* while the process stays up —
+    the bridge keeps receiving and silently stops delivering, with nothing in
+    the logs (the escape can itself be a logging failure; see
+    `_NeverFatalStream`). `poll_results` in particular has no loop-level
+    try/except at all, so one raise past its inner handler is terminal.
+
+    Restart instead of dying. Re-entry is safe for these loops: they rebuild
+    their state from `pending_replies` / `results/` on each pass, and re-send is
+    gated by the `_mark_delivered` sentinel, so a restarted loop cannot
+    duplicate a delivery that already happened. `CancelledError` is re-raised —
+    shutdown must stay prompt.
+    """
+    while True:
+        try:
+            if await coro_fn() is LOOP_DISABLED:
+                # Opted out on purpose (feature flag off) — supervising it would
+                # re-enter and re-return every POLL_LOOP_RESTART_SEC forever.
+                return
+            # A poll loop returning is itself unexpected (they never exit).
+            print(f"  [{name}] loop returned unexpectedly — restarting in {POLL_LOOP_RESTART_SEC}s", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"  [{name}] loop crashed: {type(exc).__name__}: {exc} — restarting in {POLL_LOOP_RESTART_SEC}s", flush=True)
+        await asyncio.sleep(POLL_LOOP_RESTART_SEC)
+
 
 @client.event
 async def on_ready():
-    print(f"Discord bridge ready: {client.user}", flush=True)
+    global _ready_count
+    _ready_count += 1
     # Restart-safety FIRST: if access.json was wiped/corrupted while the bridge
     # was down, auto-restore it from the durable state/auth/ backup BEFORE any
     # access read below. Without this a wipe+restart boots into pairing/TOFU with
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    # Explicit presence: after a reconnect the default presence can lag; setting
+    # it on every ready makes recovery visible immediately instead of waiting
+    # for Discord to infer it. Best-effort — presence must never break startup.
+    try:
+        await client.change_presence(status=discord.Status.online)
+    except Exception:
+        pass
     # #1147: auto-seed workspace `state/discord-config.json` from the legacy
     # access.json heuristic on first boot. Idempotent (no-op if file
     # exists). Emits a WARN to stderr if the seed had to fall back to
@@ -2511,13 +2651,13 @@ async def on_ready():
     global _poll_loops_started
     if not _poll_loops_started:
         _poll_loops_started = True
-        client.loop.create_task(poll_results())
-        client.loop.create_task(poll_progress())
-        client.loop.create_task(poll_approved())
-        client.loop.create_task(poll_proactive())
-        client.loop.create_task(poll_dm_fallback())
+        client.loop.create_task(_supervise_loop(poll_results, "poll_results"))
+        client.loop.create_task(_supervise_loop(poll_progress, "poll_progress"))
+        client.loop.create_task(_supervise_loop(poll_approved, "poll_approved"))
+        client.loop.create_task(_supervise_loop(poll_proactive, "poll_proactive"))
+        client.loop.create_task(_supervise_loop(poll_dm_fallback, "poll_dm_fallback"))
         # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
-        client.loop.create_task(_mod_flush_timer_loop())
+        client.loop.create_task(_supervise_loop(_mod_flush_timer_loop, "_mod_flush_timer_loop"))
 
 
 def _message_mentions_bot(message):
@@ -2712,6 +2852,10 @@ def _write_task_file(task_file: Path, content, username: str,
     try:
         if callable(content):
             content = content()
+        try:
+            content = stamp_text(content)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception as _tw_exc:
         print(f"  [task-write] FAILED for @{username} in #{channel_name} "
@@ -2842,6 +2986,19 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [dm-checkpoint] self-message update failed: {e}", flush=True)
         return
+    # Ahead of EVERY content consumer, the mod observer included: a THREAD_CREATED
+    # notice carries the thread NAME as content and must not be judged or actioned.
+    if getattr(message, "is_system", None) and message.is_system():
+        # Checkpoint first for the self-message branch's reason: "do not re-fetch"
+        # is about having SEEN the message, not about processing it.
+        if isinstance(message.channel, discord.DMChannel) and hasattr(message, "id"):
+            try:
+                _update_dm_checkpoint(message.channel.id, message.id)
+            except Exception as e:
+                print(f"  [dm-checkpoint] system-message update failed: {e}", flush=True)
+        print(f"  [skip] system message type={message.type}", flush=True)
+        return
+
     # Auto-mod LLM-judge observation hook (per-guild opt-in via access.json
     # `mod_active`). Pure observe — never blocks the rest of the function.
     # Action only fires from the periodic flush task, not at receive time.
@@ -2876,14 +3033,12 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    safe_log_text = redact_vault_commands(initial_secret_filter.text)
+    safe_log_text = redact_chat_body(text)   # the shared chain; see src/chat_redaction.py
     print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
         safe_snapshots = filter_chat_secrets(str(message.message_snapshots)).text  # pragma: no cover
         print(f"  [debug] message_snapshots: {safe_snapshots}", flush=True)  # pragma: no cover
-    if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
-        print(f"  [debug] non-default message type: {message.type}", flush=True)
 
     # DMs: bot messages always require explicit @-mention (no channel config path).
     if is_dm and message.author.bot and client.user not in message.mentions:
@@ -3128,11 +3283,14 @@ async def _handle_discord_message(message, force=False):
                 getattr(u, "bot", False) and getattr(u, "id", None) != _self_id
                 for u in (getattr(message, "mentions", None) or [])
             )
+            # A forward sets message.reference too but is NOT a reply (its payload is
+            # in message_snapshots); classing it as one makes this gate skip forwards.
+            _is_reply = reference_is_reply(_ref is not None, getattr(_ref, "type", None))
             if not is_addressed_in_shared_channel(
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 bot_mentioned=bot_mentioned,
                 role_mentioned=role_mentioned,
-                is_reply=_ref is not None,
+                is_reply=_is_reply,
                 reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
                 self_id=_self_id,
                 author_id=getattr(message.author, "id", None),
@@ -3350,7 +3508,11 @@ async def _handle_discord_message(message, force=False):
         try:
             await att.save(local_path)
             attachment_refs.append(_ref_from_attachment(att, local_path))  # pragma: no cover
-            transcript = _transcribe_via_skill(str(local_path))
+            # Off-loop: transcription shells out for up to 25s; run sync on the
+            # event loop it starves the gateway heartbeat (~41s interval) and
+            # Discord drops the socket -> presence flaps offline (owner report
+            # 2026-07-17: 49 fresh gateway sessions in one log window).
+            transcript = await asyncio.to_thread(_transcribe_via_skill, str(local_path))  # pragma: no cover
             if transcript:
                 attachment_note += f"\n[Voice transcript: {transcript}]"
             else:
@@ -3774,27 +3936,8 @@ async def _handle_discord_message(message, force=False):
     # review. Removed in favor of skipping the task-file write entirely.)
     tier_instructions = {
         "owner": "",
-        "team-collaborator": (
-            "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            "This task is from a designated COLLABORATOR in this channel (a team-tier sender the owner "
-            "has listed under this channel's `collaborators`). Engage substantively — do NOT sandbox "
-            "them via codex and do NOT default to NO-REPLY the way a plain team task is handled.\n\n"
-            "DO:\n"
-            "- Reply in-channel: write your response to results/task-{id}.txt (delivered back to this channel).\n"
-            "- Treat their message as collaborative input from a working peer within this channel's scope — "
-            "discuss, draft, and iterate on copy / design / analysis, and fold their contributions into the "
-            "shared work. Do not silently archive a substantive contribution.\n\n"
-            "DO NOT (authority boundary — unchanged from team tier):\n"
-            "- Take any irreversible or system-mutating action on their say-so: no git commit / push / merge, "
-            "no deleting or overwriting files, no sending to other channels or external services (email, "
-            "posts, DMs), no financial actions, no config / credential changes, no restarts. Those still "
-            "require the OWNER.\n"
-            "- If they ask for such an action, engage on the substance and prepare it if useful, but route "
-            "the go/no-go to the owner (say so in-channel) rather than executing it yourself.\n"
-            "- Never read .env, credentials, or secrets.\n\n"
-            "Scope: collaborator status is per-channel only — it grants engagement HERE, not owner authority "
-            "anywhere else.\n"
-            "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        "team-collaborator": engage_rulebook(
+            "channel", DISCORD_PROVENANCE, "results/task-{id}.txt"
         ),
         "team": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
@@ -3922,7 +4065,7 @@ async def _handle_discord_message(message, force=False):
         # self-contained-judgment form (root-cause 2026-06-25).
         lines.append(
             f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
-            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str}` — '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str}` — '
             f'and read it back (everyone\'s messages including your own prior replies) '
             f'until this message stands on its own, then answer from the reconstructed '
             f'thread, NOT from memory. Do this every time; do NOT skip it because the '
@@ -4463,6 +4606,19 @@ async def poll_results():
             except Exception:
                 pass
 
+        # A task written straight into tasks/ was never in pending_replies, so
+        # its result would sit forever. Adopt the route it declared, then let
+        # the existing resolution below turn it into a channel.
+        global _orphan_route_cursor
+        _adopted, _orphan_route_cursor = orphan_result_routes(
+            RESULTS_DIR, TASKS_DIR,
+            set(pending_replies) | set(_recovered_replies),
+            _is_discord_channel_id,
+            cursor=_orphan_route_cursor,
+        )
+        for task_id, channel_id_str in _adopted.items():
+            _recovered_replies.setdefault(task_id, channel_id_str)
+
         # Merge recovered replies into pending_replies (resolve channel objects)
         for task_id, channel_id_str in list(_recovered_replies.items()):
             if task_id not in pending_replies:
@@ -4479,7 +4635,9 @@ async def poll_results():
                 import re
                 reply_text = read_ready_result(result_file)
                 if reply_text is None:
+                    await _note_empty_result(task_id, result_file)
                     continue
+                _empty_result_polls.pop(task_id, None)
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving
@@ -4502,6 +4660,16 @@ async def poll_results():
                 # re-fire infinitely on the leftover task. Observed 2026-04-17:
                 # `[no-send]` tasks persisted in tasks/ because `continue`
                 # skipped the cleanup block at the bottom of this loop.
+                # Non-owner results are scanned before ANY marker below. The tier
+                # map dies on restart, so unknown is re-read from the task file.
+                _guard_tier = _task_tier
+                if _guard_tier == "unknown":
+                    _guard_tf = find_task_file(TASKS_DIR, task_id)
+                    _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
+                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO)
+                if _withheld:
+                    print(f"  [team-guard] withheld result for {task_id} "
+                          f"(tier={_guard_tier}): {_withheld}", flush=True)
                 _parsed = parse_markers(reply_text)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
@@ -4584,10 +4752,7 @@ async def poll_results():
                 # archive_file() finishing. See DELIVERED_DIR docstring.
                 if _is_delivered(task_id):
                     print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
-                    archive_file(result_file, "results", task_id)
-                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
-                    _clear_delivered(task_id)
+                    _archive_delivered_pair(result_file, task_id)
                     continue
 
                 try:
@@ -4602,25 +4767,10 @@ async def poll_results():
                     reply_to_id = int(reply_match.group(1)) if reply_match else None
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
-                    # Auto-thread: if the agent didn't pick an explicit
-                    # [reply: <id>], default to the triggering message so the
-                    # reply appears quoted under what it's answering. Skip
-                    # when the channel is already a Discord thread — thread
-                    # context anchors the reply implicitly, no extra quote
-                    # needed.
-                    #
-                    # getattr instead of bare `discord.Thread` so the
-                    # test-stub discord module (tests/discord-bridge-*.test.py)
-                    # — which intentionally omits Thread to keep the stub
-                    # surface small — doesn't AttributeError here. Production
-                    # discord.py always provides Thread; the getattr fallback
-                    # only matters under test, where treating "no Thread
-                    # class" as "channel isn't a thread" is correct.
+                    # Default to quoting the triggering message. Threads too:
+                    # interleaved exchanges make position stop identifying it.
                     if reply_to_id is None:
-                        _thread_cls = getattr(discord, 'Thread', None)
-                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
-                        if not is_thread:
-                            reply_to_id = source_message_anchor
+                        reply_to_id = source_message_anchor
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different
@@ -4791,13 +4941,11 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
-                archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
-                archive_file(task_file, "tasks", task_id)
-                # Delivery succeeded + archived — sentinel has served
-                # its purpose, remove to bound `discord-delivered/`
-                # directory growth.
-                _clear_delivered(task_id)
+                _archive_delivered_pair(result_file, task_id)
+            else:
+                # CONSECUTIVE means consecutive: an absent file breaks the run, or a
+                # writer that retries accumulates counts across separate appearances.
+                _empty_result_polls.pop(task_id, None)
         await asyncio.sleep(1)
 
 
@@ -4853,7 +5001,7 @@ async def poll_progress():
     must never break the loop or leak an exception into the gateway.
     """
     if not progress_stream.stream_enabled():
-        return  # feature off → never loops; zero overhead, zero risk
+        return LOOP_DISABLED  # feature off → never loops; zero overhead, zero risk
     while True:
         try:
             now = time.time()
@@ -5022,6 +5170,18 @@ async def poll_proactive():
                     if text is None:
                         release_claim(f)
                         continue
+                    # Parse ONCE, here, and reuse below: a second grammar would
+                    # miss what parse_markers peels (D7 `**[core: N]**` headers).
+                    _pp = parse_markers(text)
+                    _early_redirect = next(
+                        (a for a in _pp.actions if a.kind == "redirect"), None)
+                    if _early_redirect is not None and not re.fullmatch(
+                            r"\d{17,20}", str(_early_redirect.value).strip()):
+                        print(f"  [proactive] {f.name} targets "
+                              f"{str(_early_redirect.value).strip()!r} — not a Discord "
+                              f"channel id; releasing for its own bridge", flush=True)
+                        release_claim(f)
+                        continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
                     # workspace `state/discord-config.json` (Sutando's owned config
@@ -5068,7 +5228,8 @@ async def poll_proactive():
                         # Parse protocol markers (skip / redirect / attach).
                         # parse_markers strips all markers from .body and
                         # surfaces them as typed actions — no hand-rolled regex.
-                        _pp = parse_markers(text)
+                        # already parsed once, above the owner work
+
                         clean_text = _pp.body
                         files = [a.value for a in _pp.actions if a.kind == "attach"]
 
@@ -5523,7 +5684,10 @@ async def poll_dm_fallback():
                     # `<workspace>/src/dm-result.py` (does not exist) and the
                     # dm-fallback path errored out silently before delivering.
                     _DM_RESULT_SCRIPT = Path(__file__).resolve().parent / "dm-result.py"
-                    result = subprocess.run(
+                    # Off-loop for the same heartbeat-starvation reason as the
+                    # transcribe call in on_message (up to 15s per file here).
+                    result = await asyncio.to_thread(  # pragma: no cover
+                        subprocess.run,
                         [sys.executable, str(_DM_RESULT_SCRIPT), "--file", str(f)],
                         capture_output=True, text=True, timeout=15,
                         stdin=subprocess.DEVNULL,
@@ -5568,7 +5732,23 @@ async def poll_dm_fallback():
         await asyncio.sleep(30)
 
 
-def _send_via_rest(channel_id: str, message: str):
+def _parse_send_argv(argv):
+    """Split `send`'s post-channel argv into (reply_to, body_argv).
+
+    `--reply-to <id>` threads the post onto an existing message, giving the CLI
+    the reach the results path already has by default. Leading position only, so
+    a body word that happens to read `--reply-to` cannot be eaten mid-text.
+    """
+    reply_to = ""
+    if len(argv) >= 2 and argv[0] == "--reply-to":
+        reply_to, argv = argv[1], argv[2:]
+    if not argv:
+        raise SystemExit("usage: discord-bridge.py send <channel_id> "
+                         "[--reply-to <message_id>] <body|--body-file PATH>")
+    return reply_to, argv
+
+
+def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
     """Send a message via Discord REST API (no gateway connection).
 
     Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
@@ -5588,21 +5768,98 @@ def _send_via_rest(channel_id: str, message: str):
         # Empty message — nothing to send. Treat as no-op rather than error.
         return
     for i, chunk in enumerate(chunks, 1):
-        data = json.dumps({"content": chunk}).encode()
+        payload = {"content": chunk}
+        # First chunk only: on every chunk it renders N reply-headers for one
+        # answer. fail_if_not_exists=False -> deleted target degrades to plain.
+        if reply_to and i == 1:
+            payload["message_reference"] = {"message_id": str(reply_to),
+                                            "fail_if_not_exists": False}
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
+        # Transport only: once urlopen returns, the message is committed, so
+        # read() belongs below. Not a `with` — doubles are plain objects.
         try:
-            urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
             sys.exit(1)
+        # Best-effort, and emitted per chunk: buffering until every chunk lands
+        # leaves an earlier delivered chunk unaddressable when a later one fails.
+        try:
+            body = json.loads(resp.read().decode())
+            mid = body.get("id") if isinstance(body, dict) else None
+            mid = str(mid) if isinstance(mid, (str, int)) and str(mid) else None
+        except Exception:
+            mid = None
+        if mid:
+            print(f"message_id {mid}")
+        else:
+            print(f"message_id unavailable (chunk {i}/{len(chunks)}) — sent, not addressable")
     suffix = "..." if len(message) > 80 else ""
     chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
     print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
 
 
+def _edit_via_rest(channel_id: str, message_id: str, message: str):
+    """Replace an already-sent message's content via Discord REST PATCH.
+
+    Refuses a body the chunker would split: an edit addresses ONE message, so a
+    multi-chunk body cannot be applied without silently dropping the remainder.
+    """
+    import urllib.request
+    if not message.strip():
+        print("ERROR: refusing to edit to an empty body")
+        sys.exit(1)
+    if len(list(_chunk_for_discord_unbounded(message))) > 1:
+        # Derived from the chunker, not a second copy of its limit.
+        print(f"ERROR: body is {len(message)} chars — too long for one message. "
+              "An edit cannot chunk; shorten it or send a new message.")
+        sys.exit(1)
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
+    data = json.dumps({"content": message}).encode()
+    req = urllib.request.Request(url, data=data, method="PATCH", headers={
+        "Authorization": f"Bot {TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "DiscordBot (sutando, 1.0)",
+    })
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"Edit failed: {e}")
+        sys.exit(1)
+    suffix = "..." if len(message) > 80 else ""
+    print(f"Edited {channel_id}/{message_id}: {message[:80]}{suffix}")
+
+
+from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402  — shared owner of the --body-file bounds
+
+
+def _send_cli_body(argv: list) -> str:
+    """Body for `send`: --body-file only as the FIRST token, else joined argv.
+    Recognising it later would turn ordinary prose into a file read."""
+    if not argv or argv[0] != "--body-file":
+        return " ".join(argv)
+    if len(argv) < 2:
+        raise SystemExit("ERROR: --body-file requires a path")
+    if len(argv) > 2:
+        raise SystemExit(f"ERROR: --body-file takes the body; drop {argv[2:]!r}")
+    body = _read_body_file(argv[1])
+    if not body.strip():
+        raise SystemExit(f"ERROR: --body-file {argv[1]!r} is empty — refusing to send")
+    return body
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
-        _send_via_rest(sys.argv[2], " ".join(sys.argv[3:]))
+        reply_to, body_argv = _parse_send_argv(sys.argv[3:])
+        _send_via_rest(sys.argv[2], _send_cli_body(body_argv), reply_to)
+    elif sys.argv[1:2] == ["edit"]:
+        # Arity is checked here rather than by the `>= 5` guard the send branch
+        # uses: falling through on a short `edit` would boot the whole bridge.
+        if len(sys.argv) < 5:
+            raise SystemExit("usage: discord-bridge.py edit <channel_id> <message_id> "
+                             "<body|--body-file PATH>")
+        _edit_via_rest(sys.argv[2], sys.argv[3], _send_cli_body(sys.argv[4:]))
     else:
         _single_instance_acquire("discord-bridge")
         client.run(TOKEN, log_handler=None)

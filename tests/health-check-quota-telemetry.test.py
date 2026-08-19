@@ -98,6 +98,16 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
             self.assertEqual(r["status"], "ok", f"status={status}")
             self.assertIn("not expected", r["detail"])
 
+    def test_stale_proxy_is_still_evaluated(self):
+        """"stale" means the proxy is listening but running pre-deploy code —
+        it is still the routed path, so telemetry is still expected. Treating
+        it like down would mute this check on every redeploy."""
+        r = self.hc.check_quota_telemetry("stale")
+        self.assertEqual(r["status"], "warn",
+                         "a stale proxy is up: missing quota-state is still a warn")
+        self.assertNotIn("not expected", r["detail"])
+        self.assertIn("never written quota-state.json", r["detail"])
+
     def test_quota_state_present_is_ok_with_age(self):
         self._write_quota()
         r = self.hc.check_quota_telemetry("ok")

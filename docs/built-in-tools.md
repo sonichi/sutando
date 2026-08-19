@@ -9,12 +9,25 @@ gws calendar +agenda --week              # this week
 gws calendar +agenda --days 7 --format json   # next 7 days, JSON for parsing
 ```
 
-**Screen capture** — see what's on the user's screen. The screen-capture server runs on port 7845 (started by `src/startup.sh`):
+**Screen capture** — see what's on the user's screen. The screen-capture server runs on port 7845 (started by `src/startup.sh`). Every capture route requires the startup token in `X-Sutando-Capture-Token` — without it the server answers `403 {"status":"error","error":"forbidden"}`:
 ```bash
-curl -s http://localhost:7845/capture | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
+TOKEN="$(cat ~/.config/sutando/screen-capture-token)"
+curl -s -H "X-Sutando-Capture-Token: $TOKEN" http://localhost:7845/capture \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
 # Multi-display: add ?all=true to capture every display, or ?display=N for a specific one.
+# /capture-video takes the same header — it is the other capture route, gated identically.
 ```
 Then use the Read tool on the returned path to view the screenshot. Use this for any screen-related question: "what am I looking at", "help me with this", "what's on my screen", etc.
+
+A `forbidden` response means the header was missing or stale, **not** that capture is unavailable — re-read the token file rather than restarting the server.
+
+`/capture` returns the display's native resolution — on a Retina screen that is
+megabyte-class per frame. Frames entering a live voice session (the Watch/vision
+stream, pull or push) are bounded first: anything over 200 KB is resampled to a
+1280 px long edge and re-encoded as JPEG q60, measured at ~2.5 MB → ~236 KB on a
+3024×1964 display. Frames share one websocket with realtime audio, so an
+unbounded frame delays speech, not just vision. Reading a captured file from disk
+is unaffected — the bound applies only on the way into a session.
 
 **Notes** — the user's second brain. Save and retrieve notes:
 - Save: write to `notes/{slug}.md` with a descriptive filename
@@ -38,6 +51,8 @@ gws gmail +triage                               # unread inbox summary
 gws gmail +read <messageId>                     # read a message
 gws gmail users messages list --params 'q=keyword'  # search
 ```
+
+**Signatures are never auto-inserted — append one yourself.** Gmail attaches the configured signature in its *composer*, so anything that writes a message some other way (the Gmail API, an IMAP `APPEND`-created draft) produces mail with no signature, and no Gmail setting changes that. When drafting or sending on the owner's behalf, append their signature to the body yourself — plain text plus an HTML alternative, so links render in both parts.
 
 **Finding a specific email** — when the obvious query fails, invoke `/email-find <description>`. Broad-before-narrow playbook (full-inbox scan → partner-domain fanout → thread re-walk) that refuses to give up after one or two failed queries. See `skills/email-find/SKILL.md` for the workflow and rules around subject-mismatch + `get_thread` truncation. Per-user partner-domain mappings live in your own memory (the skill describes the file format).
 
@@ -117,8 +132,17 @@ node src/browser.mjs "https://example.com"                    # get page text
 node src/browser.mjs "https://example.com" screenshot         # full-page screenshot → path
 node src/browser.mjs "https://example.com" "fill:#email:me@x.com" "click:#submit"  # fill + click
 node src/browser.mjs "https://example.com" --headed           # watch automation live
+node src/browser.mjs "https://example.com" screenshot --timeout=60000  # override the 45s command limit
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
+Non-interactive commands are bounded to 45 seconds by default; `--timeout` may
+raise that command-level limit to at most 300,000 ms. Navigation uses the
+remaining command budget, and declared `wait:` actions must fit the budget or
+the command fails before launching with guidance to pass a larger `--timeout`.
+Up to five seconds of the limit is reserved for cleanup. Normal completion,
+errors, timeouts, `SIGINT`, and `SIGTERM` all close the page, context, and browser
+before the command exits. A second signal during cleanup restores Node's normal
+immediate termination behavior instead of being swallowed.
 
 **File search (Spotlight)** — find any file on the Mac:
 ```bash

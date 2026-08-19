@@ -84,8 +84,8 @@ bootout_if_loaded() {
 }
 
 resolve_python() {
-    # Prefer Homebrew python3 — system /usr/bin/python3 is 3.9 on older Macs
-    # and cron-runner.py uses 3.10+ syntax (set[int] / int | None hints).
+    # Prefer Homebrew python3 — NOT for the version (cron-runner.py runs on 3.9)
+    # but because /usr/bin/python3 is the Xcode-CLT stub, REVIEW.md lesson 7.
     if [ -x /opt/homebrew/bin/python3 ]; then
         echo /opt/homebrew/bin/python3
     elif [ -x /usr/local/bin/python3 ]; then
@@ -123,13 +123,13 @@ case "$cmd" in
         echo "  brew:    $BREW_BIN"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
-        # Render the template. Use a delimiter unlikely to appear in paths.
-        sed \
-            -e "s|__REPO__|$REPO|g" \
-            -e "s|__WORKSPACE__|$WORKSPACE|g" \
-            -e "s|__PYTHON__|$PYTHON_BIN|g" \
-            -e "s|__HOMEBREW_BIN__|$BREW_BIN|g" \
-            "$TEMPLATE" > "$DEST"
+        # Shared renderer: literal substitution + XML escaping + a parse
+        # check, so a path with & < > | cannot install a silently-broken job.
+        "$PYTHON_BIN" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$DEST" \
+            "REPO=$REPO" \
+            "WORKSPACE=$WORKSPACE" \
+            "PYTHON=$PYTHON_BIN" \
+            "HOMEBREW_BIN=$BREW_BIN" || exit 1
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"
