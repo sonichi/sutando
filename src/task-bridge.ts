@@ -1088,7 +1088,9 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						if (existsSync(ctxTaskFile)) {
 							try {
 								const taskBody = readFileSync(ctxTaskFile, 'utf-8');
-								if (/^source:\s*context-drop/m.test(taskBody)) {
+								// Header only: a body line reading `source: context-drop`
+								// would archive this result instead of delivering it.
+								if (/^source:\s*context-drop/m.test(headerRegion(taskBody).join('\n'))) {
 									_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 									_deliveredResults.add(file);
 									_pendingTasks.delete(taskId);
