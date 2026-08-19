@@ -84,7 +84,10 @@ export interface MatrixInput {
  *  Two fact families live here. The upstream-send family is coverage-blind
  *  by construction; the ACTIVE-silence family (design
  *  design-voice-active-silence-recovery.md §Trigger (a)) additionally needs
- *  a same-epoch baseline, which `factsAvailable` reports. */
+ *  a same-epoch baseline, which `factsAvailable` reports.
+ *
+ *  `factsAvailable` says the data existed, never that acting is safe:
+ *  consumers of the ACTIVE-silence family own their own structural gating. */
 export type MatrixFacts = {
   attemptedAudioAdvanced: boolean;
   queuedAudioAdvanced: boolean;
