@@ -75,6 +75,9 @@ import {
 
 import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_paths.js';
 import { nextConnectingTick } from './voice-connect-watchdog.js';
+import {
+	initialRedialState, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
+} from './voice-redial-scheduler.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -866,6 +869,47 @@ async function main() {
 	// it — Step 12's `backoff` upstream mapping.)
 	let voiceFatalBackoffUntil = 0;
 
+	// F5: event-driven redial with exponential backoff (voice-redial-scheduler.ts).
+	// The 30s tick below remains the safety net; these fire on bodhi's
+	// connection-lifecycle events instead of waiting up to 60s of dead air.
+	// Declared before the VoiceSession constructor because the constructor's
+	// onConnectionLifecycle option feeds them; session access is late-bound
+	// via sessionRef (assigned right after construction, before any event).
+	let redialState = initialRedialState();
+	let redialTimer: ReturnType<typeof setTimeout> | null = null;
+	// Shared with the 30s tick's throttle + the CONNECTING watchdog below.
+	let lastReconnectAt = 0;
+	const fireEventRedial = (): void => {
+		redialTimer = null;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const s = sessionRef as any;
+		if (!s) return;
+		const now = Date.now();
+		const state = String(s.sessionManager?.state ?? 'unknown');
+		const clientConnected = Boolean(s.clientConnected);
+		if (!shouldEventDial({ state, clientConnected, now, nextDialAt: redialState.nextDialAt, fatalBackoffUntil: voiceFatalBackoffUntil })) {
+			// Blocked by the fatal gate alone → re-arm for when it lifts.
+			// Any other veto drops the dial: the next lifecycle event or the
+			// 30s tick takes over.
+			if (redialState.nextDialAt > 0 && now <= voiceFatalBackoffUntil && state === 'CLOSED' && clientConnected) {
+				armRedialTimer(voiceFatalBackoffUntil - now + 100);
+			}
+			return;
+		}
+		redialState = noteDialed(redialState);
+		lastReconnectAt = now;
+		console.log(`${ts()} [Redial] event-driven reconnect (failures=${redialState.failures})`);
+		try {
+			s.handleClientConnected();
+		} catch (err) {
+			console.error(`${ts()} [Redial] reconnect trigger failed:`, (err as Error)?.message ?? err);
+		}
+	};
+	const armRedialTimer = (delayMs: number): void => {
+		if (redialTimer) clearTimeout(redialTimer);
+		redialTimer = setTimeout(fireEventRedial, delayMs);
+	};
+
 	// Declared outside the classifier IIFE below so the recovery hook can read it
 	// too; a banner already shown is what makes a recovery notice owed.
 	const voiceNotifiedCategories = new Set<string>();
@@ -972,7 +1016,20 @@ async function main() {
 				(u as { promptTokensDetails?: Array<{ modality?: string; tokenCount?: number }> })
 					.promptTokensDetails,
 			),
-		onConnectionLifecycle: (e) => audioHealth.noteLifecycleEvent(e),
+		// One lifecycle stream, two consumers: the ledger derives lineage/context
+		// facts (design §1.1/§1.4); F5's redial scheduler reacts to terminal
+		// losses — a remote generation-close or setup-failed schedules a
+		// backed-off dial; setup-ok/attempt clear it; local disconnect is a
+		// no-op (see voice-redial-scheduler.ts for the contract).
+		onConnectionLifecycle: (ev) => {
+			audioHealth.noteLifecycleEvent(ev);
+			const r = noteLifecycle(redialState, ev, { now: Date.now(), fatalBackoffUntil: voiceFatalBackoffUntil });
+			redialState = r.state;
+			if (r.scheduleDelayMs !== null) {
+				console.log(`${ts()} [Redial] ${ev.kind}${'code' in ev && ev.code !== undefined ? ` code=${ev.code}` : ''} — dial in ${r.scheduleDelayMs}ms (failures=${redialState.failures})`);
+				armRedialTimer(r.scheduleDelayMs);
+			}
+		},
 		// Phase 0.5 seams — spread for REAL key absence (design §2.1: an absent
 		// key lets the server default apply; `undefined` is not absent).
 		...(VOICE_SESSION_TUNING.compressionConfig !== undefined
@@ -1637,8 +1694,8 @@ async function main() {
 	// CLOSED→CONNECTING inline before kicking off the async connect. So the next
 	// 30s tick sees state=CONNECTING (not CLOSED) and skips the guard. If the
 	// connect fails fast and bodhi flips back to CLOSED, the 60s lastReconnectAt
-	// throttle prevents a tight retry loop.
-	let lastReconnectAt = 0;
+	// throttle prevents a tight retry loop. (lastReconnectAt is declared with
+	// the F5 redial machinery above — the event-driven path shares it.)
 	let connectingSince = 0;
 	let lastLoggedStatus = '';
 	let matrixBaseline: MatrixBaseline | null = null;
@@ -1765,9 +1822,14 @@ async function main() {
 		// Recover when session is CLOSED and a client is waiting. handleClientConnected
 		// is bodhi's internal entry point for this exact scenario (CLOSED + client
 		// present → transition to CONNECTING, reconnect fire-and-forget).
+		// F5: this is now the SAFETY NET behind the event-driven redial —
+		// tickMayDial defers to a pending scheduled dial so the tick cannot
+		// preempt the backoff.
 		// TODO: drop the (session as any) cast once bodhi exposes a public API.
-		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil) {
+		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
+			&& tickMayDial({ now: Date.now(), nextDialAt: redialState.nextDialAt })) {
 			lastReconnectAt = Date.now();
+			redialState = noteDialed(redialState);
 			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
 			try {
 				(session as any).handleClientConnected();
