@@ -232,6 +232,15 @@ for _cap in (1900, 4000):
     check("para-cut then long line stays within cap %d" % _cap, not _over,
           "over-limit: %s" % _over)
 
+# Lookback discriminator: several SHORT lines after the last blank, so the
+# buffer grows past the blank before overflowing. The parent cuts mid-B here.
+_a16 = "\n".join("A" * 99 for _ in range(16))
+_b5 = "\n".join("B" * 80 for _ in range(5))
+_lb = list(chunk_message(_a16 + "\n\n" + _b5, 1900))
+check("lookback: paragraph B is never split across chunks",
+      len(_lb) == 2 and "B" not in _lb[0] and _lb[1].count("B" * 80) == 5,
+      str([len(c) for c in _lb]))
+
 # fits_one_message: the compose-time half of the cap.
 check("fits: short body is one message", mc.fits_one_message("hello"))
 check("fits: 3k body is not", not mc.fits_one_message("z\n" * 1500))
