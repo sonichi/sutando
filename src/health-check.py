@@ -1328,7 +1328,9 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: documented family, exactly as `_STATUS_FILES` does. @qingyun-wu and
 #: @john-the-dev caught it before merge — a permanent WARN on every upgraded
 #: install would have trained operators to ignore the detector.
-WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
+#: `.legacy-notice-printed` is a LITERAL because this family has no shared name
+#: shape: written once, read AT the root by init.sh, never unlinked, no destination.
+WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 
 #: `personal_path()` resolves these at the workspace root and never under `state/`,
 #: so the probe's "state belongs under state/" remedy would break the reader.
@@ -1394,7 +1396,8 @@ def check_workspace_root_tidy() -> "dict | None":
             if p.is_file()
             and p.name not in WORKSPACE_ROOT_ALLOWED
             and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
-            and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
+            and not any(fnmatch.fnmatch(p.name, g)
+                        for g in WORKSPACE_ROOT_SENTINEL_GLOBS)
         )
     except OSError:
         return None                      # unreadable workspace is another probe's job

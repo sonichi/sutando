@@ -21,6 +21,32 @@ export function setupHint(raw: string): string | null {
 	return text;
 }
 
+export type KeystrokeOutcome =
+	| { status: 'setup_required'; steps: string[]; message: string }
+	| { error: string };
+
+/**
+ * Decide what a failed keystroke/paste reports. Same extraction rationale as
+ * scrollOutcome: in-place this could be disabled without a test failing.
+ *
+ * `scroll` already turns an OS denial into steps the model reads aloud; the
+ * keystroke tools returned the raw error, so the user heard "I don't have
+ * permission" with nothing to act on.
+ */
+export function keystrokeOutcome(prefix: string, raw: string): KeystrokeOutcome {
+	const hint = setupHint(raw);
+	// No hint means an ordinary failure — keep the raw text so real errors read
+	// unchanged rather than being dressed up as a setup problem.
+	if (!hint) return { error: `${prefix}: ${raw}` };
+	return {
+		status: 'setup_required',
+		steps: [hint],
+		message: `${prefix} did not go through — a one-time setup step is needed. `
+			+ 'Tell the user that, then read the "steps" to them verbatim, in order. '
+			+ 'Do not add steps of your own.',
+	};
+}
+
 export type ScrollOutcome =
 	| { status: 'setup_required'; moved: false; steps: string[]; message: string }
 	| { status: 'at_limit'; moved: false; message: string }
