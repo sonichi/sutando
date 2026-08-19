@@ -93,6 +93,28 @@ def resolve_access_tier(task_file) -> str:
     return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
+def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
+    """Disable only for paired Team collaborator and filter-off stamps."""
+    if tier != "team":
+        return True
+    try:
+        content = Path(task_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    before_task = content.split("\ntask:", 1)[0]
+    filter_values = [
+        line.partition(":")[2].strip()
+        for line in before_task.splitlines()
+        if line.startswith("sensitive_data_filter:")
+    ]
+    collaborator_values = [
+        line.partition(":")[2].strip()
+        for line in before_task.splitlines()
+        if line.startswith("collaborator:")
+    ]
+    return filter_values != ["false"] or collaborator_values != ["true"]
+
+
 def load_team_result_scanner(repo: Path):
     """Load and warm the full scanner graph before Team-controlled execution."""
     source_dir = str((Path(repo) / "src").resolve())
@@ -118,7 +140,8 @@ def load_team_result_scanner(repo: Path):
     return filter_chat_secrets
 
 
-def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
+def scan_team_result(body: str, repo: Path, secret_filter=None,
+                     scan_sensitive_data: bool = True) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
     kinds = {action.kind for action in parse_markers(body or "").actions}
     # dm-only only suppresses a redirect the guard already withholds, and a
@@ -127,6 +150,9 @@ def scan_team_result(body: str, repo: Path, secret_filter=None) -> str:
         raise TeamResultLeakError("result delivery control marker")
     if "skip" in kinds:
         raise TeamResultLeakError("suppressive delivery marker")
+    # Marker checks stay above this narrow scanner opt-out.
+    if not scan_sensitive_data:
+        return body
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)
@@ -254,7 +280,8 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
 
 
 def classify_result_for_tier(body: str, tier, repo: Path,
-                             secret_filter=None) -> TeamResultVerdict:
+                             secret_filter=None,
+                             scan_sensitive_data: bool = True) -> TeamResultVerdict:
     """The guard-owned policy verdict. Adapters apply transport mechanics only;
     re-deciding (or bypassing) this classification in a bridge is a boundary
     violation, not an implementation choice."""
@@ -262,7 +289,9 @@ def classify_result_for_tier(body: str, tier, repo: Path,
         return TeamResultVerdict(VERDICT_DELIVER, body, None)
     try:
         return TeamResultVerdict(
-            VERDICT_DELIVER, scan_team_result(body, repo, secret_filter), None)
+            VERDICT_DELIVER,
+            scan_team_result(body, repo, secret_filter, scan_sensitive_data),
+            None)
     except TeamResultLeakError as exc:
         if str(exc) == "suppressive delivery marker":
             return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT, str(exc))
@@ -274,12 +303,14 @@ def classify_result_for_tier(body: str, tier, repo: Path,
                                  f"scanner unavailable: {exc}")
 
 
-def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None):
+def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
+                          scan_sensitive_data: bool = True):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
     by catching an exception -- the safe body is the only one it is handed.
     Derived from classify_result_for_tier so the verdict has exactly one owner.
     """
-    verdict = classify_result_for_tier(body, tier, repo, secret_filter)
+    verdict = classify_result_for_tier(
+        body, tier, repo, secret_filter, scan_sensitive_data)
     return verdict.body, verdict.reason
