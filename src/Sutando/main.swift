@@ -2718,7 +2718,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 /// Renders the Clicky-style cursor triangle (soft blue glow, no halo) + label.
 /// Pure view — the flight is driven by AppDelegate. Ported verbatim from
-/// pointer-teacher-tracer/pointer-overlay.swift (proven by the grill POCs).
+/// pointer-teacher-tracer/Sources/pointer-overlay/main.swift (proven by the grill POCs).
 final class PointerOverlayView: NSView {
     static let blue = NSColor(calibratedRed: 0.20, green: 0.62, blue: 1.0, alpha: 1.0)
     // Clicky-faithful pointer. Small cursor-like triangle, NO halo ring (Clicky

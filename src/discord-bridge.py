@@ -207,6 +207,7 @@ from task_body_guard import confine_user_content  # noqa: E402
 from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_redaction import redact_chat_body  # noqa: E402
 from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
@@ -317,8 +318,6 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
-# Load token — env var takes precedence (allows test injection without a real .env file)
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 # Tighten perms whenever the token file exists — even when the token is already
 # in process env — so a world-readable .env never survives startup.
 channels_env = claude_home_path("channels", "discord", ".env")
@@ -330,16 +329,9 @@ if channels_env.exists():
         # restore/sync, or an ACL-restricted file must NOT crash the bridge at
         # startup — the file may still be perfectly readable. Warn and continue.
         print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
-if not TOKEN and channels_env.exists():
-    for line in channels_env.read_text().splitlines():
-        if line.startswith("DISCORD_BOT_TOKEN="):
-            TOKEN = line.split("=", 1)[1].strip()
-
-if not TOKEN:
-    # Last resort: the Keychain vault. Before this, no bridge read it, so
-    # `vault set DISCORD_BOT_TOKEN` stored the value and changed nothing.
-    from channel_token import token_from_vault  # noqa: E402
-    TOKEN = token_from_vault("DISCORD_BOT_TOKEN")
+# env -> channel .env -> vault; shared policy so quoting rules cannot drift.
+from channel_token import resolve_channel_token  # noqa: E402
+TOKEN = resolve_channel_token("DISCORD_BOT_TOKEN", env_file=channels_env)
 
 if not TOKEN:
     print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env "
@@ -3041,7 +3033,7 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    safe_log_text = redact_vault_commands(initial_secret_filter.text)
+    safe_log_text = redact_chat_body(text)   # the shared chain; see src/chat_redaction.py
     print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
@@ -4073,7 +4065,7 @@ async def _handle_discord_message(message, force=False):
         # self-contained-judgment form (root-cause 2026-06-25).
         lines.append(
             f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
-            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str}` — '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str}` — '
             f'and read it back (everyone\'s messages including your own prior replies) '
             f'until this message stands on its own, then answer from the reconstructed '
             f'thread, NOT from memory. Do this every time; do NOT skip it because the '
@@ -5178,6 +5170,18 @@ async def poll_proactive():
                     if text is None:
                         release_claim(f)
                         continue
+                    # Parse ONCE, here, and reuse below: a second grammar would
+                    # miss what parse_markers peels (D7 `**[core: N]**` headers).
+                    _pp = parse_markers(text)
+                    _early_redirect = next(
+                        (a for a in _pp.actions if a.kind == "redirect"), None)
+                    if _early_redirect is not None and not re.fullmatch(
+                            r"\d{17,20}", str(_early_redirect.value).strip()):
+                        print(f"  [proactive] {f.name} targets "
+                              f"{str(_early_redirect.value).strip()!r} — not a Discord "
+                              f"channel id; releasing for its own bridge", flush=True)
+                        release_claim(f)
+                        continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
                     # workspace `state/discord-config.json` (Sutando's owned config
@@ -5224,7 +5228,8 @@ async def poll_proactive():
                         # Parse protocol markers (skip / redirect / attach).
                         # parse_markers strips all markers from .body and
                         # surfaces them as typed actions — no hand-rolled regex.
-                        _pp = parse_markers(text)
+                        # already parsed once, above the owner work
+
                         clean_text = _pp.body
                         files = [a.value for a in _pp.actions if a.kind == "attach"]
 
@@ -5727,7 +5732,23 @@ async def poll_dm_fallback():
         await asyncio.sleep(30)
 
 
-def _send_via_rest(channel_id: str, message: str):
+def _parse_send_argv(argv):
+    """Split `send`'s post-channel argv into (reply_to, body_argv).
+
+    `--reply-to <id>` threads the post onto an existing message, giving the CLI
+    the reach the results path already has by default. Leading position only, so
+    a body word that happens to read `--reply-to` cannot be eaten mid-text.
+    """
+    reply_to = ""
+    if len(argv) >= 2 and argv[0] == "--reply-to":
+        reply_to, argv = argv[1], argv[2:]
+    if not argv:
+        raise SystemExit("usage: discord-bridge.py send <channel_id> "
+                         "[--reply-to <message_id>] <body|--body-file PATH>")
+    return reply_to, argv
+
+
+def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
     """Send a message via Discord REST API (no gateway connection).
 
     Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
@@ -5747,7 +5768,13 @@ def _send_via_rest(channel_id: str, message: str):
         # Empty message — nothing to send. Treat as no-op rather than error.
         return
     for i, chunk in enumerate(chunks, 1):
-        data = json.dumps({"content": chunk}).encode()
+        payload = {"content": chunk}
+        # First chunk only: on every chunk it renders N reply-headers for one
+        # answer. fail_if_not_exists=False -> deleted target degrades to plain.
+        if reply_to and i == 1:
+            payload["message_reference"] = {"message_id": str(reply_to),
+                                            "fail_if_not_exists": False}
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
         # Transport only: once urlopen returns, the message is committed, so
         # read() belongs below. Not a `with` — doubles are plain objects.
@@ -5824,7 +5851,8 @@ def _send_cli_body(argv: list) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
-        _send_via_rest(sys.argv[2], _send_cli_body(sys.argv[3:]))
+        reply_to, body_argv = _parse_send_argv(sys.argv[3:])
+        _send_via_rest(sys.argv[2], _send_cli_body(body_argv), reply_to)
     elif sys.argv[1:2] == ["edit"]:
         # Arity is checked here rather than by the `>= 5` guard the send branch
         # uses: falling through on a short `edit` would boot the whole bridge.
