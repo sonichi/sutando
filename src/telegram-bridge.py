@@ -944,7 +944,7 @@ def main():  # pragma: no cover
                 # body copy while these authentic ones pass through.
                 media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
                     attachment_refs, bool(text and text.strip()))
-                task_file.write_text(
+                _task_content = (
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                     f"source: telegram\n"
@@ -958,6 +958,14 @@ def main():  # pragma: no cover
                     f"{tg_skill_hints}"
                     f"{secret_notice}"
                 )
+                # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+                # fail-open so a stamping error costs the stamp and never the task.
+                try:
+                    from task_envelope import stamp_text  # sibling (src/ on sys.path)
+                    _task_content = stamp_text(_task_content, REPO)
+                except Exception:
+                    pass
+                task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 # Observability: one inbound accepted-message event. Source the
@@ -992,12 +1000,9 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import should_claim_proactive
+        from proactive_routing import should_claim_proactive_file
         try:
-            if (
-                not presenter_mode_active(REPO)
-                and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
-            ):
+            if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
                 # friction-*.txt via FALLBACK_PREFIXES; telegram-bridge only
                 # matched `proactive-`, so morning-briefing output (which
@@ -1007,8 +1012,15 @@ def main():  # pragma: no cover
                 # cron-originated results land in the owner's DM regardless
                 # of which bridge is the active channel.
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
+                def _tg_claims(name: str) -> bool:
+                    # Destination outranks activity routing, uniformly;
+                    # discord's DM fallback stays the after-grace catch-all.
+                    return should_claim_proactive_file(
+                        name, OWNER_ACTIVITY_FILE, "telegram")
+
                 for f in RESULTS_DIR.iterdir():
-                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
+                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
+                            and f.suffix == ".txt" and _tg_claims(f.name):
                         # Peek before claiming: skip Discord-targeted proactive files.
                         # [channel: <17-20 digit snowflake>] is a Discord-only marker;
                         # claiming it here sends the literal text to Telegram DM instead
