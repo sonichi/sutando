@@ -720,16 +720,10 @@ fi
 _PROXY_LABEL="com.sutando.credential-proxy"
 _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
 if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
-  # Upgrade path (Codex re-review F1): an already-loaded job may carry a plist
-  # generated BEFORE SUTANDO_NODE existed (or with a different runtime) — a
-  # KeepAlive restart would then lose the pinned runtime. Compare the loaded
-  # plist's managed runtime to the current one and reinstall on drift (the
-  # installer bootout_if_loaded+bootstraps, so re-running over a live job is
-  # safe).
-  _PROXY_PLIST_DEST="$HOME/Library/LaunchAgents/$_PROXY_LABEL.plist"
-  _PROXY_PLIST_NODE="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:SUTANDO_NODE" "$_PROXY_PLIST_DEST" 2>/dev/null || true)"
-  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1 && [ "$_PROXY_PLIST_NODE" = "${SUTANDO_NODE:-}" ]; then
-    echo "  ✓ credential proxy (launchd-supervised, already loaded, runtime current)"
+  # An already-loaded job may carry a plist generated before the current pins existed;
+  # the installer owns that comparison because it owns what the plist renders.
+  if bash "$_PROXY_INSTALLER" is-current > /dev/null 2>&1; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded, config current)"
   else
     echo "  Installing launchd-supervised credential proxy (fresh or runtime drift)..."
     if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
@@ -750,7 +744,10 @@ if ! lsof -i :7846 > /dev/null 2>&1; then
   if [ "$BUNDLED_MODE" = "1" ]; then
     _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
   else
-    _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+    # Run the proxy from THIS checkout so it resolves the same workspace as the
+    # core/dashboard; fall back to the claude-home copy if the skill is absent.
+    _PROXY_SCRIPT="$REPO/skills/quota-tracker/scripts/credential-proxy.ts"
+    [ -f "$_PROXY_SCRIPT" ] || _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
   fi
   run_node_service credential-proxy "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
