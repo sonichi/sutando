@@ -5180,14 +5180,14 @@ async def poll_proactive():
             # decision rule (last-active channel from
             # state/last-owner-activity.json; default discord on missing
             # state).
-            from proactive_routing import should_claim_proactive  # noqa: E402
-            if not should_claim_proactive(
-                STATE_DIR / "last-owner-activity.json", "discord"
-            ):
-                await asyncio.sleep(3)
-                continue
+            from proactive_routing import should_claim_proactive_file  # noqa: E402
             for f in RESULTS_DIR.iterdir():
-                if f.name.startswith("proactive-") and f.suffix == ".txt":
+                # Per-FILE decision: an explicit .to-<channel> destination
+                # outranks activity routing (see proactive_routing).
+                if f.name.startswith("proactive-") and f.suffix == ".txt" \
+                        and should_claim_proactive_file(
+                            f.name, STATE_DIR / "last-owner-activity.json",
+                            "discord"):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram
@@ -5538,6 +5538,7 @@ async def poll_dm_fallback():
     GRACE_SECONDS = 90
     MAX_RETRY_AGE_SECONDS = 86400  # 24h: give up on stale files so the loop drains
     FALLBACK_PREFIXES = ("task-", "question-", "briefing-", "insight-", "friction-")
+    from proactive_routing import fallback_claims_name as _routing_fallback_claims  # noqa: E402
     while True:
         try:
             now = time.time()
@@ -5545,6 +5546,9 @@ async def poll_dm_fallback():
                 if f.suffix != ".txt":
                     continue
                 if not any(f.name.startswith(p) for p in FALLBACK_PREFIXES):
+                    continue
+                # Foreign/unknown .to-<channel> tags are never swept here.
+                if not _routing_fallback_claims(f.name, "discord"):
                     continue
                 # Skip anything Discord is already tracking for reply.
                 task_id = f.stem  # e.g. "task-1776286725412"
