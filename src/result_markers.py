@@ -136,17 +136,14 @@ _D7_HEADER_RE = re.compile(
     r"\A\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*"
 )
 
-# Attach markers — file/send/attach aliases, matched anywhere EXCEPT inside
-# markdown code: a marker being SHOWN is prose, not a directive. The lookarounds
-# cover inline spans; _code_lines covers fenced and indented blocks, which is how
-# the marker is most often documented.
+# Attach markers — file/send/attach aliases. A marker inside markdown code is
+# being SHOWN, not issued; _code_lines and _SPAN_RE below mask those regions.
 _ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]+)\](?!`)")
 
 _FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
 
-# Inline code spans: a run of N backticks closed by the same run. Matching the
-# SPAN (rather than testing the characters either side of a marker) is what
-# catches a marker sitting in the middle of a longer span.
+# A run of N backticks closed by the same run. Matching the SPAN, not the
+# characters beside a marker, is what catches one mid-span.
 _SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\1).)+?\1(?!`)", re.DOTALL)
 
 
