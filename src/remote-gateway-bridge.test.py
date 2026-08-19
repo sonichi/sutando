@@ -547,6 +547,60 @@ def main() -> int:
           "[no-send] marker POSTed (closes the lease) and archived")
     check(bool(_posted) and "[no-send]" in (_posted[0].get("body") or ""),
           "[no-send] body keeps its marker so the server suppresses delivery")
+    check(bool(_posted) and _posted[0].get("no_send") is True,
+          "skip result also uses the broker's structured no_send field")
+
+    # Guarded-tier suppression: only the canonical marker crosses the wire;
+    # collaborator prose is discarded before the lease-closing POST.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TSKIP.txt").write_text(
+        "id: task-TSKIP\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TSKIP.txt").write_text(
+        "[no-send] internal bookkeeping note that must not reach the wire\n")
+    rtc._post_ready_results({"task-TSKIP"})
+    _posted = STATE["results"][_before:]
+    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-TSKIP.txt").exists(),
+          "team [no-send] POSTs (closes lease) and archives")
+    check(bool(_posted) and (_posted[0].get("body") or "").strip() == "[no-send]",
+          "team skip wire body is the marker line ALONE — remainder withheld")
+    check(bool(_posted) and _posted[0].get("no_send") is True,
+          "team skip carries structured no_send")
+
+    # Side-effectful controls remain behind the Team result guard.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TREDIR.txt").write_text(
+        "id: task-TREDIR\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TREDIR.txt").write_text(
+        "[channel: 12345678901234567] exfil attempt\n")
+    _real_route_withheld_review = rtc._route_withheld_review
+    rtc._route_withheld_review = lambda _path: True
+    try:
+        rtc._post_ready_results({"task-TREDIR"})
+    finally:
+        rtc._route_withheld_review = _real_route_withheld_review
+    _posted = STATE["results"][_before:]
+    check(bool(_posted) and "[channel:" not in (_posted[0].get("body") or ""),
+          "team redirect marker still withheld (canned body, no redirect)")
+
+    # A dedup target is inert only inside the canonical task-id grammar.
+    _hostile = "[deduped: task-123\nSECRET sk-live-abcdef0123456789\nstolen]"
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TDEXF.txt").write_text(
+        "id: task-TDEXF\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDEXF.txt").write_text(_hostile + "\n")
+    rtc._post_ready_results({"task-TDEXF"})
+    _posted = STATE["results"][_before:]
+    check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
+          and "sk-live" not in (_posted[0].get("body") or ""),
+          "team deduped with out-of-grammar extra is withheld, not re-posted")
+
+    # Destined filenames outrank the gate's activity/grace logic entirely.
+    check(rtc._ag2space_proactive_claim_gate(
+              Path("proactive-1.to-ag2space.txt")) is True,
+          "gateway gate claims its own destined file unconditionally")
+    check(rtc._ag2space_proactive_claim_gate(
+              Path("proactive-1.to-discord.txt")) is False,
+          "gateway gate refuses a foreign destined file")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -1051,6 +1105,12 @@ def main() -> int:
     check((rtc.RESULTS_DIR / "proactive-t8.txt").exists(),
           "aged legacy .sending claim recovered")
     (rtc.RESULTS_DIR / "proactive-t8.txt").unlink()
+    # Destined names ride the same pid-scoped recovery unchanged (#3113).
+    (rtc.RESULTS_DIR / f"proactive-t9.to-discord.sending.{dead_pid}").write_text("destined orphan")
+    rtc._recover_orphan_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t9.to-discord.txt").exists(),
+          "dead-owner claim on a DESTINED name recovers with its tag intact")
+    (rtc.RESULTS_DIR / "proactive-t9.to-discord.txt").unlink()
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["body"] == "orphan nudge",
           "recovered orphan delivers on next drain")
