@@ -52,6 +52,7 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Architecture and decisions
 
 - [Architecture boundaries](architecture-boundaries.md)
+- [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)

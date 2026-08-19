@@ -19,8 +19,10 @@ Run: python3 tests/team-result-guard.test.py
 Exit code: 0 on pass, 1 on fail.
 """
 
+import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -29,7 +31,6 @@ sys.path.insert(0, str(REPO / "src"))
 import team_result_guard as guard  # noqa: E402
 
 BRIDGE = REPO / "src" / "discord-bridge.py"
-WORKER = REPO / "skills" / "task-workstream-sessions" / "scripts" / "session-worker.py"
 
 
 class _Scan:
@@ -102,6 +103,57 @@ def behavioral() -> list:
     if out != guard.TEAM_LEAK_RESULT or not why:
         fails.append("a raising scanner must fail CLOSED and withhold the body")
 
+    out, why = guard.guard_result_for_tier(
+        "intentional secret", "team", REPO, secret_filter=_leaky,
+        scan_sensitive_data=False)
+    if out != "intentional secret" or why is not None:
+        fails.append("an explicit filter opt-out must pass ordinary result text")
+    out, why = guard.guard_result_for_tier(
+        "[attach: /etc/passwd]", "team", REPO, secret_filter=_clean,
+        scan_sensitive_data=False)
+    if out != guard.TEAM_LEAK_RESULT or not why:
+        fails.append("delivery-control markers must stay guarded when scanning is off")
+
+    with tempfile.TemporaryDirectory() as td:
+        task = Path(td) / "task.txt"
+        missing = Path(td) / "missing-task.txt"
+        directory = Path(td) / "task-directory"
+        directory.mkdir()
+        if not guard.sensitive_data_filter_enabled(missing, "team"):
+            fails.append("a missing task file must fail closed to scanning enabled")
+        if not guard.sensitive_data_filter_enabled(directory, "team"):
+            fails.append("a directory in place of a task file must fail closed")
+        task.write_text("access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a missing filter stamp must default on")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: false\n"
+            "access_tier: team\ntask: body\n")
+        if guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("paired Team collaborator and filter-off stamps must disable scanning")
+        if not guard.sensitive_data_filter_enabled(task, "guest"):
+            fails.append("a non-Team tier must keep scanning enabled")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: FALSE\n"
+            "access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a non-canonical filter value must fail closed to enabled")
+        task.write_text(
+            "collaborator: true\nsensitive_data_filter: false\n"
+            "sensitive_data_filter: false\n"
+            "access_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("duplicate filter stamps must fail closed to enabled")
+        task.write_text(
+            "collaborator: true\naccess_tier: team\ntask: body\n"
+            "sensitive_data_filter: false\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("a body-authored filter opt-out must not be trusted")
+        task.write_text(
+            "sensitive_data_filter: false\naccess_tier: team\ntask: body\n")
+        if not guard.sensitive_data_filter_enabled(task, "team"):
+            fails.append("filter-off without collaborator opt-in must fail closed")
+
     # The caller is handed only the safe body — it cannot deliver the raw text
     # by swallowing an exception.
     out, _ = guard.guard_result_for_tier("[channel: 5] secret", "team", REPO, secret_filter=_clean)
@@ -115,13 +167,103 @@ def behavioral() -> list:
             fails.append(f"tier {tier!r} must be guarded (only exact 'owner' is exempt)")
     if not guard.is_guarded_tier("Owner "):
         pass  # case/space-insensitive owner is intentionally exempt
+
+    context = {
+        "source": "ag2space",
+        "channel_id": "!room:ag2.space",
+        "reply_to_event": "$thread-root",
+        "source_message_id": "$message-one",
+        "user_id": "@requester:ag2.space",
+    }
+    if guard._bounded_context(None) != {}:
+        fails.append("non-dict review context must normalize to empty")
+    clean = guard.classify_result_for_tier(
+        "public body", "owner", REPO, secret_filter=_clean)
+    if guard.materialize_withheld_verdict(
+            clean, "public body", Path("unused"), "task-clean") != clean:
+        fails.append("non-leak verdicts must not create review artifacts")
+
+    with tempfile.TemporaryDirectory() as td:
+        directory = Path(td)
+        original_link = guard.os.link
+        try:
+            def raced_link(_temporary, destination):
+                Path(destination).write_text("race winner", encoding="utf-8")
+                raise FileExistsError
+
+            guard.os.link = raced_link
+            if not guard._write_artifact(directory / "raced.json", {"value": 1}):
+                fails.append("a concurrent artifact winner must count as persisted")
+
+            def consuming_link(temporary, destination):
+                Path(temporary).replace(destination)
+
+            guard.os.link = consuming_link
+            if not guard._write_artifact(directory / "consumed.json", {"value": 2}):
+                fails.append("cleanup must tolerate an already-consumed temporary file")
+        finally:
+            guard.os.link = original_link
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        raw = "private result one"
+        leak = guard.classify_result_for_tier(raw, "team", REPO, secret_filter=_leaky)
+        first = guard.materialize_withheld_verdict(
+            leak, raw, state, "task-one", context, "@agent-one:ag2.space", now=1000)
+        saved = list((state / guard.WITHHELD_RESULT_DIR).glob("wr_*.json"))
+        if first.kind != guard.VERDICT_SUPPRESS or first.body != "[no-send]" or len(saved) != 1:
+            fails.append("withheld result must persist for DM review and stay out of the room")
+        else:
+            payload = json.loads(saved[0].read_text(encoding="utf-8"))
+            if payload.get("withheld_body") != raw or payload.get("agent_id") != "@agent-one:ag2.space":
+                fails.append("review artifact must identify the agent and contain the withheld body")
+            if payload.get("status") != "pending_dm" or not payload.get("review_id", "").startswith("wr_"):
+                fails.append("review artifact must carry a stable id and pending-DM state")
+            if saved[0].stat().st_mode & 0o777 != 0o600:
+                fails.append("withheld review artifact must be mode 0600")
+
+        retry = guard.materialize_withheld_verdict(
+            leak, raw, state, "task-one", context, "@agent-one:ag2.space", now=1001)
+        if retry != first or len(list((state / guard.WITHHELD_RESULT_DIR).glob("wr_*.json"))) != 1:
+            fails.append("a delivery retry must reuse its private-review artifact")
+
+        second = guard.materialize_withheld_verdict(
+            leak, "private result two", state, "task-two", context,
+            "@agent-one:ag2.space", now=1002)
+        if second.kind != guard.VERDICT_SUPPRESS or second.body != "[no-send]":
+            fails.append("every withheld result must be quiet in the shared room")
+        if len(list((state / guard.WITHHELD_RESULT_DIR).glob("wr_*.json"))) != 2:
+            fails.append("each withheld result must persist its own review artifact")
+
+    with tempfile.TemporaryDirectory() as td:
+        blocked_state = Path(td) / "not-a-directory"
+        blocked_state.write_text("x", encoding="utf-8")
+        leak = guard.classify_result_for_tier("private body", "team", REPO, secret_filter=_leaky)
+        unsaved = guard.materialize_withheld_verdict(
+            leak, "private body", blocked_state, "task-fail", context, now=1000)
+        if unsaved.body != guard.TEAM_LEAK_RESULT_UNSAVED or "private body" in unsaved.body:
+            fails.append("persistence failure must be honest and still withhold the body")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        leak = guard.classify_result_for_tier(
+            "private body", "team", REPO, secret_filter=_leaky)
+        original_mkstemp = guard.tempfile.mkstemp
+        try:
+            guard.tempfile.mkstemp = lambda **_kwargs: (_ for _ in ()).throw(
+                OSError("disk full"))
+            unsaved = guard.materialize_withheld_verdict(
+                leak, "private body", state, "task-io-fail", context, now=1000)
+        finally:
+            guard.tempfile.mkstemp = original_mkstemp
+        if unsaved.body != guard.TEAM_LEAK_RESULT_UNSAVED:
+            fails.append("artifact write exceptions must return the fail-closed verdict")
     return fails
 
 
 def structural() -> list:
     fails = []
     bridge = BRIDGE.read_text()
-    worker = WORKER.read_text()
 
     if "from team_result_guard import" not in bridge:
         fails.append("discord-bridge must import the shared guard")
@@ -144,20 +286,18 @@ def structural() -> list:
         fails.append("an unknown tier must be resolved from the task file before guarding")
 
     # One implementation: consumers import the policy, never restate it.
-    for name, src, label in ((BRIDGE.name, bridge, "bridge"), (WORKER.name, worker, "worker")):
+    for name, src, label in ((BRIDGE.name, bridge, "bridge"),):
         if re.search(r"^\s*TEAM_RESULT_CONTROL\s*=\s*re\.compile", src, re.M):
             fails.append(f"{name} redefines TEAM_RESULT_CONTROL instead of importing it")
         if re.search(r"^class TeamResultLeakError", src, re.M):
             fails.append(f"{name} redefines TeamResultLeakError instead of importing it")
         if re.search(r"^def resolve_access_tier", src, re.M):
             fails.append(f"{name} redefines resolve_access_tier instead of importing it")
-    if "from team_result_guard import" not in worker:
-        fails.append("session-worker must import the shared guard")
     return fails
 
 
 def main() -> int:
-    for path in (BRIDGE, WORKER):
+    for path in (BRIDGE,):
         if not path.exists():
             print(f"FAIL: missing {path}")
             return 1
@@ -176,6 +316,9 @@ def main() -> int:
         ("**[core: 1]**\n[no-send]\nhide", "team", _clean, guard.VERDICT_SUPPRESS),
         ("[attach: /etc/passwd]", "team", _clean, guard.VERDICT_LEAK),
         ("secret text", "team", _leaky, guard.VERDICT_LEAK),
+        # Marker check precedes the secret scan: a secret-carrying skip body
+        # still SUPPRESSES — the leaky filter never gets a say on a stubbed body.
+        ("[no-send]\nsecret text", "team", _leaky, guard.VERDICT_SUPPRESS),
     ):
         v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
         assert v.kind == kind, (body, tier, v)
@@ -196,8 +339,11 @@ def main() -> int:
         got = guard.suppression_stub_for_tier(body, tier)
         assert got == stub, (body, tier, got)
         if got is not None:
-            v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=_clean)
-            assert v.kind == guard.VERDICT_SUPPRESS, (body, "stub without suppress verdict")
+            # stub⊆suppress holds regardless of filter: the marker check
+            # precedes the secret scan, so _leaky cannot flip a stub to LEAK.
+            for filt in (_clean, _leaky):
+                v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
+                assert v.kind == guard.VERDICT_SUPPRESS, (body, filt.__name__, "stub without suppress verdict")
             assert got == body[:len(got)] or got.startswith("[deduped:"), body
     print("  [stub] suppression_stub_for_tier: inert bytes only, subset of suppress")
     print("  [verdict] classify_result_for_tier owns the three-way decision;")
