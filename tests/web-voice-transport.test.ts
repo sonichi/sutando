@@ -1343,6 +1343,20 @@ describe('transport public API additions (Steps 15/16/18)', () => {
 		h.t.disconnect();
 	});
 
+	it('sendTextInput: a close between the readyState check and send() returns false, not a throw', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		// The real race: readyState is still OPEN when the guard samples it, and
+		// the socket closes before send() runs, so send() throws InvalidStateError.
+		const before = s.sent.length;
+		s.send = () => { throw new Error('InvalidStateError: still in CONNECTING state'); };
+		assert.equal(s.readyState, 1, 'guard must pass — otherwise this tests the wrong branch');
+		assert.doesNotThrow(() => h.t.sendTextInput('lost frame'));
+		assert.equal(h.t.sendTextInput('lost frame'), false, 'a frame that did not go out must report false');
+		assert.equal(s.sent.length, before, 'nothing was recorded as sent');
+		h.t.disconnect();
+	});
+
 	it('setPlaybackRate drives subsequent playback scheduling', async () => {
 		const h = harness();
 		const s = await goLive(h);
