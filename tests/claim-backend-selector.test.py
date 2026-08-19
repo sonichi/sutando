@@ -10,9 +10,18 @@ drove the resolver would pass while the bridge ignored it.
 import ast
 import importlib.util
 import os
+import pathlib
 import sys
 import tempfile
 from pathlib import Path
+
+# Isolate BEFORE anything resolves config: this test asserts on config
+# resolution, so reading the operator's real file would make it host-dependent.
+_ccd = tempfile.mkdtemp()
+os.environ["CLAUDE_CONFIG_DIR"] = _ccd
+_p = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_p.mkdir(parents=True, exist_ok=True)
+(_p / "access.json").write_text("{}")
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
