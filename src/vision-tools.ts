@@ -39,7 +39,9 @@ const execFileAsync = promisify(execFile);
 const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
-export const VISION_MIN_SEND_INTERVAL_MS = 900;
+// Push-path floor for the documented 1 fps cap: MAX_FPS below bounds only the
+// pull ticker (#3089 deferred this gate to #3090, which never landed it).
+export const VISION_MIN_SEND_INTERVAL_MS = 1000;
 // https://ai.google.dev/gemini-api/docs/live-api — video is sampled at 1 fps.
 // Cite it: the repo states this rate nowhere else, so an uncited literal here
 // would be unfalsifiable for the next reader.
