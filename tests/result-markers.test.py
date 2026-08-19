@@ -337,5 +337,31 @@ class UnknownAttachKeywords(unittest.TestCase):
                 self.assertNotIn(f"[{kw}:", r.body)
 
 
+class BacktickedMarkerIsProse(unittest.TestCase):
+    """A marker inside a markdown code span is prose ABOUT the feature.
+
+    Treating it as a directive strips it from the sentence and pushes an
+    invented path at the allowlist. Inline markers OUTSIDE backticks stay
+    directives -- that shape is relied on and pinned elsewhere in this file.
+    """
+
+    def _attach(self, body):
+        return [a.value for a in parse_markers(body).actions if a.kind == "attach"]
+
+    def test_backticked_marker_is_not_an_action(self):
+        self.assertEqual(self._attach("the `[file: /path]` marker uploads"), [])
+
+    def test_backticked_marker_survives_in_the_body(self):
+        body = "explain: `[attach: /p]` sends a file."
+        self.assertEqual(parse_markers(body).body, body)
+
+    def test_bare_inline_marker_is_still_a_directive(self):
+        self.assertEqual(self._attach("see this [file: /tmp/x.png] thanks"),
+                         ["/tmp/x.png"])
+
+    def test_standalone_marker_is_still_a_directive(self):
+        self.assertEqual(self._attach("text\n[send: /tmp/a.png]\n"), ["/tmp/a.png"])
+
+
 if __name__ == "__main__":
     unittest.main()

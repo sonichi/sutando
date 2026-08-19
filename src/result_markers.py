@@ -136,8 +136,9 @@ _D7_HEADER_RE = re.compile(
     r"\A\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*"
 )
 
-# Attach markers — file/send/attach are aliases.
-_ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
+# Attach markers — file/send/attach aliases, matched anywhere EXCEPT inside a
+# markdown code span: a backticked marker is prose, not a directive.
+_ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]+)\](?!`)")
 
 # DM-only privacy marker — matched ANYWHERE in the body (not anchored) so it
 # suppresses a [channel:] redirect regardless of which came first. All
