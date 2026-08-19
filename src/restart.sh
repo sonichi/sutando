@@ -99,5 +99,24 @@ for _ in $(seq 1 30); do
     sleep 0.1
 done
 
+# Relaunch what line 73 killed. This belongs here, not in startup.sh: that file
+# is guarded headless (tests/startup-headless.test.sh) and owns no desktop UI.
+APP_BIN="$REPO/src/Sutando/Sutando"
+if pgrep -x Sutando > /dev/null 2>&1; then
+    echo "  ✓ Sutando.app (already running)"
+elif [ -x "$APP_BIN" ]; then
+    nohup "$APP_BIN" > /tmp/sutando-app.log 2>&1 &
+    sleep 1
+    # `pgrep -x`, never `-f`: -f matches this script's own argv and would report
+    # a launch that did not happen. The ✓ stays inside the verified branch.
+    if pgrep -x Sutando > /dev/null 2>&1; then
+        echo "  ✓ Sutando.app relaunched"
+    else
+        echo "  ✗ Sutando.app — launched but not running; see /tmp/sutando-app.log"
+    fi
+else
+    echo "  ⊘ Sutando.app skipped — no binary at $APP_BIN"
+fi
+
 echo "Starting..."
 exec bash "$REPO/src/startup.sh"

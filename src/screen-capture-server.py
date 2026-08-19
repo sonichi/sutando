@@ -137,6 +137,35 @@ def _notify_capture_blocking():
         pass  # Best-effort; notification absence is never critical.
 
 
+# A frame that could not be recompressed may still pass if it is already
+# small; past this it is an error — D7.4 makes the downscale budget
+# MANDATORY, and silently sending a native-res original re-creates FE-1.
+DOWNSCALE_FAIL_MAX_BYTES = 400 * 1024
+
+
+def _downscale_frame(path: str, maxdim: int | None, quality: int | None) -> bool:
+    """P7 D7.4: resize/recompress a captured frame IN THIS PROCESS via sips.
+
+    Runs before the path is returned to the caller, so the voice event loop
+    only ever touches the already-shrunk file. Returns False when the frame
+    could not be brought under budget (sips failed AND the original exceeds
+    DOWNSCALE_FAIL_MAX_BYTES) — the caller must error, not pass it through."""
+    cmd = ["sips"]
+    if maxdim:
+        cmd += ["--resampleHeightWidthMax", str(maxdim)]
+    if quality:
+        cmd += ["-s", "format", "jpeg", "-s", "formatOptions", str(quality)]
+    cmd.append(path)
+    try:
+        subprocess.run(cmd, timeout=10, capture_output=True, check=True)
+        return True
+    except Exception:
+        try:
+            return os.path.getsize(path) <= DOWNSCALE_FAIL_MAX_BYTES
+        except Exception:
+            return False
+
+
 def _notify_capture():
     """Debounced fire-and-forget desktop notification."""
     global _last_notify_ts
@@ -211,6 +240,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fmt = "png"
         ext = "jpg" if fmt in ("jpg", "jpeg") else "png"
         type_flag = "jpg" if ext == "jpg" else "png"
+        # P7 D7.4: optional downscale/recompress executed HERE, in the capture
+        # server's process (sips subprocess) — vision compression must never
+        # compete with the voice event loop. maxdim bounds the longest edge;
+        # quality is JPEG percent (jpg only). Bounded to sane ranges.
+        maxdim_raw = query.get("maxdim", [None])[0]
+        maxdim = int(maxdim_raw) if maxdim_raw and maxdim_raw.isdigit() and 320 <= int(maxdim_raw) <= 3840 else None
+        quality_raw = query.get("quality", [None])[0]
+        quality = int(quality_raw) if quality_raw and quality_raw.isdigit() and 10 <= int(quality_raw) <= 100 else None
         try:
             # macOS supports explicit per-display capture. Windows currently
             # falls back to one virtual-screen capture for both `all` and
@@ -244,6 +281,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "capture_screen returned False — check Screen Recording "
                         "permission (macOS) or PowerShell availability (Windows)"
                     )
+            if maxdim or (quality and ext == "jpg"):
+                for p in paths:
+                    if not _downscale_frame(p, maxdim, quality if ext == "jpg" else None):
+                        for cleanup in paths:
+                            try: os.unlink(cleanup)
+                            except Exception: pass
+                        self._send_json(500, {"status": "error", "error": "downscale failed and frame exceeds budget"})
+                        return
             resp = {"status": "ok", "path": paths[0] if paths else path}
             if len(paths) > 1:
                 resp["all_paths"] = paths

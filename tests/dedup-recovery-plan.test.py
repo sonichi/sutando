@@ -30,6 +30,12 @@ CONSUMERS = {
 }
 
 
+LOOKUP_CONSUMERS = {
+    "dedup_recovery": REPO / "src" / "dedup_recovery.py",
+    "watch-tasks-stream": REPO / "src" / "watch-tasks-stream.sh",
+}
+
+
 class _Space:
     def __init__(self, td: str):
         self.results = Path(td) / "results"
@@ -72,6 +78,16 @@ class PlanTest(unittest.TestCase):
             self.assertIn("What is AG2Space?", body, "re-ask lost the question")
             self.assertIn("delivered nothing", body, "re-ask does not say why")
             self.assertIn("dedup_requeue_count: 1", body, "loop guard missing")
+
+    def test_live_unarchived_holder_is_found(self):
+        """Archival trails delivery, so a same-pass dedup is decided while the
+        holder's result is still live in results/ rather than archive/."""
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.orig()
+            (sp.results / f"{HOLDER}.txt").write_text("the full answer")
+            self.assertEqual(sp.plan(), ("honour", None))
+            self.assertFalse((sp.tasks / f"{NEW}.txt").exists(),
+                             "a holder that delivered must not be re-asked")
 
     def test_month_partitioned_holder_is_found(self):
         """The bridges archive as archive/<YYYY-MM>/<id>.txt, not flat."""
@@ -213,6 +229,21 @@ class DelegationTest(unittest.TestCase):
                 self.assertNotIn(
                     "dedup_decision(", src,
                     f"{name}: calls dedup_decision directly — the plan owns that",
+                )
+
+    def test_result_lookup_is_not_reimplemented(self):
+        """Live-then-archive is one policy: an archive-only copy reads a
+        delivered-but-unarchived result as never delivered."""
+        for name, path in LOOKUP_CONSUMERS.items():
+            with self.subTest(consumer=name):
+                src = path.read_text()
+                self.assertIn(
+                    "find_result", src,
+                    f"{name}: must use local_task_protocol.find_result",
+                )
+                self.assertNotIn(
+                    "find_archived_result", src,
+                    f"{name}: archive-only lookup cannot see a live result",
                 )
 
     def test_sparrow_bundle_matches_src(self):

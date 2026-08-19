@@ -75,7 +75,7 @@ and "After opening the PR" sections. The short checklist:
 - **Live path (bridge / network / delivery loop / startup)?** Include a real post-restart round trip, not just unit tests — reviewers reject harness-only proof for these.
 - **Stacked PR?** Name the parent and merge order; after the parent lands, rebase/update the child and rerun its full checks.
 - Scan added lines for hardcoded host paths and inline path fallbacks; production code must use the repo's path helpers.
-- After `update-branch`, CLA-Assistant may not auto-rerun — try `@cla-assistant check` comment or close+reopen if stuck
+- After `update-branch`, CLA-Assistant often does not re-post. `license/cla` is SHA-bound, so the new head carries no status, and a *required* context that never posts reads as pending forever. **Close+reopen the PR** — it is a retry, and `pull_request.reopened` is acted on. Do **not** reach for an `@cla-assistant check` comment first: that is exactly what `.github/workflows/cla-recheck-on-push.yml` already posts on every push, and it is unreliable. Full ABSENT-vs-FAILING triage, with the `gh api .../commits/{sha}/status` invocation: `CONTRIBUTING.md` → "Check the CLA status"
 
 ### Reviewing a PR
 
