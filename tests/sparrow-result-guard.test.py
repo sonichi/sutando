@@ -124,6 +124,16 @@ with tempfile.TemporaryDirectory() as td:
     write_task(
         tasks, "task-team-filter-off", "team",
         collaborator="true", sensitive_data_filter="false")
+    bundled_filter_enabled = m._team_guard_fns()[3]
+    missing_task = tasks / "missing-task.txt"
+    task_directory = tasks / "task-directory"
+    task_directory.mkdir()
+    check(bundled_filter_enabled(missing_task, "team"),
+          "a missing bundled task file fails closed to scanning enabled")
+    check(bundled_filter_enabled(task_directory, "team"),
+          "a directory in place of a bundled task file fails closed")
+    check(not bundled_filter_enabled(tasks / "task-team-filter-off.txt", "team"),
+          "a readable paired bundled task still disables scanning")
     plain, plain_withheld = m._guarded_result_body(
         "task-team-filter-off", "intentional ghp_" + "a" * 36)
     check(plain_withheld is None and plain.startswith("intentional ghp_"),

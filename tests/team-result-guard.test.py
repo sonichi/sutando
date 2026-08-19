@@ -116,6 +116,13 @@ def behavioral() -> list:
 
     with tempfile.TemporaryDirectory() as td:
         task = Path(td) / "task.txt"
+        missing = Path(td) / "missing-task.txt"
+        directory = Path(td) / "task-directory"
+        directory.mkdir()
+        if not guard.sensitive_data_filter_enabled(missing, "team"):
+            fails.append("a missing task file must fail closed to scanning enabled")
+        if not guard.sensitive_data_filter_enabled(directory, "team"):
+            fails.append("a directory in place of a task file must fail closed")
         task.write_text("access_tier: team\ntask: body\n")
         if not guard.sensitive_data_filter_enabled(task, "team"):
             fails.append("a missing filter stamp must default on")
