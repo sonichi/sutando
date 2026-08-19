@@ -367,9 +367,8 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data)
     if suppress_journal is not None:
-        # The stub is the module's existing policy for what a guarded
-        # suppression may say; this only adds the record that lets a
-        # non-journaled transport use it. Do not re-derive the body here.
+        # The stub is this module's existing policy; the journal only adds
+        # the record. Never mint a body here.
         stub = suppression_stub_for_tier(body, tier)
         if stub is not None:
             state_dir, task_id = suppress_journal

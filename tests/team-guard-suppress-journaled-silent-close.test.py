@@ -118,11 +118,8 @@ def main() -> int:
     check(got_h == guard.TEAM_SUPPRESS_RESULT,
           f"h) an UNSUCCESSFUL journal write -> notice stands, got {got_h[:40]!r}")
 
-    # i) THE STUB IS PRESERVED, not flattened. An earlier revision of this change
-    #    returned a hardcoded "[no-send]", which drops the dedup target that
-    #    discord-bridge needs to validate the holder's CHANNEL and re-queue a
-    #    cross-channel dedup. The body must be whatever suppression_stub_for_tier
-    #    says -- the module's existing policy -- never a fresh literal.
+    # i) A flat "[no-send]" would drop the dedup target discord-bridge needs to
+    #    validate the holder's channel. The body must equal the stub function's.
     for src_body, want in (("[no-send]\nx", "[no-send]"),
                            ("[REPLIED]\nx", "[REPLIED]"),
                            ("[deduped: task-abc123]\nx", "[deduped: task-abc123]")):
