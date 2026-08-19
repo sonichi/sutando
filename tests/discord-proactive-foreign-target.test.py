@@ -40,7 +40,9 @@ end = text.find("[proactive] send failure", start)
 check(start != -1 and end > start, "proactive claim block is locatable")
 block = text[start:end]
 
-check("release_claim" in block,
+# Post-5b the release goes through the claim fence, whose release() is
+# behaviorally pinned (fence suite: "release restores the .txt").
+check("_proactive_fence().release" in block,
       "the proactive block can release a claim back to the polling stream")
 
 shape = re.search(r'fullmatch\(r"\\d\{17,20\}"', block) or re.search(r"\\d\{17,20\}", block)
@@ -57,7 +59,7 @@ check(gi != -1 and ii != -1 and gi < ii,
 # The release must be reached by the foreign branch, not only by the empty-text
 # branch that already existed.
 foreign = block[gi:ii] if (gi != -1 and ii != -1) else ""
-check("release_claim" in foreign and "continue" in foreign,
+check("_proactive_fence().release" in foreign and "continue" in foreign,
       "the foreign-target branch releases the claim and stops processing")
 
 # Parity: the rule is not new policy, it is what the sibling bridges already do.
