@@ -2230,9 +2230,8 @@ def _recover_orphan_proactive() -> None:
     claim (review blocker). Claims are pid-scoped (`.sending.<pid>`): a claim
     whose owner pid is alive is left alone; a dead owner's claim recovers
     immediately. Legacy bare `.sending` claims (no owner info) recover only
-    past an age threshold."""
-    if not PROACTIVE_ROOM:
-        return
+    past an age threshold. Runs without PROACTIVE_ROOM: a file naming its own room
+    is now drainable, so its orphan claims must recover too."""
     for f in list(RESULTS_DIR.glob("proactive-*.sending.*")) \
             + list(RESULTS_DIR.glob("proactive-*.sending")):
         name = f.name
@@ -2311,21 +2310,24 @@ def _post_proactive() -> None:
     file archives beside task results; a failed POST renames the claim back
     to `.txt` for retry on the next loop pass. Auth errors propagate to the
     caller (the poll loop owns auth handling); everything else is per-file
-    fail-open — one malformed nudge never blocks the rest. No-op without
-    PROACTIVE_ROOM. A host-injected PROACTIVE_CLAIM_GATE may defer a file
+    fail-open — one malformed nudge never blocks the rest. A file naming its own
+    Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
+    with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
     that belongs to another bridge (cross-bridge routing stays host policy)."""
-    if not PROACTIVE_ROOM:
-        return
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
         # claiming it here would leak the raw body (marker included) to the
         # gateway room and starve the real consumer (review blocker).
         try:
-            route, _, _ = _proactive_route(f.read_text(encoding="utf-8"))
+            route, peek_room, _ = _proactive_route(f.read_text(encoding="utf-8"))
         except OSError:
             continue  # racing consumer already claimed it
         if route == "foreign":
+            continue
+        # No target of its own AND no default: skip BEFORE claiming. Claiming it
+        # would spin (claim -> no destination -> hand back) on every pass.
+        if route == "send" and peek_room is None and not PROACTIVE_ROOM:
             continue
         if PROACTIVE_CLAIM_GATE is not None:
             try:
@@ -2362,9 +2364,10 @@ def _post_proactive() -> None:
                      f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
                      f"owner nudge stranded under live pid until restart")
             continue
-        if route == "foreign":
-            # A foreign destination that only became visible post-claim: hand
-            # the file back to its real consumer rather than eating it.
+        if route == "foreign" or (
+                route == "send" and room_override is None and not PROACTIVE_ROOM):
+            # Hand back rather than eat: a foreign target seen only post-claim,
+            # or one that vanished with no default (room_id=None loses the body).
             try:
                 claim.rename(f)
             except OSError:
