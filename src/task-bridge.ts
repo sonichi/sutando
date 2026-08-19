@@ -616,10 +616,40 @@ export function getRecentConversation(count = 10): string {
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
 const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
 
+/** Drop task files already handed to the live session, so a re-scan cannot re-inject. */
+const _injectedDropTasks = new Set<string>();
+/** First scan only records what is already queued — a restart must not replay old drops. */
+let _seedingDropTasks = true;
+
+type DropTaskScan =
+	| { kind: 'other' }
+	| { kind: 'incomplete' }
+	| { kind: 'drop'; body: string };
+
 /**
- * Watch for context-drop.txt and inject into Gemini conversation.
- * Called once at startup. When user drops context via keyboard shortcut,
- * it gets sent to Gemini so it knows about it.
+ * Pull the dropped text back out of a `source: context-drop` task file. A drop
+ * whose `task:` line has not landed yet is `incomplete`, never `other`.
+ */
+export function scanDropTask(path: string): DropTaskScan {
+	const raw = readFileSync(path, 'utf-8');
+	if (!/^source:[ \t]*context-drop[ \t]*$/m.test(raw)) {
+		// A header still being written has no source line yet; re-read next tick.
+		return /^task:/m.test(raw) ? { kind: 'other' } : { kind: 'incomplete' };
+	}
+	const marker = raw.indexOf('\ntask:');
+	if (marker === -1) return { kind: 'incomplete' };
+	const body = raw
+		.slice(marker + '\ntask:'.length)
+		.replace(/^[ \t]*User dropped context via hotkey\. Process this:[ \t]*/, '')
+		.trim();
+	return body ? { kind: 'drop', body } : { kind: 'incomplete' };
+}
+
+/**
+ * Watch for context drops and inject them into the Gemini conversation.
+ * Called once at startup. Two producers exist and only one writes
+ * CONTEXT_DROP_FILE, so the task dir — which both write — is the injection
+ * point; see the task-dir scan below.
  */
 export function startContextDropWatcher(onContextDrop: (content: string) => void): void {
 	console.log(`${ts()} [TaskBridge] Watching for context drops`);
@@ -653,11 +683,38 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					);
 					emitTaskProcessed(stampedContent);
 					unlinkSync(CONTEXT_DROP_FILE);
-					// Also inject into Gemini if available
+					// Claim it before injecting so the task-dir scan below cannot
+					// send this same drop a second time.
+					_injectedDropTasks.add(`${taskId}.txt`);
 					onContextDrop(content);
 				}
 			} catch { /* file might be in transit */ }
 		}
+
+		// The desktop app writes its `source: context-drop` task file directly and
+		// never creates CONTEXT_DROP_FILE, so the poll above cannot see its drops.
+		try {
+			const present = readdirSync(TASK_DIR);
+			// Archived tasks can never be re-read, so their claims are dead weight.
+			if (_injectedDropTasks.size > 500) {
+				const live = new Set(present);
+				for (const seen of _injectedDropTasks) if (!live.has(seen)) _injectedDropTasks.delete(seen);
+			}
+			for (const name of present) {
+				if (!name.startsWith('task-') || !name.endsWith('.txt')) continue;
+				if (_injectedDropTasks.has(name)) continue;
+				let scan: DropTaskScan;
+				try {
+					scan = scanDropTask(join(TASK_DIR, name));
+				} catch { continue; }
+				if (scan.kind === 'incomplete') continue;
+				_injectedDropTasks.add(name);
+				if (scan.kind !== 'drop' || _seedingDropTasks) continue;
+				console.log(`${ts()} [TaskBridge] Context drop detected: ${scan.body.slice(0, 100)}`);
+				onContextDrop(scan.body);
+			}
+			_seedingDropTasks = false;
+		} catch { /* tasks dir may not exist yet */ }
 	}, 2000);
 }
 
