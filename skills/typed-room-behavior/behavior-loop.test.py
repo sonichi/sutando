@@ -107,6 +107,27 @@ def main():
     new6, _ = bl.filter_new_proposals({"!r": 1000}, "!r", items, V)
     check(len(new6) == 2, "dedup: v1 bare-stamp state treated as no prior proposals")
 
+    # unconsumed_manifests: a manifest with no registered room is a surface nothing
+    # exercises, so a regression in it would surface to nobody.
+    import tempfile
+    with tempfile.TemporaryDirectory() as md:
+        for t in ("piperoom", "inboxroom"):
+            open(os.path.join(md, f"{t}.json"), "w").write("{}")
+        rooms = [{"room": "!a", "type": "inboxroom"}]
+        check(bl.unconsumed_manifests(rooms, md) == ["piperoom"],
+              "unconsumed: names the manifest with no registered room")
+        both = [{"room": "!a", "type": "inboxroom"}, {"room": "!b", "type": "piperoom"}]
+        check(bl.unconsumed_manifests(both, md) == [],
+              "unconsumed: silent when every manifest has a room")
+        # Control: without this, returning [] unconditionally passes the line above.
+        check(bl.unconsumed_manifests([], md) == ["inboxroom", "piperoom"],
+              "unconsumed: empty registry names every manifest, sorted")
+        check(bl.unconsumed_manifests(rooms, os.path.join(md, "nope")) == [],
+              "unconsumed: unreadable manifest dir degrades to empty, never raises")
+        # A registry entry with no 'type' key must not crash the set difference.
+        check(bl.unconsumed_manifests([{"room": "!a"}], md) == ["inboxroom", "piperoom"],
+              "unconsumed: type-less registry row does not raise")
+
     print("\n" + ("PASS — all checks green" if not _fails else f"FAIL — {len(_fails)} failing"))
     return 1 if _fails else 0
 

@@ -50,6 +50,17 @@ def load_manifest(rtype, manifest_dir=None):
         return None
 
 
+def unconsumed_manifests(rooms, manifest_dir=None):
+    """Manifest types with no registered room — a shipped surface nothing exercises,
+    so no regression in it would ever surface. Sorted; pure."""
+    d = manifest_dir or MANIFEST_DIR
+    try:
+        have = {f[:-5] for f in os.listdir(d) if f.endswith(".json")}
+    except OSError:
+        return []
+    return sorted(have - {r.get("type") for r in rooms})
+
+
 def _load_module(rel, name):
     spec = importlib.util.spec_from_file_location(name, os.path.join(_REPO, rel))
     mod = importlib.util.module_from_spec(spec)
@@ -272,6 +283,9 @@ def run(registry_path, state_path, dry_run=False, force=False, manifest_dir=None
     now = int(time.time())
     engines = {}
     reports = []
+
+    for t in unconsumed_manifests(rooms, manifest_dir):
+        reports.append(("(no room)", f"manifest '{t}' has no registered room — nothing exercises it"))
 
     for rec in rooms:
         room, rtype = rec["room"], rec["type"]
