@@ -345,6 +345,20 @@ def main() -> int:
           "broker collaborator control safely promotes legacy Team metadata")
     rtc._write_task({
         **TASK,
+        "id": "task-ROOMTEAMNOFILTER",
+        "access_tier": "guest",
+        "requested_access_tier": "team",
+        "collaborator": True,
+        "sensitive_data_filter": False,
+    })
+    room_team_no_filter = (
+        rtc.TASKS_DIR / "task-ROOMTEAMNOFILTER.txt").read_text()
+    check(room_team_no_filter.count("sensitive_data_filter: false") == 1
+          and room_team_no_filter.index("sensitive_data_filter: false")
+          < room_team_no_filter.index("task:"),
+          "explicit filter opt-out is stamped before untrusted task text")
+    rtc._write_task({
+        **TASK,
         "id": "task-PLAINTEAM",
         "access_tier": "guest",
         "requested_access_tier": "team",
@@ -593,6 +607,14 @@ def main() -> int:
     check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
           and "sk-live" not in (_posted[0].get("body") or ""),
           "team deduped with out-of-grammar extra is withheld, not re-posted")
+
+    # Destined filenames outrank the gate's activity/grace logic entirely.
+    check(rtc._ag2space_proactive_claim_gate(
+              Path("proactive-1.to-ag2space.txt")) is True,
+          "gateway gate claims its own destined file unconditionally")
+    check(rtc._ag2space_proactive_claim_gate(
+              Path("proactive-1.to-discord.txt")) is False,
+          "gateway gate refuses a foreign destined file")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -1097,6 +1119,12 @@ def main() -> int:
     check((rtc.RESULTS_DIR / "proactive-t8.txt").exists(),
           "aged legacy .sending claim recovered")
     (rtc.RESULTS_DIR / "proactive-t8.txt").unlink()
+    # Destined names ride the same pid-scoped recovery unchanged (#3113).
+    (rtc.RESULTS_DIR / f"proactive-t9.to-discord.sending.{dead_pid}").write_text("destined orphan")
+    rtc._recover_orphan_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t9.to-discord.txt").exists(),
+          "dead-owner claim on a DESTINED name recovers with its tag intact")
+    (rtc.RESULTS_DIR / "proactive-t9.to-discord.txt").unlink()
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["body"] == "orphan nudge",
           "recovered orphan delivers on next drain")

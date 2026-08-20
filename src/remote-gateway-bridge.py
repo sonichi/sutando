@@ -43,7 +43,8 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from proactive_routing import BRIDGE_CHANNELS, should_claim_proactive  # noqa: E402
+from proactive_routing import (BRIDGE_CHANNELS, proactive_destination,  # noqa: E402
+                               should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 
@@ -147,6 +148,11 @@ def _routed_bridge_still_owns(routed: str, path: Path, now: float) -> bool:
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
     no other bridge will ever take (see _routed_bridge_still_owns)."""
+    # A filename destination outranks everything below, incl. the grace:
+    # a destined file strands visibly rather than leak to the gateway room.
+    dest = proactive_destination(path.name)
+    if dest is not None:
+        return dest == _CHANNEL
     state = WS / "state" / "last-owner-activity.json"
     if should_claim_proactive(state, _CHANNEL):
         return True

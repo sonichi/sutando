@@ -56,6 +56,10 @@ export const PERSIST_PAYLOAD_MAX_BYTES = 4096;
 export interface SpeechEvidence {
   active: boolean;
   onsetAt: number | null;
+  /** Onset of the most recent utterance, RETAINED after the hangover expires
+   *  (cleared only on epoch reset) — the 30s matrix window needs the first
+   *  sample of a completed utterance, which live `onsetAt` erases. */
+  lastOnsetAt: number | null;
   lastAboveFloorAt: number | null;
 }
 
@@ -121,6 +125,11 @@ export interface HealthRow {
   payload: string;
 }
 
+/** Matrix facts as recorded by the ledger. Structural (not the MatrixFacts
+ *  type) to avoid a ledger→matrix import cycle; widened past boolean for
+ *  speechObservedAt, the one timestamp member. */
+export type MatrixFactsRecord = Record<string, boolean | number | null>;
+
 export interface AudioHealthSnapshot {
   coverage: LedgerCoverage;
   /** Sampled bodhi diagnostics at snapshot time; null = unobserved. */
@@ -179,7 +188,7 @@ export interface AudioHealthSnapshot {
    *  §1.6 option 2): even a stripped row replays as the decision taken.
    *  Facts are structural (Record) to avoid a ledger→matrix import cycle. */
   lastMatrixVerdict: string | null;
-  lastMatrixFacts: Record<string, boolean> | null;
+  lastMatrixFacts: MatrixFactsRecord | null;
   lastMatrixReasons: string[] | null;
 }
 
@@ -216,7 +225,7 @@ export interface AudioHealthLedger {
   /** D7.2: record the latest matrix result — verdict plus facts and reasons
    *  (the recorded decision, design §1.6 option 2) — so every persisted row
    *  carries it. */
-  noteMatrixVerdict(verdict: string, facts?: Record<string, boolean>, reasons?: string[]): void;
+  noteMatrixVerdict(verdict: string, facts?: MatrixFactsRecord, reasons?: string[]): void;
   /** Server-reported standing prompt size + per-modality breakdown (bodhi
    *  onUsageMetadata; design §1.4). */
   noteUsageMetadata(
@@ -325,7 +334,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
    *  approximate. */
   let epochStartApproxMs: number | null = null;
   let lastMatrixVerdict: string | null = null;
-  let lastMatrixFacts: Record<string, boolean> | null = null;
+  let lastMatrixFacts: MatrixFactsRecord | null = null;
   let lastMatrixReasons: string[] | null = null;
 
   // ── lineage + context (design §1.1/§1.4; lineage OUTLIVES client epochs) ──
@@ -567,7 +576,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     // flag alone would latch active forever — the hangover check here makes
     // silence (and stalls) end the evidence.
     const active = lastAboveFloorAt !== null && t - lastAboveFloorAt <= hangMs;
-    return { active, onsetAt: active ? onsetAt : null, lastAboveFloorAt };
+    return { active, onsetAt: active ? onsetAt : null, lastOnsetAt: onsetAt, lastAboveFloorAt };
   }
 
   function inputHealth(
@@ -703,7 +712,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
       };
     },
 
-    noteMatrixVerdict(verdict: string, facts?: Record<string, boolean>, reasons?: string[]): void {
+    noteMatrixVerdict(verdict: string, facts?: MatrixFactsRecord, reasons?: string[]): void {
       lastMatrixVerdict = verdict;
       lastMatrixFacts = facts ?? null;
       lastMatrixReasons = reasons ?? null;
