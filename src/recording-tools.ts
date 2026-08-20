@@ -38,10 +38,70 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export function ffmpegSubtitleCandidates(execPath: string): string[] {
 	return [
 		'ffmpeg',
+		// Apple-Silicon Homebrew, then the Intel prefix. Both formulas are listed
+		// per arch: Homebrew installs under /opt/homebrew on arm64 and /usr/local
+		// on x86_64, so an arm64-only list leaves Intel resolving through PATH —
+		// which a launchd/service environment may not have. This is the single
+		// place a new install layout gets added; ffprobeCandidates() derives from
+		// it, so anything missing here is missing there too.
 		'/opt/homebrew/bin/ffmpeg',
 		'/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg',
+		'/usr/local/bin/ffmpeg',
+		// NOTE: the Intel ffmpeg-full formula (/usr/local/opt/ffmpeg-full/bin/ffmpeg)
+		// is deliberately NOT listed here. The repo's hardcoded-path gate flags
+		// '/opt/' as a SUBSTRING, so that path trips it while '/usr/local/bin/ffmpeg'
+		// does not — the gate blocks the Intel half of this symmetry. Adding it needs
+		// a scoped REVIEW.md exception, which is #2369's concern, not this PR's.
+		// Tracked there; an Intel user with only the ffmpeg-full formula still falls
+		// back to /usr/local/bin/ffmpeg or PATH.
 		join(dirname(execPath), 'ffmpeg'),
 	];
+}
+
+/**
+ * ffprobe, derived from the ffmpeg candidates rather than hardcoded.
+ *
+ * The duration probe invoked the Apple-Silicon Homebrew ffprobe path directly,
+ * so on an Intel or PATH-only install it threw and the recording reported no
+ * duration. Deriving from ffmpegSubtitleCandidates() reuses the prefixes already
+ * listed there (including the bundled-runtime sibling) instead of restating
+ * them, so there is ONE place to add a prefix when a new install layout appears
+ * — and no second copy to drift. ffprobe ships beside ffmpeg in every
+ * distribution that has it.
+ *
+ * Unlike findFfmpegWithSubtitles this does not probe for a capability — any
+ * ffprobe can report a duration — so it only checks existence, and a bare name
+ * is always kept so PATH resolution still applies.
+ */
+export function ffprobeCandidates(execPath: string): string[] {
+	return ffmpegSubtitleCandidates(execPath).map((p) =>
+		p.replace(/ffmpeg(?=[^/]*$)/, 'ffprobe'),
+	);
+}
+
+/**
+ * Pick an ffprobe from `cands`: prefer an ABSOLUTE candidate that actually
+ * exists, then fall back to the first bare name (so PATH resolution still
+ * applies), then the literal `ffprobe`.
+ *
+ * Exported + `exists`-injected so the ordering is testable. An earlier finder
+ * used `find((p) => !p.includes('/') || existsSync(p))`, which accepted the
+ * leading bare name immediately and short-circuited before any absolute path
+ * was tried — making the absolute candidates dead code (flagged reviewing #2370).
+ */
+export function selectFfprobe(cands: string[], exists: (p: string) => boolean): string {
+	return (
+		cands.find((p) => p.includes('/') && exists(p)) ??
+		cands.find((p) => !p.includes('/')) ??
+		'ffprobe'
+	);
+}
+
+let _cachedFfprobe: string | undefined;
+function findFfprobe(): string {
+	if (_cachedFfprobe !== undefined) return _cachedFfprobe;
+	_cachedFfprobe = selectFfprobe(ffprobeCandidates(process.execPath), existsSync);
+	return _cachedFfprobe;
 }
 
 let _cachedSubtitleFfmpeg: string | null | undefined;
@@ -569,6 +629,56 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 
 let lastResumeTime = 0;
 
+/**
+ * Pause-retry authorization. Exported so tests drive the real state machine
+ * instead of simulating its arithmetic — a test that recomputes the elapsed time
+ * by hand passes against a build with every reset deleted.
+ *
+ * `transcript` is the speech window that was current when the block was taken.
+ * A user asking again produces NEW ASR text; a model retrying because it is
+ * still hearing the video produces the same window, so comparing them separates
+ * the two callers without a timing heuristic.
+ */
+export const pauseRetryAuthorization = {
+	stamp: 0,
+	transcript: '',
+	recordBlock(now: number, recent: string): void { this.stamp = now; this.transcript = recent; },
+	clear(): void { this.stamp = 0; this.transcript = ''; },
+	msSinceBlock(now: number): number { return this.stamp === 0 ? Number.MAX_SAFE_INTEGER : now - this.stamp; },
+};
+
+/**
+ * Clear the pause-retry authorization. A block earned on one video must not
+ * authorize a keyword-less pause on the next: without this, a stray call within
+ * the retry window after ANY earlier block would pass, which is the single
+ * hallucinated pause the guard exists to stop.
+ */
+export function endPlaybackAuthorization(): void { pauseRetryAuthorization.clear(); }
+export const KEYWORD_BLOCK_RETRY_MS = 60_000;
+const PAUSE_KEYWORDS = /\b(pause|stop|hold|wait)\b/;
+
+/**
+ * Pause-guard policy. The keyword check exists so a Gemini hallucination outside
+ * the 8s audio cooldown cannot pause on its own. It fails closed against the user
+ * instead when ASR mangles the command — which is likeliest precisely when he is
+ * repeating a request that was already ignored. So a keyword-less pause is blocked
+ * on its FIRST occurrence and honoured if it recurs inside the retry window: one
+ * stray call still cannot pause, a persistent request gets through.
+ */
+export function pauseKeywordGuard(
+	recent: string,
+	msSinceLastBlock: number,
+	transcriptAtBlock = '',
+): 'allow' | 'block' {
+	if (!recent || PAUSE_KEYWORDS.test(recent)) return 'allow';
+	if (msSinceLastBlock > KEYWORD_BLOCK_RETRY_MS) return 'block';
+	// Inside the window, honour the repeat ONLY if the speech window moved on.
+	// An immediate re-call against the identical transcript is the hallucinating
+	// caller this guard exists to stop; it retries at once, while the user's own
+	// repeats were 13-20s apart and always carried new text.
+	return recent === transcriptAtBlock ? 'block' : 'allow';
+}
+
 export const playVideoTool: ToolDefinition = {
 	name: 'play_video',
 	description: 'Play the video from the beginning. Use ONLY when user explicitly says "play" or "play it".',
@@ -577,6 +687,7 @@ export const playVideoTool: ToolDefinition = {
 	async execute() {
 		console.log(`${ts()} [PlayVideo] called`);
 		lastResumeTime = Date.now(); // Set cooldown on play to prevent auto-pause
+		endPlaybackAuthorization();
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
 	},
 };
@@ -598,6 +709,7 @@ export const resumeVideoTool: ToolDefinition = {
 		try {
 			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 			lastResumeTime = Date.now();
+			endPlaybackAuthorization();
 			try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'play document 1', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 			// Restart audio stream to phone at current position
 			let seekSec = 0;
@@ -625,6 +737,7 @@ export const replayVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [ReplayVideo] called`);
+		endPlaybackAuthorization();
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
 	},
 };
@@ -650,10 +763,16 @@ export const pauseVideoTool: ToolDefinition = {
 		// outside the 8s cooldown still fires (Susan's 2026-04-16 report).
 		// Picks freshest of voice-agent vs phone transcript; fail-open if neither is fresh.
 		const recent = getRecentUserSpeech();
-		if (recent && !/\b(pause|stop|hold|wait)\b/.test(recent)) {
+		const sinceBlock = pauseRetryAuthorization.msSinceBlock(Date.now());
+		if (pauseKeywordGuard(recent, sinceBlock, pauseRetryAuthorization.transcript) === 'block') {
+			pauseRetryAuthorization.recordBlock(Date.now(), recent);
 			console.log(`${ts()} [PauseVideo] BLOCKED — no pause keyword in recent user speech: "${recent.slice(-80)}"`);
 			return { status: 'playing', instruction: 'Video is still playing. Only pause when user explicitly says "pause" or "stop".' };
 		}
+		if (recent && !PAUSE_KEYWORDS.test(recent)) {
+			console.log(`${ts()} [PauseVideo] keyword guard overridden — repeat call ${sinceBlock}ms after a block: "${recent.slice(-80)}"`);
+		}
+		pauseRetryAuthorization.clear();
 		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'if (count of documents) > 0 then', '-e', 'pause document 1', '-e', 'end if', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
@@ -668,6 +787,7 @@ export const closeVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [CloseVideo] called`);
+		endPlaybackAuthorization();
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'end tell', '-e', 'delay 0.3', '-e', 'tell application "System Events" to keystroke "w" using command down'], { timeout: 5_000 }); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
@@ -774,7 +894,7 @@ export const screenRecordTool: ToolDefinition = {
 					// Probe duration once here so open_file (now generic) doesn't need to.
 					try {
 						const dur = execFileSync(
-							'/opt/homebrew/bin/ffprobe',
+							findFfprobe(),
 							['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', files.recommended!],
 							{ timeout: 5_000 }
 						).toString().trim();

@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -25,7 +26,25 @@ from presenter_mode import presenter_mode_active  # noqa: E402
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
-LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
+# No read-fallback to the old root path on purpose: a missing stamp makes the
+# reader notify ONCE rather than suppress, so the move costs one notification.
+LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
+
+
+def write_notify_stamp(questions, now=None):
+    """Record that this question set was just notified.
+
+    Named so it is testable without driving `main`, which fires a real notification.
+    """
+    LAST_NOTIFY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time()) if now is None else now
+    LAST_NOTIFY_FILE.write_text(f"{ts} {notify_key(questions)}")
+    # Retire AFTER the new stamp exists: a crash between the two costs at most a
+    # cooldown. Path derived from LAST_NOTIFY_FILE so a redirected test stays in tmp.
+    try:
+        (LAST_NOTIFY_FILE.parent.parent / ".last-pq-notify").unlink(missing_ok=True)
+    except OSError:
+        pass
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 # How long an UNCHANGED question set stays quiet before it is raised again. This
 # is the floor that stops "notify only when the set changes" from turning an
@@ -255,6 +274,35 @@ def questions_key(questions):
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+# Deepest ordered prefix any consumer renders: notify_macos shows titles[:3],
+# the proactive DM body shows questions[:5]. Covering 5 covers both.
+VISIBLE_PREFIX = 5
+
+
+def notify_key(questions):
+    """sha256[:16] of what the owner would actually SEE — set AND visible order.
+
+    Deliberately NOT `questions_key`, which answers a different question. That one
+    identifies the SET and must stay order-independent: it names the proactive file
+    (`proactive-pending-q-<key>.txt`), so a reordered-but-identical set has to
+    collapse onto the same filename instead of delivering a second copy. Pinned by
+    tests/check-pending-questions-collapse.test.py.
+
+    The cooldown asks something else: "would this fire show him anything new?"
+    Both renders are ORDERED prefixes, so the set hash is wrong in both directions —
+    promoting an item into the top 3 changes every rendered word while the hash holds
+    (suppressed, and a promotion is deliberate precisely because the top slot should
+    change), and adding a 21st item below the fold changes the hash while the rendered
+    text is identical (fires, showing nothing new).
+
+    Composed from `questions_key` rather than replacing it, so every membership change
+    that notified before still notifies: this can only ever widen, never suppress.
+    """
+    visible = "|".join(q["title"] for q in questions[:VISIBLE_PREFIX])
+    seed = f"{questions_key(questions)}#{visible}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
 def notify_voice(questions):
     """Write to results/ so voice agent can speak it."""
     ts = int(time.time() * 1000)
@@ -286,7 +334,22 @@ def notify_discord_dm(questions):
     lines.append(
         f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
     )
-    path.write_text("\n".join(lines))
+    # Each body is a whole snapshot, so a stale one is wrong, not redundant. Look
+    # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
+    superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
+    # Appear at the deliverable name in one step, from a scratch name no other run
+    # can hold: a poll claims proactive-*.txt on sight and would DM a partial body.
+    fd, tmp_name = tempfile.mkstemp(dir=RESULTS_DIR, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines))
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    for old in superseded:
+        old.unlink(missing_ok=True)
 
 
 # A proactive-*.txt is only a DELIVERY if some bridge drains it. On a host where
@@ -443,7 +506,7 @@ def main():
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return
 
-    if not force and not should_notify(questions_key(questions)):
+    if not force and not should_notify(notify_key(questions)):
         print(f"(cooldown) {len(questions)} pending questions — skipping notification")
         return
 
@@ -455,7 +518,7 @@ def main():
     # exact "claimed an outcome it never achieved" failure this script exists to
     # remove, reproduced in its own control flow.
     summary = deliver(questions, count, titles)
-    LAST_NOTIFY_FILE.write_text(f"{int(time.time())} {questions_key(questions)}")
+    write_notify_stamp(questions)  # pragma: no cover — covered as a unit; reaching here fires a real notification
     print(summary)
 
 

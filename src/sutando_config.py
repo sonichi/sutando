@@ -57,11 +57,24 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "core_config_dirs",
     "vault",
     "migrate",
+    "health_check",
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
+
+_DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
+
+
+def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
+    """How ``health-check.py --fix`` handles a configured-but-down channel bridge."""
+    hc = load_config(repo_root).get("health_check") or {}
+    # Alert, not restart: a restart that looks successful but cannot deliver is
+    # worse than a bridge that is visibly down. Restart is an explicit opt-in.
+    configured = str(hc.get("down_bridge_action") or "alert").strip().lower()
+    action = os.environ.get("SUTANDO_DOWN_BRIDGE_ACTION", "").strip().lower() or configured
+    return action if action in _DOWN_BRIDGE_ACTIONS else "alert"
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -424,6 +437,14 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     Missing config returns `{"enabled": False, ...}` with safe defaults so
     callers can branch on `cfg["enabled"]` without KeyError. The vault sync
     engine (M2) is the primary consumer.
+
+    `sync.exclude_extra` is ADDITIVE: it is appended to `sync.exclude` rather
+    than replacing it, and does not appear in the returned schema. `_deep_merge`
+    replaces lists, so a local `exclude` override drops the shipped carve-outs
+    silently — there is no error and the carrier simply stops excluding them.
+    `exclude_extra` is how a clone adds a path while keeping the common set.
+    `include` deliberately has no additive twin: it is a whitelist, and unioning
+    it would widen what the vault carries.
     """
     cfg = load_config(repo_root)
     vault = dict(cfg.get("vault") or {})
@@ -432,6 +453,15 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     sync = dict(vault.get("sync") or {})
     sync.setdefault("include", [])
     sync.setdefault("exclude", [])
+    extra = sync.pop("exclude_extra", None)
+    if extra:
+        base = list(sync.get("exclude") or [])
+        # Order is load-bearing: gitignore is last-match-wins, so appending keeps
+        # every shipped deny ahead of the added ones. De-duplicated.
+        for p in extra:
+            if p not in base:
+                base.append(p)
+        sync["exclude"] = base
     vault["sync"] = sync
     vault.setdefault("interval_seconds", 1800)
     return vault

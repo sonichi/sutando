@@ -25,8 +25,10 @@ app-bundled `src/` symlink, it walked into the bundle and stranded owner DMs
 (tasks landed in bundle-tasks/ while the watcher polled workspace-tasks/).
 """
 from __future__ import annotations
+import json
 import os
 import shutil
+import tempfile
 import sys
 from pathlib import Path
 
@@ -294,6 +296,35 @@ def status_path(name: str, workspace: Path | None = None) -> Path:
     """
     ws = workspace if workspace is not None else resolve_workspace()
     return ws / "state" / name
+
+
+def write_status(name: str, payload: dict, workspace: Path | None = None) -> Path:
+    """Atomically write a status record to `status_path(name)`; returns that path.
+
+    Every historical writer of these files was a shell `>` redirect, which
+    truncates before it writes — so a reader landing in that window observes a
+    zero-length file and cannot tell it from a legitimately empty record.
+    temp-file + `os.replace` makes the swap atomic: a reader sees the old record
+    or the new one, never neither.
+    """
+    target = status_path(name, workspace)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp",
+                                    dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    finally:
+        # `os.replace` consumed the temp on success; this only fires on failure.
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+    return target
 
 
 def status_read_path(name: str, workspace: Path | None = None) -> Path:

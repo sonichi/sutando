@@ -60,21 +60,57 @@ def cache_path() -> Path:
     return resolve_workspace() / "state" / "calendar-today.json"
 
 
-def normalize_events(raw_events: list) -> list[dict]:
-    """Coerce assorted input shapes into the reader's `{raw, calendar}` schema.
+def _display_str(value: object, field: str) -> str:
+    """Return `value` as a display string, or raise TypeError if it isn't one.
 
-    Accepts strings or dicts; drops entries with no usable `raw` text so an
-    empty/garbage element never becomes a blank calendar line.
+    `str()` on an unrendered calendar API object yields its repr, which reaches
+    the owner's DM as `One meeting today: {'id': '35s817...', ...}`. Every field
+    that ends up in owner-visible text goes through here so no input shape can
+    coerce silently.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise TypeError(
+            f"calendar event `{field}` must be a rendered display string "
+            f"(e.g. '8:30am-9:30am Standup' from event_to_raw()), got "
+            f"{type(value).__name__}"
+        )
+    return value.strip()
+
+
+def normalize_events(raw_events: list) -> list[dict]:
+    """Coerce the documented input shapes into the reader's `{raw, calendar}` schema.
+
+    Each element is a display string or a `{raw, calendar, start}` dict; entries
+    with no usable `raw` text are dropped so an empty/garbage element never
+    becomes a blank calendar line.
+
+    Raises TypeError for any other shape — a nested connector list, a bare
+    scalar, or a non-string field. Refusing aborts the whole cache write, so the
+    briefing reports it could not read the calendar; an honest "unread" beats a
+    plausible-looking wrong day.
     """
     events: list[dict] = []
     for ev in raw_events or []:
         if isinstance(ev, dict):
-            raw = str(ev.get("raw") or "").strip()
-            cal = str(ev.get("calendar") or "").strip()
+            raw = _display_str(ev.get("raw"), "raw")
+            cal = _display_str(ev.get("calendar"), "calendar")
+            # Optional: piped connector events carry no start, and omitting the
+            # key (rather than storing "") keeps readers from special-casing it.
+            start = _display_str(ev.get("start"), "start")
+        elif isinstance(ev, str):
+            raw, cal, start = ev.strip(), "", ""
         else:
-            raw, cal = str(ev).strip(), ""
+            raise TypeError(
+                "calendar event must be a display string or a {raw, calendar} "
+                f"object, got {type(ev).__name__}"
+            )
         if raw:
-            events.append({"raw": raw, "calendar": cal})
+            ev_out = {"raw": raw, "calendar": cal}
+            if start:
+                ev_out["start"] = start
+            events.append(ev_out)
     return events
 
 
@@ -231,11 +267,11 @@ def events_from_gws(now: datetime | None = None, run=None) -> list[dict]:
             if ev.get("status") == "cancelled":
                 continue
             out.append({"raw": event_to_raw(ev), "calendar": cal["id"],
-                        "_sort": (ev.get("start") or {}).get("dateTime")
+                        "start": (ev.get("start") or {}).get("dateTime")
                                  or (ev.get("start") or {}).get("date") or ""})
-    out.sort(key=lambda e: e["_sort"])
-    for e in out:
-        e.pop("_sort", None)
+    out.sort(key=lambda e: e["start"])
+    # `start` must survive: it is what lets a reader tell the day's first event
+    # from the next one. Additive — readers ignore keys they don't know.
     return out
 
 
@@ -288,7 +324,13 @@ def main(argv: list[str] | None = None) -> int:
         # key, so it normalizes to [] — writing that as events:[] is the exact
         # false-"clear" this producer exists to prevent. Only --empty may certify an
         # empty day; here we fail nonzero and leave any prior cache untouched.
-        events = normalize_events(parsed)
+        try:
+            events = normalize_events(parsed)
+        except TypeError as e:
+            print(f"write_calendar_cache: {e}", file=sys.stderr)
+            print("write_calendar_cache: calendar UNKNOWN — prior cache left untouched, "
+                  "nothing certified.", file=sys.stderr)
+            return 2
         if not events:
             print("write_calendar_cache: input contained no usable events — refusing to "
                   "certify a verified-empty day (use --empty for a genuinely empty day). "

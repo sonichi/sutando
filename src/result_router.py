@@ -135,3 +135,40 @@ def audit_line(task_id: str, disposition: str, surface: str, ts: str) -> str:
     ISO-8601 UTC string) — this module stays pure and does no clock reads.
     """
     return f"{ts}\t{task_id}\t{disposition}\t{surface}"
+
+
+#: Empty polls before a stuck result is announced. `poll_results()` sleeps 1s, not
+#: the neighbours' 3s, so 20 is ~20s: past a write, inside the 7d age-out.
+EMPTY_RESULT_POLL_THRESHOLD = 20
+
+
+def empty_result_notice(
+    task_id: str,
+    path: str,
+    consecutive: int,
+    threshold: int = EMPTY_RESULT_POLL_THRESHOLD,
+) -> "str | None":
+    """Every result file is briefly present-and-empty (`>` truncates at open), so
+    persistence, not first sight, separates a stuck result from a racing one."""
+    if consecutive != threshold:
+        return None
+    return (
+        f"[result] {task_id}: result file has been PRESENT BUT EMPTY for "
+        f"{consecutive} consecutive polls ({path}). The reply is NOT being "
+        f"delivered and the task stays pending until the 7-day age-out. "
+        f"This is past any partial-write window — the writer likely died "
+        f"mid-write or produced no body."
+    )
+
+
+def note_empty_result(
+    counters: dict,
+    task_id: str,
+    path: str,
+    threshold: int = EMPTY_RESULT_POLL_THRESHOLD,
+) -> "str | None":
+    """Counting lives here so the policy is not copied into each bridge; `counters` is
+    caller-owned, keeping this module's no-I/O, no-global contract."""
+    n = counters.get(task_id, 0) + 1
+    counters[task_id] = n
+    return empty_result_notice(task_id, path, n, threshold)
