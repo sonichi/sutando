@@ -75,15 +75,8 @@ describe('task-bridge.ts — [no-send]/[REPLIED] skip-marker handling (#1381)', 
 	});
 
 	it('has NO private [deduped:] matcher left in code — it is a skip marker now', () => {
-		// SUPERSEDES an earlier assertion that the [deduped:] branch must appear
-		// BEFORE the skip-marker guard. That ordering was the defect, not the
-		// design: the deduped branch returned before mayRetireSkipMarked, so the
-		// one marker meaning "another result carries the reply" was the only one
-		// that could retire a result this bridge never dispatched. #3018 already
-		// moved [no-send]/[REPLIED] into the ownership module for exactly this
-		// reason ("a prefix match is not ownership"); deduped was left behind.
-		// Strip comments, then require that `deduped` survives nowhere in CODE —
-		// the grammar lives once, in skip_marker_ownership.ts.
+		// Comments are stripped first: `deduped` may survive in prose, never in CODE.
+		// The grammar lives once, in skip_marker_ownership.ts.
 		const code = SRC
 			.replace(/\/\*[\s\S]*?\*\//g, '')
 			.split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
