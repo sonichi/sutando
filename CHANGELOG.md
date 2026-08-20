@@ -2,6 +2,84 @@
 
 All notable changes are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [v0.12.0] — 2026-08-20
+
+**Headline: authenticated task ingress and durable outbound delivery.** Task
+access tiers are now covered by HMAC envelopes at every production writer, and
+the shared Delivery Core gives outbound work one claim/recovery policy with
+three explicit outcomes. The same release hardens the live voice, vision,
+startup, and channel paths around those boundaries.
+
+220 commits since v0.11.0: 41 features, 122 fixes.
+
+### Added
+
+- HMAC task envelopes make `access_tier` a verified ingress claim; the gateway,
+  Discord, Telegram, Slack, cron, workstream, and TypeScript writers stamp at
+  their edges, with a soak census for enforcement readiness. ([#3014], [#3041],
+  [#3044], [#3046], [#3058])
+- A channel-neutral Delivery Core now owns outbox claims, recovery, receipts,
+  reconciliation, and terminal disposition; Discord is the first production
+  provider, and Design C supplies the alternate namespace backend behind the
+  same contract. ([#2975], [#3013], [#3092], [#3095], [#3104], [#3123])
+- Proactive results can carry an explicit destination, and AG2 Space is a
+  first-class proactive channel with claim and wake-catch-up behavior. ([#2877],
+  [#3113])
+- Voice reliability gains audio-progress and upstream ledgers, a health matrix,
+  bounded vision egress, CONNECTING recovery, event-driven redial, and an
+  ACTIVE-silence watchdog in shadow mode. ([#2885], [#2902], [#2963], [#3130],
+  [#3132], [#3138], [#3139], [#3143])
+- Operator surfaces gain a one-command `./start.sh`, bounded provider reads for
+  local apps, mechanical cron execution, Discord edit/reply commands, Room Ops
+  `say`/`members`, a packaged pointer overlay, and display selection for vision.
+  ([#2753], [#2760], [#2969], [#2976], [#2987], [#3049], [#3053], [#3068],
+  [#3159], [#3168])
+
+### Fixed
+
+- 122 fixes across delivery, startup, health, voice, vision, and channel
+  bridges. Notable: gateway/bridge processes now recover without destroying
+  work ([#2819], [#2867], [#2900], [#3011], [#3147]); ambiguous or suppressed
+  results keep the correct ownership and delivery semantics ([#2936], [#3018],
+  [#3108], [#3109], [#3141], [#3176], [#3187]); and context-drop releases the
+  triggering modifiers before synthesizing Copy in webviews ([#3173]).
+- Vision and screen-control paths now enforce their documented frame/cadence
+  bounds, stop terminally on disconnect, report denials honestly, and target the
+  display the caller measured. ([#2885], [#2942], [#2961], [#3088], [#3089],
+  [#3090], [#3139], [#3163], [#3164], [#3169])
+- Health reporting no longer turns stale, future-dated, running, or unknown
+  observations into false all-clears, and can restart failed channel bridges
+  under the shared launch policy. ([#2316], [#2743], [#2874], [#2905], [#2906],
+  [#2978], [#3000], [#3052], [#3059], [#3062], [#3071], [#3078], [#3118],
+  [#3161], [#3190])
+
+### Security
+
+- Secret-bearing room reads and taskify writes are redacted at ingress; pairing
+  codes stay in the owner's DM; and the moderation judge wraps untrusted text in
+  explicit delimiters. ([#1986], [#2158], [#2893], [#2955], [#2956], [#2957])
+- Corrupt envelope keys fail loudly or as unverifiable, never as empty keys, and
+  collaborator output remains governed by the owner-review flow. ([#2983],
+  [#3065], [#3141])
+
+### Changed
+
+- No breaking changes and no new numbered workspace migrations. The existing
+  workspace migration now preserves owner-custom tools under
+  `<workspace>/scripts/`, with collision retention and idempotency coverage.
+  Upgrading from v0.11.0 requires no manual action; rollback is
+  `git checkout v0.11.0`. ([#3036])
+
+## [v0.11.0] — 2026-08-14
+
+**Headline: collaborator tier with AG2 Space.** A Team room reaches the
+owner-capability runtime only when the broker attests `collaborator: true`
+alongside Team tier; missing or invalid controls retain the restricted path.
+
+54 commits since v0.10.0: 10 features, 39 fixes. No breaking changes and no new
+workspace migrations. Full curated notes are on the
+[GitHub release](https://github.com/sonichi/sutando/releases/tag/v0.11.0).
+
 ## [v0.10.0] — 2026-08-12
 
 316 PRs since v0.9.0: 60 features, 202 fixes. Full curated notes live on the
