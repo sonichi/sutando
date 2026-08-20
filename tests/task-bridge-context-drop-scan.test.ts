@@ -12,6 +12,7 @@ import {
 	scanDropTask,
 	logicalTaskName,
 	isContextDropHeader,
+	headerRegion,
 	findTaskFile,
 	scanDropTasksOnce,
 	_resetDropScanState,
@@ -350,6 +351,36 @@ describe('isContextDropHeader is exact and shared', () => {
 	it('REJECTS an adjacent source bucket that merely starts with it', () => {
 		assert.equal(isContextDropHeader(hdr('context-drop-replay')), false);
 		assert.equal(isContextDropHeader(hdr('context-dropper')), false);
+	});
+
+	// The guest case at :119 passes on POSITION — it puts `task:` first, pushing
+	// `source:` out of the header region. These pin the TIER instead.
+	const tiered = (tier: string | null) =>
+		'id: task-T\n' +
+		'source: context-drop\n' +
+		(tier === null ? '' : `access_tier: ${tier}\n`) +
+		'task: body\n';
+
+	it('REJECTS a non-owner tier even when source: precedes task:', () => {
+		// source IS inside the header region here, so this cannot pass on position.
+		assert.match(tiered('guest'), /^source: context-drop$/m);
+		assert.equal(isContextDropHeader(tiered('guest')), false, 'guest must not reach the live session');
+		assert.equal(isContextDropHeader(tiered('team')), false);
+		assert.equal(isContextDropHeader(tiered('other')), false);
+	});
+
+	it('control: owner and tier-absent still classify, so the gate is not a blanket reject', () => {
+		assert.equal(isContextDropHeader(tiered('owner')), true);
+		// The real producer emits NO access_tier — verified against an archived drop
+		// (id/timestamp/source/interaction_type/task). Requiring the field would break it.
+		assert.equal(isContextDropHeader(tiered(null)), true, 'absent tier is owner per CLAUDE.md');
+	});
+
+	it('control: the pre-fix classifier ACCEPTED the guest shape — so this is a real change', () => {
+		const sourceOnly = (raw: string) =>
+			/^source:[ \t]*context-drop[ \t]*$/m.test(headerRegion(raw).join('\n'));
+		assert.equal(sourceOnly(tiered('guest')), true, 'old form accepted it — that was the gap');
+		assert.equal(isContextDropHeader(tiered('guest')), false, 'gated form does not');
 	});
 
 	it('control: the UNANCHORED form this replaced does accept it', () => {

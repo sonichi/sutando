@@ -622,7 +622,12 @@ export function logicalTaskName(basename: string): string {
 /** Anchored, so `context-drop-replay` does not match. Shared by the scan and the
  *  result loop so the two cannot disagree about what a drop is. */
 export function isContextDropHeader(raw: string): boolean {
-	return /^source:[ \t]*context-drop[ \t]*$/m.test(headerRegion(raw).join('\n'));
+	const header = headerRegion(raw).join('\n');
+	if (!/^source:[ \t]*context-drop[ \t]*$/m.test(header)) return false;
+	// A drop is owner-only. The real producer emits no access_tier, so absent stays
+	// owner per CLAUDE.md; a PRESENT non-owner tier is forged or mis-routed.
+	const tier = header.match(/^access_tier:[ \t]*(\S+)[ \t]*$/m);
+	return tier === null || tier[1] === 'owner';
 }
 
 /** Locate a task file across bare and claimed spellings — TS mirror of task_archive.find_task_file. */
