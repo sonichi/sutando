@@ -73,9 +73,11 @@ One entry per agent-facing module.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
 - **`inline-tools.ts`** — Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
+- **`install-channel-bridge-launchd.sh`** — Install / uninstall / inspect a launchd-supervised channel bridge.
 - **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level Claude Code hooks (PreCompact + Stop).
 - **`install-credential-proxy-launchd.sh`** — Install / uninstall the launchd-supervised credential-proxy job.
 - **`install-cron-runner-launchd.sh`** — Install / uninstall the launchd-supervised cron-runner job.
+- **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised ag2.space gateway-bridge.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
@@ -114,6 +116,7 @@ One entry per agent-facing module.
 - **`remote-relay-bridge.py`** — remote-relay-bridge.py — DEPRECATED name; renamed to remote-gateway-bridge.py.
 - **`render_plist_template.py`** — Render a launchd plist: literal __TOKEN__ substitution, XML escaping, parse check.
 - **`reply_chain.py`** — Reply-context formatting (pure) — companion to ``discord-bridge.py``.
+- **`repo_root.sh`** — Resolve the DURABLE repo that supplies the running `src/` code.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
@@ -223,7 +226,10 @@ One entry per agent-facing module.
 
 ## `src/launchd/`
 
+- **`channel-bridge-wrapper.sh`** — launchd entry point shared by Slack, Discord, and Telegram bridges.
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.
+- **`evict-own-bridge.sh`** — Evict a pre-existing BARE channel bridge that belongs to THIS checkout, before the launchd wrapper starts its own supervised child.
+- **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed ag2.space gateway bridge (src/remote-gateway-bridge.py).
 
 ## `src/observability/`
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 
 from ag2_sparrow.delivery_core.contract import (
-    DeliveryOutcome, DeliveryReceipt, ProviderCapabilities)
+    DeliveryAttempt, DeliveryOutcome, DeliveryReceipt, ProviderCapabilities)
 from discord_rest_client import DiscordRestClient
 from outbox import DeliveryOutcome as TransportOutcome
 
@@ -52,5 +52,5 @@ class DiscordDeliveryProvider:
             detail=transport.detail,
         )
 
-    def reconcile(self, item_id: str, idempotency_key: str):
+    def reconcile(self, attempt: DeliveryAttempt):
         return None  # capability-gated off; the core never calls this

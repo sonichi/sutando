@@ -211,9 +211,14 @@ Full core-memory index: `<workspace>/.claude-sutando/projects/<slug>/memory/MEMO
 
 Key files:
 - User profile: `<workspace>/.claude-sutando/projects/<slug>/memory/user_profile.md`
-- Feedback (response style): `<workspace>/.claude-sutando/projects/<slug>/memory/feedback_response_style.md`
-- Feedback (operating principle): `<workspace>/.claude-sutando/projects/<slug>/memory/feedback_minimal_cost_max_value.md`
 - Build log (what's built, what's next): `<workspace>/build_log.md`
+
+Everything else is reached through `MEMORY.md` above, not named here. The repo seeds no memory
+file, so no filename is guaranteed present on any install — `MEMORY.md` is the index maintained on
+every write. `user_profile.md` stays pinned because the voice prompt builder reads it by that literal
+name (`src/voice-context.ts`); the same code also reads `feedback_response_style.md` and
+`feedback_minimal_cost_max_value.md` by literal name — memories written under those slugs feed the
+voice prompt directly, and absent files are skipped silently.
 
 Read relevant core-memory files when user preferences or history would improve task quality. Write new core memory when you learn something durable about the user or the project.
 
