@@ -117,9 +117,8 @@ def main() -> int:
         check(not guard.suppressed_record_path(leak_state, f"task-leak-{n}").is_file(),
               f"e) and {marker.splitlines()[0]} is not journaled as a silent close")
 
-    # e2) A leading skip does not smuggle a redirect past the guard: the shared
-    #     parser only executes a redirect that leads the body, so the marker on
-    #     line 2 is inert text -- honoured-and-archived delivers it nowhere.
+    # e2) A leading skip cannot smuggle a redirect: the parser only executes a
+    #     redirect that LEADS the body, so the marker on line 2 is inert text.
     smuggle = "[no-send]\n[channel: 123]\nboth"
     check(guard.is_suppression_only(smuggle),
           "e2) a leading skip with a trailing [channel:] is suppression-only")

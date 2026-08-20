@@ -47,9 +47,8 @@ TEAM_LEAK_RESULT_UNSAVED = (
     "private owner review failed; the result remains withheld and will retry."
 )
 
-# Reached ONLY when the suppression record cannot be written. Suppression is
-# honoured on every tier; the record is what makes it auditable, so a failure to
-# write one must not leave the close both silent and untraceable.
+# Reached ONLY when the record cannot be written: a close must never be both
+# silent and untraceable. Unreachable in normal operation.
 TEAM_SUPPRESS_RESULT = (
     "Task handled. The agent marked this reply as not-for-delivery, but the "
     "record of that suppression could not be written, so this notice is "
@@ -328,9 +327,8 @@ def classify_result_for_tier(body: str, tier, repo: Path,
     if not is_guarded_tier(tier):
         return TeamResultVerdict(VERDICT_DELIVER, body, None)
     if is_suppression_only(body):
-        # Nothing is delivered, so there is nothing to scan and nothing to
-        # exfiltrate. Kept above the scan so a secret-carrying skip body is
-        # still closed silently rather than converted into channel prose.
+        # Above the scan on purpose: an undelivered body has nothing to leak,
+        # and a LEAK here would put a notice back in the channel.
         return TeamResultVerdict(VERDICT_DELIVER, body, None)
     try:
         return TeamResultVerdict(

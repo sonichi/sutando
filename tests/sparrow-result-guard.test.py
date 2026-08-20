@@ -167,10 +167,8 @@ with tempfile.TemporaryDirectory() as td:
     check(aowner == BODY_WITH_MARKERS and aowner_withheld is None,
           "a MONTH-ARCHIVED owner task still passes through byte-identical")
 
-    # Suppression is no longer a guarded control, so a Team result CLOSING its
-    # own lease is now allowed by design and the replay provenance no longer
-    # decides delivery. The record still exists and is left alone here: making
-    # it redundant is this change, removing it is a separate one.
+    # A Team result closing its own lease is allowed by design now, so replay
+    # provenance no longer decides delivery. Made redundant, not removed.
     write_task(tasks, "task-replay", "team")
     m.RESULTS_DIR = results = pathlib.Path(td) / "results"
     results.mkdir(exist_ok=True)
@@ -202,9 +200,8 @@ with tempfile.TemporaryDirectory() as td:
           "into a visible withheld notice on the retry")
     m._REDELIVERED.discard("task-replay")
 
-    # An agent-produced [no-send] on a Team task is honoured AND recorded: the
-    # gateway binds the journal too, so the ag2space path is not the adapter
-    # that honours a close with no record of it.
+    # Honoured AND recorded: the gateway binds the journal, so ag2space is not
+    # the adapter that closes a lease with no record of it.
     write_task(tasks, "task-mark", "team")
     ctrl, ctrl_withheld = m._guarded_result_body("task-mark", "[no-send]\n")
     check(ctrl == "[no-send]\n" and ctrl_withheld is None,

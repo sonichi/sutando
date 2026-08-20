@@ -311,9 +311,8 @@ def main() -> int:
         ("**[core: 1]**\n[no-send]\nhide", "team", _clean, guard.VERDICT_DELIVER),
         ("[attach: /etc/passwd]", "team", _clean, guard.VERDICT_LEAK),
         ("secret text", "team", _leaky, guard.VERDICT_LEAK),
-        # Suppression short-circuits the scan: nothing is delivered, so a
-        # secret-carrying skip body is still closed rather than turned into
-        # a withheld notice the asking channel has to read.
+        # Suppression short-circuits the scan: an undelivered body has nothing
+        # to leak, and a LEAK here is a notice the asking channel has to read.
         ("[no-send]\nsecret text", "team", _leaky, guard.VERDICT_DELIVER),
     ):
         v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
