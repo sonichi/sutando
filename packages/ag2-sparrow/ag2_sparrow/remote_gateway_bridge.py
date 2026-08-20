@@ -3261,12 +3261,20 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # Genuinely undelivered: ONE labeled attempt — at-least-once by
         # design; the label makes the rare duplicate self-explaining.
-        body = read_ready_result(rfile)
-        if body is None:
+        raw = read_ready_result(rfile)
+        if raw is None:
             continue
         delivery = _delivery_tid(tid)
         if delivery is None:
             continue                            # alias ledger unreadable: retry later
+        # Recovery is still a delivery: the ordinary path's guard runs BEFORE
+        # any marker is interpreted, so tier + suppression cannot be skipped.
+        body, _withheld = _guarded_result_body(tid, raw)
+        if body is None:
+            _log(f"orphan sweep: result guard unavailable for {tid} — leaving for retry")
+            continue
+        if _withheld:
+            _log(f"orphan sweep: withheld non-owner result for {tid}: {_withheld}")
         parsed = parse_markers(body)
         if [a for a in parsed.actions if a.kind == "attach"]:
             # Delivering without the files would silently drop them — park
@@ -3282,9 +3290,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                 _log(f"orphan sweep: {tid} defers to its dedup holder — quarantined")
             continue
         if skip:
-            # Marker parity with _post_ready_results: original body goes up;
-            # the server suppresses user delivery and still closes the lease.
-            labeled = body
+            # A suppression marker moves no data: the canonical close rides the
+            # wire, not the sender's prose, and no_send gates delivery.
+            labeled = _lease_close_body(skip)
         else:
             labeled = ("(recovered result — original delivery was lost)\n"
                        + parsed.body)
@@ -3292,8 +3300,10 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             if _r:
                 labeled = f"[channel: {_r.value}]\n{labeled}"
         try:
-            _req("POST", "/v1/results",
-                 {"id": _broker_tid(delivery), "body": labeled})
+            _payload = {"id": _broker_tid(delivery), "body": labeled}
+            if skip:
+                _payload["no_send"] = True
+            _req("POST", "/v1/results", _payload)
         except urllib.error.HTTPError as e:
             if 400 <= e.code < 500:
                 # Lease long gone: no consumer will ever accept this POST.

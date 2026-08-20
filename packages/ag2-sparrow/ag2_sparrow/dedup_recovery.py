@@ -16,7 +16,7 @@ from pathlib import Path
 # This file is bundled verbatim into ag2_sparrow, where its siblings are
 # package submodules; in src/ they are flat modules. Support both.
 try:  # pragma: no cover - exercised by whichever context imports it
-    from .local_task_protocol import find_result
+    from .local_task_protocol import find_result, valid_archive_lookup_id
     from .result_markers import (
         build_requeued_task,
         dedup_decision,
@@ -24,7 +24,7 @@ try:  # pragma: no cover - exercised by whichever context imports it
     )
     from .task_archive import find_task_file
 except ImportError:  # pragma: no cover - flat src/ import path
-    from local_task_protocol import find_result
+    from local_task_protocol import find_result, valid_archive_lookup_id
     from result_markers import (
         build_requeued_task,
         dedup_decision,
@@ -32,7 +32,12 @@ except ImportError:  # pragma: no cover - flat src/ import path
     )
     from task_archive import find_task_file
 
-__all__ = ["plan_dedup_recovery", "REPORT_TEMPLATE"]
+__all__ = ["plan_dedup_recovery", "REPORT_TEMPLATE", "MALFORMED_TEMPLATE"]
+
+MALFORMED_TEMPLATE = (
+    "⚠️ This was folded into another task, but the holder id on the marker is "
+    "unusable, so it could not be recovered. It needs a direct answer."
+)
 
 REPORT_TEMPLATE = (
     "⚠️ This was folded into `{holder}`, which delivered nothing, and "
@@ -72,6 +77,10 @@ def plan_dedup_recovery(
     and the next pass would add another.
     """
     holder = (holder_id or "").strip()
+    # `find_result` refuses a malformed id, so recovery would read "delivered
+    # nothing" and carry these bytes into the re-ask. Reject; never echo them.
+    if holder and not valid_archive_lookup_id(holder):
+        return "report", MALFORMED_TEMPLATE
     orig_text = _read(find_task_file(Path(tasks_dir), task_id))
     holder_text = _read(find_result(Path(results_dir), holder)) if holder else None
 

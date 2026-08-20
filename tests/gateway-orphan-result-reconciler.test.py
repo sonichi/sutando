@@ -161,13 +161,25 @@ class MarkerParity(_Base):
         t.write_text(f"id: {TID}\ntask: hi\n")
         _age(t, OLD)
 
-    def test_no_send_orphan_posts_verbatim_so_server_suppresses(self):
+    def test_suppressed_orphan_closes_the_lease_and_moves_no_data(self):
+        """A suppression marker moves no data — recovery is no exception.
+
+        This used to post the file VERBATIM, so the sender's prose rode the
+        wire on the recovery path while the ordinary path sent only the
+        canonical close. The old assertion could not see it: it checked that
+        `[no-send]` was present, which is true of the body AND of the close.
+        """
         self._archived_task()
-        self._result("[no-send]\ninternal only")
+        self._result("[no-send]\nSENSITIVE_SENTINEL")
         self._sweep()
         self.assertEqual(len(self.posted), 1, "lease still closes via POST")
-        body = self.posted[0][2]["body"]
+        payload = self.posted[0][2]
+        body = payload["body"]
         self.assertIn("[no-send]", body, "marker must reach the server intact")
+        self.assertNotIn("SENSITIVE_SENTINEL", body,
+                         "the sender's prose rode a suppressed close")
+        self.assertTrue(payload.get("no_send"),
+                        "a suppressed close must gate delivery server-side")
         self.assertNotIn("recovered result", body,
                          "a suppressed result gets no user-facing label")
 

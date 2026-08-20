@@ -39,6 +39,14 @@ def _bind_state(root):
     root = pathlib.Path(root)
     root.mkdir(parents=True, exist_ok=True)
     m._STATE = root
+    # Derived from _STATE.PARENT, so the _STATE_DERIVED loop below cannot reach
+    # them: without this the suite appends to the operator's real gateway log.
+    for name, value in (("_LOG_DIR", root.parent / "logs"),
+                        ("_LOG_FILE", root.parent / "logs" / "gateway-bridge.log"),
+                        ("_LOCK_WS", root.parent)):
+        if hasattr(m, name):
+            saved[name] = getattr(m, name)
+            setattr(m, name, value)
     for name in _STATE_DERIVED:
         if hasattr(m, name):
             old = pathlib.Path(getattr(m, name))
@@ -51,17 +59,22 @@ def _bind_state(root):
     return undo
 
 
+# `logs/` is a SIBLING of _STATE, so a fingerprint rooted at _STATE cannot see a
+# log write no matter how it walks -- the blind spot is the root, not the walk.
+_OPERATOR_WATCHED = (_OPERATOR_STATE_ROOT, _OPERATOR_STATE_ROOT.parent / "logs")
+
+
 def _operator_state_fingerprint():
-    """(path, size, mtime) for every file under the REAL _STATE, sorted."""
-    root = _OPERATOR_STATE_ROOT
-    if not root.exists():
-        return ()
+    """(path, size, mtime) for every file the module writes outside a tmpdir."""
     out = []
-    for f in sorted(root.rglob("*")):
-        if f.is_file():
-            st = f.stat()
-            out.append((str(f.relative_to(root)), st.st_size, st.st_mtime_ns))
-    return tuple(out)
+    for root in _OPERATOR_WATCHED:
+        if not root.exists():
+            continue
+        for f in sorted(root.rglob("*")):
+            if f.is_file():
+                st = f.stat()
+                out.append((str(f), st.st_size, st.st_mtime_ns))
+    return tuple(sorted(out))
 
 
 _OPERATOR_STATE_BEFORE = _operator_state_fingerprint()
@@ -426,7 +439,7 @@ check(second[0] is False and second[1] is False,
 # this is the invariant, so a third cannot reintroduce it quietly.
 _after = _operator_state_fingerprint()
 check(_after == _OPERATOR_STATE_BEFORE,
-      "HERMETIC: the operator's ~/.ag2-sparrow/state is untouched by this suite")
+      "HERMETIC: the operator's ~/.ag2-sparrow state/ AND logs/ are untouched")
 if _after != _OPERATOR_STATE_BEFORE:
     print(f"       before={_OPERATOR_STATE_BEFORE}\n       after ={_after}")
 
