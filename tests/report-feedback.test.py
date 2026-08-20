@@ -188,6 +188,30 @@ class TestWhyNoLogs(unittest.TestCase):
         self.assertIn("no .log files", why)
         self.assertNotIn("no logs directory", why)
 
+    def test_an_unlistable_directory_does_not_raise(self):
+        """It runs on the failure path, so it must degrade, never raise.
+
+        The sibling test below uses a directory named `bad.log`, which lets
+        `iterdir()` succeed — so it exercises branch 3 and cannot catch this.
+        An unreadable `logs/` would otherwise turn "filed without logs" into
+        "not filed at all", for exactly the users whose logs are unreachable.
+        """
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses the permission bit")
+        with tempfile.TemporaryDirectory() as td:
+            logs = Path(td) / "logs"
+            logs.mkdir()
+            (logs / "a.log").write_text("x\n")
+            os.chmod(logs, 0o000)
+            try:
+                if os.access(logs, os.R_OK):
+                    self.skipTest("filesystem does not enforce the permission bit")
+                self.assertEqual(report_feedback.logs_excerpt(Path(td)), (None, []))
+                why = report_feedback.why_no_logs(Path(td))
+            finally:
+                os.chmod(logs, 0o755)
+        self.assertIn("could not be listed", why)
+
     def test_present_but_unreadable_is_its_own_reason(self):
         """Pairs with test_unreadable_log_is_swallowed above: that one proves
         the excerpt is dropped, this one proves the drop is now explained."""

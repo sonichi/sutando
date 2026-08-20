@@ -119,12 +119,22 @@ def read_cloud_auth(ws: Path):
 
 
 def why_no_logs(ws: Path) -> str:
-    """Why logs_excerpt() came back empty, in words a ticket reader can act on."""
+    """Why logs_excerpt() came back empty, in words a ticket reader can act on.
+
+    Runs ONLY on the failure path, so it must never raise: logs_excerpt() already
+    degraded to (None, []) here, and an exception would turn a report filed
+    without logs into a report not filed at all.
+    """
     logs = ws / "logs"
-    if not logs.is_dir():
-        return f"no logs directory at {logs} (reporter ran outside a live workspace)"
-    if not any(f.suffix == ".log" for f in logs.iterdir()):
-        return f"{logs} has no .log files"
+    try:
+        if not logs.is_dir():
+            return f"no logs directory at {logs} (reporter ran outside a live workspace)"
+        if not any(f.suffix == ".log" for f in logs.iterdir()):
+            return f"{logs} has no .log files"
+    except OSError as exc:
+        return f"{logs} could not be listed ({type(exc).__name__})"
+    except Exception:  # noqa: BLE001 - the explanation must not outrank the report
+        return f"{logs} could not be inspected"
     return f"{logs} exists but its log files could not be read"
 
 
