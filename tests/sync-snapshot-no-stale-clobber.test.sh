@@ -60,6 +60,27 @@ _snapshot_per_host_config
 check "post-seed independent writer wins regardless of root changes" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "per-host went live" ]'
 
+echo "5b. upgrade bootstrap: pre-provenance byte-identical snapshot is adopted"
+rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+echo "same bytes both sides" > "$WORKSPACE_DIR/build_log.md"
+cp "$WORKSPACE_DIR/build_log.md" "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+_snapshot_per_host_config
+check "provenance recorded for the inherited equal snapshot" \
+      '[ -s "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha" ]'
+echo "root moved after upgrade" > "$WORKSPACE_DIR/build_log.md"
+_snapshot_per_host_config
+check "root-live refresh works after the upgrade bootstrap" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root moved after upgrade" ]'
+
+echo "5c. pre-provenance DIVERGED copy stays refused (no adoption on difference)"
+rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+_snapshot_per_host_config
+check "diverged unrecorded copy is preserved, not adopted or overwritten" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "independent content" ]'
+echo "keep it that way" >> "$WORKSPACE_DIR/build_log.md"
+echo "per-host went live" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+
 echo "6. absent root is a no-op"
 rm "$WORKSPACE_DIR/build_log.md"
 _snapshot_per_host_config

@@ -850,6 +850,13 @@ _snapshot_per_host_config() {
         local _cur="" _rec=""
         [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
         [ -f "$_sig" ] && _rec="$(cat "$_sig" 2>/dev/null)"
+        if [ -f "$_dst" ] && [ -z "$_rec" ] \
+                && cmp -s "$WORKSPACE_DIR/build_log.md" "$_dst" 2>/dev/null; then
+            # Upgrade bootstrap: a pre-provenance snapshot that still equals
+            # root is adopted, so root-live hosts keep refreshing.
+            printf '%s\n' "$_cur" > "$_sig" 2>/dev/null || true
+            _rec="$_cur"
+        fi
         if [ ! -f "$_dst" ] || { [ -n "$_rec" ] && [ "$_cur" = "$_rec" ]; }; then
             cp -p "$WORKSPACE_DIR/build_log.md" "$_dst" 2>/dev/null \
                 && shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1 > "$_sig" 2>/dev/null || true
