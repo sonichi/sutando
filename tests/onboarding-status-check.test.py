@@ -99,6 +99,30 @@ class OnboardingStatusCheckTest(unittest.TestCase):
         self.assertIn("setup incomplete", out["detail"])
         self.assertIn("core", out["detail"])
 
+    def test_a_peer_hosts_heartbeat_does_not_silence_a_local_gap(self):
+        """The reason this uses _fresh_local_core_record() and not the fleet-wide
+        resolver: that one globs every synced state/cores/*.alive and takes the
+        freshest, which the workspace contract permits to be another machine's.
+        """
+        import time
+        ws = self._with_workspace(
+            {"updated_at": 1, "rows": {"core": {"state": "todo",
+                                                "detail": "core not running"}}}
+        )
+        d = ws / "state" / "cores"
+        d.mkdir(parents=True, exist_ok=True)
+        peer = d / "some-peer-host.alive"
+        peer.write_text(json.dumps({"ts": int(time.time())}))
+        self.assertFalse((d / f"{hc._host_label()}.alive").exists(),
+                         "premise: THIS host has no heartbeat, only the peer does")
+
+        out = hc.check_onboarding_status()
+
+        self.assertEqual(out["status"], "warn",
+                         f"a peer's heartbeat must not clear a local gap: {out!r}")
+        self.assertIn("setup incomplete", out["detail"])
+        self.assertIn("core", out["detail"])
+
     def test_other_todo_rows_survive_a_stale_core_row(self):
         ws = self._with_workspace(
             {"updated_at": 1, "rows": {"core": {"state": "todo",
