@@ -74,14 +74,15 @@ describe('task-bridge.ts — [no-send]/[REPLIED] skip-marker handling (#1381)', 
 		);
 	});
 
-	it('skip-marker guard appears after the [deduped:] check (correct ordering)', () => {
-		const dedupIdx = SRC.indexOf('deduped marker; archiving silently');
-		const skipIdx = SRC.indexOf('has skip marker');
-		assert.ok(dedupIdx !== -1, '"deduped marker; archiving silently" log not found');
-		assert.ok(skipIdx !== -1, '"has skip marker" log not found');
+	it('has NO private [deduped:] matcher left in code — it is a skip marker now', () => {
+		// Comments are stripped first: `deduped` may survive in prose, never in CODE.
+		// The grammar lives once, in skip_marker_ownership.ts.
+		const code = SRC
+			.replace(/\/\*[\s\S]*?\*\//g, '')
+			.split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
 		assert.ok(
-			dedupIdx < skipIdx,
-			`[deduped:] guard (pos ${dedupIdx}) must appear before skip-marker guard (pos ${skipIdx})`
+			!code.includes('deduped'),
+			'task-bridge.ts still carries a private [deduped:] matcher; it must delegate to SKIP_MARKER_RE'
 		);
 	});
 
