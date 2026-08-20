@@ -622,12 +622,16 @@ export function logicalTaskName(basename: string): string {
 /** Anchored, so `context-drop-replay` does not match. Shared by the scan and the
  *  result loop so the two cannot disagree about what a drop is. */
 export function isContextDropHeader(raw: string): boolean {
-	const header = headerRegion(raw).join('\n');
-	if (!/^source:[ \t]*context-drop[ \t]*$/m.test(header)) return false;
-	// A drop is owner-only. The real producer emits no access_tier, so absent stays
-	// owner per CLAUDE.md; a PRESENT non-owner tier is forged or mis-routed.
-	const tier = header.match(/^access_tier:[ \t]*(\S+)[ \t]*$/m);
-	return tier === null || tier[1] === 'owner';
+	// Per LINE, never /m over rejoined text: /m ends a line at \r, U+2028 and
+	// U+2029 too, so one field could forge two headers. CRLF is stripped here.
+	const lines = headerRegion(raw).map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+	if (!lines.some((l) => /^source:[ \t]*context-drop[ \t]*$/.test(l))) return false;
+	const tiers = lines.filter((l) => /^access_tier:/.test(l));
+	// Absent stays owner (the real producer emits none); otherwise the LAST
+	// candidate decides and a malformed value fails closed, per resolve_access_tier.
+	if (tiers.length === 0) return true;
+	const m = tiers[tiers.length - 1].match(/^access_tier:[ \t]*(\S+)[ \t]*$/);
+	return m !== null && m[1] === 'owner';
 }
 
 /** Locate a task file across bare and claimed spellings — TS mirror of task_archive.find_task_file. */
@@ -650,9 +654,8 @@ export function findTaskFile(dir: string, taskId: string): string | null {
 /** Drop task files already handed to the live session, so a re-scan cannot re-inject.
  *  Holds LOGICAL names (see logicalTaskName) — a claim rename must not read as new. */
 const _injectedDropTasks = new Set<string>();
-/** Bytes fingerprint of a drop seen once but not yet claimed: a drop is only
- *  injected when two consecutive scans agree, so a partial write cannot be
- *  claimed permanently with its suffix still unwritten. */
+/** Bytes fingerprint of a drop seen but unclaimed: two consecutive scans must
+ *  agree, so a partial write cannot be claimed with its suffix unwritten. */
 const _dropStability = new Map<string, string>();
 /** First scan only records what is already queued — a restart must not replay old drops. */
 let _seedingDropTasks = true;
@@ -749,11 +752,8 @@ export function scanDropTasksOnce(dir: string, onDrop: (body: string) => void): 
 			scan = scanDropTask(join(dir, name));
 		} catch { continue; }
 		if (scan.kind === 'incomplete') continue;
-		// A body written progressively reads as complete the moment its first
-		// chunk lands, and the claim below is permanent — so the suffix would
-		// never be injected. Require the bytes to be unchanged across two scans
-		// before claiming. Seeding is exempt: it must claim on the first pass or
-		// an already-queued drop replays as a live injection on the next one.
+		// A progressive body reads complete at its first chunk and the claim is
+		// permanent, so require unchanged bytes across two scans. Seeding is exempt.
 		if (scan.kind === 'drop' && !_seedingDropTasks) {
 			let fp: string;
 			try {
