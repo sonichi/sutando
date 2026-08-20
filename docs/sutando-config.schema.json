@@ -116,7 +116,7 @@
         "sync": {
           "type": "object",
           "additionalProperties": false,
-          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) \u2014 overriding in .local.json wipes the defaults for that array.",
+          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. include/exclude arrays REPLACE on merge (not unioned) \u2014 overriding either in .local.json wipes the defaults for that array. Use exclude_extra to ADD a carve-out while keeping the shipped ones.",
           "properties": {
             "include": {
               "type": "array",
@@ -133,6 +133,14 @@
                 "minLength": 1
               },
               "description": "Workspace-relative paths to skip during sync. Glob patterns supported (e.g. '*.heartbeat')."
+            },
+            "exclude_extra": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Workspace-relative paths APPENDED to exclude rather than replacing it. Shipped denies stay first (gitignore is last-match-wins) and duplicates are dropped. There is no include_extra: include is the whitelist, and unioning it would widen what the vault carries."
             }
           }
         },
@@ -141,6 +149,19 @@
           "minimum": 60,
           "default": 1800,
           "description": "Seconds between sync runs when sync is enabled. Minimum 60 to avoid hammering the remote."
+        }
+      }
+    },
+    "health_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Behavior of src/health-check.py.",
+      "properties": {
+        "down_bridge_action": {
+          "type": "string",
+          "enum": ["restart", "alert", "off"],
+          "default": "alert",
+          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout — clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
         }
       }
     },

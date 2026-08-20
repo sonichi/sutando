@@ -85,19 +85,37 @@ case "$cmd" in
         echo "  workspace: $WORKSPACE"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
-        # Render the template.
-        sed \
-            -e "s|__REPO__|$REPO|g" \
-            -e "s|__WORKSPACE__|$WORKSPACE|g" \
-            -e "s|__HOME__|$HOME|g" \
-            "$TEMPLATE" > "$DEST"
+        # Escaping renderer + resolved interpreter: a bare python3 can be the
+        # Xcode-CLT stub, which passes an existence check and raises the dialog.
+        . "$REPO/scripts/python-binary.sh"
+        _PY="$(require_python "$REPO" "install the menubar launchd job")" || exit 1
+        "$_PY" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$DEST" \
+            "REPO=$REPO" \
+            "WORKSPACE=$WORKSPACE" \
+            "HOME=$HOME" || exit 1
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         # If Sutando.app was already running before install, the launchd-spawned
         # instance exits cleanly via singleton-detection; kickstart forces
         # launchd to take ownership so KeepAlive applies. Idempotent.
         launchctl kickstart "$SERVICE" >/dev/null 2>&1 || true
-        echo "  Loaded via $SERVICE"
+        # kickstart's status is swallowed above because it is idempotent-noisy,
+        # so supervision must be proven by a live pid, never assumed from it.
+        _sup_pid=""
+        for _ in $(seq 1 50); do
+            _sup_pid="$(launchctl print "$SERVICE" 2>/dev/null \
+                | awk '/^[[:space:]]*pid[[:space:]]*=/{print $3; exit}')"
+            [ -n "$_sup_pid" ] && [ "$_sup_pid" != "0" ] && break
+            _sup_pid=""
+            sleep 0.1
+        done
+        if [ -z "$_sup_pid" ]; then
+            echo "  ✗ $SERVICE is registered but launchd owns no running process." >&2
+            echo "    Not reporting supervision — KeepAlive cannot restart what never started." >&2
+            echo "    Inspect with: launchctl print $SERVICE" >&2
+            exit 1
+        fi
+        echo "  Loaded via $SERVICE (launchd-owned pid $_sup_pid)"
         echo
         echo "Sutando.app is now launchd-supervised."
         echo "  • Crashes auto-restart within ~10s"

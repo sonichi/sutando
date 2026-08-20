@@ -345,6 +345,26 @@ class HealthCheckDegradesWithoutGit(unittest.TestCase):
         self.assertEqual(spawned, [], "probe spawned a process with no runnable git")
         self.assertRegex(result["detail"], r"(?i)git not runnable|no runnable git")
 
+    def test_checkout_is_canonical_degrades_without_git(self):
+        """`_checkout_is_canonical` must resolve git, not invoke a bare `git`."""
+        spawned = []
+        real_run = subprocess.run
+
+        def spy(argv, *a, **k):
+            spawned.append(argv[0] if isinstance(argv, list) else argv)
+            return real_run(argv, *a, **k)
+
+        git_binary.reset_cache_for_tests()
+        try:
+            with patch.object(git_binary, "path_candidates", return_value=[]), \
+                 patch.object(subprocess, "run", spy):
+                ok, reason = health_check._checkout_is_canonical(REPO)
+        finally:
+            git_binary.reset_cache_for_tests()
+        self.assertEqual(spawned, [], "spawned a process with no runnable git — the CLT modal path")
+        self.assertFalse(ok, "must fail closed when git state is unreadable")
+        self.assertIn("unreadable", reason)
+
     def test_runs_against_a_real_git_without_raising(self):
         """Exercises both git invocations on a host that does have git.
 

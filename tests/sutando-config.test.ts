@@ -13,9 +13,10 @@
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
 	detectEnvWorkspaceInDotenv,
@@ -326,6 +327,54 @@ describe('sutando_config loader', () => {
 		}
 	});
 
+	// Twin of sutando_config.py: a key implemented on one side only makes the same
+	// config mean different things to a TS caller and a Python caller.
+	it('resolveVault appends exclude_extra without dropping the shipped excludes', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			vault: { enabled: true, sync: { include: ['notes/'], exclude: ['tasks/', 'results/'] } },
+		});
+		writeConfig(repo, 'sutando.config.local.json', {
+			vault: { sync: { exclude_extra: ['notes/generated/', 'notes/media/'] } },
+		});
+		try {
+			const vault = resolveVault(repo);
+			// shipped denies FIRST — gitignore is last-match-wins
+			assert.deepEqual(vault.sync.exclude,
+				['tasks/', 'results/', 'notes/generated/', 'notes/media/']);
+			assert.equal((vault.sync as Record<string, unknown>).exclude_extra, undefined);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('resolveVault de-duplicates an exclude_extra path already shipped', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			vault: { enabled: true, sync: { include: ['notes/'], exclude: ['tasks/'] } },
+		});
+		writeConfig(repo, 'sutando.config.local.json', {
+			vault: { sync: { exclude_extra: ['tasks/', 'notes/media/'] } },
+		});
+		try {
+			assert.deepEqual(resolveVault(repo).sync.exclude, ['tasks/', 'notes/media/']);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('resolveVault keeps include REPLACING — no include_extra widening', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			vault: { enabled: true, sync: { include: ['notes/', 'hosts/*/'], exclude: [] } },
+		});
+		writeConfig(repo, 'sutando.config.local.json', {
+			vault: { sync: { include: ['only/'] } },
+		});
+		try {
+			assert.deepEqual(resolveVault(repo).sync.include, ['only/']);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
 	// ------------------------------------------------------------------ //
 	//  Bonus: detectEnvWorkspaceInDotenv                                  //
 	// ------------------------------------------------------------------ //
@@ -435,6 +484,8 @@ describe('sutando_config loader', () => {
 		writeConfig(repo, 'sutando.config.json', {
 			workspace: { path: '/ws' },
 			vault: { enabled: false },
+			// health_check is a known key — the Python twin registers it, so no warning.
+			health_check: { down_bridge_action: 'restart' },
 		});
 		const writes: string[] = [];
 		const origWrite = process.stderr.write.bind(process.stderr);
@@ -446,6 +497,33 @@ describe('sutando_config loader', () => {
 			loadConfig(repo);
 			const combined = writes.join('');
 			assert.ok(!combined.includes('does not read'), 'stderr should be silent on the happy path');
+		} finally {
+			process.stderr.write = origWrite;
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('the REPO-TRACKED sutando.config.json loads without an unknown-key warning', () => {
+		// A synthetic config cannot catch a key added to the shipped file but
+		// registered only in the Python loader; this reads the tracked file.
+		const trackedPath = resolve(
+			fileURLToPath(new URL('.', import.meta.url)), '..', 'sutando.config.json');
+		const tracked = JSON.parse(readFileSync(trackedPath, 'utf8'));
+		writeConfig(repo, 'sutando.config.json', tracked);
+
+		const writes: string[] = [];
+		const origWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+			writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			loadConfig(repo);
+			const combined = writes.join('');
+			assert.ok(
+				!combined.includes('does not read'),
+				`tracked sutando.config.json emitted an unknown-key warning: ${combined}`,
+			);
 		} finally {
 			process.stderr.write = origWrite;
 			restoreEnvAndRepo();

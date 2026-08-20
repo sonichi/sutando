@@ -42,6 +42,10 @@ telegram-inbox/
 discord-inbox/
 archive/
 assets/
+# the blanket assets/ rule above is for workspace runtime dirs; the package's
+# brand assets are versioned source
+!packages/ag2-sparrow/assets/
+!packages/ag2-sparrow/assets/**
 stand-identity.json
 stand-avatar.png
 docs/youtube/
@@ -52,6 +56,14 @@ tests/*
 # (tests/kernel/, tests/adapters/, tests/policy/, …) — the companion to the
 # recursive runner glob. Without this, relocated tests are silently untracked.
 !tests/*/
+# `!tests/*/` re-includes EVERY dir under tests/, which defeats the global
+# `__pycache__/` above. Re-deny tool caches here; gitignore is last-match-wins.
+tests/**/__pycache__/
+tests/**/.pytest_cache/
+tests/**/.mypy_cache/
+tests/**/.ruff_cache/
+tests/**/node_modules/
+tests/**/htmlcov/
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 import re
 import secrets
 import shutil
@@ -45,7 +44,9 @@ except Exception:  # pragma: no cover — bridge must keep running
         return False
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files  # noqa: E402
+from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
+                                release_claim)
+from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -55,13 +56,17 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 import local_task_protocol  # noqa: E402
-from result_markers import parse_markers  # noqa: E402
+from result_markers import parse_markers
+from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
+from result_ready import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -175,48 +180,25 @@ def extract_forward_note(msg: dict) -> str:
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
-    """Record owner activity — see src/discord-bridge.py for schema."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ts": int(time.time()),
-            "channel": channel,
-            "summary": summary[:80],
-        }
-        if channel_id:
-            payload["channel_id"] = str(channel_id)
-        # Per-PID staging name: this file is written by four processes (this
-        # bridge + slack/discord/sparrow). A shared ".json.tmp" name lets two
-        # concurrent writers truncate and interleave the same temp file, so the
-        # rename can publish torn JSON. A per-PID temp is never shared, and
-        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, OWNER_ACTIVITY_FILE)
-    except Exception as e:
-        print(f"  [owner-activity] write failed: {e}")
+    """Record owner activity using the shared provider-neutral schema."""
+    _write_owner_activity_shared(
+        OWNER_ACTIVITY_FILE,
+        channel,
+        summary,
+        channel_id,
+        on_error=lambda exc: print(f"  [owner-activity] write failed: {exc}"),
+    )
 
 
-def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
-    Silent on failure. Chi's ask 2026-04-18: archive tasks + results for
-    later pattern-mining / self-improvement analysis."""
-    try:
-        if not src.exists():
-            return
-        from datetime import datetime
-        import shutil
-        ym = datetime.now().strftime("%Y-%m")
-        base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-        dest_dir = base / ym
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
-    except Exception as e:
-        print(f"[Telegram] archive_file({kind}, {task_id}) failed: {e}")
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+def archive_file(src: "Path", kind: str, task_id: str) -> bool:
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy. It used to unlink the source when the move failed,
+    which destroyed the only copy of the task."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(f"[Telegram]{m}"))
+
 
 # Load access config
 ACCESS_FILE = channel_access_path("telegram")
@@ -408,19 +390,35 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     assumed — we consult their return values. The task-reply path passes a
     marker-stripped body and sends parsed.actions attachments itself, then folds
     those into the same event (so file-only replies still report a delivery and
-    the count/outcome stay accurate)."""
-    # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
-    file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
-    files = file_pattern.findall(text)
-    clean_text = file_pattern.sub('', text).strip()
-    text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
+    the count/outcome stay accurate).
+
+    Marker grammar comes solely from ``result_markers.parse_markers`` — this
+    function must never re-declare it. It previously compiled a local
+    ``file|send|attach`` regex, which stripped attachment markers but left every
+    OTHER marker in the body. The proactive path (``poll_proactive``) passes raw
+    result text, so ``[dm-only]`` and ``[channel:]`` leaked verbatim into the
+    owner's message — the morning briefing is emitted as a proactive result
+    carrying ``[dm-only]``, so it rendered with the marker visible.
+
+    Parsing here (rather than at each call site) mirrors slack-bridge's
+    ``_send_reply`` and makes the function safe for both callers: parse_markers
+    is idempotent on an already-stripped body, so the task path — which passes
+    ``parsed.body`` and sends its own attachments — yields zero actions here and
+    cannot double-send."""
+    parsed = parse_markers(text)
+    files = [a.value for a in parsed.actions if a.kind == "attach"]
+    clean_text = parsed.body
+    # Fence-aware chunks via the shared chunker — naive [i:i+4000] slicing tore
+    # code fences at the boundary and re-declared policy discord/slack share.
+    chunks = chunk_plain_text(clean_text, 4000) if clean_text else []
+    text_chunks = len(chunks)
     delivered_ok = True
     files_sent = 0
 
     # Send text (if any remains after extracting file refs)
     if clean_text:
-        for i in range(0, len(clean_text), 4000):
-            resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+        for piece in chunks:
+            resp = api("sendMessage", chat_id=chat_id, text=piece)
             if not (isinstance(resp, dict) and resp.get("ok")):
                 delivered_ok = False
         try:
@@ -470,6 +468,23 @@ def _recover_orphan_sending_files() -> int:
 # swallowed so the real result still delivers.
 _progress_msgs: dict = {}        # task_id -> {message_id, chat_id, first, last_edit, last_text} | {"expired": True}
 pending_task_tiers: dict = {}    # task_id -> access_tier; in-memory ONLY → fail-closed on restart
+
+
+def _dedup_recover(task_id: str, holder_id, chat_id) -> str | None:
+    """Route the shared dedup-recovery plan; returns a new task id to route."""
+    try:
+        action, payload = plan_dedup_recovery(
+            RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
+            f"task-{int(time.time() * 1000)}")
+        if action == "requeue":
+            print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
+            return payload
+        if action == "report":
+            send_reply(chat_id, payload, task_id=task_id)
+            print(f"  [dedup] unresolved for {task_id}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - never block the skip path
+        print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+    return None
 
 
 def _clear_progress(task_id: str) -> None:
@@ -929,7 +944,7 @@ def main():  # pragma: no cover
                 # body copy while these authentic ones pass through.
                 media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
                     attachment_refs, bool(text and text.strip()))
-                task_file.write_text(
+                _task_content = (
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                     f"source: telegram\n"
@@ -943,6 +958,14 @@ def main():  # pragma: no cover
                     f"{tg_skill_hints}"
                     f"{secret_notice}"
                 )
+                # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+                # fail-open so a stamping error costs the stamp and never the task.
+                try:
+                    from task_envelope import stamp_text  # sibling (src/ on sys.path)
+                    _task_content = stamp_text(_task_content, REPO)
+                except Exception:
+                    pass
+                task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 # Observability: one inbound accepted-message event. Source the
@@ -977,12 +1000,9 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import should_claim_proactive
+        from proactive_routing import should_claim_proactive_file
         try:
-            if (
-                not presenter_mode_active(REPO)
-                and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
-            ):
+            if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
                 # friction-*.txt via FALLBACK_PREFIXES; telegram-bridge only
                 # matched `proactive-`, so morning-briefing output (which
@@ -992,8 +1012,15 @@ def main():  # pragma: no cover
                 # cron-originated results land in the owner's DM regardless
                 # of which bridge is the active channel.
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
+                def _tg_claims(name: str) -> bool:
+                    # Destination outranks activity routing, uniformly;
+                    # discord's DM fallback stays the after-grace catch-all.
+                    return should_claim_proactive_file(
+                        name, OWNER_ACTIVITY_FILE, "telegram")
+
                 for f in RESULTS_DIR.iterdir():
-                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
+                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
+                            and f.suffix == ".txt" and _tg_claims(f.name):
                         # Peek before claiming: skip Discord-targeted proactive files.
                         # [channel: <17-20 digit snowflake>] is a Discord-only marker;
                         # claiming it here sends the literal text to Telegram DM instead
@@ -1005,31 +1032,10 @@ def main():  # pragma: no cover
                         if peek.startswith("[channel:") and \
                                 re.match(r'\[channel:\s*\d{17,20}\]', peek):
                             continue
-                        # Claim-by-rename: atomic move to a `.sending`
-                        # suffix before reading, so a concurrent poll
-                        # (same bridge, or a race with discord-bridge)
-                        # can't pick it up and resend. See
-                        # discord-bridge.py for the same fix + the
-                        # 2026-04-20 bug-scenario that motivated it.
-                        claim = f.with_suffix(".sending")
-                        try:
-                            f.rename(claim)
-                        except FileNotFoundError:
-                            continue
-                        f = claim
-                        text = f.read_text().strip()
-                        if not text:
-                            f.unlink(missing_ok=True)
-                            continue
-                        # Pre-fix used `next(iter(load_allowed()))`,
-                        # which iterates a `set` — hash-slot order, not
-                        # list order. With multiple users in allowFrom
-                        # (e.g. admin adds a second sender via
-                        # `/telegram:access allow`), proactive
-                        # owner-notifications could route to the wrong
-                        # user. Mirrors the same fix shape used by
-                        # discord-bridge's poll_proactive; full priority
-                        # chain documented on _resolve_proactive_owner_id.
+                        # Resolve the recipient BEFORE claiming: the claim renames the
+                        # file out of the `*.txt` glob every peer bridge polls.
+                        # `_resolve_proactive_owner_id` orders allowFrom explicitly; a
+                        # bare `next(iter(set))` picked a hash-slot, not the first user.
                         env_override = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip()
                         try:
                             access_data = json.loads(ACCESS_FILE.read_text())
@@ -1037,8 +1043,16 @@ def main():  # pragma: no cover
                             access_data = {}
                         owner_id = _resolve_proactive_owner_id(env_override, access_data)
                         if owner_id is None:
-                            print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
-                            f.unlink(missing_ok=True)
+                            continue
+                        # The shared helper owns "no recipient -> do not claim"; this
+                        # adapter contributes only the owner it resolved.
+                        claim = claim_for_delivery(f, owner_id)
+                        if claim is None:
+                            continue
+                        f = claim
+                        text = read_ready_result(f)
+                        if text is None:
+                            release_claim(f)
                             continue
                         try:
                             _s = send_reply(int(owner_id), text)
@@ -1051,10 +1065,19 @@ def main():  # pragma: no cover
                                     outcome="ok" if _s["ok"] else "error",
                                     data={"text_chunks": _s["text_chunks"], "file_count": _s["files_sent"]},
                                 )
-                            print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                            if _s.get("ok"):
+                                print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                                f.unlink(missing_ok=True)
+                            else:
+                                # send_reply reports refusal by returning ok=False
+                                # without raising; the except below never sees it.
+                                print(f"  [proactive] send refused, releasing {f.name}")
+                                release_claim(f)
                         except Exception as e:
-                            print(f"  [proactive] failed: {e}")
-                        f.unlink(missing_ok=True)
+                            # Release, never delete: pollers scan `.txt`, so a deleted
+                            # claim is a message no bridge can ever retry.
+                            print(f"  [proactive] failed, releasing {f.name}: {e}")
+                            release_claim(f)
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
 
@@ -1070,8 +1093,8 @@ def main():  # pragma: no cover
         for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
-                reply_text = result_file.read_text().strip()
-                if not reply_text:
+                reply_text = read_ready_result(result_file)
+                if reply_text is None:
                     continue
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
@@ -1081,12 +1104,20 @@ def main():  # pragma: no cover
                 # leaks as literal text in the user's DM (#1381).
                 parsed = parse_markers(reply_text)
                 if any(a.kind == "skip" for a in parsed.actions):
+                    _sk = next(a for a in parsed.actions if a.kind == "skip")
+                    if _sk.value == "deduped":
+                        _rq = _dedup_recover(task_id, _sk.extra, chat_id)
+                        if _rq:
+                            pending_replies[_rq] = chat_id
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                     archive_file(result_file, "results", task_id)
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
+                # Bound before the try: a raise below must not leave the archive
+                # gate reading an unassigned name.
+                delivered_ok = False
                 try:
                     # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
                     # File attachments are in parsed.actions; send_reply() won't re-find them,
@@ -1124,9 +1155,15 @@ def main():  # pragma: no cover
                             outcome="ok" if delivered_ok else "error",
                             data={"task_id": task_id, "text_chunks": _s["text_chunks"], "file_count": sent_files},
                         )
-                    print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
+                    if delivered_ok:
+                        print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)
+                if not delivered_ok:
+                    # Restore the route popped above, or a retry has no chat_id.
+                    pending_replies[task_id] = chat_id
+                    print(f"[Telegram] reply refused, keeping {task_id} for retry", flush=True)
+                    continue
                 _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)

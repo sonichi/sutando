@@ -208,15 +208,63 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
 
    **Give it a minute or two before concluding it failed.** The status is posted asynchronously: on one PR it was still `total=0` immediately after reopening and `license/cla=success` on the next check. Re-running the command above is the way to tell; an immediate zero means nothing yet.
 
+   **If the status is PRESENT and `pending`, that is a third case with its own cause.** `state=pending` with the description *"Contributor License Agreement is not signed yet."* means CLA-Assistant ran and is waiting on a signature — so close+reopen does nothing, and the `--reset-author` fix above only applies if the identity is your own. Ask GitHub which commit identities it cannot vouch for:
+
+   ```bash
+   gh api repos/<owner>/<repo>/pulls/<N>/commits \
+     --jq '.[] | "\(.sha[0:8]) \(.commit.author.email) -> \(.author.login // "NULL — maps to no account")"'
+   ```
+
+   Two shapes turn up: an email mapping to **no account** (`author: null`), and an email mapping to a **real account that has not signed**.
+
+   Neither is identifiable from a single PR — every login on it looks equally plausible. The unsigned one is the login that appears on CLA-**pending** PRs and on **no green** one, which takes a comparison across the open queue:
+
+   ```bash
+   for n in $(gh pr list --state open --limit 100 --json number --jq '.[].number'); do
+     h=$(gh pr view "$n" --json headRefOid --jq .headRefOid)
+     state=$(gh api "repos/<owner>/<repo>/commits/$h/status" \
+               --jq '[.statuses[]|select(.context=="license/cla")]
+                     | if length==0 then "absent" else (sort_by(.updated_at)|last|.state) end')
+     logins=$(gh api "repos/<owner>/<repo>/pulls/$n/commits" --jq '[.[].author.login // "NULL"]|unique|join(" ")')
+     echo "$state $logins"
+   done | awk '$1=="pending"{for(i=2;i<=NF;i++) p[$i]=1} $1=="success"{for(i=2;i<=NF;i++) g[$i]=1}
+                END{for(k in p) if(!(k in g)) print "unsigned candidate:", k}'
+   ```
+
+   Treat the output as a **candidate list, not a verdict**: confirm against the PR's CLA-Assistant page before attributing the pending status to a person.
+
+   **Do not guess from the shape of the email.** One contributor here commits under two addresses that map to two different accounts, and it is the personal-looking one that is unsigned while the institutional one is signed — the opposite of the natural assumption. A suspect that also appears on a CLA-**green** PR is disproved, which is the cheap check to run before naming anyone.
+
+   **`author: null` does not mean the commit is yours.** It proves only that GitHub could not map that email to an account. Before recommending `git commit --amend --reset-author` — or running it — establish that the commit is the current contributor's own work: the author NAME, the branch it arrived on, and where there is any doubt, their confirmation. Rewriting the author of someone else's commit misattributes it, and where the unsigned identity is a third party the only correct remedy is that account signing.
+
    Note the corollary of the status being SHA-bound: **pushing to the branch after this drops the status again.** If you reopen to fix the CLA and then push a review fix, expect to be back where you started.
 
    **When to expect it.** `license/cla` is a *commit status*, so it binds to one SHA. **Every push gives the PR a new head SHA that carries no CLA status**, which is what [`.github/workflows/cla-recheck-on-push.yml`](.github/workflows/cla-recheck-on-push.yml) exists to repair — it comments the `@cla-assistant check` trigger on each `synchronize`. That repair is not reliable, so a PR you have pushed to can end up permanently short of a required check.
 
-   **The model the evidence supports: the status is SHA-bound, and its delivery can fail on `opened` just as it can on the `synchronize` repair.** A push guarantees you need a *fresh* delivery, so pushed PRs are over-represented among the missing — but a push is not required for the status to be absent, and **close+reopen is a retry of a flaky delivery, not a push-specific fix.**
+   **The model the evidence supports: the status is SHA-bound, and the write can fail *after* CLA-Assistant has received and acknowledged the event.** A push guarantees you need a *fresh* delivery, so pushed PRs are over-represented among the missing — but a push is not required for the status to be absent, and **close+reopen is a retry, not a push-specific fix.**
+
+   The webhook delivery log distinguishes "the event never arrived" from "it arrived and nothing was written", and it is the second one. Twelve `pull_request/synchronize` deliveries on 2026-08-11, each mapped to its PR through the delivery payload and cross-referenced against whether the head carries a status:
+
+   ```
+   all 12:  HTTP 200,  body 'OK - Will be working on it'
+     9 -> license/cla written        3 -> never written   (#2342, #2785, #2790)
+   ```
+
+   Identical request, identical acknowledgement, different outcome — so nothing observable on the GitHub side predicts it, which is why author email, committer identity, push recency and update-branch-button-vs-local all fail as explanations when tested against the full population. Read the log yourself with `gh api "repos/<owner>/<repo>/hooks/<id>/deliveries?per_page=60"`, then `.../deliveries/<delivery-id>` for the payload (`.number`, `.pull_request.head.sha`). Note `&page=N` is silently ignored there — the endpoint is cursor-paginated and returns an empty list, which reads exactly like an empty log.
 
    Three PRs on 2026-08-04 — `#2605`, `#2606`, `#2607` — were opened directly on their final head, had no push before the status went missing, and still had no `license/cla`. `#2607` is the sharpest case and is easy to measure wrong: it *was* pushed later, at `05:07`, but its close+reopen recovery happened at `04:50`, so the absence pre-dated any push. Comparing the head commit's date to the PR's creation date reports it as "pushed after open" and hides that entirely — read the issue **timeline** (`committed` / `closed` / `reopened` events in order), not the current head.
 
-   **Do not rely on the `@cla-assistant check` comment**, even though it is the documented recheck trigger. Of the 99 open non-draft PRs on 2026-08-04, **91 had the status and 8 did not**; all 8 had been pushed since opening, and they span eight days (2026-07-27 to 2026-08-04), so this is not a time window. Read that 8 as a *snapshot of what was still broken*, not as a population of causes: PRs recovered earlier the same day had already left the set, and those are exactly the ones that show `opened`-side failure.
+   **The `@cla-assistant check` comment cannot work on this repo — it is inert, not merely unreliable.** The CLA webhook subscribes to exactly two events, and `issue_comment` is not one of them, so a comment never reaches the service at all:
+
+   ```
+   $ gh api repos/<owner>/<repo>/hooks/<id> --jq '.config.url, (.events|join(", "))'
+   https://cla-assistant.io/github/webhook/sutando
+   merge_group, pull_request
+   ```
+
+   The distinction matters because "unreliable" invites a retry and "inert" ends it: no number of trigger comments, from a workflow or a human, can produce a status. Use a fresh head or close+reopen instead — `pull_request/reopened` acknowledges at 200, while `closed` returns 204 and is discarded, so the reopen is the half that does the work. (`.github/workflows/cla-recheck-on-push.yml` posts that comment on every `synchronize` and reports success every run; it is tracked separately as an open issue, since removing versus reworking it is a maintainer call.)
+
+   This section previously said only "do not rely on" the comment, which was right about the behaviour and silent about the cause. Of the 99 open non-draft PRs on 2026-08-04, **91 had the status and 8 did not**; all 8 had been pushed since opening, and they span eight days (2026-07-27 to 2026-08-04), so this is not a time window. Read that 8 as a *snapshot of what was still broken*, not as a population of causes: PRs recovered earlier the same day had already left the set, and those are exactly the ones that show `opened`-side failure.
 
    The practical consequence is the same either way: the trigger comment is neither sufficient nor necessary, and the check below is what tells you where you actually stand. A manual trigger comment on `#2605` did not restore it; close+reopen did, and its two approvals survived. Four PRs were recovered this way across two authors.
 3. Address every substantive review-thread comment before merge: fixed in a subsequent commit, replied with rationale for declining, or explicitly deferred to a follow-up issue.

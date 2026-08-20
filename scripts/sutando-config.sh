@@ -323,12 +323,43 @@ print(_host_label(), end='')
     # concluded "no usable python3" and left voice disabled while a valid managed
     # credential sat on disk (sonichi/sutando#2197 review, 2026-08-02).
     #
-    # Deliberately NOT fail-closed the way node-bin is: tier 3 may legitimately
-    # be the Xcode CLT stub, which is `-x` but does not run. Only EXECUTING an
-    # interpreter proves it works, and that probe belongs to the caller, which
-    # knows what it needs to import. This prints the interpreter to TRY FIRST;
-    # it does not promise the interpreter runs.
-    echo "$PY"
+    # FAIL-CLOSED with a SMOKE TEST (voice-reliability plan amendment T1): this
+    # prints an ABSOLUTE interpreter path only after executing it and importing
+    # `fcntl`, else exits non-zero with a fix. Callers building on the voice
+    # lock helper (scripts/voice-lock.py) must never receive an unverified
+    # interpreter — the previous contract ("prints the interpreter to TRY
+    # FIRST") pushed the execution probe to every caller, and the ones that
+    # skipped it shelled the Xcode-CLT stub. resolve_python() never returns
+    # the stub itself (it checks `xcode-select -p` before trusting the system
+    # location), so executing $PY here cannot raise the CLT install dialog.
+    if [ -z "$PY" ]; then
+      # Reuse require_python's actionable multi-line message, then fail.
+      require_python "$REPO_ROOT" "resolve python-bin" >/dev/null || exit 1
+      exit 1
+    fi
+    # Normalize to an absolute, physically-resolved path (the bundled tier is
+    # "<repo>/../runtime/python/bin/python3", which contains a `..`).
+    _pb="$PY"
+    case "$_pb" in
+      */*) : ;;
+      *) _pb="$(command -v "$_pb" 2>/dev/null || true)" ;;
+    esac
+    _pb_dir="$(cd "$(dirname "$_pb")" 2>/dev/null && pwd -P || true)"
+    if [ -z "$_pb_dir" ]; then
+      echo "sutando: python-bin: resolved interpreter '$PY' has no resolvable directory" >&2
+      exit 1
+    fi
+    _pb="$_pb_dir/$(basename "$_pb")"
+    if ! "$_pb" -c 'import fcntl' >/dev/null 2>&1; then
+      {
+        echo "sutando: python-bin: '$_pb' failed the smoke test (execute + import fcntl)."
+        echo "  The interpreter exists but does not run or lacks the stdlib."
+        echo "  Fix: install python3 (brew install python), set SUTANDO_PY to a"
+        echo "  working interpreter, or run xcode-select --install."
+      } >&2
+      exit 1
+    fi
+    printf '%s' "$_pb"
     ;;
   node-bin)
     # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
