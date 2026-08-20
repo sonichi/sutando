@@ -15,7 +15,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, SKIP_MARKER_RE, type TaskOrigin } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
 	emitTaskProcessed,
@@ -767,8 +767,11 @@ function startRelayResultWatcher(onResult: (result: string) => void): void {
 				if (!result) continue;
 				_deliveredResults.add(file);
 				_pendingTasks.delete(taskId);
-				const skip = /^\s*\[(deduped:[^\]]*|no-send|REPLIED)\]/.exec(result);
-				if (!skip) {
+				// Same grammar as the local watcher and as parse_markers(): this used
+				// to be a third private copy, and it drifted two ways — no /i flag, so
+				// `[DEDUPED: x]` fell through and got NARRATED; and `[^\]]*` accepted an
+				// empty `[deduped:]` that Python rejects.
+				if (!SKIP_MARKER_RE.test(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
 				}
@@ -926,31 +929,11 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
 					continue;
 				}
-				// Deduped-marker result: agent consolidated this task's reply
-				// into another task's result file. Mark this task done silently
-				// and archive — no Discord post, no voice narration, no timeout.
-				// Format: first line is "[deduped: <other-task-id>]" (rest of
-				// file optional, displayed as the result body in the UI).
-				if (file.startsWith('task-') && /^\s*\[deduped:\s*task-/i.test(result)) {
-					console.log(`${ts()} [TaskBridge] ${taskId} is deduped marker; archiving silently`);
-					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
-					_deliveredResults.add(file);
-					_pendingTasks.delete(taskId);
-					try {
-						fetch('http://localhost:7843/task-done', {
-							method: 'POST',
-							headers: _apiHeaders(),
-							body: JSON.stringify({ taskId, result }),
-						}).catch(() => {});
-					} catch {}
-					setTimeout(() => {
-						archiveFile(path, 'results', taskId);
-						const taskFile = join(TASK_DIR, `${taskId}.txt`);
-						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
-					}, 5_000);
-					continue;
-				}
-				// Skip markers: [no-send] / [REPLIED] — archive silently with no voice narration.
+				// Skip markers: [no-send] / [REPLIED] / [deduped: <id>] — archive silently,
+				// no voice narration. `deduped` used to be handled in its own branch ABOVE
+				// this one, which returned before reaching mayRetireSkipMarked — so the one
+				// marker whose whole purpose is 'another result carries the reply' was the
+				// one that could retire a result this bridge never dispatched.
 				// These are set by the core agent when delivery already happened via another path
 				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
 				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor

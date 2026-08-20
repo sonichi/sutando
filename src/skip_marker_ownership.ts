@@ -1,7 +1,12 @@
 // Suppression is universal; retirement authority is scoped to the consumer
 // that dispatched the task. One predicate for both narrowed both.
 
-export const SKIP_MARKER_RE = /^\s*\[(?:no-send|REPLIED)\]/i;
+// `deduped` belongs here for the same reason the other two do: Python's
+// parse_markers() classifies all three as ONE `skip` kind, so a consumer that
+// routes only two of them through the retirement guard is not at parity. The
+// target is matched as `[^\]]+` — any non-bracket run, closing bracket
+// REQUIRED — mirroring result_markers.py rather than re-deriving a grammar.
+export const SKIP_MARKER_RE = /^\s*(?:\[(?:no-send|REPLIED)\]|\[deduped:\s*[^\]]+\])/i;
 
 export function isSkipMarked(file: string, result: string): boolean {
 	return file.startsWith('task-') && SKIP_MARKER_RE.test(result);

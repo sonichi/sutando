@@ -185,3 +185,42 @@ describe('a durable claim outranks the source label', () => {
 			false, 'a claimed result with no source line was retired');
 	});
 });
+
+// `[deduped: <id>]` is the third skip marker. Python's parse_markers() has always
+// classified all three as ONE `skip` kind; task-bridge.ts handled this one in a
+// separate branch that returned BEFORE mayRetireSkipMarked, so the marker whose
+// entire meaning is "another result carries the reply" was the only one that
+// could retire a result this bridge never dispatched. Expectations below were
+// MEASURED against src/result_markers.py, not authored by hand.
+describe('task-bridge — [deduped:] is a skip marker under the same ownership rule', () => {
+	it('recognises a well-formed deduped marker', () => {
+		assert.equal(isSkipMarked(`${OWN}.txt`, '[deduped: task-123]'), true);
+	});
+
+	it('will NOT retire a foreign bridge\'s deduped result', () => {
+		// The case that motivated this: previously archived unconditionally.
+		assert.equal(
+			mayRetireSkipMarked(`${FOREIGN}.txt`, '[deduped: task-123]', noneOwned, origin), false,
+			'a deduped result this bridge never dispatched was retired, stranding its reply');
+	});
+
+	it('still retires its own deduped result', () => {
+		assert.equal(mayRetireSkipMarked(`${OWN}.txt`, '[deduped: task-123]', owns, origin), true);
+	});
+
+	it('matches result_markers.py exactly on the grammar edges', () => {
+		const py: [string, boolean][] = [
+			['[deduped: task-123]',         true ],
+			['[deduped: task-123',          false],  // closing bracket REQUIRED
+			['[deduped: phone-abc.task-9]', true ],  // any target, not just task-*
+			['[DEDUPED: task-123]',         true ],  // case-insensitive
+			['  [deduped:task-123]',        true ],
+			['[deduped: ]',                 true ],  // whitespace target: Python accepts
+			['[deduped:]',                  false],  // empty: Python rejects
+		];
+		for (const [body, want] of py) {
+			assert.equal(isSkipMarked(`${OWN}.txt`, body), want,
+				`grammar disagrees with parse_markers() on ${JSON.stringify(body)}`);
+		}
+	});
+});
