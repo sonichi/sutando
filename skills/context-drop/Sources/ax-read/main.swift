@@ -180,6 +180,27 @@ if focusedErr == .success, let element = focused {
 //
 // AX-on-Electron (Chrome, VS Code, Cursor, Slack, Discord) doesn't expose
 // AXSelectedText reliably — Monaco/CodeMirror/web text-fields render outside
+/// Modifiers that corrupt a synthetic Cmd+C if still held. Command is absent on
+/// purpose — the event sets it itself, so holding it changes nothing.
+let INTERFERING_MODIFIERS: CGEventFlags = [.maskControl, .maskShift, .maskAlternate]
+/// Bounded so a stuck modifier degrades to the old behaviour instead of hanging.
+let MODIFIER_WAIT_MAX: TimeInterval = 0.6
+let MODIFIER_POLL: TimeInterval = 0.01
+
+/// True when `flags` carries a modifier that would turn Cmd+C into something else.
+func hasInterferingModifiers(_ flags: CGEventFlags) -> Bool {
+    !flags.intersection(INTERFERING_MODIFIERS).isEmpty
+}
+
+/// Spin until the user lets go of the hotkey, or the bound elapses.
+func waitForModifierRelease() {
+    let start = Date()
+    while Date().timeIntervalSince(start) < MODIFIER_WAIT_MAX,
+          hasInterferingModifiers(CGEventSource.flagsState(.combinedSessionState)) {
+        Thread.sleep(forTimeInterval: MODIFIER_POLL)
+    }
+}
+
 // the native AXTextArea hierarchy. Fallback: snapshot pasteboard, send Cmd+C
 // to copy the visible selection, read, restore. The changeCount check
 // distinguishes "Cmd+C wrote something" from "clipboard was already
@@ -206,6 +227,10 @@ if selected.isEmpty {
         }
         return dict
     }
+
+    // The hotkey that triggered this run is still physically down when we get
+    // here, and its modifiers merge with the synthetic Cmd+C into e.g. Ctrl+Shift+Cmd+C.
+    waitForModifierRelease()
 
     let src = CGEventSource(stateID: .hidSystemState)
     let cDown = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true)

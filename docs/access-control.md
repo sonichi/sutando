@@ -60,12 +60,29 @@ downgrades retain the restricted path. A Discord channel's `collaborators` list 
 
 Opted-in AG2 Space Team can use the normal configured workspace, tools,
 integrations, environment, and network. It is an owner-capability trust boundary
-with a cautious prompt and final-response secret/delivery-marker scan, not hard
-isolation. Team can read owner-accessible credentials, mutate the host, and cause
+with a cautious prompt and final-response delivery-marker guard, not hard
+isolation. The owner can disable only the secret-detection half per room and agent;
+the gateway honors that setting only for an exact Team + Collaborator attestation,
+while missing, malformed, duplicated, or body-authored controls keep scanning on.
+Redirect, attachment, and suppression markers remain guarded in either setting.
+Team can read owner-accessible credentials, mutate the host, and cause
 external side effects before the output scan. Grant it only to rooms whose Team
 members are trusted with that environment. Future AG2 Space monitoring can add
 telemetry, injection/anomaly detection, alerts, and revocation as defense in
 depth; those are not current guarantees.
+
+When that final scan withholds a result, the gateway saves a mode-0600 review
+record under `state/withheld-team-results/` and sends the candidate body to the
+agent's registered owner in a Matrix direct room. Nothing is posted to the
+originating shared room. The private message is bound to a stable review id and
+offers two decisions: **Yes** confirms that the result is sensitive and keeps it
+private; **No** records a false positive and republishes the exact result to the
+originating room. A bare Yes/No is accepted only as a reply to that review
+message; the explicit `Yes wr_…` / `No wr_…` form is also accepted in the same
+owner DM. Sender tier, owner MXID, DM room, and review id/reply event must all
+match. Review DMs, publication retries, and decision-result acknowledgements
+are durable and idempotent, so a retry neither spams the owner nor publishes the
+result twice.
 
 ## Ambient (events-promotion) access control
 
@@ -92,4 +109,3 @@ promotion_reason + cursor range).
   — or tasks without an access_tier field — get full processing") already
   fails it closed; this section makes the mapping explicit rather than
   implicit (sonichi#2292 P1-1 follow-through).
-

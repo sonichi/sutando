@@ -76,6 +76,8 @@ def _run_one_drain(mod, results: Path, send_result: dict):
     # live in sys.modules; rebinding it on `mod` would never be consulted.
     routing = types.ModuleType("proactive_routing")
     routing.should_claim_proactive = lambda *_a, **_k: True
+    routing.should_claim_proactive_file = lambda *_a, **_k: True
+    routing.proactive_destination = lambda *_a, **_k: None
     sys.modules["proactive_routing"] = routing
     mod.presenter_mode_active = lambda *_a, **_k: False
     t = threading.Thread(target=lambda: _swallow(mod.main), daemon=True)

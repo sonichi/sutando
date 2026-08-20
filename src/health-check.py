@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shlex
+import statistics
 import shutil
 import tempfile
 import socket
@@ -53,7 +54,8 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
@@ -1226,11 +1228,15 @@ def check_file(path: Path, name: str) -> dict:
 
 
 def check_directory(path: Path, name: str) -> dict:
-    """Check if a directory exists and has files."""
+    """Check if a directory exists and has files.
+
+    The count names its directory: both callers (memory-dir, notes-dir) sit on
+    paths with a live twin, so a bare count reads as a claim about the wrong one.
+    """
     if not path.exists():
         return {"name": name, "status": "missing", "detail": str(path)}
     count = len(list(path.glob("*.md")))
-    return {"name": name, "status": "ok", "detail": f"{count} .md files"}
+    return {"name": name, "status": "ok", "detail": f"{count} .md files in {path}"}
 
 
 def check_memory_dir_override() -> "dict | None":
@@ -1327,7 +1333,9 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: documented family, exactly as `_STATUS_FILES` does. @qingyun-wu and
 #: @john-the-dev caught it before merge — a permanent WARN on every upgraded
 #: install would have trained operators to ignore the detector.
-WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
+#: `.legacy-notice-printed` is a LITERAL because this family has no shared name
+#: shape: written once, read AT the root by init.sh, never unlinked, no destination.
+WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 
 #: `personal_path()` resolves these at the workspace root and never under `state/`,
 #: so the probe's "state belongs under state/" remedy would break the reader.
@@ -1393,7 +1401,8 @@ def check_workspace_root_tidy() -> "dict | None":
             if p.is_file()
             and p.name not in WORKSPACE_ROOT_ALLOWED
             and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
-            and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
+            and not any(fnmatch.fnmatch(p.name, g)
+                        for g in WORKSPACE_ROOT_SENTINEL_GLOBS)
         )
     except OSError:
         return None                      # unreadable workspace is another probe's job
@@ -2136,6 +2145,17 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             note += (f"; +{grew:,} B over the last {hours:.1f}h"
                      + (f", which is ~{left / rate:.1f}h of remaining headroom at that rate"
                         if rate > 0 and left > 0 else ""))
+            # The max window is the worst case, so `gain <= 0` skips every flat one
+            # and a quoted deadline outlives its regime. Report the recent window too.
+            recent = next(((at, sz) for at, sz in reversed(points)
+                           if (newest_at - at) / 3600.0 >= 0.5), None)
+            if recent is not None:
+                r_span = (newest_at - recent[0]) / 3600.0
+                r_gain = effective_bytes - recent[1]
+                if r_gain <= 0:
+                    note += (f"; but the last {r_span:.1f}h show {r_gain:+,} B — flat or "
+                             f"shrinking, so the figure above spans a change in write rate "
+                             f"and its deadline is stale; re-measure before acting on it")
         return note
     except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
         return _TREND_UNAVAILABLE
@@ -2178,8 +2198,24 @@ def check_memory_index_integrity() -> "dict | None":
     loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
     truncated = len(loaded_text) < len(effective_text)
 
+    # An index that outgrows the load budget compacts its entries to prefix
+    # abbreviations (`f:` for feedback_, `r:` for reference_, `p:` for project_).
+    _INDEX_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
+
     def _referenced_in(hay: str, name: str) -> bool:
-        return name in hay or name[:-3] in hay
+        stem = name[:-3] if name.endswith(".md") else name
+        if name in hay or stem in hay:
+            return True
+        # Without this the probe calls an indexed file unindexed, and the
+        # "fix" it invites — expanding the index — is what blows the read limit.
+        for full, short in _INDEX_ABBREV.items():
+            if not stem.startswith(full):
+                continue
+            token = short + stem[len(full):]
+            # Trailing boundary so `f:foo` is not satisfied by `f:foobar`.
+            if re.search(re.escape(token) + r"(?![\w-])", hay):
+                return True
+        return False
 
     # MEMORY.md is not the only index. Once a corpus outgrows the load budget the
     # overflow moves to sibling HUB indexes (MEMORY-reference.md, MEMORY-wire.md,
@@ -2346,8 +2382,10 @@ def check_memory_sync() -> dict:
         if ws_git_fetch.exists():
             age_h = (time.time() - ws_git_fetch.stat().st_mtime) / 3600
             if age_h > 48:
-                return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
-            return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
+                return {"name": name, "status": "warn",
+                        "detail": f"workspace vault last fetched {age_h:.0f}h ago (stale)"}
+            return {"name": name, "status": "ok",
+                    "detail": f"workspace vault last fetched {age_h:.1f}h ago"}
         return {"name": name, "status": "ok", "detail": "workspace git repo, never fetched"}
     # Legacy memory-sync clone dir: PR #764 renamed legacy ~/.sutando-memory-sync/
     # → ~/.sutando/memory-sync/. Check new path first; fall back to legacy
@@ -2365,9 +2403,12 @@ def check_memory_sync() -> dict:
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
         if age_h > 48:
-            return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
-        return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
-    return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
+            return {"name": name, "status": "warn",
+                    "detail": f"legacy memory-sync clone last fetched {age_h:.0f}h ago (stale)"}
+        return {"name": name, "status": "ok",
+                "detail": f"legacy memory-sync clone last fetched {age_h:.1f}h ago"}
+    return {"name": name, "status": "ok",
+            "detail": "legacy memory-sync clone initialized, never fetched"}
 
 
 def _age_phrase(age_s) -> str:
@@ -4172,8 +4213,8 @@ def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
             continue                      # another machine's heartbeat
         try:
             mtime = alive_file.stat().st_mtime
-            if now - mtime >= 90.0:
-                continue                  # stale — not a live core
+            if not heartbeat_is_fresh(mtime, now):
+                continue                  # stale or future-dated — not a live core
             payload = json.loads(alive_file.read_text())
             if not isinstance(payload, dict):
                 continue
@@ -5436,6 +5477,136 @@ DISK_WARN_GIB = 10.0
 DISK_FAIL_GIB = 2.0
 
 
+DAILY_LATE_TOLERANCE_MIN = 15
+DAILY_MISS_GRACE_MIN = 60
+
+
+def _interpret_daily_punctuality(jobs: list) -> dict:
+    """Score LATENESS, not presence: a file produced daily by another path looks
+    identical to one produced by a working schedule."""
+    name = "daily-cron-punctuality"
+    late, missed, unknown = [], [], []
+    for j in jobs:
+        due = j["hour"] * 60 + j["minute"]
+        if not j["artifacts"]:
+            unknown.append(j["name"])
+            continue
+        # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
+        # -1417 early. The filename date is logical, often a day off the mtime.
+        deltas = sorted(((w - due + 720) % 1440) - 720 for _, w in j["artifacts"])
+        median = statistics.median(deltas)
+        if median > DAILY_LATE_TOLERANCE_MIN:
+            late.append((j["name"], median, len(deltas)))
+        if (not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN
+                and not j.get("conditional")
+                and (j.get("stem_declared") or j["artifacts"])):
+            missed.append((j["name"], j["minutes_since_due"]))
+    if not late and not missed:
+        seen = len(jobs) - len(unknown)
+        detail = f"{seen} of {len(jobs)} daily job(s) observable"
+        detail += ", all on schedule" if seen else ""
+        if unknown:
+            detail += (f"; UNCHECKED (no dated artifact, cannot tell whether it ran): "
+                       f"{', '.join(sorted(unknown))}")
+        if unknown:
+            # `ok` would certify jobs nobody measured: on a 1-of-5 host the four
+            # UNCHECKED ones miss forever behind green. Coverage gates the verdict.
+            scope = "no coverage on this host" if not seen else \
+                    f"{len(unknown)} of {len(jobs)} unverifiable — status cannot be ok"
+            return {"name": name, "status": "warn", "detail": f"{detail} — {scope}"}
+        return {"name": name, "status": "ok", "detail": detail}
+    bits = []
+    for n, m, c in late:
+        bits.append(f"{n}: {c} run(s), median +{m} min late — the schedule is not what "
+                    f"produced these; something else is covering for it")
+    for n, m in missed:
+        bits.append(f"{n}: no output today, {m} min past due")
+    if unknown:
+        bits.append(f"unverifiable (no dated artifact): {', '.join(sorted(unknown))}")
+    return {"name": name, "status": "warn", "detail": "; ".join(bits)}
+
+
+def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
+    """(date, minute-of-day-written) for the newest `<stem>-YYYY-MM-DD.*` files."""
+    from datetime import datetime
+    out = []
+    if not results.is_dir():
+        return out
+    # rglob, not glob: delivered results are archived into MONTH buckets
+    # (results/archive/YYYY-MM/), so the durable copies sit two levels down.
+    for f in results.rglob(f"{stem}-20*"):
+        m = re.match(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})", f.name)
+        if not m:
+            continue
+        lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((m.group(1), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def check_daily_cron_punctuality() -> dict:
+    """Report a daily job whose output never arrives at its scheduled time."""
+    from datetime import datetime, time as dtime
+    name = "daily-cron-punctuality"
+    ws = WORKSPACE_DIR
+    cfg = ws / "hosts" / _host_label() / "crons.json"
+    if not cfg.is_file():
+        return {"name": name, "status": "ok", "detail": "no per-host crons.json — skipped"}
+    try:
+        raw = json.loads(cfg.read_text())
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "ok", "detail": f"crons.json unreadable ({e}) — skipped"}
+    if isinstance(raw, list):
+        entries = raw
+    elif isinstance(raw, dict):
+        entries = raw.get("crons") or raw.get("jobs") or []
+    else:
+        # `1` is valid JSON: .get() on it aborted the whole always-on health run.
+        return {"name": name, "status": "ok",
+                "detail": f"crons.json root is {type(raw).__name__}, not a list or "
+                          f"object — skipped"}
+    now = datetime.now()
+    jobs, malformed = [], []
+    for e in entries:
+        if not isinstance(e, dict) or e.get("launchd") or e.get("execution") == "codex-task":
+            continue
+        f = str(e.get("cron") or "").split()
+        if len(f) != 5 or not f[0].isdigit() or not f[1].isdigit():
+            continue
+        if f[2] != "*" or f[3] != "*" or f[4] != "*":
+            continue                       # not a plain every-day schedule
+        jname = str(e.get("name") or "?")
+        try:
+            # "61 24 * * *" is all digits and still invalid; dtime() would raise
+            # ValueError out of the always-on run_all_checks() path.
+            due = datetime.combine(now.date(), dtime(int(f[1]), int(f[0])))
+        except ValueError:
+            malformed.append(f"{jname} ({' '.join(f[:2])})")
+            continue
+        # A NAME is not an artifact: "talk-events-nightly" infers stem "nightly"
+        # and never sees its real fleet-growth-<date>.mp4 output.
+        declared = str(e.get("artifact") or "").strip()
+        stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
+        arts = _daily_artifact_minutes(ws / "results", stem)
+        jobs.append({
+            "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
+            "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
+            "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
+            "stem": stem, "stem_declared": bool(declared),
+            # Renders only when new input exists, so a quiet day produces nothing
+            # and absence is evidence of nothing rather than of a miss.
+            "conditional": bool(e.get("conditional")),
+        })
+    if malformed:
+        return {"name": name, "status": "warn",
+                "detail": f"unparseable daily cron time(s): {', '.join(malformed)} — "
+                          f"fix the crons.json entry; punctuality unchecked for "
+                          f"{len(malformed)} job(s)"}
+    if not jobs:
+        return {"name": name, "status": "ok", "detail": "no session-owned daily jobs — skipped"}
+    return _interpret_daily_punctuality(jobs)
+
+
 def check_disk_space() -> dict:
     """Free space on the volume(s) the core actually writes to.
 
@@ -5766,6 +5937,100 @@ def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | 
         return True
 
 
+def _parse_etime(raw: str) -> "float | None":
+    """ps ELAPSED -> seconds. `MM:SS`, `HH:MM:SS`, `D-HH:MM:SS`; None if unparseable."""
+    raw = (raw or "").strip()
+    days = 0
+    if "-" in raw:
+        head, _, raw = raw.partition("-")
+        if not head.isdigit():
+            return None
+        days = int(head)
+    parts = raw.split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    nums = [int(p) for p in parts]
+    hours, minutes, seconds = ([0] + nums) if len(nums) == 2 else nums
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _worker_holdings(ps_output: "str | None" = None) -> dict:
+    """{task filename: worker RUNTIME in seconds, or None if unreadable}.
+
+    A team task stays in tasks/ for the whole run — the worker removes it only
+    when it publishes a result — so an in-flight task and an abandoned one are
+    byte-identical on disk. Only the worker's argv separates them.
+
+    The runtime comes from the worker PROCESS, not the task file: a task can sit
+    queued for hours before a worker claims it, and claiming does not touch the
+    file, so file age answers a different question than "has this worker
+    outlived its deadline".
+    """
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(["ps", "-Ao", "pid=,etime=,args="], capture_output=True,
+                                       text=True, timeout=5).stdout
+        except Exception:  # noqa: BLE001 — a probe failure must not fail the check
+            return {}
+    held: dict = {}
+    for line in (ps_output or "").splitlines():
+        if "session-worker.py" not in line:
+            continue
+        fields = line.split()
+        # Callers may pass argv-only output; then the leading fields are argv.
+        pid = int(fields[0]) if fields and fields[0].isdigit() else None
+        proc_age = _parse_etime(fields[1]) if len(fields) > 1 else None
+        if pid is None:
+            proc_age = _parse_etime(fields[0]) if fields else None
+        for tok in fields:
+            if tok.endswith(".txt") and "/tasks/" in tok:
+                name = Path(tok).name
+                held[name] = _provider_runtime(name, proc_age, pid)
+    return held
+
+
+#: The worker stamps this after acquiring its workstream lock; see
+#: session-worker.py::_run_mark. Absent + alive = still waiting for the lock.
+WORKER_RUN_MARK_DIR = Path("state") / "task-workstream-runs"
+WAITING_FOR_LOCK = "waiting"
+
+
+def _provider_runtime(task_name: str, proc_age: "float | None",
+                      pid: "int | None" = None):
+    """Seconds the PROVIDER has run, `WAITING_FOR_LOCK`, or None if unreadable.
+
+    Process age is the wrong quantity — same-workstream tasks serialize on a lock
+    taken AFTER the process starts — but it still BOUNDS how long an absent mark
+    can innocently mean "waiting".
+    """
+    mark = WORKSPACE_DIR / WORKER_RUN_MARK_DIR / f"{task_name}.started"
+    try:
+        rec = json.loads(mark.read_text())
+        started = float(rec["started"])
+        owner = int(rec["pid"])
+    except FileNotFoundError:
+        rec = None
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    else:
+        # Only a POSITIVELY matched owner may hand over its clock. A foreign pid
+        # is a SIGKILLed worker's corpse; an unknown one cannot rule that out.
+        if pid is not None and owner == pid:
+            age = time.time() - started
+            return age if age >= 0 else 0.0
+        rec = None
+    if proc_age is None:
+        return None
+    # No usable mark is innocent only while the process is younger than the
+    # deadline; past that, a failed write and a wedged provider look identical.
+    return WAITING_FOR_LOCK if proc_age <= _worker_hard_timeout_s() else None
+
+
+def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
+    """Filenames only — the set form, for callers that do not need the runtime."""
+    return set(_worker_holdings(ps_output))
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -5780,23 +6045,53 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
     now = time.time()
+    # An in-flight task looks exactly like a stalled one on disk; the worker's
+    # argv is the only thing that tells them apart.
+    holdings = _worker_holdings()
+    inflight = sum(1 for f in files if f.name in holdings)
+    held_note = f", {inflight} in flight with a worker" if inflight else ""
     oldest = min(files, key=lambda p: p.stat().st_mtime)
     oldest_age = int(now - oldest.stat().st_mtime)
+    # Deadline vs the WORKER's runtime, never the file's age: a task can queue
+    # for hours before a worker claims it, and claiming does not touch the file.
+    all_held = inflight == len(files)
+    held_deadline = int(_worker_hard_timeout_s())
+    ages = [holdings.get(f.name) for f in files if f.name in holdings]
+    # A holder still waiting for its workstream lock has not started running, so
+    # it can never be past its own deadline — that wait is progress, not a stall.
+    running = [a for a in ages if isinstance(a, (int, float))]
+    unreadable = any(a is None for a in ages)
+    worker_age = None if (unreadable or not ages) else (int(max(running)) if running else 0)
+    held_is_progress = all_held and worker_age is not None and worker_age <= held_deadline
+    wedged_note = (f" — still held by a live worker running {worker_age}s, past its own "
+                   f"{held_deadline}s hard deadline, so the WORKER is wedged, not the watcher"
+                   if worker_age is not None else
+                   " — held by a live worker whose runtime could not be read, so progress "
+                   "cannot be established")
+    held_verdict = (" — all held by a live worker, not stalled" if held_is_progress
+                    else wedged_note if all_held else None)
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
-            "status": "warn",
-            "detail": f"{len(files)} tasks queued, oldest {oldest_age}s — watcher or core may be stuck",
+            # ok, not warn: every `warn` is alertable (emit_task_for_failures /
+            # notify_for_failures), so rewording alone still fires the false alert.
+            "status": "ok" if held_is_progress else "warn",
+            "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
+                       + (held_verdict or " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
     # message could sit indefinitely while this probe printed its age under "ok".
-    if oldest_age > stuck_age_sec:
+    # A worker configured SHORTER than stuck_age_sec is already overdue here, so
+    # the age test alone would let it fall through to "ok" and hide it.
+    if oldest_age > stuck_age_sec or (all_held and not held_is_progress):
         return {
             "name": name,
-            "status": "warn",
-            "detail": f"{len(files)} task(s) queued, oldest {oldest_age}s — undrained past {stuck_age_sec}s",
+            "status": "ok" if held_is_progress else "warn",
+            "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
+                       + (held_verdict or f" — undrained past {stuck_age_sec}s")),
         }
-    return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(files)} task(s){held_note}, oldest {oldest_age}s"}
 
 
 def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
@@ -5910,6 +6205,77 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         "detail": (f"{len(orphans)} result(s) with no consumer coming — never delivered; "
                    f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
     }
+
+
+def check_stranded_destined_proactive() -> dict:
+    """A destined proactive file no bridge will claim, named while it can still act.
+
+    The destination grammar (proactive_routing) has a two-tier rule: a known
+    `.to-<channel>` tag is claimed only by that bridge; an unrecognized tag is
+    claimed by NO bridge — deliberate (a file aimed at a channel this install
+    lacks must never fall into another bridge's race), but without a reader
+    the strand is silent, and unlike the pre-fix activity strand it cannot
+    self-heal: the tag never becomes recognized. Same principle as
+    check_proactive_quarantine — preservation without a reader reaches no one
+    — in the directory that probe deliberately does not scan.
+
+    Ages past _STRAND_MIN_AGE_S only: a destined file's target bridge may
+    legitimately be seconds from its next poll.
+    """
+    name = "stranded-destined-proactive"
+    results = WORKSPACE_DIR / "results"
+    if not results.is_dir():
+        return {"name": name, "status": "ok", "detail": "no results/ directory"}
+    try:
+        sys.path.insert(0, str(REPO_DIR / "src"))
+        from presenter_mode import presenter_mode_active
+        from proactive_routing import PROACTIVE_DESTINATIONS, proactive_destination
+    except ImportError as e:
+        return {"name": name, "status": "warn",
+                "detail": f"could not load proactive_routing: {e}"}
+    # Presenter mode intentionally holds ALL proactive deliveries — an aged
+    # destined file is the bridge waiting for the talk to end, not a strand.
+    if presenter_mode_active(WORKSPACE_DIR):
+        return {"name": name, "status": "ok",
+                "detail": "presenter mode active — deliveries intentionally held"}
+    now = time.time()
+    stranded: list[tuple[str, str, int]] = []
+    for path in results.glob("proactive-*.txt"):
+        dest = proactive_destination(path.name)
+        if dest is None:
+            continue  # undestined: activity routing owns it, self-heals
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age < _STRAND_MIN_AGE_S:
+            continue
+        kind = ("unrecognized destination" if dest not in PROACTIVE_DESTINATIONS
+                else f"destination '{dest}' bridge not claiming")
+        stranded.append((path.name, kind, int(age)))
+    if not stranded:
+        return {"name": name, "status": "ok",
+                "detail": "no aged destined proactive files awaiting a claim"}
+    # Unrecognized tags outrank age in the headline: that class never
+    # self-heals, so it must be the one a human sees first.
+    stranded.sort(key=lambda item: (not item[1].startswith("unrecognized"), -item[2]))
+    fname, kind, age = stranded[0]
+    unrec = sum(1 for item in stranded if item[1].startswith("unrecognized"))
+    mix = (f"{unrec} with an unrecognized tag, "
+           f"{len(stranded) - unrec} with an unclaimed known destination — "
+           if 0 < unrec < len(stranded) else "")
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(stranded)} destined proactive file(s) older than "
+                   f"{_STRAND_MIN_AGE_S // 60}m that no bridge has claimed — "
+                   f"{mix}worst {fname} ({kind}, {age // 3600}h{age % 3600 // 60}m); "
+                   f"an unrecognized .to-<tag> never self-heals: fix the tag or "
+                   f"start the named bridge"),
+    }
+
+
+_STRAND_MIN_AGE_S = 1800
 
 
 def check_proactive_quarantine() -> dict:
@@ -6209,11 +6575,8 @@ def check_task_watcher() -> dict:
     argv = _proc_argv(pid)
     if not argv:
         if roots:
-            # The sentinel tracks only the MOST RECENT start (the script writes
-            # $$ at startup), so a dead sentinel does NOT mean nothing is
-            # draining tasks/ — an older watcher can still be running. Saying
-            # "not running" here would be false, and restarting on that basis is
-            # what produces the duplicates in the first place.
+            # The sentinel tracks only the MOST RECENT start, so a dead one does
+            # NOT mean nothing drains tasks/ — restarting here makes duplicates.
             return {"name": name, "status": "warn",
                     "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
                               f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
@@ -6241,16 +6604,24 @@ _TASK_CLAIM_WARN_MULTIPLE = 2
 _TASK_CLAIM_DOWN_MULTIPLE = 8
 
 
-def _task_claim_thresholds() -> tuple[float, float]:
-    """(warn, down) seconds from the handler's configured hard timeout, falling back to
-    its default on anything unparseable so a threshold never pages a permitted run."""
+def _worker_hard_timeout_s() -> float:
+    """session-worker.py's own per-run deadline (`SUTANDO_TIER_HARD_TIMEOUT`).
+
+    Non-positive or unparseable makes the worker refuse to start
+    (session-worker.py:249-252), so the default is the only value a RUNNING
+    worker can hold — falling back to it never pages a permitted run.
+    """
     raw = os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "")
     try:
         hard = float(raw)
     except (TypeError, ValueError):
-        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
-    if hard <= 0:
-        hard = _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+        return _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+    return hard if hard > 0 else _TASK_CLAIM_HARD_TIMEOUT_DEFAULT_S
+
+
+def _task_claim_thresholds() -> tuple[float, float]:
+    """(warn, down) seconds from the handler's configured hard timeout."""
+    hard = _worker_hard_timeout_s()
     return hard * _TASK_CLAIM_WARN_MULTIPLE, hard * _TASK_CLAIM_DOWN_MULTIPLE
 
 
@@ -6444,9 +6815,11 @@ def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
                           f"claim AGE is unavailable for {age_unknown} of them (no "
                           "trusted observation store), so stale cannot be told from "
                           "fresh for those"}
+    # Reaching here with a bounded claim means it is inside its handler bound, so
+    # it is running; counting only in_flight renders working claims as "0 running".
     return {"name": name, "status": "ok",
-            "detail": f"{held} held claim(s), {in_flight} still queued or running; "
-                      "none leaked and none past its own execution contract"}
+            "detail": f"{held} held claim(s), {in_flight + len(bounded)} still queued "
+                      "or running; none leaked and none past its own execution contract"}
 
 
 def fix_task_watcher_sentinel(check: dict) -> str:
@@ -6528,7 +6901,7 @@ def _fresh_local_core_record(
         workspace = WORKSPACE_DIR
     alive_file = workspace / "state" / "cores" / f"{_host_label()}.alive"
     try:
-        if time.time() - alive_file.stat().st_mtime >= max_age_s:
+        if not heartbeat_is_fresh(alive_file.stat().st_mtime, time.time(), max_age_s):
             return None
         record = json.loads(alive_file.read_text())
     except (OSError, ValueError):
@@ -7120,7 +7493,9 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
 
 
 def bridge_log_content_status(name: str, status: str, tail: list[str],
-                              detail: str = "") -> Optional[tuple[str, str]]:
+                              detail: str = "",
+                              slack_state: "str | None" = None,
+                              log_path: Optional[Path] = None) -> Optional[tuple[str, str]]:
     """Check a bridge's recent log lines for known failure-mode signatures.
 
     Returns an (status, detail) override, or None if nothing to override.
@@ -7160,7 +7535,50 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
         if warn_idxs:
             events_after = any("Wrote task-" in ln for ln in tail[warn_idxs[-1] + 1:])
             if not events_after:
-                return "warn", "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+                # Event Subscriptions alone is the whole fix ONLY when an owner
+                # is already enrolled; in TOFU state the code gate also blocks.
+                if slack_state is None:
+                    try:
+                        slack_state = slack_access.access_state(
+                            channel_access_path("slack"))
+                    except Exception:  # noqa: BLE001 — a probe must not fail the check
+                        slack_state = slack_access.UNKNOWN
+                if slack_state == slack_access.ENROLLED:
+                    return "warn", ("connected but events not arriving — enable Event "
+                                    "Subscriptions at api.slack.com/apps")
+                if slack_state == slack_access.UNKNOWN:
+                    # A resolver we could not run leaves us knowing nothing, so it
+                    # keeps the quieter enrolled remedy; a malformed record does not.
+                    try:
+                        bad_record = channel_access_path("slack")
+                    except Exception:  # noqa: BLE001 — a probe must not fail the check
+                        bad_record = None
+                    if bad_record is not None:
+                        return "warn", ("connected but events not arriving, and access.json "
+                                        "is unreadable or malformed, so no user can be "
+                                        "authorized and TOFU stays closed — Event "
+                                        "Subscriptions alone leaves Slack silent: inspect "
+                                        f"or repair {shlex.quote(str(bad_record))} "
+                                        "(allowFrom must be a list of user-id strings), "
+                                        "then enable Event Subscriptions at "
+                                        "api.slack.com/apps")
+                    return "warn", ("connected but events not arriving — enable Event "
+                                    "Subscriptions at api.slack.com/apps")
+                # Name the log this check actually read — the workspace is
+                # configurable, so a literal path can point at no such file.
+                resolved = Path(log_path) if log_path else (
+                    WORKSPACE_DIR / "logs" / "slack-bridge.log")
+                if slack_state == slack_access.LOCKED:
+                    return "warn", ("connected but events not arriving, and access.json "
+                                    "allows nobody (empty allowFrom) — Event Subscriptions "
+                                    "alone leaves Slack silent because no user may reach "
+                                    "it: add an allowed user id to "
+                                    f"{shlex.quote(str(channel_access_path('slack')))} too")
+                return "warn", ("connected but events not arriving, and no owner is enrolled "
+                                "(access.json absent) — BOTH are needed: enable Event "
+                                "Subscriptions at api.slack.com/apps, then DM the bot the code "
+                                f"from `grep -i \"enrollment code\" {shlex.quote(str(resolved))} "
+                                "| tail -1` (regenerated on every bridge start)")
     return None
 
 
@@ -8444,7 +8862,8 @@ def run_all_checks() -> list[dict]:
                 and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                override = bridge_log_content_status(name, status, tail, detail)
+                override = bridge_log_content_status(name, status, tail, detail,
+                                                     log_path=log_file)
                 if override is not None:
                     status, detail = override
             except OSError:
@@ -8547,12 +8966,14 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
     checks.append(check_proactive_quarantine())
+    checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
+    checks.append(check_daily_cron_punctuality())
     checks.append(check_disk_space())
 
     return checks
@@ -8577,7 +8998,7 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
     now = time.time()
     for alive_file in cores_dir.glob("*.alive"):
         try:
-            if now - alive_file.stat().st_mtime < max_age_s:
+            if heartbeat_is_fresh(alive_file.stat().st_mtime, now, max_age_s):
                 return True
         except OSError:
             pass
@@ -9214,8 +9635,8 @@ def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: 
     youngest_start = None
     for alive_file in cores_dir.glob("*.alive"):
         try:
-            if now - alive_file.stat().st_mtime >= 90.0:
-                continue  # stale heartbeat — not a live core
+            if not heartbeat_is_fresh(alive_file.stat().st_mtime, now):
+                continue  # stale or future-dated — not a live core
             data = json.loads(alive_file.read_text())
         except (OSError, ValueError):
             continue
@@ -9486,6 +9907,27 @@ def recover_core_if_wedged(
 CRON_STALE_SEC = int(os.environ.get("SUTANDO_CRON_STALE_SEC", "1800"))
 
 
+CORE_HEARTBEAT_MAX_AGE_S = 90.0
+# Callers snapshot `now` BEFORE they stat, so an atomic heartbeat rewrite in
+# between yields a slightly newer mtime; cross-host sync adds small clock skew.
+CORE_HEARTBEAT_FUTURE_TOLERANCE_S = 5.0
+
+
+def heartbeat_is_fresh(mtime: float, now: float,
+                       max_age_s: float = CORE_HEARTBEAT_MAX_AGE_S) -> bool:
+    """A `state/cores/*.alive` heartbeat is fresh only inside
+    [-CORE_HEARTBEAT_FUTURE_TOLERANCE_S, max_age_s).
+
+    Bounded from BELOW as well: a far-future file has a negative age, and every
+    one-sided `age >= max` test accepts that as fresh — so a clock step or a bad
+    write reads as a live core forever. The bound is a tolerance, not zero: a
+    strictly non-negative test discards a live heartbeat that was atomically
+    rewritten between a caller's `now` snapshot and its stat (sub-ms in practice).
+    """
+    age = now - mtime
+    return -CORE_HEARTBEAT_FUTURE_TOLERANCE_S <= age < max_age_s
+
+
 def _live_core_socket(workspace: Optional[Path] = None) -> str:
     """Tmux socket of the freshest LIVE core heartbeat — the runtime-authored
     `socket` field of `state/cores/<host>.alive` (the same source
@@ -9504,8 +9946,8 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
     for alive_file in cores_dir.glob("*.alive"):
         try:
             mtime = alive_file.stat().st_mtime
-            if now - mtime >= 90.0:
-                continue  # stale heartbeat — not a live core
+            if not heartbeat_is_fresh(mtime, now):
+                continue  # stale or future-dated — not a live core
             payload = json.loads(alive_file.read_text())
             # A heartbeat that decodes to a NON-OBJECT (`null`, `[]`, `"x"`, `3`)
             # raises AttributeError on `.get`, which this handler does not catch —
