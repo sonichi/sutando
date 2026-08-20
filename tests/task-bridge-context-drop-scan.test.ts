@@ -15,7 +15,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -24,6 +24,9 @@ import {
 	logicalTaskName,
 	isContextDropHeader,
 	findTaskFile,
+	scanDropTasksOnce,
+	_resetDropScanState,
+	_dropScanStateSize,
 } from '../src/task-bridge.js';
 
 let dir: string;
@@ -181,38 +184,63 @@ describe('claim rename is the same logical task', () => {
 		assert.equal(logicalTaskName('task-X.claimed-core-1.bak.txt'), 'task-X.claimed-core-1.bak.txt');
 	});
 
-	it('dedup keyed on the logical name suppresses a claim (one injection)', () => {
-		// The watcher's own guard, exercised directly: raw-basename keying admits
-		// the claimed spelling as new, which is the double-injection.
-		const seen = new Set<string>();
-		const injections: string[] = [];
-		for (const name of ['task-A.txt', 'task-A.claimed-core-1.txt']) {
-			const logical = logicalTaskName(name);
-			if (seen.has(logical)) continue;
-			seen.add(logical);
-			injections.push(name);
+	it('production scan: a claim does NOT re-inject (one injection)', () => {
+		// Drives scanDropTasksOnce and its real _injectedDropTasks state. Mutating
+		// the production `logicalTaskName(name)` back to `name` must fail here.
+		const d = mkdtempSync(join(tmpdir(), 'drop-prod-'));
+		try {
+			_resetDropScanState(false);
+			const drop = 'id: task-A\nsource: context-drop\ntask: the dropped text\n';
+			writeFileSync(join(d, 'task-A.txt'), drop);
+			const got: string[] = [];
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, ['the dropped text'], 'first pass injects once');
+
+			renameSync(join(d, 'task-A.txt'), join(d, 'task-A.claimed-core-1.txt'));
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, ['the dropped text'], 'a core claim must not inject a second time');
+		} finally {
+			rmSync(d, { recursive: true, force: true });
 		}
-		assert.deepEqual(injections, ['task-A.txt'], 'a claim must not re-inject');
 	});
 
-	it('a SEEDED drop stays suppressed after a claim (zero injections)', () => {
-		const seen = new Set<string>([logicalTaskName('task-B.txt')]); // seeded at startup
-		const injections: string[] = [];
-		for (const name of ['task-B.claimed-core-3.txt']) {
-			const logical = logicalTaskName(name);
-			if (seen.has(logical)) continue;
-			seen.add(logical);
-			injections.push(name);
+	it('production scan: a SEEDED drop stays suppressed after a claim (zero injections)', () => {
+		const d = mkdtempSync(join(tmpdir(), 'drop-seed-'));
+		try {
+			_resetDropScanState(true); // first pass is the restart seed
+			writeFileSync(join(d, 'task-B.txt'),
+				'id: task-B\nsource: context-drop\ntask: yesterday\n');
+			const got: string[] = [];
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, [], 'the seed pass never injects');
+
+			renameSync(join(d, 'task-B.txt'), join(d, 'task-B.claimed-core-3.txt'));
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, [], 'a claim must not replay a seeded drop');
+		} finally {
+			rmSync(d, { recursive: true, force: true });
 		}
-		assert.deepEqual(injections, [], 'a restart seed must survive a claim');
 	});
 
-	it('eviction compares logical names, so the set does not empty itself', () => {
-		// The >500 sweep drops entries absent from the dir listing. If `live` held
-		// raw names while the set holds logical ones, every entry looks absent.
-		const present = ['task-C.claimed-core-2.txt'];
-		const live = new Set(present.map(logicalTaskName));
-		assert.ok(live.has(logicalTaskName('task-C.txt')), 'claimed file must keep its logical entry alive');
+	it('production scan: the >500 eviction keeps a claimed file alive', () => {
+		const d = mkdtempSync(join(tmpdir(), 'drop-evict-'));
+		try {
+			_resetDropScanState(false);
+			for (let i = 0; i < 501; i++) {
+				writeFileSync(join(d, `task-pad${i}.txt`), 'id: x\nsource: other\ntask: b\n');
+			}
+			writeFileSync(join(d, 'task-C.txt'), 'id: task-C\nsource: context-drop\ntask: keep me\n');
+			const got: string[] = [];
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.equal(got.length, 1, 'the one real drop injects');
+			assert.ok(_dropScanStateSize() > 500, 'eviction branch is now armed');
+
+			renameSync(join(d, 'task-C.txt'), join(d, 'task-C.claimed-core-2.txt'));
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.equal(got.length, 1, 'eviction must not drop the claimed file\'s logical entry');
+		} finally {
+			rmSync(d, { recursive: true, force: true });
+		}
 	});
 });
 

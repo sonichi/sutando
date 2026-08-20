@@ -733,29 +733,49 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 		// The desktop app writes its `source: context-drop` task file directly and
 		// never creates CONTEXT_DROP_FILE, so the poll above cannot see its drops.
 		try {
-			const present = readdirSync(TASK_DIR);
-			// Archived tasks can never be re-read, so their claims are dead weight.
-			if (_injectedDropTasks.size > 500) {
-				const live = new Set(present.map(logicalTaskName));
-				for (const seen of _injectedDropTasks) if (!live.has(seen)) _injectedDropTasks.delete(seen);
-			}
-			for (const name of present) {
-				if (!name.startsWith('task-') || !name.endsWith('.txt')) continue;
-				const logical = logicalTaskName(name);
-				if (_injectedDropTasks.has(logical)) continue;
-				let scan: DropTaskScan;
-				try {
-					scan = scanDropTask(join(TASK_DIR, name));
-				} catch { continue; }
-				if (scan.kind === 'incomplete') continue;
-				_injectedDropTasks.add(logical);
-				if (scan.kind !== 'drop' || _seedingDropTasks) continue;
-				console.log(`${ts()} [TaskBridge] Context drop detected: ${scan.body.slice(0, 100)}`);
-				onContextDrop(scan.body);
-			}
-			_seedingDropTasks = false;
+			scanDropTasksOnce(TASK_DIR, onContextDrop);
 		} catch { /* tasks dir may not exist yet */ }
 	}, 2000);
+}
+
+/**
+ * One tick of the desktop-drop scan: the dedup + restart-seed state machine.
+ * Exported so regressions drive THIS state, not a re-implementation of it —
+ * a copied recipe still passes when the production call is mutated.
+ */
+export function scanDropTasksOnce(dir: string, onDrop: (body: string) => void): void {
+	const present = readdirSync(dir);
+	// Archived tasks can never be re-read, so their claims are dead weight.
+	if (_injectedDropTasks.size > 500) {
+		const live = new Set(present.map(logicalTaskName));
+		for (const seen of _injectedDropTasks) if (!live.has(seen)) _injectedDropTasks.delete(seen);
+	}
+	for (const name of present) {
+		if (!name.startsWith('task-') || !name.endsWith('.txt')) continue;
+		const logical = logicalTaskName(name);
+		if (_injectedDropTasks.has(logical)) continue;
+		let scan: DropTaskScan;
+		try {
+			scan = scanDropTask(join(dir, name));
+		} catch { continue; }
+		if (scan.kind === 'incomplete') continue;
+		_injectedDropTasks.add(logical);
+		if (scan.kind !== 'drop' || _seedingDropTasks) continue;
+		console.log(`${ts()} [TaskBridge] Context drop detected: ${scan.body.slice(0, 100)}`);
+		onDrop(scan.body);
+	}
+	_seedingDropTasks = false;
+}
+
+/** Test seam: clear the scan's dedup set and choose whether the next pass seeds. */
+export function _resetDropScanState(seeding: boolean): void {
+	_injectedDropTasks.clear();
+	_seedingDropTasks = seeding;
+}
+
+/** Test seam: current dedup-set size, for the >500 eviction case. */
+export function _dropScanStateSize(): number {
+	return _injectedDropTasks.size;
 }
 
 /**
