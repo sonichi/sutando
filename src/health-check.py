@@ -2436,15 +2436,30 @@ def check_onboarding_status() -> "dict | None":
         rows = data["rows"]
         # Carry each row's own detail: "gateway" alone cannot distinguish "not
         # running" from a reconnect. `str()` because a separate repo writes this.
-        todo = [f"{k} ({d})" if (d := str(v.get("detail") or "").strip()[:120]) else k
-                for k, v in sorted(rows.items())
-                if isinstance(v, dict) and v.get("state") == "todo"]
+        todo_keys = [k for k, v in sorted(rows.items())
+                     if isinstance(v, dict) and v.get("state") == "todo"]
+        # A mirror row this host's own heartbeat contradicts is stale, not a
+        # real gap: the Console writes on change and can be hours behind.
+        stale_core = "core" in todo_keys and _fresh_local_core_record() is not None
+        if stale_core:
+            todo_keys.remove("core")
+        todo = [f"{k} ({d})" if (d := str(rows[k].get("detail") or "").strip()[:120]) else k
+                for k in todo_keys]
         # Absent/null/0 updated_at is UNKNOWN, not the epoch — int(None or 0)
         # rendered the whole unix time as an age (~56 years) on both lines.
         _updated = int(data.get("updated_at", 0) or 0)
         age_s = max(0, int(time.time()) - _updated) if _updated > 0 else None
     except (ValueError, OSError, TypeError):
         return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+    if stale_core:
+        rest = f"; still todo: {', '.join(todo)}" if todo else ""
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"Console mirror is stale — its core row says 'not running' but this "
+                       f"host's heartbeat is live; mirror last written {_age_phrase(age_s)}"
+                       f"{rest}"),
+        }
     if todo:
         return {
             "name": name,
