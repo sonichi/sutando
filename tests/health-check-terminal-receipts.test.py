@@ -40,6 +40,25 @@ class TerminalReceiptHealthTest(unittest.TestCase):
             check = self._check(workspace)
         self.assertEqual(check["status"], "ok", check)
         self.assertIn("1 terminal receipt(s)", check["detail"])
+        self.assertIn("removed nothing", check["detail"])
+
+    def test_expired_receipt_reports_pre_cleanup_count_and_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = self._root(workspace)
+            hc.outbox.record_terminal_receipt(
+                root, "task-expired", hc.outbox.TerminalDisposition.DELIVERED,
+                now=1.0)
+            path = hc.outbox._terminal_receipt_path(root, "task-expired", 0)
+
+            check = self._check(workspace)
+
+            self.assertEqual(check["status"], "ok", check)
+            self.assertIn("1 terminal receipt(s) before periodic retention", check["detail"])
+            self.assertIn("removed 1 expired", check["detail"])
+            self.assertIn("0 retained", check["detail"])
+            self.assertNotIn("removed nothing", check["detail"])
+            self.assertFalse(path.exists())
 
     def test_corrupt_receipt_warns_and_survives_the_probe(self):
         with tempfile.TemporaryDirectory() as tmp:

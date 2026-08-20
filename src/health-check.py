@@ -6337,7 +6337,7 @@ def check_proactive_quarantine() -> dict:
 
 
 def check_terminal_receipts() -> dict:
-    """Surface terminal receipts that require a human delivery decision."""
+    """Drive periodic receipt retention and surface human reconciliation needs."""
     name = "terminal-receipts"
     root = WORKSPACE_DIR / "results" / ".outbox-discord-task-results"
     try:
@@ -6358,8 +6358,18 @@ def check_terminal_receipts() -> dict:
                        "fail-closed; confirm the delivery outcome, then remove only "
                        "the affected receipt under results/.outbox-discord-task-results/"),
         }
+    before_cleanup = report.kept + report.expired + report.overflow
+    removals = []
+    if report.expired:
+        removals.append(f"{report.expired} expired")
+    if report.overflow:
+        removals.append(f"{report.overflow} over quota")
+    if report.stale_temps:
+        removals.append(f"{report.stale_temps} stale temporary")
+    cleanup = f"removed {', '.join(removals)}" if removals else "removed nothing"
     return {"name": name, "status": "ok",
-            "detail": f"{report.kept} terminal receipt(s) retained; no reconciliation needed"}
+            "detail": (f"{before_cleanup} terminal receipt(s) before periodic retention; "
+                       f"{cleanup}; {report.kept} retained; no reconciliation needed")}
 
 
 def _ps_snapshot() -> "str | None":
