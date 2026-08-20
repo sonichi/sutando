@@ -329,6 +329,11 @@ def main() -> int:
     # A legit single tier still resolves; missing tier stays owner (legacy).
     assert _tier("id: x\ntask: hi\naccess_tier: team\n") == "team"
     assert _tier("id: x\ntask: hi\nsource: s\n") == "owner"
+    # Two DISTINCT explicit tiers in one region (only injection) -> fail closed.
+    assert _tier("id: x\naccess_tier: owner\naccess_tier: guest\ntask: hi\n") == "guest"
+    assert _tier("id: x\ntask: hi\naccess_tier: owner\naccess_tier: guest\n") == "guest"
+    # A repeated SAME tier is not a conflict — it still resolves.
+    assert _tier("id: x\naccess_tier: team\naccess_tier: team\ntask: hi\n") == "team"
     print("PASS: Unicode line-boundary tier bypass closed (LF-only split, fail-closed).")
     # Verdict ownership: the wrapper must DERIVE from classify (one owner).
     for body, tier, filt, kind in (
