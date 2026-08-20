@@ -320,6 +320,8 @@ _GUARDED_PY_WRITERS = {
     # The centralized write side (serialize_task_last). Its guard is
     # structural, not ZWSP-defang: header values reject newlines outright and
     "src/local_task_protocol.py",
+    # Byte-identical vendored copy of the line above; same structural guard.
+    "packages/ag2-sparrow/ag2_sparrow/local_task_protocol.py",
     "skills/schedule-crons/scripts/codex-scheduler.py",
     "src/discord-bridge.py",
     "src/telegram-bridge.py",
