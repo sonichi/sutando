@@ -253,9 +253,29 @@ def should_notify(key=None):
     return (time.time() - mtime) > UNCHANGED_REMINDER_SEC
 
 
+#: Body budget for the macOS notification. Not a hard OS limit — a chosen bound
+#: the assembled body is held under, so no count width can overrun it.
+BODY_MAX = 160
+
+
 def notify_macos(count, titles):
     """Returns True only if osascript actually accepted the notification."""
-    msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(titles[:3])}"
+    # macOS truncates the body: the [:40] cap is the bound, since a title need
+    # not contain a comma; blanks are dropped so the join cannot emit a bare `, ,`.
+    names = [n for n in (t.split(",", 1)[0].strip()[:40] for t in titles[:3]) if n]
+    extra = f" (+{count - len(names)} more)" if count > len(names) else ""
+    head = f"{count} pending question{'s' if count > 1 else ''}: "
+    # Cap the ASSEMBLED body, not just each name: the count and the overflow both
+    # widen with the queue, so per-name bounds alone leave the total arithmetic.
+    room = BODY_MAX - len(head) - len(extra) - 1
+    joined = ", ".join(names)
+    if room <= 0:
+        joined = ""
+    elif len(joined) > room:
+        joined = joined[:room - 1] + "…"
+    # When every candidate name is blank there is nothing between the colon and the
+    # overflow, and `head` already ends in a space — so join on the stripped head.
+    msg = f"{head}{joined}{extra}" if joined else f"{head.rstrip()}{extra}"
     # AppleScript string literal: backslashes and double quotes in question
     # titles must be escaped, or osascript rejects the script and the
     # notification silently reports FAILED (bit us 2026-07-26 — a title
