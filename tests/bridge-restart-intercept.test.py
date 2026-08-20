@@ -134,9 +134,8 @@ handled, chan = _run("restart core", ws=ws4, chan=_Chan(fail=True))
 check("ack send failure swallowed, still handled + intent written",
       handled is True and os.path.exists(os.path.join(ws4, "state", "core-restart-requested.json")))
 
-# --- a request already pending → refuse, name the SURVIVING action ---
-# The owner must never be told the stop was queued when the restart is the one
-# on disk: only one of them can be what the executor's deletion refers to.
+# --- a request already pending → refuse, naming the SURVIVING action: only one
+# of them can be what the executor's single deletion actually refers to ---
 ws5 = tempfile.mkdtemp()
 _run("restart core", ws=ws5)
 handled, chan = _run("stop core", ws=ws5)
