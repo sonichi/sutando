@@ -163,6 +163,56 @@ def main():
     finally:
         bl._load_module = orig
 
+    # END-TO-END: a room type the repo has never heard of must work as a DECLARATION
+    # alone. This pins Track 13's central claim; the assertions above pin one seam.
+    import tempfile
+    _MOD = '''
+def resolve_token(repo):
+    return ("http://local.invalid", "tok")
+def load_pipeline(url, secret, room):
+    return {"cases": [{"name": "Acme", "severity": "high", "updated": "2026-08-01"},
+                      {"name": "Refund", "severity": "low", "updated": "2026-08-19"}]}
+def save_pipeline(url, secret, room, data):
+    return True
+def cases_needing_attention(data, today="2026-08-20", stale_days=3):
+    out = []
+    for c in data.get("cases", []):
+        if c.get("severity") == "high":
+            out.append({"name": c["name"], "reasons": ["high-severity"]})
+    return out
+'''
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "mod"))
+        open(os.path.join(td, "mod", "case.py"), "w").write(_MOD)
+        os.makedirs(os.path.join(td, "manifests"))
+        json.dump({"type": "caseroom", "version": 1, "entity": "Case",
+                   "data_object": {"folder": "caseroom", "filename": "cases.json"},
+                   "analyze": {"module": "mod/case.py", "function": "cases_needing_attention"},
+                   "autonomy_default": "safe", "cooldown_s": 1,
+                   "tiers": {"safe": {"reasons": [], "actions": []},
+                             "advance": {"reasons": ["high-severity"],
+                                         "verbs": {"high-severity": "`escalate {name}`"}}}},
+                  open(os.path.join(td, "manifests", "caseroom.json"), "w"))
+        json.dump([{"room": "!c:ag2.space", "type": "caseroom"}],
+                  open(os.path.join(td, "registry.json"), "w"))
+        json.dump({}, open(os.path.join(td, "state.json"), "w"))
+        _orig_repo = bl._REPO
+        try:
+            bl._REPO = td  # manifest module paths resolve against the repo root
+            rep = dict(bl.run(os.path.join(td, "registry.json"),
+                              os.path.join(td, "state.json"),
+                              dry_run=True, force=True,
+                              manifest_dir=os.path.join(td, "manifests")))
+        finally:
+            bl._REPO = _orig_repo
+        body = rep.get("!c:ag2.space", "")
+        check("escalate Acme" in body,
+              f"e2e: a NEW type works from a manifest alone — got {body[:90]!r}")
+        # Guard the guard: a bare `"Refund" not in body` passes VACUOUSLY when the
+        # type fails to load at all, so require the proposal to be present too.
+        check("escalate Acme" in body and "Refund" not in body,
+              "e2e: the new type's own tier config filters, not a shipped default")
+
     print("\n" + ("PASS — all checks green" if not _fails else f"FAIL — {len(_fails)} failing"))
     return 1 if _fails else 0
 
