@@ -161,8 +161,8 @@ class TestMemorySyncVaultLookup(unittest.TestCase):
     def test_legacy_clone_branch_names_the_legacy_clone(self):
         """No workspace .git → the legacy memory-sync clone supplies the freshness signal.
 
-        home is patched because this host really has ~/.sutando/memory-sync; reading it
-        would make the result depend on the machine.
+        home is patched because a real host may already have the legacy clone on disk;
+        reading it would make the result depend on the machine.
         """
         _, ws = self._configured()
         fake_home = self.tmp / "home"
