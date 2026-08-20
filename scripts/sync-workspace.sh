@@ -844,23 +844,45 @@ _snapshot_per_host_config() {
     done
 
     # One-writer contract: the per-host copy is OURS only while it still holds
-    # exactly what this snapshot last wrote (provenance, never mtime).
+    # exactly what this snapshot last wrote (provenance, never mtime). The
+    # replace is atomic (temp + rename) and gated on a re-hash of the dest
+    # taken after staging: a writer that grew the file since the ownership
+    # check flips that gate and we refuse, so a concurrent live write can
+    # never be erased by the copy.
     if [ -f "$WORKSPACE_DIR/build_log.md" ]; then
+        local _src="$WORKSPACE_DIR/build_log.md"
         local _dst="$_host_dir/build_log.md" _sig="$_host_dir/.build_log.snapshot-sha"
         local _cur="" _rec=""
         [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
         [ -f "$_sig" ] && _rec="$(cat "$_sig" 2>/dev/null)"
-        if [ -f "$_dst" ] && [ -z "$_rec" ] \
-                && cmp -s "$WORKSPACE_DIR/build_log.md" "$_dst" 2>/dev/null; then
-            # Upgrade bootstrap: a pre-provenance snapshot that still equals
-            # root is adopted, so root-live hosts keep refreshing.
-            printf '%s\n' "$_cur" > "$_sig" 2>/dev/null || true
-            _rec="$_cur"
-        fi
-        if [ ! -f "$_dst" ] || { [ -n "$_rec" ] && [ "$_cur" = "$_rec" ]; }; then
-            cp -p "$WORKSPACE_DIR/build_log.md" "$_dst" 2>/dev/null \
-                && shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1 > "$_sig" 2>/dev/null || true
-        elif ! cmp -s "$WORKSPACE_DIR/build_log.md" "$_dst" 2>/dev/null; then
+        if [ -f "$_dst" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
+            # Equal content is always safe to (re-)own: repair a missing OR
+            # stale provenance sha so an interrupted publish self-heals, and
+            # skip the copy — there is nothing to propagate.
+            [ "$_cur" != "$_rec" ] && printf '%s\n' "$_cur" > "$_sig" 2>/dev/null || true
+        elif [ ! -f "$_dst" ] || { [ -n "$_rec" ] && [ "$_cur" = "$_rec" ]; }; then
+            # Absent, or ours (still hashes to the recorded sha) -> refresh.
+            # Stage to a temp on the same dir, then swap ONLY if the dest still
+            # matches what we hashed above; else a live writer touched it and we
+            # refuse. The sha is taken from the staged temp, never a post-swap
+            # re-read of the dest.
+            local _tmp
+            _tmp="$(mktemp "${_dst}.snap.XXXXXX" 2>/dev/null)" || _tmp=""
+            if [ -n "$_tmp" ] && cp -p "$_src" "$_tmp" 2>/dev/null; then
+                local _new _now=""
+                _new="$(shasum -a 256 "$_tmp" 2>/dev/null | cut -d' ' -f1)"
+                [ -f "$_dst" ] && _now="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
+                if [ "$_now" = "$_cur" ]; then
+                    mv -f "$_tmp" "$_dst" 2>/dev/null \
+                        && printf '%s\n' "$_new" > "$_sig" 2>/dev/null || true
+                else
+                    rm -f "$_tmp" 2>/dev/null || true
+                    log "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
+                fi
+            else
+                [ -n "$_tmp" ] && rm -f "$_tmp" 2>/dev/null || true
+            fi
+        elif ! cmp -s "$_src" "$_dst" 2>/dev/null; then
             log "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
         fi
     fi

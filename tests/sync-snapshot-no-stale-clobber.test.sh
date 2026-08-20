@@ -87,5 +87,45 @@ _snapshot_per_host_config
 check "no root file leaves the per-host log untouched" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "per-host went live" ]'
 
+echo "7. TOCTOU: a per-host write landing AFTER the ownership check is not clobbered"
+# Seed a clean, owned snapshot (dst == root, sha recorded), then advance root.
+printf 'root baseline\n' > "$WORKSPACE_DIR/build_log.md"
+rm -f "$WORKSPACE_DIR/hosts/testhost/build_log.md" \
+      "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+_snapshot_per_host_config
+printf 'root advanced\n' > "$WORKSPACE_DIR/build_log.md"
+# Inject a concurrent per-host append EXACTLY ONCE, right after the ownership
+# hash of the destination — the check->replace window the reviewer exercised.
+# Wrapping shasum lets the append land after _cur is computed but before the
+# copy, identically for the fixed and the pre-fix function.
+rm -f "$SB/.injected"
+shasum() {
+    local _o; _o="$(command shasum "$@")"
+    if [ ! -e "$SB/.injected" ] && printf '%s' "$*" \
+            | grep -q "hosts/testhost/build_log.md$"; then
+        printf 'per-host live append\n' >> "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+        : > "$SB/.injected"
+    fi
+    printf '%s\n' "$_o"
+}
+_out7="$(_snapshot_per_host_config 2>&1)"
+unset -f shasum
+check "a per-host write in the check->replace window survives" \
+      'grep -q "per-host live append" "$WORKSPACE_DIR/hosts/testhost/build_log.md"'
+check "the racing replace is refused loudly" \
+      'printf "%s" "$_out7" | grep -q "changed between check and replace"'
+
+echo "8. self-heal: equal content with a stale provenance sha repairs itself"
+printf 'converged\n' > "$WORKSPACE_DIR/build_log.md"
+printf 'converged\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+printf 'deadbeefstale\n' > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+_snapshot_per_host_config
+check "equal content adopts the true sha over a stale one" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")" = "$(shasum -a 256 "$WORKSPACE_DIR/hosts/testhost/build_log.md" | cut -d" " -f1)" ]'
+printf 'root moved after self-heal\n' > "$WORKSPACE_DIR/build_log.md"
+_snapshot_per_host_config
+check "root-live refresh works once provenance self-healed" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root moved after self-heal" ]'
+
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1
