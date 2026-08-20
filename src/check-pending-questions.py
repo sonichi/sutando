@@ -273,7 +273,9 @@ def notify_macos(count, titles):
         joined = ""
     elif len(joined) > room:
         joined = joined[:room - 1] + "…"
-    msg = f"{head}{joined}{extra}"
+    # When every candidate name is blank there is nothing between the colon and the
+    # overflow, and `head` already ends in a space — so join on the stripped head.
+    msg = f"{head}{joined}{extra}" if joined else f"{head.rstrip()}{extra}"
     # AppleScript string literal: backslashes and double quotes in question
     # titles must be escaped, or osascript rejects the script and the
     # notification silently reports FAILED (bit us 2026-07-26 — a title

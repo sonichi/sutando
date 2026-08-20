@@ -330,6 +330,16 @@ class TestReviewFindings(unittest.TestCase):
         # Dropping two names moves them into the remainder rather than losing them.
         self.assertIn("(+4 more)", body, "dropped blanks must be counted, not vanish")
 
+    def test_f7_all_blank_names_leave_no_double_space(self):
+        """Every candidate blank: the join is empty and `head` ends in a space, so
+        without stripping it the body renders `N pending questions:  (+N more)`."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        self.m.notify_macos(9, ["", "   ", ","])
+        body = _notification_body(sent[0])
+        self.assertNotIn("  ", body, f"empty join must not leave a double space: {body}")
+        self.assertIn("(+9 more)", body, "the overflow must still account for every question")
+
     def test_f5_no_room_for_names_drops_them_rather_than_slicing_backwards(self):
         """A budget too small for the prefix must yield no names, not a negative
         slice: `joined[:room - 1]` at room==0 is `[:-1]`, which silently eats a char."""
