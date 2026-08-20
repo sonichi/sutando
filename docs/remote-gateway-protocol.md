@@ -67,6 +67,13 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+An AG2 Space broker may additionally send `"session_scope": "room"`. The
+bridge writes only that exact value as a trusted pre-body header; missing,
+unknown, or malformed values are omitted, preserving the main-session path for
+older brokers, bridges, and Sutando installations. An optional task handler may
+use the header with `source: ag2space` and `channel_id` to select a durable
+room-specific provider session.
+
 ### `POST /v1/tasks/<id>/ack`
 
 Claim/acknowledge a task so the server stops redelivering it.
