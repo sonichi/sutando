@@ -108,7 +108,10 @@ class EventRouter:
         # EventWriter nests material under `data`; flat shapes are fallbacks.
         # Only str payloads: stringifying the dict renders its repr as the QR.
         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
-        if "qr" in kind:
+        # Exact matches first: "paired" must not fall into the "pair" branch.
+        if kind in ("connected", "authenticated", "paired", "success"):
+            self.paired = True
+        elif "qr" in kind:
             payload = (data.get("code") or data.get("payload")
                        or ev.get("code") or ev.get("payload"))
             if isinstance(payload, str) and payload:
@@ -118,8 +121,6 @@ class EventRouter:
                     or ev.get("code") or ev.get("pairing_code"))
             if isinstance(code, str) and code:
                 emit(f"PAIR_CODE: {code}")
-        elif kind in ("connected", "authenticated", "paired", "success"):
-            self.paired = True
         elif kind in ("error", "fatal"):
             self.error = str(ev.get("message") or data.get("message")
                              or ev.get("error") or "unknown")
@@ -161,6 +162,7 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
     for t in threads:
         t.start()
 
+    timed_out = False
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if router.error:
@@ -171,9 +173,7 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
             break
         time.sleep(0.5)
     else:
-        proc.terminate()
-        emit("ERROR: pairing timed out — ask the user to retry when ready")
-        return 1
+        timed_out = True
 
     # wacli outlives `connected` (~30s bootstrap-sync idle exit) — reap it;
     # the session store is already durable, verification below is the check.
@@ -184,12 +184,15 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-    # The stream can end without an explicit paired event; the session store is
-    # the authority either way.
+    # The session store is the authority on every exit path — including
+    # timeout, where an unrecognised event vocabulary may hide a live pairing.
     if auth_status_ok(wacli) and chats_probe(wacli):
         emit("CONNECTED")
         return 0
-    emit(f"ERROR: {router.error or 'auth ended without a valid session'}")
+    if timed_out:
+        emit("ERROR: pairing timed out — ask the user to retry when ready")
+    else:
+        emit(f"ERROR: {router.error or 'auth ended without a valid session'}")
     return 1
 
 

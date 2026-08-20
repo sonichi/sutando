@@ -86,6 +86,11 @@ check(r.paired, "plain-text success flips paired")
 r, _ = routed(["error: passkey verification required"], qr_dir)
 check(r.error is not None and "passkey" in r.error, "passkey stop is terminal")
 
+print("3b. 'paired' event type flips paired — not swallowed by the 'pair' branch")
+r, out = routed(['{"event": "paired", "data": {}, "ts": 4}'], qr_dir)
+check(r.paired, "type=paired sets router.paired")
+check("PAIR_CODE" not in out, "paired event emits no pairing-code line")
+
 print("4. JSON-looking prose does not crash the router")
 r, _ = routed(['{not json at all', '{"type": 3}'], qr_dir)
 check(r.error is None, "malformed lines are tolerated")
@@ -153,6 +158,25 @@ check("Traceback" not in out.stderr, f"no uncaught exception (stderr={out.stderr
 check(out.returncode == 0 and "CONNECTED" in out.stdout,
       f"verification reached after reap (stdout={out.stdout.strip()!r})")
 check(elapsed < 45, f"long-lived auth is reaped, not waited out ({elapsed:.0f}s)")
+
+print("8. timeout path verifies the session store before declaring failure")
+# Unrecognised vocabulary + auth outliving --timeout: the store is live,
+# so verification must emit CONNECTED, never "pairing timed out".
+stub.write_text(
+    "#!/bin/sh\n"
+    f'MARK="{lab}/paired8"\n'
+    'case "$1 $2" in\n'
+    '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
+    'else echo "not authenticated"; exit 1; fi;;\n'
+    '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
+    '  "auth --events") echo \'{"event":"future_vocab","data":{},"ts":5}\' >&2; '
+    f'touch "$MARK"; sleep 60; exit 0;;\n'
+    'esac\nexit 0\n')
+out = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "5"],
+                     capture_output=True, text=True, env=env, timeout=90)
+check(out.returncode == 0 and "CONNECTED" in out.stdout,
+      f"live session wins over the timeout verdict (stdout={out.stdout.strip()!r})")
+check("timed out" not in out.stdout, "no false timeout error for a live session")
 
 if failures:
     print(f"{len(failures)} FAILURE(S)")
