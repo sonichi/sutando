@@ -30,11 +30,13 @@ def check(label, cond, extra=""):
 
 def _verdict(trees, parents):
     """check_task_watcher() with no sentinel, given tree roots and their ppids."""
+    # "" is a scan that RAN and found nothing; None means ps is unavailable,
+    # which would contradict this scenario's premise that watchers exist.
     with tempfile.TemporaryDirectory() as ws:
         with patch.object(hc, "WORKSPACE_DIR", Path(ws)), \
              patch.object(hc, "_fresh_local_core_record", return_value={"ts": 1}), \
              patch.object(hc, "_watcher_trees", return_value=trees), \
-             patch.object(hc, "_ps_snapshot", return_value=None), \
+             patch.object(hc, "_ps_snapshot", return_value=""), \
              patch.object(hc, "_pid_parent", side_effect=lambda pid, ps=None: parents.get(str(pid))):
             return hc.check_task_watcher()
 

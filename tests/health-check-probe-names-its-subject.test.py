@@ -85,6 +85,31 @@ class TaskWatcherSubjectTest(unittest.TestCase):
         self.assertIn("111", out["detail"])
         self.assertIn("222", out["detail"])
 
+    def test_ps_failure_is_unknown_not_an_empty_scan(self):
+        """`_watcher_trees()` returns {} for a FAILED ps and a clean empty scan
+        alike, so the idle green may only follow a scan that actually ran.
+
+        Without this the probe re-commits the exact defect this PR is named for:
+        asserting "no watcher processes" without having measured their absence.
+        """
+        with patch.object(hc, "_ps_snapshot", return_value=None):
+            out = hc.check_task_watcher()
+        self.assertNotEqual(out["status"], "ok",
+                            f"a failed enumeration is UNKNOWN, not clear: {out!r}")
+        self.assertNotIn("not expected", out["detail"])
+        self.assertIn("ps unavailable", out["detail"])
+
+    def test_an_empty_scan_that_ran_is_still_a_clean_result(self):
+        """Mutation guard: ps returning NOTHING is not ps failing.
+
+        Distinguishing them is the whole point; treating "" as unavailable would
+        make the probe permanently warn on a genuinely idle install.
+        """
+        with patch.object(hc, "_ps_snapshot", return_value=""):
+            out = hc.check_task_watcher()
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("not expected", out["detail"])
+
     def test_a_peer_heartbeat_does_not_make_this_host_expect_a_watcher(self):
         """The watcher is a LOCAL process, so the gate must read the LOCAL core.
 

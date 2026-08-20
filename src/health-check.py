@@ -6546,9 +6546,16 @@ def check_task_watcher() -> dict:
     """
     name = "task-watcher"
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
+    # so take the snapshot here: None is unavailable, "" is genuinely empty.
+    ps_out = _ps_snapshot()
+    if ps_out is None:
+        return {"name": name, "status": "warn",
+                "detail": "cannot enumerate processes (ps unavailable) — watcher liveness is "
+                          "UNKNOWN, not clear; a dead or duplicate watcher would be invisible"}
     # "Not expected" is a claim about THIS host, so it needs the local heartbeat
     # and must not be made before enumerating: visible watchers outrank it.
-    trees = _watcher_trees()
+    trees = _watcher_trees(ps_out)
     roots = sorted(trees)
     if not roots and _fresh_local_core_record() is None:
         return {"name": name, "status": "ok",
@@ -6559,7 +6566,7 @@ def check_task_watcher() -> dict:
             # nothing supervises them, and each new start adds another (observed
             # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
             # duplicate processing, not a stalled queue).
-            ps_out = _ps_snapshot()
+
             # A KNOWN parent that is not init: its spawning session still owns it.
             # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
