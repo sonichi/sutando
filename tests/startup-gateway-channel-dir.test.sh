@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Wiring test for the REAL launcher (#2701 review P1, bassil): the named
-# secondary-gateway loop in src/startup.sh must thread REMOTE_TASK_CHANNEL_DIR
-# per instance, or a dev bridge inherits prod's channels/ag2space/ config.
+# secondary-gateway loop (start_gateway_lanes() in src/startup-runtime.sh,
+# called from both startup.sh and scripts/restart-gateway-lanes.sh) must
+# thread REMOTE_TASK_CHANNEL_DIR per instance, or a dev bridge inherits
+# prod's channels/ag2space/ config.
 # Runs the actual loop body with a stub python that records its environment.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,10 +17,10 @@ env | grep -E '^(REMOTE_TASK_CHANNEL_DIR|REMOTE_TASK_TOKEN_FILE|REMOTE_TASK_URL|
 STUB
 chmod +x "$TMP/py-stub"
 
-# Extract the named-gateway loop from the real startup.sh (single source: the
-# test fails if the loop moves or the marker comment is renamed).
-LOOP="$(awk '/# Named secondary gateways \(multi-gateway\)/,/^  done$/' "$REPO/src/startup.sh")"
-[ -n "$LOOP" ] || { echo "FAIL: named-gateway loop not found in startup.sh"; exit 1; }
+# Extract the named-gateway loop from the real start_gateway_lanes() (single
+# source: the test fails if the loop moves or the marker comment is renamed).
+LOOP="$(awk '/# Named secondary gateways \(multi-gateway\)/,/^    done$/' "$REPO/src/startup-runtime.sh")"
+[ -n "$LOOP" ] || { echo "FAIL: named-gateway loop not found in startup-runtime.sh"; exit 1; }
 
 run_loop() {  # $1 = extra env assignments (string), evaluated before the loop
   ENV_DUMP="$TMP/env-dump"; : > "$ENV_DUMP"; export ENV_DUMP

@@ -17,6 +17,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SWIFT_CONFIG = ROOT / "src" / "Sutando" / "SutandoConfig.swift"
 
+# Shared with tests/sutando-config-python-resolution.test.py: one warm Clang
+# module cache for every Swift probe compile, instead of one cold cache each.
+_MODULE_CACHE = Path(tempfile.gettempdir()) / "sutando-swift-module-cache"
+_MODULE_CACHE.mkdir(parents=True, exist_ok=True)
+
 
 @unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
 class TestSutandoConfigSwift(unittest.TestCase):
@@ -32,7 +37,9 @@ class TestSutandoConfigSwift(unittest.TestCase):
             encoding="utf-8",
         )
         env = os.environ.copy()
-        env["CLANG_MODULE_CACHE_PATH"] = str(self.tmp / "module-cache")
+        # Persistent, NOT under self.tmp: setUp runs per test method, so a per-run
+        # cache rebuilt Foundation's modules on every single one of them.
+        env["CLANG_MODULE_CACHE_PATH"] = str(_MODULE_CACHE)
         subprocess.run(
             [
                 "swiftc",
@@ -116,7 +123,9 @@ class TestPersonalAssetPathSwift(unittest.TestCase):
             encoding="utf-8",
         )
         env = os.environ.copy()
-        env["CLANG_MODULE_CACHE_PATH"] = str(self.tmp / "module-cache")
+        # Persistent, NOT under self.tmp: setUp runs per test method, so a per-run
+        # cache rebuilt Foundation's modules on every single one of them.
+        env["CLANG_MODULE_CACHE_PATH"] = str(_MODULE_CACHE)
         subprocess.run(
             ["swiftc", str(SWIFT_CONFIG), str(self.probe_dir / "main.swift"), "-o", str(self.probe)],
             env=env, check=True, text=True, capture_output=True,
