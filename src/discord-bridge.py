@@ -211,7 +211,7 @@ from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_redaction import redact_chat_body  # noqa: E402
-from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
+from core_restart_intent import await_consumption, parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
@@ -2996,11 +2996,22 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
         return False
     try:
         write_intent(workspace, action, "discord")
-        ack = ("Restart requested — the app will relaunch the core in a few "
-               "seconds (authenticated, GUI session). I'll be back once it's up."
-               if action == "restart" else
-               "Stop requested — the app will stop the core in a few seconds. "
-               "It stays stopped until you say `restart core`.")
+        # Ack on CONSUMPTION, not on write (#3183): writing always succeeds, so
+        # acking here promised a restart on hosts whose executor was gone —
+        # silent for as long as nobody happened to notice.
+        claimed = await asyncio.to_thread(await_consumption, workspace)
+        if claimed:
+            ack = ("Restart requested and picked up by the executor — I'll be "
+                   "back once it's up."
+                   if action == "restart" else
+                   "Stop requested and picked up by the executor. It stays "
+                   "stopped until you say `restart core`.")
+        else:
+            ack = (f"Wrote the {action} request, but **no executor picked it "
+                   f"up** within 12s — so nothing is going to happen. The "
+                   f"request expires on its own in 10 minutes. Whatever "
+                   f"consumes `state/core-restart-requested.json` on this host "
+                   f"(the desktop app, or a launchd executor) isn't running.")
     except Exception as exc:
         ack = f"Couldn't write the {action} request ({type(exc).__name__}) — not queued."
     print(f"  [core-restart] owner {action} command from @{username}", flush=True)

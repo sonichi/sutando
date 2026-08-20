@@ -76,6 +76,34 @@ def write_intent(workspace: str | None, action: str, source: str) -> str:
     return path
 
 
+def await_consumption(
+    workspace: str | None,
+    timeout_sec: float = 12.0,
+    poll_sec: float = 0.5,
+    sleep=time.sleep,
+    now=time.monotonic,
+) -> bool:
+    """Block until some executor consumes the intent; True if it did.
+
+    Consumption is defined by the file being GONE, which is the only
+    implementation-agnostic evidence available: `consume_intent` deletes
+    before acting, so disappearance means an executor claimed it. Probing for
+    a specific consumer (a running Sutando.app, a named launchd label) answers
+    "is THAT consumer here", not "will anything act" — and returns the same
+    False for a host whose executor is simply a different one.
+
+    Default timeout covers the documented 5s poll interval twice over.
+    """
+    path = intent_path(workspace)
+    deadline = now() + timeout_sec
+    while True:
+        if not os.path.exists(path):
+            return True
+        if now() >= deadline:
+            return False
+        sleep(poll_sec)
+
+
 def consume_intent(workspace: str | None, now: float | None = None) -> str | None:
     """Read-and-DELETE the intent; return its action, or None.
 

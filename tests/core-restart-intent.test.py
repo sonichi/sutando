@@ -122,3 +122,47 @@ class TestWriteConsume(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestAwaitConsumption(unittest.TestCase):
+    """Ack-on-consumption (#3183): the bridge must not promise a restart that
+    no executor will perform. Consumption is proven by the file disappearing —
+    not by probing for one named consumer implementation."""
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+
+    def test_returns_true_when_executor_consumes(self):
+        _mod.write_intent(self.ws, "restart", "test")
+        calls = {"n": 0}
+
+        def fake_sleep(_):
+            calls["n"] += 1
+            if calls["n"] == 2:  # an executor claims it on the 2nd poll
+                _mod.consume_intent(self.ws)
+
+        self.assertTrue(_mod.await_consumption(
+            self.ws, timeout_sec=10, poll_sec=0, sleep=fake_sleep,
+            now=lambda: 0.0))
+
+    def test_returns_false_when_nothing_consumes(self):
+        _mod.write_intent(self.ws, "restart", "test")
+        t = {"v": 0.0}
+
+        def fake_sleep(_):
+            t["v"] += 1.0
+
+        # File is never consumed -> must time out False, not hang or lie.
+        self.assertFalse(_mod.await_consumption(
+            self.ws, timeout_sec=3, poll_sec=0, sleep=fake_sleep,
+            now=lambda: t["v"]))
+        # ...and the intent is still on disk for a late executor / expiry.
+        self.assertTrue(os.path.exists(_mod.intent_path(self.ws)))
+
+    def test_already_consumed_before_first_poll_returns_immediately(self):
+        # No intent on disk at all: return True without ever sleeping.
+        def boom(_):
+            raise AssertionError("must not sleep when already consumed")
+
+        self.assertTrue(_mod.await_consumption(
+            self.ws, timeout_sec=5, poll_sec=0, sleep=boom, now=lambda: 0.0))
