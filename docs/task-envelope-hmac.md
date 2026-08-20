@@ -264,7 +264,8 @@ verified report.
 
 Related hardening from the same design thread: #3069 (Team-result guard
 derives marker detection from the canonical grammar; withheld bodies persist
-for owner review) and the staged spawn-cwd resolver (Phase-5-adjacent).
+for owner review — **closed unmerged 2026-08-19, so this hardening is not on
+main**) and the staged spawn-cwd resolver (Phase-5-adjacent).
 
 ## Pointers
 
