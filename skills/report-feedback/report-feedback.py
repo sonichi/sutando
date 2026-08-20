@@ -22,8 +22,13 @@ import platform
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+
+# Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
+# these; any other target aborts rather than forwarding the owner's token.
+TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
 
 
 def _redact(text: str) -> str:
@@ -138,6 +143,41 @@ def logs_excerpt(ws: Path):
         return None, []
 
 
+def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
+    """POST the report, following one 307/308 hop itself.
+
+    urllib only auto-follows 307/308 for GET/HEAD — for POST it raises instead,
+    so a cloud host that redirects (sutando.ag2.ai -> .space) makes every report
+    fail with `feedback API 307` and file nothing.
+    """
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Sutando-Feedback/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        if e.code not in (307, 308) or _hops >= 2:
+            raise
+        loc = e.headers.get("Location")
+        if not loc:
+            raise
+        nxt = urllib.parse.urljoin(url, loc)
+        host = urllib.parse.urlsplit(nxt).hostname or ""
+        if host not in TRUSTED_API_HOSTS:
+            raise RuntimeError(
+                f"refusing to forward credentials to untrusted redirect host {host!r}"
+            ) from e
+        return post_feedback(nxt, payload, token, _hops + 1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--title", required=True)
@@ -175,19 +215,9 @@ def main() -> None:
         "body": a.body.strip() or a.title.strip(),
         "context": ctx,
     }
-    req = urllib.request.Request(
-        f"{base.rstrip('/')}/api/feedback",
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "Sutando-Feedback/1.0",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            print(f"OK: filed {a.kind} report ({r.status}).")
+        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+        print(f"OK: filed {a.kind} report ({status}).")
     except urllib.error.HTTPError as e:
         print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
         sys.exit(1)
