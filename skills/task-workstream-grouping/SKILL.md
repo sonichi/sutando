@@ -49,18 +49,37 @@ labels.
    **Read the snapshot and submit the apply in ONE process.** `apply` requires
    the supplied hash to still match the current candidate set, so any task that
    arrives between a separate `snapshot` call and a separate `apply` call
-   invalidates the hash. On an active queue that window is wider than the gap,
-   and retrying alone does not converge — each retry re-opens it. Build the
-   proposal in the same process that read the snapshot:
+   invalidates the hash. Doing both in one process narrows that window to the
+   inference itself — it does not close it, since `snapshot` and `apply` are
+   still separate subprocesses and a task can arrive between them. **Retrying
+   does converge in practice** (@yixuan-ag2 runs this skill continuously and
+   measured it); one process just wastes far fewer cycles getting there.
+
+   Because it can still fail, the caller must **check both subprocesses and
+   retry the whole cycle** — a rejected `apply` that goes uninspected is
+   indistinguishable from success, and step 6 would then mark the maintenance
+   task `[no-send]` as though grouping had happened:
 
    ```python
    import json, subprocess
    S = "skills/task-workstream-grouping/scripts/workstreams.py"
-   snap = json.loads(subprocess.run(["python3", S, "snapshot"],
-                                    capture_output=True, text=True).stdout)
-   proposal = {"snapshot_hash": snap["snapshot_hash"], "workstreams": infer(snap)}
-   subprocess.run(["python3", S, "apply", "-"], input=json.dumps(proposal), text=True)
+   for attempt in range(3):
+       snap = json.loads(subprocess.run(["python3", S, "snapshot"], check=True,
+                                        capture_output=True, text=True).stdout)
+       proposal = {"snapshot_hash": snap["snapshot_hash"],
+                   "workstreams": infer(snap)}
+       done = subprocess.run(["python3", S, "apply", "-"],
+                             input=json.dumps(proposal), text=True,
+                             capture_output=True)
+       if done.returncode == 0:
+           break
+   else:
+       raise RuntimeError(f"apply rejected after 3 snapshot/infer/apply cycles: "
+                          f"{done.stderr.strip()}")
    ```
+
+   Bounded on purpose: an unbounded loop on a queue that never quiesces is a
+   spin, and the failure has to reach the operator rather than be swallowed.
 
    An empty `workstreams` list is a valid answer, not a skip: `apply` records
    every unassigned candidate as `classifier-omitted` and marks the snapshot
