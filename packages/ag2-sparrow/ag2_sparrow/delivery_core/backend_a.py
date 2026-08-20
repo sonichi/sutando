@@ -100,16 +100,38 @@ class DesignAClaimBackend:
         outbox.park_item(self.root, item_id, reason)
 
     def recover(self) -> RecoverReport:
-        """A recovers lazily at claim time (reclaim TTL); this pass reports
-        which items are currently reclaimable so the core can re-drive
-        them. Nothing is moved — reclaim happens under the next claim."""
+        """Startup reconciliation over the real claim records.
+
+        Reports which items are reclaimable so the core can re-drive them, and
+        RETIRES claims left on a TERMINAL item by a crash between complete()'s
+        terminal write and its release. That crash leaves no body for the caller
+        to re-derive an item id from, so claim() is never invoked for it again —
+        this pass is the only path that reaches such a record.
+        """
         rep = RecoverReport()
         claims = outbox._claims_dir(self.root)
-        if claims.exists():
-            for p in claims.glob("*.json"):
-                item_id = p.stem
-                if outbox.may_reclaim_delivery(self.root, item_id,
-                                               self.reclaim_ttl_s):
+        if not claims.exists():
+            return rep
+        for p in sorted(claims.glob("*.claim")):
+            # The id comes from INSIDE the record: the filename is a lossy,
+            # digest-suffixed safe key and cannot be reversed to an item id.
+            rec = outbox._read_claim_at(p, "")
+            if rec is None or not rec.item_id:
+                continue
+            item_id = rec.item_id
+            with outbox._item_lock(self.root, item_id):
+                current = outbox.read_delivery_claim(self.root, item_id)
+                if current is None:
+                    continue
+                if not outbox.may_reclaim_delivery(self.root, item_id,
+                                                   self.reclaim_ttl_s):
+                    continue        # ALIVE or UNKNOWN owner: never displaced
+                if outbox._read_item(self.root, item_id).get(
+                        "status") in self.TERMINAL:
+                    outbox._release_locked(self.root, item_id,
+                                           current.drainer_id)
+                    rep.retired.append(item_id)
+                else:
                     rep.recovered.append(item_id)
         return rep
 
