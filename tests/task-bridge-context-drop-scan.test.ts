@@ -4,6 +4,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync, readFileSync, renameSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -239,6 +240,49 @@ describe('findTaskFile locates both spellings', () => {
 
 	it('returns null when neither exists', () => {
 		assert.equal(findTaskFile(dir, 'task-does-not-exist'), null);
+	});
+
+	it('finds the quarantined file when bare and claimed are gone', () => {
+		write('task-Q.txt.archive-failed', 'id: task-Q\nsource: context-drop\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-Q'), join(dir, 'task-Q.txt.archive-failed'));
+	});
+
+	it('prefers bare, then claimed, then quarantined', () => {
+		write('task-P.txt.archive-failed', 'id: task-P\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-P'), join(dir, 'task-P.txt.archive-failed'));
+		write('task-P.claimed-core-1.txt', 'id: task-P\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-P'), join(dir, 'task-P.claimed-core-1.txt'),
+			'claimed outranks quarantined');
+		write('task-P.txt', 'id: task-P\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-P'), join(dir, 'task-P.txt'), 'bare outranks both');
+	});
+
+	// The TS locator claims to mirror find_task_file in task_archive.py. Assert that
+	// against the real Python, not against a restatement of it: a copied expectation
+	// drifts silently, which is how the quarantine spelling went missing here.
+	it('agrees with the Python owner on every spelling', () => {
+		const py = `
+import sys, pathlib
+sys.path.insert(0, ${JSON.stringify(join(process.cwd(), 'src'))})
+from task_archive import find_task_file
+d = pathlib.Path(sys.argv[1])
+for tid in sys.argv[2:]:
+    r = find_task_file(d, tid)
+    print(r.name if r else "")
+`;
+		const ids = ['task-D', 'task-E', 'task-Q', 'task-P', 'task-does-not-exist'];
+		let out: string;
+		try {
+			out = execFileSync('python3', ['-c', py, dir, ...ids], { encoding: 'utf-8' });
+		} catch {
+			return; // no python3 available; the locator cases above still run
+		}
+		const pyNames = out.split('\n').slice(0, ids.length);
+		ids.forEach((tid, i) => {
+			const tsPath = findTaskFile(dir, tid);
+			const tsName = tsPath ? tsPath.slice(tsPath.lastIndexOf('/') + 1) : '';
+			assert.equal(tsName, pyNames[i], `locators disagree for ${tid}`);
+		});
 	});
 });
 

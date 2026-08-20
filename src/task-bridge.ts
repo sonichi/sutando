@@ -630,10 +630,13 @@ export function findTaskFile(dir: string, taskId: string): string | null {
 	const bare = join(dir, `${taskId}.txt`);
 	if (existsSync(bare)) return bare;
 	try {
-		const claimed = readdirSync(dir)
-			.filter((n) => n.startsWith(`${taskId}.claimed-core-`) && n.endsWith('.txt'))
-			.sort();
-		return claimed.length ? join(dir, claimed[0]) : null;
+		const names = readdirSync(dir).sort();
+		const claimed = names.filter((n) => n.startsWith(`${taskId}.claimed-core-`) && n.endsWith('.txt'));
+		if (claimed.length) return join(dir, claimed[0]);
+		// Quarantined last, matching find_task_file in task_archive.py: it is the
+		// task's only surviving header block, and routing needs those headers.
+		const quarantined = names.filter((n) => n.startsWith(`${taskId}.txt.archive-failed`));
+		return quarantined.length ? join(dir, quarantined[0]) : null;
 	} catch {
 		return null;
 	}
