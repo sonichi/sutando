@@ -196,10 +196,14 @@ class TypeEngine:
         self.type_name = manifest["type"]
         self.mod = _load_module(manifest["analyze"]["module"], f"mod_{self.type_name}")
         self._analyze_fn = getattr(self.mod, manifest["analyze"]["function"])
-        # save/widget helpers exist on piperoom's module; used only when present
+        # Pipeline save/load helpers are optional; used only when the type has them.
         self._pipe_mod = self.mod if hasattr(self.mod, "save_pipeline") else None
-        aux = _load_module("skills/piperoom/piperoom-command.py", "prc_tok")
-        self.url, self.secret = aux.resolve_token(_REPO)
+        if not hasattr(self.mod, "resolve_token"):
+            raise TypeError(
+                f"manifest '{self.type_name}': analyze.module "
+                f"{manifest['analyze']['module']} must define resolve_token(repo); "
+                "the engine resolves credentials through the type's own module.")
+        self.url, self.secret = self.mod.resolve_token(_REPO)
 
     def load(self, room):
         do = self.m["data_object"]

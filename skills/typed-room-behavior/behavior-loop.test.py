@@ -128,6 +128,41 @@ def main():
         check(bl.unconsumed_manifests([{"room": "!a"}], md) == ["inboxroom", "piperoom"],
               "unconsumed: type-less registry row does not raise")
 
+    # TypeEngine must resolve credentials through the TYPE'S OWN module. It used to
+    # hardcode skills/piperoom/piperoom-command.py, which made every type load piperoom.
+    class _Stub:
+        def __init__(self, tok): self._tok = tok
+        def resolve_token(self, repo): return ("u-" + self._tok, "s-" + self._tok)
+    loaded = []
+    def _fake_loader(rel, name):
+        loaded.append(rel)
+        return _Stub("mine")
+    orig = bl._load_module
+    try:
+        bl._load_module = _fake_loader
+        man = {"type": "caseroom", "analyze": {"module": "skills/caseroom/x.py",
+                                               "function": "resolve_token"}}
+        eng = bl.TypeEngine(man)
+        check(eng.url == "u-mine" and eng.secret == "s-mine",
+              "engine: credentials come from the type's own module")
+        check(loaded == ["skills/caseroom/x.py"],
+              f"engine: loads ONLY the manifest-named module, got {loaded}")
+        check(not any("piperoom" in r for r in loaded),
+              "engine: never loads a concrete skill the manifest did not name")
+        # A module missing resolve_token must fail LOUDLY, not silently fall back.
+        class _NoTok:
+            def analyze(self, d): return []
+        bl._load_module = lambda rel, name: _NoTok()
+        try:
+            bl.TypeEngine({"type": "caseroom",
+                           "analyze": {"module": "skills/caseroom/x.py", "function": "analyze"}})
+            check(False, "engine: missing resolve_token must raise")
+        except TypeError as ex:
+            check("caseroom" in str(ex) and "resolve_token" in str(ex),
+                  "engine: the error names the manifest and the missing helper")
+    finally:
+        bl._load_module = orig
+
     print("\n" + ("PASS — all checks green" if not _fails else f"FAIL — {len(_fails)} failing"))
     return 1 if _fails else 0
 
