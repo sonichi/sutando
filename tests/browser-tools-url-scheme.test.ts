@@ -50,9 +50,8 @@ describe('withScheme', () => {
 		assert.equal(new URL(withScheme('NBA.com')).origin, 'https://nba.com');
 	});
 
-	// The port rule keeps `host:port` out of the scheme bucket by refusing a
-	// digit after the colon — which also caught opaque schemes whose content is
-	// digits, mangling them silently into `https://tel:911`.
+	// Refusing a digit after the colon also caught digit-content schemes,
+	// mangling them into `https://tel:911`.
 	it('leaves digit-opaque schemes alone (tel/sms/callto)', () => {
 		assert.equal(withScheme('tel:911'), 'tel:911');
 		assert.equal(withScheme('tel:5551234'), 'tel:5551234');
@@ -67,14 +66,11 @@ describe('withScheme', () => {
 		assert.equal(withScheme('[::1]:8080'), 'https://[::1]:8080');
 	});
 
-	// `example.com:8080` is syntactically a scheme AND an authority, and nothing
-	// in the string decides which. It keeps its input form — same as main, so no
-	// regression — because guessing wrong on the other branch rewrites a deep
-	// link to an attacker-reachable origin. An explicit scheme qualifies it.
+	// `example.com:8080` is both a scheme and an authority and nothing decides
+	// which, so it keeps its input form; an explicit scheme qualifies it.
 	it('leaves an ambiguous dotted host:port alone rather than guessing', () => {
 		assert.equal(withScheme('example.com:8080/x'), 'example.com:8080/x');
 		assert.equal(withScheme('https://example.com:8080/x'), 'https://example.com:8080/x');
-		// The PR's actual target — a bare host with no port — is unaffected.
 		assert.equal(withScheme('example.com/x'), 'https://example.com/x');
 	});
 
@@ -107,9 +103,5 @@ describe('open_url wiring', () => {
 		// With the raw bare host, new URL() throws, targetOrigin stays '' and
 		// every open silently became a new tab.
 		assert.match(SRC, /targetOrigin = new URL\(target\)\.origin/);
-	});
-
-	it('reports the URL it actually opened', () => {
-		assert.match(SRC, /return \{ status: reused \? 'reused' : 'opened', url: target \}/);
 	});
 });

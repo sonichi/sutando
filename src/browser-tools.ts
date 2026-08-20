@@ -335,9 +335,8 @@ export const openUrlTool: ToolDefinition = {
 			console.log(`${ts()} [OpenURL] rejected url with zero-width char: ${redactQuery(url)}`);
 			return { error: `Failed to open: URL contains zero-width character (got ${JSON.stringify(url)})` };
 		}
-		// A bare host is what the model actually passes ("open github.com" is in
-		// this tool's own description), and AppleScript rejects it as "Invalid
-		// URL entered. (5)" — only the omnibox infers a scheme.
+		// AppleScript rejects a bare host ("Invalid URL entered. (5)"); only the
+		// omnibox infers a scheme, and this tool advertises the bare-host form.
 		const target = withScheme(url);
 		// Escape backslashes first, then quotes — prevents shell injection via osascript
 		const safeUrl = target.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
