@@ -37,7 +37,7 @@ class _Base(unittest.TestCase):
         self._saved = {n: getattr(gw, n) for n in (
             "TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR",
             "UNDELIVERABLE_RESULTS_DIR", "_req", "_delivery_tid", "_log",
-            "_last_orphan_sweep")}
+            "_last_orphan_sweep", "_guarded_result_body")}
         gw.TASKS_DIR = root / "tasks"
         gw.RESULTS_DIR = root / "results"
         gw.ARCHIVE_RESULTS_DIR = gw.RESULTS_DIR / "archive"
@@ -392,6 +392,42 @@ class AbandonedHardening(_Base):
                              "old archived task: normal abandoned-drop applies")
         finally:
             gw._save_inflight = self._saved_save
+
+
+class GuardDelegation(_Base):
+    """Recovery runs the SAME guard as ordinary delivery, and obeys its answer."""
+
+    def _archived_task(self):
+        d = gw.TASKS_DIR / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        t = d / f"{TID}.txt"
+        t.write_text(f"id: {TID}\ntask: hi\n")
+        _age(t, OLD)
+
+    def test_guard_unavailable_leaves_the_orphan_for_retry(self):
+        """(None, reason) means the guard could not load. Delivering anyway
+        would honour markers on unscanned non-owner output."""
+        self._archived_task()
+        self._result("the reply")
+        gw._guarded_result_body = lambda tid, body: (None, "guard unavailable")
+        self._sweep()
+        self.assertEqual(self.posted, [], "posted an unguarded orphan result")
+        self.assertTrue((gw.RESULTS_DIR / f"{TID}.txt").exists(),
+                        "the result must survive for the next pass")
+        self.assertTrue(any("guard unavailable" in m for m in self.logs),
+                        "a skipped delivery must say why")
+
+    def test_the_guarded_body_ships_not_the_raw_file(self):
+        self._archived_task()
+        self._result("RAW_SENDER_PROSE")
+        gw._guarded_result_body = lambda tid, body: ("guarded replacement", "tier=team")
+        self._sweep()
+        self.assertEqual(len(self.posted), 1)
+        body = self.posted[0][2]["body"]
+        self.assertIn("guarded replacement", body, "the guard's body was discarded")
+        self.assertNotIn("RAW_SENDER_PROSE", body, "the raw file bypassed the guard")
+        self.assertTrue(any("tier=team" in m for m in self.logs),
+                        "a withheld reason must be logged")
 
 
 if __name__ == "__main__":
