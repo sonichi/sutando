@@ -225,5 +225,88 @@ class TestExclusiveIntent(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+
+class TestExclusiveIntentEdges(unittest.TestCase):
+    """The refusal paths of the exclusive claim. Each one decides whether the
+    owner is told a request was queued, so none of them may be inferred."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = self.tmp.name
+        self.state = os.path.join(self.ws, "state")
+        os.makedirs(self.state, exist_ok=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_peek_returns_none_when_absent_or_unreadable(self):
+        self.assertIsNone(_mod.peek_intent(self.ws))
+        with open(_mod.intent_path(self.ws), "w") as f:
+            f.write("{not json")
+        self.assertIsNone(_mod.peek_intent(self.ws))
+
+    def test_peek_returns_none_for_unknown_action(self):
+        for payload in ({"action": "self-destruct", "requested_at": time.time()},
+                        ["not", "a", "dict"]):
+            with open(_mod.intent_path(self.ws), "w") as f:
+                json.dump(payload, f)
+            self.assertIsNone(_mod.peek_intent(self.ws))
+
+    def test_racing_writer_refill_loses(self):
+        # Both attempts collide and peek finds nothing live: someone else is
+        # writing. Refuse rather than clobber a claim we cannot read.
+        real_link = os.link
+
+        def always_taken(src, dst):
+            raise FileExistsError(dst)
+
+        os.link = always_taken
+        try:
+            with self.assertRaises(_mod.IntentPending):
+                _mod.write_intent(self.ws, "restart", "test")
+        finally:
+            os.link = real_link
+
+    def test_undeletable_stale_intent_refuses_rather_than_clobbers(self):
+        _mod.write_intent(self.ws, "restart", "test")
+        path = _mod.intent_path(self.ws)
+        with open(path) as f:
+            d = json.load(f)
+        d["requested_at"] = time.time() - (_mod.STALE_SEC + 60)
+        with open(path, "w") as f:
+            json.dump(d, f)
+        real_unlink = os.unlink
+
+        def refuse_intent(target):
+            if str(target) == path:
+                raise OSError("read-only")
+            return real_unlink(target)
+
+        os.unlink = refuse_intent
+        try:
+            with self.assertRaises(_mod.IntentPending):
+                _mod.write_intent(self.ws, "stop", "test")
+        finally:
+            os.unlink = real_unlink
+
+    def test_tmp_cleanup_failure_never_masks_the_result(self):
+        # The temp file is bookkeeping; failing to remove it must not turn a
+        # successful claim into an error the owner sees.
+        real_unlink = os.unlink
+
+        def refuse_tmp(target):
+            if str(target).endswith(".tmp"):
+                raise OSError("gone already")
+            return real_unlink(target)
+
+        os.unlink = refuse_tmp
+        try:
+            self.assertEqual(_mod.write_intent(self.ws, "restart", "test"),
+                             _mod.intent_path(self.ws))
+        finally:
+            os.unlink = real_unlink
+        self.assertEqual(_mod.consume_intent(self.ws), "restart")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
