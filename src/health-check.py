@@ -2438,9 +2438,12 @@ def check_onboarding_status() -> "dict | None":
         # running" from a reconnect. `str()` because a separate repo writes this.
         todo_keys = [k for k, v in sorted(rows.items())
                      if isinstance(v, dict) and v.get("state") == "todo"]
-        # A mirror row this host's own heartbeat contradicts is stale, not a
-        # real gap: the Console writes on change and can be hours behind.
-        stale_core = "core" in todo_keys and _fresh_local_core_record() is not None
+        # A heartbeat refutes only the runtime-DOWN row; the writer also emits
+        # "core running, Claude sign-in required", a real gap on a running core.
+        _core = rows.get("core") if isinstance(rows.get("core"), dict) else {}
+        _down = (_core.get("claude_authed") is not False
+                 and "not running" in str(_core.get("detail") or "").lower())
+        stale_core = "core" in todo_keys and _down and _fresh_local_core_record() is not None
         if stale_core:
             todo_keys.remove("core")
         todo = [f"{k} ({d})" if (d := str(rows[k].get("detail") or "").strip()[:120]) else k

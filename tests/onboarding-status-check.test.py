@@ -63,6 +63,29 @@ class OnboardingStatusCheckTest(unittest.TestCase):
         # The false claim must NOT survive as user-facing incompleteness.
         self.assertNotIn("setup incomplete", out["detail"])
 
+    def test_detail_less_core_row_is_not_assumed_to_be_the_down_state(self):
+        """Fail safe: a todo core row with no detail says nothing about WHY, so a
+        heartbeat cannot refute it — report the gap rather than suppress it."""
+        ws = self._with_workspace({"updated_at": 1, "rows": {"core": {"state": "todo"}}})
+        self._core_heartbeat(ws, fresh=True)
+        out = hc.check_onboarding_status()
+        self.assertIn("setup incomplete", out["detail"])
+
+    def test_fresh_heartbeat_does_not_hide_a_signin_gap_on_a_running_core(self):
+        """Control for the over-broad first cut: the writer emits TWO core todo
+        details, and a heartbeat refutes only 'not running'."""
+        ws = self._with_workspace(
+            {"updated_at": 1, "rows": {"core": {
+                "state": "todo", "detail": "core running, Claude sign-in required",
+                "claude_authed": False}}}
+        )
+        self._core_heartbeat(ws, fresh=True)
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("setup incomplete", out["detail"])
+        self.assertIn("sign-in", out["detail"])
+        self.assertNotIn("stale", out["detail"].lower())
+
     def test_core_row_still_reported_when_heartbeat_is_dead(self):
         """Mutation guard: with no live heartbeat the row is a REAL gap, so the
         stale-mirror branch must not swallow it."""
@@ -78,7 +101,8 @@ class OnboardingStatusCheckTest(unittest.TestCase):
 
     def test_other_todo_rows_survive_a_stale_core_row(self):
         ws = self._with_workspace(
-            {"updated_at": 1, "rows": {"core": {"state": "todo"},
+            {"updated_at": 1, "rows": {"core": {"state": "todo",
+                                                "detail": "core not running"},
                                        "gateway": {"state": "todo"}}}
         )
         self._core_heartbeat(ws, fresh=True)
