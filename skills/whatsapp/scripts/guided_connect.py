@@ -85,12 +85,8 @@ def wacli_version(wacli: str) -> str:
     return (out.stdout or out.stderr).strip() or "unknown"
 
 
-# QR PNGs reach the user through the result-file bridges, whose attachment
-# allowlist (src/send_allowlist.py) fail-closes to the /tmp/sutando- and
-# /private/tmp/sutando- prefixes. Render under that prefix so the `[file:]`
-# marker is deliverable; a bare system-temp path (macOS /var/folders, or a
-# plain /tmp/whatsapp-qr-) is denied and the QR never reaches the chat. Both
-# the directory and the filename prefix matter to the realpath check.
+# Must render under send_allowlist's /tmp/sutando- prefix (dir AND filename),
+# else the [file:] marker is delivery-denied and the QR never reaches the chat.
 _SENDABLE_QR_DIR = "/tmp"
 _QR_FILE_PREFIX = "sutando-whatsapp-qr-"
 

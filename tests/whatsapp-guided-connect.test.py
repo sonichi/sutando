@@ -425,11 +425,8 @@ check("steipete" not in skill_md and "steipete" not in script_src,
 check("openclaw/tap/wacli" in skill_md and "openclaw/tap/wacli" in script_src,
       "install/upgrade surfaces name the maintained openclaw tap")
 
-# The QR only helps if the result bridges may actually attach it. Render into
-# the PRODUCTION default dir and assert the resulting path clears the same
-# fail-closed allowlist the bridges enforce (src/send_allowlist.py) — the
-# delivery-authorization contract, which output/existence checks cannot see.
-# A control against the system temp dir pins the failure this replaces.
+# Assert the default-dir QR clears send_allowlist (the delivery contract that
+# output/existence checks miss); the system-temp control pins the old failure.
 try:
     import qrcode  # noqa: F401
     _qr_ok = True
