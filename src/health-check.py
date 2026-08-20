@@ -6358,12 +6358,18 @@ def check_proactive_quarantine() -> dict:
 
 
 def _ps_snapshot() -> "str | None":
-    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once."""
+    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once.
+
+    None means UNAVAILABLE, and that includes a `ps` that returned normally with
+    a nonzero exit: its empty stdout would otherwise read as a successful scan
+    that found nothing, which is the absence callers must not assert.
+    """
     try:
-        return subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5).stdout
+        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                              capture_output=True, text=True, timeout=5)
     except Exception:  # noqa: BLE001
         return None
+    return done.stdout if done.returncode == 0 else None
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":

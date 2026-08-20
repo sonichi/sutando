@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -36,7 +37,12 @@ spec.loader.exec_module(hc)
 
 
 class TaskWatcherSubjectTest(unittest.TestCase):
-    """The 'not expected' green is a claim about this host's processes."""
+    """The 'not expected' green is a claim about this host's processes.
+
+    check_task_watcher() takes the ps snapshot itself now, so every case that
+    mocks the tree result must also pin the snapshot or it stops controlling
+    its own premise on a runner where ps cannot run.
+    """
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="hc-watcher-"))
@@ -62,7 +68,8 @@ class TaskWatcherSubjectTest(unittest.TestCase):
         Preserved deliberately: a check that is always red carries the same
         information as one that is always green.
         """
-        with patch.object(hc, "_watcher_trees", return_value={}):
+        with patch.object(hc, "_ps_snapshot", return_value=""), \
+             patch.object(hc, "_watcher_trees", return_value={}):
             out = hc.check_task_watcher()
         self.assertEqual(out["status"], "ok")
         self.assertIn("not expected", out["detail"])
@@ -75,7 +82,8 @@ class TaskWatcherSubjectTest(unittest.TestCase):
         host whose heartbeat had gone stale.
         """
         self._heartbeat(hc._host_label(), fresh=False)
-        with patch.object(hc, "_watcher_trees", return_value={"111": ["111"], "222": ["222"]}), \
+        with patch.object(hc, "_ps_snapshot", return_value=""), \
+             patch.object(hc, "_watcher_trees", return_value={"111": ["111"], "222": ["222"]}), \
              patch.object(hc, "_ps_snapshot", return_value=""), \
              patch.object(hc, "_pid_parent", return_value="1"):
             out = hc.check_task_watcher()
@@ -99,6 +107,30 @@ class TaskWatcherSubjectTest(unittest.TestCase):
         self.assertNotIn("not expected", out["detail"])
         self.assertIn("ps unavailable", out["detail"])
 
+    def test_a_nonzero_ps_exit_is_unavailable_not_an_empty_scan(self):
+        """A command that FAILS but returns normally never raises, so its empty
+        stdout would read as a scan that ran and found nothing.
+
+        This is the same unmeasured-absence the probe fix closes, one layer
+        down in the helper: `subprocess.run(...).stdout` is `""` for rc=1.
+        """
+        ok = subprocess.CompletedProcess(args=["ps"], returncode=0, stdout="", stderr="")
+        bad = subprocess.CompletedProcess(args=["ps"], returncode=1, stdout="",
+                                          stderr="ps: permission denied")
+        with patch.object(hc.subprocess, "run", return_value=ok):
+            self.assertEqual(hc._ps_snapshot(), "", "rc=0 + empty stdout IS a clean scan")
+        with patch.object(hc.subprocess, "run", return_value=bad):
+            self.assertIsNone(hc._ps_snapshot(), "rc!=0 must be UNAVAILABLE, not empty")
+
+    def test_a_failed_ps_that_returns_normally_still_warns(self):
+        """End to end: the nonzero exit must reach the probe's verdict."""
+        bad = subprocess.CompletedProcess(args=["ps"], returncode=1, stdout="",
+                                          stderr="ps: permission denied")
+        with patch.object(hc.subprocess, "run", return_value=bad):
+            out = hc.check_task_watcher()
+        self.assertNotEqual(out["status"], "ok", f"false green on a failed ps: {out!r}")
+        self.assertIn("ps unavailable", out["detail"])
+
     def test_an_empty_scan_that_ran_is_still_a_clean_result(self):
         """Mutation guard: ps returning NOTHING is not ps failing.
 
@@ -119,7 +151,8 @@ class TaskWatcherSubjectTest(unittest.TestCase):
         self._heartbeat("some-peer-host", fresh=True)
         self.assertFalse((self.tmp / "state" / "cores" / f"{hc._host_label()}.alive").exists(),
                          "premise: only the PEER has a heartbeat")
-        with patch.object(hc, "_watcher_trees", return_value={}):
+        with patch.object(hc, "_ps_snapshot", return_value=""), \
+             patch.object(hc, "_watcher_trees", return_value={}):
             out = hc.check_task_watcher()
         self.assertEqual(out["status"], "ok",
                          f"a peer's heartbeat must not make this host expect a watcher: {out!r}")
@@ -128,7 +161,8 @@ class TaskWatcherSubjectTest(unittest.TestCase):
     def test_live_local_core_with_no_watcher_still_warns(self):
         """Mutation guard: the real gap must survive the reordering."""
         self._heartbeat(hc._host_label(), fresh=True)
-        with patch.object(hc, "_watcher_trees", return_value={}):
+        with patch.object(hc, "_ps_snapshot", return_value=""), \
+             patch.object(hc, "_watcher_trees", return_value={}):
             out = hc.check_task_watcher()
         self.assertEqual(out["status"], "warn")
         self.assertIn("not running", out["detail"])
