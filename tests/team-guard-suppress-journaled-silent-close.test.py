@@ -21,6 +21,8 @@ validated a dedup target -- a second copy of a rule the consumer already owns.
   f) malformed dedup id  -> HONOURED, not converted into channel prose
   g) secret + skip       -> honoured; the scan never runs on an undelivered body
   h) the stub minter is GONE, not merely unused
+  i) a non-DELIVER verdict handed to the journal is returned untouched
+  j) a record write that REPORTS failure (not just mkdir) also keeps the notice
 
 Run: python3 tests/team-guard-suppress-journaled-silent-close.test.py
 Exit: 0 on pass, 1 on fail.
@@ -58,6 +60,10 @@ def _clean(_text):
         detected = False
         secret_types: list = []
     return R()
+
+
+def _raise_write(*_args, **_kwargs):
+    raise OSError("disk gone")
 
 
 def main() -> int:
@@ -143,6 +149,30 @@ def main() -> int:
         "[no-send]\nAKIAIOSFODNN7EXAMPLE", "team", REPO, secret_filter=_leaky)
     check(got_g == "[no-send]\nAKIAIOSFODNN7EXAMPLE" and reason_g is None,
           f"g) a secret-carrying skip body is still honoured, got {got_g[:40]!r}")
+
+    # i) The two fail-closed branches of the journal, driven DIRECTLY: the
+    #    wrapper only ever hands it a DELIVER verdict, so nothing else reaches them.
+    leak_in = guard.TeamResultVerdict(guard.VERDICT_LEAK, guard.TEAM_LEAK_RESULT, "secret")
+    out_i = guard.journal_suppressed_result(
+        leak_in, body, pathlib.Path(tempfile.mkdtemp(prefix="tg-i-")), "task-i")
+    check(out_i == leak_in, f"i) a non-DELIVER verdict is returned untouched, got {out_i}")
+
+    # j) The record write REPORTS failure (returns False) rather than raising —
+    #    distinct from d), which fails one step earlier at mkdir.
+    for label, artifact in (("returns False", lambda *_a, **_k: False),
+                            ("raises", _raise_write)):
+        state_j = pathlib.Path(tempfile.mkdtemp(prefix="tg-j-"))
+        saved_write = guard._write_artifact
+        guard._write_artifact = artifact
+        try:
+            got_j, reason_j = guard.guard_result_for_tier(
+                body, "team", REPO, secret_filter=_clean,
+                suppress_journal=(state_j, "task-j"))
+        finally:
+            guard._write_artifact = saved_write
+        check(got_j == guard.TEAM_SUPPRESS_RESULT and
+              reason_j == "suppression record unwritable",
+              f"j) write {label} -> notice stands, got {got_j[:32]!r}/{reason_j!r}")
 
     # h) Removed, not orphaned: an unused minter is one import from returning.
     check(not hasattr(guard, "suppression_stub_for_tier"),
