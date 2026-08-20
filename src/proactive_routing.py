@@ -170,6 +170,10 @@ def target_channel_kind(target) -> "str | None":
 
     None means "not recognised as any bridge's address" — deliberately NOT
     "foreign". See body_claimable_by for why that distinction is load-bearing.
+
+    Telegram is absent by decision, not omission: its bridge DROPS a `[channel:]`
+    redirect outright, so classifying a telegram chat id would route the file to
+    a bridge guaranteed never to deliver it — the strand this module prevents.
     """
     value = str(target or "").strip()
     for kind, pattern in _TARGET_KINDS:

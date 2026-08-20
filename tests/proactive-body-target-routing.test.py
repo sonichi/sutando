@@ -118,6 +118,19 @@ def main() -> int:
                   f"3) recognised {target[:18]!r}: foreign to {channel} iff it is not {kind}")
     check(body_claimable_by("[channel: garbage]\nx", "telegram"),
           "3) UNRECOGNISED stays claimable (telegram delivers rather than strands)")
+
+    # 3a) Telegram is NOT a target kind BY DECISION: its bridge drops [channel:]
+    #     redirects, so classifying one would route a file to a non-delivery.
+    tg_src = (REPO / "src" / "telegram-bridge.py").read_text(encoding="utf-8")
+    check("silently drops [channel:] redirects" in tg_src,
+          "3a) telegram-bridge still documents that it DROPS a [channel:] redirect")
+    check("parse_markers(reply_text)" in tg_src,
+          "3a) and the drop happens at its parse_markers call, not a private branch")
+    for tg_id in ("12345", "-1001234567890", "987654321"):
+        check(target_channel_kind(tg_id) is None,
+              f"3a) {tg_id} classifies as NO bridge, so nothing routes to telegram")
+        check(body_claimable_by(f"[channel: {tg_id}]\nx", "telegram"),
+              f"3a) and {tg_id} stays claimable by every bridge — delivered, not stranded")
     check(redirect_target_is_foreign("garbage", "discord"),
           "3) UNRECOGNISED is foreign to the default (discord releases it)")
 
