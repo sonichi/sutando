@@ -208,6 +208,14 @@ gc.subprocess.run = lambda *a, **k: _Done(0)
 check(gc.chats_probe("w") is True, "chats probe passes on rc 0")
 gc.subprocess.run = _real_run
 
+print("9a. text fallback: negatives never read as success")
+r, _ = routed(["wacli: not authenticated"], qr_dir)
+check(r.paired is False, "'not authenticated' does not flip paired")
+r, _ = routed(["device unauthenticated, restarting pairing"], qr_dir)
+check(r.paired is False, "'unauthenticated' does not flip paired")
+r, _ = routed(["session authenticated"], qr_dir)
+check(r.paired is True, "positive 'authenticated' still flips paired")
+
 print("9b. router text/edge branches: text pairing code, data.message error")
 r, out = routed(["Enter this pairing code: WXYZ-9876"], qr_dir)
 check("PAIR_CODE: WXYZ-9876" in out, "plain-text pairing code relayed")
@@ -224,6 +232,7 @@ class _FakeProc:
     def __init__(self, stderr_lines):
         self.stdout, self.stderr = iter(()), iter(stderr_lines)
         self._alive, self.killed = True, False
+        self.wait_calls = 0
 
     def poll(self):
         return None if self._alive else 0
@@ -236,6 +245,7 @@ class _FakeProc:
         self._alive = False
 
     def wait(self, timeout=None):
+        self.wait_calls += 1
         return 0
 
 
@@ -244,22 +254,30 @@ _real_aso, _real_cp = gc.auth_status_ok, gc.chats_probe
 
 
 def run_inproc(stderr_lines, *, phone=None, timeout=30, status=True, proc_cls=_FakeProc):
-    gc.subprocess.Popen = lambda *a, **k: proc_cls(stderr_lines)
+    procs = []
+
+    def _spawn(*a, **k):
+        procs.append(proc_cls(stderr_lines))
+        return procs[-1]
+
+    gc.subprocess.Popen = _spawn
     gc.auth_status_ok = lambda w: status
     gc.chats_probe = lambda w: status
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = gc.run_auth("/fake/wacli", phone, timeout, qr_dir)
-    return rc, buf.getvalue()
+    return rc, buf.getvalue(), procs[0]
 
 
-rc, out = run_inproc(['{"event":"connected","data":{},"ts":1}\n'])
+rc, out, pr = run_inproc(['{"event":"connected","data":{},"ts":1}\n'])
 check(rc == 0 and "CONNECTED" in out, "event-driven connect verified in-process")
-rc, out = run_inproc(['{"event":"error","message":"relay down"}\n'])
+rc, out, pr = run_inproc(['{"event":"error","message":"relay down"}\n'])
 check(rc == 1 and "ERROR: relay down" in out, "error event is terminal")
-rc, out = run_inproc([], phone="15551234567", timeout=1, status=False)
+check(pr.wait_calls >= 1 and pr.poll() is not None,
+      f"error exit REAPS the child (wait={pr.wait_calls}, alive={pr.poll() is None})")
+rc, out, pr = run_inproc([], phone="15551234567", timeout=1, status=False)
 check(rc == 1 and "timed out" in out, "quiet stream + dead store -> timeout error")
-rc, out = run_inproc([], timeout=1, status=True)
+rc, out, pr = run_inproc([], timeout=1, status=True)
 check(rc == 0 and "CONNECTED" in out, "timeout path still verifies the store first")
 
 
@@ -269,7 +287,7 @@ class _DeadProc(_FakeProc):
         self._alive = False
 
 
-rc, out = run_inproc([], status=False, proc_cls=_DeadProc)
+rc, out, pr = run_inproc([], status=False, proc_cls=_DeadProc)
 check(rc == 1 and "auth ended without a valid session" in out,
       "stream end without pairing errors without a timeout verdict")
 
@@ -281,9 +299,13 @@ class _StubbornProc(_FakeProc):
         return 0
 
 
-rc, out = run_inproc(['{"event":"connected","data":{},"ts":1}\n'],
-                     proc_cls=_StubbornProc)
+rc, out, pr = run_inproc(['{"event":"connected","data":{},"ts":1}\n'],
+                         proc_cls=_StubbornProc)
 check(rc == 0 and "CONNECTED" in out, "reap escalates to kill when terminate hangs")
+rc, out, pr = run_inproc(['{"event":"error","message":"boom"}\n'],
+                         proc_cls=_StubbornProc)
+check(rc == 1 and pr.killed and pr.poll() is not None,
+      "stubborn child on the ERROR exit is killed, not abandoned")
 gc.subprocess.Popen = _real_popen
 
 print("11. in-process main(): missing wacli / already-connected / delegation")
@@ -311,6 +333,21 @@ gc.run_auth = _real_run_auth
 gc.auth_status_ok, gc.chats_probe = _real_aso, _real_cp
 gc.shutil.which = _real_which
 sys.argv = _real_argv
+
+print("12. instruction contract: guided connect is the authoritative unpaired path")
+skill_md = (REPO / "skills" / "whatsapp" / "SKILL.md").read_text()
+manifest = (REPO / "skills" / "whatsapp" / "manifest.json").read_text()
+tools_md = (REPO / "docs" / "built-in-tools.md").read_text()
+check("guided_connect.py" in skill_md, "SKILL.md names the guided path")
+check("Use after the user has run" not in skill_md.split("---", 2)[1],
+      "SKILL.md description no longer gates on manual wacli auth")
+check("tell the user to run `wacli auth`" not in skill_md,
+      "unpaired guidance no longer sends the user to a terminal")
+check("guided connect" in manifest and "run wacli auth" not in manifest,
+      "manifest description points at guided connect")
+wa_line = next(l for l in tools_md.splitlines() if l.startswith("**WhatsApp**"))
+check("guided connect" in wa_line and "requires `wacli auth` first" not in wa_line,
+      "built-in-tools catalog routes unpaired users to guided connect")
 
 if failures:
     print(f"{len(failures)} FAILURE(S)")

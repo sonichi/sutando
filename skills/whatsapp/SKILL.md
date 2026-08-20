@@ -1,6 +1,6 @@
 ---
 name: whatsapp
-description: Send WhatsApp messages, list chats, and search history via wacli (local CLI backed by a synced store at ~/.wacli). Use after the user has run `wacli auth` to pair the device.
+description: Send WhatsApp messages, list chats, and search history via wacli (local CLI backed by a synced store at ~/.wacli). Unpaired? Run the guided connect flow (scripts/guided_connect.py) from chat — no terminal needed.
 ---
 
 # WhatsApp (wacli)
@@ -11,7 +11,7 @@ Send messages, list chats, and search history using [wacli](https://github.com/s
 
 - The user asks to send a WhatsApp message, list chats, or search WhatsApp history.
 - The user asks "did X message me on WhatsApp?" or similar history-search questions.
-- **Not** available until `wacli auth` has completed on this Mac. Probe with `wacli chats list --limit 1`; if it errors "not authenticated," tell the user to run `wacli auth` (QR-code pairing from their phone).
+- Unpaired Mac? Probe with `wacli chats list --limit 1`; if it errors "not authenticated," run the guided connect flow (`python3 scripts/guided_connect.py --phone <number>`) and relay its protocol lines into chat — the user never opens a terminal. Manual `wacli auth` in a terminal is the explicit fallback only.
 
 ## Install + auth
 
@@ -75,8 +75,8 @@ Phone numbers are in E.164 (`+countrycode...`). For groups, pass the JID returne
 
 ## Failure modes
 
-- `wacli: not authenticated` → user must run `wacli auth` (QR-code flow). One-time per Mac.
-- `wacli: linked device revoked` → user revoked the session from their phone. Re-run `wacli auth`.
+- `wacli: not authenticated` → run the guided connect flow (`scripts/guided_connect.py`) and relay its lines; terminal `wacli auth` only as an explicit fallback. One-time per Mac.
+- `wacli: linked device revoked` → user revoked the session from their phone. Re-run the guided connect flow.
 - `wacli: rate limited` → WhatsApp is throttling. Back off ~30s and retry.
 - Phone-number invalid → confirm the user provided E.164 format with a `+` prefix.
 

@@ -130,6 +130,8 @@ class EventRouter:
         if "passkey" in low:
             self.error = "passkey-gated pairing is not supported by wacli; " \
                          "link once via WhatsApp's QR flow on this Mac instead"
+        elif "not authenticated" in low or "unauthenticated" in low:
+            pass  # known negatives — must never read as a success signal
         elif "authenticated" in low or "pairing successful" in low:
             self.paired = True
         else:
@@ -162,21 +164,21 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
     for t in threads:
         t.start()
 
+    err_terminal = False
     timed_out = False
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if router.error:
-            proc.terminate()
-            emit(f"ERROR: {router.error}")
-            return 1
+            err_terminal = True
+            break
         if router.paired or proc.poll() is not None:
             break
         time.sleep(0.5)
     else:
         timed_out = True
 
-    # wacli outlives `connected` (~30s bootstrap-sync idle exit) — reap it;
-    # the session store is already durable, verification below is the check.
+    # Every exit reaps: wacli outlives `connected` (~30s bootstrap-sync idle
+    # exit), and an error event must not abandon a live child either.
     if proc.poll() is None:
         proc.terminate()
     try:
@@ -184,7 +186,10 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-    # The session store is the authority on every exit path — including
+    if err_terminal:
+        emit(f"ERROR: {router.error}")
+        return 1
+    # The session store is the authority on every non-error exit — including
     # timeout, where an unrecognised event vocabulary may hide a live pairing.
     if auth_status_ok(wacli) and chats_probe(wacli):
         emit("CONNECTED")
