@@ -1,17 +1,5 @@
-/**
- * Behavioural guard for the context-drop → live-session injection path.
- *
- * Two producers write a context drop and only one of them creates
- * context-drop.txt: the desktop app writes its `source: context-drop` task file
- * directly. scanDropTask() is what lets the watcher see both, so it is tested
- * against the real bytes each producer emits.
- *
- * The load-bearing case is `incomplete`: a half-written file must NOT classify
- * as `other`, because the watcher records `other` permanently and would drop
- * that context on the floor.
- *
- * Run: node --import tsx/esm tests/task-bridge-context-drop-scan.test.ts
- */
+/** Guards context-drop → live-session injection against the real bytes each of
+ *  the two producers emits. Run: node --import tsx/esm <this file> */
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -116,10 +104,8 @@ describe('scanDropTask', () => {
 		assert.deepEqual(scanDropTask(p), { kind: 'drop', body: 'the selected paragraph' });
 	});
 
-	// --- trust boundary: `source:` is a header field, never body -------------
-	// Scanning the whole file let a `source: context-drop` line placed AFTER
-	// `task:` classify as a drop. The watcher then injected it into the live
-	// owner session via frameContextDrop(), which attributes it to the owner.
+	// Trust boundary: scanning the whole file let a body line forge
+	// `source: context-drop` into the owner-attributed live session.
 
 	it('a post-`task:` source line does NOT forge a drop', () => {
 		const p = write('task-1787158077777.txt',
@@ -165,12 +151,8 @@ describe('scanDropTask', () => {
 	});
 });
 
-/**
- * A core claim renames `task-X.txt` -> `task-X.claimed-core-N.txt`
- * (src/task_archive.py). Both spellings pass the watcher's `task-*.txt` filter,
- * so anything keyed on the raw basename sees a claim as a NEW task: the drop is
- * injected twice, and a seeded drop replays into a fresh owner session.
- */
+/** A claim rename passes the same filter, so keying on the raw basename sees it
+ *  as NEW: the drop injects twice and a seeded drop replays. */
 describe('claim rename is the same logical task', () => {
 	it('collapses the claimed spelling onto the bare one', () => {
 		assert.equal(logicalTaskName('task-X.txt'), 'task-X.txt');
@@ -260,11 +242,8 @@ describe('findTaskFile locates both spellings', () => {
 	});
 });
 
-/**
- * The scan and the result loop MUST share one classifier. An unanchored test
- * also claims `context-drop-replay`, which the scan buckets as `other` — so its
- * reply would be archived as a context drop and silently never delivered.
- */
+/** Scan and result loop must share one classifier: an unanchored test claims
+ *  `context-drop-replay`, whose reply is then archived undelivered. */
 describe('isContextDropHeader is exact and shared', () => {
 	const hdr = (src: string) => `id: task-Z\nsource: ${src}\ntask: body\n`;
 
@@ -279,9 +258,8 @@ describe('isContextDropHeader is exact and shared', () => {
 	});
 
 	it('control: the UNANCHORED form this replaced does accept it', () => {
-		// The defect, pinned so the fix cannot be silently reverted: the result
-		// loop used /^source:\s*context-drop/m, which claims context-drop-replay
-		// while scanDropTask's anchored test buckets it as `other`.
+		// Pinned so the fix cannot be silently reverted: the loop's unanchored
+		// regex claimed context-drop-replay while the scan bucketed it `other`.
 		const unanchored = /^source:\s*context-drop/m;
 		assert.equal(unanchored.test(hdr('context-drop-replay')), true, 'old form matched — that was the bug');
 		assert.equal(isContextDropHeader(hdr('context-drop-replay')), false, 'shared form does not');
