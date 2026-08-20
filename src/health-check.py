@@ -3345,9 +3345,12 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
 
     restarted = []
     for c in checks:
+        # The name gate is NOT redundant with the detail match: for an unknown
+        # name the lookup is None, and a check with no detail is also None.
         if not (
-            c["status"] == "warn"
-            and c.get("detail") == DOWN_BRIDGE_DETAILS.get(c["name"])
+            c["name"] in DOWN_BRIDGE_DETAILS
+            and c["status"] == "warn"
+            and c.get("detail") == DOWN_BRIDGE_DETAILS[c["name"]]
         ):
             continue
         name = c["name"]

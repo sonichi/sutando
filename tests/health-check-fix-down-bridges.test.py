@@ -20,6 +20,7 @@ Guards:
   z) gateway-bridge's non-down warns describe a LIVE process → never respawned
  aa) a tokenless gateway yields no launch plan (alert, not a crash-loop)
  ab) AG2_REMOTE_TOKEN alone is enough, matching _gateway_configured()
+ ac) a non-bridge name with absent/None detail is NEVER restarted
 
 Second incident (2026-08-20): the gateway bridge — the ag2.space carrier — was
 the one channel bridge this path excluded, and its check name differs from its
@@ -156,6 +157,30 @@ def case_z_gateway_other_warns_never_respawn() -> list[str]:
     restarted, spawned = run_with_popen_stub(checks)
     if restarted or spawned:
         fails.append(f"z) non-down gateway warns must not respawn: {restarted} {spawned}")
+    return fails
+
+
+def case_ac_unknown_name_without_detail_is_untouched() -> list[str]:
+    """Reported by Sutando (rui) on #3203 and reproduced against the production
+    function before fixing. Matching only on the per-bridge detail lets an
+    unknown name through: the lookup is None, a check with no `detail` is also
+    None, and `None == None` restarts it — `_launch_bridge` then puts the check
+    NAME into a path, so `voice-agent` spawned `src/voice-agent.py`.
+
+    Existing case (c) cannot catch this: it pairs a non-bridge name with a real
+    bridge detail, which fails the match either way. The discriminator is a
+    non-bridge name whose detail is absent or None."""
+    fails = []
+    for label, chk in (
+        ("no detail key", {"name": "voice-agent", "status": "warn"}),
+        ("detail None", {"name": "voice-agent", "status": "warn", "detail": None}),
+        ("unknown + gateway detail", {"name": "voice-agent", "status": "warn",
+                                      "detail": hc.GATEWAY_DOWN_DETAIL}),
+    ):
+        restarted, spawned = run_with_popen_stub([chk])
+        if restarted or spawned:
+            fails.append(f"ac) {label}: non-bridge check must never restart — "
+                         f"got {restarted} {spawned}")
     return fails
 
 
@@ -1134,7 +1159,8 @@ def main() -> int:
                  case_y_gateway_bridge_down_is_restarted,
                  case_z_gateway_other_warns_never_respawn,
                  case_aa_gateway_plan_requires_a_token,
-                 case_ab_ag2_remote_token_alias_is_accepted):
+                 case_ab_ag2_remote_token_alias_is_accepted,
+                 case_ac_unknown_name_without_detail_is_untouched):
         fails = case()
         status = "PASS" if not fails else "FAIL"
         print(f"  {status} {case.__name__}")
