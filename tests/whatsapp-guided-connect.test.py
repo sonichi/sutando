@@ -425,25 +425,26 @@ check("steipete" not in skill_md and "steipete" not in script_src,
 check("openclaw/tap/wacli" in skill_md and "openclaw/tap/wacli" in script_src,
       "install/upgrade surfaces name the maintained openclaw tap")
 
-# Assert the default-dir QR clears send_allowlist (the delivery contract that
-# output/existence checks miss); the system-temp control pins the old failure.
+# The QR must clear send_allowlist or delivery is denied. Negative control
+# models the pre-fix /tmp/whatsapp-qr- shape directly (denied on all platforms).
+sys.path.insert(0, str(REPO / "src"))
+from send_allowlist import is_path_sendable
+_fd, _old_shape = tempfile.mkstemp(prefix="whatsapp-qr-", suffix=".png", dir="/tmp")
+os.close(_fd)
+check(not is_path_sendable(_old_shape),
+      "control: the pre-fix /tmp/whatsapp-qr- shape is NOT deliverable")
+os.unlink(_old_shape)
 try:
     import qrcode  # noqa: F401
     _qr_ok = True
 except ImportError:
     _qr_ok = False
 if _qr_ok:
-    sys.path.insert(0, str(REPO / "src"))
-    from send_allowlist import is_path_sendable
     _default_qr = gc.render_qr_png("2@deliverable-payload", gc._SENDABLE_QR_DIR)
     check(_default_qr is not None and is_path_sendable(_default_qr),
           "QR rendered into the default dir is deliverable through the bridges")
-    _sys_temp_qr = gc.render_qr_png("2@denied-payload", tempfile.gettempdir())
-    check(not is_path_sendable(_sys_temp_qr),
-          "control: the old system-temp render was NOT deliverable (the bug)")
-    for _p in (_default_qr, _sys_temp_qr):
-        if _p:
-            os.unlink(_p)
+    if _default_qr:
+        os.unlink(_default_qr)
 
 if failures:
     print(f"{len(failures)} FAILURE(S)")
