@@ -2417,6 +2417,32 @@ def _age_phrase(age_s) -> str:
     return "age unknown" if age_s is None else f"{age_s}s ago"
 
 
+def _last_fetch_age_s(repo, git_bin: str) -> "int | None":
+    """Seconds since this checkout last contacted its remote, or None.
+
+    FETCH_HEAD is rewritten by every fetch, including one that finds nothing new;
+    refs/remotes/* only moves when the remote does, so it under-reports silence.
+    """
+    try:
+        out = subprocess.run([git_bin, "-C", str(repo), "rev-parse", "--git-common-dir"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        common = Path(out.stdout.strip())
+        if not common.is_absolute():
+            common = Path(repo) / common
+        return max(int(time.time() - (common / "FETCH_HEAD").stat().st_mtime), 0)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def _fetch_age_phrase(age_s) -> str:
+    """A currency claim with no fetch behind it is worth naming, not omitting."""
+    if age_s is None:
+        return "no fetch recorded in this checkout"
+    return f"a fetch {age_s // 3600}h{age_s % 3600 // 60}m ago"
+
+
 def check_onboarding_status() -> "dict | None":
     """Read the desktop checklist's agent surface (onboarding v2 spec,
     ag2space-cinny-desktop#165 S4).
@@ -2931,7 +2957,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # census costs ten 5s-timeout pgreps to say so. None is unanswerable, so it probes.
     if behind == 0:
         return {"name": name, "status": "ok",
-                "detail": f"live checkout on {expected!r}"}
+                "detail": f"live checkout on {expected!r} "
+                          f"({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin))})"}
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     # LIVE processes only: `src/` moves several times a day, so the running set
     # is what keeps this from becoming the alert fatigue the threshold prevents.
@@ -2978,7 +3005,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           f"{refresh} + restart the affected service. {tail}"}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
-                      + (f", {behind} commits behind" if behind else "")}
+                      + (f", {behind} commits behind" if behind else "")
+                      + f" ({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin))})"}
 
 
 def check_engine_revision_drift(repo_dir: "Path | None" = None,

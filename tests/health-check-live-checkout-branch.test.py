@@ -74,6 +74,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -257,6 +258,45 @@ def main() -> int:
         r = hc.check_live_checkout_branch(work)
         check(r["status"] == "ok" and "behind" not in r["detail"],
               f"l) up-to-date -> clean ok, got {r}")
+
+    # l2) "0 behind" is a claim about the remote and this probe never fetches, so a
+    #     clean verdict is only as current as the last fetch. Say when that was.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        r = hc.check_live_checkout_branch(work)
+        check("fetch" in r["detail"],
+              f"l2) clean verdict names its fetch age, got {r['detail']}")
+
+    # l3) Backdating FETCH_HEAD alone must move the age: `refs/remotes/*` moves only
+    #     when the remote does, so a reading taken from it would call a quiet main stale.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        fh = common / "FETCH_HEAD"
+        fh.touch()
+        old = time.time() - (26 * 3600 + 5 * 60)
+        os.utime(fh, (old, old))
+        r = hc.check_live_checkout_branch(work)
+        check("26h5m" in r["detail"],
+              f"l3) age tracks FETCH_HEAD mtime, got {r['detail']}")
+
+    # l4) With no fetch on record, say so. A fabricated "0h0m ago" reads as maximally
+    #     fresh — this disclosure's own failure mode, inverted.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        (common / "FETCH_HEAD").unlink(missing_ok=True)
+        r = hc.check_live_checkout_branch(work)
+        check("no fetch recorded" in r["detail"] and "h0m" not in r["detail"],
+              f"l4) absent FETCH_HEAD is named, not rendered as fresh, got {r['detail']}")
 
     # Behavioral staleness (added 2026-08-03). The count threshold above is
     # deliberately 10 and case k) pins that 1 behind stays ok — both correct for
