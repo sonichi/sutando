@@ -165,6 +165,40 @@ class TestLogsExcerpt(unittest.TestCase):
             self.assertEqual(report_feedback.logs_excerpt(ws), (None, []))
 
 
+class TestWhyNoLogs(unittest.TestCase):
+    """Logs are on by default, so their absence must be explained, not silent."""
+
+    def test_names_the_missing_directory(self):
+        """The reproduced case: a fresh checkout / worktree / CI runner.
+
+        `workspace/*` is gitignored, so `<workspace>/logs` does not exist there
+        and logs_excerpt() returns (None, []) — indistinguishable, before this,
+        from a report that never asked for logs.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            why = report_feedback.why_no_logs(Path(td))
+        self.assertIn("no logs directory", why)
+        self.assertIn(str(Path(td) / "logs"), why,
+                      "the reader needs the path that was looked at")
+
+    def test_an_empty_directory_is_not_a_missing_one(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "logs").mkdir()
+            why = report_feedback.why_no_logs(Path(td))
+        self.assertIn("no .log files", why)
+        self.assertNotIn("no logs directory", why)
+
+    def test_present_but_unreadable_is_its_own_reason(self):
+        """Pairs with test_unreadable_log_is_swallowed above: that one proves
+        the excerpt is dropped, this one proves the drop is now explained."""
+        with tempfile.TemporaryDirectory() as td:
+            logs = Path(td) / "logs"
+            logs.mkdir()
+            (logs / "bad.log").mkdir()
+            why = report_feedback.why_no_logs(Path(td))
+        self.assertIn("could not be read", why)
+
+
 class _FakeResp:
     status = 200
 
@@ -196,6 +230,44 @@ class TestMain(unittest.TestCase):
                 mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
             self._run(["--title", "hello", "--no-logs"])
         self.assertEqual(uo.call_count, 1)
+
+    def _posted_context(self, argv, ws):
+        seen = {}
+
+        def _capture(req, *a, **k):
+            seen["ctx"] = json.loads(req.data.decode())["context"]
+            return _FakeResp()
+
+        with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
+            self._run(argv)
+        return seen["ctx"]
+
+    def test_absent_logs_are_explained_in_the_posted_context(self):
+        """THE BUG: Odoo tickets carried exactly {source, platform, python}."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx = self._posted_context(["--title", "hello"], Path(td))
+        self.assertNotIn("last_logs_excerpt", ctx)
+        self.assertIn("logs_omitted", ctx)
+        self.assertIn("no logs directory", ctx["logs_omitted"])
+
+    def test_present_logs_carry_no_omission_note(self):
+        """Mutation guard: the note must not fire when logs actually shipped."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "logs").mkdir()
+            (ws / "logs" / "a.log").write_text("hello\n")
+            ctx = self._posted_context(["--title", "hello"], ws)
+        self.assertIn("last_logs_excerpt", ctx)
+        self.assertNotIn("logs_omitted", ctx)
+
+    def test_no_logs_flag_is_not_an_omission_to_explain(self):
+        """--no-logs is the user's choice, not a failure to report."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx = self._posted_context(["--title", "hello", "--no-logs"], Path(td))
+        self.assertNotIn("logs_omitted", ctx)
+        self.assertNotIn("last_logs_excerpt", ctx)
 
     def test_successful_post_sets_explicit_user_agent(self):
         with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \

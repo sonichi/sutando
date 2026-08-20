@@ -118,6 +118,16 @@ def read_cloud_auth(ws: Path):
     return None, None
 
 
+def why_no_logs(ws: Path) -> str:
+    """Why logs_excerpt() came back empty, in words a ticket reader can act on."""
+    logs = ws / "logs"
+    if not logs.is_dir():
+        return f"no logs directory at {logs} (reporter ran outside a live workspace)"
+    if not any(f.suffix == ".log" for f in logs.iterdir()):
+        return f"{logs} has no .log files"
+    return f"{logs} exists but its log files could not be read"
+
+
 def logs_excerpt(ws: Path):
     """Last 40 lines of the 4 most-recent <workspace>/logs/*.log (capped ~8KB)."""
     try:
@@ -163,6 +173,10 @@ def main() -> None:
         if excerpt:
             ctx["last_logs_excerpt"] = excerpt
             ctx["log_files"] = names
+        else:
+            # Logs are on by default, so silence here is indistinguishable from
+            # a report that never wanted them. Say why they are absent.
+            ctx["logs_omitted"] = why_no_logs(ws)
 
     payload = {
         "kind": a.kind,
