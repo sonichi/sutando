@@ -4730,7 +4730,10 @@ async def poll_results():
                 if _guard_tier == "unknown":
                     _guard_tf = find_task_file(TASKS_DIR, task_id)
                     _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
-                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO)
+                # A Discord channel is a human surface: the suppression is journaled
+                # under STATE_DIR and closed silently rather than posted as prose.
+                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO,
+                                                             suppress_journal=(STATE_DIR, task_id))
                 if _withheld:
                     print(f"  [team-guard] withheld result for {task_id} "
                           f"(tier={_guard_tier}): {_withheld}", flush=True)
