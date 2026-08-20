@@ -212,8 +212,10 @@ migrate_root_status_to_state() {
 # migrator would have skipped the move silently. Both cases now require
 # explicit invocation of `bash scripts/sutando-migrate.sh`.
 legacy_state_notice() {
-  local notice_sentinel="$WORKSPACE/.legacy-notice-printed"
-  if [ -f "$notice_sentinel" ]; then
+  # Under state/: the workspace root is reserved for top-level directories, and
+  # the legacy root path is still honoured so installs don't re-print the notice.
+  local notice_sentinel="$WORKSPACE/state/.legacy-notice-printed"
+  if [ -f "$notice_sentinel" ] || [ -f "$WORKSPACE/.legacy-notice-printed" ]; then
     return 0
   fi
   local found=()
@@ -239,7 +241,7 @@ legacy_state_notice() {
       echo "    Auto-migration is disabled as of #1169 (option B)."
       echo "    Run \`bash scripts/sutando-migrate.sh --dry-run\` to preview, then \`--commit\` to relocate."
     } >&2
-    : > "$notice_sentinel"
+    mkdir -p "$(dirname "$notice_sentinel")" && : > "$notice_sentinel"
   fi
 }
 
