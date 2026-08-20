@@ -843,14 +843,13 @@ _snapshot_per_host_config() {
         cp -p "$_ch" "$_host_dir/channels/$_svc/access.json" 2>/dev/null || true
     done
 
-    # build_log.md is per-host (F1 decision) but its loop-writer keeps it at the
-    # workspace root and reads it from there — so it's snapshot-model like the
-    # files above (live at root, backup here; nothing reads the hosts/ copy live,
-    # so no read/write skew). Its root entry is dropped from vault.sync.include
-    # in tandem with this (it was colliding across hosts as a bare carried path);
-    # this snapshot is what carries it per-host instead.
+    # Root build_log.md is live only on hosts whose loop-writer still uses it;
+    # an unconditional copy clobbers a per-host log that has since become live.
     if [ -f "$WORKSPACE_DIR/build_log.md" ]; then
-        cp -p "$WORKSPACE_DIR/build_log.md" "$_host_dir/build_log.md" 2>/dev/null || true
+        if [ ! -f "$_host_dir/build_log.md" ] \
+                || [ "$WORKSPACE_DIR/build_log.md" -nt "$_host_dir/build_log.md" ]; then
+            cp -p "$WORKSPACE_DIR/build_log.md" "$_host_dir/build_log.md" 2>/dev/null || true
+        fi
     fi
     return 0
 }
