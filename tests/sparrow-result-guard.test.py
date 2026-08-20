@@ -22,6 +22,51 @@ m = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
 fail = 0
 
 
+# Captured ONCE, before any helper rebinds m._STATE. Reading m._STATE at call
+# time fingerprints whichever tmpdir the last helper left behind, not the host.
+_OPERATOR_STATE_ROOT = pathlib.Path(m._STATE)
+
+# Rebinding _STATE alone is NOT enough: these are computed at IMPORT from the
+# module value, so they keep pointing at the operator's home afterwards.
+_STATE_DERIVED = ("INFLIGHT_FILE", "TASK_ROOMS_FILE", "DEDUP_ALIAS_FILE",
+                  "GATEWAY_STATUS_FILE", "OWNER_ACTIVITY_FILE",
+                  "_WITHHELD_DM_CACHE", "_WITHHELD_CONTROL_DIR")
+
+
+def _bind_state(root):
+    """Point _STATE and every import-time derived path at `root`. Returns undo()."""
+    saved = {"_STATE": m._STATE}
+    root = pathlib.Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    m._STATE = root
+    for name in _STATE_DERIVED:
+        if hasattr(m, name):
+            old = pathlib.Path(getattr(m, name))
+            saved[name] = old
+            setattr(m, name, root / old.name)
+
+    def undo():
+        for name, value in saved.items():
+            setattr(m, name, value)
+    return undo
+
+
+def _operator_state_fingerprint():
+    """(path, size, mtime) for every file under the REAL _STATE, sorted."""
+    root = _OPERATOR_STATE_ROOT
+    if not root.exists():
+        return ()
+    out = []
+    for f in sorted(root.rglob("*")):
+        if f.is_file():
+            st = f.stat()
+            out.append((str(f.relative_to(root)), st.st_size, st.st_mtime_ns))
+    return tuple(out)
+
+
+_OPERATOR_STATE_BEFORE = _operator_state_fingerprint()
+
+
 def check(cond, label):
     global fail
     print(("PASS: " if cond else "FAIL: ") + label)
@@ -282,10 +327,7 @@ def drain_once(tids, provenance=()):
     m.TASKS_DIR = tasks
     m.RESULTS_DIR = results
     m.ARCHIVE_RESULTS_DIR = results / "archive"
-    # _STATE too: the drain journals suppressions now, and the module-level
-    # value is the OPERATOR's ~/.ag2-sparrow/state.
-    real_state = m._STATE
-    m._STATE = root / "state"
+    _undo_state = _bind_state(root / "state")
     m._REDELIVERED.clear()
     for tid in tids:
         write_task(tasks, tid, "team")
@@ -303,7 +345,7 @@ def drain_once(tids, provenance=()):
         return posted, inflight
     finally:
         m._req = real_req
-        m._STATE = real_state
+        _undo_state()
 
 
 # THE security property, post-#3108: a guarded tier may suppress its own
@@ -337,6 +379,7 @@ def drain_two_pass():
     m.TASKS_DIR = tasks
     m.RESULTS_DIR = results
     m.ARCHIVE_RESULTS_DIR = results / "archive"
+    _undo_two = _bind_state(root / "state")
     m._REDELIVERED.clear()
     tid = "task-retry"
     write_task(tasks, tid, "team")
@@ -366,6 +409,7 @@ def drain_two_pass():
         return first, second
     finally:
         m._req = real_req
+        _undo_two()
 
 
 first, second = drain_two_pass()
@@ -377,6 +421,14 @@ check(len(second[2]) == 1 and "[no-send]" in second[2][0]["body"],
       "the retry posts the bridge's OWN control, not the guard's notice")
 check(second[0] is False and second[1] is False,
       "the record retires only WITH the result, once the POST actually succeeds")
+
+# Two helpers leaked here before this guard existed. A census is a one-time act;
+# this is the invariant, so a third cannot reintroduce it quietly.
+_after = _operator_state_fingerprint()
+check(_after == _OPERATOR_STATE_BEFORE,
+      "HERMETIC: the operator's ~/.ag2-sparrow/state is untouched by this suite")
+if _after != _OPERATOR_STATE_BEFORE:
+    print(f"       before={_OPERATOR_STATE_BEFORE}\n       after ={_after}")
 
 if fail:
     print("FAIL: sparrow result guard")
