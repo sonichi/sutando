@@ -6285,15 +6285,17 @@ def check_proactive_quarantine() -> dict:
     the owner never saw was also destroyed — observed live here as
     `413 Payload Too Large (error code: 40005)`. The fix (#2626) moves the body
     to `results/undelivered/` instead of deleting it, which is strictly better
-    and still ends with nobody being told: a scan of the whole tree at that
+    but left the body with no consumer: a scan of the whole tree at that
     change's head finds the writer and **no reader at all**. The nearest
     candidate, `friction-detector.check_stale_results()`, is a stub that returns
     `[]` and is never called.
 
-    That is the shape this probe exists to close. Preservation without a reader
-    is a message that exists on disk and reaches no one — the same failure as
-    deletion from the owner's side, minus the recoverability. Losing it loudly
-    at least surfaces; losing it quietly does not.
+    That is the shape this probe exists to close, which makes it the reader —
+    so "nobody has been told" stopped being true the moment this shipped, and
+    saying it here or in what this probe emits invites the output to be quoted
+    back as independent evidence that no reader exists. What stays true is
+    narrower: nothing drains or re-drives the directory, so a preserved body
+    reaches no one until someone acts. Warning is not delivering.
 
     Deliberately NOT a failure: quarantine is the correct end state for a body
     Discord will never accept (a 413 never becomes a 200). The action is for a
