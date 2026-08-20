@@ -4751,7 +4751,12 @@ async def poll_results():
                     # — notify in-channel instead (owner-directed).
                     if _skip.value == "deduped" and _skip.extra:
                         try:
-                            _holder_file = find_task_file(TASKS_DIR, _skip.extra)
+                            # find_task_file globs unchecked; an id failing the
+                            # gate find_result applies is "holder not found".
+                            _holder_file = (
+                                find_task_file(TASKS_DIR, _skip.extra)
+                                if local_task_protocol.valid_archive_lookup_id(_skip.extra)
+                                else None)
                             _holder_text = _holder_file.read_text() if _holder_file else None
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
                             _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)

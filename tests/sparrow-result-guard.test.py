@@ -167,28 +167,22 @@ with tempfile.TemporaryDirectory() as td:
     check(aowner == BODY_WITH_MARKERS and aowner_withheld is None,
           "a MONTH-ARCHIVED owner task still passes through byte-identical")
 
-    # Provenance is THIS PROCESS'S RECORD, not the bytes and not a file. Same
-    # body, opposite verdicts.
+    # Suppression is no longer a guarded control, so a Team result CLOSING its
+    # own lease is now allowed by design and the replay provenance no longer
+    # decides delivery. The record still exists and is left alone here: making
+    # it redundant is this change, removing it is a separate one.
     write_task(tasks, "task-replay", "team")
     m.RESULTS_DIR = results = pathlib.Path(td) / "results"
     results.mkdir(exist_ok=True)
 
     forged, forged_withheld = m._guarded_result_body(
         "task-replay", m.GATEWAY_REDELIVERY_RESULT)
-    check(forged_withheld is not None,
-          "a TEAM result emitting the replay bytes WITHOUT the record is withheld")
-    check(not any(a.kind == "skip" for a in m.parse_markers(forged).actions),
-          "and forged delivery-control bytes still cannot close their own lease")
-
-    # The collaborator path has full workspace write, so it can create any
-    # sidecar the guard reads: the OLD one must no longer buy anything.
-    (results / "task-replay.replay").write_text("")
-    spoof, spoof_withheld = m._guarded_result_body(
-        "task-replay", m.GATEWAY_REDELIVERY_RESULT)
-    check(spoof_withheld is not None,
-          "a collaborator-written .replay sidecar does NOT flip the verdict")
-    check(not any(a.kind == "skip" for a in m.parse_markers(spoof).actions),
-          "so a forged sidecar still cannot close the lease")
+    check(forged_withheld is None and forged == m.GATEWAY_REDELIVERY_RESULT,
+          "a TEAM result emitting the replay bytes WITHOUT the record is honoured")
+    check(any(a.kind == "skip" for a in m.parse_markers(forged).actions),
+          "and closes its own lease — suppression moves no data")
+    check(m._team_guard_fns()[4](m._STATE, "task-replay").is_file() is False,
+          "and it is not filed for private owner review")
 
     m._REDELIVERED.add("task-replay")
     real, real_withheld = m._guarded_result_body(
@@ -208,11 +202,16 @@ with tempfile.TemporaryDirectory() as td:
           "into a visible withheld notice on the retry")
     m._REDELIVERED.discard("task-replay")
 
-    # An agent-produced [no-send] on a Team task stays forbidden.
+    # An agent-produced [no-send] on a Team task is honoured AND recorded: the
+    # gateway binds the journal too, so the ag2space path is not the adapter
+    # that honours a close with no record of it.
     write_task(tasks, "task-mark", "team")
     ctrl, ctrl_withheld = m._guarded_result_body("task-mark", "[no-send]\n")
-    check(ctrl_withheld is not None,
-          "an AGENT-produced [no-send] on a Team task is still withheld")
+    check(ctrl == "[no-send]\n" and ctrl_withheld is None,
+          "an AGENT-produced [no-send] on a Team task is honoured verbatim")
+    from ag2_sparrow.team_result_guard import suppressed_record_path
+    check(suppressed_record_path(m._STATE, "task-mark").is_file(),
+          "and the gateway journals it — honoured is not the same as unrecorded")
 
     # Named instances emit `task-<inst>~<broker-id>`, which the archive lookup
     # rejected — so an archived owner task read as guest and got withheld.

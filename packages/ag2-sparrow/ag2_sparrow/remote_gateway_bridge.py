@@ -189,7 +189,6 @@ from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
 from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROVENANCE
-from . import team_result_guard
 from .outbox import DeliveryOutcome
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -562,6 +561,9 @@ def _team_guard_fns():
     """Load the BUNDLED guard; an installed wheel has no monorepo src/."""
     from .team_result_guard import (
         classify_result_for_tier,
+        is_guarded_tier,
+        is_suppression_only,
+        journal_suppressed_result,
         materialize_withheld_verdict,
         resolve_access_tier,
         sensitive_data_filter_enabled,
@@ -569,7 +571,8 @@ def _team_guard_fns():
     )
     return (classify_result_for_tier, materialize_withheld_verdict,
             resolve_access_tier, sensitive_data_filter_enabled,
-            withheld_review_path)
+            withheld_review_path, journal_suppressed_result,
+            is_suppression_only, is_guarded_tier)
 
 
 def _atomic_private_json(path: Path, payload: dict) -> None:
@@ -952,7 +955,8 @@ def _guarded_result_body(tid: str, body: str):
     if tid in _WITHHELD_TASK_OUTPUT:
         return _WITHHELD_TASK_OUTPUT[tid]
     try:
-        classify, materialize, resolve, filter_enabled, review_path = _team_guard_fns()
+        (classify, materialize, resolve, filter_enabled, review_path,
+         journal_suppression, suppression_only, guarded_tier) = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
         return None, f"team_result_guard unavailable: {exc}"
@@ -978,6 +982,12 @@ def _guarded_result_body(tid: str, body: str):
     verdict = materialize(
         verdict, body, _STATE, tid, context=context, agent_id=agent_id,
         now=time.time())
+    if guarded_tier(tier) and suppression_only(body):
+        # Honouring a guarded close without recording it is the accountability
+        # gap the guard used to answer with a refusal.
+        verdict = journal_suppression(
+            verdict, body, _STATE, tid, context=context, agent_id=agent_id,
+            now=time.time())
     if is_leak:
         artifact = review_path(_STATE, tid)
         if not artifact.is_file():
@@ -2938,14 +2948,17 @@ def _dedup_plan(tid: str, holder_id: str | None):
     return action, payload, room
 
 
-def _result_tier(tid: str) -> "str | None":
-    """Resolve the task tier; unknown provenance stays on the guarded path."""
-    try:
-        tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
-        return (team_result_guard.resolve_access_tier(tfile)
-                if tfile is not None else "guest")
-    except Exception:
-        return None
+def _lease_close_body(skip) -> str:
+    """Canonical bytes for a lease close — the marker, never the sender's prose.
+
+    The guard decides THAT a result is suppressed; what rides this wire is the
+    transport's own choice, and nobody reads a suppressed body.
+    """
+    if skip.value == "deduped":
+        extra = (skip.extra or "").strip()
+        return (f"[deduped: {extra}]"
+                if local_task_protocol.valid_archive_lookup_id(extra) else "[no-send]")
+    return "[REPLIED]" if skip.value == "REPLIED" else "[no-send]"
 
 
 def _post_ready_results(inflight: set[str]) -> None:
@@ -2959,15 +2972,9 @@ def _post_ready_results(inflight: set[str]) -> None:
         raw = read_ready_result(rfile)
         if raw is None:
             continue
-        # The guard owns the suppression verdict; this journaled transport
-        # applies it as a canonical stub with no collaborator-controlled bytes.
-        _tier = _result_tier(tid)
-        stub = (team_result_guard.suppression_stub_for_tier(raw, _tier)
-                if _tier is not None else None)
-        if stub is not None:
-            body, _withheld = stub, None
-        else:
-            body, _withheld = _guarded_result_body(tid, raw)
+        # The guard honours suppression on every tier now, so there is no stub
+        # to pre-apply; the ordinary guarded path returns the body unchanged.
+        body, _withheld = _guarded_result_body(tid, raw)
         if body is None:
             _log(f"result guard unavailable for {tid} — leaving for retry")
             continue
@@ -3018,7 +3025,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                     _log(f"delivery deferred for {tid} — alias ledger unreadable")
                     continue
                 _req("POST", "/v1/results",
-                     {"id": _broker_tid(_delivery), "body": body,
+                     {"id": _broker_tid(_delivery), "body": _lease_close_body(skip),
                       "no_send": True})
             except urllib.error.HTTPError as e:
                 _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
