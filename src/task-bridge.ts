@@ -618,7 +618,40 @@ export function getRecentConversation(count = 10): string {
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
 const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
 
-/** Drop task files already handed to the live session, so a re-scan cannot re-inject. */
+/**
+ * `task-X.txt` and `task-X.claimed-core-1.txt` are the same task — claim_task.py
+ * renames on claim (see src/task_archive.py) and both spellings pass this scan's
+ * filter. Key anything task-identity-shaped on this, never the raw basename.
+ */
+export function logicalTaskName(basename: string): string {
+	return basename.replace(/\.claimed-core-\d+\.txt$/, '.txt');
+}
+
+/**
+ * Exact `source: context-drop` in the header. Shared by the scan and the result
+ * loop so they cannot disagree: an unanchored test also claims `context-drop-replay`,
+ * which classifies as `other` for injection, so its reply would be archived undelivered.
+ */
+export function isContextDropHeader(raw: string): boolean {
+	return /^source:[ \t]*context-drop[ \t]*$/m.test(headerRegion(raw).join('\n'));
+}
+
+/** Locate a task file across bare and claimed spellings — TS mirror of task_archive.find_task_file. */
+export function findTaskFile(dir: string, taskId: string): string | null {
+	const bare = join(dir, `${taskId}.txt`);
+	if (existsSync(bare)) return bare;
+	try {
+		const claimed = readdirSync(dir)
+			.filter((n) => n.startsWith(`${taskId}.claimed-core-`) && n.endsWith('.txt'))
+			.sort();
+		return claimed.length ? join(dir, claimed[0]) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Drop task files already handed to the live session, so a re-scan cannot re-inject.
+ *  Holds LOGICAL names (see logicalTaskName) — a claim rename must not read as new. */
 const _injectedDropTasks = new Set<string>();
 /** First scan only records what is already queued — a restart must not replay old drops. */
 let _seedingDropTasks = true;
@@ -638,7 +671,7 @@ export function scanDropTask(path: string): DropTaskScan {
 	// context-drop` line sitting after `task:`, i.e. inside attacker-supplied
 	// body, so a Guest gateway task could be injected into the live owner
 	// session. Both real producers write `source:` before `task:`.
-	if (!/^source:[ \t]*context-drop[ \t]*$/m.test(headerRegion(raw).join('\n'))) {
+	if (!isContextDropHeader(raw)) {
 		// A header still being written has no source line yet; re-read next tick.
 		return /^task:/m.test(raw) ? { kind: 'other' } : { kind: 'incomplete' };
 	}
@@ -703,18 +736,19 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 			const present = readdirSync(TASK_DIR);
 			// Archived tasks can never be re-read, so their claims are dead weight.
 			if (_injectedDropTasks.size > 500) {
-				const live = new Set(present);
+				const live = new Set(present.map(logicalTaskName));
 				for (const seen of _injectedDropTasks) if (!live.has(seen)) _injectedDropTasks.delete(seen);
 			}
 			for (const name of present) {
 				if (!name.startsWith('task-') || !name.endsWith('.txt')) continue;
-				if (_injectedDropTasks.has(name)) continue;
+				const logical = logicalTaskName(name);
+				if (_injectedDropTasks.has(logical)) continue;
 				let scan: DropTaskScan;
 				try {
 					scan = scanDropTask(join(TASK_DIR, name));
 				} catch { continue; }
 				if (scan.kind === 'incomplete') continue;
-				_injectedDropTasks.add(name);
+				_injectedDropTasks.add(logical);
 				if (scan.kind !== 'drop' || _seedingDropTasks) continue;
 				console.log(`${ts()} [TaskBridge] Context drop detected: ${scan.body.slice(0, 100)}`);
 				onContextDrop(scan.body);
@@ -1084,13 +1118,13 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					// Companion fix: Sutando.app main.swift writeTask() must include this field.
 					// Issue: https://github.com/sonichi/sutando/issues/969
 					if (taskId.startsWith('task-')) {
-						const ctxTaskFile = join(TASK_DIR, `${taskId}.txt`);
-						if (existsSync(ctxTaskFile)) {
+						const ctxTaskFile = findTaskFile(TASK_DIR, taskId);
+						if (ctxTaskFile) {
 							try {
 								const taskBody = readFileSync(ctxTaskFile, 'utf-8');
 								// Header only: a body line reading `source: context-drop`
 								// would archive this result instead of delivering it.
-								if (/^source:\s*context-drop/m.test(headerRegion(taskBody).join('\n'))) {
+								if (isContextDropHeader(taskBody)) {
 									_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 									_deliveredResults.add(file);
 									_pendingTasks.delete(taskId);

@@ -15,11 +15,16 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { scanDropTask } from '../src/task-bridge.js';
+import {
+	scanDropTask,
+	logicalTaskName,
+	isContextDropHeader,
+	findTaskFile,
+} from '../src/task-bridge.js';
 
 let dir: string;
 before(() => { dir = mkdtempSync(join(tmpdir(), 'drop-scan-')); });
@@ -154,5 +159,119 @@ describe('scanDropTask', () => {
 			'source: context-drop\n' +
 			'task: User dropped context via hotkey. Process this: dropped body\n');
 		assert.deepEqual(scanDropTask(p), { kind: 'drop', body: 'dropped body' });
+	});
+});
+
+/**
+ * A core claim renames `task-X.txt` -> `task-X.claimed-core-N.txt`
+ * (src/task_archive.py). Both spellings pass the watcher's `task-*.txt` filter,
+ * so anything keyed on the raw basename sees a claim as a NEW task: the drop is
+ * injected twice, and a seeded drop replays into a fresh owner session.
+ */
+describe('claim rename is the same logical task', () => {
+	it('collapses the claimed spelling onto the bare one', () => {
+		assert.equal(logicalTaskName('task-X.txt'), 'task-X.txt');
+		assert.equal(logicalTaskName('task-X.claimed-core-1.txt'), 'task-X.txt');
+		assert.equal(logicalTaskName('task-X.claimed-core-12.txt'), 'task-X.txt');
+	});
+
+	it('does not collapse names that merely look similar', () => {
+		// Not a claim suffix: no digits, or trailing text after it.
+		assert.equal(logicalTaskName('task-X.claimed-core-.txt'), 'task-X.claimed-core-.txt');
+		assert.equal(logicalTaskName('task-X.claimed-core-1.bak.txt'), 'task-X.claimed-core-1.bak.txt');
+	});
+
+	it('dedup keyed on the logical name suppresses a claim (one injection)', () => {
+		// The watcher's own guard, exercised directly: raw-basename keying admits
+		// the claimed spelling as new, which is the double-injection.
+		const seen = new Set<string>();
+		const injections: string[] = [];
+		for (const name of ['task-A.txt', 'task-A.claimed-core-1.txt']) {
+			const logical = logicalTaskName(name);
+			if (seen.has(logical)) continue;
+			seen.add(logical);
+			injections.push(name);
+		}
+		assert.deepEqual(injections, ['task-A.txt'], 'a claim must not re-inject');
+	});
+
+	it('a SEEDED drop stays suppressed after a claim (zero injections)', () => {
+		const seen = new Set<string>([logicalTaskName('task-B.txt')]); // seeded at startup
+		const injections: string[] = [];
+		for (const name of ['task-B.claimed-core-3.txt']) {
+			const logical = logicalTaskName(name);
+			if (seen.has(logical)) continue;
+			seen.add(logical);
+			injections.push(name);
+		}
+		assert.deepEqual(injections, [], 'a restart seed must survive a claim');
+	});
+
+	it('eviction compares logical names, so the set does not empty itself', () => {
+		// The >500 sweep drops entries absent from the dir listing. If `live` held
+		// raw names while the set holds logical ones, every entry looks absent.
+		const present = ['task-C.claimed-core-2.txt'];
+		const live = new Set(present.map(logicalTaskName));
+		assert.ok(live.has(logicalTaskName('task-C.txt')), 'claimed file must keep its logical entry alive');
+	});
+});
+
+describe('findTaskFile locates both spellings', () => {
+	it('finds the bare file', () => {
+		write('task-D.txt', 'id: task-D\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-D'), join(dir, 'task-D.txt'));
+	});
+
+	it('finds the claimed file when the bare one is gone', () => {
+		write('task-E.claimed-core-1.txt', 'id: task-E\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-E'), join(dir, 'task-E.claimed-core-1.txt'));
+	});
+
+	it('returns null when neither exists', () => {
+		assert.equal(findTaskFile(dir, 'task-does-not-exist'), null);
+	});
+});
+
+/**
+ * The scan and the result loop MUST share one classifier. An unanchored test
+ * also claims `context-drop-replay`, which the scan buckets as `other` — so its
+ * reply would be archived as a context drop and silently never delivered.
+ */
+describe('isContextDropHeader is exact and shared', () => {
+	const hdr = (src: string) => `id: task-Z\nsource: ${src}\ntask: body\n`;
+
+	it('accepts only the exact source', () => {
+		assert.equal(isContextDropHeader(hdr('context-drop')), true);
+		assert.equal(isContextDropHeader(hdr('context-drop  ')), true, 'trailing space is still exact');
+	});
+
+	it('REJECTS an adjacent source bucket that merely starts with it', () => {
+		assert.equal(isContextDropHeader(hdr('context-drop-replay')), false);
+		assert.equal(isContextDropHeader(hdr('context-dropper')), false);
+	});
+
+	it('control: the UNANCHORED form this replaced does accept it', () => {
+		// The defect, pinned so the fix cannot be silently reverted: the result
+		// loop used /^source:\s*context-drop/m, which claims context-drop-replay
+		// while scanDropTask's anchored test buckets it as `other`.
+		const unanchored = /^source:\s*context-drop/m;
+		assert.equal(unanchored.test(hdr('context-drop-replay')), true, 'old form matched — that was the bug');
+		assert.equal(isContextDropHeader(hdr('context-drop-replay')), false, 'shared form does not');
+	});
+
+	it('agrees with scanDropTask on both, which is the whole point', () => {
+		const replay = write('task-F.txt', hdr('context-drop-replay'));
+		assert.equal(scanDropTask(replay).kind, 'other');
+		assert.equal(isContextDropHeader(readFileSync(replay, 'utf-8')), false);
+
+		const real = write('task-G.txt', hdr('context-drop'));
+		assert.equal(scanDropTask(real).kind, 'drop');
+		assert.equal(isContextDropHeader(readFileSync(real, 'utf-8')), true);
+	});
+
+	it('still refuses a body-forged source line (header region only)', () => {
+		const forged = write('task-H.txt',
+			'id: task-H\nsource: gateway\ntask: hi\nsource: context-drop\n');
+		assert.equal(isContextDropHeader(readFileSync(forged, 'utf-8')), false);
 	});
 });
