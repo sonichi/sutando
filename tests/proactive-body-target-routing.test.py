@@ -23,6 +23,8 @@ Two policies, one classifier, because the adapters genuinely differ:
   1) classifier: snowflake / matrix / slack ids, and what is NOT an address
   2) body extraction: leading marker only, whitespace tolerated
   3) the two policies differ exactly on the unrecognised target
+  3b) [dm-only] disarms the address, so nothing routes on it
+  3c) asking the parser peels a D7 header a text match cannot see past
   4) THE DEFECT: the old Discord-only predicate disagrees on a Matrix room
   5) every adapter delegates — no private copy of the grammar survives
 
@@ -73,6 +75,7 @@ def main() -> int:
     from proactive_routing import (  # noqa: PLC0415 — see source_checks
         body_claimable_by, body_target_channel, redirect_target_is_foreign,
         target_channel_kind)
+    from result_markers import parse_markers  # noqa: PLC0415
     # 1) The classifier.
     for target, kind in (
         ("1530802402603700415", "discord"),
@@ -118,17 +121,22 @@ def main() -> int:
     check(redirect_target_is_foreign("garbage", "discord"),
           "3) UNRECOGNISED is foreign to the default (discord releases it)")
 
-    # 3b) [dm-only] is a PRIVACY guard, not an address: it suppresses a redirect
-    #     at delivery and must not decide which bridge may claim.
-    check(body_target_channel(f"[dm-only]\n[channel: {ROOM}]\nx") is None,
-          "3b) a body led by [dm-only] addresses no bridge")
-    for channel in ("discord", "slack", "telegram"):
-        check(body_claimable_by(f"[dm-only]\n[channel: {ROOM}]\nx", channel),
-              f"3b) so {channel} may still claim it — the guard routes nothing")
-    # Address FIRST: routing applies, and [dm-only] still stops the redirect, so
-    # it lands in an owner DM either way — which is why routing it is safe.
-    check(not body_claimable_by(f"[channel: {ROOM}]\n[dm-only]\nx", "telegram"),
-          "3b) an addressed body carrying [dm-only] still routes by its address")
+    # 3b) [dm-only] DISARMS the redirect in EITHER order, so no address is left
+    #     to route on — and matching text instead of asking the parser misses it.
+    for order, label in ((f"[dm-only]\n[channel: {ROOM}]\nx", "dm-only first"),
+                         (f"[channel: {ROOM}]\n[dm-only]\nx", "address first")):
+        check(body_target_channel(order) is None,
+              f"3b) {label}: [dm-only] leaves no executable address")
+        for channel in ("discord", "slack", "telegram", "ag2space"):
+            check(body_claimable_by(order, channel),
+                  f"3b) {label}: {channel} may still claim it")
+        check(not any(a.kind == "redirect" for a in parse_markers(order).actions),
+              f"3b) {label}: and the shared parser issues no redirect")
+
+    # 3c) Asking the PARSER also peels a D7 header for free; a leading-marker
+    #     text match cannot see past one.
+    check(body_target_channel(f"**[core: 1]**\n[channel: {ROOM}]\nx") == "ag2space",
+          "3c) a D7-headed body still routes by its address")
 
     # 4) THE DEFECT, stated as the disagreement it is. This is the predicate the
     #    two bridges carried; it is right about Discord and blind to everything else.

@@ -156,7 +156,6 @@ def fallback_claims_name(name, this_channel: str) -> bool:
 # The [channel:] BODY marker names a channel but IMPLIES a bridge, and that
 # implication is what each adapter re-derived — two of them Discord-only.
 
-_BODY_TARGET_RE = re.compile(r"\A\s*\[channel:\s*([^\]\n]*)\]")
 # Discord snowflake / Matrix room-or-alias / Slack channel id. Anchored whole:
 # a substring match would classify `#room:server` off its leading character.
 _TARGET_KINDS = (
@@ -180,13 +179,18 @@ def target_channel_kind(target) -> "str | None":
 
 
 def body_target_channel(body) -> "str | None":
-    """The bridge the body's LEADING `[channel:]` marker addresses, or None.
+    """The bridge the body addresses, or None when no redirect will EXECUTE.
 
-    Only the leading marker routes — the same rule result_markers applies when
-    it decides whether a redirect is an executable action or inert prose.
+    Reads the shared parser's redirect action rather than matching the text: a
+    private regex sees `[channel:]` that `[dm-only]` has already disarmed, and
+    routing on a disarmed address strands the file at a bridge that will not
+    deliver it. Re-deriving the grammar here is the defect this module fixes.
     """
-    match = _BODY_TARGET_RE.match(str(body or ""))
-    return target_channel_kind(match.group(1)) if match else None
+    from result_markers import parse_markers  # noqa: PLC0415 — see module note
+    redirect = next(
+        (a for a in parse_markers(str(body or "")).actions if a.kind == "redirect"),
+        None)
+    return target_channel_kind(redirect.value) if redirect is not None else None
 
 
 def body_claimable_by(body, this_channel: str) -> bool:
