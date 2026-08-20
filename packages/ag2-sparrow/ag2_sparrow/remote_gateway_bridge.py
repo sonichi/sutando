@@ -2984,7 +2984,11 @@ def _post_ready_results(inflight: set[str]) -> None:
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
-        if skip and skip.value == "deduped":
+        # A holder id outside the lookup grammar cannot address a result, so it
+        # drives no recovery; it closes the lease as an ordinary skip instead.
+        if (skip and skip.value == "deduped"
+                and local_task_protocol.valid_archive_lookup_id(
+                    (skip.extra or "").strip())):
             action, payload, room = _dedup_plan(tid, skip.extra)
             if action == "defer":
                 # Nothing was retired; the next pass retries the whole decision.
