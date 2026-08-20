@@ -116,6 +116,8 @@ def write_intent(workspace: str | None, action: str, source: str) -> str:
                 # Stale or unreadable: clear it and retry once.
                 try:
                     os.unlink(path)
+                except FileNotFoundError:
+                    pass
                 except OSError:
                     raise IntentPending(action, time.time())
     finally:
@@ -139,10 +141,9 @@ def await_consumption(
     before acting, so disappearance means an executor claimed it. That
     inference is only sound because `write_intent` is exclusive — otherwise a
     superseding write would let one deletion satisfy two different waiters.
-    Probing for
-    a specific consumer (a running Sutando.app, a named launchd label) answers
-    "is THAT consumer here", not "will anything act" — and returns the same
-    False for a host whose executor is simply a different one.
+    Probing for a specific consumer (a running Sutando.app, a named launchd
+    label) answers "is THAT consumer here", not "will anything act" — and
+    returns the same False for a host whose executor is simply a different one.
 
     Default timeout covers the documented 5s poll interval twice over.
     """

@@ -289,6 +289,30 @@ class TestExclusiveIntentEdges(unittest.TestCase):
         finally:
             os.unlink = real_unlink
 
+    def test_stale_intent_consumed_mid_clear_still_succeeds(self):
+        # An executor consumes the stale intent between our peek and unlink:
+        # the path is FREE, so claim it — don't report a request nobody made.
+        path = _mod.write_intent(self.ws, "restart", "test")
+        with open(path) as f:
+            d = json.load(f)
+        d["requested_at"] = time.time() - (_mod.STALE_SEC + 60)
+        with open(path, "w") as f:
+            json.dump(d, f)
+        real_unlink = os.unlink
+
+        def raced(target):
+            if str(target) == path:
+                real_unlink(target)          # the "executor" got there first
+                raise FileNotFoundError(target)
+            return real_unlink(target)
+
+        os.unlink = raced
+        try:
+            self.assertEqual(_mod.write_intent(self.ws, "stop", "test"), path)
+        finally:
+            os.unlink = real_unlink
+        self.assertEqual(_mod.peek_intent(self.ws)["action"], "stop")
+
     def test_tmp_cleanup_failure_never_masks_the_result(self):
         # The temp file is bookkeeping; failing to remove it must not turn a
         # successful claim into an error the owner sees.
