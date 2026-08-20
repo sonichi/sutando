@@ -420,6 +420,11 @@ check("guided connect" in manifest and "run wacli auth" not in manifest,
 wa_line = next(l for l in tools_md.splitlines() if l.startswith("**WhatsApp**"))
 check("guided connect" in wa_line and "requires `wacli auth` first" not in wa_line,
       "built-in-tools catalog routes unpaired users to guided connect")
+script_src = SCRIPT.read_text()
+check("steipete" not in skill_md and "steipete" not in script_src,
+      "no surface names the retired steipete tap")
+check("openclaw/tap/wacli" in skill_md and "openclaw/tap/wacli" in script_src,
+      "install/upgrade surfaces name the maintained openclaw tap")
 
 if failures:
     print(f"{len(failures)} FAILURE(S)")

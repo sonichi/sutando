@@ -239,7 +239,7 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
     else:
         emit(f"ERROR: auth ended without a valid session on {wacli_version(wacli)} "
              "(no --events support) — upgrading wacli may be required: "
-             "brew upgrade steipete/tap/wacli")
+             "brew upgrade openclaw/tap/wacli")
     return 1
 
 
@@ -256,7 +256,7 @@ def main() -> int:
     wacli = wacli_bin()
     if not wacli:
         emit("ERROR: wacli is not installed — run: "
-             "brew install steipete/tap/wacli")
+             "brew install openclaw/tap/wacli")
         return 1
 
     if auth_status_ok(wacli) and chats_probe(wacli):

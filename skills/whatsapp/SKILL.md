@@ -5,7 +5,7 @@ description: Send WhatsApp messages, list chats, and search history via wacli (l
 
 # WhatsApp (wacli)
 
-Send messages, list chats, and search history using [wacli](https://github.com/steipete/wacli) — a local CLI that syncs a WhatsApp Web session into `~/.wacli/`. No third-party service, no API key; the auth flow is a QR-code scan from the user's phone.
+Send messages, list chats, and search history using [wacli](https://github.com/openclaw/wacli) — a local CLI that syncs a WhatsApp Web session into `~/.wacli/`. No third-party service, no API key; the auth flow is a QR-code scan from the user's phone.
 
 ## When to use
 
@@ -16,11 +16,11 @@ Send messages, list chats, and search history using [wacli](https://github.com/s
 ## Install + auth
 
 ```bash
-brew install steipete/tap/wacli       # one-time install (3rd-party tap, NOT Homebrew-core)
+brew install openclaw/tap/wacli       # one-time install (3rd-party tap, NOT Homebrew-core)
 wacli auth                            # opens a QR for the user to scan from WhatsApp → Linked Devices
 ```
 
-`steipete/tap` is a third-party Homebrew tap (not Homebrew-core), and wacli stores a WhatsApp Web session locally at `~/.wacli/`. Review the tap source before installing if security-sensitive.
+`openclaw/tap` is a third-party Homebrew tap (not Homebrew-core), and wacli stores a WhatsApp Web session locally at `~/.wacli/`. Review the tap source before installing if security-sensitive.
 
 The session lives at `~/.wacli/`. Stays signed in across reboots until the user revokes the linked device from their phone.
 
@@ -29,7 +29,7 @@ Optional `.env` settings (label shown in WhatsApp's Linked Devices screen on the
 ```bash
 WACLI_DEVICE_LABEL=Sutando            # any string; appears next to the device in WhatsApp → Linked Devices
 WACLI_DEVICE_PLATFORM=CHROME          # default per wacli is DESKTOP; CHROME is the fallback if an invalid value is set.
-                                      # See wacli's docs (https://github.com/steipete/wacli) for the full platform-string list.
+                                      # See wacli's docs (https://github.com/openclaw/wacli) for the full platform-string list.
 ```
 
 ## Guided connect (zero-terminal pairing)
