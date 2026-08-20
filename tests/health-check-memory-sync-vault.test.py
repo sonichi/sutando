@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -107,6 +108,32 @@ class TestMemorySyncVaultLookup(unittest.TestCase):
         self.assertNotIn("sync-memory.sh", detail)
         if "never synced" in detail:
             self.assertIn("sync-workspace.sh", detail)
+
+    def test_freshness_detail_names_which_repo_it_measured(self):
+        """The probe is called 'memory-sync' but the freshness signal it reads is
+        the WORKSPACE vault fetch. A bare 'last sync Nh ago' reads as a claim about
+        memory and contradicts a healthy memory sync, so the detail must say which.
+        """
+        repo, ws = self._set_repo()
+        (repo / "sutando.config.local.json").write_text(
+            json.dumps({"vault": {"remote_url": "git@github.com:user/vault.git"}})
+        )
+        git_dir = ws / ".git"
+        git_dir.mkdir(parents=True, exist_ok=True)
+        fetch_head = git_dir / "FETCH_HEAD"
+        fetch_head.write_text("")
+        stale = time.time() - (367 * 3600)
+        os.utime(fetch_head, (stale, stale))
+
+        with patch("sys.path", [str(REPO / "src")] + sys.path):
+            result = hc.check_memory_sync()
+
+        detail = result.get("detail", "")
+        self.assertEqual(result["status"], "warn", f"367h should be stale: {result!r}")
+        self.assertIn("stale", detail)
+        self.assertIn("workspace", detail.lower(),
+                      f"detail must name the workspace vault as its subject: {detail!r}")
+        self.assertNotIn("sync-memory.sh", detail)
 
 
 if __name__ == "__main__":

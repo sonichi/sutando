@@ -2378,8 +2378,10 @@ def check_memory_sync() -> dict:
         if ws_git_fetch.exists():
             age_h = (time.time() - ws_git_fetch.stat().st_mtime) / 3600
             if age_h > 48:
-                return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
-            return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
+                return {"name": name, "status": "warn",
+                        "detail": f"workspace vault last fetched {age_h:.0f}h ago (stale)"}
+            return {"name": name, "status": "ok",
+                    "detail": f"workspace vault last fetched {age_h:.1f}h ago"}
         return {"name": name, "status": "ok", "detail": "workspace git repo, never fetched"}
     # Legacy memory-sync clone dir: PR #764 renamed legacy ~/.sutando-memory-sync/
     # → ~/.sutando/memory-sync/. Check new path first; fall back to legacy
@@ -2397,8 +2399,10 @@ def check_memory_sync() -> dict:
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
         if age_h > 48:
-            return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
-        return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
+            return {"name": name, "status": "warn",
+                    "detail": f"legacy memory-sync clone last fetched {age_h:.0f}h ago (stale)"}
+        return {"name": name, "status": "ok",
+                "detail": f"legacy memory-sync clone last fetched {age_h:.1f}h ago"}
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
 
 
