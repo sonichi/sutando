@@ -127,13 +127,13 @@ coexist with v1 during a migration window.
 
 ## Current status — Phase 1 live
 
-**Merged on main** (derived from actual `main` call sites — the modules
-that import and call the stamper): remote gateway bridge, discord-bridge,
-and the workstream classifier. **Pending (#3058, open)**: the TS lineage —
-the delegation seam, context-drop path, and voice-agent. **Pending
-(#3046, open)**: telegram-bridge and slack-bridge. **Not yet stamping, no
-PR**: agent-api and cron-runner — these write task files directly today;
-their edges are unowned work, not covered elsewhere. Until each row
+**Stamping on main** (regenerated from current `main` call sites — the
+modules that import and call the stamper): remote gateway bridge,
+discord-bridge, telegram-bridge, slack-bridge, the workstream classifier,
+cron-runner, and the TS lineage (`task-bridge.ts`, `task-delegation.ts`).
+**Not yet stamping, no PR**: `agent-api` and `voice-agent` — these write
+task files directly today; their edges are unowned work, not covered
+elsewhere. Until each row
 lands, tasks from those writers are `unsigned`. Stamps are **telemetry
 only** today:
 `src/task_envelope_census.py` counts verified/unsigned so the unsigned
@@ -249,10 +249,10 @@ the fleet) plus the acting agent's mxid, matching each PR body's
 | #3014 | The envelope itself: `src/task_envelope.py` (key, canonical slot, four verdicts) + contract/falsifier suite + the Discord and gateway writer edges | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
 | #3034 | Census (`src/task_envelope_census.py`) — soak-window telemetry; note: its auto-merge raced its own review fix | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
 | #3044 | Workstream classifier stamps at its writer edge | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
-| #3046 | telegram-bridge + slack-bridge stamp at their writer edges | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
+| #3046 | telegram-bridge + slack-bridge stamp at their writer edges | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
 | #3055 | Census read/stat TOCTOU fix (the #3034 race, recovered) | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
-| #3058 | TS mirror `src/task_envelope.ts` + delegation-seam/context-drop stamping + cross-language parity tests + TS corrupt-key guard | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
-| #3065 | Python corrupt-key guard: loud error or `unverifiable`, never a zero-length key | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
+| #3058 | TS mirror `src/task_envelope.ts` + delegation-seam/context-drop stamping + cross-language parity tests + TS corrupt-key guard | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
+| #3065 | Python corrupt-key guard: loud error or `unverifiable`, never a zero-length key | qingyun-wu (@sutando-qingyun-001:ag2.space) | merged |
 | #3070 | This document | qingyun-wu (@sutando-qingyun-001:ag2.space) | open |
 
 Reviewer/approver identities are the GitHub accounts on each PR (sonichi,
