@@ -212,6 +212,27 @@ class TestWhyNoLogs(unittest.TestCase):
                 os.chmod(logs, 0o755)
         self.assertIn("could not be listed", why)
 
+    def test_a_non_oserror_also_degrades(self):
+        """The bare fallback is load-bearing, so it is covered rather than cut.
+
+        `iterdir()` raising OSError was the obvious case, not the only one — and
+        this function runs on the failure path, where raising would cost the
+        report entirely. Covering the branch is the point; deleting it to satisfy
+        a coverage gate would remove the guarantee.
+        """
+        class _Exploding:
+            def __truediv__(self, other):
+                return self
+
+            def is_dir(self):
+                raise RuntimeError("not an OSError")
+
+            def __str__(self):
+                return "<exploding>"
+
+        why = report_feedback.why_no_logs(_Exploding())
+        self.assertIn("could not be inspected", why)
+
     def test_present_but_unreadable_is_its_own_reason(self):
         """Pairs with test_unreadable_log_is_swallowed above: that one proves
         the excerpt is dropped, this one proves the drop is now explained."""
