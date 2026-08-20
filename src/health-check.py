@@ -1228,11 +1228,15 @@ def check_file(path: Path, name: str) -> dict:
 
 
 def check_directory(path: Path, name: str) -> dict:
-    """Check if a directory exists and has files."""
+    """Check if a directory exists and has files.
+
+    The count names its directory: both callers (memory-dir, notes-dir) sit on
+    paths with a live twin, so a bare count reads as a claim about the wrong one.
+    """
     if not path.exists():
         return {"name": name, "status": "missing", "detail": str(path)}
     count = len(list(path.glob("*.md")))
-    return {"name": name, "status": "ok", "detail": f"{count} .md files"}
+    return {"name": name, "status": "ok", "detail": f"{count} .md files in {path}"}
 
 
 def check_memory_dir_override() -> "dict | None":

@@ -187,5 +187,48 @@ class TestMemorySyncVaultLookup(unittest.TestCase):
         self.assertIn("legacy", result["detail"].lower())
 
 
+
+class TestDirectoryCountNamesItsPath(unittest.TestCase):
+    """A bare '.md files' count is a claim about whichever corpus the reader assumes.
+
+    Both callers (memory-dir, notes-dir) sit on paths that have a live twin on this
+    fleet, and the sibling slug-split check is deliberately diagnostic-only — it
+    reports the divergence and refuses to pick a canonical corpus. So the count has
+    to carry its own path; that disambiguates without answering the open question.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="hc-dircount-"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_count_detail_names_the_directory_it_counted(self):
+        a = self.tmp / "corpus-a"
+        b = self.tmp / "corpus-b"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+        (a / "one.md").write_text("x")
+        for n in range(3):
+            (b / f"n{n}.md").write_text("x")
+
+        ra = hc.check_directory(a, "memory-dir")
+        rb = hc.check_directory(b, "memory-dir")
+
+        self.assertEqual(ra["status"], "ok")
+        self.assertIn("1 .md files", ra["detail"])
+        self.assertIn("3 .md files", rb["detail"])
+        # Same probe name, same count format, different corpora: without the path
+        # the two details are indistinguishable to a reader.
+        self.assertIn(str(a), ra["detail"])
+        self.assertIn(str(b), rb["detail"])
+        self.assertNotEqual(ra["detail"], rb["detail"])
+
+    def test_missing_directory_still_reports_the_path(self):
+        r = hc.check_directory(self.tmp / "nope", "notes-dir")
+        self.assertEqual(r["status"], "missing")
+        self.assertIn("nope", r["detail"])
+
 if __name__ == "__main__":
     unittest.main()
