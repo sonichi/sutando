@@ -120,9 +120,6 @@ class TestWriteConsume(unittest.TestCase):
             self.assertIsNone(_mod.consume_intent(ws))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class TestAwaitConsumption(unittest.TestCase):
     """Ack-on-consumption (#3183): the bridge must not promise a restart that
@@ -166,3 +163,5 @@ class TestAwaitConsumption(unittest.TestCase):
 
         self.assertTrue(_mod.await_consumption(
             self.ws, timeout_sec=5, poll_sec=0, sleep=boom, now=lambda: 0.0))
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

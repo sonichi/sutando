@@ -2981,7 +2981,8 @@ def select_rulebook_key(access_tier, is_collaborator):
     return "team-collaborator" if is_collaborator else access_tier
 
 
-async def _handle_restart_command(message, text, access_tier, username, workspace) -> bool:
+async def _handle_restart_command(message, text, access_tier, username, workspace,
+                                  wait_for_consumption=await_consumption) -> bool:
     """Owner easy-restart command (sonichi#2401): "restart core" / "stop core"
     is handled by the BRIDGE, not the core — the whole point is that it works
     while the core is dead. Writes the intent file for the GUI-session
@@ -2999,7 +3000,7 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
         # Ack on CONSUMPTION, not on write (#3183): writing always succeeds, so
         # acking here promised a restart on hosts whose executor was gone —
         # silent for as long as nobody happened to notice.
-        claimed = await asyncio.to_thread(await_consumption, workspace)
+        claimed = await asyncio.to_thread(wait_for_consumption, workspace)
         if claimed:
             ack = ("Restart requested and picked up by the executor — I'll be "
                    "back once it's up."
@@ -3007,11 +3008,13 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
                    "Stop requested and picked up by the executor. It stays "
                    "stopped until you say `restart core`.")
         else:
-            ack = (f"Wrote the {action} request, but **no executor picked it "
-                   f"up** within 12s — so nothing is going to happen. The "
-                   f"request expires on its own in 10 minutes. Whatever "
-                   f"consumes `state/core-restart-requested.json` on this host "
-                   f"(the desktop app, or a launchd executor) isn't running.")
+            # The intent stays on disk, so a late executor can still claim it
+            # before STALE_SEC — say "not yet", never "nothing will happen".
+            ack = (f"Wrote the {action} request, but **no executor picked it up "
+                   f"within 12s**. It may still run if one starts before the "
+                   f"request expires in 10 minutes. If nothing consumes "
+                   f"`state/core-restart-requested.json` on this host (the "
+                   f"desktop app, or a launchd executor), it will simply lapse.")
     except Exception as exc:
         ack = f"Couldn't write the {action} request ({type(exc).__name__}) — not queued."
     print(f"  [core-restart] owner {action} command from @{username}", flush=True)

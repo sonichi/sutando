@@ -73,10 +73,13 @@ class _Msg:
         self.channel = chan
 
 
-def _run(text, tier="owner", ws=None, chan=None):
+def _run(text, tier="owner", ws=None, chan=None, claimed=True):
+    """`claimed` stubs the consumption wait (#3183). Production blocks up to 12s
+    polling for an executor; the suite must assert both acks without sleeping."""
     chan = chan if chan is not None else _Chan()
     handled = asyncio.run(
-        db._handle_restart_command(_Msg(chan), text, tier, "tester", ws or tempfile.mkdtemp()))
+        db._handle_restart_command(_Msg(chan), text, tier, "tester", ws or tempfile.mkdtemp(),
+                                   wait_for_consumption=lambda _ws: claimed))
     return handled, chan
 
 
@@ -88,7 +91,8 @@ check("owner 'restart core' → handled=True", handled is True)
 check("intent file written with action=restart",
       os.path.exists(intent_file) and json.load(open(intent_file))["action"] == "restart",
       intent_file)
-check("ack sent mentions relaunch", len(chan.sent) == 1 and "Restart requested" in chan.sent[0])
+check("claimed → ack says picked up",
+      len(chan.sent) == 1 and "picked up by the executor" in chan.sent[0])
 
 # --- owner stop command ---
 ws2 = tempfile.mkdtemp()
@@ -96,6 +100,15 @@ handled, chan = _run("Stop core.", ws=ws2)
 check("owner 'Stop core.' → handled + action=stop",
       handled and json.load(open(os.path.join(ws2, "state", "core-restart-requested.json")))["action"] == "stop")
 check("stop ack says stays stopped", "stays stopped" in chan.sent[0])
+
+# --- nothing consumes the intent: ack must say "not yet", never "nothing will happen" ---
+ws2b = tempfile.mkdtemp()
+handled, chan = _run("restart core", ws=ws2b, claimed=False)
+check("timeout → handled, honest not-picked-up ack",
+      handled and "no executor picked it up" in chan.sent[0]
+      and "may still run" in chan.sent[0])
+check("timeout leaves the intent on disk for a late executor",
+      os.path.exists(os.path.join(ws2b, "state", "core-restart-requested.json")))
 
 # --- prose and non-owner never trigger ---
 handled, chan = _run("we should restart core tomorrow")
