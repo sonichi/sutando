@@ -44,6 +44,19 @@ class TestSkipMarkers(unittest.TestCase):
         self.assertEqual(r.actions[0].value, "deduped")
         self.assertEqual(r.actions[0].extra, "task-1779164273868")
 
+    def test_deduped_empty_target_parses_like_its_spaced_twin(self):
+        # One space apart: the spaced form parsed, the bare one did not, so
+        # the bare one shipped its marker text and body to the channel.
+        for src in ("[deduped:]\nfull reply elsewhere",
+                    "[deduped: ]\nfull reply elsewhere"):
+            with self.subTest(src=src.splitlines()[0]):
+                r = parse_markers(src)
+                self.assertEqual(len(r.actions), 1, "must parse as exactly one skip")
+                self.assertEqual(r.actions[0].kind, "skip")
+                self.assertEqual(r.actions[0].value, "deduped")
+                self.assertEqual(r.actions[0].extra, "")
+                self.assertNotIn("[deduped", r.body)
+
     def test_skip_strips_leading_whitespace(self):
         r = parse_markers("  [no-send]\nbody")
         self.assertEqual(r.actions[0].kind, "skip")

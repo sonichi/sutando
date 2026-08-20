@@ -114,7 +114,9 @@ class ParseResult:
 _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^\s*\[no-send\]\s*", re.IGNORECASE), "no-send"),
     (re.compile(r"^\s*\[REPLIED\]\s*"), "REPLIED"),
-    (re.compile(r"^\s*\[deduped:\s*([^\]]+)\]\s*", re.IGNORECASE), "deduped"),
+    # `*` not `+`: `[deduped:]` and `[deduped: ]` differ only by a space and
+    # must parse alike, or one is audited and the other ships its own marker.
+    (re.compile(r"^\s*\[deduped:\s*([^\]]*)\]\s*", re.IGNORECASE), "deduped"),
 ]
 
 # Redirect marker — Discord channel IDs are 17-20 digits; Slack channel IDs
