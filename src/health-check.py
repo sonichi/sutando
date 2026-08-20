@@ -2161,6 +2161,65 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
         return _TREND_UNAVAILABLE
 
 
+#: Docs naming memory files an agent must read; `tests/` is excluded because its
+#: memory paths are synthetic fixtures that SHOULD NOT resolve.
+MEMORY_CITATION_SOURCES = ("CLAUDE.md", "AGENTS.md")
+MEMORY_CITATION_GLOBS = ("skills/*/SKILL.md",)
+_MEMORY_CITATION_RE = re.compile(r"memory/([A-Za-z0-9_-]+)\.md")
+
+
+def _cited_memory_names(repo: "Path | None" = None) -> dict:
+    """name -> sorted list of the docs citing it."""
+    repo = REPO_DIR if repo is None else repo
+    sources = [repo / rel for rel in MEMORY_CITATION_SOURCES]
+    for pattern in MEMORY_CITATION_GLOBS:
+        sources.extend(sorted(repo.glob(pattern)))
+    cited: dict = {}
+    for path in sources:
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        try:
+            label = str(path.relative_to(repo))
+        except ValueError:
+            label = path.name
+        for name in _MEMORY_CITATION_RE.findall(text):
+            cited.setdefault(name, set()).add(label)
+    return {k: sorted(v) for k, v in cited.items()}
+
+
+def check_memory_citations() -> "dict | None":
+    """Repo docs that tell an agent to read a memory file that does not exist.
+
+    `CLAUDE.md` loads into every session, so a bullet naming
+    `memory/<name>.md` is an instruction, not a footnote. When the file is
+    absent the reference silently no-ops: nothing errors, no test fails, and
+    the agent simply never gets the rule it was told to load.
+
+    Names the corpus it resolved against, because `SUTANDO_MEMORY_DIR` can
+    point this at a different one than the session loads — a verdict about the
+    wrong corpus is worse than no verdict.
+    """
+    if not MEMORY_DIR.is_dir():
+        return None                      # no corpus here: nothing to resolve against
+    cited = _cited_memory_names()
+    if not cited:
+        return None
+    missing = {n: src for n, src in cited.items()
+               if not (MEMORY_DIR / f"{n}.md").exists()}
+    if not missing:
+        return {"name": "memory-citations", "status": "ok",
+                "detail": f"all {len(cited)} memory file(s) cited by repo docs and "
+                          f"skills resolve in {MEMORY_DIR}"}
+    listed = "; ".join(f"{n}.md (cited by {', '.join(src)})"
+                       for n, src in sorted(missing.items()))
+    return {"name": "memory-citations", "status": "warn",
+            "detail": f"{len(missing)} of {len(cited)} memory file(s) named by repo docs "
+                      f"do not exist in {MEMORY_DIR}, so every agent told to read them "
+                      f"silently gets nothing: {listed}"}
+
+
 def check_memory_index_integrity() -> "dict | None":
     """Catch memories that exist on disk but will never load into a session.
 
@@ -8618,6 +8677,10 @@ def run_all_checks() -> list[dict]:
     _mem_index = check_memory_index_integrity()
     if _mem_index:
         checks.append(_mem_index)
+
+    _mem_cites = check_memory_citations()
+    if _mem_cites:
+        checks.append(_mem_cites)
 
     # Carrier-set enforcement — a stale exclude means the vault is silently not
     # backing up paths the config says it carries (#2565).
