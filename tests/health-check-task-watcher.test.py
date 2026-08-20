@@ -74,7 +74,9 @@ def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
     if core_alive:
         cores = state / "cores"
         cores.mkdir(exist_ok=True)
-        beat = cores / "testhost.alive"
+        # Host-labelled: the probe asks whether THIS host's core is alive,
+        # so a fixed name would only ever satisfy the fleet-wide reader.
+        beat = cores / f"{hc._host_label()}.alive"
         beat.write_text("{}")
         # _any_core_alive uses a 90s window; a just-written file is inside it.
     if pid_text is not None:

@@ -2299,6 +2299,19 @@ def check_memory_index_integrity() -> "dict | None":
                 f"({MEMORY_INDEX_LOAD_BYTES:,} B) / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
+    def _corpus_note() -> str:
+        """Name the corpus measured: "compact it now" is destructive advice about
+        one specific file, and SUTANDO_MEMORY_DIR can point this at another."""
+        try:
+            default = Path(_default_memory_dir())
+        except Exception:  # pragma: no cover - defensive; never break the check
+            return f" [corpus: {MEMORY_DIR}]"
+        if default.resolve() != MEMORY_DIR.resolve():
+            return (f" [corpus: {MEMORY_DIR} — set by SUTANDO_MEMORY_DIR, NOT the "
+                    f"workspace default {default}; if sessions load the default, "
+                    f"this verdict is about a corpus they never read]")
+        return f" [corpus: {MEMORY_DIR}]"
+
     def _hub_note() -> str:
         return (f"; {len(hub_only)} reachable via a sibling hub index "
                 f"({', '.join(sorted(index_names - {'MEMORY.md'}))}) — by design, not loaded"
@@ -2307,7 +2320,7 @@ def check_memory_index_integrity() -> "dict | None":
     if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
                 "detail": (f"all memory files reachable from the loaded MEMORY.md index"
-                           f"{_hub_note()} ({_size_note()})")}
+                           f"{_hub_note()} ({_size_note()}){_corpus_note()}")}
     parts = []
     if beyond_cut:
         parts.append(
@@ -2344,7 +2357,7 @@ def check_memory_index_integrity() -> "dict | None":
     # that still loaded fine once frontmatter/comments were excluded.)
     return {"name": "memory-index",
             "status": "fail" if beyond_cut else "warn",
-            "detail": "; ".join(parts)}
+            "detail": "; ".join(parts) + _corpus_note()}
 
 
 def check_memory_sync() -> dict:
@@ -6533,10 +6546,13 @@ def check_task_watcher() -> dict:
     """
     name = "task-watcher"
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
-    if not _any_core_alive():
-        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
+    # "Not expected" is a claim about THIS host, so it needs the local heartbeat
+    # and must not be made before enumerating: visible watchers outrank it.
     trees = _watcher_trees()
     roots = sorted(trees)
+    if not roots and _fresh_local_core_record() is None:
+        return {"name": name, "status": "ok",
+                "detail": "no local core running and no watcher processes — watcher not expected"}
     if not pid_file.exists():
         if roots:
             # Sentinel gone but watchers alive: they are draining tasks/ but

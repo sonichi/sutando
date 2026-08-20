@@ -32,7 +32,7 @@ def _verdict(trees, parents):
     """check_task_watcher() with no sentinel, given tree roots and their ppids."""
     with tempfile.TemporaryDirectory() as ws:
         with patch.object(hc, "WORKSPACE_DIR", Path(ws)), \
-             patch.object(hc, "_any_core_alive", return_value=True), \
+             patch.object(hc, "_fresh_local_core_record", return_value={"ts": 1}), \
              patch.object(hc, "_watcher_trees", return_value=trees), \
              patch.object(hc, "_ps_snapshot", return_value=None), \
              patch.object(hc, "_pid_parent", side_effect=lambda pid, ps=None: parents.get(str(pid))):
