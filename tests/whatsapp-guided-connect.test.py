@@ -282,7 +282,7 @@ def run_inproc(stderr_lines, *, phone=None, timeout=30, status=True, proc_cls=_F
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = gc.run_auth("/fake/wacli", phone, timeout, qr_dir)
-    return rc, buf.getvalue(), procs[0]
+    return rc, buf.getvalue(), (procs[0] if procs else None)
 
 
 rc, out, pr = run_inproc(['{"event":"connected","data":{},"ts":1}\n'])
@@ -297,11 +297,10 @@ rc, out, pr = run_inproc([], timeout=1, status=True)
 check(rc == 0 and "CONNECTED" in out, "timeout path still verifies the store first")
 
 
-rc, out, pr = run_inproc(["Pairing successful\n"], phone="15551234567",
+rc, out, pr = run_inproc([], phone="15551234567", timeout=1,
                          surface="--follow --idle-exit")
-check(rc == 0 and "CONNECTED" in out and "predates" in out
-      and "--phone pairing" in out,
-      "in-process flagless run: both NOTEs + text-router pairing")
+check(rc == 1 and "lacks --events" in out and pr is None,
+      "in-process flagless run errors before any spawn")
 
 
 class _DeadProc(_FakeProc):
@@ -357,34 +356,32 @@ gc.auth_status_ok, gc.chats_probe = _real_aso, _real_cp
 gc.shutil.which = _real_which
 sys.argv = _real_argv
 
-print("11b. flagless wacli (0.6.0-class): probe + plain-auth fallback")
-# Producer-faithful: real 0.6.0 lists no --events/--phone in `auth --help` and
-# exits "unknown flag" when passed one (measured by the repo owner on-host).
+print("11b. flagless wacli (0.6.0-class): immediate upgrade-required error")
+# Producer-faithful: 0.6.0 lists no --events/--phone in `auth --help` and its
+# only QR is terminal block art — no payload exists for a fallback to relay.
 stub.write_text(
     "#!/bin/sh\n"
-    f'MARK="{lab}/paired13"\n'
     f'echo "ARGS:$@" >> "{lab}/calls13"\n'
     'case "$1 $2" in\n'
     '  "auth --help") echo "Flags:"; echo "  --follow  --idle-exit"; exit 0;;\n'
     '  "--version ") echo "wacli 0.6.0"; exit 0;;\n'
-    '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
-    'else echo "not authenticated"; exit 1; fi;;\n'
-    '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
+    '  "auth status") echo "not authenticated"; exit 1;;\n'
+    '  "chats list") exit 1;;\n'
     '  "auth --events"|"auth --phone") echo "unknown flag: $2" >&2; exit 1;;\n'
-    '  "auth ") echo "Scan the QR code"; '
-    f'touch "$MARK"; echo "Pairing successful"; exit 0;;\n'
     'esac\nexit 0\n')
+import time as _time
+_t0 = _time.time()
 out = subprocess.run([sys.executable, str(SCRIPT), "--phone", "15551234567",
-                      "--timeout", "30"],
+                      "--timeout", "180"],
                      capture_output=True, text=True, env=env, timeout=60)
-check(out.returncode == 0 and "CONNECTED" in out.stdout,
-      f"flagless build pairs via plain auth + text router (stdout={out.stdout.strip()!r})")
-check("NOTE: " in out.stdout and "--events" in out.stdout,
-      "degradation is announced, not silent")
-check("--phone pairing" in out.stdout, "unsupported --phone is announced")
+_elapsed = _time.time() - _t0
+check(out.returncode == 1 and "lacks --events" in out.stdout
+      and "wacli 0.6.0" in out.stdout and "openclaw/tap/wacli" in out.stdout,
+      f"specific upgrade-required error names version + tap (stdout={out.stdout.strip()!r})")
+check(_elapsed < 30, f"fails fast, never waits out the pairing bound ({_elapsed:.0f}s)")
 calls13 = (Path(lab) / "calls13").read_text()
-check("ARGS:auth --events" not in calls13 and "--phone" not in calls13.replace("ARGS:auth --help",""),
-      "no unsupported flag is ever passed to the flagless build")
+check("ARGS:auth --events" not in calls13 and "ARGS:auth\n" not in calls13,
+      "no auth session is ever spawned on a flagless build")
 
 print("11c. flagged wacli keeps the events-mode invocation")
 stub.write_text(

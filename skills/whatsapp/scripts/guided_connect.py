@@ -173,14 +173,14 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
     # Probe the flag surface: passing a flag this build lacks makes wacli exit
     # instantly on "unknown flag" and every guided run dies generically.
     flags = auth_flag_surface(wacli)
-    has_events = "--events" in flags
-    cmd = [wacli, "auth"]
-    if has_events:
-        cmd += ["--events", "--qr-format", "text"]
-    else:
-        emit(f"NOTE: this wacli build ({wacli_version(wacli)}) predates "
-             "--events; driving plain auth output instead — QR/pairing lines "
-             "may be reduced")
+    if "--events" not in flags:
+        # A flagless build renders its only QR as terminal block art — no
+        # payload exists to relay, so pretending to pair would just time out.
+        emit(f"ERROR: this wacli build ({wacli_version(wacli)}) lacks "
+             "--events, so chat pairing cannot work — upgrade first: "
+             "brew install openclaw/tap/wacli")
+        return 1
+    cmd = [wacli, "auth", "--events", "--qr-format", "text"]
     if phone:
         if "--phone" in flags:
             cmd += ["--phone", phone]
@@ -232,14 +232,8 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
         return 0
     if timed_out:
         emit("ERROR: pairing timed out — ask the user to retry when ready")
-    elif router.error:
-        emit(f"ERROR: {router.error}")
-    elif has_events:
-        emit("ERROR: auth ended without a valid session")
     else:
-        emit(f"ERROR: auth ended without a valid session on {wacli_version(wacli)} "
-             "(no --events support) — upgrading wacli may be required: "
-             "brew upgrade openclaw/tap/wacli")
+        emit(f"ERROR: {router.error or 'auth ended without a valid session'}")
     return 1
 
 
