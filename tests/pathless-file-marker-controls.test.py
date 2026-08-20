@@ -35,10 +35,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-pathless-")
-for _ch in ("discord", "telegram"):
-    _d = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / _ch
-    _d.mkdir(parents=True, exist_ok=True)
-    (_d / "access.json").write_text('{"allowFrom": ["4242"]}')
+_cfg_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_cfg_discord.mkdir(parents=True, exist_ok=True)
+(_cfg_discord / "access.json").write_text('{"allowFrom": ["4242"]}')
+_cfg_telegram = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_cfg_telegram.mkdir(parents=True, exist_ok=True)
+(_cfg_telegram / "access.json").write_text('{"allowFrom": ["4242"]}')
 os.environ["TELEGRAM_BOT_TOKEN"] = "test-token-not-real"
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 os.environ["SUTANDO_TEST_MODE"] = "1"
