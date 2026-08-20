@@ -14,6 +14,8 @@ Line protocol (stdout, one record per line):
                             line supersedes the previous image (codes rotate)
   QR_TEXT: <payload>        raw QR payload (qrcode lib unavailable) — caller
                             renders with any external tool
+  NOTE: <text>              non-terminal degradation the user should hear
+                            (e.g. this wacli build lacks --phone pairing)
   CONNECTED                 pairing succeeded AND the chats probe passed
   ERROR: <reason>           terminal failure (includes wacli's passkey-gated
                             stop, which it reports instead of rotating codes)
@@ -61,6 +63,26 @@ def chats_probe(wacli: str) -> bool:
     except (subprocess.TimeoutExpired, OSError):
         return False
     return out.returncode == 0
+
+
+def auth_flag_surface(wacli: str) -> str:
+    """`wacli auth --help` text — the flag surface varies widely by version
+    (0.6.0 ships none of --events/--qr-format/--phone; 0.17.x ships all)."""
+    try:
+        out = subprocess.run([wacli, "auth", "--help"], capture_output=True,
+                             text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return out.stdout + out.stderr
+
+
+def wacli_version(wacli: str) -> str:
+    try:
+        out = subprocess.run([wacli, "--version"], capture_output=True,
+                             text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    return (out.stdout or out.stderr).strip() or "unknown"
 
 
 def render_qr_png(payload: str, out_dir: str) -> str | None:
@@ -148,9 +170,23 @@ class EventRouter:
 
 
 def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
-    cmd = [wacli, "auth", "--events", "--qr-format", "text"]
+    # Probe the flag surface: passing a flag this build lacks makes wacli exit
+    # instantly on "unknown flag" and every guided run dies generically.
+    flags = auth_flag_surface(wacli)
+    has_events = "--events" in flags
+    cmd = [wacli, "auth"]
+    if has_events:
+        cmd += ["--events", "--qr-format", "text"]
+    else:
+        emit(f"NOTE: this wacli build ({wacli_version(wacli)}) predates "
+             "--events; driving plain auth output instead — QR/pairing lines "
+             "may be reduced")
     if phone:
-        cmd += ["--phone", phone]
+        if "--phone" in flags:
+            cmd += ["--phone", phone]
+        else:
+            emit("NOTE: this wacli build lacks --phone pairing; falling back "
+                 "to the QR flow")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, bufsize=1)
     router = EventRouter(qr_dir)
@@ -196,8 +232,14 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
         return 0
     if timed_out:
         emit("ERROR: pairing timed out — ask the user to retry when ready")
+    elif router.error:
+        emit(f"ERROR: {router.error}")
+    elif has_events:
+        emit("ERROR: auth ended without a valid session")
     else:
-        emit(f"ERROR: {router.error or 'auth ended without a valid session'}")
+        emit(f"ERROR: auth ended without a valid session on {wacli_version(wacli)} "
+             "(no --events support) — upgrading wacli may be required: "
+             "brew upgrade steipete/tap/wacli")
     return 1
 
 

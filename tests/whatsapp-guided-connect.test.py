@@ -119,6 +119,7 @@ print("6. stubbed wacli: dead auth stream ends in ERROR, nonzero exit")
 stub.write_text(
     "#!/bin/sh\n"
     'case "$1 $2" in\n'
+    '  "auth --help") echo "  --events  --qr-format  --phone"; exit 0;;\n'
     '  "auth status") echo "not authenticated"; exit 1;;\n'
     '  "chats list") exit 1;;\n'
     '  "auth --events") exit 0;;\n'
@@ -144,6 +145,7 @@ stub.write_text(
     "#!/bin/sh\n"
     f'MARK="{lab}/paired"\n'
     'case "$1 $2" in\n'
+    '  "auth --help") echo "  --events  --qr-format  --phone"; exit 0;;\n'
     '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
     'else echo "not authenticated"; exit 1; fi;;\n'
     '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
@@ -166,6 +168,7 @@ stub.write_text(
     "#!/bin/sh\n"
     f'MARK="{lab}/paired8"\n'
     'case "$1 $2" in\n'
+    '  "auth --help") echo "  --events  --qr-format  --phone"; exit 0;;\n'
     '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
     'else echo "not authenticated"; exit 1; fi;;\n'
     '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
@@ -206,6 +209,13 @@ check(gc.auth_status_ok("w") is False and gc.chats_probe("w") is False,
       "probe timeouts read as not-connected, never raise")
 gc.subprocess.run = lambda *a, **k: _Done(0)
 check(gc.chats_probe("w") is True, "chats probe passes on rc 0")
+gc.subprocess.run = lambda *a, **k: _Done(0, "  --events  --phone")
+check("--events" in gc.auth_flag_surface("w"), "flag surface read from auth --help")
+gc.subprocess.run = lambda *a, **k: _Done(0, "wacli 9.9")
+check(gc.wacli_version("w") == "wacli 9.9", "version string read")
+gc.subprocess.run = _timeout_run
+check(gc.auth_flag_surface("w") == "" and gc.wacli_version("w") == "unknown",
+      "probe failures degrade to empty surface / unknown version")
 gc.subprocess.run = _real_run
 
 print("9a. text fallback: negatives never read as success")
@@ -253,7 +263,8 @@ _real_popen = gc.subprocess.Popen
 _real_aso, _real_cp = gc.auth_status_ok, gc.chats_probe
 
 
-def run_inproc(stderr_lines, *, phone=None, timeout=30, status=True, proc_cls=_FakeProc):
+def run_inproc(stderr_lines, *, phone=None, timeout=30, status=True, proc_cls=_FakeProc,
+               surface="--events --qr-format --phone"):
     procs = []
 
     def _spawn(*a, **k):
@@ -263,6 +274,11 @@ def run_inproc(stderr_lines, *, phone=None, timeout=30, status=True, proc_cls=_F
     gc.subprocess.Popen = _spawn
     gc.auth_status_ok = lambda w: status
     gc.chats_probe = lambda w: status
+    # Events-capable surface: these cases exercise the event loop, not the
+    # flag probe (11b/11c cover that against the stub binary).
+    gc.auth_flag_surface = lambda w: surface
+    gc.wacli_version = lambda w: "wacli test"
+
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = gc.run_auth("/fake/wacli", phone, timeout, qr_dir)
@@ -279,6 +295,13 @@ rc, out, pr = run_inproc([], phone="15551234567", timeout=1, status=False)
 check(rc == 1 and "timed out" in out, "quiet stream + dead store -> timeout error")
 rc, out, pr = run_inproc([], timeout=1, status=True)
 check(rc == 0 and "CONNECTED" in out, "timeout path still verifies the store first")
+
+
+rc, out, pr = run_inproc(["Pairing successful\n"], phone="15551234567",
+                         surface="--follow --idle-exit")
+check(rc == 0 and "CONNECTED" in out and "predates" in out
+      and "--phone pairing" in out,
+      "in-process flagless run: both NOTEs + text-router pairing")
 
 
 class _DeadProc(_FakeProc):
@@ -333,6 +356,55 @@ gc.run_auth = _real_run_auth
 gc.auth_status_ok, gc.chats_probe = _real_aso, _real_cp
 gc.shutil.which = _real_which
 sys.argv = _real_argv
+
+print("11b. flagless wacli (0.6.0-class): probe + plain-auth fallback")
+# Producer-faithful: real 0.6.0 lists no --events/--phone in `auth --help` and
+# exits "unknown flag" when passed one (measured by the repo owner on-host).
+stub.write_text(
+    "#!/bin/sh\n"
+    f'MARK="{lab}/paired13"\n'
+    f'echo "ARGS:$@" >> "{lab}/calls13"\n'
+    'case "$1 $2" in\n'
+    '  "auth --help") echo "Flags:"; echo "  --follow  --idle-exit"; exit 0;;\n'
+    '  "--version ") echo "wacli 0.6.0"; exit 0;;\n'
+    '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
+    'else echo "not authenticated"; exit 1; fi;;\n'
+    '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
+    '  "auth --events"|"auth --phone") echo "unknown flag: $2" >&2; exit 1;;\n'
+    '  "auth ") echo "Scan the QR code"; '
+    f'touch "$MARK"; echo "Pairing successful"; exit 0;;\n'
+    'esac\nexit 0\n')
+out = subprocess.run([sys.executable, str(SCRIPT), "--phone", "15551234567",
+                      "--timeout", "30"],
+                     capture_output=True, text=True, env=env, timeout=60)
+check(out.returncode == 0 and "CONNECTED" in out.stdout,
+      f"flagless build pairs via plain auth + text router (stdout={out.stdout.strip()!r})")
+check("NOTE: " in out.stdout and "--events" in out.stdout,
+      "degradation is announced, not silent")
+check("--phone pairing" in out.stdout, "unsupported --phone is announced")
+calls13 = (Path(lab) / "calls13").read_text()
+check("ARGS:auth --events" not in calls13 and "--phone" not in calls13.replace("ARGS:auth --help",""),
+      "no unsupported flag is ever passed to the flagless build")
+
+print("11c. flagged wacli keeps the events-mode invocation")
+stub.write_text(
+    "#!/bin/sh\n"
+    f'MARK="{lab}/paired14"\n'
+    f'echo "ARGS:$@" >> "{lab}/calls14"\n'
+    'case "$1 $2" in\n'
+    '  "auth --help") echo "  --events  --qr-format  --phone"; exit 0;;\n'
+    '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
+    'else echo "not authenticated"; exit 1; fi;;\n'
+    '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
+    '  "auth --events") echo \'{"event":"connected","data":{},"ts":9}\' >&2; '
+    f'touch "$MARK"; exit 0;;\n'
+    'esac\nexit 0\n')
+out = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "30"],
+                     capture_output=True, text=True, env=env, timeout=60)
+calls14 = (Path(lab) / "calls14").read_text()
+check(out.returncode == 0 and "CONNECTED" in out.stdout
+      and "ARGS:auth --events --qr-format text" in calls14,
+      f"events mode preserved when the build supports it (stdout={out.stdout.strip()!r})")
 
 print("12. instruction contract: guided connect is the authoritative unpaired path")
 skill_md = (REPO / "skills" / "whatsapp" / "SKILL.md").read_text()
