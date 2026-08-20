@@ -135,6 +135,57 @@ class TestMemorySyncVaultLookup(unittest.TestCase):
                       f"detail must name the workspace vault as its subject: {detail!r}")
         self.assertNotIn("sync-memory.sh", detail)
 
+    def _configured(self):
+        repo, ws = self._set_repo()
+        (repo / "sutando.config.local.json").write_text(
+            json.dumps({"vault": {"remote_url": "git@github.com:user/vault.git"}})
+        )
+        return repo, ws
+
+    def _aged_fetch_head(self, git_dir: Path, hours: float) -> None:
+        git_dir.mkdir(parents=True, exist_ok=True)
+        fh = git_dir / "FETCH_HEAD"
+        fh.write_text("")
+        when = time.time() - (hours * 3600)
+        os.utime(fh, (when, when))
+
+    def test_fresh_workspace_fetch_also_names_the_workspace(self):
+        """The ok branch is as ambiguous as the warn branch, so it names its subject too."""
+        _, ws = self._configured()
+        self._aged_fetch_head(ws / ".git", 2)
+        with patch("sys.path", [str(REPO / "src")] + sys.path):
+            result = hc.check_memory_sync()
+        self.assertEqual(result["status"], "ok", f"2h is fresh: {result!r}")
+        self.assertIn("workspace", result["detail"].lower())
+
+    def test_legacy_clone_branch_names_the_legacy_clone(self):
+        """No workspace .git → the legacy memory-sync clone supplies the freshness signal.
+
+        home is patched because this host really has ~/.sutando/memory-sync; reading it
+        would make the result depend on the machine.
+        """
+        _, ws = self._configured()
+        fake_home = self.tmp / "home"
+        self._aged_fetch_head(fake_home / ".sutando" / "memory-sync" / ".git", 367)
+        with patch.object(Path, "home", staticmethod(lambda: fake_home)):
+            with patch("sys.path", [str(REPO / "src")] + sys.path):
+                result = hc.check_memory_sync()
+        detail = result["detail"]
+        self.assertEqual(result["status"], "warn", f"367h is stale: {result!r}")
+        self.assertIn("legacy", detail.lower(),
+                      f"legacy-clone freshness must say so, not just 'last sync': {detail!r}")
+        self.assertNotIn("workspace vault", detail)
+
+    def test_fresh_legacy_clone_names_the_legacy_clone(self):
+        _, ws = self._configured()
+        fake_home = self.tmp / "home"
+        self._aged_fetch_head(fake_home / ".sutando" / "memory-sync" / ".git", 3)
+        with patch.object(Path, "home", staticmethod(lambda: fake_home)):
+            with patch("sys.path", [str(REPO / "src")] + sys.path):
+                result = hc.check_memory_sync()
+        self.assertEqual(result["status"], "ok", f"3h is fresh: {result!r}")
+        self.assertIn("legacy", result["detail"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()
