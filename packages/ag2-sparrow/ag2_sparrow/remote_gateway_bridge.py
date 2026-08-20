@@ -1484,7 +1484,7 @@ def _one_line(value) -> str:
     stripped so a gateway-controlled field can't inject extra `key: value`
     lines (e.g. forge a second access_tier). CR/LF alone was not enough —
     U+2028 is a boundary for a JS /m reader but not for split('\\n')."""
-    return " ".join(str(value).splitlines()) if str(value) else str(value)
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
