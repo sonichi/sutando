@@ -192,6 +192,12 @@ def _main(argv):
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     a = ap.parse_args(argv)
+
+    # Set where _main REJECTS INPUT before any op runs: nothing was attempted,
+
+    # so no caller can have believed it succeeded.
+
+    rejected_before_attempt = False
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before)
     elif a.cmd == "fetch":
@@ -209,6 +215,7 @@ def _main(argv):
             except (OSError, UnicodeDecodeError) as e:
                 content = None
                 res = {"ok": False, "reason": f"cannot read --file {a.file}: {e}"}
+                rejected_before_attempt = True
             if content is not None:
                 res = _doc.doc_put(a.room, content, folder=a.folder,
                                    name=a.name or "CONTEXT.md", message=a.message,
@@ -240,6 +247,7 @@ def _main(argv):
             tiers = _grant.parse_tier_pairs(a.tiers)
         except ValueError as e:
             res = {"ok": False, "reason": str(e)}
+            rejected_before_attempt = True
         else:
             res = _grant.grant_room(a.room_id, tiers=tiers, default_tier=a.default_tier,
                                     revoke=a.revoke, agent_mxid=a.agent_mxid)
@@ -248,7 +256,11 @@ def _main(argv):
         fn = _react.react if a.cmd == "react" else _react.unreact
         res = fn(a.room_id, a.event_id, key, a.agent_mxid)
     print(json.dumps(res, indent=2))
-    return 0
+    # An ATTEMPTED op that failed exited 0, so a caller checking $? recorded a
+    # success it never got. `ok is False` is doc.py/events.py's own discriminator.
+    if rejected_before_attempt:
+        return 0
+    return 1 if isinstance(res, dict) and res.get("ok") is False else 0
 
 
 if __name__ == "__main__":

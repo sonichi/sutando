@@ -163,6 +163,58 @@ class SayCliDispatchTests(unittest.TestCase):
         # say() takes (message, room_id); the CLI takes (room_id, message).
         m.assert_called_once_with("hi there", ROOM, None)
 
+    def test_a_failed_say_exits_nonzero(self):
+        """The CLI exited 0 on failure, so `$?` reported a post that never happened.
+
+        Measured live on 2026-08-20: a room with no gateway returned rc=0 carrying
+        {"ok": false, "reason": "no gateway configured"} and the caller recorded a
+        successful post. The JSON was right; only the exit code lied.
+        """
+        import io
+        import room_ops
+        from contextlib import redirect_stdout
+        with mock.patch.object(room_ops._say, "say",
+                               return_value={"ok": False, "room_id": ROOM,
+                                             "event_id": None,
+                                             "reason": "no gateway configured"}):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = room_ops._main(["say", ROOM, "hi there"])
+        self.assertEqual(rc, 1, "a failed say must not report success to the shell")
+        self.assertIn("no gateway configured", buf.getvalue(),
+                      "the reason must still reach stdout")
+
+    def test_unreadable_doc_file_is_rejected_before_any_attempt_and_exits_zero(self):
+        """The second pre-attempt branch, pinned so the exemption stays deliberate.
+
+        `doc put --file <unreadable>` is rejected by _main before doc_put runs, so
+        no caller can have believed a write happened -- the same reason
+        room-ops-grant.test.py pins rc=0 for a bad --tier.
+        """
+        import io
+        import room_ops
+        from contextlib import redirect_stdout
+        import doc as _doc_mod   # room_ops imports it lazily inside the branch
+        with mock.patch.object(_doc_mod, "doc_put") as put:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = room_ops._main(["doc", "put", ROOM,
+                                     "--file", "/nonexistent/nope.md"])
+        self.assertEqual(rc, 0, "input rejected before any attempt is not an op failure")
+        self.assertEqual(put.call_count, 0, "never reached the write")
+        self.assertIn("cannot read --file", buf.getvalue())
+
+    def test_a_result_without_an_ok_key_still_exits_zero(self):
+        """Only an EXPLICIT ok:false fails. Commands that report no `ok` are unchanged."""
+        import io
+        import room_ops
+        from contextlib import redirect_stdout
+        with mock.patch.object(room_ops._say, "say",
+                               return_value={"room_id": ROOM, "event_id": "$e"}):
+            with redirect_stdout(io.StringIO()):
+                rc = room_ops._main(["say", ROOM, "hi there"])
+        self.assertEqual(rc, 0)
+
 
 class SayNetworkFailureTests(unittest.TestCase):
     def test_http_error_degrades_and_does_not_raise(self):
