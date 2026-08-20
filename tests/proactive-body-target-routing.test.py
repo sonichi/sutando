@@ -125,9 +125,8 @@ def main() -> int:
     for channel in ("discord", "slack", "telegram"):
         check(body_claimable_by(f"[dm-only]\n[channel: {ROOM}]\nx", channel),
               f"3b) so {channel} may still claim it — the guard routes nothing")
-    # And with the address FIRST, routing applies as usual; [dm-only] then stops
-    # the redirect executing, so it lands in the owner's DM on the bridge that
-    # claimed it — an owner DM either way, which is why this is safe to route.
+    # Address FIRST: routing applies, and [dm-only] still stops the redirect, so
+    # it lands in an owner DM either way — which is why routing it is safe.
     check(not body_claimable_by(f"[channel: {ROOM}]\n[dm-only]\nx", "telegram"),
           "3b) an addressed body carrying [dm-only] still routes by its address")
 
