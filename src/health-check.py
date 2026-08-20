@@ -2417,11 +2417,11 @@ def _age_phrase(age_s) -> str:
     return "age unknown" if age_s is None else f"{age_s}s ago"
 
 
-def _last_fetch_age_s(repo, git_bin: str) -> "int | None":
-    """Seconds since this checkout last contacted its remote, or None.
+def _last_fetch_age_s(repo, git_bin: str, expected: str) -> "int | None":
+    """Seconds since this checkout last fetched `expected` from a remote, or None.
 
-    FETCH_HEAD is rewritten by every fetch, including one that finds nothing new;
-    refs/remotes/* only moves when the remote does, so it under-reports silence.
+    Scoped to the ref whose currency the caller is claiming: FETCH_HEAD's mtime is
+    the last fetch of ANYTHING, so a PR-ref fetch would date a stale origin/main.
     """
     try:
         out = subprocess.run([git_bin, "-C", str(repo), "rev-parse", "--git-common-dir"],
@@ -2431,7 +2431,13 @@ def _last_fetch_age_s(repo, git_bin: str) -> "int | None":
         common = Path(out.stdout.strip())
         if not common.is_absolute():
             common = Path(repo) / common
-        return max(int(time.time() - (common / "FETCH_HEAD").stat().st_mtime), 0)
+        fetch_head = common / "FETCH_HEAD"
+        st = fetch_head.stat()
+        # Only the CONTENT says which ref was fetched. A record naming another ref
+        # dates that ref, never this one — understating is the safe direction here.
+        if f"branch '{expected}' of " not in fetch_head.read_text(errors="replace"):
+            return None
+        return max(int(time.time() - st.st_mtime), 0)
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
 
@@ -2439,7 +2445,7 @@ def _last_fetch_age_s(repo, git_bin: str) -> "int | None":
 def _fetch_age_phrase(age_s) -> str:
     """A currency claim with no fetch behind it is worth naming, not omitting."""
     if age_s is None:
-        return "no fetch recorded in this checkout"
+        return "no fetch of that branch recorded"
     return f"a fetch {age_s // 3600}h{age_s % 3600 // 60}m ago"
 
 
@@ -2958,7 +2964,7 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     if behind == 0:
         return {"name": name, "status": "ok",
                 "detail": f"live checkout on {expected!r} "
-                          f"({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin))})"}
+                          f"({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin, expected))})"}
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     # LIVE processes only: `src/` moves several times a day, so the running set
     # is what keeps this from becoming the alert fatigue the threshold prevents.
@@ -3006,7 +3012,7 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
                       + (f", {behind} commits behind" if behind else "")
-                      + f" ({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin))})"}
+                      + f" ({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin, expected))})"}
 
 
 def check_engine_revision_drift(repo_dir: "Path | None" = None,

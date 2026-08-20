@@ -277,7 +277,7 @@ def main() -> int:
         if not common.is_absolute():
             common = work / common
         fh = common / "FETCH_HEAD"
-        fh.touch()
+        fh.write_text("deadbeef\t\tbranch 'main' of /tmp/origin\n")
         old = time.time() - (26 * 3600 + 5 * 60)
         os.utime(fh, (old, old))
         r = hc.check_live_checkout_branch(work)
@@ -295,8 +295,34 @@ def main() -> int:
             common = work / common
         (common / "FETCH_HEAD").unlink(missing_ok=True)
         r = hc.check_live_checkout_branch(work)
-        check("no fetch recorded" in r["detail"] and "h0m" not in r["detail"],
+        check("no fetch of that branch recorded" in r["detail"] and "h0m" not in r["detail"],
               f"l4) absent FETCH_HEAD is named, not rendered as fresh, got {r['detail']}")
+
+    # l5) A fetch of an UNRELATED ref must not date origin/<expected>. FETCH_HEAD's
+    #     mtime is the last fetch of anything; only its content names the ref.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        (common / "FETCH_HEAD").write_text(
+            "deadbeef\t\t'refs/pull/2270/head' of https://example.invalid/r\n")
+        r = hc.check_live_checkout_branch(work)
+        check("no fetch of that branch recorded" in r["detail"],
+              f"l5) a PR-ref fetch must not read as freshly fetched, got {r['detail']}")
+
+    # l6) A failed `rev-parse --git-common-dir` degrades to None, never to a number.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        fake = Path(td) / "git-nocommon"
+        fake.write_text("#!/bin/sh\ncase \"$*\" in *--git-common-dir*) exit 3;; esac\nexec git \"$@\"\n")
+        fake.chmod(0o755)
+        age = hc._last_fetch_age_s(work, str(fake), "main")
+        check(age is None, f"l6) nonzero --git-common-dir must degrade to None, got {age}")
+        check(hc._fetch_age_phrase(age) == "no fetch of that branch recorded",
+              f"l6) and renders the named phrase, got {hc._fetch_age_phrase(age)}")
 
     # Behavioral staleness (added 2026-08-03). The count threshold above is
     # deliberately 10 and case k) pins that 1 behind stays ok — both correct for
