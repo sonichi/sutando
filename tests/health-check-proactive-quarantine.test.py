@@ -63,7 +63,10 @@ class TestProactiveQuarantine(unittest.TestCase):
             self.assertIn("proactive-1785870055.txt", r["detail"])
             self.assertIn("2h15m", r["detail"])
             # The verdict must say WHY it matters, not just that a file exists.
-            self.assertIn("nothing reads this directory", r["detail"])
+            self.assertIn("no consumer drains this directory", r["detail"])
+            # ...and must not say nobody was told. Emitting this line IS telling;
+            # the claim was quoted as an independent finding twice.
+            self.assertNotIn("nobody has been told", r["detail"])
 
     def test_every_kept_body_is_counted(self):
         with tempfile.TemporaryDirectory() as td:

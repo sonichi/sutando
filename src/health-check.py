@@ -6338,8 +6338,9 @@ def check_proactive_quarantine() -> dict:
         "name": name,
         "status": "warn",
         "detail": (f"{len(kept)} proactive message(s) kept in results/undelivered/ that Discord "
-                   f"refused — preserved, but nothing reads this directory, so nobody has been "
-                   f"told; oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
+                   f"refused — preserved, but no consumer drains this directory, so they stay "
+                   f"until someone acts; oldest {oldest_name} "
+                   f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
                    f"{partial}"),
     }
 
