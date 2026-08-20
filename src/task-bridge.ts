@@ -221,13 +221,8 @@ export function _readTaskHeader(taskId: string): string[] | null {
 	return null;
 }
 
-/**
- * The trusted header region: every line before the first `task:` delimiter.
- * `task:` is written last, so anything at or after it is user-supplied body
- * and must never be interpreted as a header field — otherwise a body line
- * like `channel_id: local-voice` or `source: context-drop` forges its own
- * classification. Canonical contract: src/local_task_protocol.py.
- */
+/** Lines before the first `task:`. Body after it is user-supplied, so reading it
+ *  as a header field lets a body line forge its own classification. */
 export function headerRegion(raw: string): string[] {
 	const headerLines: string[] = [];
 	for (const l of raw.split('\n')) {
@@ -618,20 +613,14 @@ export function getRecentConversation(count = 10): string {
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
 const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
 
-/**
- * `task-X.txt` and `task-X.claimed-core-1.txt` are the same task — claim_task.py
- * renames on claim (see src/task_archive.py) and both spellings pass this scan's
- * filter. Key anything task-identity-shaped on this, never the raw basename.
- */
+/** claim_task.py renames on claim, so both spellings are one task. Key any
+ *  task-identity state on this, never the raw basename. */
 export function logicalTaskName(basename: string): string {
 	return basename.replace(/\.claimed-core-\d+\.txt$/, '.txt');
 }
 
-/**
- * Exact `source: context-drop` in the header. Shared by the scan and the result
- * loop so they cannot disagree: an unanchored test also claims `context-drop-replay`,
- * which classifies as `other` for injection, so its reply would be archived undelivered.
- */
+/** Anchored, so `context-drop-replay` does not match. Shared by the scan and the
+ *  result loop so the two cannot disagree about what a drop is. */
 export function isContextDropHeader(raw: string): boolean {
 	return /^source:[ \t]*context-drop[ \t]*$/m.test(headerRegion(raw).join('\n'));
 }
@@ -661,16 +650,11 @@ type DropTaskScan =
 	| { kind: 'incomplete' }
 	| { kind: 'drop'; body: string };
 
-/**
- * Pull the dropped text back out of a `source: context-drop` task file. A drop
- * whose `task:` line has not landed yet is `incomplete`, never `other`.
- */
+/** A drop whose `task:` line has not landed yet is `incomplete`, never `other`. */
 export function scanDropTask(path: string): DropTaskScan {
 	const raw = readFileSync(path, 'utf-8');
-	// Classify from the HEADER only. Testing `raw` matched a `source:
-	// context-drop` line sitting after `task:`, i.e. inside attacker-supplied
-	// body, so a Guest gateway task could be injected into the live owner
-	// session. Both real producers write `source:` before `task:`.
+	// Header only: matching `raw` let a body line forge `source: context-drop`,
+	// injecting a Guest task into the live owner session.
 	if (!isContextDropHeader(raw)) {
 		// A header still being written has no source line yet; re-read next tick.
 		return /^task:/m.test(raw) ? { kind: 'other' } : { kind: 'incomplete' };
@@ -684,12 +668,8 @@ export function scanDropTask(path: string): DropTaskScan {
 	return body ? { kind: 'drop', body } : { kind: 'incomplete' };
 }
 
-/**
- * Watch for context drops and inject them into the Gemini conversation.
- * Called once at startup. Two producers exist and only one writes
- * CONTEXT_DROP_FILE, so the task dir — which both write — is the injection
- * point; see the task-dir scan below.
- */
+/** Watch for context drops and inject them. Only one of the two producers writes
+ *  CONTEXT_DROP_FILE, so the task dir — which both write — is the injection point. */
 export function startContextDropWatcher(onContextDrop: (content: string) => void): void {
 	console.log(`${ts()} [TaskBridge] Watching for context drops`);
 	setInterval(() => {
@@ -738,11 +718,8 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 	}, 2000);
 }
 
-/**
- * One tick of the desktop-drop scan: the dedup + restart-seed state machine.
- * Exported so regressions drive THIS state, not a re-implementation of it —
- * a copied recipe still passes when the production call is mutated.
- */
+/** One tick of the desktop-drop scan. Exported so regressions drive THIS state:
+ *  a copied recipe still passes when the production call is mutated. */
 export function scanDropTasksOnce(dir: string, onDrop: (body: string) => void): void {
 	const present = readdirSync(dir);
 	// Archived tasks can never be re-read, so their claims are dead weight.
