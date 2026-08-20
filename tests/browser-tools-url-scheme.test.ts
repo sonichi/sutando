@@ -64,7 +64,18 @@ describe('withScheme', () => {
 	it('still qualifies host:port, which is what the digit rule exists for', () => {
 		assert.equal(withScheme('localhost:3000'), 'https://localhost:3000');
 		assert.equal(withScheme('127.0.0.1:8080'), 'https://127.0.0.1:8080');
-		assert.equal(withScheme('example.com:8080/x'), 'https://example.com:8080/x');
+		assert.equal(withScheme('[::1]:8080'), 'https://[::1]:8080');
+	});
+
+	// `example.com:8080` is syntactically a scheme AND an authority, and nothing
+	// in the string decides which. It keeps its input form — same as main, so no
+	// regression — because guessing wrong on the other branch rewrites a deep
+	// link to an attacker-reachable origin. An explicit scheme qualifies it.
+	it('leaves an ambiguous dotted host:port alone rather than guessing', () => {
+		assert.equal(withScheme('example.com:8080/x'), 'example.com:8080/x');
+		assert.equal(withScheme('https://example.com:8080/x'), 'https://example.com:8080/x');
+		// The PR's actual target — a bare host with no port — is unaffected.
+		assert.equal(withScheme('example.com/x'), 'https://example.com/x');
 	});
 
 	// A scheme allowlist can only preserve the schemes it lists. Any other
@@ -73,6 +84,14 @@ describe('withScheme', () => {
 		assert.equal(withScheme('mailto:123@example.com'), 'mailto:123@example.com');
 		assert.equal(withScheme('bitcoin:1A1zP1eP5Q'), 'bitcoin:1A1zP1eP5Q');
 		assert.equal(withScheme('spotify:404'), 'spotify:404');
+	});
+
+	// Opposite direction: a reverse-DNS scheme is dotted, which is the ordinary
+	// shape of an app deep link. Inferring host:port from "dotted" claimed it.
+	it('preserves a dotted (reverse-DNS) scheme rather than reading it as host:port', () => {
+		assert.equal(withScheme('com.example:123/path'), 'com.example:123/path');
+		assert.equal(withScheme('com.spotify.music:456'), 'com.spotify.music:456');
+		assert.equal(new URL(withScheme('com.example:123/path')).protocol, 'com.example:');
 	});
 });
 
