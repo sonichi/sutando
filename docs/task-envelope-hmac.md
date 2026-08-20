@@ -69,11 +69,11 @@ property. Execution uniqueness is Phase 3.
 - **Key**: 32 bytes as 64 hex chars at `<workspace>/state/auth/task-hmac.key`,
   mode 0600, never leaving the host. The merged Python writer mints it via
   temp file + `link()` first-writer-wins, which publishes only complete
-  bytes. *Pending (#3058):* the TS writer creates at the final path with
-  `O_EXCL` — atomic create but not atomic content publication, a window the
-  corrupt-key guards close by rejection. *Pending (#3058 TS, #3065 Python):*
-  both loaders rejecting a present-but-corrupt key loudly (exactly 64 hex
-  chars / 32 bytes) instead of operating with a truncated key.
+  bytes. The TS writer creates at the final path with `O_EXCL` — atomic
+  create but not atomic content publication, a window the corrupt-key guards
+  close by rejection. Both loaders reject a present-but-corrupt key loudly
+  (exactly 64 hex chars / 32 bytes) rather than operating with a truncated
+  key; shipped in #3058 (TS) and #3065 (Python), both merged 2026-08-18.
 - **Stamping**: HMAC-SHA256 over the entire body (any previous stamp line
   stripped first), spliced into the **canonical slot** — line 1 directly
   after `id:`, or line 0 when there is no id header. Writers fail *open*: a
@@ -138,9 +138,11 @@ lands, tasks from those writers are `unsigned`. Stamps are **telemetry
 only** today:
 `src/task_envelope_census.py` counts verified/unsigned so the unsigned
 population can be watched draining during the soak window. No consumer
-changes behavior on a verdict yet. (Phase 1 is complete when the PR-trail
-"open" rows land; the census's unsigned count is the live measure of the
-gap.)
+changes behavior on a verdict yet. (Phase 1 is complete when every writer edge
+stamps — **not** when the PR trail has no open rows. Those two came apart on
+2026-08-20: the trail is now fully merged while `agent-api` and `voice-agent`
+still write unstamped and have no PR. The census's unsigned count is the live
+measure of that gap.)
 
 **Read that count with its window in mind.** The default invocation is
 `python3 src/task_envelope_census.py --days 7`, and it scans `tasks/` **and**
