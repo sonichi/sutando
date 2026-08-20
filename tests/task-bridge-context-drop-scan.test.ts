@@ -167,6 +167,52 @@ describe('claim rename is the same logical task', () => {
 		assert.equal(logicalTaskName('task-X.claimed-core-1.bak.txt'), 'task-X.claimed-core-1.bak.txt');
 	});
 
+	it('production scan: a body completed between polls injects the WHOLE body', () => {
+		// The defect: a progressively-written body reads as complete the moment its
+		// first chunk lands, and the claim is permanent — so the suffix never injects
+		// and the live session acts on a truncated prefix.
+		const d = mkdtempSync(join(tmpdir(), 'drop-partial-'));
+		try {
+			_resetDropScanState(false);
+			const p = join(d, 'task-PART.txt');
+			const got: string[] = [];
+			writeFileSync(p, 'id: task-PART\nsource: context-drop\ntask: selected');
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, [], 'a first sighting must not inject: the bytes may still be growing');
+
+			writeFileSync(p, 'id: task-PART\nsource: context-drop\ntask: selected paragraph in full\n');
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, [], 'bytes changed, so it is still not stable');
+
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, ['selected paragraph in full'],
+				'once two scans agree the FULL body injects, never the prefix');
+
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.equal(got.length, 1, 'and it stays claimed afterwards');
+		} finally {
+			rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	it('production scan: seeding still claims on the FIRST pass (no replay)', () => {
+		// Seeding must be exempt from the stability wait: a queued drop left unclaimed
+		// by the seeding pass would inject for real on the next live pass.
+		const d = mkdtempSync(join(tmpdir(), 'drop-seed-stab-'));
+		try {
+			_resetDropScanState(true);
+			writeFileSync(join(d, 'task-SEED2.txt'),
+				'id: task-SEED2\nsource: context-drop\ntask: already queued at startup\n');
+			const got: string[] = [];
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, [], 'seeding never injects');
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, [], 'and the seeded drop must not replay once seeding is over');
+		} finally {
+			rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	it('production scan: a claim does NOT re-inject (one injection)', () => {
 		// Drives scanDropTasksOnce and its real _injectedDropTasks state. Mutating
 		// the production `logicalTaskName(name)` back to `name` must fail here.
@@ -176,8 +222,12 @@ describe('claim rename is the same logical task', () => {
 			const drop = 'id: task-A\nsource: context-drop\ntask: the dropped text\n';
 			writeFileSync(join(d, 'task-A.txt'), drop);
 			const got: string[] = [];
+			// Two scans: a drop is only claimed once its bytes are unchanged between
+			// them, so a partial write cannot be claimed with its suffix unwritten.
 			scanDropTasksOnce(d, (b) => got.push(b));
-			assert.deepEqual(got, ['the dropped text'], 'first pass injects once');
+			assert.deepEqual(got, [], 'first sighting records the bytes, does not inject');
+			scanDropTasksOnce(d, (b) => got.push(b));
+			assert.deepEqual(got, ['the dropped text'], 'the stable pass injects once');
 
 			renameSync(join(d, 'task-A.txt'), join(d, 'task-A.claimed-core-1.txt'));
 			scanDropTasksOnce(d, (b) => got.push(b));
@@ -214,7 +264,8 @@ describe('claim rename is the same logical task', () => {
 			}
 			writeFileSync(join(d, 'task-C.txt'), 'id: task-C\nsource: context-drop\ntask: keep me\n');
 			const got: string[] = [];
-			scanDropTasksOnce(d, (b) => got.push(b));
+			scanDropTasksOnce(d, (b) => got.push(b));   // pads claim immediately; the drop is fingerprinted
+			scanDropTasksOnce(d, (b) => got.push(b));   // stable now -> injects
 			assert.equal(got.length, 1, 'the one real drop injects');
 			assert.ok(_dropScanStateSize() > 500, 'eviction branch is now armed');
 

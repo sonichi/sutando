@@ -645,6 +645,10 @@ export function findTaskFile(dir: string, taskId: string): string | null {
 /** Drop task files already handed to the live session, so a re-scan cannot re-inject.
  *  Holds LOGICAL names (see logicalTaskName) — a claim rename must not read as new. */
 const _injectedDropTasks = new Set<string>();
+/** Bytes fingerprint of a drop seen once but not yet claimed: a drop is only
+ *  injected when two consecutive scans agree, so a partial write cannot be
+ *  claimed permanently with its suffix still unwritten. */
+const _dropStability = new Map<string, string>();
 /** First scan only records what is already queued — a restart must not replay old drops. */
 let _seedingDropTasks = true;
 
@@ -729,6 +733,7 @@ export function scanDropTasksOnce(dir: string, onDrop: (body: string) => void): 
 	if (_injectedDropTasks.size > 500) {
 		const live = new Set(present.map(logicalTaskName));
 		for (const seen of _injectedDropTasks) if (!live.has(seen)) _injectedDropTasks.delete(seen);
+		for (const seen of _dropStability.keys()) if (!live.has(seen)) _dropStability.delete(seen);
 	}
 	for (const name of present) {
 		if (!name.startsWith('task-') || !name.endsWith('.txt')) continue;
@@ -739,6 +744,23 @@ export function scanDropTasksOnce(dir: string, onDrop: (body: string) => void): 
 			scan = scanDropTask(join(dir, name));
 		} catch { continue; }
 		if (scan.kind === 'incomplete') continue;
+		// A body written progressively reads as complete the moment its first
+		// chunk lands, and the claim below is permanent — so the suffix would
+		// never be injected. Require the bytes to be unchanged across two scans
+		// before claiming. Seeding is exempt: it must claim on the first pass or
+		// an already-queued drop replays as a live injection on the next one.
+		if (scan.kind === 'drop' && !_seedingDropTasks) {
+			let fp: string;
+			try {
+				const st = statSync(join(dir, name));
+				fp = `${st.size}:${st.mtimeMs}`;
+			} catch { continue; }
+			if (_dropStability.get(logical) !== fp) {
+				_dropStability.set(logical, fp);
+				continue;
+			}
+			_dropStability.delete(logical);
+		}
 		_injectedDropTasks.add(logical);
 		if (scan.kind !== 'drop' || _seedingDropTasks) continue;
 		console.log(`${ts()} [TaskBridge] Context drop detected: ${scan.body.slice(0, 100)}`);
@@ -750,6 +772,7 @@ export function scanDropTasksOnce(dir: string, onDrop: (body: string) => void): 
 /** Test seam: clear the scan's dedup set and choose whether the next pass seeds. */
 export function _resetDropScanState(seeding: boolean): void {
 	_injectedDropTasks.clear();
+	_dropStability.clear();
 	_seedingDropTasks = seeding;
 }
 
