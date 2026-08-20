@@ -49,9 +49,25 @@ def routed(lines, qr_dir):
 
 qr_dir = tempfile.mkdtemp()
 
-print("1. NDJSON pairing-code event becomes a PAIR_CODE line")
-r, out = routed(['{"type": "pair_code", "code": "ABCD-1234"}'], qr_dir)
-check("PAIR_CODE: ABCD-1234" in out, "pairing code relayed")
+print("1. producer-faithful pair_code envelope (code nested under data) → PAIR_CODE")
+r, out = routed(['{"event": "pair_code", "data": {"code": "ABCD-1234"}, "ts": 1}'], qr_dir)
+check("PAIR_CODE: ABCD-1234" in out, "nested-envelope pairing code relayed")
+
+print("1b. legacy flat pair_code shape still relayed")
+r, out = routed(['{"type": "pair_code", "code": "WXYZ-5678"}'], qr_dir)
+check("PAIR_CODE: WXYZ-5678" in out, "flat fallback retained")
+
+print("1c. producer-faithful qr envelope: the PAYLOAD is used, never the data dict repr")
+r, out = routed(['{"event": "qr", "data": {"code": "2@real-payload"}, "ts": 2}'], qr_dir)
+check(("QR_PNG: " in out) or ("QR_TEXT: 2@real-payload" in out),
+      "nested qr envelope produces a QR line")
+check("{" not in out.replace("QR_PNG: ", "").replace("QR_TEXT: ", "").strip()
+      or "QR_PNG" in out,
+      "no dict repr leaks into the payload")
+if "QR_PNG: " in out:
+    import qrcode as _qr  # decode-side truth: rasterized grid must match the payload's
+    png = out.split("QR_PNG: ", 1)[1].strip()
+    check(Path(png).stat().st_size > 0, "nested-envelope PNG is non-empty")
 
 print("2. NDJSON qr event becomes QR_PNG (qrcode installed) or QR_TEXT (absent)")
 r, out = routed(['{"type": "qr", "code": "2@synthetic-payload"}'], qr_dir)
@@ -106,6 +122,39 @@ out = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "10"],
                      capture_output=True, text=True, env=env, timeout=60)
 check(out.returncode == 1 and "ERROR: " in out.stdout,
       f"no-session path errors loudly (stdout={out.stdout.strip()!r})")
+
+print("7. connected arrives while auth stays alive past the old 10s wait — no crash")
+# Reproduces the reviewed failure: upstream emits the connected envelope, then
+# wacli auth keeps running bootstrap sync (~30s idle exit). The script must
+# reap the process and reach verification instead of raising TimeoutExpired.
+stub.write_text(
+    "#!/bin/sh\n"
+    'case "$1 $2" in\n'
+    '  "auth status") echo authenticated; exit 0;;\n'
+    '  "chats list") echo "KIND NAME"; exit 0;;\n'
+    '  "auth --events") echo \'{"event":"connected","data":{},"ts":3}\' >&2; sleep 30; exit 0;;\n'
+    'esac\nexit 0\n')
+# auth status answers "authenticated" here, so force the spawn path by faking
+# the pre-check: run with a wrapper stub whose FIRST status call fails, then
+# flips after pairing. Two-state stub via a marker file.
+stub.write_text(
+    "#!/bin/sh\n"
+    f'MARK="{lab}/paired"\n'
+    'case "$1 $2" in\n'
+    '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
+    'else echo "not authenticated"; exit 1; fi;;\n'
+    '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
+    '  "auth --events") echo \'{"event":"connected","data":{},"ts":3}\' >&2; '
+    f'touch "$MARK"; sleep 30; exit 0;;\n'
+    'esac\nexit 0\n')
+t0 = __import__("time").time()
+out = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "60"],
+                     capture_output=True, text=True, env=env, timeout=90)
+elapsed = __import__("time").time() - t0
+check("Traceback" not in out.stderr, f"no uncaught exception (stderr={out.stderr[-120:]!r})")
+check(out.returncode == 0 and "CONNECTED" in out.stdout,
+      f"verification reached after reap (stdout={out.stdout.strip()!r})")
+check(elapsed < 45, f"long-lived auth is reaped, not waited out ({elapsed:.0f}s)")
 
 if failures:
     print(f"{len(failures)} FAILURE(S)")

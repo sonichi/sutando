@@ -105,16 +105,26 @@ class EventRouter:
 
     def _feed_event(self, ev: dict) -> None:
         kind = str(ev.get("type") or ev.get("event") or "").lower()
+        # wacli's EventWriter nests the material under `data`
+        # ({"event":"pair_code","data":{"code":…}}); older/flat shapes are kept
+        # as fallbacks. Never stringify the whole data dict — that renders a
+        # dict repr into the QR instead of the payload.
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
         if "qr" in kind:
-            payload = ev.get("code") or ev.get("payload") or ev.get("data")
-            if payload:
-                self._emit_qr(str(payload))
-        elif "pair" in kind and ("code" in ev or "pairing_code" in ev):
-            emit(f"PAIR_CODE: {ev.get('code') or ev.get('pairing_code')}")
+            payload = (data.get("code") or data.get("payload")
+                       or ev.get("code") or ev.get("payload"))
+            if isinstance(payload, str) and payload:
+                self._emit_qr(payload)
+        elif "pair" in kind:
+            code = (data.get("code") or data.get("pairing_code")
+                    or ev.get("code") or ev.get("pairing_code"))
+            if isinstance(code, str) and code:
+                emit(f"PAIR_CODE: {code}")
         elif kind in ("connected", "authenticated", "paired", "success"):
             self.paired = True
         elif kind in ("error", "fatal"):
-            self.error = str(ev.get("message") or ev.get("error") or "unknown")
+            self.error = str(ev.get("message") or data.get("message")
+                             or ev.get("error") or "unknown")
 
     def _feed_text(self, line: str) -> None:
         low = line.lower()
@@ -167,7 +177,17 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
         emit("ERROR: pairing timed out — ask the user to retry when ready")
         return 1
 
-    proc.wait(timeout=10)
+    # After the connected event, wacli keeps running bootstrap sync until its
+    # ~30s idle exit — reap it explicitly instead of waiting it out. The
+    # session store is already durable, so cutting the sync short costs
+    # nothing the verification below wouldn't catch.
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
     # The stream can end without an explicit paired event; the session store is
     # the authority either way.
     if auth_status_ok(wacli) and chats_probe(wacli):
