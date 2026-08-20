@@ -213,6 +213,20 @@ def cases_needing_attention(data, today="2026-08-20", stale_days=3):
         check("escalate Acme" in body and "Refund" not in body,
               "e2e: the new type's own tier config filters, not a shipped default")
 
+    # The autonomy override lives in the ROOM's data object, which room members can
+    # write. Pin the direction: a room may only ever REDUCE its own automation.
+    for room_val, dflt, want_auto in [("propose", "safe", False), ("safe", "safe", True),
+                                      (None, "safe", True), ("anything-else", "safe", False),
+                                      ("safe", "propose", True)]:
+        eff = room_val if room_val is not None else dflt
+        auto, prop = bl.split_actions([{"name": "x", "reasons": ["r"]}], eff, ["r"])
+        check(bool(auto) == want_auto,
+              f"autonomy: room={room_val!r} default={dflt!r} -> auto={bool(auto)} (want {want_auto})")
+    # The last case is the one that matters: a manifest default of "propose" does NOT
+    # hold, because the room can name "safe" and re-enable auto-exec on itself.
+    check(bool(bl.split_actions([{"name": "x", "reasons": ["r"]}], "safe", ["r"])[0]),
+          "autonomy: a 'propose' manifest default is NOT a guard — the room overrides it")
+
     print("\n" + ("PASS — all checks green" if not _fails else f"FAIL — {len(_fails)} failing"))
     return 1 if _fails else 0
 

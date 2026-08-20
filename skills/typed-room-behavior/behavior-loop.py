@@ -310,6 +310,8 @@ def run(registry_path, state_path, dry_run=False, force=False, manifest_dir=None
         if not data:
             reports.append((room, "no data object"))
             continue
+        # `data` is the ROOM's vault doc, so its members control this override. Only
+        # "safe" enables auto-exec: never set autonomy_default to "propose" as a guard.
         autonomy = data.get("autonomy", manifest.get("autonomy_default", "safe"))
         items = eng.analyze(data)
         if not items:
