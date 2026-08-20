@@ -212,10 +212,19 @@ migrate_root_status_to_state() {
 # migrator would have skipped the move silently. Both cases now require
 # explicit invocation of `bash scripts/sutando-migrate.sh`.
 legacy_state_notice() {
-  # Under state/: the workspace root is reserved for top-level directories, and
-  # the legacy root path is still honoured so installs don't re-print the notice.
+  # Under state/: the workspace root is reserved for top-level directories.
   local notice_sentinel="$WORKSPACE/state/.legacy-notice-printed"
-  if [ -f "$notice_sentinel" ] || [ -f "$WORKSPACE/.legacy-notice-printed" ]; then
+  local legacy_sentinel="$WORKSPACE/.legacy-notice-printed"
+  # Migrate an already-printed install rather than only honouring it: leaving the
+  # root file in place keeps workspace-root-tidy warning forever (review, #3205).
+  if [ -f "$legacy_sentinel" ] && [ ! -f "$notice_sentinel" ]; then
+    mkdir -p "$(dirname "$notice_sentinel")" 2>/dev/null && : > "$notice_sentinel" 2>/dev/null
+  fi
+  if [ -f "$notice_sentinel" ]; then
+    rm -f "$legacy_sentinel" 2>/dev/null   # best-effort; metadata only
+    return 0
+  fi
+  if [ -f "$legacy_sentinel" ]; then
     return 0
   fi
   local found=()
