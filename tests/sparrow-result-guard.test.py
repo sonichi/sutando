@@ -282,6 +282,10 @@ def drain_once(tids, provenance=()):
     m.TASKS_DIR = tasks
     m.RESULTS_DIR = results
     m.ARCHIVE_RESULTS_DIR = results / "archive"
+    # _STATE too: the drain journals suppressions now, and the module-level
+    # value is the OPERATOR's ~/.ag2-sparrow/state.
+    real_state = m._STATE
+    m._STATE = root / "state"
     m._REDELIVERED.clear()
     for tid in tids:
         write_task(tasks, tid, "team")
@@ -299,6 +303,7 @@ def drain_once(tids, provenance=()):
         return posted, inflight
     finally:
         m._req = real_req
+        m._STATE = real_state
 
 
 # THE security property, post-#3108: a guarded tier may suppress its own
