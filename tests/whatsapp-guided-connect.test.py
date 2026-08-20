@@ -425,6 +425,29 @@ check("steipete" not in skill_md and "steipete" not in script_src,
 check("openclaw/tap/wacli" in skill_md and "openclaw/tap/wacli" in script_src,
       "install/upgrade surfaces name the maintained openclaw tap")
 
+# The QR only helps if the result bridges may actually attach it. Render into
+# the PRODUCTION default dir and assert the resulting path clears the same
+# fail-closed allowlist the bridges enforce (src/send_allowlist.py) — the
+# delivery-authorization contract, which output/existence checks cannot see.
+# A control against the system temp dir pins the failure this replaces.
+try:
+    import qrcode  # noqa: F401
+    _qr_ok = True
+except ImportError:
+    _qr_ok = False
+if _qr_ok:
+    sys.path.insert(0, str(REPO / "src"))
+    from send_allowlist import is_path_sendable
+    _default_qr = gc.render_qr_png("2@deliverable-payload", gc._SENDABLE_QR_DIR)
+    check(_default_qr is not None and is_path_sendable(_default_qr),
+          "QR rendered into the default dir is deliverable through the bridges")
+    _sys_temp_qr = gc.render_qr_png("2@denied-payload", tempfile.gettempdir())
+    check(not is_path_sendable(_sys_temp_qr),
+          "control: the old system-temp render was NOT deliverable (the bug)")
+    for _p in (_default_qr, _sys_temp_qr):
+        if _p:
+            os.unlink(_p)
+
 if failures:
     print(f"{len(failures)} FAILURE(S)")
     sys.exit(1)

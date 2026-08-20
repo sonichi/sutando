@@ -85,6 +85,16 @@ def wacli_version(wacli: str) -> str:
     return (out.stdout or out.stderr).strip() or "unknown"
 
 
+# QR PNGs reach the user through the result-file bridges, whose attachment
+# allowlist (src/send_allowlist.py) fail-closes to the /tmp/sutando- and
+# /private/tmp/sutando- prefixes. Render under that prefix so the `[file:]`
+# marker is deliverable; a bare system-temp path (macOS /var/folders, or a
+# plain /tmp/whatsapp-qr-) is denied and the QR never reaches the chat. Both
+# the directory and the filename prefix matter to the realpath check.
+_SENDABLE_QR_DIR = "/tmp"
+_QR_FILE_PREFIX = "sutando-whatsapp-qr-"
+
+
 def render_qr_png(payload: str, out_dir: str) -> str | None:
     """Render the raw payload to a PNG; None when the qrcode lib is absent."""
     try:
@@ -92,7 +102,7 @@ def render_qr_png(payload: str, out_dir: str) -> str | None:
     except ImportError:
         return None
     img = qrcode.make(payload)
-    fd, path = tempfile.mkstemp(prefix="whatsapp-qr-", suffix=".png", dir=out_dir)
+    fd, path = tempfile.mkstemp(prefix=_QR_FILE_PREFIX, suffix=".png", dir=out_dir)
     os.close(fd)
     img.save(path)
     return path
@@ -243,8 +253,10 @@ def main() -> int:
                                     "(preferred: no QR scan needed)")
     ap.add_argument("--timeout", type=int, default=180,
                     help="overall pairing bound in seconds (default 180)")
-    ap.add_argument("--qr-dir", default=tempfile.gettempdir(),
-                    help="directory for rendered QR PNGs")
+    ap.add_argument("--qr-dir", default=_SENDABLE_QR_DIR,
+                    help="directory for rendered QR PNGs (default lands under "
+                         "the send-allowlist /tmp/sutando- prefix so the QR is "
+                         "deliverable through the chat bridges)")
     args = ap.parse_args()
 
     wacli = wacli_bin()
