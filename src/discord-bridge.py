@@ -437,6 +437,14 @@ def _chunk_for_discord(
         preview.append(chunk)
         if len(preview) > max_chunks:
             break
+    if len(preview) > 1:
+        # Compose-side feedback: a multi-chunk delivery means the body failed
+        # the one-message cap. The composer never sees the split otherwise.
+        print(
+            f"  [delivery-gate] body needed {len(preview)} chunk(s) "
+            f"({len(text)} chars > {max_len}) — compose-side cap missed",
+            flush=True,
+        )
     if len(preview) <= max_chunks:
         yield from preview
         return
@@ -2514,6 +2522,41 @@ intents.message_content = True
 # connect. Gated behind env var so bridge boots safely without the flag.
 if os.environ.get("DISCORD_GUILD_MEMBERS_INTENT", "").lower() in ("1", "true", "yes"):
     intents.members = True
+async def _deliver_pairing_prompt(channel, code, username, sender_id, allowed):
+    """The code is an approval credential, so no branch may put it in a shared
+    channel — owner DM, else the requester's own DM, else a code-free notice."""
+    where = getattr(channel, "name", None) or "DM"
+    prompt = (
+        f"Pairing request from @{username} (id {sender_id}) in #{where}.\n"
+        f"To approve, run: `/discord:access pair {code}`\n"
+        f"Ignore this to deny (codes expire in 1 hour)."
+    )
+    delivered = False
+    for oid in allowed:
+        try:
+            owner_user = await client.fetch_user(int(oid))
+            await owner_user.send(prompt)
+            delivered = True
+        except Exception as e:
+            print(f"  pairing DM to {oid} failed: {type(e).__name__}: {e}", flush=True)
+    if delivered:
+        await channel.send("Pairing required — the request has been sent to the owner for approval.")
+        return "dm"
+    if not allowed and isinstance(channel, discord.DMChannel):
+        # Fresh install: no enrolled owner exists yet, so the requester's own
+        # private DM is the only non-shared surface that preserves self-pairing.
+        await channel.send(prompt)
+        return "dm"
+    # Fail SAFE: with no reachable owner the code must still not reach a shared
+    # channel. It stays in access.json `pending` and the owner-only bridge log.
+    print(f"  [pairing] owner DM unreachable — code NOT posted to #{where}; retrieve pending code={code} from access.json/this log to approve @{username} ({sender_id}).", flush=True)
+    await channel.send(
+        "Pairing required, but I couldn't reach the owner to deliver the approval code. "
+        "Please contact the owner directly — they can approve your request."
+    )
+    return "channel"
+
+
 client = discord.Client(intents=intents)
 _ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
 
@@ -3441,9 +3484,9 @@ async def _handle_discord_message(message, force=False):
         tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')  # pragma: no cover — async pairing branch; atomicity asserted structurally
         write_private_text(tmp_path, json.dumps(access, indent=2))  # pragma: no cover
         os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
-        _backup_access_to_disk(access)  # pragma: no cover — durable backup on every valid access write
-        await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
-        print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
+        _backup_access_to_disk(access)  # pragma: no cover — durable backup on every valid access write (#2358)
+        route = await _deliver_pairing_prompt(message.channel, code, username, sender_id, allowed)
+        print(f"  Pairing requested: @{username} ({sender_id}) code delivered via {route}")
         return
 
     # Handle forwarded messages (message_snapshots) — Discord's forwarding feature
@@ -4687,7 +4730,10 @@ async def poll_results():
                 if _guard_tier == "unknown":
                     _guard_tf = find_task_file(TASKS_DIR, task_id)
                     _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
-                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO)
+                # A Discord channel is a human surface: the suppression is journaled
+                # under STATE_DIR and closed silently rather than posted as prose.
+                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO,
+                                                             suppress_journal=(STATE_DIR, task_id))
                 if _withheld:
                     print(f"  [team-guard] withheld result for {task_id} "
                           f"(tier={_guard_tier}): {_withheld}", flush=True)

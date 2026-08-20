@@ -568,10 +568,12 @@ def _team_guard_fns():
         classify_result_for_tier,
         materialize_withheld_verdict,
         resolve_access_tier,
+        sensitive_data_filter_enabled,
         withheld_review_path,
     )
     return (classify_result_for_tier, materialize_withheld_verdict,
-            resolve_access_tier, withheld_review_path)
+            resolve_access_tier, sensitive_data_filter_enabled,
+            withheld_review_path)
 
 
 def _atomic_private_json(path: Path, payload: dict) -> None:
@@ -954,7 +956,7 @@ def _guarded_result_body(tid: str, body: str):
     if tid in _WITHHELD_TASK_OUTPUT:
         return _WITHHELD_TASK_OUTPUT[tid]
     try:
-        classify, materialize, resolve, review_path = _team_guard_fns()
+        classify, materialize, resolve, filter_enabled, review_path = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
         return None, f"team_result_guard unavailable: {exc}"
@@ -962,6 +964,7 @@ def _guarded_result_body(tid: str, body: str):
     # Absence is not owner provenance: a month-archived Team task is exactly the
     # case that would otherwise fall open.
     tier = resolve(tfile) if tfile is not None else "guest"
+    scan_sensitive_data = filter_enabled(tfile, tier) if tfile is not None else True
     context = {}
     if tfile is not None:
         try:
@@ -971,7 +974,9 @@ def _guarded_result_body(tid: str, body: str):
                 "source", "channel_id", "reply_to_event", "source_message_id", "user_id")}
         except OSError:
             pass
-    verdict = classify(body, tier, None, secret_filter=filter_chat_secrets)
+    verdict = classify(
+        body, tier, None, secret_filter=filter_chat_secrets,
+        scan_sensitive_data=scan_sensitive_data)
     is_leak = verdict.kind == "leak"
     agent_id = _reenroll_identity()
     verdict = materialize(
@@ -2244,6 +2249,8 @@ def _write_task(task: dict) -> str | None:
             # trusted execution-policy header before all untrusted body text.
             if collaborator_enabled:
                 lines.append("collaborator: true")
+                if task.get("sensitive_data_filter") is False:
+                    lines.append("sensitive_data_filter: false")
             # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
             # reaches the agent as body content (owner directive 2026-07-16) —
             # see _strip_room_ops_meta. Runs first so the stripped body is what
