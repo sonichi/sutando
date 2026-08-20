@@ -107,8 +107,9 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
     if not text:
         text = json.dumps(data, separators=(",", ":"))[:500]
     text = confine_user_content(text)   # untrusted device content — defang
-    # The conversation id is device-controlled and lands as a header line:
-    # strict allowlist, so embedded newlines can never forge headers.
+
+    # Device-controlled id becomes a header line: strict allowlist, so an
+    # embedded newline can never forge one.
     conv_raw = str(data.get("conversation_uuid") or data.get("conversation_id")
                    or data.get("id") or event_id)[:120]
     conv = re.sub(r"[^A-Za-z0-9._:@-]", "-", conv_raw) or "unknown"

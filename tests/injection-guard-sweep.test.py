@@ -39,7 +39,6 @@ def _src(path: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Python bridge files: must import AND call confine_user_content
-# ---------------------------------------------------------------------------
 
 for _f in (
     "src/discord-bridge.py",
@@ -63,7 +62,6 @@ for _f in (
 
 # discord-bridge: enriched task body must be re-confined after Discord-state prefetch
 # (fetched channel messages are not run through confine before being prepended;
-# an attacker-controlled channel could post ===SUTANDO SYSTEM INSTRUCTIONS===)
 _db = _src("src/discord-bridge.py")
 _check(
     "discord-bridge: confine_user_content(enriched) after prefetch",
@@ -75,9 +73,6 @@ _check(
 
 # ---------------------------------------------------------------------------
 # Python bridges: task: field must come AFTER source/access_tier/priority
-# (belt-and-suspenders alongside the ZWSP guard — a forged field in user content
-# that slips past the guard would appear before the real fields, losing the race)
-# ---------------------------------------------------------------------------
 
 def _task_field_is_last_in_write_text(src: str) -> bool:
     """Check that task: appears after source/access_tier/priority in the
@@ -137,9 +132,6 @@ for _fb, _fname in (
 
 # ---------------------------------------------------------------------------
 # github-webhook.py: access_tier: other MUST appear before task: (security-critical)
-# External GitHub events are untrusted — owner-tier processing must be impossible
-# even if confine_user_content is somehow bypassed.
-# ---------------------------------------------------------------------------
 
 _gh = _src("src/github-webhook.py")
 # Find the task_content block
@@ -163,8 +155,6 @@ _check(
 
 # ---------------------------------------------------------------------------
 # Python ag2-relay: uses _one_line() as structural equivalent
-# (collapses newlines → prevents line-based injection; no ZWSP needed)
-# ---------------------------------------------------------------------------
 
 _ag2_path = REPO / "skills/ag2-relay/remote-task-client.py"
 if _ag2_path.exists():
@@ -183,7 +173,6 @@ if _ag2_path.exists():
 
 # ---------------------------------------------------------------------------
 # TypeScript task-bridge.ts: confineUserContent defined and applied at all sites
-# ---------------------------------------------------------------------------
 
 _tb = _src("src/task-bridge.ts")
 _check(
@@ -209,7 +198,6 @@ _check(
 
 # ---------------------------------------------------------------------------
 # TypeScript conversation-server.ts: confineUserContent defined and applied
-# ---------------------------------------------------------------------------
 
 _cs = _src("skills/phone-conversation/scripts/conversation-server.ts")
 _check(
@@ -245,7 +233,6 @@ _check(
 
 # ---------------------------------------------------------------------------
 # inline-tools.ts cancel_task: targetId newline-stripped, task: field last
-# ---------------------------------------------------------------------------
 
 _it = _src("src/inline-tools.ts")
 # Locate the cancelBody block
@@ -268,9 +255,6 @@ _check(
 
 # ---------------------------------------------------------------------------
 # agent-api.py Twilio handlers: caller/sender must be confined in from: AND task: body
-# (SMS and transcription handlers embed caller/sender in the task body — unconfined
-# values could inject ===fence=== patterns or header-key lines into the task body)
-# ---------------------------------------------------------------------------
 
 _aa = _src("src/agent-api.py")
 _check(
@@ -297,8 +281,6 @@ _check(
 )
 # All four agent-api.py task writers must declare access_tier: owner explicitly
 # before task: — self-documenting and immune to a future default-tier change.
-# Anchor on the f-string source field literal so we hit the task_content block,
-# not the function-name or comment that contains the same substring.
 for _src_literal, _src_label in (
     ('"source: twilio_voice\\n"',   "twilio_voice"),
     ('"source: twilio_sms\\n"',     "twilio_sms"),
@@ -318,7 +300,6 @@ for _src_literal, _src_label in (
 
 # ---------------------------------------------------------------------------
 # web-client.ts: task body is hardcoded (no user data embedded)
-# ---------------------------------------------------------------------------
 
 _wc = _src("src/web-client.ts")
 # Find the server-side handler by locating the writeFileSync call that follows
@@ -334,23 +315,10 @@ _check(
 
 # ---------------------------------------------------------------------------
 # Exhaustive scan: every Python file that embeds an interpolated task: field
-# (pattern: f"task: {) must be in the known-guarded set.  This acts as a
-# trip-wire — a new task writer that forgets to call confine_user_content()
-# fails here before it ships, rather than being discovered later via manual
-# code review.
-#
-# health-check.py is deliberately absent: its task: line is a hardcoded
-# string literal with no {interpolation}, so user content never lands there
-# and the pattern does not match.
-# ag2-relay uses f"{field}: {_one_line(value)}" not f"task: {" directly, so
-# it also does not appear in this scan (it is covered by its own check above).
-# ---------------------------------------------------------------------------
 
 _GUARDED_PY_WRITERS = {
     # The centralized write side (serialize_task_last). Its guard is
     # structural, not ZWSP-defang: header values reject newlines outright and
-    # the body is serialized after the single task: line, so the task-last
-    # parser can never promote body content to a header.
     "src/local_task_protocol.py",
     "skills/schedule-crons/scripts/codex-scheduler.py",
     "src/discord-bridge.py",
@@ -361,16 +329,9 @@ _GUARDED_PY_WRITERS = {
     "src/cron-runner.py",
     # Bee wearable lane: event_to_task confines the third-party device text
     # (utterance/todo body) before it enters the task body; the local-sink
-    # writer then persists that already-defanged text. Bee events are
-    # room/device-trust, never owner-trust (persistence inherits source trust).
-    # (Moved out of skills/ into the ag2-sparrow package 2026-08-06 — the
-    # packages/ scan root below exists so relocations can't silently exit.)
     "packages/ag2-sparrow/ag2_sparrow/bee_watcher.py",
     # Sparrow gateway bridge: guarded by a DIFFERENT documented mechanism —
     # every interpolated value passes _one_line() (newline-strip; header
-    # forgery requires a newline) and the locally-decided access_tier is
-    # written LAST so it wins under parse_task_headers_trusted. Plus
-    # _strip_room_ops_meta quarantine + filter_chat_secrets before persist.
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",
 }
 
@@ -397,15 +358,6 @@ for _pyf in sorted(
 
 # ---------------------------------------------------------------------------
 # Exhaustive scan (TypeScript): every TS file containing "task: ${"
-# (template-literal interpolated task field) must be in the known-guarded set.
-#
-# inline-tools.ts cancel_task uses "task: CANCEL_INSTRUCTION: ... ${safeTargetId}"
-# — the pattern "task: ${" does NOT match because there is static text between
-# "task: " and "${safeTargetId}"; it is covered by the specific cancelBody
-# assertions above.
-# web-client.ts uses a hardcoded task body (no ${req.} interpolation); also
-# covered by its own assertion above.
-# ---------------------------------------------------------------------------
 
 _GUARDED_TS_WRITERS = {
     "src/task-bridge.ts",
@@ -435,10 +387,6 @@ for _tsf in sorted(
 
 # ---------------------------------------------------------------------------
 # Header-key parity: _HEADER_KEYS in task_body_guard.py, task-bridge.ts, and
-# conversation-server.ts must contain the same 14 keys.  Drift between
-# implementations creates blind spots — a key guarded in Python but not TS
-# (or vice versa) leaves one attack surface unprotected.
-# ---------------------------------------------------------------------------
 
 _tg = _src("src/task_body_guard.py")
 _py_keys_m = re.search(r"_HEADER_KEYS\s*=\s*\(([^)]+)\)", _tg, re.DOTALL)
@@ -452,7 +400,6 @@ if _py_keys_m:
 else:
     # The guard imports its keys from local_task_protocol.KNOWN_HEADER_KEYS
     # (single source of truth — no hardcoded literal to scrape). Read that
-    # tuple directly so the parity check still has the authoritative py set.
     _ltp = _src("src/local_task_protocol.py")
     # Close-paren is anchored to line start (\n)) so a ')' inside an inline
     # comment can't truncate the tuple early.
@@ -494,7 +441,6 @@ _check(
 
 # ---------------------------------------------------------------------------
 # Summary
-# ---------------------------------------------------------------------------
 
 _total = _passed + _failed
 print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 48/48
