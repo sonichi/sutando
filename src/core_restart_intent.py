@@ -62,18 +62,67 @@ def intent_path(workspace: str | None = None) -> str:
     return os.path.join(ws, "state", INTENT_BASENAME)
 
 
+class IntentPending(Exception):
+    """A different, still-unconsumed intent already occupies the file."""
+
+    def __init__(self, action: str, requested_at: float):
+        super().__init__(f"an unconsumed {action!r} request is already pending")
+        self.action = action
+        self.requested_at = requested_at
+
+
+def peek_intent(workspace: str | None, now: float | None = None) -> dict | None:
+    """Return the pending intent WITHOUT consuming it, or None if there is
+    none / it is unreadable / it is stale. Read-only: never deletes."""
+    try:
+        with open(intent_path(workspace)) as f:
+            d = json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("action") not in _ACTIONS:
+        return None
+    age = (now if now is not None else time.time()) - float(d.get("requested_at") or 0)
+    return None if age > STALE_SEC else d
+
+
 def write_intent(workspace: str | None, action: str, source: str) -> str:
     """Atomically write the intent file; returns its path. Raises ValueError
-    on an unknown action — callers never write arbitrary strings."""
+    on an unknown action, and IntentPending if a live intent already exists.
+
+    Exclusive by construction (os.link fails when the target exists), because
+    a waiter can only correlate consumption by the pathname disappearing: with
+    two intents in flight, one supersedes the other on disk and BOTH waiters
+    read the single deletion as their own (qingyun review, #3191). One pending
+    intent at a time is what makes that inference sound.
+    """
     if action not in _ACTIONS:
         raise ValueError(f"unknown intent action: {action!r}")
     path = intent_path(workspace)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump({"action": action, "requested_at": time.time(), "source": source}, f)
-    os.replace(tmp, path)
-    return path
+    try:
+        for attempt in (0, 1):
+            try:
+                os.link(tmp, path)
+                return path
+            except FileExistsError:
+                live = peek_intent(workspace)
+                if live is not None:
+                    raise IntentPending(live["action"], float(live["requested_at"]))
+                if attempt:  # a racing writer refilled it — theirs stands
+                    raise IntentPending(action, time.time())
+                # Stale or unreadable: clear it and retry once.
+                try:
+                    os.unlink(path)
+                except OSError:
+                    raise IntentPending(action, time.time())
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def await_consumption(
@@ -87,7 +136,10 @@ def await_consumption(
 
     Consumption is defined by the file being GONE, which is the only
     implementation-agnostic evidence available: `consume_intent` deletes
-    before acting, so disappearance means an executor claimed it. Probing for
+    before acting, so disappearance means an executor claimed it. That
+    inference is only sound because `write_intent` is exclusive — otherwise a
+    superseding write would let one deletion satisfy two different waiters.
+    Probing for
     a specific consumer (a running Sutando.app, a named launchd label) answers
     "is THAT consumer here", not "will anything act" — and returns the same
     False for a host whose executor is simply a different one.

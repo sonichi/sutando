@@ -211,7 +211,12 @@ from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_redaction import redact_chat_body  # noqa: E402
-from core_restart_intent import await_consumption, parse_restart_command, write_intent  # noqa: E402
+from core_restart_intent import (  # noqa: E402
+    IntentPending,
+    await_consumption,
+    parse_restart_command,
+    write_intent,
+)
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
@@ -2997,9 +3002,8 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
         return False
     try:
         write_intent(workspace, action, "discord")
-        # Ack on CONSUMPTION, not on write (#3183): writing always succeeds, so
-        # acking here promised a restart on hosts whose executor was gone —
-        # silent for as long as nobody happened to notice.
+        # Ack on CONSUMPTION, not on write (#3183): a write always succeeds, so
+        # acking there promised a restart on hosts whose executor was gone.
         claimed = await asyncio.to_thread(wait_for_consumption, workspace)
         if claimed:
             ack = ("Restart requested and picked up by the executor — I'll be "
@@ -3015,6 +3019,12 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
                    f"request expires in 10 minutes. If nothing consumes "
                    f"`state/core-restart-requested.json` on this host (the "
                    f"desktop app, or a launchd executor), it will simply lapse.")
+    except IntentPending as pending:
+        # One intent at a time: acking a superseded request would report the
+        # wrong action as picked up when the survivor's deletion arrives.
+        ack = (f"A **{pending.action}** request is already pending and not yet "
+               f"picked up, so I did not queue the {action}. Wait for that one "
+               f"to be consumed (or to expire in 10 minutes), then ask again.")
     except Exception as exc:
         ack = f"Couldn't write the {action} request ({type(exc).__name__}) — not queued."
     print(f"  [core-restart] owner {action} command from @{username}", flush=True)

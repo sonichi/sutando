@@ -163,5 +163,67 @@ class TestAwaitConsumption(unittest.TestCase):
 
         self.assertTrue(_mod.await_consumption(
             self.ws, timeout_sec=5, poll_sec=0, sleep=boom, now=lambda: 0.0))
+
+class TestExclusiveIntent(unittest.TestCase):
+    """One pending intent at a time (#3191 review). `await_consumption` reads a
+    single deletion as "my request was taken", so two live intents would let one
+    executor action satisfy two waiters expecting OPPOSITE actions."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = self.tmp.name
+        os.makedirs(os.path.join(self.ws, "state"), exist_ok=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_superseding_opposite_action_is_rejected(self):
+        _mod.write_intent(self.ws, "restart", "test")
+        with self.assertRaises(_mod.IntentPending) as caught:
+            _mod.write_intent(self.ws, "stop", "test")
+        # The rejection names the SURVIVING action, so the ack can be accurate.
+        self.assertEqual(caught.exception.action, "restart")
+        # The first intent is untouched — the loser never clobbers the winner.
+        self.assertEqual(_mod.peek_intent(self.ws)["action"], "restart")
+
+    def test_rejection_leaves_exactly_one_consumable_intent(self):
+        # The scenario from the review: restart, then stop, then one executor.
+        _mod.write_intent(self.ws, "restart", "test")
+        with self.assertRaises(_mod.IntentPending):
+            _mod.write_intent(self.ws, "stop", "test")
+        self.assertEqual(_mod.consume_intent(self.ws), "restart")
+        self.assertIsNone(_mod.consume_intent(self.ws))
+
+    def test_same_action_repeat_is_also_rejected(self):
+        _mod.write_intent(self.ws, "stop", "test")
+        with self.assertRaises(_mod.IntentPending):
+            _mod.write_intent(self.ws, "stop", "test")
+
+    def test_stale_intent_is_replaced_not_rejected(self):
+        path = _mod.write_intent(self.ws, "restart", "test")
+        with open(path) as f:
+            d = json.load(f)
+        d["requested_at"] = time.time() - (_mod.STALE_SEC + 60)
+        with open(path, "w") as f:
+            json.dump(d, f)
+        # An abandoned intent must not wedge the command forever.
+        _mod.write_intent(self.ws, "stop", "test")
+        self.assertEqual(_mod.peek_intent(self.ws)["action"], "stop")
+
+    def test_peek_never_consumes(self):
+        _mod.write_intent(self.ws, "restart", "test")
+        self.assertEqual(_mod.peek_intent(self.ws)["action"], "restart")
+        self.assertEqual(_mod.peek_intent(self.ws)["action"], "restart")
+        self.assertEqual(_mod.consume_intent(self.ws), "restart")
+
+    def test_no_temp_files_left_behind(self):
+        _mod.write_intent(self.ws, "restart", "test")
+        with self.assertRaises(_mod.IntentPending):
+            _mod.write_intent(self.ws, "stop", "test")
+        leftovers = [f for f in os.listdir(os.path.join(self.ws, "state"))
+                     if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
