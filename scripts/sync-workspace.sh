@@ -843,12 +843,18 @@ _snapshot_per_host_config() {
         cp -p "$_ch" "$_host_dir/channels/$_svc/access.json" 2>/dev/null || true
     done
 
-    # Root build_log.md is live only on hosts whose loop-writer still uses it;
-    # an unconditional copy clobbers a per-host log that has since become live.
+    # One-writer contract: the per-host copy is OURS only while it still holds
+    # exactly what this snapshot last wrote (provenance, never mtime).
     if [ -f "$WORKSPACE_DIR/build_log.md" ]; then
-        if [ ! -f "$_host_dir/build_log.md" ] \
-                || [ "$WORKSPACE_DIR/build_log.md" -nt "$_host_dir/build_log.md" ]; then
-            cp -p "$WORKSPACE_DIR/build_log.md" "$_host_dir/build_log.md" 2>/dev/null || true
+        local _dst="$_host_dir/build_log.md" _sig="$_host_dir/.build_log.snapshot-sha"
+        local _cur="" _rec=""
+        [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
+        [ -f "$_sig" ] && _rec="$(cat "$_sig" 2>/dev/null)"
+        if [ ! -f "$_dst" ] || { [ -n "$_rec" ] && [ "$_cur" = "$_rec" ]; }; then
+            cp -p "$WORKSPACE_DIR/build_log.md" "$_dst" 2>/dev/null \
+                && shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1 > "$_sig" 2>/dev/null || true
+        elif ! cmp -s "$WORKSPACE_DIR/build_log.md" "$_dst" 2>/dev/null; then
+            log "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
         fi
     fi
     return 0

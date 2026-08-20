@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# _snapshot_per_host_config must never clobber a NEWER hosts/<label>/build_log.md
-# with the workspace-root copy (the 2026-08-20 per-host log "eraser").
+# The build_log snapshot must never clobber an independently-written per-host
+# copy — ownership is decided by recorded provenance, never by mtime.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 fails=0
@@ -20,33 +20,51 @@ chmod +x "$SCRIPT_PARENT/scripts/sutando-config.sh"
 _host() { echo testhost; }
 eval "$(sed -n '/^_snapshot_per_host_config() {/,/^}$/p' "$REPO/scripts/sync-workspace.sh")"
 
-echo "1. stale root must NOT clobber a newer per-host log"
-echo "stale relic" > "$WORKSPACE_DIR/build_log.md"
-touch -t 202501010000 "$WORKSPACE_DIR/build_log.md"
-echo "live per-host entries" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
-_snapshot_per_host_config
-check "newer per-host content survives the snapshot" \
-      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "live per-host entries" ]'
+log() { echo "log: $*"; }
 
-echo "2. newer root still snapshots over an older per-host copy"
-echo "fresh root entries" > "$WORKSPACE_DIR/build_log.md"
-touch -t 202501010000 "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+echo "1. reviewer's control: per-host written independently, stale root TOUCHED LATER"
+echo "stale relic" > "$WORKSPACE_DIR/build_log.md"
+echo "per-host live entry" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+sleep 1
+touch "$WORKSPACE_DIR/build_log.md"   # root now strictly NEWER than the live per-host copy
 _snapshot_per_host_config
-check "snapshot model preserved when root is the live writer" \
+check "independent per-host writer survives a later-touched root" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "per-host live entry" ]'
+check "the refusal is loud, not silent" \
+      '_snapshot_per_host_config | grep -q "independent writer"'
+
+echo "2. reverse ordering: per-host newer than root — still refused, still loud"
+touch "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+_snapshot_per_host_config
+check "mtime ordering is irrelevant to the refusal" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "per-host live entry" ]'
+
+echo "3. seed: absent per-host copy is created and its provenance recorded"
+rm "$WORKSPACE_DIR/hosts/testhost/build_log.md" "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha" 2>/dev/null
+_snapshot_per_host_config
+check "first snapshot seeds the per-host copy" \
+      '[ -f "$WORKSPACE_DIR/hosts/testhost/build_log.md" ]'
+check "provenance sha recorded beside it" \
+      '[ -s "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha" ]'
+
+echo "4. root-live host: untouched snapshot refreshes when root changes"
+echo "fresh root entries" > "$WORKSPACE_DIR/build_log.md"
+_snapshot_per_host_config
+check "pure snapshot (matching recorded sha) is refreshed from root" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "fresh root entries" ]'
 
-echo "3. absent per-host copy is seeded from root"
-rm "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+echo "5. independent edit AFTER seeding is never overwritten"
+echo "per-host went live" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+echo "root moved on too" > "$WORKSPACE_DIR/build_log.md"
 _snapshot_per_host_config
-check "first snapshot creates the per-host copy" \
-      '[ -f "$WORKSPACE_DIR/hosts/testhost/build_log.md" ]'
+check "post-seed independent writer wins regardless of root changes" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "per-host went live" ]'
 
-echo "4. absent root is a no-op"
+echo "6. absent root is a no-op"
 rm "$WORKSPACE_DIR/build_log.md"
-echo "keep me" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
 _snapshot_per_host_config
 check "no root file leaves the per-host log untouched" \
-      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "keep me" ]'
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "per-host went live" ]'
 
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1
