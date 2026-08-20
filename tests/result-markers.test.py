@@ -220,6 +220,18 @@ class TestNoLeakInvariant(unittest.TestCase):
     sees clean output.
     """
 
+    def test_empty_target_markers_never_leak_in_any_family(self):
+        # Each family captured `+` (one-or-more), so the bare `[x:]` form matched
+        # nothing and shipped its own marker text with the body.
+        for src, kind in (("[deduped:]\nbody", "skip"),
+                          ("[channel:]\nbody", "redirect"),
+                          ("[file:]\nbody", "attach")):
+            with self.subTest(src=src.splitlines()[0]):
+                r = parse_markers(src)
+                self.assertEqual([a.kind for a in r.actions], [kind])
+                for marker in ("[deduped:", "[channel:", "[file:"):
+                    self.assertNotIn(marker, r.body)
+
     def test_no_attach_marker_in_body(self):
         r = parse_markers("body [file: /a] [send: /b] [attach: /c] end")
         for marker in ("[file:", "[send:", "[attach:"):

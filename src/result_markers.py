@@ -125,7 +125,7 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # Note: used with `.match()` below, which always anchors at string start —
 # no MULTILINE flag needed (re.MULTILINE only affects `^`/`$` in scan-style
 # methods like `.search()` / `.finditer()`).
-_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]+)\]\s*\n?")
+_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]*)\]\s*\n?")
 
 # D7 reply-header pattern (owner directive 2026-05-19) — pool cores prepend
 # `**[core: N]**` plus an optional italic `_(...)_` sub-line to every
@@ -140,7 +140,7 @@ _D7_HEADER_RE = re.compile(
 
 # Attach markers — file/send/attach aliases. A marker inside markdown code is
 # being SHOWN, not issued; _code_lines and _SPAN_RE below mask those regions.
-_ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]+)\](?!`)")
+_ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]*)\](?!`)")
 
 _FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
 
