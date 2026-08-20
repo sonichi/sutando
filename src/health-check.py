@@ -2417,11 +2417,18 @@ def _age_phrase(age_s) -> str:
     return "age unknown" if age_s is None else f"{age_s}s ago"
 
 
+def _norm_remote(u: str) -> str:
+    """FETCH_HEAD drops a trailing `.git` that `remote get-url` keeps."""
+    u = u.strip().rstrip("/")
+    return u[:-4] if u.endswith(".git") else u
+
+
 def _last_fetch_age_s(repo, git_bin: str, expected: str) -> "int | None":
     """Seconds since this checkout last fetched `expected` from a remote, or None.
 
-    Scoped to the ref whose currency the caller is claiming: FETCH_HEAD's mtime is
-    the last fetch of ANYTHING, so a PR-ref fetch would date a stale origin/main.
+    Scoped to `origin/<expected>`, the exact comparison target: FETCH_HEAD's mtime is
+    the last fetch of ANYTHING, so a PR ref — or `main` from a second remote — would
+    otherwise date a stale origin/main.
     """
     try:
         out = subprocess.run([git_bin, "-C", str(repo), "rev-parse", "--git-common-dir"],
@@ -2433,11 +2440,19 @@ def _last_fetch_age_s(repo, git_bin: str, expected: str) -> "int | None":
             common = Path(repo) / common
         fetch_head = common / "FETCH_HEAD"
         st = fetch_head.stat()
-        # Only the CONTENT says which ref was fetched. A record naming another ref
-        # dates that ref, never this one — understating is the safe direction here.
-        if f"branch '{expected}' of " not in fetch_head.read_text(errors="replace"):
+        url = subprocess.run([git_bin, "-C", str(repo), "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10)
+        if url.returncode != 0:
             return None
-        return max(int(time.time() - st.st_mtime), 0)
+        # `remote get-url` keeps a trailing `.git` that FETCH_HEAD drops, so an exact
+        # compare never matches on a real clone; normalise both ends before comparing.
+        want = _norm_remote(url.stdout)
+        marker = f"branch '{expected}' of "
+        for line in fetch_head.read_text(errors="replace").splitlines():
+            i = line.find(marker)
+            if i >= 0 and _norm_remote(line[i + len(marker):]) == want:
+                return max(int(time.time() - st.st_mtime), 0)
+        return None
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
 
