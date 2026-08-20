@@ -94,7 +94,7 @@ Both directions work:
 
 > `<workspace>` resolves via `bash scripts/sutando-config.sh workspace`
 > (M0 helper, PR #1395). Defaults to `<repo>/workspace/`; honors
-> `$SUTANDO_WORKSPACE` as a legacy escape hatch internally.
+> **`$SUTANDO_WORKSPACE` is not honored** — removed in v0.8; setting it only warns.
 
 ## What's NOT supported
 

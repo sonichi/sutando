@@ -1,13 +1,20 @@
 """
-Unified parsing for the result-body protocol markers used by every bridge
-(discord, slack, telegram, voice/task-bridge). Closes #873.
+Unified parsing for the result-body protocol markers used by every delivery
+consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the
+`src/dm-result.py` REST fallback). Closes #873.
 
 Why centralize: each bridge previously hand-rolled its own marker recognition,
 which (a) drifted (telegram never recognized [deduped:], slack never recognized
 [channel:]), and (b) leaked literal marker text to the user when the bridge
 didn't honor it. This module is the single source of truth for marker
-shapes; bridges call `parse_markers(text)` and apply the actions they CAN
+shapes; consumers call `parse_markers(text)` and apply the actions they CAN
 support, silently stripping the rest from the body so nothing ever leaks.
+
+No consumer may define its own marker regex. discord-bridge.py and
+dm-result.py each carried a private `_FILE_MARKER_RE` that matched only
+`/...` or `~/...` values; markers this parser strips were therefore delivered
+as literal text by the fallback. Both copies are gone and
+`tests/bridge-marker-no-leak.test.py` guards their return.
 
 This module deliberately does NOT enforce path allowlists. File-marker
 extraction returns paths; the bridge's own `_is_path_sendable()` check
@@ -129,8 +136,32 @@ _D7_HEADER_RE = re.compile(
     r"\A\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*"
 )
 
-# Attach markers — file/send/attach are aliases.
-_ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
+# Attach markers — file/send/attach aliases. A marker inside markdown code is
+# being SHOWN, not issued; _code_lines and _SPAN_RE below mask those regions.
+_ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]+)\](?!`)")
+
+_FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
+
+# A run of N backticks closed by the same run. Matching the SPAN, not the
+# characters beside a marker, is what catches one mid-span.
+_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\1).)+?\1(?!`)", re.DOTALL)
+
+
+def _code_lines(text: str) -> set:
+    """Line indices inside a fenced or indented markdown code block.
+
+    An unclosed fence swallows the rest of the body on purpose: the alternative
+    is treating shown-but-unterminated example text as a live directive.
+    """
+    lines, out, fenced = text.split("\n"), set(), False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            fenced = not fenced
+            out.add(i)
+            continue
+        if fenced or line.startswith(("    ", "\t")):
+            out.add(i)
+    return out
 
 # DM-only privacy marker — matched ANYWHERE in the body (not anchored) so it
 # suppresses a [channel:] redirect regardless of which came first. All
@@ -236,12 +267,23 @@ def parse_markers(text: str) -> ParseResult:
 
     # 3. ATTACH — scan everywhere in the (possibly already-redirected) body.
     # Document-order paths.
-    for m in _ATTACH_RE.finditer(body):
-        path = m.group(1).strip()
-        actions.append(Action(kind="attach", value=path))
+    code = _code_lines(body)
+    spans = [(m.start(), m.end()) for m in _SPAN_RE.finditer(body)]
 
-    # Strip the attach markers from body so the user never sees them.
-    body = _ATTACH_RE.sub("", body).strip()
+    def _in_code(pos: int) -> bool:
+        if body.count("\n", 0, pos) in code:
+            return True
+        return any(a <= pos < b for a, b in spans)
+
+    for m in _ATTACH_RE.finditer(body):
+        if _in_code(m.start()):
+            continue
+        actions.append(Action(kind="attach", value=m.group(1).strip()))
+
+    # Strip only the markers we acted on — one shown in a code block stays
+    # visible, which is the whole point of showing it.
+    body = _ATTACH_RE.sub(
+        lambda m: "" if not _in_code(m.start()) else m.group(0), body).strip()
 
     return ParseResult(body=body, actions=actions)
 
@@ -278,6 +320,25 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None)
     return None
 
 
+def dedup_holder_delivered(holder_result_text: str | None) -> bool:
+    """Whether a `[deduped: task-X]` holder actually produced a user-facing reply.
+
+    A dedup is only valid if the holder answered. When the holder's own result
+    was empty or was itself a skip marker, honouring the dedup archives the
+    asking task against a delivery that never happened, and every retry carrying
+    the same marker is archived the same way — the ask can never be answered.
+
+    Pure: the caller supplies the holder's archived result text (None when the
+    archive has no record of it).
+    """
+    if holder_result_text is None:
+        return False
+    body = holder_result_text.strip()
+    if not body:
+        return False
+    return not any(a.kind == "skip" for a in parse_markers(body).actions)
+
+
 _REQUEUE_COUNT_RE = re.compile(r"^dedup_requeue_count:\s*(\d+)\s*$", re.MULTILINE)
 
 
@@ -293,8 +354,41 @@ def dedup_requeue_count(task_text: str | None) -> int:
     return int(m.group(1)) if m else 0
 
 
+def dedup_decision(holder_result_text: str | None, orig_task_text: str | None) -> str:
+    """What to do with a `[deduped: <holder>]` result.
+
+    ``"honour"``  — the holder answered; archive silently as before.
+    ``"requeue"`` — it did not; re-ask so the question actually gets answered.
+    ``"report"``  — re-asking already failed once; tell the owner instead of looping.
+
+    Pure. The caller supplies the holder's archived result text (None when the
+    archive has no record) and the original task text (for the loop guard).
+    """
+    if dedup_holder_delivered(holder_result_text):
+        return "honour"
+    if dedup_requeue_count(orig_task_text) >= 1:
+        return "report"
+    return "requeue"
+
+
+_REQUEUE_REASONS = {
+    "cross-channel": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder task is in a "
+        f"DIFFERENT channel. Dedup is per-channel only — a cross-channel dedup leaves this "
+        f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
+        "Do NOT [deduped:] across channels.\n"
+    ),
+    "holder-empty": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder delivered nothing, "
+        "so this question was never answered. Answer THIS task directly and in full. Only use "
+        "[deduped:] when the holder task carries the complete reply.\n"
+    ),
+}
+
+
 def build_requeued_task(
-    orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str
+    orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str,
+    reason: str = "cross-channel",
 ) -> str:
     """Rewrite an original task for re-processing after a REJECTED cross-channel
     dedup. Keeps the original fields (channel_id, access_tier, source, body, …)
@@ -324,11 +418,10 @@ def build_requeued_task(
         lines.append(f"dedup_requeue_count: {count}")
     note = (
         "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-        f"Your previous result used [deduped: {holder_id}], but that holder task is in a "
-        f"DIFFERENT channel. Dedup is per-channel only — a cross-channel dedup leaves this "
-        f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
-        "Do NOT [deduped:] across channels.\n"
-        "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        + _REQUEUE_REASONS.get(reason, _REQUEUE_REASONS["cross-channel"])(
+            holder_id, asking_channel
+        )
+        + "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
     )
     return "\n".join(lines) + note
 

@@ -46,7 +46,34 @@ shift
 # file every fire, silently and permanently. This is the gate-side (root) half
 # of the fix; the eligibility-side half (don't migrate gated entries) landed in
 # reconcile_launchd.py.
-if [ -d "$WORKSPACE/tasks" ] && [ -n "$(find "$WORKSPACE/tasks" -maxdepth 1 -name 'task-*.txt' ! -name 'task-cron-*.txt' -print -quit 2>/dev/null)" ]; then
+#
+# task-workstream-grouping-* / task-project-grouping-* are emitted only while
+# the core is idle and declare access_tier: owner, so the tier filter misses them.
+# Tier filter: a task that EXPLICITLY declares a non-owner access_tier (team /
+# other / ambient) is peer or public traffic, not the human-owner DMs/voice this
+# gate exists to yield to. Deferring on it starves the cron for as long as peers
+# keep talking -- observed 2026-08-03: both pending-questions and sync-workspace
+# deferred on two #bot2bot notices, with 6 team-tier tasks arriving in one hour.
+#
+# A file with NO access_tier line still defers. That is deliberate and matches
+# CLAUDE.md: "Only access_tier: owner (or tasks without an access_tier field)
+# get full processing." Unknown tier fails CLOSED -- toward yielding.
+owner_task_queued() {
+  local f tier
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    tier="$(sed -n 's/^access_tier:[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '[:space:]')"
+    case "$tier" in
+      team|other|guest|ambient) continue ;;   # explicitly not the owner -> ignore
+      *) return 0 ;;                    # owner, or unstated -> yield
+    esac
+  done <<EOF
+$(find "$WORKSPACE/tasks" -maxdepth 1 -name 'task-*.txt' ! -name 'task-cron-*.txt' ! -name 'task-workstream-grouping-*.txt' ! -name 'task-project-grouping-*.txt' 2>/dev/null)
+EOF
+  return 1
+}
+
+if [ -d "$WORKSPACE/tasks" ] && owner_task_queued; then
   echo "cron-gate: owner tasks queued — deferring $reason (will retry next fire)"
   exit 0
 fi

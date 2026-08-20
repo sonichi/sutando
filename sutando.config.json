@@ -32,10 +32,15 @@
       ],
       "exclude": [
         "tasks/",
-        "results/"
+        "results/",
+        "notes/generated/",
+        "notes/media/"
       ]
     },
     "interval_seconds": 1800
+  },
+  "health_check": {
+    "down_bridge_action": "alert"
   },
   "bridges": {
     "progress_stream": false

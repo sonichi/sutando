@@ -76,8 +76,18 @@ with tempfile.TemporaryDirectory() as t:
 # and could not detect a wrong cutoff at all (qingyun-wu, #2449).
 check("shipped line limit matches the documented 200", hc.MEMORY_INDEX_LOAD_LINES == 200,
       f"got {hc.MEMORY_INDEX_LOAD_LINES}")
-check("shipped byte limit matches the documented 25KB", hc.MEMORY_INDEX_LOAD_BYTES == 25 * 1024,
+# 25 KB DECIMAL. The docs say "the first 25KB"; 25 * 1024 made this 600 B looser
+# than the runtime. The runtime prints its own limit as "24.4KB", and
+# 25_000 / 1024 = 24.41 — 25_600 would print "25.0KB". Assert the units, and
+# assert the band that used to read healthy while being truncated.
+check("shipped byte limit is 25 KB DECIMAL, not KiB", hc.MEMORY_INDEX_LOAD_BYTES == 25_000,
       f"got {hc.MEMORY_INDEX_LOAD_BYTES}")
+check("the limit renders as the runtime prints it (24.4KB)",
+      f"{hc.MEMORY_INDEX_LOAD_BYTES / 1024:.1f}" == "24.4",
+      f"renders {hc.MEMORY_INDEX_LOAD_BYTES / 1024:.1f}KB")
+check("a file in the 25_000..25_600 band is NOT treated as under the limit",
+      25_200 > 25_000 and hc.MEMORY_INDEX_LOAD_BYTES <= 25_000,
+      "the KiB reading would have called 25,200 B healthy while its tail was dropped")
 
 def _mem_with(index_body: str, extra=()):
     """A memory tree whose MEMORY.md is exactly `index_body`."""
@@ -257,12 +267,12 @@ for _label, _body, _want in (
 
 # qingyun-wu: the byte limit cuts THROUGH a line; the filename before the cut is
 # still read, so the memory loads and must not be reported lost.
-_mem_with(("x" * (25 * 1024 - 100)) + "\n- [Good](good-memory.md) " + ("d" * 4000) + "\n")
+_mem_with(("x" * (25_000 - 100)) + "\n- [Good](good-memory.md) " + ("d" * 4000) + "\n")
 r = hc.check_memory_index_integrity()
 check("entry starting just BEFORE the 25KB cut is read → not a failure",
       r and r["status"] != "fail", str(r))
 # Discriminating control: an entry starting AFTER the cut is genuinely lost.
-_mem_with(("x" * (25 * 1024 + 50)) + "\n" + _ENTRY)
+_mem_with(("x" * (25_000 + 50)) + "\n" + _ENTRY)
 r = hc.check_memory_index_integrity()
 check("entry starting AFTER the cut is still a failure", r and r["status"] == "fail", str(r))
 
@@ -382,6 +392,46 @@ with tempfile.TemporaryDirectory() as t:
     r = hc.check_memory_index_integrity()
     check("beyond-the-cut entry still FAILS (scope unchanged)",
           r and r["status"] == "fail", str(r))
+
+# 7) A COMPACTED index (`f:`/`r:`/`p:` prefixes) still counts as indexed. The
+#    corpus large enough to abbreviate is the one this probe most needs to read.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text(
+        "# Index\nExpand `f:`->`feedback_`, `r:`->`reference_`, `p:`->`project_`.\n"
+        "- f:pronoun_she_her - r:discord_channels - p:room_apps_platform\n")
+    for n in ("feedback_pronoun_she_her.md", "reference_discord_channels.md",
+              "project_room_apps_platform.md"):
+        (mem / n).write_text("body")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("abbreviated index → ok (not 3 false orphans)",
+          r and r["status"] == "ok", str(r))
+
+# 7b) The fix must not blind the probe: a file absent from an abbreviated index
+#     is still reported, and reported BY NAME.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text("# Index\n- f:pronoun_she_her\n")
+    (mem / "feedback_pronoun_she_her.md").write_text("body")
+    (mem / "feedback_never_written_down.md").write_text("genuinely stranded")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("genuinely-missing file still warns", r and r["status"] == "warn", str(r))
+    check("and is named", r and "feedback_never_written_down.md" in r["detail"], str(r))
+
+# 7c) The abbreviation is matched at a boundary: `f:foo` in the index must not
+#     satisfy `feedback_foo_bar.md`, or one entry laundered a whole family.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text("# Index\n- f:pronoun\n")
+    (mem / "feedback_pronoun.md").write_text("body")
+    (mem / "feedback_pronoun_she_her.md").write_text("distinct memory, NOT indexed")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("prefix does not launder a longer sibling",
+          r and r["status"] == "warn"
+          and "feedback_pronoun_she_her.md" in r["detail"], str(r))
 
 print()
 if _failed:

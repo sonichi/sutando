@@ -505,6 +505,26 @@ class TestGatewaySourceTraversal(unittest.TestCase):
         for bad in ("EVIL", "a b", "a/b", ".hidden", "", "-lead"):
             self.assertFalse(self.mod.send_remote_gateway(bad, "!r:s", "hi"), bad)
 
+    def test_dotted_traversal_shapes_still_refused(self):
+        # Dots are legal BETWEEN alphanumerics (domain-named lanes) — every
+        # traversal-adjacent shape stays out, before containment even runs.
+        for bad in ("..", "../evil", "a..b", "a.", ".a", "a.-b", "dev.ag2.space."):
+            self.assertFalse(self.mod.send_remote_gateway(bad, "!r:s", "hi"), bad)
+
+    def test_domain_named_source_reads_its_channel_env(self):
+        # The owner-ideal naming: channels/dev.ag2.space/ is a valid lane and
+        # its .env is read (send reaches _post with that lane's gateway).
+        lane = self.cfg / "channels" / "dev.ag2.space"
+        lane.mkdir()
+        (lane / ".env").write_text(
+            "REMOTE_TASK_URL=https://dev-gw.example\nREMOTE_TASK_TOKEN=dev-token\n")
+        posts = []
+        with patch.object(self.mod, "_post", side_effect=lambda *a, **k: posts.append(a) or True):
+            ok = self.mod.send_remote_gateway("dev.ag2.space", "!r:dev.ag2.space", "hi")
+        self.assertTrue(ok)
+        self.assertEqual(len(posts), 1)
+        self.assertIn("dev-gw.example", str(posts[0]))
+
 
 class TestCLI(unittest.TestCase):
     def test_missing_channel_id_exits_1(self):

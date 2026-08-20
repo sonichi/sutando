@@ -91,6 +91,12 @@ WORKSPACE_SURFACE_DIRS=(
     "docs"
     "email-drafts"
     "agent-inbox"
+    # Owner-custom tooling surface (report c8310df7): <workspace>/scripts is
+    # DATA. The repo's own scripts/ is code — excluded via SOURCE_A_EXCLUDE.
+    "scripts"
+    # Agent config tree (report 9de2a03d): skills, settings, hooks, memory.
+    # Quarantining it silently breaks every configured hook/skill path.
+    ".claude-sutando"
 )
 
 # Per `feedback_per_source_surface_lists` 2026-06-02: dirs in Mini's #7
@@ -105,6 +111,7 @@ SOURCE_A_EXCLUDE=(
     "docs"
     "email-drafts"
     "agent-inbox"
+    "scripts"
 )
 WORKSPACE_SURFACE_FILES=(
     "build_log.md"
@@ -240,6 +247,8 @@ CLASS_RULES=(
     "docs/*|structural"
     "email-drafts/*|structural"
     "agent-inbox/*|structural"
+    "scripts/*|collision-keep-both"  # owner-custom tools: user content, never drop a version
+    ".claude-sutando/*|structural"  # agent config tree: same relpath, never clobber dest
     # Catchall — per Lucy #design 2026-06-02 + owner direction: workspace
     # sources B+C may have user-custom dirs/files (experiments/, obsidian-vault/,
     # personal-src/, repro-*.ts, etc.) outside the canonical surface. Anything
@@ -280,6 +289,10 @@ B_PATH="${SUTANDO_MIGRATE_SRC_B:-$HOME/.sutando/workspace}"
 
 # Source C — env override (env or .env)
 # (TEST hook: SUTANDO_MIGRATE_SRC_C overrides for E2E fixtures)
+# A source is a sutando CODE checkout only if it carries the repo-only resolver
+# module; scripts/sutando-config.sh alone is a tool a workspace may legitimately own.
+_is_sutando_repo() { [ -f "$1/src/sutando_config.py" ]; }
+
 detect_C() {
     local c=""
     if [ -n "${SUTANDO_MIGRATE_SRC_C:-}" ]; then
@@ -408,12 +421,12 @@ scan_source() {
     # source path IS a sutando repo checkout (by content, not by tag) — if
     # so, skip dirs that exist as repo code rather than workspace data
     # (docs/, agents/, etc.). Detection: presence of `src/sutando_config.py`
-    # (or the same-shape sutando-config.sh) at source root. Owner clarified
+    # at source root — NOT scripts/sutando-config.sh, which a workspace may own. Owner clarified
     # 2026-06-02 07:29: "We should only EXCLUDE them when they are in the
     # sutando repo root." A custom workspace path that happens to live
     # inside a sutando checkout should ALSO get the exclude.
     local IS_SUTANDO_REPO=0
-    if [ -f "$src/src/sutando_config.py" ] || [ -f "$src/scripts/sutando-config.sh" ]; then
+    if _is_sutando_repo "$src"; then
         IS_SUTANDO_REPO=1
     fi
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
@@ -1382,12 +1395,12 @@ commit_source() {
     # source path IS a sutando repo checkout (by content, not by tag) — if
     # so, skip dirs that exist as repo code rather than workspace data
     # (docs/, agents/, etc.). Detection: presence of `src/sutando_config.py`
-    # (or the same-shape sutando-config.sh) at source root. Owner clarified
+    # at source root — NOT scripts/sutando-config.sh, which a workspace may own. Owner clarified
     # 2026-06-02 07:29: "We should only EXCLUDE them when they are in the
     # sutando repo root." A custom workspace path that happens to live
     # inside a sutando checkout should ALSO get the exclude.
     local IS_SUTANDO_REPO=0
-    if [ -f "$src/src/sutando_config.py" ] || [ -f "$src/scripts/sutando-config.sh" ]; then
+    if _is_sutando_repo "$src"; then
         IS_SUTANDO_REPO=1
     fi
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
@@ -1727,7 +1740,16 @@ commit_main() {
     # ~/.claude/hooks/... paths (which can't move automatically). See
     # scripts/sutando-config-hooks.sh header for the full rationale.
     # Opt out with --no-hook-bridge.
-    if [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
+    # SUTANDO_MIGRATE_DEST is declared above as a TEST hook. It redirects DEST,
+    # but the two bridges below resolve claude-sutando-config-dir independently
+    # via sutando-config.sh, so under a test-redirected migration they still
+    # write the OPERATOR's real config dir. Measured on a live host: three of the
+    # four tests that set SUTANDO_MIGRATE_DEST rewrote <ccd>/settings.json.
+    # Bridging into the real config dir during a redirected migration is never
+    # correct, so the test hook now covers both destinations, not just DEST.
+    if [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ] && [ -n "${SUTANDO_MIGRATE_DEST:-}" ]; then
+        echo "  hook bridge: skipped (SUTANDO_MIGRATE_DEST set — test-redirected migration must not write the real config dir)"
+    elif [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
         local _hook_helper="$(dirname "$0")/sutando-config-hooks.sh"
         local _new_ccd; _new_ccd="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
         local _new_settings="${_new_ccd}/settings.json"
@@ -1762,7 +1784,9 @@ commit_main() {
     # Idempotent: skip if dest already populated. Honors $SOURCE_CLAUDE_CONFIG_DIR
     # for the read-from location (defaults to ~/.claude/ — matches the legacy
     # claude_home_path() fallback). Opt out with --no-channel-bridge.
-    if [ "$NO_CHANNEL_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
+    if [ "$NO_CHANNEL_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ] && [ -n "${SUTANDO_MIGRATE_DEST:-}" ]; then
+        echo "  channel bridge: skipped (SUTANDO_MIGRATE_DEST set — test-redirected migration must not write the real config dir)"
+    elif [ "$NO_CHANNEL_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
         local _new_ccd_ch; _new_ccd_ch="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
         local _src_channels="${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels"
         local _dst_channels="${_new_ccd_ch}/channels"

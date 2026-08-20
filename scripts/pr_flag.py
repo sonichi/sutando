@@ -1,168 +1,57 @@
 #!/usr/bin/env python3
-"""
-PR-flag — mechanical state gatherer for the owner's open PRs.
+"""Deprecated forwarder. The implementation moved to the pr-triage skill.
 
-Design (Chi 2026-07-27, "are you using a script to do judgement that should be
-done by an agent?" → refactor): this script does ONLY the mechanical, deterministic
-part — fetch open PRs, read each one's objective state (CI / mergeable /
-reviewDecision / approvals / author), and dedup on a state-hash so nothing wakes
-the agent when nothing changed. It makes NO judgement: no "ready", no "held", no
-"which PRs need you". That judgement is the AGENT's, done live each cycle from
-this raw state — because a script deciding "ready" is structurally blind to
-content (the #2339 case: green + approved but with fail-open bugs the script
-couldn't see, which a hardcoded rule wrongly called "ready").
-
-Usage:
-  python3 scripts/pr_flag.py --emit [--repo R] [--owner L] [--state-file P] [--force]
-
-`--emit` prints the raw per-PR state as JSON **only when the set changed** since
-last fire (and records the new hash); prints `NO_CHANGE` and exits 0 otherwise,
-so the cron stays quiet and the agent isn't woken for nothing. `--force` always
-emits (ignores dedup). Exit 0 always (fail-open; never break a cron).
+Kept for one release because a registered cron is a PROMPT SNAPSHOT: a host
+whose job was registered against this path keeps invoking it until someone
+re-runs /schedule-crons, and no repository change can reach that snapshot.
+Holds no logic, so it cannot drift from the skill copy the way the vendored
+duplicate did.
 """
 from __future__ import annotations
 
-import argparse
-import hashlib
-import json
-import subprocess
+import os
+import pathlib
 import sys
-from pathlib import Path
+
+_REL = pathlib.Path("skills/pr-triage/scripts/pr_flag.py")
+_MIGRATE = (
+    "Re-point this host, then remove the shim:\n"
+    "  bash skills/install.sh            # links the pr-triage skill\n"
+    "  /schedule-crons                   # re-registers the job from crons.json\n"
+    "The registered prompt must invoke "
+    "\"$CLAUDE_CONFIG_DIR/skills/pr-triage/scripts/pr_flag.py\"."
+)
 
 
-def _ci_state(rollup) -> str:
-    """Collapse a statusCheckRollup list into one of green/pending/failing/none."""
-    rc = rollup or []
-    if not rc:
-        return "none"
-    if any(
-        c.get("conclusion") in ("FAILURE", "CANCELLED", "TIMED_OUT")
-        or c.get("state") in ("FAILURE", "ERROR")
-        for c in rc
-    ):
-        return "failing"
-    if any(
-        c.get("status") in ("IN_PROGRESS", "QUEUED", "PENDING")
-        or c.get("state") in ("PENDING", "EXPECTED")
-        for c in rc
-    ):
-        return "pending"
-    return "green"
+def _target() -> "pathlib.Path | None":
+    """The skill's copy, from the config dir first and the checkout as fallback."""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    seen = []
+    if cfg:
+        seen.append(pathlib.Path(cfg) / "skills/pr-triage/scripts/pr_flag.py")
+    # Resolves the REPO root to find the skill checkout, never the workspace.
+    seen.append(pathlib.Path(__file__).resolve().parent.parent / _REL)  # lint-workspace-resolution: allow-repo-root
+    for p in seen:
+        if p.is_file():
+            return p
+    _target.searched = seen
+    return None
 
 
-def raw_state(prs: list, owner_login: str) -> list:
-    """Objective per-PR state — NO judgement. Sorted by number.
-
-    Each record: number, title, author, is_mine, head, ci, mergeable, review,
-    approvals. `approvals` = count of distinct logins whose latest effective
-    formal review state is APPROVED on the current head. These are facts the
-    agent then judges (is it ready? does the owner need it? caveats?).
-    """
-    out = []
-    for pr in prs:
-        if pr.get("isDraft"):
-            continue
-        author = (pr.get("author") or {}).get("login", "")
-        head = pr.get("headRefOid") or ""
-        latest_formal_review = {}
-        for index, review in enumerate(pr.get("reviews") or []):
-            if (review.get("commit") or {}).get("oid") != head:
-                continue
-            state = review.get("state")
-            if state not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
-                continue
-            login = (review.get("author") or {}).get("login")
-            if not login:
-                continue
-            order = (review.get("submittedAt") or "", index)
-            if login not in latest_formal_review or order >= latest_formal_review[login][0]:
-                latest_formal_review[login] = (order, state)
-        approvers = {
-            login
-            for login, (_, state) in latest_formal_review.items()
-            if state == "APPROVED"
-        }
-        out.append({
-            "number": pr.get("number"),
-            "title": pr.get("title", ""),
-            "author": author,
-            "is_mine": author == owner_login,
-            "head": head,
-            "ci": _ci_state(pr.get("statusCheckRollup")),
-            "mergeable": pr.get("mergeable") or "UNKNOWN",
-            "review": pr.get("reviewDecision") or "none",
-            "approvals": len(approvers),
-        })
-    out.sort(key=lambda x: x["number"])
-    return out
-
-
-def state_hash(state: list) -> str:
-    """Stable hash of the objective set. Changes when a PR appears/disappears or
-    any actionable field (head/ci/mergeable/review/approvals) flips; a title
-    edit does not refire."""
-    key = [[s["number"], s["is_mine"], s["head"], s["ci"], s["mergeable"], s["review"], s["approvals"]]
-           for s in state]
-    return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
-
-
-def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
-    cmd = [
-        "gh", "pr", "list", "--repo", repo, "--state", "open",
-        "--author", owner_login, "--limit", "1000",
-        "--json", "number,title,author,headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft,reviews",
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if res.returncode != 0:
-        print(f"pr-flag: gh failed: {res.stderr[:200]}", file=sys.stderr)
-        return []
-    try:
-        return json.loads(res.stdout)
-    except json.JSONDecodeError:
-        return []
-
-
-def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic covered in tests
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default="sonichi/sutando")
-    ap.add_argument("--owner", default="sonichi", help="GH login whose authored PRs are 'mine'")
-    ap.add_argument("--emit", action="store_true", help="print raw state JSON when it changed, else NO_CHANGE")
-    ap.add_argument("--force", action="store_true", help="always emit (ignore dedup)")
-    ap.add_argument("--state-file", default=None)
-    args = ap.parse_args()
-
-    state = raw_state(_fetch_prs(args.repo, args.owner), args.owner)
-    h = state_hash(state)
-
-    # dedup: resolve the stored-hash file the same way every reader does
-    sf = Path(args.state_file) if args.state_file else None
-    if sf is None:
-        ws = ""
-        try:
-            ws = subprocess.run(["bash", "scripts/sutando-config.sh", "workspace"],
-                                capture_output=True, text=True, timeout=20).stdout.strip()
-        except Exception:
-            ws = ""
-        sf = Path(ws) / "state" / "pr-flag-state.json" if ws else Path("state/pr-flag-state.json")
-    prev = ""
-    try:
-        prev = json.loads(sf.read_text()).get("hash", "")
-    except Exception:
-        prev = ""
-
-    if h == prev and not args.force:
-        print("NO_CHANGE")
-        return 0
-
-    # emit the objective state for the AGENT to judge, then record the hash
-    print(json.dumps({"hash": h, "changed": True, "prs": state}, indent=2))
-    try:
-        sf.parent.mkdir(parents=True, exist_ok=True)
-        sf.write_text(json.dumps({"hash": h, "count": len(state)}))
-    except Exception as e:
-        print(f"pr-flag: state write failed: {e}", file=sys.stderr)
-    return 0
+def main() -> int:
+    tgt = _target()
+    if tgt is None:
+        searched = "\n".join(f"  {p}" for p in getattr(_target, "searched", []))
+        sys.stderr.write(
+            "pr_flag.py: this path is a deprecated shim and the pr-triage skill "
+            f"is not installed.\nLooked in:\n{searched}\n{_MIGRATE}\n")
+        # Loud and non-zero: a silent success here is the digest going missing.
+        return 2
+    # execv replaces the process image before coverage flushes: unobservable.
+    sys.stderr.write(  # pragma: no cover
+        f"pr_flag.py: DEPRECATED path; forwarding to {tgt}. {_MIGRATE}\n")
+    os.execv(sys.executable, [sys.executable, str(tgt), *sys.argv[1:]])  # pragma: no cover
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

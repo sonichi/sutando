@@ -143,6 +143,8 @@ touch "$FIXTURE_REPO/CLAUDE.md"
 git init -q "$FIXTURE_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$FIXTURE_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$FIXTURE_REPO/src/"
 cat > "$FIXTURE_REPO/sutando.config.json" <<'JSON'
 {
@@ -754,17 +756,21 @@ echo "==== Test 16: SUTANDO_VAULT env var is NO LONGER honored (PR-2 — removed
 # config-file + --vault-url cover both canonical and override cases. Setting
 # the env var alone (no flag, no config, no .env) should NOT resolve vault.
 
+ENV_ONLY_VAULT="$FIXTURE_VAULT-env-var-only"
+# Not $FIXTURE_VAULT: this workspace was --init'd against it, so its `origin`
+# supplies the same URL and a match would not say which source produced it.
+
 out_removed=$(env \
     SUTANDO_REPO_DIR="$FIXTURE_REPO" \
     SUTANDO_WORKSPACE="$FIXTURE_WS" \
     SUTANDO_TEST_MODE=1 \
-    SUTANDO_VAULT="$FIXTURE_VAULT" \
+    SUTANDO_VAULT="$ENV_ONLY_VAULT" \
     bash "$SYNC" --status 2>&1; echo "EXIT=$?")
 
 # Status should still exit 0 (it doesn't require vault to be resolved),
-# but VAULT_URL must NOT match $FIXTURE_VAULT
+# but VAULT_URL must NOT match the env-var-only URL
 case "$out_removed" in
-  *"$FIXTURE_VAULT"*)
+  *"$ENV_ONLY_VAULT"*)
     echo "  FAIL: SUTANDO_VAULT env var was still honored (should be removed)"; fail=$((fail+1)) ;;
   *)
     echo "  OK: SUTANDO_VAULT env var ignored as expected"; pass=$((pass+1)) ;;
@@ -1063,6 +1069,8 @@ touch "$WSA_REPO/CLAUDE.md"
 git init -q "$WSA_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$WSA_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$WSA_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$WSA_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$WSA_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$WSA_REPO/"
 WSA_SLUG=$(printf '%s' "$WSA_REPO" | sed 's|/|-|g')
@@ -1086,6 +1094,8 @@ touch "$WSB_REPO/CLAUDE.md"
 git init -q "$WSB_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$WSB_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$WSB_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$WSB_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$WSB_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$WSB_REPO/"
 WSB_SLUG=$(printf '%s' "$WSB_REPO" | sed 's|/|-|g')
@@ -1161,6 +1171,8 @@ touch "$HOSTA_REPO/CLAUDE.md"
 git init -q "$HOSTA_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$HOSTA_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$HOSTA_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$HOSTA_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$HOSTA_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$HOSTA_REPO/"
 HOSTA_SLUG=$(printf '%s' "$HOSTA_REPO" | sed 's|/|-|g')
@@ -1189,6 +1201,8 @@ touch "$HOSTB_REPO/CLAUDE.md"
 git init -q "$HOSTB_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$HOSTB_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$HOSTB_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$HOSTB_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$HOSTB_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$HOSTB_REPO/"
 HOSTB_SLUG=$(printf '%s' "$HOSTB_REPO" | sed 's|/|-|g')
@@ -1331,6 +1345,8 @@ touch "$T27_REPO/CLAUDE.md"
 git init -q "$T27_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$T27_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$T27_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$T27_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$T27_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$T27_REPO/"
 

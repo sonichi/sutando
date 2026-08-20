@@ -34,6 +34,9 @@ import tempfile
 import types
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "_helpers"))
+import bridge_paths  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -111,9 +114,32 @@ class _TempBridgeState:
         ws = Path(self._td) / "workspace"
         ws.mkdir()
         BRIDGE.WORKSPACE = str(ws)
+
+        # …and redirect the path write_owner_activity ACTUALLY writes.
+        #
+        # Two symbols, and only the second one matters. `STATE_DIR = REPO/"state"`
+        # (slack-bridge.py:98) is where you'd expect the write to resolve, but
+        # line 102 binds `OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"`
+        # **at import time**, and :177/:179 write through that constant. Rebinding
+        # STATE_DIR afterwards does not retroactively re-derive it — so patching
+        # STATE_DIR alone leaves the write pointed at the operator's real file
+        # (bassilkhilo-ag2, #2615). Both are rebound here; STATE_DIR because
+        # `mkdir(parents=True)` in the writer uses it, OWNER_ACTIVITY_FILE because
+        # it is the destination.
+        #
+        # Why it matters: that file is the presence signal the proactive loop
+        # reads to decide whether the owner is mid-conversation. Stamping it with
+        # `ts: now` made an idle machine look like the owner had just messaged —
+        # observed live, and it put a loop pass into conversation mode before it
+        # was traced back here.
+        # Rebind EVERY import-time path, not the two this fixture happened to name:
+        # PENDING_REPLIES_FILE is bound the same way and leaked to live state.
+        self._orig_paths = bridge_paths.rebind_workspace(BRIDGE, Path(self._td))
+        BRIDGE.STATE_DIR.mkdir(parents=True, exist_ok=True)
         return self
 
     def __exit__(self, *_):
+        bridge_paths.restore(BRIDGE, self._orig_paths)
         BRIDGE.ACCESS_FILE = self._orig_access
         BRIDGE.TASKS_DIR = self._orig_tasks
         BRIDGE._TOFU_ENROLLMENT_CODE = None

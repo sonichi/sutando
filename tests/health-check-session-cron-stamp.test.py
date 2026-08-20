@@ -15,6 +15,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "health-check.py"
@@ -32,7 +33,17 @@ SESSION_ENTRIES = [
 
 
 class SessionCronStampTest(unittest.TestCase):
-    def _workspace(self, root: Path, entries, stamp=None, started_at=None) -> Path:
+    def _workspace(self, root: Path, entries, stamp=None, started_at=None,
+                   alive_started_at=None) -> Path:
+        """`started_at` is the SESSION LAUNCH boundary and is written where the
+        probe now reads it: `state/session-starts.log`.
+
+        `alive_started_at` writes the heartbeat's `.alive` field INSTEAD, which
+        the probe must no longer consult — see
+        `test_alive_started_at_alone_does_not_warn`. Before this split the helper
+        wrote only `.alive`, so every case here silently exercised the wrong
+        source and the probe's real-world false alarm was unreachable in tests.
+        """
         workspace = root / "workspace"
         config = workspace / "hosts" / "test-host" / "crons.json"
         config.parent.mkdir(parents=True)
@@ -42,12 +53,25 @@ class SessionCronStampTest(unittest.TestCase):
         if stamp is not None:
             (config.parent / "schedule-crons-stamp.json").write_text(json.dumps(stamp))
         if started_at is not None:
+            (state / "session-starts.log").write_text(
+                json.dumps({"host": "test-host", "session_started_at": started_at}) + "\n"
+            )
+        if alive_started_at is not None:
             cores = state / "cores"
             cores.mkdir(exist_ok=True)
-            (cores / "test-host.alive").write_text(json.dumps({"started_at": started_at}))
+            (cores / "test-host.alive").write_text(
+                json.dumps({"started_at": alive_started_at})
+            )
         return workspace
 
     def _check(self, workspace, **kw):
+        # `_last_core_launch_at` skips launch records belonging to another host,
+        # so the fixture's label has to read as local or every boundary is None.
+        with mock.patch.object(health, "_local_host_labels",
+                               return_value={"test-host"}):
+            return self._check_unpatched(workspace, **kw)
+
+    def _check_unpatched(self, workspace, **kw):
         return health.check_session_cron_registration(
             workspace, host_label="test-host", runtime=kw.pop("runtime", "claude"), **kw
         )
@@ -84,7 +108,49 @@ class SessionCronStampTest(unittest.TestCase):
             )
             check = self._check(ws)
             self.assertEqual(check["status"], "warn")
-            self.assertIn("predates this core boot", check["detail"])
+            self.assertIn("predates this session's launch", check["detail"])
+
+    def test_alive_started_at_alone_does_not_warn(self):
+        """THE regression. `.alive.started_at` is the HEARTBEAT writer's age,
+        not the session's — both launch paths retain an existing heartbeat
+        process, so restarting it under a live session moved that field hours
+        forward while every cron stayed registered. Reading it as the boot
+        boundary reported all of them gone.
+
+        Observed on Chis-Mac-mini 2026-08-04 with all 9 expected crons live:
+        core pid 30961 up since 11:32:30, heartbeat pid 72981 restarted at
+        16:13:56, `.alive.started_at` = 16:13:56, stamp written 11:37:21 ->
+        "stamp predates this core boot (16595s older)".
+
+        Same field and same mistake as #2446, which established
+        `_last_core_launch_at` as the boundary for exactly this reason.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._workspace(
+                Path(td), SESSION_ENTRIES,
+                stamp={"ts": 1000.0, "registered": 2},
+                alive_started_at=5000.0,   # heartbeat restarted AFTER the stamp
+            )                              # and NO session-starts.log
+            check = self._check(ws)
+            self.assertNotEqual(
+                check["status"], "warn",
+                f"a heartbeat restart must not read as a lost session: {check['detail']}")
+            self.assertNotIn("predates", check["detail"])
+
+    def test_session_launch_still_warns_when_both_are_present(self):
+        """Control for the case above: with a real launch record present, a
+        genuinely pre-launch stamp must still warn. Without this, the fix could
+        have disabled the check rather than corrected its input."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._workspace(
+                Path(td), SESSION_ENTRIES,
+                stamp={"ts": 1000.0, "registered": 2},
+                started_at=5000.0,        # the authoritative boundary
+                alive_started_at=200.0,   # older heartbeat: must not soften it
+            )
+            check = self._check(ws)
+            self.assertEqual(check["status"], "warn")
+            self.assertIn("predates this session's launch", check["detail"])
 
     def test_fresh_stamp_ok(self):
         with tempfile.TemporaryDirectory() as td:

@@ -104,6 +104,102 @@ resolve_python() {
     fi
 }
 
+# Can this interpreter actually RUN health-check.py? Imports it WITHOUT executing
+# it: `main()` is behind `if __name__ == "__main__"`, so the whole import chain
+# runs and no checks do.
+#
+# Two probes that look right and are not, both rejected after trying them:
+#   - `py_compile`: the file compiles fine under a broken interpreter. The
+#     failure is dlopen of a C extension at IMPORT time, not syntax.
+#   - `health-check.py --help`: there is no --help. The script ignores it and
+#     runs the FULL check — slow, touches the workspace, and exits non-zero on
+#     any unhealthy host, so a healthy interpreter on an unhealthy host would be
+#     rejected. (Observed: it reported missing .env / build_log for the probe's
+#     own working tree.)
+probe_python() {
+    [ -n "${1:-}" ] && [ -x "$1" ] || return 1
+    "$1" - "$REPO/src/health-check.py" >/dev/null 2>&1 <<'PROBE'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("hc_probe", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+sys.modules["hc_probe"] = mod
+spec.loader.exec_module(mod)
+PROBE
+}
+
+# resolve_python() picks the first interpreter that EXISTS. Existing is not
+# working, and this installs the OS-level net that catches a wedged or dead
+# session — the one component whose failure nothing else watches. Measured
+# 2026-08-03: the preferred Homebrew python3 (3.14.5) could not `import
+# plistlib` at all (pyexpat/libexpat symbol mismatch), so the installed job
+# would have failed every 300s into a log nobody reads while `--status` still
+# reported it loaded.
+#
+# So: keep resolve_python's preference order as the first candidate, but VERIFY
+# it, and fall back to the PATH interpreter if it cannot run the script.
+# $SUTANDO_PYTHON_CANDIDATES (space-separated) overrides the whole list, so an
+# operator can pin the interpreter on a host where the default order is wrong,
+# and the tests can inject stubs. A pinned candidate is still probed — pinning
+# says which to prefer, not "skip the check".
+#
+# Deliberately does NOT add /usr/bin/python3 as a fallback: per REVIEW.md
+# lesson 7 that path is the Xcode-CLT stub, which exists whether or not the
+# tools do and pops a GUI dialog when invoked without them. An operator who
+# knows CLT is installed can still select it explicitly via the env var.
+resolve_python_verified() {
+    __cands="${SUTANDO_PYTHON_CANDIDATES:-}"
+    [ -n "$__cands" ] || __cands="$(resolve_python) $(command -v python3 2>/dev/null || true)"
+
+    __first=""
+    __seen=""
+    # shellcheck disable=SC2086 # deliberate word-splitting of a space-separated list
+    for __c in $__cands; do
+        [ -n "$__c" ] && [ -x "$__c" ] || continue
+        case " $__seen " in *" $__c "*) continue ;; esac
+        __seen="$__seen $__c"
+        [ -n "$__first" ] || __first="$__c"
+        if probe_python "$__c"; then
+            echo "$__c"
+            return 0
+        fi
+        echo "note: $__c cannot import health-check.py — trying the next candidate" >&2
+    done
+
+    if [ -n "$__first" ]; then
+        # FAIL CLOSED. An earlier version warned and installed with the broken
+        # interpreter anyway, reasoning that refusing would block an install over
+        # a probe that might be wrong. That trade is backwards, for two reasons
+        # (review-caught, qingyun-wu on #2582):
+        #
+        #   1. The caller runs `bootout_if_loaded` AFTER this resolves. Proceeding
+        #      therefore UNLOADS a job that may currently be working and replaces
+        #      it with one already proven unable to start. Failing here preserves
+        #      whatever is installed.
+        #   2. The installer would report success. A safety net that reports
+        #      installed and cannot run is worse than a failed install, because
+        #      nothing else watches this job — that is the whole premise of the
+        #      change.
+        #
+        # And it is not a hypothetical branch: on the host that motivated this,
+        # the default list collapses to the same broken interpreter twice
+        # (Homebrew, and PATH resolving to it), so ALL candidates fail.
+        #
+        # The probe being wrong is still handled — $SUTANDO_PYTHON_CANDIDATES
+        # overrides the list — so failing closed strands nobody.
+        echo "ERROR: no candidate python3 can import health-check.py." >&2
+        echo "       Tried:$__seen" >&2
+        echo "       Refusing to install: the job would fail every run while" >&2
+        echo "       reporting success, and installing would unload any working" >&2
+        echo "       job already in place." >&2
+        echo "       Fix the interpreter, or pin a known-good one:" >&2
+        echo "         SUTANDO_PYTHON_CANDIDATES=/path/to/python3 $0 install" >&2
+        exit 1
+    fi
+
+    echo "ERROR: no python3 found" >&2
+    exit 1
+}
+
 resolve_homebrew_bin() {
     # Apple Silicon vs Intel — both prefixes work; pick whichever exists.
     if [ -d /opt/homebrew/bin ]; then
@@ -121,21 +217,30 @@ case "$cmd" in
             echo "ERROR: template not found: $TEMPLATE" >&2
             exit 1
         fi
-        PYTHON_BIN="$(resolve_python)"
+        PYTHON_BIN="$(resolve_python_verified)"
         BREW_BIN="$(resolve_homebrew_bin)"
+        # Canonical config dir, baked into the plist so the minimal launchd env
+        # resolves channels/ag2space/.env the same way startup does (#2487 P1).
+        CLAUDE_CFG="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
+        # The helper owns every supported fallback. If it cannot resolve one,
+        # do not install a launchd job with an empty/legacy config path and
+        # silently lose the core-independent gateway alert.
+        [ -n "$CLAUDE_CFG" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; exit 1; }
         echo "Installing $LABEL"
         echo "  repo:    $REPO"
         echo "  python:  $PYTHON_BIN"
         echo "  brew:    $BREW_BIN"
+        echo "  config:  $CLAUDE_CFG"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
-        # Render the template. Use a delimiter unlikely to appear in paths.
-        sed \
-            -e "s|__REPO__|$REPO|g" \
-            -e "s|__WORKSPACE__|$WORKSPACE|g" \
-            -e "s|__PYTHON__|$PYTHON_BIN|g" \
-            -e "s|__HOMEBREW_BIN__|$BREW_BIN|g" \
-            "$TEMPLATE" > "$DEST"
+        # Shared renderer: literal substitution + XML escaping + a parse
+        # check, so a path with & < > | cannot install a silently-broken job.
+        "$PYTHON_BIN" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$DEST" \
+            "REPO=$REPO" \
+            "WORKSPACE=$WORKSPACE" \
+            "PYTHON=$PYTHON_BIN" \
+            "HOMEBREW_BIN=$BREW_BIN" \
+            "CLAUDE_CONFIG_DIR=$CLAUDE_CFG" || exit 1
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"

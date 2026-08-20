@@ -106,8 +106,8 @@ state.
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
 
-    ↻ = a cron job fires the `/proactive-loop` skill every 5 minutes
-        (`*/5 * * * *` in `skills/schedule-crons/crons.json`). The skill
+    ↻ = a cron job fires the `/proactive-loop` skill every 15 minutes
+        (`*/15 * * * *` in the per-host `crons.json`). The skill
         runs as a 10-minute pass that keeps a persistent watcher on
         `tasks/` via Claude Code's `Monitor` tool — pending tasks are
         processed the moment they arrive, not just on the cron tick.
@@ -133,9 +133,13 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 - Python 3 (`brew install python3`)
 - fswatch (`brew install fswatch`) — auto-installs via Homebrew on first start
 
-**Also required, but *not* checked at boot** — startup tests only that a command exists, so a host can pass every check above and still fail once running:
-- **Sign in to your agent CLI.** An unauthenticated CLI passes the presence check and then fails when the core starts.
-- macOS 15+, Node.js 22+.
+**Also required** — sign in to the selected agent CLI. Startup checks the
+configured Claude or Codex home before launching background services and fails
+with the matching login remedy. `SUTANDO_SKIP_AUTH_PREFLIGHT=1` bypasses this
+once for recovery; the runtime launcher still checks again before replacing the
+core session.
+
+**Recommended, but not checked at boot** — macOS 15+ and Node.js 22+.
 
 `bash src/verify-setup.sh` covers this second list — it checks the Node version and whether your CLI is actually authenticated. Run it if startup succeeds but the core doesn't.
 
@@ -158,11 +162,37 @@ cd sutando
 cp .env.example .env
 # Add GEMINI_API_KEY only if you want voice
 
-# Start everything
-bash src/startup.sh
+# Start everything — core, menu-bar app, and the dashboard in your browser
+./start.sh
 ```
 
-This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) plus **Open Core** (selected CLI terminal) and **Open Dashboard** (status page).
+That is the whole first run. `start.sh` is a thin front door: it delegates to `src/startup.sh --with-app` and opens the dashboard once it answers. Extra arguments pass straight through (`./start.sh --runtime codex`). Set `SUTANDO_OPEN_DASHBOARD=0` to skip the browser, or `SUTANDO_DASHBOARD_URL` to point it elsewhere. If the dashboard never comes up the core still starts — the browser open is backgrounded and can never gate it.
+
+`src/startup.sh` remains the supported lower-level entry, and is what you want when there is no desktop to open things on:
+
+```bash
+# Headless core only — no app, no browser
+bash src/startup.sh
+
+# Core plus the macOS menu-bar app, still no browser
+bash src/startup.sh --with-app
+```
+
+Either path starts the core services (voice agent, phone conversation server, web client, dashboard, and API) and the autonomous loop. The browser UI is at http://localhost:8080 and the dashboard at http://localhost:7844; `src/startup.sh` never opens a browser for you.
+
+**The macOS menu-bar app is opt-in and separate.** Plain `bash src/startup.sh` never touches it, so the core stays headless. `--with-app` builds, signs, and **launches** the bundle; a failure there is reported and never stops the core.
+
+**Auto-start at login is a further, explicit opt-in.** Neither `./start.sh` nor `--with-app` installs a launchd job — running the app and having macOS resurrect it forever are different decisions. When you do want it, run the installer from the checkout you actually use: it records that path in the LaunchAgent, so installing from a temporary worktree leaves you with a login job pointing at a directory that will be deleted.
+
+To manage the app on its own — build only, launch once, or supervise — use its installer directly:
+
+```bash
+bash scripts/install-menu-bar-app.sh              # build + sign, print next steps
+bash scripts/install-menu-bar-app.sh --launch     # …and open it now
+bash scripts/install-menu-bar-app.sh --supervise  # …and auto-start it at login
+```
+
+First run needs Accessibility granted in System Settings → Privacy & Security. Run the installer from the checkout you actually use: it records that path in the launchd job, so running it from a temporary worktree pins the app to a directory that will be deleted.
 
 > **Why Sutando runs with elevated permissions.** Autonomous voice-driven work means `startup.sh` launches the selected core CLI with unattended approvals and full local access — permission prompts would otherwise break the voice-in / answer-out flow. In exchange:
 >
@@ -231,7 +261,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Telegram | Message Sutando from your phone. **First DM auto-enrolls you as owner** (trust-on-first-use). Subsequent senders need to be added: edit `$CLAUDE_CONFIG_DIR/channels/telegram/access.json` → `allowFrom` list. | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
-| Sutando app (menu bar) | Global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Auto-launches via `startup.sh` |
+| Sutando app (menu bar) | Optional global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Build and launch separately; core startup stays headless |
 | OS-supervised health checks | Detect stuck loops, dead watchers, and queue pileups even when core is unresponsive — macOS notifies you when Sutando is broken | `bash src/install-health-check-launchd.sh` (idempotent; uninstall with `--uninstall`) |
 | Multi-machine workspace sync | Run the same agent identity across Mac mini + MacBook + Mac Studio etc.; memory + notes + state stay consistent via a private git repo you own | Create a private vault repo, set `vault.remote_url` in `sutando.config.local.json`, run `bash scripts/sync-workspace.sh --init` once + cron it. See [docs/workspace-sync.md](docs/workspace-sync.md). The legacy `sync-memory.sh` flow is deprecated in v0.3.0 and removed in v0.4.0. |
 
@@ -303,7 +333,7 @@ When running, Sutando exposes these local ports:
 
 ## Keyboard shortcuts
 
-The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published at runtime to `<workspace>/state/hotkeys.json` (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
+The optional Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It is separate from the headless core and is never built or launched by `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published at runtime to `<workspace>/state/hotkeys.json` (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
 
 | Action | Default binding |
 |--------|-----------------|
@@ -321,7 +351,7 @@ On first run:
 1. Grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security
 2. Enable **Allow JavaScript from Apple Events** in Chrome: View → Developer → Allow JavaScript from Apple Events (required for the **Toggle Voice** hotkey — default ⌃V, see [Keyboard shortcuts](#keyboard-shortcuts))
 
-The binary auto-compiles on `startup.sh` if missing. To compile manually: `cd src/Sutando && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices`
+To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sutando main.swift SutandoConfig.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation`, then run `./Sutando`. The app and its accessibility helper are not core boot dependencies.
 
 ---
 

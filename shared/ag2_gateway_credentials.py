@@ -1,0 +1,113 @@
+"""ag2_gateway_credentials — the CANONICAL pure credential contract.
+
+THE single source of AG2 Space gateway credential PARSING/PRECEDENCE
+semantics. Both consumers use machine-generated copies of this file
+(`tools/sync_gateway_credentials.py`):
+
+    packages/ag2-sparrow/ag2_sparrow/gateway_credentials.py   (generated)
+    skills/agent-room-ops/gateway_credentials.py              (generated)
+
+Neutral top-level home by owner ruling (Feature Haul 2026-08-05): sparrow is
+a CONSUMER of the contract, not its owner — canonical-in-sparrow would
+invite sparrow's runtime lifecycle (device-env discovery, rotation, reload,
+DNS policy) to leak into the shared module. This module is strictly pure:
+
+    it never reads os.environ, touches the filesystem, calls a vault,
+    prints diagnostics, refreshes tokens, sends HTTP, mutates globals,
+    or decides agent identity.
+
+Consumers own those as runtime adapters and feed plain values in.
+
+Promotion contract: when a THIRD consumer appears (CLI/MCP/external), this
+becomes the independent ag2-gateway-client package; the generated copies
+convert to a dependency with this API unchanged.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Mapping, Sequence
+
+# Canonical alias precedence (earlier wins). GATEWAY_* primary; RELAY_* and
+# REMOTE_TASK_* transition aliases; AG2_* legacy.
+TOKEN_ALIAS_PRECEDENCE: "tuple[str, ...]" = (
+    "GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+URL_ALIAS_PRECEDENCE: "tuple[str, ...]" = (
+    "GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
+
+# The combined onboarding form separates URL from secret with "|" — which
+# some transports URL-encode as %7C/%7c. Only a value STARTING with an
+# http(s) scheme is combined; a bare secret is opaque and never touched even
+# if it contains either separator (#2307: secrets are split, never mutated).
+# A literal "|" is PREFERRED over %7C/%7c when both appear: a raw pipe
+# cannot legally occur inside a URL, so when one exists it IS the separator
+# — this keeps a URL half that carries an encoded %7C intact (#2670 review).
+_ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
+
+
+@dataclass(frozen=True)
+class GatewayCredentials:
+    """Normalized resolution result.
+
+    ``token`` is excluded from repr so a stray log/print of this object can
+    never leak the secret. ``source`` is a qualified, secret-free origin tag
+    the consumer supplies — e.g. ``env:REMOTE_TASK_TOKEN``,
+    ``dotenv:/path/to/file``, ``vault:REMOTE_TASK_TOKEN``, ``none``.
+    ``base_url`` is '' when unconfigured (callers degrade gracefully)."""
+    base_url: str
+    token: str = field(repr=False, default="")
+    source: str = "none"
+
+
+def parse_onboarding_token(raw: str) -> "tuple[str, str]":
+    """Split an onboarding string into (url_from_token, secret).
+
+    Case-insensitive scheme detection; splits at the first literal ``|``,
+    falling back to the first ``%7C``/``%7c`` only when no literal pipe
+    exists; both halves returned verbatim (never mutated). The literal pipe
+    is preferred because a raw ``|`` cannot legally occur inside a URL — so
+    when one is present it must be the separator, and a URL half that
+    legitimately carries an encoded ``%7C`` stays intact (#2670 review). A
+    bare secret — no leading scheme — is ('', raw) untouched even if it
+    contains a separator. A scheme-prefixed value with no separator is
+    ('', raw) too (the caller's URL-less guard speaks)."""
+    if not raw.lower().startswith(("http://", "https://")):
+        return "", raw
+    i = raw.find("|")
+    if i != -1:
+        return raw[:i], raw[i + 1:]
+    m = _ENCODED_SEPARATOR_RE.search(raw)
+    if m is None:
+        return "", raw
+    return raw[: m.start()], raw[m.end():]
+
+
+def normalize_gateway_url(url: str) -> str:
+    """Canonical URL normalization: strip trailing slashes, nothing else."""
+    return (url or "").rstrip("/")
+
+
+def resolve_alias_precedence(values: Mapping[str, str],
+                             names: Sequence[str]) -> "tuple[str, str]":
+    """First non-empty value in canonical order → (value, winning_name);
+    ('', '') when none. Pure: ``values`` is any mapping the CALLER built —
+    never os.environ implicitly."""
+    for name in names:
+        v = values.get(name) or ""
+        if v:
+            return v, name
+    return "", ""
+
+
+def normalize_credentials(raw_token_value: str,
+                          explicit_url: str = "",
+                          fallback_url: str = "",
+                          source: str = "none") -> GatewayCredentials:
+    """Compose parse + URL chain into the value object. URL precedence:
+    explicit (alias chain) > url-embedded-in-token > caller fallback (e.g. a
+    device-env file's REMOTE_TASK_URL line). ``source`` must already be the
+    qualified secret-free tag; it is kept only when a token resolved."""
+    url_from_token, token = parse_onboarding_token(raw_token_value) if raw_token_value else ("", "")
+    base = normalize_gateway_url(explicit_url or url_from_token or fallback_url)
+    return GatewayCredentials(base_url=base, token=token,
+                              source=source if token else "none")
