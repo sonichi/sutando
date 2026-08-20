@@ -149,8 +149,9 @@ stub.write_text(
     '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
     'else echo "not authenticated"; exit 1; fi;;\n'
     '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
-    '  "auth --events") echo \'{"event":"connected","data":{},"ts":3}\' >&2; '
-    f'touch "$MARK"; sleep 30; exit 0;;\n'
+    '  "auth --events") trap \'kill $SP 2>/dev/null; exit 0\' TERM; '
+    'echo \'{"event":"connected","data":{},"ts":3}\' >&2; '
+    f'touch "$MARK"; sleep 30 & SP=$!; wait $SP; exit 0;;\n'
     'esac\nexit 0\n')
 t0 = __import__("time").time()
 out = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "60"],
@@ -172,8 +173,9 @@ stub.write_text(
     '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
     'else echo "not authenticated"; exit 1; fi;;\n'
     '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
-    '  "auth --events") echo \'{"event":"future_vocab","data":{},"ts":5}\' >&2; '
-    f'touch "$MARK"; sleep 60; exit 0;;\n'
+    '  "auth --events") trap \'kill $SP 2>/dev/null; exit 0\' TERM; '
+    'echo \'{"event":"future_vocab","data":{},"ts":5}\' >&2; '
+    f'touch "$MARK"; sleep 60 & SP=$!; wait $SP; exit 0;;\n'
     'esac\nexit 0\n')
 out = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "5"],
                      capture_output=True, text=True, env=env, timeout=90)
