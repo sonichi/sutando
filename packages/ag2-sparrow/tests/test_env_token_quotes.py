@@ -28,10 +28,8 @@ import tempfile
 import types
 import unittest
 
-# --------------------------------------------------------------------------- #
-# Hermeticity, both boundaries, BEFORE the bridge can be imported (module init
-# resolves the token during exec_module — see lint-hermetic-bridge-tests).
-# --------------------------------------------------------------------------- #
+# Module init resolves the token during exec_module, so both boundaries must be
+# hermetic before the bridge is imported.
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-env-token-quotes-")
 
 _FAKE_VI = types.ModuleType("vault_intercept")
@@ -112,9 +110,8 @@ class EnvTierTests(unittest.TestCase):
         self.assertEqual(m.URL, URL)
 
     def test_trailing_quote_only(self):
-        # The shape observed in production 2026-08-20: the leading quote had
-        # already been eaten somewhere upstream, so the URL parsed and the
-        # request reached the gateway — and 401'd on the bearer alone.
+        # Leading quote already eaten upstream: the URL parses, so the request reaches
+        # the gateway and 401s on the bearer alone.
         m = _load(REMOTE_TASK_TOKEN=f"{COMBINED}'")
         self.assertEqual(m.TOKEN, SECRET)
         self.assertEqual(m.URL, URL)
