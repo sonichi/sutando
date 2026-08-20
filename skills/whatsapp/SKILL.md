@@ -32,6 +32,29 @@ WACLI_DEVICE_PLATFORM=CHROME          # default per wacli is DESKTOP; CHROME is 
                                       # See wacli's docs (https://github.com/steipete/wacli) for the full platform-string list.
 ```
 
+## Guided connect (zero-terminal pairing)
+
+When the user asks to connect WhatsApp, do NOT tell them to open a terminal.
+Run the orchestrator and relay its line protocol into the chat:
+
+```bash
+python3 skills/whatsapp/scripts/guided_connect.py --phone "+14155551234"   # preferred
+python3 skills/whatsapp/scripts/guided_connect.py                          # QR fallback
+```
+
+- **Prefer `--phone`** whenever the user's number is known or can be asked for:
+  it emits `PAIR_CODE: XXXX-XXXX`, which you relay as text — the user types it
+  under WhatsApp → Linked devices → "Link with phone number". A QR posted into
+  the chat cannot be scanned when the chat is open on the same phone.
+- QR mode emits `QR_PNG: <path>` — attach it to your reply via `[file: <path>]`.
+  Codes rotate; each new `QR_PNG:` line supersedes the previous image, so
+  re-post it. `QR_TEXT: <payload>` appears instead if the qrcode lib is absent.
+- `ALREADY_CONNECTED` / `CONNECTED` both mean the session is live and the
+  chats probe passed — confirm to the user and offer a closed-loop test send
+  to a recipient THEY name (wacli refuses self-sends by design).
+- `ERROR: <reason>` is terminal; relay it honestly. Passkey-gated accounts are
+  a documented wacli limitation.
+
 ## Commands
 
 ```bash
