@@ -124,9 +124,8 @@ check(out.returncode == 1 and "ERROR: " in out.stdout,
       f"no-session path errors loudly (stdout={out.stdout.strip()!r})")
 
 print("7. connected arrives while auth stays alive past the old 10s wait — no crash")
-# Reproduces the reviewed failure: upstream emits the connected envelope, then
-# wacli auth keeps running bootstrap sync (~30s idle exit). The script must
-# reap the process and reach verification instead of raising TimeoutExpired.
+# Reviewed failure: connected arrives, auth stays alive (~30s sync); the
+# script must reap and verify instead of raising TimeoutExpired.
 stub.write_text(
     "#!/bin/sh\n"
     'case "$1 $2" in\n'
@@ -134,9 +133,8 @@ stub.write_text(
     '  "chats list") echo "KIND NAME"; exit 0;;\n'
     '  "auth --events") echo \'{"event":"connected","data":{},"ts":3}\' >&2; sleep 30; exit 0;;\n'
     'esac\nexit 0\n')
-# auth status answers "authenticated" here, so force the spawn path by faking
-# the pre-check: run with a wrapper stub whose FIRST status call fails, then
-# flips after pairing. Two-state stub via a marker file.
+# Two-state stub via marker file: status fails until auth "pairs", so the
+# spawn path is exercised and post-pair verification can succeed.
 stub.write_text(
     "#!/bin/sh\n"
     f'MARK="{lab}/paired"\n'

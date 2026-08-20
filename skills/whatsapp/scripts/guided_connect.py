@@ -105,10 +105,8 @@ class EventRouter:
 
     def _feed_event(self, ev: dict) -> None:
         kind = str(ev.get("type") or ev.get("event") or "").lower()
-        # wacli's EventWriter nests the material under `data`
-        # ({"event":"pair_code","data":{"code":…}}); older/flat shapes are kept
-        # as fallbacks. Never stringify the whole data dict — that renders a
-        # dict repr into the QR instead of the payload.
+        # EventWriter nests material under `data`; flat shapes are fallbacks.
+        # Only str payloads: stringifying the dict renders its repr as the QR.
         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
         if "qr" in kind:
             payload = (data.get("code") or data.get("payload")
@@ -177,10 +175,8 @@ def run_auth(wacli: str, phone: str | None, timeout_s: int, qr_dir: str) -> int:
         emit("ERROR: pairing timed out — ask the user to retry when ready")
         return 1
 
-    # After the connected event, wacli keeps running bootstrap sync until its
-    # ~30s idle exit — reap it explicitly instead of waiting it out. The
-    # session store is already durable, so cutting the sync short costs
-    # nothing the verification below wouldn't catch.
+    # wacli outlives `connected` (~30s bootstrap-sync idle exit) — reap it;
+    # the session store is already durable, verification below is the check.
     if proc.poll() is None:
         proc.terminate()
     try:
