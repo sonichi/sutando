@@ -486,7 +486,10 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertEqual(self.mod.run(cfg, once=True), 0)
 
     def test_main_happy_path_via_cli_args(self):
+        # --bee-sink broker is now EXPLICIT: the default is local, so a test
+        # that means to exercise the broker must say so.
         argv = ["bee_watcher.py", "--once",
+                "--bee-sink", "broker",
                 "--bee-proxy-url", self.base,
                 "--bee-broker-url", self.base,
                 "--bee-broker-token", "tok-cli",
@@ -495,6 +498,33 @@ class TestBeeWatcher(unittest.TestCase):
             rc = self.mod.main()
         self.assertEqual(rc, 0)
         self.assertEqual(set(_Server.auth_seen), {"Bearer tok-cli"})
+
+
+    def test_default_sink_emits_an_ambient_tier_task(self):
+        """The DEFAULT sink must not produce owner-tier tasks.
+
+        Reviewer blocker (bassilkhilo-ag2, sonichi): the broker sink emits no
+        access_tier, the receiving core ignores the wire tier, and its
+        REMOTE_TASK_TIER defaults to owner — so a device-capture lane shipped
+        privileged out of the box. Asserted as a PROPERTY of whatever the
+        default is, not as a string equality, so renaming a sink cannot satisfy
+        it and a future default change has to keep the guarantee."""
+        from ag2_sparrow.sources import bee as bee_src
+        default = bee_src.DEFAULTS["BEE_SINK"]
+        self.assertNotEqual(default, "broker",
+                            "broker drops the wire tier; it must stay opt-in")
+        from ag2_sparrow import _dirs
+        tasksdir = Path(self.tmp.name) / "default-sink-tasks"
+        _dirs.set_dirs(task_dir=str(tasksdir),
+                       state_dir=str(Path(self.tmp.name) / "default-sink-state"))
+        cfg = {**self.cfg, "BEE_SINK": default}
+        rc = self.mod.run(cfg, once=True)
+        self.assertEqual(rc, 0)
+        written = sorted(tasksdir.glob("*.txt"))
+        self.assertTrue(written, f"default sink {default!r} wrote no task file")
+        body = written[0].read_text()
+        self.assertIn("access_tier: ambient", body)
+        self.assertNotIn("access_tier: owner", body)
 
     def test_config_vault_fallback_and_inline_defaults(self):
         import types

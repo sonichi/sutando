@@ -28,7 +28,9 @@ DEFAULTS = {
     "BEE_EVENTS_PATH": "/v1/stream",
     "BEE_EVENT_TYPES": "todo-created,todo-updated",  # conservative; utterances flood
     "BEE_AGENT_ID": "bee-lane",
-    "BEE_SINK": "broker",
+    # local, not broker: the broker path drops the wire tier and the RECEIVING
+    # core applies REMOTE_TASK_TIER, which defaults to owner.
+    "BEE_SINK": "local",
 }
 
 _REPO = Path(__file__).resolve().parents[4]
@@ -111,8 +113,8 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
                    or data.get("id") or event_id)[:120]
     conv = re.sub(r"[^A-Za-z0-9._:@-]", "-", conv_raw) or "unknown"
     stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
-    # No access_tier: the broker path resolves it locally (REMOTE_TASK_TIER),
-    # ignoring the wire — a hosted bee-lane MUST set that to team (no ambient there).
+    # No access_tier: the broker path drops it and the receiving core decides.
+    # That is why broker is opt-in — see DEFAULTS and _require_non_owner_broker.
     return {
         "id": _safe_task_id(f"{etype}-{stable}"),
         "task": f"[Bee {etype}] {text}",
