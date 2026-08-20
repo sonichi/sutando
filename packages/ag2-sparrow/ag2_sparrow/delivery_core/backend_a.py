@@ -53,6 +53,12 @@ class DesignAClaimBackend:
             if not outbox._item_path(self.root, item_id).exists():
                 return None
             if outbox._read_item(self.root, item_id).get("status") in self.TERMINAL:
+                # complete() writes the terminal status BEFORE releasing, so a
+                # crash in that window leaves a claim no other path reclaims.
+                rec = outbox.read_delivery_claim(self.root, item_id)
+                if rec is not None and outbox.may_reclaim_delivery(
+                        self.root, item_id, self.reclaim_ttl_s):
+                    outbox._release_locked(self.root, item_id, rec.drainer_id)
                 return None
             took = (outbox._acquire_locked(self.root, item_id, worker)
                     or outbox._reclaim_locked(self.root, item_id,
