@@ -434,5 +434,78 @@ class TestConcurrentStaleReplacement(unittest.TestCase):
         self.assertIn(_mod.consume_intent(self.ws), _mod._ACTIONS)
 
 
+
+class TestWriterVersusConsumer(unittest.TestCase):
+    """A consumer that reads, then deletes, can delete an intent it never read
+    (qingyun review, #3191): writer replaces the stale file between the two
+    steps, consumer removes the NEW one and discards its stale payload. Nobody
+    acts, the file is gone, and the writer's waiter reads that as consumption."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = self.tmp.name
+        os.makedirs(os.path.join(self.ws, "state"), exist_ok=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seed_stale(self):
+        path = _mod.write_intent(self.ws, "restart", "seed")
+        with open(path) as f:
+            d = json.load(f)
+        d["requested_at"] = time.time() - (_mod.STALE_SEC + 60)
+        with open(path, "w") as f:
+            json.dump(d, f)
+
+    def test_consumer_blocks_while_the_intent_lock_is_held(self):
+        import fcntl
+        self._seed_stale()
+        done = threading.Event()
+
+        def consumer():
+            _mod.consume_intent(self.ws)
+            done.set()
+
+        with open(_mod.intent_path(self.ws) + ".lock", "a") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            threading.Thread(target=consumer, daemon=True).start()
+            self.assertFalse(done.wait(timeout=1.0),
+                             "consume_intent deleted without holding the lock")
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        self.assertTrue(done.wait(timeout=10), "consumer never resumed")
+
+    def test_consumer_never_destroys_an_intent_it_did_not_act_on(self):
+        # The invariant: after any writer/consumer interleaving, either the
+        # consumer acted, or a live intent is still on disk for the next poll.
+        for _ in range(60):
+            self.setUp()
+            self._seed_stale()
+            got = {}
+            start = threading.Barrier(2)
+
+            def writer():
+                start.wait()
+                try:
+                    _mod.write_intent(self.ws, "stop", "w")
+                    got["written"] = True
+                except _mod.IntentPending:
+                    got["written"] = False
+
+            def consumer():
+                start.wait()
+                got["action"] = _mod.consume_intent(self.ws)
+
+            ts = [threading.Thread(target=writer), threading.Thread(target=consumer)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(timeout=10)
+            if got.get("written") and got.get("action") is None:
+                self.assertTrue(
+                    os.path.exists(_mod.intent_path(self.ws)),
+                    "writer succeeded and nobody acted, yet the intent is gone — "
+                    "its waiter would report a consumption that never happened")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

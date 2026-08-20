@@ -75,9 +75,11 @@ class IntentPending(Exception):
 
 
 @contextlib.contextmanager
-def _writer_lock(path: str):
-    """Serialize the whole inspect/remove/claim transition across threads AND
-    processes. flock is released by the kernel if the holder dies."""
+def _intent_lock(path: str):
+    """Serialize every read-modify-delete of the intent, for writers AND
+    consumers, across threads and processes. Any participant that deletes the
+    pathname must hold this, or it can delete an intent it never read.
+    Released by the kernel if the holder dies."""
     with open(path + ".lock", "a") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
@@ -121,7 +123,7 @@ def write_intent(workspace: str | None, action: str, source: str) -> str:
     try:
         with os.fdopen(fd, "w") as f:
             json.dump({"action": action, "requested_at": time.time(), "source": source}, f)
-        with _writer_lock(path):
+        with _intent_lock(path):
             live = peek_intent(workspace)
             if live is not None:
                 raise IntentPending(live["action"], float(live["requested_at"]))
@@ -183,18 +185,22 @@ def consume_intent(workspace: str | None, now: float | None = None) -> str | Non
     file too — a bad or ancient intent must never linger and re-fire.
     """
     path = intent_path(workspace)
-    try:
-        with open(path) as f:
-            raw = f.read()
-    except OSError:
+    # Nothing to delete means nothing to serialize, and the lock's own
+    # directory may not exist yet on a workspace that has never been written.
+    if not os.path.exists(path):
         return None
-    try:
-        os.unlink(path)  # consume FIRST — crash mid-action must not replay
-    except OSError:
-        # FAIL CLOSED (qingyun review, #2408): if the file can't be removed,
-        # the next 5s poll would see it again — acting now would replay the
-        # same restart every poll. No positive consume → no action.
-        return None
+    with _intent_lock(path):
+        try:
+            with open(path) as f:
+                raw = f.read()
+        except OSError:
+            return None
+        try:
+            os.unlink(path)  # consume FIRST — crash mid-action must not replay
+        except OSError:
+            # FAIL CLOSED (qingyun review, #2408): if the file can't be
+            # removed, the next poll would see it again and replay the action.
+            return None
     try:
         d = json.loads(raw)
     except ValueError:
