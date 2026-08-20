@@ -176,6 +176,22 @@ class TestMemorySyncVaultLookup(unittest.TestCase):
                       f"legacy-clone freshness must say so, not just 'last sync': {detail!r}")
         self.assertNotIn("workspace vault", detail)
 
+    def test_never_fetched_legacy_clone_names_the_legacy_clone(self):
+        """The never-fetched pair must not split: its workspace sibling names a subject,
+        so the legacy one carrying no name is the same ambiguity in a quieter form.
+        """
+        _, ws = self._configured()
+        fake_home = self.tmp / "home"
+        (fake_home / ".sutando" / "memory-sync").mkdir(parents=True)
+        with patch.object(Path, "home", staticmethod(lambda: fake_home)):
+            with patch("sys.path", [str(REPO / "src")] + sys.path):
+                result = hc.check_memory_sync()
+        detail = result["detail"]
+        self.assertEqual(result["status"], "ok", f"clone present but unfetched: {result!r}")
+        self.assertIn("never fetched", detail)
+        self.assertIn("legacy", detail.lower(),
+                      f"never-fetched detail must name its repo too: {detail!r}")
+
     def test_fresh_legacy_clone_names_the_legacy_clone(self):
         _, ws = self._configured()
         fake_home = self.tmp / "home"

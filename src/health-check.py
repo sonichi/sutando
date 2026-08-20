@@ -2407,7 +2407,8 @@ def check_memory_sync() -> dict:
                     "detail": f"legacy memory-sync clone last fetched {age_h:.0f}h ago (stale)"}
         return {"name": name, "status": "ok",
                 "detail": f"legacy memory-sync clone last fetched {age_h:.1f}h ago"}
-    return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
+    return {"name": name, "status": "ok",
+            "detail": "legacy memory-sync clone initialized, never fetched"}
 
 
 def _age_phrase(age_s) -> str:
