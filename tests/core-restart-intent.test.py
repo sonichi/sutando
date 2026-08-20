@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -330,6 +331,107 @@ class TestExclusiveIntentEdges(unittest.TestCase):
         finally:
             os.unlink = real_unlink
         self.assertEqual(_mod.consume_intent(self.ws), "restart")
+
+
+
+class TestConcurrentStaleReplacement(unittest.TestCase):
+    """Two writers observing the SAME stale intent (qingyun review, #3191).
+    Unserialized, each could unlink what the other just installed, so a waiter
+    would see its own intent disappear and report a consumption that never
+    happened. Exactly one writer may win, and its file must survive until
+    `consume_intent` takes it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = self.tmp.name
+        os.makedirs(os.path.join(self.ws, "state"), exist_ok=True)
+        path = _mod.write_intent(self.ws, "restart", "seed")
+        with open(path) as f:
+            d = json.load(f)
+        d["requested_at"] = time.time() - (_mod.STALE_SEC + 60)
+        with open(path, "w") as f:
+            json.dump(d, f)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _race(self, n=2):
+        start = threading.Barrier(n)
+        won, refused = [], []
+        lock = threading.Lock()
+
+        def writer(i):
+            start.wait()
+            try:
+                p = _mod.write_intent(self.ws, "stop" if i else "restart", f"w{i}")
+                with lock:
+                    won.append((i, p))
+            except _mod.IntentPending:
+                with lock:
+                    refused.append(i)
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertFalse([t for t in threads if t.is_alive()], "writer deadlocked")
+        return won, refused
+
+    def test_writer_blocks_while_the_transition_lock_is_held(self):
+        # Deterministic proof of serialization: hold the writer lock from
+        # outside and the production function must not proceed past inspect.
+        import fcntl
+        done = threading.Event()
+
+        def writer():
+            try:
+                _mod.write_intent(self.ws, "stop", "blocked")
+            except _mod.IntentPending:
+                pass
+            done.set()
+
+        with open(_mod.intent_path(self.ws) + ".lock", "a") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            threading.Thread(target=writer, daemon=True).start()
+            self.assertFalse(done.wait(timeout=1.0),
+                             "write_intent did not serialize on the lock")
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        self.assertTrue(done.wait(timeout=10), "writer never resumed")
+
+    def test_exactly_one_writer_wins(self):
+        # Repeated: a single race rarely lands in the peek/unlink window, so
+        # one round passes even unserialized and proves nothing.
+        for _ in range(60):
+            self.setUp()
+            won, refused = self._race()
+            self.assertEqual(len(won), 1, f"won={won} refused={refused}")
+            self.assertEqual(len(refused), 1)
+            self.assertTrue(os.path.exists(_mod.intent_path(self.ws)),
+                            "the winner's intent was deleted by the loser")
+
+    def test_winners_intent_survives_until_consumed(self):
+        # The whole point: the loser must not delete the winner's live file,
+        # or the winner's waiter reads that deletion as executor consumption.
+        won, _ = self._race()
+        self.assertTrue(os.path.exists(_mod.intent_path(self.ws)))
+        self.assertIsNotNone(_mod.peek_intent(self.ws))
+        # No executor has run, so a zero-timeout wait must NOT claim success.
+        self.assertFalse(_mod.await_consumption(
+            self.ws, timeout_sec=0, poll_sec=0, sleep=lambda _: None, now=lambda: 0.0))
+        self.assertIsNotNone(_mod.consume_intent(self.ws))
+
+    def test_no_temp_files_survive_the_race(self):
+        self._race()
+        leftovers = [f for f in os.listdir(os.path.join(self.ws, "state"))
+                     if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+    def test_eight_writers_still_yield_one_intent(self):
+        won, refused = self._race(n=8)
+        self.assertEqual(len(won), 1, f"won={won} refused={refused}")
+        self.assertEqual(len(refused), 7)
+        self.assertIn(_mod.consume_intent(self.ws), _mod._ACTIONS)
 
 
 if __name__ == "__main__":

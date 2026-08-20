@@ -23,8 +23,11 @@ restart when the app next boots.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
+import tempfile
 import time
 
 # Canonical workspace resolution (state-paths adoption lint): callers may pass
@@ -71,6 +74,18 @@ class IntentPending(Exception):
         self.requested_at = requested_at
 
 
+@contextlib.contextmanager
+def _writer_lock(path: str):
+    """Serialize the whole inspect/remove/claim transition across threads AND
+    processes. flock is released by the kernel if the holder dies."""
+    with open(path + ".lock", "a") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
 def peek_intent(workspace: str | None, now: float | None = None) -> dict | None:
     """Return the pending intent WITHOUT consuming it, or None if there is
     none / it is unreadable / it is stale. Read-only: never deletes."""
@@ -99,27 +114,30 @@ def write_intent(workspace: str | None, action: str, source: str) -> str:
         raise ValueError(f"unknown intent action: {action!r}")
     path = intent_path(workspace)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
-        json.dump({"action": action, "requested_at": time.time(), "source": source}, f)
+    # mkstemp, not pid: two threads of one bridge would share a pid-named temp,
+    # so one could link the other's bytes or unlink the temp it is about to link.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                               prefix=INTENT_BASENAME + ".", suffix=".tmp")
     try:
-        for attempt in (0, 1):
+        with os.fdopen(fd, "w") as f:
+            json.dump({"action": action, "requested_at": time.time(), "source": source}, f)
+        with _writer_lock(path):
+            live = peek_intent(workspace)
+            if live is not None:
+                raise IntentPending(live["action"], float(live["requested_at"]))
+            # Absent or stale. Both the remove and the claim happen under the
+            # lock, so no writer can delete another's freshly-installed intent.
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise IntentPending(action, time.time())
             try:
                 os.link(tmp, path)
-                return path
-            except FileExistsError:
-                live = peek_intent(workspace)
-                if live is not None:
-                    raise IntentPending(live["action"], float(live["requested_at"]))
-                if attempt:  # a racing writer refilled it — theirs stands
-                    raise IntentPending(action, time.time())
-                # Stale or unreadable: clear it and retry once.
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    raise IntentPending(action, time.time())
+            except FileExistsError:  # refilled outside the lock — theirs stands
+                raise IntentPending(action, time.time())
+            return path
     finally:
         try:
             os.unlink(tmp)
