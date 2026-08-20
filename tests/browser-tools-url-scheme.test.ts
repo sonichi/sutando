@@ -66,6 +66,14 @@ describe('withScheme', () => {
 		assert.equal(withScheme('127.0.0.1:8080'), 'https://127.0.0.1:8080');
 		assert.equal(withScheme('example.com:8080/x'), 'https://example.com:8080/x');
 	});
+
+	// A scheme allowlist can only preserve the schemes it lists. Any other
+	// scheme whose content opens with a digit was rewritten as a web origin.
+	it('preserves an unlisted scheme whose content opens with a digit', () => {
+		assert.equal(withScheme('mailto:123@example.com'), 'mailto:123@example.com');
+		assert.equal(withScheme('bitcoin:1A1zP1eP5Q'), 'bitcoin:1A1zP1eP5Q');
+		assert.equal(withScheme('spotify:404'), 'spotify:404');
+	});
 });
 
 describe('open_url wiring', () => {

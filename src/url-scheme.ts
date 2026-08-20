@@ -6,16 +6,16 @@
  * a scheme, which is why the same address works once it is typed there.
  */
 
-// `host:port` is not a scheme: a real scheme is followed by "//" or by opaque
-// content, never by a port number.
-const HIERARCHICAL = /^[a-z][a-z0-9+.-]*:\/\//i;
-const OPAQUE = /^[a-z][a-z0-9+.-]*:[^/\d]/i;
-// Opaque schemes whose content is digits, which the port rule above would
-// otherwise mangle into `https://tel:911`.
-const DIGIT_OPAQUE = /^(tel|sms|callto|fax|facetime|facetime-audio):/i;
+// `tel:911` and `localhost:3000` are the same shape, so the colon cannot
+// classify them. The host does: an authority is dotted or literally localhost,
+// while a scheme name is neither. Matching host:port positively keeps the
+// scheme rule open-ended, so an unlisted scheme is never rewritten.
+const HOST_PORT = /^(?:localhost|[a-z0-9-]+(?:\.[a-z0-9-]+)+):\d+(?:[/?#]|$)/i;
+const SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 
 /** Return `url` unchanged if it already carries a scheme, else prefix https://. */
 export function withScheme(url: string): string {
-	if (DIGIT_OPAQUE.test(url) || HIERARCHICAL.test(url) || OPAQUE.test(url)) return url;
+	if (HOST_PORT.test(url)) return `https://${url}`;
+	if (SCHEME.test(url)) return url;
 	return `https://${url}`;
 }
