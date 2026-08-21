@@ -2238,6 +2238,16 @@ def _write_task(task: dict) -> str | None:
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
+    # Which instance took delivery. A shared-room message fans out to every
+    # Sutando present and each writes its own task file; the addressee is in the
+    # body (@agent:server) but nothing recorded who received it, so a
+    # non-addressed core could not tell the message was not for it. Same
+    # namespace as the body addressee; header status (KNOWN_HEADER_KEYS) defangs
+    # a forged body copy. Written only when identity is known, and in the header
+    # block above task: — later lines parse as untrusted body.
+    _recv = _reenroll_identity()
+    if _recv:
+        lines.append(f"receiving_instance: {_one_line(_recv)}")
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
         if f == "source":

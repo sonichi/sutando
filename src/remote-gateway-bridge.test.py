@@ -331,6 +331,27 @@ def main() -> int:
           "a local owner-to-team cap does not opt the room into trusted Team")
     check("codex exec" not in content,
           "transport records team authority without selecting a model runtime")
+
+    # receiving_instance: a shared-room message fans out to every Sutando and each
+    # writes its own task file; the writer must record which instance took delivery
+    # (in the header, above task:) so a non-addressed core can tell it was not the
+    # addressee. Written only when identity is known. Monkeypatch the identity
+    # resolver so the check is hermetic (env/channel/state fallbacks vary by host).
+    _orig_reenroll = rtc._reenroll_identity
+    rtc._reenroll_identity = lambda: "@qingyun-air.agent:ag2.space"
+    rtc._write_task({**TASK, "id": "task-RECV", "task": "hi"})
+    recv_body = (rtc.TASKS_DIR / "task-RECV.txt").read_text()
+    check("receiving_instance: @qingyun-air.agent:ag2.space" in recv_body,
+          "receiving_instance header carries the receiving agent mxid")
+    check("receiving_instance:" in recv_body
+          and recv_body.index("receiving_instance:") < recv_body.index("task:"),
+          "receiving_instance sits in the header, above task:")
+    rtc._reenroll_identity = lambda: ""
+    rtc._write_task({**TASK, "id": "task-RECVNONE", "task": "hi"})
+    check("receiving_instance:" not in (rtc.TASKS_DIR / "task-RECVNONE.txt").read_text(),
+          "no receiving_instance header when the agent identity is unknown")
+    rtc._reenroll_identity = _orig_reenroll
+
     rtc._write_task({
         **TASK,
         "id": "task-ROOMTEAM",
