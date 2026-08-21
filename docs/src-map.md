@@ -202,6 +202,7 @@ One entry per agent-facing module.
 
 ## `src/Sutando/`
 
+- **`RestartCoordinator.swift`** — Restart lifecycle state machine for the menu-bar graceful restart.
 - **`SutandoConfig.swift`** — SutandoConfig.swift — Swift twin of src/sutando_config.{py,ts}.
 - **`main.swift`** — Sutando Drop Menu Bar App
 
