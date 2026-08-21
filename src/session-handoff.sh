@@ -22,7 +22,10 @@
 # session after relocating the checkout gets empty REPO-rooted output (commits,
 # health, session-state). Validate before trusting. (-e not -d for .git:
 # submodule/worktree checkouts have a file, not a directory, at .git.)
-_repo_ok() { [ -f "$1/CLAUDE.md" ] && [ -d "$1/skills" ] && [ -e "$1/.git" ]; }
+# App-bundled engine checkouts ship WITHOUT .git, so requiring it rejected every
+# candidate and no handoff ran there at all (#2756). src/ is the alternate
+# checkout signal; CLAUDE.md + skills/ still carry the identification.
+_repo_ok() { [ -f "$1/CLAUDE.md" ] && [ -d "$1/skills" ] && { [ -e "$1/.git" ] || [ -d "$1/src" ]; }; }
 __SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || echo "")"
 if [ -n "${SUTANDO_REPO_DIR:-}" ] && _repo_ok "$SUTANDO_REPO_DIR"; then
     REPO="$SUTANDO_REPO_DIR"
