@@ -98,15 +98,15 @@ def _post(url: str, payload: dict, headers: dict) -> bool:
 
 
 def _rest_client(token: str):
-    """The shared Discord chokepoint (src/discord_rest_client.py). Resolved and
+    """The shared Discord chokepoint + injected post-gate. Resolved and
     imported lazily so non-Discord sources never touch the Discord stack."""
     repo = next(p for p in Path(__file__).resolve().parents
                 if (p / "src" / "discord_rest_client.py").is_file())
     src = str(repo / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
-    from discord_rest_client import DiscordRestClient
-    return DiscordRestClient(token, timeout=10)
+    from discord_post_gate import make_client
+    return make_client(token, timeout=10)
 
 
 def _discord_mentions(message: str):

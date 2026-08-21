@@ -5194,10 +5194,10 @@ def _proactive_provider():
     client (and its 30s upload timeout pin)."""
     global _PROACTIVE_PROVIDER
     if _PROACTIVE_PROVIDER is None:
-        from discord_rest_client import DiscordRestClient
+        from discord_post_gate import make_client
         from discord_delivery_provider import DiscordDeliveryProvider
         _PROACTIVE_PROVIDER = DiscordDeliveryProvider(
-            DiscordRestClient(TOKEN, timeout=30))
+            make_client(TOKEN, timeout=30))
     return _PROACTIVE_PROVIDER
 
 
@@ -5870,9 +5870,9 @@ def _parse_send_argv(argv):
 def _rest_client(timeout: int = 10):
     """The shared Discord REST chokepoint for the CLI send/edit paths. A test
     binds a scripted transport through here so the PRODUCTION client stays in
-    the loop; hand-rolled urlopen in this file is the drift this seam removed."""
-    from discord_rest_client import DiscordRestClient
-    return DiscordRestClient(TOKEN, timeout=timeout)
+    the loop; make_client resolves the injected post-gate for this process."""
+    from discord_post_gate import make_client
+    return make_client(TOKEN, timeout=timeout)
 
 
 def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):

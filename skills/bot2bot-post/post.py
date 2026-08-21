@@ -265,13 +265,14 @@ _repo = next(p for p in pathlib.Path(__file__).resolve().parents
              if (p / "src" / "body_file.py").is_file())
 sys.path.insert(0, str(_repo / "src"))
 from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402
-from discord_rest_client import DiscordRestClient  # noqa: E402  — the one Discord POST chokepoint
+from discord_post_gate import make_client  # noqa: E402  — the one Discord POST chokepoint
+from discord_rest_client import DiscordRestClient  # noqa: E402  — for test doubles
 from outbox import DeliveryOutcome  # noqa: E402
 
 
 def _client(token: str) -> DiscordRestClient:
     """Seam for tests; timeout preserves this script's pre-client 10s cap."""
-    return DiscordRestClient(token, timeout=10)
+    return make_client(token, timeout=10)
 
 
 def main():
