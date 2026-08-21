@@ -346,16 +346,27 @@ _EVENT_CHANNEL = None
 # aliases for one release (remove next), with a one-line migration nudge, so the
 # bridge keeps connecting under any launcher. New onboards use REMOTE_TASK_*.
 _warned_legacy = set()
+
+
+def _unquote_env(v):
+    """Whitespace and surrounding quotes off a credential value.
+
+    The ONE definition every reader uses, so the env tier cannot disagree with
+    the file tiers about a quoted `.env` line.
+    """
+    return v.strip().strip("'\"") if v else v
+
+
 def _env_compat(new, old):
     v = os.environ.get(new)
     if v:
-        return v
+        return _unquote_env(v)
     v = os.environ.get(old)
     if v and old not in _warned_legacy:
         _warned_legacy.add(old)
         print(f"[remote-gateway-bridge] {old} is deprecated — rename to {new} in your .env",
               file=sys.stderr, flush=True)
-    return v
+    return _unquote_env(v)
 
 # One-token onboarding: REMOTE_TASK_TOKEN alone is enough. The onboarding
 # string may be the combined "https://<gateway>|<secret>" form (the URL travels
@@ -427,7 +438,7 @@ def _channel_env_candidates():
             if not ln or ln.startswith("#") or "=" not in ln:
                 continue
             key, _, val = ln.partition("=")
-            vals[key.strip()] = val.strip().strip('"').strip("'")
+            vals[key.strip()] = _unquote_env(val)
         out.append((path, vals))
     return out
 
@@ -1220,7 +1231,7 @@ def _auth_probe() -> bool:
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
-_TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
+_TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
                 # them (absent for other sources); each newline-stripped by
@@ -1617,7 +1628,7 @@ def _read_token_file(path: str) -> str:
             line = line[len("export "):].lstrip()
         for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
             if line.startswith(key + "="):
-                found[key] = line[len(key) + 1:].strip().strip("'\"")
+                found[key] = _unquote_env(line[len(key) + 1:])
     for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
         if found.get(key):
             return found[key]
@@ -1649,7 +1660,7 @@ def _read_token_file_url(path: str) -> str:
             line = line[len("export "):].lstrip()
         for key in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
             if line.startswith(key + "="):
-                found[key] = line[len(key) + 1:].strip().strip("'\"")
+                found[key] = _unquote_env(line[len(key) + 1:])
     return found.get("REMOTE_TASK_URL") or found.get("AG2_REMOTE_URL") or ""
 
 
@@ -2227,9 +2238,15 @@ def _write_task(task: dict) -> str | None:
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
+    # Which instance took delivery (shared-room fan-out: each Sutando writes its own
+    # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
+    _recv = _reenroll_identity()
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
-        if f == "source":
+        if f == "session_scope":
+            if task.get(f) == "room":
+                lines.append("session_scope: room")
+        elif f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
@@ -2314,6 +2331,9 @@ def _write_task(task: dict) -> str | None:
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
+            # After id: so the canonical id-first / HMAC-stamp prefix stays line 0.
+            if f == "id" and _recv:
+                lines.append(f"receiving_instance: {_one_line(_recv)}")
     # sender_tier is resolved once, ahead of the field loop above (needed there
     # for the "task" field's vault interception), and reused here unchanged.
     # All preceding fields are newline-stripped, so none can forge a tier header.

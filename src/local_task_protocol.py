@@ -132,7 +132,7 @@ ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
 #   can survive undefanged in user-supplied content.
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
-    "id", "timestamp", "task", "source", "access_tier", "user_id",
+    "id", "timestamp", "session_scope", "task", "source", "access_tier", "user_id",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
@@ -141,6 +141,9 @@ KNOWN_HEADER_KEYS = (
     # them, and the guard defangs forged body copies of the same names.
     "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
+    # Which instance took delivery. Same namespace as the addressee in the body, so a
+    # non-addressed core can tell; header status defangs a forged body copy.
+    "receiving_instance",
     "from", "call_sid", "hint", "instructions", "transcript",
     # Durable schedule identity (#2723): the codex scheduler stamps which
     # schedule and which slot produced the task.

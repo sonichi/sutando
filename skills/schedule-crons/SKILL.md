@@ -82,8 +82,24 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    m = importlib.util.module_from_spec(s)
    try: s.loader.exec_module(m)
    except SystemExit: pass
-   sys.exit(0 if m._watcher_trees() else 1)" && echo skip || echo start
+   ps = m._ps_snapshot()
+   sys.exit(2 if ps is None else (0 if m._watcher_trees(ps) else 1))"
+   case $? in
+     0) echo skip;;
+     1) echo start;;
+     *) echo 'UNKNOWN: ps did not run — do NOT start; a watcher may be live';;
+   esac
    ```
+
+   **Three states, not two: an unavailable `ps` is UNKNOWN, not "no watcher".**
+   `_watcher_trees()` catches every `ps` timeout/error and returns `{}`, which is
+   byte-identical to a clean empty scan — so the earlier `0 if m._watcher_trees()
+   else 1` form printed `start` when enumeration merely failed. Starting there is
+   exactly the duplicate this step exists to prevent, and it is the same
+   can't-distinguish defect the paragraph below names for the sentinel, pointing
+   the other way. `_ps_snapshot()` separates them: `None` means ps did not run,
+   `""` means it ran and found nothing. On UNKNOWN, do nothing — a missing
+   watcher costs delayed tasks, a duplicate one processes every task twice.
 
    **Do not gate on the sentinel alone.** `watch-tasks-stream.sh` writes it once at startup, so an absent file means "no watcher" OR "a live watcher whose file was removed" — indistinguishable. Measured 2026-08-07 on a live core: `_watcher_trees()` returned `{'12631': ['12631']}` (functioning — it emitted `TASK_FILE:` for a probe) with the sentinel absent from disk. Gating on the sentinel there would have started a **second** watcher, and both then emit every task, so every task is processed twice. `_watcher_trees()` is also what makes the `pgrep` warning below unnecessary to re-solve: it drops its own pid and matches on argv shape. Don't use `pgrep -f watch-tasks-stream`: pgrep's `-f` argument matches the literal string `watch-tasks-stream` against full argv, which matches the bash wrapper invoking this very pgrep call (the wrapper's argv contains the search string), producing a transient self-match that returns a PID for a subshell that's already gone by the next `ps`. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 0 — single anti-pattern, single fix. Documented as F5 in `workspace/build_log.md` 2026-06-03T00:02Z validation pass; replayed on the very next session bootstrap (07:25Z) — Sutando.app's checkWatcher Timer caught the gap and sent a `watcher` keystroke, but two owner DMs were silently held in `tasks/` for ~5 min first. Don't kick off `bash src/watch-tasks.sh` (retired 2026-05-14).
 5.5. **Ensure the core heartbeat is running (sonichi/sutando#2198 prerequisite).** `src/core_heartbeat.py` (the writer of `state/cores/<hostname>.alive`) is started by `src/startup.sh` — but the CLI boot path lands here without ever running startup.sh (observed 2026-07-20: desktop-supervised core running for 20+ min with `state/cores/` empty, so the dashboard/health-check read the core as dead and the stop-path had no pid/socket target). Check freshness of `"$WORKSPACE/state/cores/$(bash scripts/sutando-config.sh host-label).alive"` — if the file is missing or its mtime is older than 90 seconds (the documented staleness threshold), start the heartbeat: `nohup python3 src/core_heartbeat.py > /tmp/core-heartbeat.log 2>&1 &`. Freshness-of-.alive is the running-check by design — do NOT use `pgrep -f core_heartbeat` (same wrapper-argv self-match anti-pattern as step 5's watcher note), and a fresh mtime is exactly the signal every other reader of the file trusts. Idempotent on mid-session re-runs: a live heartbeat keeps the mtime younger than 90s, so the start is skipped.

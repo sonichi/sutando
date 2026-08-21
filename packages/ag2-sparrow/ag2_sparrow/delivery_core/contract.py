@@ -140,6 +140,7 @@ class DrainReport:
 class RecoverReport:
     recovered: list = field(default_factory=list)   # item_ids re-claimable
     quarantined: list = field(default_factory=list)
+    retired: list = field(default_factory=list)     # dead claims on TERMINAL items
 
 
 @runtime_checkable
