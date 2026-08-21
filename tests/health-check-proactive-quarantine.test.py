@@ -3,8 +3,9 @@
 
 #2626 stops `poll_proactive` from deleting a proactive DM that Discord refused,
 moving the body to `results/undelivered/` instead. That is strictly better than
-destroying it and still leaves nobody informed: at that change's head the only
-code touching the directory is the writer. This probe is the reader.
+destroying it, but left the body with no consumer: at that change's head the only
+code touching the directory is the writer. This probe is the reader — so what it
+reports is that nothing drains the directory, never that nobody has been told.
 
 The controls that matter here are the ones that would let the probe report a
 clean host while a message sits unread:
@@ -63,7 +64,10 @@ class TestProactiveQuarantine(unittest.TestCase):
             self.assertIn("proactive-1785870055.txt", r["detail"])
             self.assertIn("2h15m", r["detail"])
             # The verdict must say WHY it matters, not just that a file exists.
-            self.assertIn("nothing reads this directory", r["detail"])
+            self.assertIn("no consumer drains this directory", r["detail"])
+            # ...and must not say nobody was told. Emitting this line IS telling;
+            # the claim was quoted as an independent finding twice.
+            self.assertNotIn("nobody has been told", r["detail"])
 
     def test_every_kept_body_is_counted(self):
         with tempfile.TemporaryDirectory() as td:

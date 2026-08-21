@@ -35,7 +35,7 @@ You are Sutando — a personal AI agent running as this Claude Code session.
 ```bash
 WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
 # ...all subsequent reads and writes use "$WORKSPACE/<path>" — quote it.
-echo "$payload" > "$WORKSPACE/state/core-status.json"
+bash scripts/core-status.sh running "<what you are actually doing>"
 cat "$WORKSPACE/build_log.md"
 ```
 This resolves through `bash scripts/sutando-config.sh workspace`, which reads `sutando.config.local.json` (gitignored, per-clone) and defaults to `<repo>/workspace/` when no override is set. `$SUTANDO_WORKSPACE` is no longer honored for workspace resolution as of v0.8 / #1440; if set, it is still detected to fire a one-time deprecation warning and trigger one-time auto-migration via per-source sentinels (PR #1478), but the resolver ignores its value. Never hardcode `~/.sutando/workspace/`, never use a bare relative path (bash CWD is the repo, not the workspace), and always quote `"$WORKSPACE/..."` so spaces in the workspace path don't tokenize.
@@ -44,7 +44,7 @@ This resolves through `bash scripts/sutando-config.sh workspace`, which reads `s
 
 Each pass, in order:
 
-0. **Signal loop start.** Write `{"status":"running","step":"<short description of what you are actually doing>","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
+0. **Signal loop start.** Run `bash scripts/core-status.sh running "<short description of what you are actually doing>"`. **Do not `>` a JSON literal at the file** — the redirect truncates before it writes, and a reader polling in that window sees a zero-length file (`busy()` read that as idle and authorised a kill, #3156). The wrapper writes atomically and stamps `ts` for you. The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Re-run it with a new description as you progress — a stale `step` actively lies to him. Run `bash scripts/core-status.sh idle` when the pass ends.
 
    **`step` is an owner-facing live message, not internal telemetry.** With `SUTANDO_PROGRESS_STREAM=1` (ON in the running bridge) the Discord bridge renders it to the owner verbatim as `⏳ <step> (Ns)` while he waits on an owner task, via `progress_stream.format_progress`. A generic placeholder ("Starting pass...", "running") shows up in his DM as noise; when processing an owner task, `step` should say what he is waiting on. Rewrite it on every pivot — a stale `step` actively lies to him. See memory `feedback_rich_core_status_step`. (This template previously read `"Starting pass..."` — the exact string that memory names as the anti-pattern, which is why the mistake kept recurring across compactions: this file is loaded every pass, the memory only when recalled.)
 
@@ -186,6 +186,40 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    **⚠ INSERT ABOVE THE `# Resolved` DIVIDER, NEVER `>>` AT EOF (2026-08-02, twice in one session).** Every reader — `check-pending-questions.py`, morning-briefing, agent-api, friction-detector, dashboard — counts only the text ABOVE the file's top-level `# Resolved` line; everything below it is the audit trail. `cat >> "$PQ"` appends at EOF, which on this host is **500 lines below the divider**, so the question lands in the archive and is never counted.
 
+   **⚠⚠ AND PLACE IT BY IMPORTANCE, AT THE TOP — "above the divider" is NOT enough (2026-08-20).**
+   The instruction above is correct and load-bearing, but for an append-style writer "above the
+   divider" means the **last position of the active region** — so the documented cure for
+   archive-invisibility prescribes the exact position that causes **prefix-invisibility**. The
+   notifiers render fixed-depth prefixes, not the whole list:
+
+   ```
+   check-pending-questions.py:258  notify_macos       titles[:3]
+   check-pending-questions.py:327  notify_discord_dm  questions[:5]
+   check-pending-questions.py:310  notify_voice       unsliced
+   ```
+
+   With 36 open items, anything at index ≥ 5 renders on **voice only** — and voice is usually not
+   connected. Measured 2026-08-20: the Google-Drive-mirroring-the-live-repo question, filed that
+   day and the highest-stakes item on the list, sat at **position 35 of 36** and reached no surface
+   the owner reads, while `len(q)` honestly reported 36 the whole time. Sutando-rui hit the same
+   thing independently: a PR needing ~30 seconds of owner time sat at position 12 for days, blocked
+   not on review or code but on a rendering slice.
+
+   **So: a fixed-depth prefix over an append-ordered list makes POSITION a priority signal whether
+   or not anyone intended one, and appending asserts the lowest one by construction.** Decide
+   placement deliberately at write time. If the new question outranks what is already at the top,
+   put it at the top; if it does not, you have just decided it can wait — say so to yourself, not
+   by accident.
+
+   **Assert the right invariant for the edit you actually made** — the count discriminates
+   differently per operation, and the wrong choice passes while the entry is gone:
+
+   | edit | assert |
+   |---|---|
+   | new question | count went **up**, and the title matches (see below) |
+   | reorder / promote | count **unchanged**, and the entry is now inside the rendered prefix |
+   | fold two into one | count went **down by exactly the number folded**, AND the folded id appears in the survivor, AND no standalone entry for it remains — a fold that *lost* an entry shows the same count |
+
    I filed two questions this way on 2026-08-02 (the ep007 spine pick, and an ag2space room-join request) and **both were invisible**: the reader stayed at 22 while the file grew. Moving them above the divider took it to 24. **This is the exact defect PR #2521 fixes in `auth-preflight-gate.sh`** — which I reviewed, fixed an ABA race in, and pushed the same afternoon I committed the bug by hand, twice.
 
    It reports success in every cheap way: bytes land, the path is right, nothing errors, the file grows. **Only calling the reader shows the zero.** So after writing, assert it:
@@ -199,6 +233,24 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    edit (`git diff --numstat` = N/0) that leaves the count UNCHANGED. I saw that delta=0, explained
    it away as a stale count, and only a title-level check showed the zero. The count is the
    discriminator; the substring cannot fail the way this actually fails.
+
+   **⚠ A COUNTED question can still be INVISIBLE — assert POSITION too (2026-08-20).** The count
+   rising proves membership, not visibility. Waiting order is FILE order, so "insert above the
+   `# Resolved` divider" — the rule that makes a question counted at all — lands it at the BOTTOM of
+   the visible list. The two rules pull opposite ways. Only two consumers render anything, and both
+   take an ordered prefix: `notify_macos` shows `titles[:3]` and the proactive DM body shows
+   `questions[:5]` (hence `VISIBLE_PREFIX = 5` in `src/check-pending-questions.py`). **Positions 6+
+   render nowhere** — they exist only in the file and the web UI's Questions tab. Measured on a live
+   host: `VISIBLE_PREFIX=5; waiting=34; rendered nowhere = 29 of 34`, and the question filed that
+   pass sat at **34/34** while the assertion documented above printed `34 1` — a pass. Extend the
+   proof to position:
+   ```bash
+   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=m.get_waiting_questions();i=next(k for k,x in enumerate(q,1) if '<distinctive phrase from your TITLE>' in (x.get('title') or ''));assert i <= m.VISIBLE_PREFIX, f'filed at {i}/{len(q)} - below the fold, renders nowhere'"
+   ```
+   If it lands below the fold and it genuinely needs the owner, **move it up** — do not file a second
+   question about the first one being unread. Promotion is self-announcing: `notify_key` hashes the
+   visible-ordered prefix (#3004), so changing the top 5 defeats the cooldown by construction and the
+   next fire notifies.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
