@@ -699,6 +699,11 @@ if _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$_ws/state/session-starts.log" 2>/dev/null || true
+  # Publish the ACTIVE runtime here, not at switch time: reaching this line
+  # means this launcher is the one coming up (codex does the same at its own).
+  printf '{"runtime":"claude","session":"%s","started_at":%s}\n' \
+    "${SESSION:-sutando-core}" "$(date +%s)" \
+    > "$_ws/state/core-runtime.json" 2>/dev/null || true
 fi
 
 # Fall back to a bare `exec claude` if tmux is still missing.

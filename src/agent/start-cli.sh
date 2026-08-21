@@ -28,14 +28,12 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
 fi
 
-# --runtime <claude|codex>: switch the configured core runtime, then restart
-# into it (the desktop app's "Core Runtime" picker calls this). We persist the
-# choice to sutando.config.local.json so it survives every launch path, and we
-# refresh the core-runtime.json marker for the TARGET runtime. That marker is
-# otherwise written only by the Codex launcher, so a Codex->Claude switch would
-# leave it claiming "codex" and mislead health-check's runtime detection until
-# the next Codex boot. Parsed here (before runtime resolution) and stripped from
-# "$@" so the value never leaks to the runtime-specific launcher.
+# --runtime <claude|codex>: persist the desired core runtime, then restart into
+# it (the desktop app's "Core Runtime" picker calls this). Only the config is
+# written here; each launcher publishes core-runtime.json when it comes up, so a
+# refused or failed restart leaves the previous active marker truthful. Parsed
+# before runtime resolution and stripped from "$@" so the value never leaks to
+# the runtime-specific launcher.
 requested_runtime=""
 _passthru=()
 while [ "$#" -gt 0 ]; do
@@ -101,14 +99,8 @@ finally:
     except OSError:
         pass
 PY
-  # Refresh the marker for the target so runtime-detection is correct at once
-  # (the running launcher will overwrite it on boot; this fixes the interim +
-  # the Codex->Claude case the Claude launcher never writes).
-  _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
-  mkdir -p "$_ws/state"
-  printf '{"runtime":"%s","session":"%s","started_at":%s,"source":"runtime-switch"}\n' \
-    "$requested_runtime" "${SUTANDO_TMUX_SESSION:-sutando-core}" "$(date +%s)" \
-    > "$_ws/state/core-runtime.json"
+  # config is DESIRED state; the active marker belongs to whichever launcher
+  # actually comes up, so a refused or failed restart cannot forge it.
   # A runtime switch must restart into the new CLI, even if the caller didn't
   # pass --restart.
   case " $* " in
