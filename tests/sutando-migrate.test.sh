@@ -50,13 +50,8 @@ echo '{"new":"snapshot"}' > "$A/state/contextual-chips.json"
 touch -t 202606010600 "$C/state/contextual-chips.json"
 touch -t 202606012130 "$A/state/contextual-chips.json"
 
-# --- Fixture: union-json-array — the reported loss case ---
-# A fresh install writes an EMPTY allow-set and is NEWER; an older source holds
-# the real grants. Under newest-mtime the grants vanish; under structural they
-# survive only in a sidecar the Slack reader never opens. Either way the owner
-# is locked out, so the union must produce a populated active file.
-# `schemaVersion` is the unrelated-field control: it must survive from the newer
-# file rather than being dropped by the merge.
+# Fixture union-json-array: a newer EMPTY allow-set must not erase an older
+# populated one; schemaVersion is the control that must survive from the newer file.
 cat > "$C/state/slack-allowed-recipients.json" <<'JSON'
 {"allowFrom": ["U_OLD_ONE", "U_SHARED"], "schemaVersion": 1}
 JSON
@@ -295,9 +290,8 @@ else
     echo "  OK: Source A repo scripts/ excluded from migration"
 fi
 
-# 6g. union-json-array: newer-empty + older-populated must yield a POPULATED
-# active file. This is the whole reported bug — under newest-mtime or structural
-# this assertion fails, because neither merges within a file.
+# 6g. newer-empty + older-populated must yield a POPULATED active file — the
+# reported bug; newest-mtime and structural both fail it, neither merges in-file.
 UJ="$DEST/state/slack-allowed-recipients.json"
 if [ ! -f "$UJ" ]; then
     echo "  FAIL: $UJ missing"; fail=1
@@ -323,9 +317,8 @@ PY
     fi
 fi
 
-# 6i. Three-source accumulation: the scalar winner must be the NEWEST source,
-# not whichever ran last. Two-source cases cannot expose this — the union rewrites
-# dest and resets its mtime, so a genuinely newest third source looked older.
+# 6i. Three-source accumulation: the scalar winner must be the NEWEST source, not
+# whichever ran last — the union rewrites dest and resets its mtime, hiding this.
 U3="$TMP/union3"
 mkdir -p "$U3"
 printf '{"schemaVersion":1,"allowFrom":["U_C"]}\n' > "$U3/C.json"
@@ -368,9 +361,8 @@ else
     echo "  FAIL: three-source union — $u3_check"; fail=1
 fi
 
-# 6h. Union idempotency against the REAL script, not a reimplementation of the
-# rule: migrate the same populated source into a dest that already holds the
-# unioned result. A second pass must not duplicate entries or drop fields.
+# 6h. Idempotency against the REAL script, not a reimplementation: a second pass
+# over an already-unioned dest must not duplicate entries or drop fields.
 IDEM_DEST="$TMP/dest-idem"
 mkdir -p "$IDEM_DEST/state"
 cp -p "$UJ" "$IDEM_DEST/state/slack-allowed-recipients.json"
