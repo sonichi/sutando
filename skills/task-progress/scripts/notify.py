@@ -26,7 +26,6 @@ import re
 import sys
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 
 MAX_PROGRESS_CHARS = 280
@@ -98,22 +97,16 @@ def _post(url: str, payload: dict, headers: dict) -> bool:
         return False
 
 
-def _discord_request(url: str, token: str, payload: Optional[dict] = None):
-    """Make a Discord JSON request and return its response body, or None."""
-    try:
-        data = json.dumps(payload).encode() if payload is not None else None
-        headers = {
-            "Authorization": f"Bot {token}",
-            "User-Agent": "DiscordBot (https://github.com/sonichi/sutando, 1.0)",
-        }
-        if data is not None:
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        print(f"[task-progress] Discord request failed: {e}", file=sys.stderr)
-        return None
+def _rest_client(token: str):
+    """The shared Discord chokepoint (src/discord_rest_client.py). Resolved and
+    imported lazily so non-Discord sources never touch the Discord stack."""
+    repo = next(p for p in Path(__file__).resolve().parents
+                if (p / "src" / "discord_rest_client.py").is_file())
+    src = str(repo / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from discord_rest_client import DiscordRestClient
+    return DiscordRestClient(token, timeout=10)
 
 
 def _discord_mentions(message: str):
@@ -155,11 +148,16 @@ def send_discord(channel_id: str, message: str, validate_mentions: bool = True) 
         )
         return False
 
+    client = _rest_client(token)
+    from outbox import DeliveryOutcome  # importable once _rest_client set the path
+
     if validate_mentions:
         for user_id in user_ids:
-            resolved = _discord_request(
-                f"https://discord.com/api/v10/users/{user_id}", token
-            )
+            try:
+                resolved = client.get_user(user_id)
+            except Exception as e:
+                print(f"[task-progress] Discord request failed: {e}", file=sys.stderr)
+                resolved = None
             if not isinstance(resolved, dict) or str(resolved.get("id")) != user_id:
                 print(
                     f"[task-progress] Discord mention <@{user_id}> did not resolve; "
@@ -176,12 +174,13 @@ def send_discord(channel_id: str, message: str, validate_mentions: bool = True) 
             "replied_user": False,
         },
     }
-    posted = _discord_request(
-        f"https://discord.com/api/v10/channels/{channel_id}/messages",
-        token,
-        payload,
-    )
-    if not isinstance(posted, dict):
+    receipt, _status, posted = client.send_message_with_response(channel_id, payload)
+    if receipt.outcome is not DeliveryOutcome.CONFIRMED or not isinstance(posted, dict):
+        print(
+            f"[task-progress] Discord send not confirmed "
+            f"({receipt.outcome.value}: {receipt.detail})",
+            file=sys.stderr,
+        )
         return False
 
     if validate_mentions:

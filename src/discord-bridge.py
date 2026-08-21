@@ -5867,25 +5867,28 @@ def _parse_send_argv(argv):
     return reply_to, argv
 
 
+def _rest_client(timeout: int = 10):
+    """The shared Discord REST chokepoint for the CLI send/edit paths. A test
+    binds a scripted transport through here so the PRODUCTION client stays in
+    the loop; hand-rolled urlopen in this file is the drift this seam removed."""
+    from discord_rest_client import DiscordRestClient
+    return DiscordRestClient(TOKEN, timeout=timeout)
+
+
 def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
-    """Send a message via Discord REST API (no gateway connection).
+    """Send a message via the shared DiscordRestClient (no gateway connection).
 
     Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
     limit render correctly without allowing one oversized payload to monopolize
     the bridge. Without chunking the API returns 400; without the delivery budget,
     a malformed result can produce hundreds of sequential POSTs.
     """
-    import urllib.request
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    headers = {
-        "Authorization": f"Bot {TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": "DiscordBot (sutando, 1.0)",
-    }
+    from outbox import DeliveryOutcome
     chunks = list(_chunk_for_discord(message))
     if not chunks:
         # Empty message — nothing to send. Treat as no-op rather than error.
         return
+    client = _rest_client()
     for i, chunk in enumerate(chunks, 1):
         payload = {"content": chunk}
         # First chunk only: on every chunk it renders N reply-headers for one
@@ -5893,26 +5896,20 @@ def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
         if reply_to and i == 1:
             payload["message_reference"] = {"message_id": str(reply_to),
                                             "fail_if_not_exists": False}
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=data, headers=headers)
-        # Transport only: once urlopen returns, the message is committed, so
-        # read() belongs below. Not a `with` — doubles are plain objects.
-        try:
-            resp = urllib.request.urlopen(req, timeout=10)
-        except Exception as e:
-            print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
+        receipt, status, _body = client.send_message_with_response(channel_id, payload)
+        committed = status is not None and 200 <= status < 300
+        if receipt.outcome is not DeliveryOutcome.CONFIRMED and not committed:
+            # No 2xx reached us: refused, or genuinely unknown. Exiting nonzero
+            # matches the pre-client behavior for these transport failures.
+            print(f"Send failed (chunk {i}/{len(chunks)}): {receipt.detail}")
             sys.exit(1)
         # Best-effort, and emitted per chunk: buffering until every chunk lands
         # leaves an earlier delivered chunk unaddressable when a later one fails.
-        try:
-            body = json.loads(resp.read().decode())
-            mid = body.get("id") if isinstance(body, dict) else None
-            mid = str(mid) if isinstance(mid, (str, int)) and str(mid) else None
-        except Exception:
-            mid = None
-        if mid:
-            print(f"message_id {mid}")
+        if receipt.receipt_id:
+            print(f"message_id {receipt.receipt_id}")
         else:
+            # 2xx without a readable id: COMMITTED, so this must not report a
+            # failure — that invites the retry that duplicates the message.
             print(f"message_id unavailable (chunk {i}/{len(chunks)}) — sent, not addressable")
     suffix = "..." if len(message) > 80 else ""
     chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
@@ -5925,7 +5922,6 @@ def _edit_via_rest(channel_id: str, message_id: str, message: str):
     Refuses a body the chunker would split: an edit addresses ONE message, so a
     multi-chunk body cannot be applied without silently dropping the remainder.
     """
-    import urllib.request
     if not message.strip():
         print("ERROR: refusing to edit to an empty body")
         sys.exit(1)
@@ -5934,17 +5930,12 @@ def _edit_via_rest(channel_id: str, message_id: str, message: str):
         print(f"ERROR: body is {len(message)} chars — too long for one message. "
               "An edit cannot chunk; shorten it or send a new message.")
         sys.exit(1)
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
-    data = json.dumps({"content": message}).encode()
-    req = urllib.request.Request(url, data=data, method="PATCH", headers={
-        "Authorization": f"Bot {TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": "DiscordBot (sutando, 1.0)",
-    })
-    try:
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        print(f"Edit failed: {e}")
+    from outbox import DeliveryOutcome
+    receipt, status, _body = _rest_client().edit_message_with_response(
+        channel_id, message_id, {"content": message})
+    committed = status is not None and 200 <= status < 300
+    if receipt.outcome is not DeliveryOutcome.CONFIRMED and not committed:
+        print(f"Edit failed: {receipt.detail}")
         sys.exit(1)
     suffix = "..." if len(message) > 80 else ""
     print(f"Edited {channel_id}/{message_id}: {message[:80]}{suffix}")
