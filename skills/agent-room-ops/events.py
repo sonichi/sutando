@@ -51,6 +51,8 @@ class StreamDisconnected(ConnectionError):
     decide for themselves."""
 
 
+# emit's fields live HERE, not in a private builder: all seven `_op_call`
+# failure paths return through this one, so a split would KeyError on denial.
 def _result(ok, *, room_id=None, subscription_id=None, subscriptions=None, reason=None,
             event_id=None, state=None):
     return {"ok": bool(ok), "room_id": room_id, "subscription_id": subscription_id,
