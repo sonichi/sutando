@@ -200,6 +200,31 @@ check("policy saw every channel id",
 check("policy saw dict payloads with content",
       all(isinstance(s["payload"], dict) and "content" in s["payload"] for s in seen))
 
+# CR 2026-08-21 regressions: unreadable config fails CLOSED; relative
+# config paths anchor to the repo root, not the process cwd.
+import sutando_config as _sc
+_orig_load = _sc.load_config
+def _boom(repo_root=None):
+    raise ValueError("malformed sutando.config.json")
+_sc.load_config = _boom
+os.environ.pop("SUTANDO_DISCORD_POST_GATE", None)
+_v = dpg.resolve_validator()
+check("unreadable config yields a refuser, not None", _v is not None)
+check("refuser names the closed gate",
+      _v is not None and "refusing unvalidated sends" in str(_v("1", {"content": "x"})))
+_root = Path(tempfile.mkdtemp(prefix="post-gate-root-"))
+(_root / "policy").mkdir()
+(_root / "policy" / "gate_ok.py").write_text("def validate(channel_id, payload):\n    return None\n")
+_sc.load_config = lambda repo_root=None: {"bridges": {"discord_post_gate": "policy/gate_ok.py"}}
+_prev_cwd = os.getcwd(); os.chdir("/")
+try:
+    _v2 = dpg.resolve_validator(repo_root=_root)
+finally:
+    os.chdir(_prev_cwd)
+check("relative config path anchors to repo_root (cwd wrong on purpose)",
+      callable(_v2) and _v2("1", {"content": "x"}) is None)
+_sc.load_config = _orig_load
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURE(S)")

@@ -32,14 +32,11 @@ def _configured_path(repo_root=None) -> str:
     env = os.environ.get("SUTANDO_DISCORD_POST_GATE", "").strip()
     if env:
         return env
-    try:
-        from sutando_config import load_config
-        bridges = load_config(repo_root).get("bridges") or {}
-        return str(bridges.get("discord_post_gate") or "").strip()
-    except Exception:
-        # A config layer that cannot load must not decide gating either way;
-        # treat as unconfigured (workspace resolution already warns loudly).
-        return ""
+    # May raise: a config layer that cannot load leaves gating state UNKNOWN,
+    # and the caller must fail closed rather than treat it as unconfigured.
+    from sutando_config import load_config
+    bridges = load_config(repo_root).get("bridges") or {}
+    return str(bridges.get("discord_post_gate") or "").strip()
 
 
 def _fail_closed(reason: str):
@@ -51,10 +48,21 @@ def _fail_closed(reason: str):
 def resolve_validator(repo_root=None):
     """The configured validator callable, None (unconfigured), or a
     fail-closed refuser when a configured policy cannot be loaded."""
-    path = _configured_path(repo_root)
+    try:
+        path = _configured_path(repo_root)
+    except Exception as e:  # noqa: BLE001 — unreadable config fails CLOSED
+        return _fail_closed(
+            f"post-gate config unreadable ({type(e).__name__}: {e}); "
+            "refusing unvalidated sends")
     if not path:
         return None
     file = Path(os.path.expanduser(path))
+    if not file.is_absolute():
+        # Anchor to the config's own repo, never the process cwd.
+        from sutando_config import _find_repo_root
+        root = Path(repo_root) if repo_root else _find_repo_root()
+        if root:
+            file = Path(root) / file
     try:
         spec = importlib.util.spec_from_file_location(
             f"sutando_post_gate_{uuid.uuid4().hex}", file)
