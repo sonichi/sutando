@@ -2238,16 +2238,9 @@ def _write_task(task: dict) -> str | None:
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
-    # Which instance took delivery. A shared-room message fans out to every
-    # Sutando present and each writes its own task file; the addressee is in the
-    # body (@agent:server) but nothing recorded who received it, so a
-    # non-addressed core could not tell the message was not for it. Same
-    # namespace as the body addressee; header status (KNOWN_HEADER_KEYS) defangs
-    # a forged body copy. Written only when identity is known, and in the header
-    # block above task: — later lines parse as untrusted body.
+    # Which instance took delivery (shared-room fan-out: each Sutando writes its own
+    # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
     _recv = _reenroll_identity()
-    if _recv:
-        lines.append(f"receiving_instance: {_one_line(_recv)}")
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
         if f == "source":
@@ -2335,6 +2328,9 @@ def _write_task(task: dict) -> str | None:
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
+            # After id: so the canonical id-first / HMAC-stamp prefix stays line 0.
+            if f == "id" and _recv:
+                lines.append(f"receiving_instance: {_one_line(_recv)}")
     # sender_tier is resolved once, ahead of the field loop above (needed there
     # for the "task" field's vault interception), and reused here unchanged.
     # All preceding fields are newline-stripped, so none can forge a tier header.

@@ -332,20 +332,21 @@ def main() -> int:
     check("codex exec" not in content,
           "transport records team authority without selecting a model runtime")
 
-    # receiving_instance: a shared-room message fans out to every Sutando and each
-    # writes its own task file; the writer must record which instance took delivery
-    # (in the header, above task:) so a non-addressed core can tell it was not the
-    # addressee. Written only when identity is known. Monkeypatch the identity
-    # resolver so the check is hermetic (env/channel/state fallbacks vary by host).
+    # receiving_instance: the writer records which instance took delivery (header,
+    # after id:, above task:). Monkeypatch the resolver so the check is hermetic.
     _orig_reenroll = rtc._reenroll_identity
     rtc._reenroll_identity = lambda: "@qingyun-air.agent:ag2.space"
     rtc._write_task({**TASK, "id": "task-RECV", "task": "hi"})
     recv_body = (rtc.TASKS_DIR / "task-RECV.txt").read_text()
+    _recv_lines = recv_body.splitlines()
+    _recv_idx = next(i for i, l in enumerate(_recv_lines)
+                     if l.startswith("receiving_instance:"))
     check("receiving_instance: @qingyun-air.agent:ag2.space" in recv_body,
           "receiving_instance header carries the receiving agent mxid")
-    check("receiving_instance:" in recv_body
-          and recv_body.index("receiving_instance:") < recv_body.index("task:"),
-          "receiving_instance sits in the header, above task:")
+    check(_recv_lines[0].startswith("id:"),
+          "id: stays the first line (HMAC-stamp canonical slot)")
+    check(_recv_idx > 0 and recv_body.index("receiving_instance:") < recv_body.index("task:"),
+          "receiving_instance is a header line after id:, above task: (never line 0)")
     rtc._reenroll_identity = lambda: ""
     rtc._write_task({**TASK, "id": "task-RECVNONE", "task": "hi"})
     check("receiving_instance:" not in (rtc.TASKS_DIR / "task-RECVNONE.txt").read_text(),
