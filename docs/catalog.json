@@ -154,7 +154,7 @@
       ],
       "status": "canonical",
       "canonical_for": "remote gateway wire protocol",
-      "last_verified": "2026-08-18"
+      "last_verified": "2026-08-20"
     },
     "docs/runtime/claude-hook-contract-v1.md": {
       "title": "Claude Code Hook Contract — v1",
