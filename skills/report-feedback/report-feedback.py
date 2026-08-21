@@ -127,6 +127,26 @@ def read_cloud_auth(ws: Path):
     return None, None
 
 
+def why_no_logs(ws: Path) -> str:
+    """Why logs_excerpt() came back empty, in words a ticket reader can act on.
+
+    Runs ONLY on the failure path, so it must never raise: logs_excerpt() already
+    degraded to (None, []) here, and an exception would turn a report filed
+    without logs into a report not filed at all.
+    """
+    logs = ws / "logs"
+    try:
+        if not logs.is_dir():
+            return f"no logs directory at {logs} (reporter ran outside a live workspace)"
+        if not any(f.suffix == ".log" for f in logs.iterdir()):
+            return f"{logs} has no .log files"
+    except OSError as exc:
+        return f"{logs} could not be listed ({type(exc).__name__})"
+    except Exception:  # noqa: BLE001 - the explanation must not outrank the report
+        return f"{logs} could not be inspected"
+    return f"{logs} exists but its log files could not be read"
+
+
 def logs_excerpt(ws: Path):
     """Last 40 lines of the 4 most-recent <workspace>/logs/*.log (capped ~8KB)."""
     try:
@@ -218,6 +238,10 @@ def main() -> None:
         if excerpt:
             ctx["last_logs_excerpt"] = excerpt
             ctx["log_files"] = names
+        else:
+            # Logs are on by default, so silence here is indistinguishable from
+            # a report that never wanted them. Say why they are absent.
+            ctx["logs_omitted"] = why_no_logs(ws)
 
     payload = {
         "kind": a.kind,
