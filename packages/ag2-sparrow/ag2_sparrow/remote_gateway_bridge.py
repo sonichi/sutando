@@ -1231,7 +1231,7 @@ def _auth_probe() -> bool:
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
-_TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
+_TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
                 # them (absent for other sources); each newline-stripped by
@@ -2243,7 +2243,10 @@ def _write_task(task: dict) -> str | None:
     _recv = _reenroll_identity()
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
-        if f == "source":
+        if f == "session_scope":
+            if task.get(f) == "room":
+                lines.append("session_scope: room")
+        elif f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
