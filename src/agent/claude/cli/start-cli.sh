@@ -405,6 +405,18 @@ fi
 # Optional feature-owned task handler.  The adapter injects the capability at
 # the edge; the generic watcher remains unaware of concrete skills and falls
 # back to its legacy TASK_FILE event whenever this script is absent/unhandled.
+ROOM_SESSION_HANDLER="$REPO/skills/ag2space-room-sessions/scripts/session-worker.py"
+if [ -x "$ROOM_SESSION_HANDLER" ]; then
+  export SUTANDO_TASK_EVENT_HANDLER="$ROOM_SESSION_HANDLER"
+  export SUTANDO_ISOLATED_WORKING_DIR="${SUTANDO_CLAUDE_WORKING_DIR:-$REPO}"
+  CORE_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  CORE_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
+  if [ -n "${CORE_SETTINGS_JSON:-}" ]; then
+    export SUTANDO_ISOLATED_CLAUDE_SETTINGS="$CORE_SETTINGS_JSON"
+    CORE_ENV_ARGS+=(-e "SUTANDO_ISOLATED_CLAUDE_SETTINGS=$SUTANDO_ISOLATED_CLAUDE_SETTINGS")
+  fi
+fi
+
 # ---- obs metering (CC native OTel token + cost) -----------------------------
 # Hooks give obs events but carry NO tokens. Claude Code's OTel
 # `claude_code.token.usage` / `cost.usage` metrics are the authoritative usage

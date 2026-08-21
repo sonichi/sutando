@@ -1,0 +1,16 @@
+{
+  "name": "ag2space-room-sessions",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Run opted-in owner AG2 Space rooms in separate durable Claude or Codex sessions.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

@@ -70,9 +70,11 @@ broker also supplies its room-policy `access_tier` attestation.
 An AG2 Space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
 unknown, or malformed values are omitted, preserving the main-session path for
-older brokers, bridges, and Sutando installations. An optional task handler may
-use the header with `source: ag2space` and `channel_id` to select a durable
-room-specific provider session.
+older brokers and bridges. The `ag2space-room-sessions` skill uses the header
+with `source: ag2space`, owner tier, and `channel_id` to select one durable
+provider session per room. Messages in the same room resume that session;
+different rooms use different sessions. Team and Guest tasks keep their
+established guarded paths.
 
 ### `POST /v1/tasks/<id>/ack`
 

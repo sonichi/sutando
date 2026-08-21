@@ -1,0 +1,3 @@
+interface:
+  display_name: "AG2 Space Room Sessions"
+  short_description: "Keep opted-in AG2 Space rooms in separate durable sessions"
