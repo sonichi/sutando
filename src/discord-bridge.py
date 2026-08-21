@@ -4193,6 +4193,9 @@ async def _handle_discord_message(message, force=False):
             f"channel_name: {channel_name}\n"
             f"guild_name: {guild_name}\n"
             f"source_message_id: {message.id}\n"
+            # Same namespace as the addressee in the body (`<@id>`), so a non-addressed core
+            # can tell. Must stay above `task:` — later lines parse as untrusted body.
+            f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
             f"access_tier: {access_tier}\n"
