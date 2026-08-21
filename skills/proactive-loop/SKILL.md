@@ -120,6 +120,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
+   **⚠ A WARN IS A POINTER INTO THE RECORD, NOT NEW INFORMATION. Grep the PQ before investigating one.** Health-check warns are chronic by construction: they re-fire every pass until an owner decision lands, so the ones that survive are precisely the ones already investigated and parked. The warn text looks new every time and carries no memory of having been read — that mismatch is the whole trap.
+
+   ```bash
+   grep -in "<probe-name-or-keyword>" "$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)/pending-questions.md" | head
+   ```
+
+   One call, before any investigation costing more than a couple of tool calls. It either returns nothing or hands you your own prior write-up — with the measurements, the mechanism, and usually the proposed fix already in it. When it hits: **extend it with what is genuinely new, or say plainly that nothing is new.** Re-filing a weaker duplicate is the failure mode, and surfacing one to the owner as a discovery makes them read the same thing twice.
+
+   This lives in the loop file rather than only in a memory because a memory loads when RECALLED while this file loads EVERY PASS. The rule already existed, stated sharply, and still failed repeatedly — placement was the defect, not precision.
+
 3.5. **Apply the self-development policy gate.** Run:
 
    ```bash
