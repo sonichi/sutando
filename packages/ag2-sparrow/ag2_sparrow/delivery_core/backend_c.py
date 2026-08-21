@@ -91,6 +91,10 @@ class DesignCClaimBackend:
     """C: one live object per item, moved between state directories under a
     striped host-local lock. force-release exists as administrative requeue."""
 
+    # The FILENAME is the record here — an archived rename carries no field
+    # to hold receipt metadata, so complete() accepts and drops it.
+    persists_receipt_metadata = False
+
     capabilities = BackendCapabilities(supports_force_release=True)
 
     def __init__(self, root: Path, activate: bool = False):

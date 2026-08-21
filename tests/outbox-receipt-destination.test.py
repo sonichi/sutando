@@ -61,6 +61,53 @@ def main() -> int:
         check(DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED).destination is None,
               "destination defaults to None so existing providers keep working")
 
+        # --- receipt metadata must stay LOCAL to the delivery it came from ---
+        from ag2_sparrow.delivery_core import (DeliveryCore, DesignAClaimBackend,
+                                               RetryPolicy)
+        from ag2_sparrow.delivery_core.contract import (DeliveryReceipt,
+                                                        DeliveryOutcome,
+                                                        ProviderCapabilities,
+                                                        ProviderIndeterminate)
+
+        class TwoItemProvider:
+            """A confirms with X; B is ambiguous then confirmed by reconcile
+            with Y. B must never inherit A's destination."""
+            capabilities = ProviderCapabilities(reconcile_capable=True,
+                                                idempotent_send=False)
+
+            def deliver(self, item_id, payload, key):
+                if item_id == "A":
+                    return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
+                                           destination="room-X")
+                # RAISING is the leak vector: an except-path return never
+                # touches a stale field, so A's value would survive into B.
+                raise ProviderIndeterminate("boundary crossed, outcome unknown")
+
+            def reconcile(self, attempt):
+                return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
+                                       destination="room-Y")
+
+        root = Path(td) / "ob"
+        backend = DesignAClaimBackend(root)
+        core = DeliveryCore(backend, TwoItemProvider(),
+                            policy=RetryPolicy(max_attempts=3), worker="w")
+        for iid in ("A", "B"):
+            backend.publish(iid, b"{}")     # claim() needs a published item
+            core.deliver_one(iid, b"{}")
+        a = outbox._read_item(root, "A"); b = outbox._read_item(root, "B")
+        check(a.get("destination") == "room-X", f"A keeps its own destination, got {a.get('destination')}")
+        check(b.get("destination") == "room-Y",
+              f"B confirmed via reconcile carries the RECONCILE receipt's destination, got {b.get('destination')}")
+        check(b.get("destination") != "room-X",
+              "B did NOT inherit A's destination (cross-item metadata leak)")
+
+        # --- an accepted argument must not be mistaken for durable storage ---
+        from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
+        check(DesignAClaimBackend.persists_receipt_metadata is True,
+              "Design A declares it persists receipt metadata")
+        check(DesignCClaimBackend.persists_receipt_metadata is False,
+              "Design C declares it does NOT — it accepts and drops")
+
     print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
     return 1 if failures else 0
 

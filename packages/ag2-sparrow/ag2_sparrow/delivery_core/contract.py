@@ -172,6 +172,10 @@ class ClaimBackend(Protocol):
         """Acquire exclusive local ownership, or None on a lost race."""
         ...
 
+    # False = complete() accepts provider/destination and DROPS them.
+    # Check this; a signature does not imply durable storage.
+    persists_receipt_metadata: bool = False
+
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,

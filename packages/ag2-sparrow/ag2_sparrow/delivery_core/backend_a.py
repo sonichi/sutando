@@ -18,6 +18,8 @@ class DesignAClaimBackend:
     Reclaim TTL is A's dead-owner recovery window; force-release exists
     (declared) as the administrative-destruction mechanism."""
 
+    persists_receipt_metadata = True   # record_delivered() stores both
+
     capabilities = BackendCapabilities(supports_force_release=True)
 
     def __init__(self, root: Path, reclaim_ttl_s: float = 300.0):
