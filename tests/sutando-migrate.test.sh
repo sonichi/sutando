@@ -50,6 +50,17 @@ echo '{"new":"snapshot"}' > "$A/state/contextual-chips.json"
 touch -t 202606010600 "$C/state/contextual-chips.json"
 touch -t 202606012130 "$A/state/contextual-chips.json"
 
+# Fixture union-json-array: a newer EMPTY allow-set must not erase an older
+# populated one; schemaVersion is the control that must survive from the newer file.
+cat > "$C/state/slack-allowed-recipients.json" <<'JSON'
+{"allowFrom": ["U_OLD_ONE", "U_SHARED"], "schemaVersion": 1}
+JSON
+cat > "$A/state/slack-allowed-recipients.json" <<'JSON'
+{"allowFrom": [], "schemaVersion": 2}
+JSON
+touch -t 202606010600 "$C/state/slack-allowed-recipients.json"   # older, populated
+touch -t 202606012130 "$A/state/slack-allowed-recipients.json"   # newer, empty
+
 # --- Fixture: in-flight task (newer than 60s guard, must be skipped) ---
 mkdir -p "$C/tasks"
 echo "id: live-task" > "$C/tasks/task-now.txt"  # mtime = now → inflight
@@ -277,6 +288,101 @@ elif [ -e "$DEST/legacy/A/quarantine/scripts" ]; then
     echo "  FAIL: Source A repo scripts/ was quarantined — should be excluded entirely"; fail=1
 else
     echo "  OK: Source A repo scripts/ excluded from migration"
+fi
+
+# 6g. newer-empty + older-populated must yield a POPULATED active file — the
+# reported bug; newest-mtime and structural both fail it, neither merges in-file.
+UJ="$DEST/state/slack-allowed-recipients.json"
+if [ ! -f "$UJ" ]; then
+    echo "  FAIL: $UJ missing"; fail=1
+else
+    union_check="$(python3 - "$UJ" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+got = d.get("allowFrom")
+problems = []
+if sorted(got or []) != ["U_OLD_ONE", "U_SHARED"]:
+    problems.append(f"allowFrom={got!r}, expected the union of both sources")
+if len(got or []) != len(set(map(repr, got or []))):
+    problems.append(f"duplicate entries in allowFrom: {got!r}")
+if d.get("schemaVersion") != 2:
+    problems.append(f"schemaVersion={d.get('schemaVersion')!r}, expected 2 from the newer file")
+print("; ".join(problems) if problems else "OK")
+PY
+)"
+    if [ "$union_check" = "OK" ]; then
+        echo "  OK: allow-set unioned (grants survive a newer empty file; unrelated fields kept)"
+    else
+        echo "  FAIL: union-json-array — $union_check"; fail=1
+    fi
+fi
+
+# 6i. Three-source accumulation: the scalar winner must be the NEWEST source, not
+# whichever ran last — the union rewrites dest and resets its mtime, hiding this.
+U3="$TMP/union3"
+mkdir -p "$U3"
+printf '{"schemaVersion":1,"allowFrom":["U_C"]}\n' > "$U3/C.json"
+printf '{"schemaVersion":2,"allowFrom":["U_A"]}\n' > "$U3/A.json"
+printf '{"schemaVersion":3,"allowFrom":["U_B"]}\n' > "$U3/B.json"
+touch -t 202601010000 "$U3/C.json"
+touch -t 202601020000 "$U3/A.json"
+touch -t 202601030000 "$U3/B.json"
+cp "$U3/C.json" "$U3/dst.json"; touch -t 202601010000 "$U3/dst.json"
+# Call the production writer itself, not a reimplementation of the rule.
+u3_fn="$TMP/union_fn.sh"
+python3 - "$MIGRATE" "$u3_fn" "$REPO" <<'PYX'
+import sys
+src, out, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
+i = s.index("union_json_arrays_into() {")
+j = s.index("\n}\n", i) + 3
+open(out, "w").write(
+    f'SCRIPT_DIR="{repo}/scripts"\nREPO_DIR="{repo}"\n'
+    f'. "{repo}/scripts/python-binary.sh"\n\n' + s[i:j])
+PYX
+u3_check="$(
+  . "$u3_fn"
+  union_json_arrays_into "$U3/A.json" "$U3/dst.json" || echo "union A failed"
+  union_json_arrays_into "$U3/B.json" "$U3/dst.json" || echo "union B failed"
+  python3 - "$U3/dst.json" <<'PYX'
+import json, sys
+d = json.load(open(sys.argv[1]))
+problems = []
+if d.get("schemaVersion") != 3:
+    problems.append(f"schemaVersion={d.get('schemaVersion')!r}, expected 3 from the newest source")
+if sorted(d.get("allowFrom") or []) != ["U_A", "U_B", "U_C"]:
+    problems.append(f"allowFrom={d.get('allowFrom')!r}, expected all three accumulated")
+print("; ".join(problems) if problems else "OK")
+PYX
+)"
+if [ "$u3_check" = "OK" ]; then
+    echo "  OK: three-source union keeps the newest scalar and accumulates every array"
+else
+    echo "  FAIL: three-source union — $u3_check"; fail=1
+fi
+
+# 6h. Idempotency against the REAL script, not a reimplementation: a second pass
+# over an already-unioned dest must not duplicate entries or drop fields.
+IDEM_DEST="$TMP/dest-idem"
+mkdir -p "$IDEM_DEST/state"
+cp -p "$UJ" "$IDEM_DEST/state/slack-allowed-recipients.json"
+before_idem="$(cat "$IDEM_DEST/state/slack-allowed-recipients.json")"
+SUTANDO_MIGRATE_SRC_C="$C" SUTANDO_MIGRATE_DEST="$IDEM_DEST" \
+    bash "$MIGRATE" commit --source C --no-confirm >/dev/null 2>&1 || true
+after_idem="$(python3 - "$IDEM_DEST/state/slack-allowed-recipients.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(json.dumps({"allowFrom": sorted(d.get("allowFrom") or []),
+                  "schemaVersion": d.get("schemaVersion")}, sort_keys=True))
+PY
+)"
+expected_idem='{"allowFrom": ["U_OLD_ONE", "U_SHARED"], "schemaVersion": 2}'
+if [ "$after_idem" = "$expected_idem" ]; then
+    echo "  OK: union is idempotent (second pass adds no duplicates, keeps fields)"
+else
+    echo "  FAIL: union not idempotent — got $after_idem, expected $expected_idem"
+    echo "        (before: $before_idem)"
+    fail=1
 fi
 
 # 7. Per-source sentinels exist
