@@ -132,7 +132,7 @@ ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
 #   can survive undefanged in user-supplied content.
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
-    "id", "timestamp", "task", "source", "access_tier", "user_id",
+    "id", "timestamp", "session_scope", "task", "source", "access_tier", "user_id",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
