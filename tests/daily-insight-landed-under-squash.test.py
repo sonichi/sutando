@@ -17,6 +17,12 @@ def _load():
     return mod
 
 
+def _tmpdir():
+    # Teardown is not under test: rmtree of a git worktree can race to ENOTEMPTY on
+    # '.git'. Suppression is deliberate and UNBOUNDED — a later fd leak goes quiet too.
+    return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
 def _git(repo):
     def g(*a):
         # check=True raises with the exit code only, so a failing fixture reports
@@ -88,7 +94,7 @@ class TestLandedUnderSquash(unittest.TestCase):
     def test_the_reported_symptom_none_landed_on_a_squash_repo(self):
         """The reported symptom: "none landed yet" on a day work did land."""
         mod = _load()
-        with tempfile.TemporaryDirectory() as td:
+        with _tmpdir() as td:
             dev = mod.analyze_dev_activity(repo_root=_all_work_on_a_branch(td))
         self.assertIsNone(dev["landed_24h"], dev)
         line = mod.dev_activity_insight(dev)
@@ -97,7 +103,7 @@ class TestLandedUnderSquash(unittest.TestCase):
 
     def test_squash_repo_yields_unknown_not_zero(self):
         mod = _load()
-        with tempfile.TemporaryDirectory() as td:
+        with _tmpdir() as td:
             repo = _repo(td, merges=False)
             dev = mod.analyze_dev_activity(repo_root=repo)
         self.assertIsNotNone(dev)
@@ -112,7 +118,7 @@ class TestLandedUnderSquash(unittest.TestCase):
     def test_merge_commit_repo_still_reports_a_real_zero(self):
         """The suppression must not swallow the case reachability CAN answer."""
         mod = _load()
-        with tempfile.TemporaryDirectory() as td:
+        with _tmpdir() as td:
             repo = _repo(td, merges=True)
             dev = mod.analyze_dev_activity(repo_root=repo)
         self.assertIsNotNone(dev)
@@ -123,7 +129,7 @@ class TestLandedUnderSquash(unittest.TestCase):
     def test_too_little_history_is_unknown_not_proof_of_no_rewriting(self):
         """A depth-1 clone of a squash repo looks identical to a young one here."""
         mod = _load()
-        with tempfile.TemporaryDirectory() as td:
+        with _tmpdir() as td:
             repo = _repo(td, merges=False, main_commits=2)
             dev = mod.analyze_dev_activity(repo_root=repo)
         self.assertIsNone(dev["landed_24h"],
@@ -133,7 +139,7 @@ class TestLandedUnderSquash(unittest.TestCase):
     def test_a_shallow_clone_of_a_squash_repo_is_not_read_as_no_rewriting(self):
         """The reviewer's case: depth-1 hides the merge history entirely."""
         mod = _load()
-        with tempfile.TemporaryDirectory() as td:
+        with _tmpdir() as td:
             src = pathlib.Path(td) / "src"
             src.mkdir()
             g = _git(src)
@@ -209,7 +215,7 @@ class TestDiscriminatorFailsSafe(unittest.TestCase):
                 raise OSError("probe unavailable")
             return real(cmd, *a, **k)
         self._with_run(only_the_probe_fails)
-        with tempfile.TemporaryDirectory() as td:
+        with _tmpdir() as td:
             dev = self.mod.analyze_dev_activity(repo_root=_all_work_on_a_branch(td))
         self.assertIsNone(dev["landed_24h"],
                           "git errored, so whether reachability tracks landing here is "

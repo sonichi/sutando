@@ -73,20 +73,22 @@ def resolve_access_tier(task_file) -> str:
         content = Path(task_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return "guest"
-    before_task = content.split("\ntask:", 1)[0]
-    candidates = [
-        line.partition(":")[2].strip().lower()
-        for line in before_task.splitlines()
-        if line.startswith("access_tier:")
-    ]
-    if not candidates:
-        candidates = [
+    # LF-only split: the writer strips only \r/\n, so a Unicode line
+    # boundary in a field must not forge a header. str.splitlines() would.
+    def _tiers(text):
+        return [
             line.partition(":")[2].strip().lower()
-            for line in content.splitlines()
+            for line in text.split("\n")
             if line.startswith("access_tier:")
         ]
+    before_task = content.split("\ntask:", 1)[0]
+    candidates = _tiers(before_task) or _tiers(content)
     if not candidates:
         return "owner"
+    # Conflicting explicit tiers can only come from injection — fail closed.
+    normed = {"guest" if t == "other" else t for t in candidates}
+    if len(normed) > 1:
+        return "guest"
     tier = candidates[-1]
     if tier == "other":
         tier = "guest"
@@ -101,15 +103,17 @@ def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
         content = Path(task_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return True
-    before_task = content.split("\ntask:", 1)[0]
+    # LF-only split (see resolve_access_tier): a Unicode line boundary in a
+    # field must not forge a filter-off / collaborator stamp.
+    before_task = content.split("\ntask:", 1)[0].split("\n")
     filter_values = [
         line.partition(":")[2].strip()
-        for line in before_task.splitlines()
+        for line in before_task
         if line.startswith("sensitive_data_filter:")
     ]
     collaborator_values = [
         line.partition(":")[2].strip()
-        for line in before_task.splitlines()
+        for line in before_task
         if line.startswith("collaborator:")
     ]
     return filter_values != ["false"] or collaborator_values != ["true"]
@@ -193,6 +197,7 @@ VERDICT_DELIVER = "deliver"
 VERDICT_LEAK = "leak"
 VERDICT_SUPPRESS = "suppress"
 WITHHELD_RESULT_DIR = "withheld-team-results"
+SUPPRESSED_RESULT_DIR = "suppressed-team-results"
 
 
 class TeamResultVerdict(NamedTuple):
@@ -279,6 +284,53 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; pending private owner review")
 
 
+def suppressed_record_path(state_dir: Path, task_id: str) -> Path:
+    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
+
+
+def materialize_suppressed_verdict(verdict: TeamResultVerdict, body: str,
+                                   state_dir: Path, task_id: str, context=None,
+                                   agent_id: str = "", now=None, *,
+                                   stub: str) -> TeamResultVerdict:
+    """Realise a notice-bearing SUPPRESS as a journaled close carrying `stub`.
+
+    The record requirement is the policy, not the notice: once the suppression
+    is durably journaled, posting prose about marker mechanics into a human
+    channel is noise. `stub` must come from suppression_stub_for_tier -- it is
+    the canonical, sender-uninfluenced body, and it preserves a dedup target
+    that a flat "[no-send]" would drop. Fail-CLOSED -- if the journal cannot be
+    written the notice stands, so the record is never silently dropped.
+    """
+    if verdict.kind != VERDICT_SUPPRESS or verdict.body != TEAM_SUPPRESS_RESULT:
+        return verdict                     # already silent, or not a suppress
+    timestamp = float(time.time() if now is None else now)
+    directory = Path(state_dir) / SUPPRESSED_RESULT_DIR
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    except OSError:
+        return verdict
+    payload = {
+        "schema_version": 1,
+        "record_id": withheld_review_id(task_id),
+        "status": "suppressed_silent_close",
+        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "reason": verdict.reason,
+        "context": _bounded_context(context),
+        "suppressed_body": body,
+    }
+    try:
+        saved = _write_artifact(suppressed_record_path(state_dir, task_id), payload)
+    except Exception:  # noqa: BLE001 -- storage failure must remain fail-closed
+        saved = False
+    if not saved:
+        return verdict
+    return TeamResultVerdict(
+        VERDICT_SUPPRESS, stub, f"{verdict.reason}; journaled silent close")
+
+
 def classify_result_for_tier(body: str, tier, repo: Path,
                              secret_filter=None,
                              scan_sensitive_data: bool = True) -> TeamResultVerdict:
@@ -304,13 +356,26 @@ def classify_result_for_tier(body: str, tier, repo: Path,
 
 
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
-                          scan_sensitive_data: bool = True):
+                          scan_sensitive_data: bool = True, *,
+                          suppress_journal=None):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
     by catching an exception -- the safe body is the only one it is handed.
     Derived from classify_result_for_tier so the verdict has exactly one owner.
+
+    suppress_journal: `(state_dir, task_id)` from an adapter whose surface is a
+    human channel. The notice becomes a journaled silent close there; adapters
+    that omit it keep the posted notice.
     """
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data)
+    if suppress_journal is not None:
+        # The stub is this module's existing policy; the journal only adds
+        # the record. Never mint a body here.
+        stub = suppression_stub_for_tier(body, tier)
+        if stub is not None:
+            state_dir, task_id = suppress_journal
+            verdict = materialize_suppressed_verdict(
+                verdict, body, state_dir, task_id, stub=stub)
     return verdict.body, verdict.reason

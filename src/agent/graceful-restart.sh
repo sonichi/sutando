@@ -1,10 +1,19 @@
 #!/bin/bash
 # Graceful core-restart orchestrator. Flow, flags and rationale live in
-# notes/graceful-restart-design.md. Exit: 0 ok · 3 prep failed · 4 deferred.
+# notes/graceful-restart-design.md. Exit: 0 ok · 3 prep failed · 4 deferred ·
+# 5 dry-run (nothing killed or restarted).
 set -euo pipefail
 
 DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+[ "${1:-}" = "--dry-run" ] && { DRY_RUN=1; shift; }
+# Args after `--` reach start-cli.sh. The menu-bar restart needs --visible to
+# survive the handoff, or its relaunch silently becomes detached.
+[ "${1:-}" = "--" ] && shift
+RESTART_ARGS=("$@")
+# Log-only form: "${arr[@]}" inside a larger quoted string splits across log()'s
+# parameters and is correct only by accident of `$*`.
+RESTART_ARGS_STR=""
+[ "${#RESTART_ARGS[@]}" -gt 0 ] && RESTART_ARGS_STR=" ${RESTART_ARGS[*]}"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 WS="${GR_WS:-$(bash "$REPO/scripts/sutando-config.sh" workspace)}"   # GR_WS: test-only workspace override
@@ -132,11 +141,16 @@ busy() {
 do_restart() {
   local reason="$1"
   if [ "$DRY_RUN" = 1 ]; then
-    log "DRY-RUN — would exec 'start-cli.sh --restart' now ($reason). Skipping the actual kill."
-    return 0
+    # Echo the REAL argv: without it the passthrough is unobservable in dry-run.
+    log "DRY-RUN — would exec 'start-cli.sh --restart${RESTART_ARGS_STR}' now ($reason). Skipping the actual kill."
+    # Exit rather than return: both call sites follow with `exit 0`, which is
+    # indistinguishable from a real restart to anyone reading the status.
+    exit 5
   fi
   log "restarting core ($reason)…"
-  exec bash "$REPO/src/agent/start-cli.sh" --restart
+  # The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
+  # GR_START_CLI is a test seam: dry-run never reaches this line.
+  exec bash "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" --restart ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}
 }
 
 # ---- Phase 1: quiet gate -------------------------------------------------
