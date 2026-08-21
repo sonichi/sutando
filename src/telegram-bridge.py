@@ -1000,7 +1000,8 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import should_claim_proactive_file
+        from proactive_routing import (body_claimable_by,
+                                       should_claim_proactive_file)
         try:
             if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
@@ -1021,16 +1022,13 @@ def main():  # pragma: no cover
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
                             and f.suffix == ".txt" and _tg_claims(f.name):
-                        # Peek before claiming: skip Discord-targeted proactive files.
-                        # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                        # claiming it here sends the literal text to Telegram DM instead
-                        # of leaving it for discord-bridge. (#1401)
+                        # Peek before claiming: a body addressed to another bridge
+                        # is delivered by that bridge, not sent here as literal text.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if peek.startswith("[channel:") and \
-                                re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                        if not body_claimable_by(peek, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.

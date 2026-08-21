@@ -122,10 +122,14 @@ If `PERSONAL_CLAUDE.md` exists, read and follow it. It contains user-specific ru
 Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `<workspace>/state/core-status.json` via `status_read_path` (`src/workspace_default.py`), where `<workspace>` = the M0 canonical (`<repo>/workspace/` by default; env-overridable as the legacy escape).
 
 ```bash
-CORE_STATUS="$(bash scripts/sutando-config.sh workspace)/state/core-status.json"
-echo '{"status":"running","step":"<description>","ts":<epoch>}' > "$CORE_STATUS"   # start of significant work
-echo '{"status":"idle","ts":<epoch>}' > "$CORE_STATUS"                            # when done
+bash scripts/core-status.sh running "<description>"   # start of significant work
+bash scripts/core-status.sh idle                      # when done
 ```
+
+**Use the wrapper, not a `>` redirect.** A redirect truncates before it writes, so a reader polling
+in that window sees a zero-length file — graceful-restart's `busy()` gate read that as "idle" and
+authorised a kill (#3156). `scripts/core-status.sh` writes via temp-file + `os.replace`, so the swap
+is atomic, and it stamps `ts` itself so a caller cannot omit or misformat it.
 
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
