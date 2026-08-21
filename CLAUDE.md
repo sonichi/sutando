@@ -12,6 +12,11 @@ For irreversible actions (sending email, deleting files, financial transactions)
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
 
+**"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — unless you have a
+better mechanism for that specific job. It is not "keep this in mind while doing other things", and
+it is not a licence to defer the work to a later session. If the ask is too large for your remaining
+context, that is the reason TO delegate it, not a reason to hand it back.
+
 ## Architecture rules
 
 - **Core services** (`src/`, `skills/phone-conversation/`) are general-purpose infrastructure. They provide generic capabilities (audio streaming, task bridge, tool execution) but must NOT contain feature-specific logic.
