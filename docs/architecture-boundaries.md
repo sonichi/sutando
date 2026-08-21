@@ -111,7 +111,8 @@ Optional capability discovery also remains at the adapter edge. A generic
 core helper may run an injected script path and standardize timeout/failure
 semantics, but it must not name, locate, or import a concrete skill. This keeps
 the dependency direction adapter → helper while preserving the rule that core
-does not depend on installed skills.
+does not depend on installed skills. Add direct contract tests for the runner
+and wiring tests for every adapter that delegates to it.
 
 ### Shared adapter policy
 
@@ -135,7 +136,8 @@ before publishing the shared record it applies the sender-tier gate, excludes
 known fleet agents, strips gateway attribution, and redacts secrets. Those are
 gateway trust-boundary rules, not provider-neutral record-publication mechanics.
 Do not delegate that writer to `src/owner_activity.py` unless those controls and
-their tests move with it.
+their tests move with it. Any writer excepted from centralization must have its
+exception documented, as this one is.
 
 ### Shared result-file lifecycle
 
@@ -146,6 +148,23 @@ and retain only provider-specific delivery. For example,
 `src/proactive_recovery.py` restores proactive delivery claims stranded by a
 crash, while Discord, Slack, and Telegram decide how the recovered result is
 sent. Copying the filesystem state machine into each adapter is not permitted.
+
+### Outbound delivery ownership
+
+Outbound delivery of an already-published result has one implementation, and it
+is the outbox. `src/outbox.py` owns delivery claims (acquire/release/reclaim,
+per-item locking, crash recovery) and `src/outbox_adapter.py` owns the
+three-state delivery outcome (CONFIRMED / NOT_DELIVERED / OUTCOME_UNKNOWN);
+both are vendored verbatim into `packages/ag2-sparrow/`. Scope is the outbound
+leg only — an existing `OutboundItem` from claim through terminal disposition;
+other task/result lifecycle transitions keep their documented owners (e.g.
+`src/proactive_recovery.py` above). Consumers delivering outbound results bind
+these; do not re-implement claim, delivered-sentinel, or retry machinery in a
+bridge. Adapters bind their resolved directories and retain provider-specific
+delivery only. Pin both the shared contract and every adapter's delegation in
+tests. Pre-outbox private copies (e.g. discord-bridge's
+archive/delivered-sentinel/pending-replies machinery) are migration debt, not
+precedent.
 
 ### HTTP transport handlers
 
