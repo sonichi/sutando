@@ -5248,7 +5248,8 @@ async def poll_proactive():
             # decision rule (last-active channel from
             # state/last-owner-activity.json; default discord on missing
             # state).
-            from proactive_routing import should_claim_proactive_file  # noqa: E402
+            from proactive_routing import (  # noqa: E402
+                redirect_target_is_foreign, should_claim_proactive_file)
             for f in RESULTS_DIR.iterdir():
                 # Per-FILE decision: an explicit .to-<channel> destination
                 # outranks activity routing (see proactive_routing).
@@ -5281,8 +5282,8 @@ async def poll_proactive():
                     _pp = parse_markers(text)
                     _early_redirect = next(
                         (a for a in _pp.actions if a.kind == "redirect"), None)
-                    if _early_redirect is not None and not re.fullmatch(
-                            r"\d{17,20}", str(_early_redirect.value).strip()):
+                    if _early_redirect is not None and redirect_target_is_foreign(
+                            _early_redirect.value, "discord"):
                         print(f"  [proactive] {f.name} targets "
                               f"{str(_early_redirect.value).strip()!r} — not a Discord "
                               f"channel id; releasing for its own bridge", flush=True)
