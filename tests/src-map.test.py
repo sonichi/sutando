@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Regression checks for scripts/gen-src-map.py."""
 
+import contextlib
 import importlib.util
+import io
 import re
 import shutil
 import subprocess
@@ -105,6 +107,27 @@ try:
 
     _tmp.unlink()
     check("main: --check fails when file missing", gen_src_map.main() == 1)
+
+    # The tally is the only place the module counts survive, so the branch that
+    # names undocumented modules has to be exercised where it is now printed.
+    sys.argv = ["gen-src-map.py"]
+    _orig_collect = gen_src_map.collect
+    try:
+        gen_src_map.collect = lambda: [("src/a.ts", "Alpha module."), ("src/b.py", "")]
+        _out = io.StringIO()
+        with contextlib.redirect_stdout(_out):
+            gen_src_map.main()
+        check("main: tally names the undocumented count",
+              "1 without a usable header comment" in _out.getvalue())
+
+        gen_src_map.collect = lambda: [("src/a.ts", "Alpha module.")]
+        _out = io.StringIO()
+        with contextlib.redirect_stdout(_out):
+            gen_src_map.main()
+        check("main: tally omits the clause when all are documented",
+              "without a usable header comment" not in _out.getvalue())
+    finally:
+        gen_src_map.collect = _orig_collect
 finally:
     gen_src_map.OUT, sys.argv = _orig_out, _orig_argv
     shutil.rmtree(_tmpdir, ignore_errors=True)

@@ -287,8 +287,11 @@ class TestLandedIsASubsetNotASecondQuery(unittest.TestCase):
             dev = mod.analyze_dev_activity(repo_root=repo)
         self.assertIsNotNone(dev, "the --branches scan should still see the WIP commit")
         self.assertEqual(dev["commits_24h"], 1, dev)
-        self.assertLessEqual(dev["landed_24h"], dev["commits_24h"], dev)
-        self.assertEqual(dev["landed_24h"], 0, "the WIP commit is not on origin/main")
+        # `None` (unknown) cannot exceed anything; the invariant this test is named
+        # for holds. The repo is too small to prove it does not rewrite SHAs.
+        self.assertTrue(dev["landed_24h"] is None
+                        or dev["landed_24h"] <= dev["commits_24h"], dev)
+        self.assertIsNone(dev["landed_24h"], "2 commits cannot settle the merge strategy")
 
     def test_the_rendered_sentence_cannot_go_negative(self):
         mod = _load()

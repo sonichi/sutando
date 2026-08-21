@@ -150,5 +150,71 @@ with tempfile.TemporaryDirectory() as td:
     check("workspace-root-tidy is wired into run_all_checks()",
           "workspace-root-tidy" in names, True)
 
+    # 10. `.env` is CONTRACT-SANCTIONED, not drift. `sutando_config.resolve_dotenv`
+    #     resolves repo-root -> workspace (#1871), and health-check's own `.env`
+    #     probe reads and validates that second tier — so the two probes disagreed
+    #     about the same file: one required it, the other called it escaped state.
+    td7 = Path(_tf.mkdtemp()); ws7 = td7 / "workspace"; (ws7 / "state").mkdir(parents=True)
+    (ws7 / ".env").write_text("GEMINI_API_KEY=x")
+    check("a workspace .env is not drift", load(ws7).check_workspace_root_tidy(), None)
+
+    # 11. Lock guards live at the root by six-site convention (voice-lock.ts,
+    #     startup-runtime.sh, restart.sh, restart-voice-agent.sh, voice-lock.test.py).
+    #     Moving one without the others leaves two processes disagreeing about where
+    #     the lock is — a double-started voice agent, worse than the warn.
+    #     Both are exempt BY NAME, not by a `*.lock.guard` glob: state/locks/ is where
+    #     workspace_lock.py writes this artifact type, so an unknown guard at the root
+    #     is a resolution bug the probe must keep catching — test 13 pins that.
+    td8 = Path(_tf.mkdtemp()); ws8 = td8 / "workspace"; (ws8 / "state").mkdir(parents=True)
+    (ws8 / ".voice-agent.lock.guard").write_text("")
+    (ws8 / ".backend-supervisor.lock.guard").write_text("")
+    check("lock guards are not drift", load(ws8).check_workspace_root_tidy(), None)
+
+    # 12. The exemptions must not swallow the one file that IS this repo's drift.
+    #     Without this, adding `.env` + the guard glob could have been written as a
+    #     blanket dotfile pass and every check above would still be green.
+    td9 = Path(_tf.mkdtemp()); ws9 = td9 / "workspace"; (ws9 / "state").mkdir(parents=True)
+    for name in (".env", ".voice-agent.lock.guard", ".backend-supervisor.lock.guard",
+                 ".voice-agent.pid"):
+        (ws9 / name).write_text("")
+    r12 = load(ws9).check_workspace_root_tidy()
+    check("the real deviant is still flagged", ".voice-agent.pid" in (r12 or {}).get("detail", ""), True)
+    check("and the exempt files are not named alongside it",
+          any(n in (r12 or {}).get("detail", "")
+              for n in (".env", ".lock.guard")), False)
+
+    # 13. An UNKNOWN root .lock.guard is still drift. state/locks/ is where
+    #     workspace_lock.py already writes this artifact type, and this probe
+    #     only lists ROOT files — so a role guard appearing at the root is a
+    #     workspace-resolution bug, the class the probe exists to catch. A
+    #     `*.lock.guard` glob would have hidden it; the two real root guards
+    #     are exempt by name instead.
+    td11 = Path(_tf.mkdtemp()); ws11 = td11 / "workspace"; (ws11 / "state").mkdir(parents=True)
+    (ws11 / "sync-worker.lock.guard").write_text("")
+    r11 = load(ws11).check_workspace_root_tidy()
+    check("an unknown root .lock.guard is still drift",
+          "sync-worker.lock.guard" in (r11 or {}).get("detail", ""), True)
+
+    # 14. A guard-LIKE name that is not a guard stays flagged — the exemption
+    #     must not degrade into "anything containing lock".
+    td10 = Path(_tf.mkdtemp()); ws10 = td10 / "workspace"; (ws10 / "state").mkdir(parents=True)
+    (ws10 / "voice.lock").write_text("")
+    (ws10 / ".env.local").write_text("")
+    r13 = load(ws10).check_workspace_root_tidy()
+    check("a bare .lock is still drift", "voice.lock" in (r13 or {}).get("detail", ""), True)
+    check("and so is .env.local (only the resolver's own name is sanctioned)",
+          ".env.local" in (r13 or {}).get("detail", ""), True)
+
+    # 15. A write-once notice sentinel has NO destination: init.sh reads it AT
+    #     the root and nothing unlinks it, so flagging it is a permanent WARN.
+    td12 = Path(_tf.mkdtemp()); ws12 = td12 / "workspace"; (ws12 / "state").mkdir(parents=True)
+    (ws12 / ".legacy-notice-printed").write_text("")
+    (ws12 / ".voice-agent.pid").write_text("4242")
+    r14 = load(ws12).check_workspace_root_tidy()
+    d14 = (r14 or {}).get("detail", "")
+    check("the notice sentinel is not flagged", ".legacy-notice-printed" in d14, False)
+    check("the real deviant beside it still is", ".voice-agent.pid" in d14, True)
+    check("so the probe still fires rather than going silent", r14 is not None, True)
+
 print(("FAILED: " + ", ".join(fails)) if fails else "workspace-root-tidy: all checks passed")
 sys.exit(1 if fails else 0)

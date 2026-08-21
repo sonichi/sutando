@@ -31,11 +31,16 @@ import urllib.request
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-WORKSPACE = SKILL_DIR.parents[1]
+WORKSPACE = SKILL_DIR.parents[1]  # repo root (.env lives here)
 STATE_DIR = SKILL_DIR / "state"
 SEEN_PATH = STATE_DIR / "seen.json"
 CRITERIA_PATH = STATE_DIR / "criteria.json"
-RESULTS_DIR = WORKSPACE / "results"
+# Bridges poll the RESOLVED workspace results/ — the repo-root guess wrote
+# where no poller looks (the historic bridge anti-pattern, workspace-config).
+sys.path.insert(0, str(SKILL_DIR.parents[1] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
+RESULTS_DIR = resolve_workspace() / "results"
 
 UA = (
     "Sutando-Personal-Agent/1.0 "
@@ -318,12 +323,17 @@ def send_sms(env: dict, body: str) -> tuple[bool, str]:
 
 
 def send_telegram(body: str) -> bool:
-    """Drop a proactive- file for the telegram-bridge to pick up."""
+    """Drop a Telegram-destined proactive file for the telegram-bridge.
+
+    The destination rides in the filename (typed constructor, the only legal
+    spelling) so the intended channel — not whichever bridge polls first —
+    claims it."""
     try:
-        RESULTS_DIR.mkdir(exist_ok=True)
-        ts = int(time.time() * 1000)
-        path = RESULTS_DIR / f"proactive-deal-finder-{ts}.txt"
-        path.write_text(body)
+        from proactive_routing import proactive_filename
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        name = proactive_filename(f"deal-finder-{int(time.time() * 1000)}",
+                                  channel="telegram")
+        (RESULTS_DIR / name).write_text(body)
         return True
     except Exception:
         return False

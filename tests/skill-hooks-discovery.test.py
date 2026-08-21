@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,11 +35,45 @@ class SkillHookDiscovery(unittest.TestCase):
             {"event": "PreToolUse", "command": "./hooks/g.py"}]})
         rows = discover(self.repo)
         self.assertEqual(len(rows), 1)
-        event, token, cmd = rows[0]
+        event, token, cmd, prior = rows[0]
         self.assertEqual(event, "PreToolUse")
         self.assertEqual(token, "g.py")
-        self.assertTrue(cmd.startswith("python3 "), cmd)
+        # The runner still has to be the one the suffix selects; it just no longer
+        # leads the command, because an existence guard runs first.
+        self.assertIn("exec python3 ", cmd)
         self.assertIn("skills/demo/hooks/g.py", cmd)
+        # The unguarded form an earlier installer wrote, so the sweep can match and
+        # replace it without re-deriving it from `cmd`.
+        self.assertTrue(cmd.endswith(prior), f"{cmd!r} does not end with {prior!r}")
+        self.assertEqual(cmd, f"[ -f {shlex.quote(str(self.repo.resolve() / 'skills/demo/hooks/g.py'))} ]"
+                              f" || exit 0; exec {prior}")
+
+    def test_prior_command_survives_a_repo_path_containing_exec_and_pipe(self):
+        """`${CMD#*exec }` splits at the first `exec ` — inside the path, not the
+        keyword — so the derived shape matched nothing. Emitting it is immune."""
+        self._td.cleanup()
+        self._td = tempfile.TemporaryDirectory(prefix="exec repo|x ")
+        self.addCleanup(self._td.cleanup)
+        self.repo = Path(self._td.name)
+        self._skill("demo", {"name": "demo", "hooks": [
+            {"event": "PreToolUse", "command": "./hooks/g.py"}]})
+        _event, _token, cmd, prior = discover(self.repo)[0]
+
+        self.assertEqual(prior, f"python3 {shlex.quote(str(self.repo.resolve() / 'skills/demo/hooks/g.py'))}")
+        self.assertTrue(cmd.endswith(prior))
+        # What the installer used to compute. It is wrong here, and that is the bug.
+        self.assertNotEqual(cmd.split("exec ", 1)[1], prior,
+                            "fixture must actually exercise the bad derivation")
+
+    def test_a_vanished_script_allows_the_tool_instead_of_blocking_it(self):
+        """The registration outlives the file, and a hook that cannot start blocks
+        the tool it gates, so an absent script must exit 0."""
+        d = self._skill("demo", {"name": "demo", "hooks": [
+            {"event": "PreToolUse", "command": "./hooks/g.py"}]}, hook_body="import sys; sys.exit(2)")
+        cmd = discover(self.repo)[0][2]
+        self.assertEqual(subprocess.run(cmd, shell=True).returncode, 2, "present guard must still block")
+        (d / "hooks" / "g.py").unlink()
+        self.assertEqual(subprocess.run(cmd, shell=True).returncode, 0, "absent guard must fail OPEN")
 
     def test_discovery_refuses_a_command_outside_the_declaring_skill(self):
         """A manifest must not be able to point core at a host executable."""

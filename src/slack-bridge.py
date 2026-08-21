@@ -64,7 +64,15 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
+from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+
+
+def _slack_claims_name(name: str) -> bool:
+    """Filename-level claim decision — the policy lives in proactive_routing;
+    this adapter only binds its channel."""
+    return fallback_claims_name(name, "slack")
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
+import slack_access  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -82,6 +90,7 @@ from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
@@ -182,25 +191,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     )
 
 
-def archive_file(src: Path, kind: str, task_id: str) -> None:
-    """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
-    Matches the behavior of telegram-bridge.py / discord-bridge.py."""
-    try:
-        if not src.exists():
-            return
-        from datetime import datetime
-        import shutil
-        ym = datetime.now().strftime("%Y-%m")
-        base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-        dest_dir = base / ym
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
-    except Exception as e:
-        print(f"[Slack] archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+def archive_file(src: Path, kind: str, task_id: str) -> bool:
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy. It used to unlink the source when the move failed,
+    which destroyed the only copy of the task."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(f"[Slack]{m}", flush=True))
 
 
 ACCESS_FILE = channel_access_path("slack")
@@ -316,14 +314,12 @@ def load_allowed():
 
     None vs empty-set: file-missing means never-configured (TOFU-eligible);
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        _update_access_cache(data)
-        return set(data.get("allowFrom", []))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return set()
+    access = slack_access.read_access(ACCESS_FILE)
+    # Only a record the shared reader accepted is worth caching; a malformed one
+    # would overwrite a good backup with a document nobody can authenticate from.
+    if access.record is not None:
+        _update_access_cache(access.record)
+    return access.allowed
 
 
 def load_tier_map() -> dict:
@@ -579,6 +575,13 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
     """Persist the Slack route before exposing its task file to the core."""
     _set_pending_reply(task_id, info)
     try:
+        # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+        # fail-open so a stamping error costs the stamp and never the task.
+        try:
+            from task_envelope import stamp_text  # sibling module (src/ on sys.path)
+            content = stamp_text(content, REPO)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception:
         _pop_pending_reply(task_id)
@@ -1058,9 +1061,20 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
     _claude_config_dir = claude_home_path()
     skill_hints = ""
-    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+    # CONTEXT-FIRST is a correctness step, not a skill hint: it must not be
+    # gated on optional skills. The steps that need them stay conditional inside.
+    if access_tier == "owner":
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
+        hints_lines.append(
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained '
+            f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
+            f'stated here), reconstruct context BEFORE interpreting. Slack has no '
+            f'channel-history fetch in this bridge, so use the embedded thread/reply '
+            f'context above (if present) plus the session transcript, and answer from '
+            f'that, not from memory.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_thread_arg = (
                 f" --thread-ts {shlex.quote(str(reply_thread_ts))}"
@@ -1592,16 +1606,16 @@ def result_watcher():
                         _record_skip_audit(delivery_id, "deduped")
                         f.unlink(missing_ok=True)
                         continue
-                    # Peek before claiming: skip Discord-targeted proactive files.
-                    # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                    # claiming it here dumps the literal text to Slack DM instead.
-                    # Leave it for discord-bridge to claim. (#1401)
+                    # Peek before claiming: a body addressed to another bridge
+                    # is delivered by that bridge, not dumped here as literal text.
                     try:
                         peek = f.read_text(errors="ignore").lstrip()
                     except OSError:
                         continue
-                    if peek.startswith("[channel:") and \
-                            re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                    if not body_claimable_by(peek, "slack"):
+                        continue
+                    # Explicit filename destination outranks the race.
+                    if not _slack_claims_name(f.name):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

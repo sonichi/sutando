@@ -10,12 +10,23 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
 	registerSource,
 	setVisionSession,
 	captureSendFrame,
+	resetVisionEgressForTests,
+	VISION_MIN_SEND_INTERVAL_MS,
 	_getVisionFrameHookCount,
 } from '../src/vision-tools.js';
+
+// P7 D7.4: real sends are paced by the egress token bucket (~1 fps) — the
+// e2e drives real sends, so it must respect the designed cadence.
+async function pacedCapture(name: string): Promise<Awaited<ReturnType<typeof captureSendFrame>>> {
+	const r = await captureSendFrame(name);
+	await delay(VISION_MIN_SEND_INTERVAL_MS + 50);
+	return r;
+}
 // Importing the skill registers `_frameHook` into vision-tools' hook registry
 // at module-load time (registerVisionFrameHook(_frameHook)).
 import {
@@ -46,12 +57,14 @@ test('captureAndSend fires the screen-companion hook and injects selection after
 	});
 
 	_resetFrameHookState();
+	resetVisionEgressForTests();
 	_setVisionQueryDeps({ readSelection: () => ({ text: 'HELLO', source: 'ax_selection' }) });
 	try {
-		// _frameHook probes every 3rd frame — drive 3 captures to hit the boundary.
-		await captureSendFrame('testsrc');
-		await captureSendFrame('testsrc');
-		await captureSendFrame('testsrc');
+		// _frameHook probes every 3rd frame — drive 3 PACED captures to hit
+		// the boundary (the P7 egress bucket caps real sends at ~1 fps).
+		await pacedCapture('testsrc');
+		await pacedCapture('testsrc');
+		await pacedCapture('testsrc');
 	} finally {
 		_resetVisionQueryDeps();
 	}
@@ -83,12 +96,13 @@ test('no injection when the session transport has no sendContent (graceful)', as
 	});
 
 	_resetFrameHookState();
+	resetVisionEgressForTests();
 	_setVisionQueryDeps({ readSelection: () => ({ text: 'HELLO', source: 'ax_selection' }) });
 	let r;
 	try {
-		await captureSendFrame('testsrc2');
-		await captureSendFrame('testsrc2');
-		r = await captureSendFrame('testsrc2'); // probe tick — would inject if sendContent existed
+		await pacedCapture('testsrc2');
+		await pacedCapture('testsrc2');
+		r = await pacedCapture('testsrc2'); // probe tick — would inject if sendContent existed
 	} finally {
 		_resetVisionQueryDeps();
 	}

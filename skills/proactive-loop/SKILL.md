@@ -35,7 +35,7 @@ You are Sutando — a personal AI agent running as this Claude Code session.
 ```bash
 WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
 # ...all subsequent reads and writes use "$WORKSPACE/<path>" — quote it.
-echo "$payload" > "$WORKSPACE/state/core-status.json"
+bash scripts/core-status.sh running "<what you are actually doing>"
 cat "$WORKSPACE/build_log.md"
 ```
 This resolves through `bash scripts/sutando-config.sh workspace`, which reads `sutando.config.local.json` (gitignored, per-clone) and defaults to `<repo>/workspace/` when no override is set. `$SUTANDO_WORKSPACE` is no longer honored for workspace resolution as of v0.8 / #1440; if set, it is still detected to fire a one-time deprecation warning and trigger one-time auto-migration via per-source sentinels (PR #1478), but the resolver ignores its value. Never hardcode `~/.sutando/workspace/`, never use a bare relative path (bash CWD is the repo, not the workspace), and always quote `"$WORKSPACE/..."` so spaces in the workspace path don't tokenize.
@@ -44,7 +44,7 @@ This resolves through `bash scripts/sutando-config.sh workspace`, which reads `s
 
 Each pass, in order:
 
-0. **Signal loop start.** Write `{"status":"running","step":"<short description of what you are actually doing>","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
+0. **Signal loop start.** Run `bash scripts/core-status.sh running "<short description of what you are actually doing>"`. **Do not `>` a JSON literal at the file** — the redirect truncates before it writes, and a reader polling in that window sees a zero-length file (`busy()` read that as idle and authorised a kill, #3156). The wrapper writes atomically and stamps `ts` for you. The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Re-run it with a new description as you progress — a stale `step` actively lies to him. Run `bash scripts/core-status.sh idle` when the pass ends.
 
    **`step` is an owner-facing live message, not internal telemetry.** With `SUTANDO_PROGRESS_STREAM=1` (ON in the running bridge) the Discord bridge renders it to the owner verbatim as `⏳ <step> (Ns)` while he waits on an owner task, via `progress_stream.format_progress`. A generic placeholder ("Starting pass...", "running") shows up in his DM as noise; when processing an owner task, `step` should say what he is waiting on. Rewrite it on every pivot — a stale `step` actively lies to him. See memory `feedback_rich_core_status_step`. (This template previously read `"Starting pass..."` — the exact string that memory names as the anti-pattern, which is why the mistake kept recurring across compactions: this file is loaded every pass, the memory only when recalled.)
 
@@ -95,7 +95,7 @@ Each pass, in order:
 
    Either way: budget informs the **depth** of step 6 — not whether to do it when quota permits. When the branch resolves to `LIGHT`/`MINIMAL`, skip autonomous self-development/research in step 6 even if the self-development policy is enabled; owner-requested tasks, pending questions, health/service recovery, watcher maintenance, and the build-log update remain active. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the other legitimate reasons step 6 may be skipped.
 
-0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `<workspace>/hosts/<hostname>/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id>`), per-host `pending-questions.md`, the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `<workspace>/hosts/<hostname>/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
+0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `<workspace>/hosts/<hostname>/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id> --serving <task channel_id>` (task-serving; gated) or `--operator` (autonomous pass)), per-host `pending-questions.md`, the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `<workspace>/hosts/<hostname>/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
 
 ## Skip conditions for step 6 (the ONLY legitimate reasons)
 
@@ -190,9 +190,33 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    It reports success in every cheap way: bytes land, the path is right, nothing errors, the file grows. **Only calling the reader shows the zero.** So after writing, assert it:
    ```bash
-   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=[str(x) for x in m.get_waiting_questions()];print(any('<a distinctive phrase from your question>' in x for x in q))"
+   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=m.get_waiting_questions();print(len(q), sum('<distinctive phrase from your TITLE>' in (x.get('title') or '') for x in q))"
    ```
-   A `True` is the only proof the question exists for anyone but you.
+   **Match on `title`, and check that the COUNT went up — not `str(x)`.** ⚠ 2026-08-13: the
+   substring-anywhere form above this line passed while the entry was **swallowed into the
+   neighbouring section's body**, because a merged section still contains your text. The reader
+   splits on `##` ONLY; a `###` heading is body text, not a new question. Tell: a purely additive
+   edit (`git diff --numstat` = N/0) that leaves the count UNCHANGED. I saw that delta=0, explained
+   it away as a stale count, and only a title-level check showed the zero. The count is the
+   discriminator; the substring cannot fail the way this actually fails.
+
+   **⚠ A COUNTED question can still be INVISIBLE — assert POSITION too (2026-08-20).** The count
+   rising proves membership, not visibility. Waiting order is FILE order, so "insert above the
+   `# Resolved` divider" — the rule that makes a question counted at all — lands it at the BOTTOM of
+   the visible list. The two rules pull opposite ways. Only two consumers render anything, and both
+   take an ordered prefix: `notify_macos` shows `titles[:3]` and the proactive DM body shows
+   `questions[:5]` (hence `VISIBLE_PREFIX = 5` in `src/check-pending-questions.py`). **Positions 6+
+   render nowhere** — they exist only in the file and the web UI's Questions tab. Measured on a live
+   host: `VISIBLE_PREFIX=5; waiting=34; rendered nowhere = 29 of 34`, and the question filed that
+   pass sat at **34/34** while the assertion documented above printed `34 1` — a pass. Extend the
+   proof to position:
+   ```bash
+   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=m.get_waiting_questions();i=next(k for k,x in enumerate(q,1) if '<distinctive phrase from your TITLE>' in (x.get('title') or ''));assert i <= m.VISIBLE_PREFIX, f'filed at {i}/{len(q)} - below the fold, renders nowhere'"
+   ```
+   If it lands below the fold and it genuinely needs the owner, **move it up** — do not file a second
+   question about the first one being unread. Promotion is self-announcing: `notify_key` hashes the
+   visible-ordered prefix (#3004), so changing the top 5 defeats the cooldown by construction and the
+   next fire notifies.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
