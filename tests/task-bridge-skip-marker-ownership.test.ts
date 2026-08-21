@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { hasNetworkConsumer, isSkipMarked, mayRetireSkipMarked }
+import { bodyIsSkipMarked, hasNetworkConsumer, isSkipMarked, mayRetireSkipMarked }
 	from '../src/skip_marker_ownership.js';
 
 // results/ is shared by every consumer. Matching `task-*` plus a skip marker
@@ -183,5 +183,70 @@ describe('a durable claim outranks the source label', () => {
 			mayRetireSkipMarked(`${FOREIGN}.txt`, '[no-send]', noneOwned,
 				() => ({ source: null, claimedElsewhere: true })),
 			false, 'a claimed result with no source line was retired');
+	});
+});
+
+// Third skip marker; had its own branch that returned before the ownership gate.
+// Expectations MEASURED against src/result_markers.py, not authored by hand.
+describe('task-bridge — [deduped:] is a skip marker under the same ownership rule', () => {
+	it('recognises a well-formed deduped marker', () => {
+		assert.equal(isSkipMarked(`${OWN}.txt`, '[deduped: task-123]'), true);
+	});
+
+	it('will NOT retire a foreign bridge\'s deduped result', () => {
+		// The case that motivated this: previously archived unconditionally.
+		assert.equal(
+			mayRetireSkipMarked(`${FOREIGN}.txt`, '[deduped: task-123]', noneOwned, origin), false,
+			'a deduped result this bridge never dispatched was retired, stranding its reply');
+	});
+
+	it('still retires its own deduped result', () => {
+		assert.equal(mayRetireSkipMarked(`${OWN}.txt`, '[deduped: task-123]', owns, origin), true);
+	});
+
+	it('matches result_markers.py exactly on the grammar edges', () => {
+		const py: [string, boolean][] = [
+			['[deduped: task-123]',         true ],
+			['[deduped: task-123',          false],  // closing bracket REQUIRED
+			['[deduped: phone-abc.task-9]', true ],  // any target, not just task-*
+			['[DEDUPED: task-123]',         true ],  // case-insensitive
+			['  [deduped:task-123]',        true ],
+			['[deduped: ]',                 true ],  // whitespace target: Python accepts
+			['[deduped:]',                  false],  // empty: Python rejects
+		];
+		for (const [body, want] of py) {
+			assert.equal(isSkipMarked(`${OWN}.txt`, body), want,
+				`grammar disagrees with parse_markers() on ${JSON.stringify(body)}`);
+		}
+	});
+});
+
+// A pool core prepends `**[core: N]**` before the marker; parse_markers peels it
+// before scanning, so a consumer that does not is narrating a suppressed result.
+describe('task-bridge — D7 `**[core: N]**` header is peeled before the marker scan', () => {
+	const D7: [string, boolean][] = [
+		['**[core: 1]**\n[deduped: task-1]',      true ],
+		['**[core: 1]**\n[no-send]',              true ],
+		['**[core: 1]**\n[REPLIED]',              true ],
+		['**[core: 7]**\n_(routed)_\n[no-send]',  true ],
+		['**[core: 1]**\nthe actual reply',       false],
+	];
+
+	it('matches result_markers.py on every D7-prefixed body', () => {
+		for (const [body, want] of D7) {
+			assert.equal(bodyIsSkipMarked(body), want,
+				`disagrees with parse_markers() on ${JSON.stringify(body)}`);
+		}
+	});
+
+	it('retires an OWNED D7-prefixed deduped result', () => {
+		assert.equal(
+			mayRetireSkipMarked(`${OWN}.txt`, '**[core: 1]**\n[deduped: task-1]', owns, origin), true,
+			'a D7-prefixed skip marker was narrated instead of suppressed');
+	});
+
+	it('still refuses a FOREIGN D7-prefixed result', () => {
+		assert.equal(
+			mayRetireSkipMarked(`${FOREIGN}.txt`, '**[core: 1]**\n[no-send]', noneOwned, origin), false);
 	});
 });

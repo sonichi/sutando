@@ -96,7 +96,7 @@ exempt = set(hc.WORKSPACE_ROOT_ALLOWED) | set(personal_assets)
 missing = [
     n for n in root_files
     if n not in exempt
-    and not fnmatch.fnmatch(n, hc.WORKSPACE_ROOT_SENTINEL_GLOB)
+    and not any(fnmatch.fnmatch(n, g) for g in hc.WORKSPACE_ROOT_SENTINEL_GLOBS)
 ]
 if missing:
     bad("every root-resolved personal asset is exempt from the tidy probe",
