@@ -538,7 +538,8 @@ class _RecoverLoop(unittest.TestCase):
             _reset()
 
     def test_persistently_failing_probe_keeps_waiting_even_unguarded(self):
-        # Negative twin: unguarding the probe must not create a false recovery.
+        # A probe stubbed to always fail can never return True, so SystemExit
+        # here is just the harness's bound; assertGreater below is the real pin.
         saved = {n: getattr(gw, n) for n in
                  ("TOKEN_FILE", "TOKEN", "REENROLL_ENABLED", "AUTH_RECHECK_INTERVAL",
                   "_reload_rotated_token", "_heartbeat_singleton", "_auth_probe",
@@ -569,6 +570,57 @@ class _RecoverLoop(unittest.TestCase):
                 gw._recover_auth(401)
             self.assertGreater(probes["n"], 0)   # it did run, unguarded...
             self.assertIsNone(gw._reenroll_state["code"])   # ...but never resumed
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+            _reset()
+
+    def test_probe_only_resume_preserves_the_claim_cadence(self):
+        # A never-parked episode's cadence must survive the clear, or every
+        # future episode re-claims immediately regardless of the 600s throttle.
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "TOKEN", "REENROLL_ENABLED", "AUTH_RECHECK_INTERVAL",
+                  "_reload_rotated_token", "_heartbeat_singleton", "_auth_probe",
+                  "_reenroll_claim", "_emit_gateway_status", "_log", "REENROLL_PROBE_EVERY")}
+        try:
+            gw.TOKEN_FILE = ""
+            gw.TOKEN = "ab" * 24
+            gw.REENROLL_ENABLED = True
+            gw.AUTH_RECHECK_INTERVAL = 0
+            gw.REENROLL_PROBE_EVERY = 1
+            gw._reload_rotated_token = lambda: False
+            gw._emit_gateway_status = lambda *a, **k: None
+            gw._log = lambda m: None
+            gw._reenroll_claim = lambda: None   # always refused, never parks
+            gw._heartbeat_singleton = lambda: True
+            gw._reenroll_state["last_attempt_at"] = 12345.0   # a real prior POST
+            gw._auth_probe = lambda: True   # resolves on cycle 1
+            self.assertTrue(gw._recover_auth(401))
+            self.assertEqual(gw._reenroll_state["last_attempt_at"], 12345.0)
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+            _reset()
+
+    def test_probe_ignores_reenroll_kill_switch(self):
+        # Documented, intentional: REMOTE_REENROLL=0 disables self-claim, not the probe.
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "TOKEN", "REENROLL_ENABLED", "AUTH_RECHECK_INTERVAL",
+                  "_reload_rotated_token", "_heartbeat_singleton", "_auth_probe",
+                  "_reenroll_claim", "_emit_gateway_status", "_log", "REENROLL_PROBE_EVERY")}
+        try:
+            gw.TOKEN_FILE = "/tmp/token-file"   # rotation channel: no fatal exit
+            gw.TOKEN = "ab" * 24
+            gw.REENROLL_ENABLED = False
+            gw.AUTH_RECHECK_INTERVAL = 0
+            gw.REENROLL_PROBE_EVERY = 1
+            gw._reload_rotated_token = lambda: False
+            gw._emit_gateway_status = lambda *a, **k: None
+            gw._log = lambda m: None
+            gw._heartbeat_singleton = lambda: True
+            gw._auth_probe = lambda: True
+            self.assertTrue(gw._recover_auth(401))
+            self.assertIsNone(gw._reenroll_state["code"])
         finally:
             for n, v in saved.items():
                 setattr(gw, n, v)
