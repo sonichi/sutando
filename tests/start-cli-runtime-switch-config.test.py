@@ -37,6 +37,8 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# resolved with the real PATH, so a test may hand the child an empty one
+BASH = shutil.which("bash") or "/bin/bash"
 SCRIPT = REPO / "src" / "agent" / "start-cli.sh"
 
 # What bare `python3` does on a genuinely fresh Mac.
@@ -77,7 +79,7 @@ def _run_writer(repo: str, runtime: str, *, env: dict) -> subprocess.CompletedPr
         + _resolver_snippet().replace("  fi", "fi") + "\n"
         f'"$_cfg_py" "{body}" "{repo}" "{runtime}"\n'
     )
-    return subprocess.run(["bash", "-c", harness], capture_output=True, text=True, env=env)
+    return subprocess.run([BASH, "-c", harness], capture_output=True, text=True, env=env)
 
 
 class RuntimeSwitchConfig(unittest.TestCase):
@@ -101,7 +103,9 @@ class RuntimeSwitchConfig(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = dict(os.environ)
             env.pop("SUTANDO_PY", None)
-            env["PATH"] = "/bin"          # bash resolves here; python3 does not
+            empty = Path(tmp) / "emptypath"
+            empty.mkdir()
+            env["PATH"] = str(empty)   # /bin holds python3 on Linux; this holds nothing
             r = _run_writer(tmp, "codex", env=env)
             self.assertNotEqual(r.returncode, 0,
                 "with no runnable interpreter the switch must fail, not shell a stub")
