@@ -84,6 +84,33 @@ class UnquoteEnvTests(unittest.TestCase):
         self.assertEqual(self.m._unquote_env(""), "")
         self.assertIsNone(self.m._unquote_env(None))
 
+    def test_matched_pair_only_unmatched_edge_quotes_are_secret_bytes(self):
+        # A secret is opaque: only a MATCHING wrapped pair is a quoting
+        # artifact. An unmatched edge quote is part of the value and must
+        # survive — .strip("'\"") ate it and silently changed the bearer.
+        for raw in (f"{SECRET}'", f"'{SECRET}", f'"{SECRET}\'', f"{SECRET}\"'"):
+            self.assertEqual(self.m._unquote_env(raw), raw, raw)
+
+    def test_one_layer_only_inner_wrap_is_secret_bytes(self):
+        self.assertEqual(self.m._unquote_env(f"''{SECRET}''"), f"'{SECRET}'")
+        self.assertEqual(self.m._unquote_env(f"\"'{SECRET}'\""), f"'{SECRET}'")
+
+    def test_agrees_with_core_channel_token_clean(self):
+        # One dequote rule repo-wide: sparrow's helper and the core policy
+        # (src/channel_token._clean) must read every value identically, or the
+        # same .env line resolves to two different bearers depending on which
+        # resolver got there first.
+        core_src = pathlib.Path(__file__).resolve().parents[3] / "src"
+        sys.path.insert(0, str(core_src))
+        try:
+            from channel_token import _clean
+        finally:
+            sys.path.remove(str(core_src))
+        for raw in (f"'{COMBINED}'", f'"{COMBINED}"', COMBINED, "",
+                    f"{SECRET}'", f"'{SECRET}", f"''{SECRET}''",
+                    f"\"'{SECRET}'\"", f"  '{COMBINED}'  ", "ab'cd"):
+            self.assertEqual(self.m._unquote_env(raw), _clean(raw), raw)
+
 
 class EnvTierTests(unittest.TestCase):
     """The regression: a quoted credential in the process environment."""
@@ -109,11 +136,14 @@ class EnvTierTests(unittest.TestCase):
         self.assertEqual(m.TOKEN, SECRET)
         self.assertEqual(m.URL, URL)
 
-    def test_trailing_quote_only(self):
-        # Leading quote already eaten upstream: the URL parses, so the request reaches
-        # the gateway and 401s on the bearer alone.
+    def test_unmatched_trailing_quote_is_secret_bytes(self):
+        # A half-quoted value (a writer bug) is NOT healed: under the
+        # matched-pair rule an unmatched edge quote is secret bytes, because
+        # eating it would silently corrupt a legal secret that ends in a
+        # quote. The URL half still parses, so the failure stays a loud 401
+        # at the gateway — never a silent secret mutation on our side.
         m = _load(REMOTE_TASK_TOKEN=f"{COMBINED}'")
-        self.assertEqual(m.TOKEN, SECRET)
+        self.assertEqual(m.TOKEN, f"{SECRET}'")
         self.assertEqual(m.URL, URL)
 
     def test_quoted_split_layout_url(self):

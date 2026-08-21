@@ -349,12 +349,21 @@ _warned_legacy = set()
 
 
 def _unquote_env(v):
-    """Whitespace and surrounding quotes off a credential value.
+    """Whitespace and ONE layer of matching wrapped quotes off a credential
+    value — the dotenv convention, byte-for-byte the core `channel_token._clean`
+    rule, so the two resolvers can never read the same line differently.
 
     The ONE definition every reader uses, so the env tier cannot disagree with
-    the file tiers about a quoted `.env` line.
+    the file tiers about a quoted `.env` line. Matched-pair only: a secret is
+    opaque, so one that genuinely starts or ends with a quote byte (or wears
+    quotes inside a wrapped pair) is preserved verbatim, not eaten.
     """
-    return v.strip().strip("'\"") if v else v
+    if not v:
+        return v
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return v
 
 
 def _env_compat(new, old):
