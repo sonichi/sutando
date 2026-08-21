@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
@@ -46,6 +46,38 @@ beforeEach(() => {
 });
 
 describe('P7 D7.4 vision egress controls', () => {
+	it('the push-path minimum send interval enforces the documented 1 fps cap', async () => {
+		// MAX_FPS clamps only the pull ticker; the push path is bounded by
+		// VISION_MIN_SEND_INTERVAL_MS alone. A frame 950 ms after the last
+		// send must be parked — 1/MAX_FPS is 1000 ms (#3089 deferred this
+		// gate to #3090, which never landed it).
+		// Only a delay in (900, 1000) discriminates 900 from 1000, so the window
+		// is structurally 100ms wide. A real sleep left ~42ms of headroom to the
+		// gate; the gate reads Date.now(), so mock it and the window is exact.
+		const { session, sent } = fakeSession('ACTIVE');
+		mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+		try {
+			setVisionSession(session);
+			startStreaming('browser', undefined, 'push');
+			const r1 = submitFrame(frameBuf(1));
+			assert.equal(r1.ok, true);
+			assert.equal(sent.length, 1);
+			mock.timers.tick(950);
+			const r2 = submitFrame(frameBuf(2));
+			assert.equal(r2.deferred, true, '950 ms after the last send is above 1 fps — must park');
+			assert.equal(sent.length, 1);
+		} finally {
+			mock.timers.reset();
+		}
+		// The derivation the gate must never undercut. This constrains anything
+		// only while MAX_FPS is an independent literal — re-deriving it from
+		// VISION_MIN_SEND_INTERVAL_MS reduces this to `X >= X`, always true.
+		assert.ok(
+			VISION_MIN_SEND_INTERVAL_MS >= 1000 / MAX_FPS,
+			`gate ${VISION_MIN_SEND_INTERVAL_MS}ms undercuts the ${MAX_FPS} fps cap`,
+		);
+	});
+
 	it('browser push rides the central gate: ACTIVE sends, non-ACTIVE defers to the latest-frame slot', async () => {
 		const { session, sent } = fakeSession('CONNECTING');
 		setVisionSession(session);

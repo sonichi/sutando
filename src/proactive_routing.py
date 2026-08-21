@@ -151,3 +151,68 @@ def fallback_claims_name(name, this_channel: str) -> bool:
     destination strands visibly rather than falling into another channel's
     fallback sweep."""
     return proactive_destination(name) in (None, this_channel)
+
+
+# The [channel:] BODY marker names a channel but IMPLIES a bridge, and that
+# implication is what each adapter re-derived — two of them Discord-only.
+
+# Discord snowflake / Matrix room-or-alias / Slack channel id. Anchored whole:
+# a substring match would classify `#room:server` off its leading character.
+_TARGET_KINDS = (
+    ("discord", re.compile(r"\d{17,20}\Z")),
+    ("ag2space", re.compile(r"[!#][^\s:]+:[^\s:]+\Z")),
+    ("slack", re.compile(r"[CDG][A-Z0-9]{6,}\Z")),
+)
+
+
+def target_channel_kind(target) -> "str | None":
+    """The bridge a resolved `[channel:]` target belongs to, or None.
+
+    None means "not recognised as any bridge's address" — deliberately NOT
+    "foreign". See body_claimable_by for why that distinction is load-bearing.
+
+    Telegram is absent by decision, not omission: its bridge DROPS a `[channel:]`
+    redirect outright, so classifying a telegram chat id would route the file to
+    a bridge guaranteed never to deliver it — the strand this module prevents.
+    """
+    value = str(target or "").strip()
+    for kind, pattern in _TARGET_KINDS:
+        if pattern.fullmatch(value):
+            return kind
+    return None
+
+
+def body_target_channel(body) -> "str | None":
+    """The bridge the body addresses, or None when no redirect will EXECUTE.
+
+    Reads the shared parser's redirect action rather than matching the text: a
+    private regex sees `[channel:]` that `[dm-only]` has already disarmed, and
+    routing on a disarmed address strands the file at a bridge that will not
+    deliver it. Re-deriving the grammar here is the defect this module fixes.
+    """
+    from result_markers import parse_markers  # noqa: PLC0415 — see module note
+    redirect = next(
+        (a for a in parse_markers(str(body or "")).actions if a.kind == "redirect"),
+        None)
+    return target_channel_kind(redirect.value) if redirect is not None else None
+
+
+def body_claimable_by(body, this_channel: str) -> bool:
+    """False only when the body names ANOTHER bridge's address.
+
+    An unrecognised target stays claimable, which is the pre-existing behaviour
+    of every body-marker gate and is deliberately not changed here: stranding a
+    briefing on a malformed target is a worse failure than delivering it with a
+    stray marker line, and it is a separate judgement from this one.
+    """
+    kind = body_target_channel(body)
+    return kind is None or kind == this_channel
+
+
+def redirect_target_is_foreign(target, this_channel: str) -> bool:
+    """Strict form: anything not POSITIVELY this bridge's address is foreign.
+
+    The default destination uses this — an unrecognised target must not fall
+    into the default's delivery, or every malformed marker lands in one DM.
+    """
+    return target_channel_kind(target) != this_channel

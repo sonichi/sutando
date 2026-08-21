@@ -81,6 +81,9 @@ assert_class "state/voice-state.json" "structural" || fail=1
 assert_class "state/core-status.json" "structural" || fail=1
 assert_class "state/quota-state.json" "structural" || fail=1
 assert_class "state/dynamic-content.json" "structural" || fail=1
+# Accumulated grants, not a snapshot: newest-mtime drops the granted set when an
+# empty source is newer, and structural only sidecars it — neither merges in-file.
+assert_class "state/slack-allowed-recipients.json" "union-json-array" || fail=1
 # Other state/*.json (not in the per-host carve-out list) still hit newest-mtime
 assert_class "state/random-other.json" "newest-mtime" || fail=1
 assert_class "state/loop-paused-until.sentinel" "structural" || fail=1
@@ -102,6 +105,12 @@ assert_class "agents/foo.json" "structural" || fail=1
 assert_class "docs/design.md" "structural" || fail=1
 assert_class "email-drafts/task-email.txt" "structural" || fail=1
 assert_class "agent-inbox/processed/x.json" "structural" || fail=1
+# Owner-custom tooling surface (report c8310df7): workspace scripts/ is data
+assert_class "scripts/zoom_schedule.py" "collision-keep-both" || fail=1
+assert_class "scripts/lib/helper.py" "collision-keep-both" || fail=1
+# Agent config tree (report 9de2a03d): quarantining it broke skill/hook paths
+assert_class ".claude-sutando/skills/email-triage/scripts/gmail-drafts.py" "structural" || fail=1
+assert_class ".claude-sutando/settings.json" "structural" || fail=1
 
 # Ordering check: state/auth/X.json should match state/auth/* BEFORE state/*.json|newest-mtime.
 # This is Mini's #2 catch — without explicit ordering, auth files would be newest-mtime'd

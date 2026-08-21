@@ -3,9 +3,11 @@
 
 The provider-neutral bridge tests never execute startup.sh's launcher mapping,
 which is how a marker mismatch shipped (inbound images rendered as plain text).
-This test executes the REAL defaulting line extracted from src/startup.sh in a
-bash subshell — not a re-implementation of it — so it fails if the line is
-removed, renamed, or its semantics change:
+This test executes the REAL defaulting line extracted from start_gateway_lanes()
+in src/startup-runtime.sh (startup.sh's own gateway-launch block moved there so
+it can also run standalone via scripts/restart-gateway-lanes.sh) in a bash
+subshell — not a re-implementation of it — so it fails if the line is removed,
+renamed, or its semantics change:
 
   1. unset REMOTE_MEDIA_MARKER  -> defaults to "ag2space-media"
   2. explicitly set             -> the explicit value survives untouched
@@ -15,7 +17,7 @@ import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-STARTUP = REPO / "src" / "startup.sh"
+STARTUP = REPO / "src" / "startup-runtime.sh"
 
 
 def _marker_line() -> str:
@@ -26,8 +28,8 @@ def _marker_line() -> str:
     ]
     assert len(lines) == 1, (
         f"expected exactly one REMOTE_MEDIA_MARKER defaulting line in "
-        f"src/startup.sh, found {len(lines)} — the AG2 launch-block contract "
-        f"this test pins has moved or been duplicated"
+        f"src/startup-runtime.sh, found {len(lines)} — the AG2 launch-block "
+        f"contract this test pins has moved or been duplicated"
     )
     return lines[0]
 

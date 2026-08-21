@@ -126,9 +126,27 @@ def chunk_message(text: str, max_len: int = 1900):
         buf_len = 0
         return chunk
 
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    for idx, line in enumerate(lines):
         # Real fence-line detection (only at start of stripped line, not anywhere)
         opener_on_line = _is_fence_open_line(line)
+
+        # A fence block that fits a chunk alone must not be entered near the
+        # cap — that forces a close/reopen split inside the block.
+        if opener_on_line is not None and fence_opener is None and buf:
+            block_len = len(line) + 1
+            for look in lines[idx + 1:]:
+                block_len += len(look) + 1
+                if _is_fence_open_line(look) is not None \
+                        and _closes_fence(look.strip(), opener_on_line):
+                    break
+            else:
+                block_len = None  # unterminated fence — no lookahead call
+            if block_len is not None and block_len <= max_len \
+                    and buf_len + block_len > max_len:
+                chunk = flush()
+                if chunk is not None:
+                    yield chunk
         # If we're outside a fence and this line is a fence-open, treat as opening.
         # If we're inside a fence and this line matches the fence-token kind,
         # treat as closing (we don't require exact length match for close).
@@ -138,13 +156,40 @@ def chunk_message(text: str, max_len: int = 1900):
         reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
 
         if buf_len + line_overhead + reserve > max_len and buf:
-            chunk = flush()
-            if chunk is not None:
-                yield chunk
-            # Reopen fence in next chunk if we were inside one
-            if fence_opener:
-                buf.append(fence_opener)
-                buf_len = len(fence_opener) + 1
+            # Outside a fence, prefer the last blank line in the lookback
+            # window: the paragraph is what a reader loses to a mid-cut.
+            cut = None
+            if fence_opener is None:
+                scanned = 0
+                for j in range(len(buf) - 1, 0, -1):
+                    scanned += len(buf[j]) + 1
+                    # Lookback is a quarter of the budget so chunks stay near
+                    # max_len (no half-empty sends) at ANY cap, not only 1900.
+                    if scanned > max_len // 4:
+                        break
+                    if buf[j] == "":
+                        cut = j
+                        break
+            tail_len = 0
+            if cut is not None:
+                tail_len = sum(len(t) + 1 for t in buf[cut + 1:])
+                # A cut must leave room for this line, or it trades a clean
+                # boundary for a chunk over max_len.
+                if tail_len + line_overhead + reserve > max_len:
+                    cut = None
+            if cut is not None:
+                head, tail = buf[:cut], buf[cut + 1:]
+                yield "\n".join(head)
+                buf = tail
+                buf_len = tail_len
+            else:
+                chunk = flush()
+                if chunk is not None:
+                    yield chunk
+                # Reopen fence in next chunk if we were inside one
+                if fence_opener:
+                    buf.append(fence_opener)
+                    buf_len = len(fence_opener) + 1
 
         # Single line longer than max_len → hard-split
         if line_overhead + reserve > max_len:
@@ -215,3 +260,15 @@ def chunk_plain_text(text: str, max_len: int) -> list[str]:
     if rest:
         chunks.append(rest)
     return chunks
+
+
+def fits_one_message(text: str, max_len: int = 1900) -> bool:
+    """True when chunk_message would deliver `text` as ONE message.
+
+    The compose-time half of the delivery cap: gate a body on this before
+    writing it, instead of learning from the delivered thread that it split.
+    """
+    gen = chunk_message(text, max_len)
+    if next(gen, None) is None:
+        return True
+    return next(gen, None) is None
