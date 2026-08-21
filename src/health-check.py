@@ -2417,6 +2417,53 @@ def _age_phrase(age_s) -> str:
     return "age unknown" if age_s is None else f"{age_s}s ago"
 
 
+def _norm_remote(u: str) -> str:
+    """FETCH_HEAD drops a trailing `.git` that `remote get-url` keeps."""
+    u = u.strip().rstrip("/")
+    return u[:-4] if u.endswith(".git") else u
+
+
+def _last_fetch_age_s(repo, git_bin: str, expected: str) -> "int | None":
+    """Seconds since this checkout last fetched `expected` from a remote, or None.
+
+    Scoped to `origin/<expected>`, the exact comparison target: FETCH_HEAD's mtime is
+    the last fetch of ANYTHING, so a PR ref — or `main` from a second remote — would
+    otherwise date a stale origin/main.
+    """
+    try:
+        out = subprocess.run([git_bin, "-C", str(repo), "rev-parse", "--git-common-dir"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        common = Path(out.stdout.strip())
+        if not common.is_absolute():
+            common = Path(repo) / common
+        fetch_head = common / "FETCH_HEAD"
+        st = fetch_head.stat()
+        url = subprocess.run([git_bin, "-C", str(repo), "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10)
+        if url.returncode != 0:
+            return None
+        # `remote get-url` keeps a trailing `.git` that FETCH_HEAD drops, so an exact
+        # compare never matches on a real clone; normalise both ends before comparing.
+        want = _norm_remote(url.stdout)
+        marker = f"branch '{expected}' of "
+        for line in fetch_head.read_text(errors="replace").splitlines():
+            i = line.find(marker)
+            if i >= 0 and _norm_remote(line[i + len(marker):]) == want:
+                return max(int(time.time() - st.st_mtime), 0)
+        return None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def _fetch_age_phrase(age_s) -> str:
+    """A currency claim with no fetch behind it is worth naming, not omitting."""
+    if age_s is None:
+        return "no fetch of that branch recorded"
+    return f"a fetch {age_s // 3600}h{age_s % 3600 // 60}m ago"
+
+
 def check_onboarding_status() -> "dict | None":
     """Read the desktop checklist's agent surface (onboarding v2 spec,
     ag2space-cinny-desktop#165 S4).
@@ -2949,7 +2996,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # census costs ten 5s-timeout pgreps to say so. None is unanswerable, so it probes.
     if behind == 0:
         return {"name": name, "status": "ok",
-                "detail": f"live checkout on {expected!r}"}
+                "detail": f"live checkout on {expected!r} "
+                          f"({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin, expected))})"}
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     # LIVE processes only: `src/` moves several times a day, so the running set
     # is what keeps this from becoming the alert fatigue the threshold prevents.
@@ -2996,7 +3044,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           f"{refresh} + restart the affected service. {tail}"}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
-                      + (f", {behind} commits behind" if behind else "")}
+                      + (f", {behind} commits behind" if behind else "")
+                      + f" ({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin, expected))})"}
 
 
 def check_engine_revision_drift(repo_dir: "Path | None" = None,
