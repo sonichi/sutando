@@ -129,10 +129,8 @@ def build_prompt(instructions: str, events: list) -> str:
 def agent_command() -> list:
     override = os.environ.get("SIGNIFICANCE_JUDGE_CMD", "").strip()
     command = shlex.split(override) if override else list(DEFAULT_AGENT_CMD)
-    if not command:
-        raise JudgeError("SIGNIFICANCE_JUDGE_CMD is set but empty")
-    if shutil.which(command[0]) is None:
-        raise JudgeError(f"agent CLI not found on PATH: {command[0]}")
+    if not command or shutil.which(command[0]) is None:
+        raise JudgeError(f"agent CLI not found on PATH: {command[0] if command else '(empty)'}")
     return command
 
 

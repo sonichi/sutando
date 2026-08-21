@@ -20,6 +20,14 @@ REPO = Path(__file__).parent.parent
 JUDGE = REPO / "skills" / "significance-judge" / "scripts" / "judge.py"
 
 
+def _judge_command() -> list:
+    """Instrument the judge subprocess when the coverage gate is driving."""
+    command = [sys.executable]
+    if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+        command += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+    return command + [str(JUDGE)]
+
+
 def _event(event_id: str, **overrides) -> dict:
     row = {
         "id": event_id,
@@ -65,7 +73,7 @@ class JudgeHarness(unittest.TestCase):
             env["SIGNIFICANCE_JUDGE_CMD"] = self.stub_cmd(stub_body)
         env.update(env_extra)
         return subprocess.run(
-            [sys.executable, str(JUDGE)],
+            _judge_command(),
             input=stdin, capture_output=True, text=True, env=env, timeout=60,
         )
 
@@ -217,6 +225,57 @@ class TestEnvironment(JudgeHarness):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertIn("not found on PATH", result.stderr)
+
+    def test_nonpositive_timeout_env_rejected(self):
+        result = self.run_judge(
+            _request([_event("ev-1")]), STUB_VALID,
+            SIGNIFICANCE_JUDGE_TIMEOUT="-5")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("must be positive", result.stderr)
+
+    def test_subagent_timeout_is_reported(self):
+        stub = "import sys, time\nsys.stdin.read()\ntime.sleep(30)\n"
+        result = self.run_judge(
+            _request([_event("ev-1")]), stub,
+            SIGNIFICANCE_JUDGE_TIMEOUT="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("timed out", result.stderr)
+
+    def test_unspawnable_agent_cli_is_reported(self):
+        # On PATH and executable, but not a runnable binary (no shebang) —
+        # the spawn itself raises OSError rather than the CLI-missing check.
+        broken = self.tmp / "broken-agent"
+        broken.write_text("not a runnable program\n")
+        broken.chmod(0o755)
+        result = self.run_judge(
+            _request([_event("ev-1")]),
+            stub_body=None,
+            SIGNIFICANCE_JUDGE_CMD=str(broken),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("could not be spawned", result.stderr)
+
+    def test_oversized_batch_prompt_is_capped(self):
+        capture = self.tmp / "prompt.txt"
+        stub = (
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(capture)!r}).write_text(sys.stdin.read())\n"
+            "print(json.dumps([{'event_id': 'ev-000', 'significance_score': 0.7, 'reason': 'r'}]))\n"
+        )
+        big = "x" * 4000
+        events = [
+            _event(f"ev-{i:03d}", detail=big, title=big, place=big, url=big)
+            for i in range(1000)
+        ]
+        result = self.run_judge(_request(events), stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt_bytes = len(capture.read_text().encode("utf-8"))
+        self.assertLessEqual(prompt_bytes, 1_000_000, "prompt exceeded the byte cap")
+        self.assertIn('"ev-000"', capture.read_text(), "newest events must survive the cap")
+        self.assertEqual(json.loads(result.stdout)[0]["event_id"], "ev-000")
 
     def test_bad_timeout_env_rejected(self):
         result = self.run_judge(
