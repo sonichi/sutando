@@ -24,6 +24,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
 - [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
+- [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
 
 ## Guides and examples
 
