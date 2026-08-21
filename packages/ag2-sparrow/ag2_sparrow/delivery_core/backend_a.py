@@ -25,15 +25,21 @@ class DesignAClaimBackend:
         self.reclaim_ttl_s = reclaim_ttl_s
 
     def publish(self, item_id: str, payload: bytes) -> bool:
-        if outbox._item_path(self.root, item_id).exists():
-            return False
-        outbox._write_item(self.root, item_id, {
-            "item_id": item_id,
-            "payload": payload.decode("utf-8", "replace"),
-            "status": "READY",
-            "published_at": time.time(),
-        })
-        return True
+        with outbox._item_lock(self.root, item_id):
+            if outbox._item_path(self.root, item_id).exists():
+                # DELIVERED = completed lifecycle -> fresh cycle (C-parity);
+                # PARKED stays refused: the operator holds it.
+                if outbox._read_item(self.root, item_id).get("status") != "DELIVERED":
+                    return False
+                if outbox.read_delivery_claim(self.root, item_id) is not None:
+                    return False
+            outbox._write_item(self.root, item_id, {
+                "item_id": item_id,
+                "payload": payload.decode("utf-8", "replace"),
+                "status": "READY",
+                "published_at": time.time(),
+            })
+            return True
 
     def _incarnation_of(self, item_id: str) -> Optional[str]:
         """The claim record's non-reusable identity: pid + process birth +
