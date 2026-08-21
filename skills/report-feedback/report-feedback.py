@@ -22,8 +22,17 @@ import platform
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+
+# Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
+# these; any other target aborts rather than forwarding the owner's token.
+TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
+
+# Test seam. Empty in production: a redirect that downgrades to plaintext must
+# never replay the bearer token, so http is allowed only where a test opts in.
+INSECURE_REDIRECT_HOSTS: frozenset[str] = frozenset()
 
 
 def _redact(text: str) -> str:
@@ -118,6 +127,26 @@ def read_cloud_auth(ws: Path):
     return None, None
 
 
+def why_no_logs(ws: Path) -> str:
+    """Why logs_excerpt() came back empty, in words a ticket reader can act on.
+
+    Runs ONLY on the failure path, so it must never raise: logs_excerpt() already
+    degraded to (None, []) here, and an exception would turn a report filed
+    without logs into a report not filed at all.
+    """
+    logs = ws / "logs"
+    try:
+        if not logs.is_dir():
+            return f"no logs directory at {logs} (reporter ran outside a live workspace)"
+        if not any(f.suffix == ".log" for f in logs.iterdir()):
+            return f"{logs} has no .log files"
+    except OSError as exc:
+        return f"{logs} could not be listed ({type(exc).__name__})"
+    except Exception:  # noqa: BLE001 - the explanation must not outrank the report
+        return f"{logs} could not be inspected"
+    return f"{logs} exists but its log files could not be read"
+
+
 def logs_excerpt(ws: Path):
     """Last 40 lines of the 4 most-recent <workspace>/logs/*.log (capped ~8KB)."""
     try:
@@ -136,6 +165,52 @@ def logs_excerpt(ws: Path):
         return _redact("\n\n".join(parts))[-8000:], [f.name for f in files]
     except Exception:
         return None, []
+
+
+def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
+    """POST the report, following one 307/308 hop itself.
+
+    urllib only auto-follows 307/308 for GET/HEAD — for POST it raises instead,
+    so a cloud host that redirects (sutando.ag2.ai -> .space) makes every report
+    fail with `feedback API 307` and file nothing.
+    """
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Sutando-Feedback/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        if e.code not in (307, 308) or _hops >= 2:
+            raise
+        loc = e.headers.get("Location")
+        if not loc:
+            raise
+        nxt = urllib.parse.urljoin(url, loc)
+        split = urllib.parse.urlsplit(nxt)
+        host = split.hostname or ""
+        # Userinfo lets a target read as a trusted host to this check while
+        # resolving elsewhere in other parsers; refuse rather than reconcile.
+        if split.username or split.password:
+            raise RuntimeError(
+                "refusing to forward credentials to a redirect target carrying userinfo"
+            ) from e
+        if host not in TRUSTED_API_HOSTS:
+            raise RuntimeError(
+                f"refusing to forward credentials to untrusted redirect host {host!r}"
+            ) from e
+        if split.scheme != "https" and host not in INSECURE_REDIRECT_HOSTS:
+            raise RuntimeError(
+                f"refusing to forward credentials over {split.scheme or 'no'} scheme to {host!r}"
+            ) from e
+        return post_feedback(nxt, payload, token, _hops + 1)
 
 
 def main() -> None:
@@ -163,6 +238,10 @@ def main() -> None:
         if excerpt:
             ctx["last_logs_excerpt"] = excerpt
             ctx["log_files"] = names
+        else:
+            # Logs are on by default, so silence here is indistinguishable from
+            # a report that never wanted them. Say why they are absent.
+            ctx["logs_omitted"] = why_no_logs(ws)
 
     payload = {
         "kind": a.kind,
@@ -175,19 +254,9 @@ def main() -> None:
         "body": a.body.strip() or a.title.strip(),
         "context": ctx,
     }
-    req = urllib.request.Request(
-        f"{base.rstrip('/')}/api/feedback",
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "Sutando-Feedback/1.0",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            print(f"OK: filed {a.kind} report ({r.status}).")
+        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+        print(f"OK: filed {a.kind} report ({status}).")
     except urllib.error.HTTPError as e:
         print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
         sys.exit(1)
