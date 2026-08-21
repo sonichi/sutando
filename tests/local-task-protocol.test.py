@@ -343,6 +343,20 @@ check("iter: non-task-prefixed files WITH task: line are included",
 check("iter: no archive dir yields nothing",
       list(ltp.iter_archived_tasks(_tmp / "nonexistent")) == [])
 
+_results = _tmp / "results"
+(_results / "archive-2026-08-20").mkdir(parents=True)
+(_results / "archive-2026-08-21").mkdir(parents=True)
+(_results / "archive-2026-08-20" / "task-retained.txt").write_text("old\n")
+(_results / "archive-2026-08-21" / "task-retained.txt").write_text("new\n")
+(_results / "archive-2026-08-21" / "task-collision.txt").write_text("first\n")
+(_results / "archive-2026-08-21" / "task-collision.txt.1").write_text("second\n")
+check("find result: newest startup-retention directory",
+      ltp.find_result(_results, "task-retained")
+      == _results / "archive-2026-08-21" / "task-retained.txt")
+check("find result: newest collision in startup-retention directory",
+      ltp.find_result(_results, "task-collision")
+      == _results / "archive-2026-08-21" / "task-collision.txt.1")
+
 # _has_task_line: OSError branch (unreadable file returns False, not an exception).
 # Skip when running as root — root can read 0o000 files.
 import os as _os

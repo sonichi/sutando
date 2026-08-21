@@ -20,3 +20,7 @@ an owner request.
 Session IDs live in `<workspace>/state/ag2space-room-sessions.json`. Remove this
 skill or revert its adapter wiring to return every task to the legacy main
 session path.
+
+Provider hard and stall timeouts default to the values declared in
+`manifest.json`. CLI options override environment values, which override the
+manifest defaults.

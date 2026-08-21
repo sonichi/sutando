@@ -547,7 +547,23 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
     flat = sorted(archive.glob(f"{task_id}-*.txt"))
-    return flat[-1] if flat else None
+    if flat:
+        return flat[-1]
+
+    # Startup retention archives are siblings of archive/, not descendants.
+    # They carry the same exact result names and collision suffixes.
+    try:
+        retention_dirs = sorted(
+            (path for path in Path(results_dir).glob("archive-*") if path.is_dir()),
+            reverse=True,
+        )
+    except OSError:
+        retention_dirs = []
+    for directory in retention_dirs:
+        found = newest_archived(directory, task_id)
+        if found is not None:
+            return found
+    return None
 
 
 def find_result(results_dir: Path, task_id: str) -> Path | None:

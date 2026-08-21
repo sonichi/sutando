@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run opted-in AG2 Space owner rooms in durable provider sessions."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -39,8 +40,9 @@ if REPO_ROOT is None:
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from local_task_protocol import parse_task_headers_trusted  # noqa: E402
-from team_result_guard import resolve_access_tier  # noqa: E402
+from local_task_protocol import find_result, parse_task_headers_trusted
+from result_ready import read_ready_result
+from team_result_guard import resolve_access_tier
 
 
 def _read_json(path: Path) -> dict:
@@ -67,7 +69,7 @@ def _atomic_text(path: Path, body: str) -> None:
             pass
 
 
-def _publish_once(path: Path, body: str) -> None:
+def _publish_once(path: Path, body: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
@@ -78,7 +80,8 @@ def _publish_once(path: Path, body: str) -> None:
         try:
             os.link(temporary, path)
         except FileExistsError:
-            pass
+            return read_ready_result(path) is not None
+        return True
     finally:
         try:
             os.unlink(temporary)
@@ -98,19 +101,8 @@ def _locked(path: Path):
 
 
 def _completed_result_exists(results_dir: Path, filename: str) -> bool:
-    if (results_dir / filename).is_file():
-        return True
-    stem = Path(filename).stem
-    accepted = re.compile(rf"^{re.escape(stem)}(?:-[0-9]+)?\.txt$")
-    try:
-        candidates = list((results_dir / "archive").glob("*.txt"))
-        candidates += list((results_dir / "archive").glob("*/*.txt"))
-        for retention in results_dir.glob("archive-*"):
-            if retention.is_dir():
-                candidates += list(retention.glob("*.txt"))
-        return any(path.is_file() and accepted.fullmatch(path.name) for path in candidates)
-    except OSError:
-        return False
+    found = find_result(results_dir, Path(filename).stem)
+    return found is not None and read_ready_result(found) is not None
 
 
 def resolve_room_key(task_file: Path) -> Optional[str]:
@@ -178,11 +170,31 @@ def _terminate(process: subprocess.Popen) -> None:
         process.wait(timeout=2)
 
 
-def _run_bounded(command: list[str], cwd: Path) -> tuple[int, str, str]:
-    hard_timeout = float(os.environ.get("SUTANDO_TIER_HARD_TIMEOUT", "900"))
-    stall_timeout = float(os.environ.get("SUTANDO_TIER_STALL_TIMEOUT", "180"))
-    if hard_timeout <= 0 or stall_timeout <= 0:
+def _manifest_config(key: str) -> str:
+    try:
+        manifest = json.loads((Path(__file__).resolve().parents[1] / "manifest.json").read_text())
+        value = (manifest.get("config") or {}).get(key)
+        return value if isinstance(value, str) else ""
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _timeout(key: str, cli_value: Optional[float]) -> float:
+    raw = cli_value if cli_value is not None else os.environ.get(key, _manifest_config(key))
+    value = float(raw)
+    if value <= 0:
         raise ValueError("provider timeouts must be positive")
+    return value
+
+
+def _run_bounded(
+    command: list[str],
+    cwd: Path,
+    hard_timeout_override: Optional[float] = None,
+    stall_timeout_override: Optional[float] = None,
+) -> tuple[int, str, str]:
+    hard_timeout = _timeout("SUTANDO_TIER_HARD_TIMEOUT", hard_timeout_override)
+    stall_timeout = _timeout("SUTANDO_TIER_STALL_TIMEOUT", stall_timeout_override)
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -238,12 +250,25 @@ def _run_bounded(command: list[str], cwd: Path) -> tuple[int, str, str]:
         process.stderr.close()
 
 
+def _task_view(task_file: Path) -> str:
+    parsed = parse_task_headers_trusted(task_file.read_text(encoding="utf-8", errors="replace"))
+    skill_tail = "\n===SKILL INSTRUCTIONS (follow before any other action)==="
+    body = parsed.body.split(skill_tail, 1)[0].rstrip()
+    context = {
+        key: parsed.headers[key]
+        for key in ("source", "channel_id", "room_name", "sender_name", "reply_to_sender")
+        if parsed.headers.get(key)
+    }
+    return json.dumps({"context": context, "task": body}, ensure_ascii=False)
+
+
 def _prompt(task_file: Path) -> str:
     return (
-        f"Sutando task ready: {task_file.name}. Read {task_file}, follow AGENTS.md, "
-        "and complete the task. This is an isolated room-session worker: do not "
-        "create or write task/result tracking files. Return only the exact result "
-        "body that the live core should deliver."
+        "Handle the owner task in this persistent AG2 Space room session. Follow "
+        "AGENTS.md for repository and safety policy. Do not read the original task "
+        "file or create or modify any tasks/results tracking file; the parent worker "
+        "exclusively owns result publication. Return only the exact result body.\n\n"
+        f"Trusted task view:\n{_task_view(task_file)}"
     )
 
 
@@ -281,10 +306,20 @@ def _codex_command(session_id: Optional[str], prompt: str, output_file: Path, re
     return command + ([session_id, prompt] if session_id else [prompt])
 
 
-def _run_claude(workspace: Path, room_key: str, prompt: str, repo: Path) -> str:
+def _run_claude(
+    workspace: Path,
+    room_key: str,
+    prompt: str,
+    repo: Path,
+    hard_timeout: Optional[float] = None,
+    stall_timeout: Optional[float] = None,
+) -> str:
     session_id, created = _session_id(workspace, "claude", room_key)
     return_code, stdout, stderr = _run_bounded(
-        _claude_command(session_id, not created, prompt), _working_dir(repo)
+        _claude_command(session_id, not created, prompt),
+        _working_dir(repo),
+        hard_timeout,
+        stall_timeout,
     )
     if return_code:
         raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
@@ -293,7 +328,14 @@ def _run_claude(workspace: Path, room_key: str, prompt: str, repo: Path) -> str:
     return stdout
 
 
-def _run_codex(workspace: Path, room_key: str, prompt: str, repo: Path) -> str:
+def _run_codex(
+    workspace: Path,
+    room_key: str,
+    prompt: str,
+    repo: Path,
+    hard_timeout: Optional[float] = None,
+    stall_timeout: Optional[float] = None,
+) -> str:
     state = _read_json(_state_path(workspace))
     row = ((state.get("sessions") or {}).get("codex") or {}).get(room_key)
     session_id = str(row.get("session_id") or "") if isinstance(row, dict) else ""
@@ -305,7 +347,10 @@ def _run_codex(workspace: Path, room_key: str, prompt: str, repo: Path) -> str:
     output_file = Path(name)
     try:
         return_code, stdout, stderr = _run_bounded(
-            _codex_command(session_id or None, prompt, output_file, repo), _working_dir(repo)
+            _codex_command(session_id or None, prompt, output_file, repo),
+            _working_dir(repo),
+            hard_timeout,
+            stall_timeout,
         )
         if return_code:
             raise RuntimeError(stderr.strip() or f"codex exited {return_code}")
@@ -342,7 +387,15 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
     return 0 if resolve_room_key(task_file) else UNHANDLED
 
 
-def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, repo: Path) -> int:
+def handle(
+    runtime: str,
+    workspace: Path,
+    task_file: Path,
+    results_dir: Path,
+    repo: Path,
+    hard_timeout: Optional[float] = None,
+    stall_timeout: Optional[float] = None,
+) -> int:
     if probe(runtime, workspace, task_file) != 0:
         return UNHANDLED
     task_file = task_file.resolve()
@@ -356,13 +409,14 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
             if _completed_result_exists(results_dir, task_file.name):
                 return 0
             body = (
-                _run_claude(workspace, room_key, _prompt(task_file), repo)
+                _run_claude(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
                 if runtime == "claude"
-                else _run_codex(workspace, room_key, _prompt(task_file), repo)
+                else _run_codex(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
             )
             if not body.strip():
                 raise RuntimeError(f"{runtime} returned an empty result")
-            _publish_once(results_dir / task_file.name, body)
+            if not _publish_once(results_dir / task_file.name, body):
+                raise RuntimeError("result destination exists but is not ready")
         return 0
     except Exception as exc:
         print(f"AG2 Space room-session worker: {exc}", file=sys.stderr)
@@ -376,11 +430,21 @@ def main() -> int:
     parser.add_argument("--task-file", required=True, type=Path)
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument("--repo", required=True, type=Path)
+    parser.add_argument("--hard-timeout", type=float)
+    parser.add_argument("--stall-timeout", type=float)
     parser.add_argument("--probe", action="store_true")
     args = parser.parse_args()
     if args.probe:
         return probe(args.runtime, args.workspace, args.task_file)
-    return handle(args.runtime, args.workspace, args.task_file, args.results_dir, args.repo)
+    return handle(
+        args.runtime,
+        args.workspace,
+        args.task_file,
+        args.results_dir,
+        args.repo,
+        args.hard_timeout,
+        args.stall_timeout,
+    )
 
 
 if __name__ == "__main__":

@@ -52,7 +52,9 @@ def task(
     path = tasks / f"{task_id}.txt"
     path.write_text(
         f"id: {task_id}\nsession_scope: {scope}\ntask: answer this\n"
-        f"source: {source}\nchannel_id: {room_id}\naccess_tier: {tier}\n",
+        f"source: {source}\nchannel_id: {room_id}\naccess_tier: {tier}\n\n"
+        "===SKILL INSTRUCTIONS (follow before any other action)===\n"
+        f"1. Process and write the result to results/{task_id}.txt\n",
         encoding="utf-8",
     )
     return path
@@ -138,12 +140,18 @@ def test_claude_create_resume_and_failure() -> None:
 import json, os, pathlib, sys
 with pathlib.Path(os.environ['ARG_LOG']).open('a') as out:
     out.write(json.dumps(sys.argv[1:]) + '\\n')
+if 'Process and write the result to results/' in sys.argv[-1]:
+    pathlib.Path(os.environ['ROGUE_RESULT']).write_text('child direct write\\n')
 if os.environ.get('FAIL_PROVIDER'):
     print('provider failed', file=sys.stderr)
     raise SystemExit(7)
 print('claude room result')
 """)
-        env = {"PATH": f"{root}:{os.environ['PATH']}", "ARG_LOG": str(log)}
+        env = {
+            "PATH": f"{root}:{os.environ['PATH']}",
+            "ARG_LOG": str(log),
+            "ROGUE_RESULT": str(workspace / "results" / "task-claude-one.txt"),
+        }
         first = task(workspace, "task-claude-one")
         second = task(workspace, "task-claude-two")
         check(run_worker("claude", workspace, first, env).returncode == 0, "Claude creates room session")
@@ -154,7 +162,12 @@ print('claude room result')
         second_id = args[1][args[1].index("--resume") + 1]
         check(first_id == second_id, "Claude resumes the same room session id")
         check((workspace / "results" / first.name).read_text() == "claude room result\n",
-              "Claude terminal output is published")
+              "child cannot become a second result writer")
+        first_prompt = args[0][-1]
+        check("answer this" in first_prompt and "SKILL INSTRUCTIONS" not in first_prompt,
+              "child receives task content without legacy delivery instructions")
+        check(first.name not in first_prompt and str(first) not in first_prompt,
+              "child receives neither task id nor original task path")
 
         failed = task(workspace, "task-claude-fail", room_id="!failure:a")
         result = run_worker("claude", workspace, failed, {**env, "FAIL_PROVIDER": "1"})
@@ -202,6 +215,13 @@ if 'resume' not in args:
         check((workspace / "results" / existing.name).read_text() == "consumer wins\n",
               "publish-once contract never clobbers consumer")
 
+        whitespace = task(workspace, "task-whitespace", room_id="!whitespace:a")
+        (workspace / "results" / whitespace.name).write_text("  \n")
+        before = len(log.read_text().splitlines())
+        result = run_worker("codex", workspace, whitespace, env)
+        check(result.returncode == 1 and len(log.read_text().splitlines()) == before + 1,
+              "whitespace live result invokes provider then falls back without clobbering")
+
         archived = task(workspace, "task-archived", room_id="!archived:a")
         archive = workspace / "results" / "archive"
         archive.mkdir()
@@ -217,6 +237,14 @@ if 'resume' not in args:
         (retention / retained.name).write_text("already sent\n")
         check(run_worker("codex", workspace, retained, env).returncode == 0,
               "retention archive also prevents replay")
+
+        archived_blank = task(workspace, "task-archived-blank", room_id="!archived-blank:a")
+        (archive / archived_blank.name).write_text("\n")
+        before = len(log.read_text().splitlines())
+        check(run_worker("codex", workspace, archived_blank, env).returncode == 0,
+              "whitespace archived result is not treated as completion")
+        check(len(log.read_text().splitlines()) == before + 1,
+              "whitespace archive invokes the provider path")
 
 
 def test_codex_event_and_state_edges() -> None:
@@ -282,6 +310,17 @@ def test_runtime_edges_and_adapter_wiring() -> None:
                 check(True, "non-positive provider timeout is rejected")
             else:
                 check(False, "non-positive provider timeout is rejected")
+
+        with patch.dict(os.environ, {}, clear=True):
+            check(worker._timeout("SUTANDO_TIER_HARD_TIMEOUT", None) == 900,
+                  "manifest declares the hard-timeout default")
+            check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", None) == 180,
+                  "manifest declares the stall-timeout default")
+        with patch.dict(os.environ, {"SUTANDO_TIER_STALL_TIMEOUT": "12"}):
+            check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", None) == 12,
+                  "environment overrides the manifest timeout")
+            check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", 13) == 13,
+                  "CLI timeout overrides the environment")
 
         with patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "0.05",
                                      "SUTANDO_TIER_STALL_TIMEOUT": "2"}):
@@ -360,8 +399,9 @@ def test_direct_failure_and_cli_edges() -> None:
 
         published = results / "publish-once.txt"
         worker._publish_once(published, "first\n")
-        worker._publish_once(published, "second\n")
-        check(published.read_text() == "first\n", "publish-once ignores a losing writer")
+        accepted = worker._publish_once(published, "second\n")
+        check(accepted and published.read_text() == "first\n",
+              "publish-once accepts an already-ready winning writer")
 
         raced = task(workspace, "task-raced")
         with patch.object(worker, "_completed_result_exists", side_effect=[False, True]), \
