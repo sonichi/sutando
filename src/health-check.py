@@ -6656,7 +6656,16 @@ def check_task_watcher() -> dict:
     name = "task-watcher"
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
     if not _any_core_alive():
-        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
+        # Stay green (an always-red check informs nothing), but measure before
+        # claiming: a live watcher here makes "not expected" a false premise.
+        idle_trees = _watcher_trees()
+        if idle_trees:
+            return {"name": name, "status": "ok",
+                    "detail": f"no live core heartbeat, but {len(idle_trees)} watcher tree(s) "
+                              f"alive (pids {', '.join(sorted(idle_trees))}) — watcher health is "
+                              "NOT asserted while the core signal is stale"}
+        return {"name": name, "status": "ok",
+                "detail": "no core running and no watcher process — watcher not expected"}
     trees = _watcher_trees()
     roots = sorted(trees)
     if not pid_file.exists():

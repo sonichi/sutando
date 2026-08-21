@@ -12,6 +12,8 @@ and the watcher is not.
 Covers:
   a) no core alive → ok (watcher not expected; must not latch red on hosts
      that simply aren't running Sutando)
+  a2) no core alive but a watcher IS running → still ok, yet the detail must
+     not say "not expected" and must name the pid it measured
   b) core alive, sentinel absent → warn
   c) core alive, sentinel holds a dead PID → warn (crashed, sentinel left behind)
   d) core alive, PID alive but argv is not the watcher → warn (PID reuse)
@@ -480,6 +482,20 @@ def case_a_no_core_is_ok() -> list[str]:
     return []
 
 
+def case_a2_no_core_but_live_watcher_is_not_called_unexpected() -> list[str]:
+    # The gate stays green, but a watcher IS running, so "not expected" is a
+    # false premise and that green would assert nothing about the watcher.
+    r = run_check(core_alive=False, pid_text=None, trees={"11464": ["11464"]})
+    out = []
+    if r["status"] != "ok":
+        out.append(f"a2) must stay ok (anti-latch), got {r['status']}")
+    if "not expected" in r["detail"]:
+        out.append(f"a2) claims 'not expected' with a watcher alive: {r['detail']}")
+    if "11464" not in r["detail"]:
+        out.append(f"a2) does not name the watcher it measured: {r['detail']}")
+    return out
+
+
 def case_b_sentinel_absent_warns() -> list[str]:
     r = run_check(core_alive=True, pid_text=None)
     if r["status"] != "warn":
@@ -724,6 +740,7 @@ def case_q_trees_swallows_probe_failure() -> list[str]:
 def main() -> int:
     cases = [
         ("a", case_a_no_core_is_ok),
+        ("a2", case_a2_no_core_but_live_watcher_is_not_called_unexpected),
         ("b", case_b_sentinel_absent_warns),
         ("c", case_c_dead_pid_warns),
         ("d", case_d_pid_reuse_warns),
