@@ -2242,6 +2242,9 @@ def _write_task(task: dict) -> str | None:
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
+    # Which instance took delivery (shared-room fan-out: each Sutando writes its own
+    # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
+    _recv = _reenroll_identity()
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
         if f == "session_scope":
@@ -2332,6 +2335,9 @@ def _write_task(task: dict) -> str | None:
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
+            # After id: so the canonical id-first / HMAC-stamp prefix stays line 0.
+            if f == "id" and _recv:
+                lines.append(f"receiving_instance: {_one_line(_recv)}")
     # sender_tier is resolved once, ahead of the field loop above (needed there
     # for the "task" field's vault interception), and reused here unchanged.
     # All preceding fields are newline-stripped, so none can forge a tier header.
