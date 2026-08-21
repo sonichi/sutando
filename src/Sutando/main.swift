@@ -344,12 +344,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(pauseItem)
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        // Core Runtime picker — switch the persistent core between Claude and
-        // Codex without hand-editing config. Each item shells to
-        // start-cli.sh --runtime <name> --restart (see switchRuntime), which
-        // persists core.runtime to sutando.config.local.json and refreshes the
-        // runtime marker before restarting into the chosen CLI. The current
-        // runtime (sutando-config.sh core-runtime) gets the ● checkmark.
+        // Each item shells to start-cli.sh --runtime <name> via switchRuntime;
+        // the runtime from sutando-config.sh core-runtime gets the ● checkmark.
         let currentRuntime = (runShell("/bin/bash",
             [repoRoot + "/scripts/sutando-config.sh", "core-runtime"]) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2588,11 +2584,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Switch the persistent core runtime (claude|codex) and restart into it.
-    /// Mirrors restartCore's detached-bash + stderr-on-failure contract, but
-    /// passes --runtime so start-cli.sh persists the choice to
-    /// sutando.config.local.json and refreshes the runtime marker before
-    /// restarting. No-op-safe if the chosen runtime is already active (the
-    /// config write + restart just re-selects the same CLI).
+    /// Re-selecting the already-active runtime is a no-op-safe write + restart.
     func switchRuntime(_ runtime: String) {
         notify("Sutando", "Switching core runtime to \(runtime)…")
         let script = repoRoot + "/src/agent/start-cli.sh"
