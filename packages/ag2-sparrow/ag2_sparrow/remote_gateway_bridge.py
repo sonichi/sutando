@@ -2960,8 +2960,9 @@ def _delivery_core() -> DeliveryCore:
     """The outbound result leg behind the ClaimBackend/DeliveryProvider seam:
     claim, retry, ambiguity and crash-recovery semantics live in DeliveryCore;
     this bridge keeps presentation (guard, markers, attachments) and the
-    resolved dirs. max_attempts=None preserves the legacy semantics — a failed
-    POST retries on every pass, never terminally. The root lives INSIDE the
+    resolved dirs. The ceiling is the shared outbound cap, NOT the legacy
+    retry-every-pass behaviour: an unbounded retry is a duplicate generator.
+    The root lives INSIDE the
     results dir it drains (archive/ and undelivered/ precedent), so every
     harness that redirects RESULTS_DIR is hermetic for free; the singleton is
     keyed by that root and recomposes when it moves."""
@@ -2973,7 +2974,7 @@ def _delivery_core() -> DeliveryCore:
             # Late-bound so token rotation reassigning module globals (and the
             # test harness's _req double) reach the provider mid-process.
             AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)),
-            policy=RetryPolicy(max_attempts=None),
+            policy=RetryPolicy(max_attempts=MAX_TRANSIENT_ATTEMPTS),
             worker="gateway-result-drain")
     return _DELIVERY_CORE
 

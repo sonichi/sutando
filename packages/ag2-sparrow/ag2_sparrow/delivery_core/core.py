@@ -23,9 +23,14 @@ from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryP
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """None removes the park ceiling: every confirmed NOT_DELIVERED stays
-    retryable (an adapter keeping legacy retry-every-pass semantics)."""
-    max_attempts: "int | None" = 3
+    """The park ceiling is mandatory: an adapter may raise it, never remove it.
+    An unbounded retry is a duplicate generator, not a resilience setting."""
+    max_attempts: int = 3
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_attempts, int) or self.max_attempts < 1:
+            raise ValueError(
+                f"max_attempts must be a positive int, got {self.max_attempts!r}")
 
 
 def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:

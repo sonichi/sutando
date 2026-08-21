@@ -119,7 +119,7 @@ def main() -> int:
                              {"ok": True, "duplicate": True})
         core = DeliveryCore(DesignAClaimBackend(Path(td)),
                             AG2SpaceResultProvider(gw),
-                            policy=RetryPolicy(max_attempts=None), worker="w")
+                            policy=RetryPolicy(max_attempts=10), worker="w")
         core.backend.publish("task-X", ENVELOPE)
         res = core.deliver_one("task-X", ENVELOPE)
         check("UNKNOWN resolved by idempotent re-send -> CONFIRMED",
@@ -134,7 +134,7 @@ def main() -> int:
                              {"ok": True, "duplicate": True})
         core = DeliveryCore(DesignAClaimBackend(Path(td)),
                             AG2SpaceResultProvider(gw),
-                            policy=RetryPolicy(max_attempts=None), worker="w")
+                            policy=RetryPolicy(max_attempts=10), worker="w")
         core.backend.publish("task-X", ENVELOPE)
         res = core.deliver_one("task-X", ENVELOPE)
         check("double-UNKNOWN completes NOT_DELIVERED (retryable), not parked",
@@ -149,7 +149,7 @@ def main() -> int:
         gw = ScriptedGateway({"ok": True}, {"ok": True})
         core = DeliveryCore(DesignAClaimBackend(Path(td)),
                             AG2SpaceResultProvider(gw),
-                            policy=RetryPolicy(max_attempts=None), worker="w")
+                            policy=RetryPolicy(max_attempts=10), worker="w")
         core.backend.publish("task-X", ENVELOPE)
         check("first cycle confirms",
               core.deliver_one("task-X", ENVELOPE).outcome
@@ -166,28 +166,40 @@ def main() -> int:
         check("PARKED still refuses re-publish (operator holds it)",
               core.backend.publish("task-Y", ENVELOPE) is False)
 
-    # Refusals stay retryable forever under max_attempts=None (the legacy
-    # retry-every-pass semantics this adapter keeps).
+    # Repeated refusals PARK at the ceiling. A retry that never terminates is a
+    # duplicate generator (#2959/#2960), so the cap is not optional here.
     with tempfile.TemporaryDirectory() as td:
         gw = ScriptedGateway(*([_http_error(400)] * 5 + [{"ok": True}]))
         core = DeliveryCore(DesignAClaimBackend(Path(td)),
                             AG2SpaceResultProvider(gw),
-                            policy=RetryPolicy(max_attempts=None), worker="w")
+                            policy=RetryPolicy(max_attempts=3), worker="w")
         core.backend.publish("task-X", ENVELOPE)
-        for i in range(5):
+        for i in range(3):
             res = core.deliver_one("task-X", ENVELOPE)
-            check(f"refusal #{i+1} completes NOT_DELIVERED, item stays claimable",
+            check(f"refusal #{i+1} completes NOT_DELIVERED",
                   res.outcome is DeliveryOutcome.NOT_DELIVERED
                   and core.backend.attempts("task-X") == i + 1)
+        # The 4th pass must NOT reach the provider: the item is parked, so the
+        # still-scripted {"ok": True} is never consumed.
         res = core.deliver_one("task-X", ENVELOPE)
-        check("6th pass (no ceiling) still claims and now confirms",
-              res.outcome is DeliveryOutcome.CONFIRMED)
+        check("at the ceiling the item is PARKED, not retried forever",
+              res.status is DrainStatus.NOT_CLAIMED)
+        check("a parked item refuses re-publish (operator holds it)",
+              core.backend.publish("task-X", ENVELOPE) is False)
+
+    # The ceiling cannot be removed: None/0/negative are rejected at construction.
+    for bad in (None, 0, -1):
+        try:
+            RetryPolicy(max_attempts=bad)
+            check(f"RetryPolicy(max_attempts={bad!r}) must raise", False)
+        except ValueError:
+            check(f"RetryPolicy(max_attempts={bad!r}) rejected", True)
 
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}", file=sys.stderr)
         return 1
     print("\nPASS: AG2SpaceResultProvider — classification, idempotent-resend "
-          "confirmation, no-ceiling retry parity")
+          "confirmation, mandatory retry ceiling")
     return 0
 
 
