@@ -4193,6 +4193,9 @@ async def _handle_discord_message(message, force=False):
             f"channel_name: {channel_name}\n"
             f"guild_name: {guild_name}\n"
             f"source_message_id: {message.id}\n"
+            # Same namespace as the addressee in the body (`<@id>`), so a non-addressed core
+            # can tell. Must stay above `task:` — later lines parse as untrusted body.
+            f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
             f"access_tier: {access_tier}\n"
@@ -4977,6 +4980,12 @@ async def poll_results():
                         if _is_path_sendable(fpath):
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
+                        elif not fpath:
+                            # EMPTY target = malformed, not a prose quotation.
+                            # Unsurfaced, a file-only result retires with no output.
+                            await channel.send(
+                                "(a file marker in this reply had no path — nothing attached)")
+                            print("  [file marker with EMPTY path — malformed, surfaced]", flush=True)
                         elif not os.path.isfile(fpath):
                             # Prose-quoted `[file:/path]` substrings extract
                             # as markers but reference no real file. Log for
