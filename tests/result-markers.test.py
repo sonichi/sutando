@@ -223,12 +223,18 @@ class TestNoLeakInvariant(unittest.TestCase):
     def test_empty_target_markers_never_leak_in_any_family(self):
         # Each family captured `+` (one-or-more), so the bare `[x:]` form matched
         # nothing and shipped its own marker text with the body.
-        for src, kind in (("[deduped:]\nbody", "skip"),
-                          ("[channel:]\nbody", "redirect"),
-                          ("[file:]\nbody", "attach")):
+        # redirect expects NO action: an empty target is not a target. Emitting
+        # value="" composed claim policy (malformed stays claimable) with the
+        # default sink's strict foreign gate into a claim/release loop, plus
+        # int("") at both Discord conversion sites. The marker is still
+        # recognised and stripped; the body takes the default route. Pinned
+        # end-to-end in tests/empty-redirect-target-default-route.test.py.
+        for src, kinds in (("[deduped:]\nbody", ["skip"]),
+                           ("[channel:]\nbody", []),
+                           ("[file:]\nbody", ["attach"])):
             with self.subTest(src=src.splitlines()[0]):
                 r = parse_markers(src)
-                self.assertEqual([a.kind for a in r.actions], [kind])
+                self.assertEqual([a.kind for a in r.actions], kinds)
                 for marker in ("[deduped:", "[channel:", "[file:"):
                     self.assertNotIn(marker, r.body)
 

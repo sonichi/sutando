@@ -257,8 +257,13 @@ def parse_markers(text: str) -> ParseResult:
     # private body stays in the owner's DM.
     redirect_match = _REDIRECT_RE.match(body)
     if redirect_match:
-        if not dm_only:
-            channel = redirect_match.group(1).strip()
+        channel = redirect_match.group(1).strip()
+        if not dm_only and channel:
+            # An EMPTY target is not a target: strip the recognised marker but
+            # emit NO redirect action, so the body takes the default route.
+            # Emitting value="" made the default sink's foreign-gate release
+            # the file (unrecognised != this bridge) while claim policy kept
+            # it claimable — an infinite release loop, and int("") downstream.
             actions.append(Action(kind="redirect", value=channel))
         body = body[redirect_match.end():]
 
