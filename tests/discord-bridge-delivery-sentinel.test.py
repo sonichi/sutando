@@ -235,9 +235,9 @@ def test_bridge_delegates_terminal_decisions_to_outbox_before_send():
     start = src.index("async def poll_results():")
     end = src.index("\nasync def ", start + 1)
     body = src[start:end]
-    receipt_pos = body.index("_terminal_receipt_state(task_id)")
+    receipt_pos = body.index("_terminal_receipt_state(task_id,")
     send_pos = body.index("await channel.send(")
-    mark_pos = body.index("_mark_delivered(task_id)")
+    mark_pos = body.index("_mark_delivered(task_id,")
     assert receipt_pos < send_pos < mark_pos
 
 

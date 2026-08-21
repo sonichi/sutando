@@ -79,6 +79,63 @@ def test_states_dispositions_and_first_terminal_wins():
                 raise AssertionError("partial nonterminal receipt was accepted")
 
 
+def test_content_digest_matches_and_changed_content_replaces_receipt():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        first_digest = outbox.terminal_content_digest("first answer")
+        changed_digest = outbox.terminal_content_digest("revised answer")
+        first = outbox.record_terminal_receipt(
+            root, "revision", outbox.TerminalDisposition.DELIVERED,
+            now=10.0, content_digest=first_digest)
+
+        assert outbox.terminal_receipt_content_state(
+            first, first_digest) is outbox.TerminalReceiptState.TERMINAL
+        assert outbox.terminal_receipt_content_state(
+            first, changed_digest) is outbox.TerminalReceiptState.ABSENT
+
+        replacement = outbox.record_terminal_receipt(
+            root, "revision", outbox.TerminalDisposition.DELIVERED,
+            now=11.0, content_digest=changed_digest)
+        assert replacement.content_digest == changed_digest
+        assert replacement.recorded_at == 11.0
+        assert outbox.read_terminal_receipt(
+            root, "revision", now=12.0) == replacement
+        assert len(list((root / outbox.TERMINAL_RECEIPTS_DIR).glob("*/*.json"))) == 1
+
+        digestless = outbox.record_terminal_receipt(
+            root, "legacy-shape", outbox.TerminalDisposition.DELIVERED,
+            now=10.0)
+        assert outbox.terminal_receipt_content_state(
+            digestless, first_digest) is outbox.TerminalReceiptState.UNKNOWN
+
+
+def test_failed_content_update_preserves_the_previous_receipt():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        first_digest = outbox.terminal_content_digest("first answer")
+        changed_digest = outbox.terminal_content_digest("revised answer")
+        original = outbox.record_terminal_receipt(
+            root, "failed-revision", outbox.TerminalDisposition.DELIVERED,
+            now=10.0, content_digest=first_digest)
+        path = outbox._terminal_receipt_path(root, "failed-revision", 0)
+        before = path.read_bytes()
+
+        with mock.patch.object(
+                outbox.os, "replace", side_effect=OSError(errno.EIO, "injected")):
+            try:
+                outbox.record_terminal_receipt(
+                    root, "failed-revision", outbox.TerminalDisposition.DELIVERED,
+                    now=11.0, content_digest=changed_digest)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("failed receipt update reported success")
+
+        assert path.read_bytes() == before
+        assert outbox.read_terminal_receipt(
+            root, "failed-revision", now=12.0) == original
+
+
 def test_concurrent_writers_observe_one_terminal_winner():
     with tempfile.TemporaryDirectory() as tmp:
         ctx = multiprocessing.get_context("fork")
@@ -179,6 +236,12 @@ def test_reader_rejects_every_semantically_invalid_record_shape():
         data = outbox._terminal_payload(
             item_id, 0, outbox.TerminalDisposition.DELIVERED, 100.0)
         data["recorded_at"] = "yesterday"
+        cases.append((item_id, 0, data))
+
+        item_id = "invalid-content-digest"
+        data = outbox._terminal_payload(
+            item_id, 0, outbox.TerminalDisposition.DELIVERED, 100.0)
+        data["content_digest"] = "not-sha256"
         cases.append((item_id, 0, data))
 
         item_id = "mismatched-generation"
@@ -723,6 +786,10 @@ def test_invalid_identity_and_clock_inputs_are_rejected():
             lambda: outbox.read_terminal_receipt(tmp, "x", now=float("nan")),
             lambda: outbox.read_terminal_receipt(tmp, "x", now=1.0, ttl_seconds=-1.0),
             lambda: outbox.record_terminal_receipt(tmp, "x", "bogus", now=1.0),
+            lambda: outbox.record_terminal_receipt(
+                tmp, "x", outbox.TerminalDisposition.DELIVERED,
+                now=1.0, content_digest="not-sha256"),
+            lambda: outbox.terminal_content_digest(1),
         ]
         for call in invalid_calls:
             try:

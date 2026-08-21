@@ -41,7 +41,7 @@ CLAIMS_DIR = ".claims"
 LOCKS_DIR = ".claim-locks"
 ITEMS_DIR = ".items"
 TERMINAL_RECEIPTS_DIR = ".terminal-receipts"
-TERMINAL_RECEIPT_SCHEMA = 1
+TERMINAL_RECEIPT_SCHEMA = 2
 TERMINAL_RECEIPT_TTL_S = 30 * 86400.0
 TERMINAL_RECEIPT_MAX_RECORDS = 100_000
 TERMINAL_RECEIPT_MAX_BYTES = 16 * 1024
@@ -756,12 +756,14 @@ class TerminalReceipt:
     generation: int
     disposition: Optional[TerminalDisposition] = None
     recorded_at: Optional[float] = None
+    content_digest: Optional[str] = None
 
     def __post_init__(self) -> None:
         terminal = self.state is TerminalReceiptState.TERMINAL
         if ((self.disposition is not None) is not terminal
                 or (self.recorded_at is not None) is not terminal):
             raise ValueError("a terminal state has a disposition and timestamp")
+        _validate_content_digest(self.content_digest)
 
 
 @dataclass(frozen=True)
@@ -800,14 +802,50 @@ def _terminal_receipt_path(root: Path, item_id: str, generation: int) -> Path:
     return _terminal_receipt_shard(root, digest) / f"{digest}.json"
 
 
+def _validate_content_digest(content_digest: Optional[str]) -> None:
+    if content_digest is None:
+        return
+    if (not isinstance(content_digest, str) or len(content_digest) != 64
+            or any(c not in "0123456789abcdef" for c in content_digest)):
+        raise ValueError("content_digest must be a lowercase SHA-256 digest")
+
+
+def terminal_content_digest(content: Union[str, bytes]) -> str:
+    if isinstance(content, str):
+        encoded = content.encode("utf-8")
+    elif isinstance(content, bytes):
+        encoded = content
+    else:
+        raise ValueError("content must be text or bytes")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def terminal_receipt_content_state(
+    receipt: TerminalReceipt,
+    content_digest: str,
+) -> TerminalReceiptState:
+    """Match a candidate body without treating digest-less evidence as absent."""
+    _validate_content_digest(content_digest)
+    if receipt.state is not TerminalReceiptState.TERMINAL:
+        return receipt.state
+    if receipt.content_digest is None:
+        return TerminalReceiptState.UNKNOWN
+    if receipt.content_digest == content_digest:
+        return TerminalReceiptState.TERMINAL
+    return TerminalReceiptState.ABSENT
+
+
 def _terminal_payload(item_id: str, generation: int,
-                      disposition: TerminalDisposition, recorded_at: float) -> dict:
+                      disposition: TerminalDisposition, recorded_at: float,
+                      content_digest: Optional[str] = None) -> dict:
+    _validate_content_digest(content_digest)
     base = {
         "schema": TERMINAL_RECEIPT_SCHEMA,
         "item_id": item_id,
         "generation": generation,
         "disposition": disposition.value,
         "recorded_at": recorded_at,
+        "content_digest": content_digest,
     }
     canonical = json.dumps(base, ensure_ascii=False, sort_keys=True,
                            separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -852,7 +890,7 @@ def _read_terminal_path(path: Path, item_id: Optional[str] = None,
     except (UnicodeDecodeError, json.JSONDecodeError):
         return _unknown_terminal(item_id, generation)
     fields = {"schema", "item_id", "generation", "disposition",
-              "recorded_at", "checksum"}
+              "recorded_at", "content_digest", "checksum"}
     if not isinstance(data, dict) or set(data) != fields:
         return _unknown_terminal(item_id, generation)
     if data.get("schema") != TERMINAL_RECEIPT_SCHEMA:
@@ -860,6 +898,7 @@ def _read_terminal_path(path: Path, item_id: Optional[str] = None,
     stored_item = data.get("item_id")
     stored_generation = data.get("generation")
     recorded_at = data.get("recorded_at")
+    content_digest = data.get("content_digest")
     if not isinstance(stored_item, str) or not stored_item:
         return _unknown_terminal(item_id, generation)
     if (isinstance(stored_generation, bool)
@@ -867,6 +906,10 @@ def _read_terminal_path(path: Path, item_id: Optional[str] = None,
         return _unknown_terminal(item_id, generation)
     if (isinstance(recorded_at, bool) or not isinstance(recorded_at, (int, float))
             or not math.isfinite(float(recorded_at))):
+        return _unknown_terminal(item_id, generation)
+    try:
+        _validate_content_digest(content_digest)
+    except ValueError:
         return _unknown_terminal(item_id, generation)
     if item_id is not None and stored_item != item_id:
         return _unknown_terminal(item_id, generation)
@@ -886,7 +929,8 @@ def _read_terminal_path(path: Path, item_id: Optional[str] = None,
     if not isinstance(checksum, str) or checksum != hashlib.sha256(canonical).hexdigest():
         return _unknown_terminal(item_id, generation)
     return TerminalReceipt(TerminalReceiptState.TERMINAL, stored_item,
-                           stored_generation, disposition, float(recorded_at))
+                           stored_generation, disposition, float(recorded_at),
+                           content_digest)
 
 
 def _terminal_clock_and_ttl(now: Optional[float],
@@ -961,9 +1005,11 @@ def record_terminal_receipt(
     generation: int = 0,
     now: Optional[float] = None,
     ttl_seconds: float = TERMINAL_RECEIPT_TTL_S,
+    content_digest: Optional[str] = None,
 ) -> TerminalReceipt:
-    """Persist one terminal outcome. The first valid or corrupt record wins."""
+    """Persist one terminal outcome, replacing it for newly delivered content."""
     _terminal_identity(item_id, generation)
+    _validate_content_digest(content_digest)
     try:
         terminal = TerminalDisposition(disposition)
     except (TypeError, ValueError) as exc:
@@ -974,7 +1020,7 @@ def record_terminal_receipt(
     shard_name = digest[:2]
     path = _terminal_receipt_shard(root, digest) / f"{digest}.json"
     encoded = _terminal_bytes(
-        _terminal_payload(item_id, generation, terminal, recorded_at))
+        _terminal_payload(item_id, generation, terminal, recorded_at, content_digest))
     if len(encoded) > TERMINAL_RECEIPT_MAX_BYTES:
         raise ValueError("terminal receipt exceeds the durable record size limit")
     capacity = _terminal_shard_capacity(
@@ -983,6 +1029,7 @@ def record_terminal_receipt(
         return _unknown_terminal(item_id, generation)
     _ensure_terminal_root(root)
     with _item_lock(root, _terminal_shard_lock_id(shard_name)):
+        replace_existing = False
         current = _read_terminal_path(path, item_id, generation)
         if current.state is TerminalReceiptState.UNKNOWN:
             _cleanup_terminal_receipt_shard_locked(
@@ -994,18 +1041,23 @@ def record_terminal_receipt(
                 _cleanup_terminal_receipt_shard_locked(
                     root, shard_name, recorded_at, ttl, capacity,
                     protected_name=path.name)
-                return current
-            try:
-                path.unlink()
-                _fsync_directory(path.parent)
-            except FileNotFoundError:
-                pass
-            except OSError:
+                if (content_digest is None
+                        or current.content_digest == content_digest):
+                    return current
+                replace_existing = True
+            else:
+                try:
+                    path.unlink()
+                    _fsync_directory(path.parent)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return _unknown_terminal(item_id, generation)
+        if not replace_existing:
+            cleanup = _cleanup_terminal_receipt_shard_locked(
+                root, shard_name, recorded_at, ttl, max(0, capacity - 1))
+            if cleanup.incomplete or cleanup.kept >= capacity:
                 return _unknown_terminal(item_id, generation)
-        cleanup = _cleanup_terminal_receipt_shard_locked(
-            root, shard_name, recorded_at, ttl, max(0, capacity - 1))
-        if cleanup.incomplete or cleanup.kept >= capacity:
-            return _unknown_terminal(item_id, generation)
         directory = _ensure_terminal_receipts_dir(root, digest)
         fd, tmp_name = tempfile.mkstemp(dir=str(directory),
                                         prefix=f".{digest}.", suffix=".tmp")
@@ -1015,13 +1067,17 @@ def record_terminal_receipt(
                 fh.write(encoded)
                 fh.flush()
                 os.fsync(fh.fileno())
-            try:
-                os.link(str(tmp), str(path))
-            except FileExistsError:
-                return _read_terminal_path(path, item_id, generation)
+            if replace_existing:
+                os.replace(str(tmp), str(path))
+            else:
+                try:
+                    os.link(str(tmp), str(path))
+                except FileExistsError:
+                    return _read_terminal_path(path, item_id, generation)
             _fsync_directory(directory)
             return TerminalReceipt(TerminalReceiptState.TERMINAL, item_id,
-                                   generation, terminal, recorded_at)
+                                   generation, terminal, recorded_at,
+                                   content_digest)
         finally:
             tmp.unlink(missing_ok=True)
             _fsync_directory(directory)

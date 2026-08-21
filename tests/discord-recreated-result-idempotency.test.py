@@ -166,10 +166,11 @@ class DiscordRecreatedResultTest(unittest.TestCase):
         (bridge.RESULTS_DIR / f"{task_id}.txt").write_text(body, encoding="utf-8")
 
     @staticmethod
-    def _terminal(task_id: str, disposition=None) -> None:
+    def _terminal(task_id: str, result_body: str, disposition=None) -> None:
         bridge.outbox.record_terminal_receipt(
             bridge._result_receipt_root(), task_id,
             disposition or bridge.outbox.TerminalDisposition.DELIVERED,
+            content_digest=bridge.outbox.terminal_content_digest(result_body),
         )
 
     @staticmethod
@@ -244,7 +245,7 @@ class DiscordRecreatedResultTest(unittest.TestCase):
             1,
         )
 
-    def test_recreated_confirmed_result_is_retired_without_another_send(self):
+    def test_identical_recreation_is_suppressed_but_changed_body_is_delivered(self):
         task_id = "task-2000000000001"
         first = "first confirmed answer"
         changed = "completion narration written after the answer"
@@ -261,16 +262,22 @@ class DiscordRecreatedResultTest(unittest.TestCase):
         self._result(task_id, changed)
         self._one_pass()
 
-        self.assertEqual(self.channel.sent, [first])
-        self.assertEqual(self.client.fetches, 1)
+        self.assertEqual(self.channel.sent, [first, changed])
+        self.assertEqual(self.client.fetches, 2)
         self.assertFalse((bridge.RESULTS_DIR / f"{task_id}.txt").exists())
         self.assertNotIn(task_id, bridge.pending_replies)
         self.assertEqual(self._archive_bodies(task_id), sorted([first, first, changed]))
+        receipt = bridge.outbox.read_terminal_receipt(
+            bridge._result_receipt_root(), task_id)
+        self.assertEqual(
+            receipt.content_digest,
+            bridge.outbox.terminal_content_digest(changed),
+        )
 
     def test_archive_failure_retries_without_send_or_audit_then_audits_once(self):
         task_id = "task-2000000000002"
         self._live_task(task_id)
-        self._terminal(task_id)
+        self._terminal(task_id, "late copy")
         self._result(task_id, "late copy")
         original = bridge.archive_file
         bridge.archive_file = lambda *_args, **_kwargs: False
@@ -299,7 +306,7 @@ class DiscordRecreatedResultTest(unittest.TestCase):
     def test_pending_terminal_nonempty_result_retires_without_send_or_failure(self):
         task_id = "task-2000000000009"
         self._seed_pending(task_id, "already delivered")
-        self._terminal(task_id)
+        self._terminal(task_id, "already delivered")
 
         self._one_pass()
 
@@ -314,23 +321,35 @@ class DiscordRecreatedResultTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][2:], ["deduped", "discord"])
 
-    def test_pending_terminal_empty_result_retires_without_send_or_failure(self):
+    def test_pending_changed_result_is_delivered_and_updates_receipt(self):
+        task_id = "task-2000000000014"
+        changed = "revised while the route is still pending"
+        self._seed_pending(task_id, changed)
+        self._terminal(task_id, "earlier delivered body")
+
+        self._one_pass()
+
+        self.assertEqual(self.channel.sent, [changed])
+        receipt = bridge.outbox.read_terminal_receipt(
+            bridge._result_receipt_root(), task_id)
+        self.assertEqual(
+            receipt.content_digest,
+            bridge.outbox.terminal_content_digest(changed),
+        )
+
+    def test_pending_terminal_empty_result_stays_live_until_ready(self):
         task_id = "task-2000000000010"
         self._seed_pending(task_id, "")
-        self._terminal(task_id)
+        self._terminal(task_id, "")
 
         self._one_pass()
 
         self.assertEqual(self.channel.sent, [])
-        self.assertFalse((bridge.RESULTS_DIR / f"{task_id}.txt").exists())
-        self.assertFalse((bridge.TASKS_DIR / f"{task_id}.txt").exists())
-        self.assertNotIn(task_id, bridge.pending_replies)
-        self.assertNotIn(task_id, bridge.pending_reply_anchors)
-        self.assertNotIn(task_id, bridge.pending_task_tiers)
-        self.assertNotIn(task_id, bridge._empty_result_polls)
-        rows = self._audit_rows(task_id)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][2:], ["deduped", "discord"])
+        self.assertTrue((bridge.RESULTS_DIR / f"{task_id}.txt").exists())
+        self.assertTrue((bridge.TASKS_DIR / f"{task_id}.txt").exists())
+        self.assertIs(bridge.pending_replies.get(task_id), self.channel)
+        self.assertEqual(bridge._empty_result_polls.get(task_id), 1)
+        self.assertEqual(self._audit_rows(task_id), [])
 
     def test_pending_unknown_nonempty_result_stays_live_across_polls(self):
         self._assert_pending_unknown_is_held(
@@ -339,7 +358,7 @@ class DiscordRecreatedResultTest(unittest.TestCase):
     def test_pending_unknown_empty_result_stays_live_without_empty_count(self):
         self._assert_pending_unknown_is_held("task-2000000000012", "")
 
-    def test_fresh_bridge_module_suppresses_a_recreated_result(self):
+    def test_fresh_bridge_suppresses_identical_body_and_delivers_revision(self):
         task_id = "task-2000000000013"
         first = "first process delivered this"
         self._archived_task(task_id)
@@ -349,7 +368,7 @@ class DiscordRecreatedResultTest(unittest.TestCase):
         self.assertTrue(bridge._has_durable_terminal_receipt(task_id))
         self.assertFalse(bridge._delivered_sentinel_path(task_id).exists())
 
-        self._result(task_id, "recreated after process restart")
+        self._result(task_id, first)
         fresh = _load_bridge("discord_recreated_result_bridge_restart")
         fresh.REPO = WORKSPACE
         fresh.RESULTS_DIR = WORKSPACE / "results"
@@ -381,6 +400,19 @@ class DiscordRecreatedResultTest(unittest.TestCase):
         self.assertFalse((fresh.RESULTS_DIR / f"{task_id}.txt").exists())
         self.assertNotIn(task_id, fresh.pending_replies)
         self.assertTrue(fresh._has_durable_terminal_receipt(task_id))
+
+        revision = "revised after process restart"
+        self._result(task_id, revision)
+        self._one_pass(fresh)
+
+        self.assertEqual(fresh_channel.sent, [revision])
+        self.assertEqual(fresh_client.fetches, 1)
+        receipt = fresh.outbox.read_terminal_receipt(
+            fresh._result_receipt_root(), task_id)
+        self.assertEqual(
+            receipt.content_digest,
+            fresh.outbox.terminal_content_digest(revision),
+        )
 
     def test_failed_delivery_record_does_not_suppress_a_recreated_result(self):
         task_id = "task-2000000000003"
@@ -443,7 +475,7 @@ class DiscordRecreatedResultTest(unittest.TestCase):
             1,
         )
 
-    def test_terminal_skip_outcomes_do_not_resurrect_as_plain_replies(self):
+    def test_changed_body_after_terminal_skip_is_a_followup(self):
         for offset, marker, disposition in (
             (6, "[no-send]\nalready handled", bridge.outbox.TerminalDisposition.NO_SEND),
             (7, "[deduped: task-holder]\nalready handled",
@@ -462,7 +494,10 @@ class DiscordRecreatedResultTest(unittest.TestCase):
                 self._result(task_id, "late completion narration")
                 self._one_pass()
 
-        self.assertEqual(self.channel.sent, [])
+        self.assertEqual(
+            self.channel.sent,
+            ["late completion narration", "late completion narration"],
+        )
 
     def test_corrupt_receipt_holds_the_result_instead_of_sending_or_discarding(self):
         task_id = "task-2000000000008"
