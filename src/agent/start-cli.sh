@@ -59,15 +59,14 @@ if [ -n "$requested_runtime" ]; then
     claude|codex) ;;
     *) echo "start-cli: unsupported --runtime: $requested_runtime (expected claude|codex)" >&2; exit 2 ;;
   esac
-  # Same resolution as scripts/sutando-config.sh and the per-runtime launchers:
-  # this path runs from the app menu, where a bare `python3` can be Apple's
-  # Xcode-CLT stub and exits before anything is persisted.
-  if [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
-    _cfg_py="$SUTANDO_PY"
-  elif [ -x "$REPO/../runtime/python/bin/python3" ]; then
-    _cfg_py="$REPO/../runtime/python/bin/python3"
-  else
-    _cfg_py="python3"
+  # The shared resolver refuses Apple's Xcode-CLT stub; it reports failure as
+  # EMPTY output with exit 0, so test the string, not the exit code.
+  # shellcheck source=scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  _cfg_py="$(resolve_python "$REPO")"
+  if [ -z "$_cfg_py" ]; then
+    echo "start-cli: no runnable interpreter — refusing to persist core.runtime" >&2
+    exit 1
   fi
   # Persist core.runtime into the per-clone local config (atomic merge).
   "$_cfg_py" - "$REPO" "$requested_runtime" <<'PY'

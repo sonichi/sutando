@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,7 +59,7 @@ def _resolver_snippet() -> str:
     """The script's own interpreter resolution, extracted verbatim."""
     src = SCRIPT.read_text(encoding="utf-8")
     m = re.search(
-        r'(if \[ -n "\$\{SUTANDO_PY:-\}" \].*?\n  fi)\n', src, re.DOTALL)
+        r'(\. "\$REPO/scripts/python-binary\.sh".*?\n  fi)\n', src, re.DOTALL)
     assert m, "interpreter resolver not found in start-cli.sh — did it regress to bare python3?"
     return m.group(1)
 
@@ -67,6 +68,9 @@ def _run_writer(repo: str, runtime: str, *, env: dict) -> subprocess.CompletedPr
     """Resolve the interpreter the way the script does, then run its writer."""
     body = Path(repo) / ".writer.py"
     body.write_text(_writer_heredoc(), encoding="utf-8")
+    # the snippet sources the resolver out of $REPO, so the harness repo carries it
+    (Path(repo) / "scripts").mkdir(exist_ok=True)
+    shutil.copy(REPO / "scripts" / "python-binary.sh", Path(repo) / "scripts" / "python-binary.sh")
     harness = (
         "set -euo pipefail\n"
         f'REPO="{repo}"\n'
@@ -88,6 +92,22 @@ class RuntimeSwitchConfig(unittest.TestCase):
             stub.chmod(0o755)
             env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
         return env
+
+    def test_no_runnable_interpreter_refuses_before_persisting(self):
+        """No SUTANDO_PY, no bundle, no python3 on PATH: refuse, do not write.
+
+        The suite could not reach this while _env always set SUTANDO_PY.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env.pop("SUTANDO_PY", None)
+            env["PATH"] = "/bin"          # bash resolves here; python3 does not
+            r = _run_writer(tmp, "codex", env=env)
+            self.assertNotEqual(r.returncode, 0,
+                "with no runnable interpreter the switch must fail, not shell a stub")
+            self.assertIn("no runnable interpreter", r.stderr)
+            self.assertFalse((Path(tmp) / "sutando.config.local.json").exists(),
+                "core.runtime must not be persisted when no interpreter resolved")
 
     def test_source_no_longer_calls_bare_python3_for_the_writer(self):
         src = SCRIPT.read_text(encoding="utf-8")
