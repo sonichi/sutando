@@ -46,15 +46,27 @@ def task(
     tier: str = "owner",
     source: str = "ag2space",
     scope: str = "room",
+    addressed_to: str = "",
 ) -> Path:
     tasks = workspace / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     path = tasks / f"{task_id}.txt"
+    addressing = f"addressed_to: {addressed_to}\n" if addressed_to else ""
+    policy = (
+        "1. ADDRESSING: this message belongs to a peer. Close with [no-send].\n"
+        "2. CONTEXT-FIRST (unconditional): reconstruct the room thread before interpreting it.\n"
+        "3. NOTIFY FIRST (if task takes >60s): send a progress update.\n"
+        if addressed_to else
+        "1. CONTEXT-FIRST (unconditional): reconstruct the room thread before interpreting it.\n"
+        "2. NOTIFY FIRST (if task takes >60s): send a progress update.\n"
+    )
+    publication_step = 4 if addressed_to else 3
     path.write_text(
         f"id: {task_id}\nsession_scope: {scope}\ntask: answer this\n"
-        f"source: {source}\nchannel_id: {room_id}\naccess_tier: {tier}\n\n"
+        f"source: {source}\nchannel_id: {room_id}\naccess_tier: {tier}\n{addressing}\n"
         "===SKILL INSTRUCTIONS (follow before any other action)===\n"
-        f"1. Process and write the result to results/{task_id}.txt\n",
+        f"{policy}"
+        f"{publication_step}. Process and write the result to results/{task_id}.txt\n",
         encoding="utf-8",
     )
     return path
@@ -152,7 +164,7 @@ print('claude room result')
             "ARG_LOG": str(log),
             "ROGUE_RESULT": str(workspace / "results" / "task-claude-one.txt"),
         }
-        first = task(workspace, "task-claude-one")
+        first = task(workspace, "task-claude-one", addressed_to="@peer:ag2.space")
         second = task(workspace, "task-claude-two")
         check(run_worker("claude", workspace, first, env).returncode == 0, "Claude creates room session")
         check(run_worker("claude", workspace, second, env).returncode == 0, "Claude resumes room session")
@@ -164,8 +176,14 @@ print('claude room result')
         check((workspace / "results" / first.name).read_text() == "claude room result\n",
               "child cannot become a second result writer")
         first_prompt = args[0][-1]
-        check("answer this" in first_prompt and "SKILL INSTRUCTIONS" not in first_prompt,
-              "child receives task content without legacy delivery instructions")
+        check("answer this" in first_prompt and "SKILL INSTRUCTIONS" in first_prompt,
+              "child receives task content and trusted execution policy")
+        check("ADDRESSING:" in first_prompt and "CONTEXT-FIRST (unconditional)" in first_prompt,
+              "child preserves addressing and unconditional context-first policy")
+        check('"addressed_to": "@peer:ag2.space"' in first_prompt,
+              "child context preserves the trusted addressed-to target")
+        check("Process and write the result to results/" not in first_prompt,
+              "child omits only the parent-owned publication directive")
         check(first.name not in first_prompt and str(first) not in first_prompt,
               "child receives neither task id nor original task path")
 

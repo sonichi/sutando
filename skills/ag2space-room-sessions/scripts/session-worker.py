@@ -252,11 +252,19 @@ def _run_bounded(
 
 def _task_view(task_file: Path) -> str:
     parsed = parse_task_headers_trusted(task_file.read_text(encoding="utf-8", errors="replace"))
-    skill_tail = "\n===SKILL INSTRUCTIONS (follow before any other action)==="
-    body = parsed.body.split(skill_tail, 1)[0].rstrip()
+    body = parsed.body.rstrip()
+    task_id = parsed.headers.get("id") or task_file.stem
+    publication = f"Process and write the result to results/{task_id}.txt"
+    body = "\n".join(
+        line for line in body.splitlines()
+        if not re.fullmatch(rf"\d+\. {re.escape(publication)}", line.strip())
+    ).rstrip()
     context = {
         key: parsed.headers[key]
-        for key in ("source", "channel_id", "room_name", "sender_name", "reply_to_sender")
+        for key in (
+            "source", "channel_id", "room_name", "sender_name", "reply_to_sender",
+            "addressed_to",
+        )
         if parsed.headers.get(key)
     }
     return json.dumps({"context": context, "task": body}, ensure_ascii=False)
