@@ -200,6 +200,24 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    it away as a stale count, and only a title-level check showed the zero. The count is the
    discriminator; the substring cannot fail the way this actually fails.
 
+   **⚠ A COUNTED question can still be INVISIBLE — assert POSITION too (2026-08-20).** The count
+   rising proves membership, not visibility. Waiting order is FILE order, so "insert above the
+   `# Resolved` divider" — the rule that makes a question counted at all — lands it at the BOTTOM of
+   the visible list. The two rules pull opposite ways. Only two consumers render anything, and both
+   take an ordered prefix: `notify_macos` shows `titles[:3]` and the proactive DM body shows
+   `questions[:5]` (hence `VISIBLE_PREFIX = 5` in `src/check-pending-questions.py`). **Positions 6+
+   render nowhere** — they exist only in the file and the web UI's Questions tab. Measured on a live
+   host: `VISIBLE_PREFIX=5; waiting=34; rendered nowhere = 29 of 34`, and the question filed that
+   pass sat at **34/34** while the assertion documented above printed `34 1` — a pass. Extend the
+   proof to position:
+   ```bash
+   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=m.get_waiting_questions();i=next(k for k,x in enumerate(q,1) if '<distinctive phrase from your TITLE>' in (x.get('title') or ''));assert i <= m.VISIBLE_PREFIX, f'filed at {i}/{len(q)} - below the fold, renders nowhere'"
+   ```
+   If it lands below the fold and it genuinely needs the owner, **move it up** — do not file a second
+   question about the first one being unread. Promotion is self-announcing: `notify_key` hashes the
+   visible-ordered prefix (#3004), so changing the top 5 defeats the cooldown by construction and the
+   next fire notifies.
+
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
    | probe says | action |
