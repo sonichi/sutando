@@ -2445,15 +2445,33 @@ def check_onboarding_status() -> "dict | None":
         rows = data["rows"]
         # Carry each row's own detail: "gateway" alone cannot distinguish "not
         # running" from a reconnect. `str()` because a separate repo writes this.
-        todo = [f"{k} ({d})" if (d := str(v.get("detail") or "").strip()[:120]) else k
-                for k, v in sorted(rows.items())
-                if isinstance(v, dict) and v.get("state") == "todo"]
+        todo_keys = [k for k, v in sorted(rows.items())
+                     if isinstance(v, dict) and v.get("state") == "todo"]
+        # A heartbeat refutes only the runtime-DOWN row; the writer also emits
+        # "core running, Claude sign-in required", a real gap on a running core.
+        _core = rows.get("core") if isinstance(rows.get("core"), dict) else {}
+        _down = (_core.get("claude_authed") is not False
+                 and "not running" in str(_core.get("detail") or "").lower())
+        stale_core = "core" in todo_keys and _down and _fresh_local_core_record() is not None
+        if stale_core:
+            todo_keys.remove("core")
+        todo = [f"{k} ({d})" if (d := str(rows[k].get("detail") or "").strip()[:120]) else k
+                for k in todo_keys]
         # Absent/null/0 updated_at is UNKNOWN, not the epoch — int(None or 0)
         # rendered the whole unix time as an age (~56 years) on both lines.
         _updated = int(data.get("updated_at", 0) or 0)
         age_s = max(0, int(time.time()) - _updated) if _updated > 0 else None
     except (ValueError, OSError, TypeError):
         return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+    if stale_core:
+        rest = f"; still todo: {', '.join(todo)}" if todo else ""
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"Console mirror is stale — its core row says 'not running' but this "
+                       f"host's heartbeat is live; mirror last written {_age_phrase(age_s)}"
+                       f"{rest}"),
+        }
     if todo:
         return {
             "name": name,
@@ -3307,6 +3325,19 @@ def _default_local_notifier(msg: str) -> bool:
         return False
 
 
+# Per-bridge EXACT detail: gateway-bridge's other warns (not-serving, duplicate
+# pileup) describe a live process, so only this string may respawn one.
+GATEWAY_DOWN_DETAIL = (
+    "configured but NOT running — ag2.space mobile messages will not be delivered"
+)
+DOWN_BRIDGE_DETAILS = {
+    "telegram-bridge": "configured but not running",
+    "discord-bridge": "configured but not running",
+    "slack-bridge": "configured but not running",
+    "gateway-bridge": GATEWAY_DOWN_DETAIL,
+}
+
+
 def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
                      notifier=None) -> list:
     """Restart or alert on configured-but-not-running channel bridges."""
@@ -3341,10 +3372,12 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
 
     restarted = []
     for c in checks:
+        # The name gate is NOT redundant with the detail match: for an unknown
+        # name the lookup is None, and a check with no detail is also None.
         if not (
-            c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge")
+            c["name"] in DOWN_BRIDGE_DETAILS
             and c["status"] == "warn"
-            and c.get("detail") == "configured but not running"
+            and c.get("detail") == DOWN_BRIDGE_DETAILS[c["name"]]
         ):
             continue
         name = c["name"]
@@ -3383,6 +3416,19 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
         # No interpreter can import the bridge's dependency (startup.sh skips too).
         return None
     child_env = os.environ.copy()
+    if name == "gateway-bridge":
+        # The bridge exits without a token, and startup.sh sources the same
+        # channels/ag2space/.env before launching it.
+        gw_env = _load_channel_env("ag2space")
+        merged = {**os.environ, **gw_env}
+        token = merged.get("REMOTE_TASK_TOKEN") or merged.get("AG2_REMOTE_TOKEN")
+        if not token:
+            return None
+        child_env.update(gw_env)
+        child_env["REMOTE_TASK_TOKEN"] = token
+        # Marks the launch supervised so the bridge stamps launched_via and
+        # skips its own bare-launch file log (see remote_gateway_bridge._log).
+        child_env["SUTANDO_SUPERVISED"] = "1"
     if name == "slack-bridge":
         # slack-bridge exits without BOTH tokens non-empty; the Keychain vault is
         # a real source (same env -> .env -> vault tiering as the bridge itself).
@@ -3396,6 +3442,10 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
     return interp, child_env
 
 
+# Check name → src/<script>.py, for the bridges whose two names differ.
+_BRIDGE_SCRIPT = {"gateway-bridge": "remote-gateway-bridge"}
+
+
 def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
     """Spawn a bridge per _bridge_launch_plan; True if spawned."""
     plan = plan or _bridge_launch_plan(name)
@@ -3407,7 +3457,7 @@ def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
     # `with` closes the parent's handle after Popen; the child holds
     # its own dup of the fd, so the log stays writable.
     with open(str(log_path), "a") as log_f:
-        subprocess.Popen([interp, str(REPO_DIR / "src" / f"{name}.py")],
+        subprocess.Popen([interp, str(REPO_DIR / "src" / f"{_BRIDGE_SCRIPT.get(name, name)}.py")],
                          stdout=log_f, stderr=subprocess.STDOUT,
                          env=child_env, start_new_session=True)
     return True
@@ -5361,7 +5411,7 @@ def check_gateway_bridge() -> "dict | None":
         return {
             "name": "gateway-bridge",
             "status": "warn",
-            "detail": "configured but NOT running — ag2.space mobile messages will not be delivered",
+            "detail": GATEWAY_DOWN_DETAIL,
         }
     claimed = _gateway_lock_pids()
     if claimed:
@@ -10400,7 +10450,7 @@ def main():
                     # here — the result string will say the restart failed.
                     result = fix_launchd(LAUNCHD_BACKED_CHECKS[c["name"]])  # pragma: no cover
                     print(f"  {c['name']}: {result}")  # pragma: no cover
-                elif c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge"):  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
+                elif c["name"] in DOWN_BRIDGE_DETAILS:  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
                     # LoginFailure means the token is bad — restarting won't help
                     # and would create a duplicate alongside the launchd-managed one.
                     if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):
