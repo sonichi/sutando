@@ -690,6 +690,18 @@ if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
   brew install tmux 2>&1 | tail -3
 fi
 
+publish_active_runtime() {
+  # Only callers that have VERIFIED the session may call this; the exec path
+  # cannot, so it publishes optimistically and says so at its call site.
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  mkdir -p "$ws/state" 2>/dev/null || true
+  printf '{"runtime":"claude","session":"%s","started_at":%s}\n' \
+    "${SESSION:-sutando-core}" "$(date +%s)" \
+    > "$ws/state/core-runtime.json" 2>/dev/null || true
+}
+
 # Stamp the core session start into an append-only per-boot log. One JSONL
 # line per launch; consecutive entries bound each session's lifetime, which
 # is what session-recap tooling needs to pick the right transcript (owner
@@ -699,11 +711,6 @@ if _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$_ws/state/session-starts.log" 2>/dev/null || true
-  # Publish the ACTIVE runtime here, not at switch time: reaching this line
-  # means this launcher is the one coming up (codex does the same at its own).
-  printf '{"runtime":"claude","session":"%s","started_at":%s}\n' \
-    "${SESSION:-sutando-core}" "$(date +%s)" \
-    > "$_ws/state/core-runtime.json" 2>/dev/null || true
 fi
 
 # Fall back to a bare `exec claude` if tmux is still missing.
@@ -741,6 +748,8 @@ apply_tmux_defaults
 # working dir must go through `--restart` (kill-then-create), not a bare rerun.
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
+  # exec replaces this process, so there is no post-launch point to publish from.
+  publish_active_runtime
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
@@ -766,6 +775,7 @@ else
     exit 1
   fi
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
+  publish_active_runtime   # verified live above; a failed launch exits before here
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal

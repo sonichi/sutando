@@ -29,6 +29,22 @@ class MarkerOwnership(unittest.TestCase):
             self.assertIn("core-runtime.json", f.read_text(encoding="utf-8"),
                           f"{f.name} must publish the active runtime when it comes up")
 
+    def test_the_detached_publish_sits_behind_the_liveness_gate(self):
+        """Presence is not the question — ordering is. A publish before the gate
+        can replace a truthful marker with a runtime that never came up."""
+        src = CLAUDE.read_text(encoding="utf-8")
+        gate = src.index("did not come up within")
+        pub = src.index("publish_active_runtime", src.index("new-session -d"))
+        self.assertGreater(pub, gate,
+                           "the detached path must publish only after the liveness check")
+
+    def test_the_exec_path_publishes_immediately_before_exec(self):
+        """exec leaves no post-launch point; the call must at least be adjacent."""
+        src = CLAUDE.read_text(encoding="utf-8")
+        i = src.index('exec tmux -S "$TMUX_SOCKET" new-session')
+        window = src[max(0, i - 220):i]
+        self.assertIn("publish_active_runtime", window)
+
     def test_a_refused_switch_leaves_the_previous_marker_truthful(self):
         """Codex->Claude: the switch runs, the restart never does."""
         with tempfile.TemporaryDirectory() as tmp:

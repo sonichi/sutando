@@ -28,12 +28,8 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
 fi
 
-# --runtime <claude|codex>: persist the desired core runtime, then restart into
-# it (the desktop app's "Core Runtime" picker calls this). Only the config is
-# written here; each launcher publishes core-runtime.json when it comes up, so a
-# refused or failed restart leaves the previous active marker truthful. Parsed
-# before runtime resolution and stripped from "$@" so the value never leaks to
-# the runtime-specific launcher.
+# --runtime: this layer writes DESIRED state only; each launcher publishes the
+# active core-runtime.json, so a refused restart leaves the old marker truthful.
 requested_runtime=""
 _passthru=()
 while [ "$#" -gt 0 ]; do
