@@ -105,7 +105,8 @@ def main() -> int:
 
     # The PRODUCTION DiscordRestClient stays in the loop; only its transport
     # is scripted, so "did not send" is observed at the real chokepoint.
-    post_mod._client = lambda token: post_mod.DiscordRestClient(
+    from discord_rest_client import DiscordRestClient
+    post_mod._client = lambda token: DiscordRestClient(
         token, transport=_recording_transport)
     try:
         raised = ""
