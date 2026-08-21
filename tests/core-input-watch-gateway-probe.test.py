@@ -24,7 +24,9 @@ Covers:
   g) state_dir None → fall back (preserves the old call signature)
   h) the 90s threshold clears the bridge's worst-case write gap
   i) connected:false WITH backoff_s and a recent last_ok_ts → alive (a
-     retryable transport blip, not a dead link)
+     retryable transport blip, not a dead link). The 35s gap is measured from
+     a real capture: a 1s backoff still means a whole poll cycle since success,
+     so a grace window under ~35s would fail on live traffic.
   j) auth rejection (backoff_s 0) stays down despite a recent last_ok_ts
   k) a 4.9h outage stays down — backoff grows, last_ok_ts ages out
      (REMOTE_TASK_POLL_WAIT 25s + 10s request timeout)
@@ -164,15 +166,16 @@ def case_h_threshold_clears_poll_gap() -> list[str]:
 
 
 def case_i_transient_backoff_is_alive() -> list[str]:
-    # A poll timeout writes connected:false WITH backoff_s while the link still
-    # works. pgrep_returns=False so a fallback could not manufacture the True.
+    # Values from a REAL captured blip, not invented: backoff_s 1 with the last
+    # success 35s back — a poll cycle (POLL_WAIT 25s + 10s timeout), not seconds.
     v, pgrepped = with_status(
         {"connected": False, "ts": time.time(), "backoff_s": 1,
-         "last_ok_ts": time.time() - 5, "error": "network: read timed out"},
+         "last_ok_ts": time.time() - 35,
+         "error": "network: The read operation timed out"},
         pgrep_returns=False)
     fails = []
     if v is not True:
-        fails.append(f"i) a 1s retry with a 5s-old success should be alive, got {v!r}")
+        fails.append(f"i) a 1s retry with a 35s-old success should be alive, got {v!r}")
     if pgrepped:
         fails.append("i) the sidecar answered; pgrep must not be consulted")
     return fails
