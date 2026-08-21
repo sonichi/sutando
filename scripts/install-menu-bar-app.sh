@@ -39,7 +39,7 @@ if ! swiftc --version >/dev/null 2>&1; then
 fi
 
 echo "Building menu-bar binary…"
-( cd "$SRC_DIR" && swiftc -O -o Sutando main.swift SutandoConfig.swift \
+( cd "$SRC_DIR" && swiftc -O -o Sutando main.swift SutandoConfig.swift RestartCoordinator.swift \
     -framework Cocoa -framework Carbon -framework ApplicationServices \
     -framework AVFoundation )
 echo "  ✓ $BIN"
