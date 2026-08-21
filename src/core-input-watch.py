@@ -261,6 +261,14 @@ GATEWAY_STATUS_MAX_AGE_S = 90.0
 def _gateway_status(state_dir):
     """Read the bridge's own liveness sidecar. Returns True/False if the file
     is present and fresh, else None (meaning: no opinion, fall back to pgrep).
+
+    `connected: false` covers three different conditions and only two are down.
+    The bridge writes `backoff_s` ONLY on a retryable transport failure
+    (`network: …` / `HTTP 5xx`); an auth rejection writes `backoff_s` 0, and a
+    sustained outage ages `last_ok_ts` past the window while backoff grows. So a
+    retry whose last success is still inside GATEWAY_STATUS_MAX_AGE_S is a
+    reconnecting-but-serving link, not a dead one — the sidecar preserves
+    `last_ok_ts` across reconnect writes specifically so a consumer can tell.
     """
     if not state_dir:
         return None
@@ -273,7 +281,12 @@ def _gateway_status(state_dir):
             return None
         if time.time() - ts > GATEWAY_STATUS_MAX_AGE_S:
             return None      # stale — the bridge may be wedged; let pgrep answer
-        return bool(data.get("connected"))
+        if data.get("connected"):
+            return True
+        last_ok = data.get("last_ok_ts")
+        if data.get("backoff_s") and isinstance(last_ok, (int, float)):
+            return time.time() - last_ok <= GATEWAY_STATUS_MAX_AGE_S
+        return False
     except Exception:
         return None
 
