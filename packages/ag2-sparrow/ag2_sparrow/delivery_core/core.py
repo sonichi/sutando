@@ -16,16 +16,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contract import (ClaimBackend, DeliveryOutcome, DeliveryProvider,
+from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
                        DrainResult, DrainStatus, ProviderIndeterminate,
                        ProviderRefused, RecoverReport)
 
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """None removes the park ceiling: every confirmed NOT_DELIVERED stays
-    retryable (an adapter keeping legacy retry-every-pass semantics)."""
-    max_attempts: "int | None" = 3
+    """The park ceiling is mandatory: an adapter may raise it, never remove it.
+    An unbounded retry is a duplicate generator, not a resilience setting."""
+    max_attempts: int = 3
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_attempts, int) or self.max_attempts < 1:
+            raise ValueError(
+                f"max_attempts must be a positive int, got {self.max_attempts!r}")
 
 
 def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:
@@ -56,6 +61,24 @@ class DeliveryCore:
         except ProviderRefused:
             return DeliveryOutcome.NOT_DELIVERED
 
+    def _reconcile(self, item_id: str, payload: bytes, key: str):
+        """Resolve a prior ambiguity, or None when reconciliation resolved
+        NOTHING — the caller keeps the outcome it already had.
+
+        A raise here describes the RECONCILE call, not the original send.
+        ProviderRefused proves only that this second call never dispatched;
+        the first may already have crossed the side-effect boundary. Only a
+        reconciliation RECEIPT is a statement about the original attempt, so
+        only a receipt may replace OUTCOME_UNKNOWN (sparrow-v1-contract:
+        "Ambiguous is never auto-relabeled NOT_DELIVERED").
+        """
+        try:
+            resolved = self.provider.reconcile(
+                DeliveryAttempt(item_id, payload, key))
+        except (ProviderIndeterminate, ProviderRefused):
+            return None
+        return None if resolved is None else resolved.outcome
+
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
         """Claim -> deliver -> classify -> complete, with retry accounting."""
         token = self.backend.claim(item_id, self.worker)
@@ -68,9 +91,9 @@ class DeliveryCore:
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
-                resolved = self.provider.reconcile(item_id, key)
+                resolved = self._reconcile(item_id, payload, key)
                 if resolved is not None:
-                    outcome = resolved.outcome
+                    outcome = resolved
             elif caps.idempotent_send:
                 outcome = self._attempt(item_id, payload, key)
                 if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:

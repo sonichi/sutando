@@ -64,7 +64,15 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
+from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+
+
+def _slack_claims_name(name: str) -> bool:
+    """Filename-level claim decision — the policy lives in proactive_routing;
+    this adapter only binds its channel."""
+    return fallback_claims_name(name, "slack")
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
+import slack_access  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -306,14 +314,12 @@ def load_allowed():
 
     None vs empty-set: file-missing means never-configured (TOFU-eligible);
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        _update_access_cache(data)
-        return set(data.get("allowFrom", []))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return set()
+    access = slack_access.read_access(ACCESS_FILE)
+    # Only a record the shared reader accepted is worth caching; a malformed one
+    # would overwrite a good backup with a document nobody can authenticate from.
+    if access.record is not None:
+        _update_access_cache(access.record)
+    return access.allowed
 
 
 def load_tier_map() -> dict:
@@ -1600,16 +1606,16 @@ def result_watcher():
                         _record_skip_audit(delivery_id, "deduped")
                         f.unlink(missing_ok=True)
                         continue
-                    # Peek before claiming: skip Discord-targeted proactive files.
-                    # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                    # claiming it here dumps the literal text to Slack DM instead.
-                    # Leave it for discord-bridge to claim. (#1401)
+                    # Peek before claiming: a body addressed to another bridge
+                    # is delivered by that bridge, not dumped here as literal text.
                     try:
                         peek = f.read_text(errors="ignore").lstrip()
                     except OSError:
                         continue
-                    if peek.startswith("[channel:") and \
-                            re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                    if not body_claimable_by(peek, "slack"):
+                        continue
+                    # Explicit filename destination outranks the race.
+                    if not _slack_claims_name(f.name):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

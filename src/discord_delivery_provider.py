@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 
 from ag2_sparrow.delivery_core.contract import (
-    DeliveryOutcome, DeliveryReceipt, ProviderCapabilities)
+    DeliveryAttempt, DeliveryOutcome, DeliveryReceipt, ProviderCapabilities)
 from discord_rest_client import DiscordRestClient
 from outbox import DeliveryOutcome as TransportOutcome
 
@@ -25,6 +25,9 @@ _OUTCOME_MAP = {
     TransportOutcome.NOT_DELIVERED: DeliveryOutcome.NOT_DELIVERED,
     TransportOutcome.OUTCOME_UNKNOWN: DeliveryOutcome.OUTCOME_UNKNOWN,
 }
+# Totality is load-bearing: a miss in deliver() raises AFTER the send, leaking
+# the claim into a redelivery (capabilities declare no reconcile/dedupe here).
+assert set(_OUTCOME_MAP) == set(TransportOutcome)
 
 
 class DiscordDeliveryProvider:
@@ -49,5 +52,5 @@ class DiscordDeliveryProvider:
             detail=transport.detail,
         )
 
-    def reconcile(self, item_id: str, idempotency_key: str):
+    def reconcile(self, attempt: DeliveryAttempt):
         return None  # capability-gated off; the core never calls this

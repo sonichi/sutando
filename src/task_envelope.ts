@@ -7,7 +7,7 @@
  * needs (and does not get) a verify path.
  */
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 
@@ -17,17 +17,37 @@ export function keyPath(workspace?: string): string {
 	return join(workspace ?? resolveWorkspace(), 'state', 'auth', 'task-hmac.key');
 }
 
+function parseKey(text: string, p: string): Buffer {
+	// Buffer.from(..,'hex') never throws: an empty or malformed key file
+	// silently yields a short (even zero-length) key that stamps envelopes
+	// no verifier accepts. Reject anything but exactly 32 bytes of hex.
+	const key = Buffer.from(text, 'hex');
+	if (text.length !== 64 || key.length !== 32) {
+		throw new Error(`invalid task-hmac key at ${p} (want 64 hex chars, got ${text.length})`);
+	}
+	return key;
+}
+
 function loadOrCreateKey(workspace?: string): Buffer {
 	const p = keyPath(workspace);
+	let text: string | null = null;
 	try {
-		return Buffer.from(readFileSync(p, 'utf-8').trim(), 'hex');
+		text = readFileSync(p, 'utf-8').trim();
 	} catch { /* no key yet — create below */ }
-	mkdirSync(dirname(p), { recursive: true });
-	try {
-		// 'wx' + mode at open: no umask-default window, first writer wins.
-		writeFileSync(p, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' });
-	} catch { /* concurrent creator won — read theirs */ }
-	return Buffer.from(readFileSync(p, 'utf-8').trim(), 'hex');
+	if (text === null) {
+		mkdirSync(dirname(p), { recursive: true });
+		// Complete bytes land in a tmp file first; link() publishes atomically
+		// with first-writer-wins — a reader can never see a partial key.
+		const tmp = `${p}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
+		writeFileSync(tmp, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' });
+		try {
+			linkSync(tmp, p);
+		} catch { /* concurrent creator won — read theirs */ } finally {
+			try { unlinkSync(tmp); } catch { /* already gone */ }
+		}
+		text = readFileSync(p, 'utf-8').trim();
+	}
+	return parseKey(text, p);
 }
 
 /** Canonical slot only (line 0, or line 1 after `id:`) — a stamp-shaped

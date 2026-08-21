@@ -446,6 +446,12 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
         elif os.path.isfile(fpath):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
+        elif not fpath:
+            # An EMPTY target is malformed, not a prose quotation — surface it,
+            # or a file-only result is retired with zero user-visible output.
+            api("sendMessage", chat_id=chat_id,
+                text="(a file marker in this reply had no path — nothing attached)")
+            print("  file marker with EMPTY path — malformed, surfaced", flush=True)
         else:
             # Prose-quoted `[file:/path]` substrings extract as markers
             # but reference no actual file. Don't ship the warning to
@@ -1000,12 +1006,10 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import should_claim_proactive
+        from proactive_routing import (body_claimable_by,
+                                       should_claim_proactive_file)
         try:
-            if (
-                not presenter_mode_active(REPO)
-                and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
-            ):
+            if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
                 # friction-*.txt via FALLBACK_PREFIXES; telegram-bridge only
                 # matched `proactive-`, so morning-briefing output (which
@@ -1015,18 +1019,22 @@ def main():  # pragma: no cover
                 # cron-originated results land in the owner's DM regardless
                 # of which bridge is the active channel.
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
+                def _tg_claims(name: str) -> bool:
+                    # Destination outranks activity routing, uniformly;
+                    # discord's DM fallback stays the after-grace catch-all.
+                    return should_claim_proactive_file(
+                        name, OWNER_ACTIVITY_FILE, "telegram")
+
                 for f in RESULTS_DIR.iterdir():
-                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
-                        # Peek before claiming: skip Discord-targeted proactive files.
-                        # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                        # claiming it here sends the literal text to Telegram DM instead
-                        # of leaving it for discord-bridge. (#1401)
+                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
+                            and f.suffix == ".txt" and _tg_claims(f.name):
+                        # Peek before claiming: a body addressed to another bridge
+                        # is delivered by that bridge, not sent here as literal text.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if peek.startswith("[channel:") and \
-                                re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                        if not body_claimable_by(peek, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.

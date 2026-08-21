@@ -64,6 +64,26 @@ describe('task_envelope.ts', () => {
 		assert.match(raw, /^[0-9a-f]{64}$/);
 	});
 
+	it('corrupt key file: never stamps under a short key, fails open instead', () => {
+		// Buffer.from(x,'hex') never throws — before the length guard, an
+		// empty or malformed key file stamped under a ZERO-LENGTH key and
+		// emitted a well-formed envelope no verifier accepts.
+		for (const bad of ['', 'zzzz', 'deadbeef', 'a'.repeat(63)]) {
+			const ws = mkdtempSync(join(tmpdir(), 'envelope-ts-badkey-'));
+			try {
+				mkdirSync(dirname(keyPath(ws)), { recursive: true });
+				writeFileSync(keyPath(ws), bad);
+				assert.throws(() => stampText(BODY, ws),
+					/invalid task-hmac key/,
+					`stampText must reject key file ${JSON.stringify(bad)}`);
+				assert.equal(tryStampText(BODY, ws), BODY,
+					`tryStampText must fail open on key file ${JSON.stringify(bad)}`);
+			} finally {
+				rmSync(ws, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it('tryStampText fails open when the key location is unwritable', () => {
 		const lockedWs = mkdtempSync(join(tmpdir(), 'envelope-ts-locked-'));
 		try {

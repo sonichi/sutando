@@ -47,6 +47,8 @@ The git repo. Source of truth for behavior. Owned by version control.
 
 **What does NOT go here:** anything per-user. `tasks/`, `results/`, `state/`, `logs/`, `.env`, `logs/conversation.log`, the actual `notes/` and `build_log.md`, the agent's memory — none of these are code.
 
+**Custom tooling caution:** `<repo>/scripts/` is *shipped code* and is replaced on every app update — a custom script written there has no durability guarantee and is silently lost (report c8310df7: five-plus recurrences, ten tools). Owner-custom tools belong in **`<workspace>/scripts/`**, which is a canonical migration surface (carried by `sutando-migrate.sh`, collision-keep-both) and survives updates. If a tool must live in the repo tree, it must be committed upstream — an uncommitted file in the code tree is a file scheduled for deletion.
+
 ### Workspace
 
 Per-user runtime + content. Lives at `<repo>/workspace/` by default (post-M0). Synced across the fleet via `sync-workspace.sh` for the sub-paths the user opts in to.
