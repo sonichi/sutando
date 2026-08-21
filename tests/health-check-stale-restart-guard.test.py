@@ -44,6 +44,19 @@ def main() -> int:
     check(ok2 is True, "canonical checkout still permits the stale restart")
     check(why2 == "", "no reason is reported when the restart is permitted")
 
+    # Undetermined is not "wrong branch": refusing on an unreadable git state
+    # would block recovery on a premise nothing established.
+    ok_u, why_u = hc.stale_restart_allowed(
+        REPO, guard=lambda _d: (False, f"{hc.CHECKOUT_UNREADABLE} (git exit 128)"))
+    check(ok_u is True, "an UNREADABLE git state permits the restart (undetermined != wrong)")
+    check(hc.CHECKOUT_UNREADABLE in why_u,
+          "and it still reports why the checkout could not be determined")
+
+    # ...but a DETERMINED wrong branch must still refuse, or the guard is inert.
+    ok_d, _ = hc.stale_restart_allowed(
+        REPO, guard=lambda _d: (False, "checkout has uncommitted changes"))
+    check(ok_d is False, "a determined non-canonical checkout still refuses")
+
     # The default guard must BE the down path's guard, not a private copy that
     # can drift. Compare against the real symbol rather than asserting on prose.
     import inspect

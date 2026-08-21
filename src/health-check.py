@@ -3328,6 +3328,11 @@ def fix_screen_capture() -> str:
         f"restart attempted but port check says {after['status']} — see {log_path}")
 
 
+# Reasons beginning with this are "we could not determine the branch", NOT
+# "the branch is wrong" — the two justify different actions.
+CHECKOUT_UNREADABLE = "git state unreadable"
+
+
 def _checkout_is_canonical(repo_dir) -> tuple:
     """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?"""
     try:
@@ -3342,12 +3347,12 @@ def _checkout_is_canonical(repo_dir) -> tuple:
             capture_output=True, text=True, timeout=10,
         )
     except Exception as e:  # noqa: BLE001 — any git failure → fail closed
-        return (False, f"git state unreadable ({e})")
+        return (False, f"{CHECKOUT_UNREADABLE} ({e})")
     # A nonzero git exit means the (possibly empty) stdout can't be trusted — an empty
     # `status --porcelain` from a FAILED call must not read as "clean" and green-light an
     if branch_proc.returncode != 0 or dirty_proc.returncode != 0:
         rc = branch_proc.returncode or dirty_proc.returncode
-        return (False, f"git state unreadable (git exit {rc})")
+        return (False, f"{CHECKOUT_UNREADABLE} (git exit {rc})")
     branch = branch_proc.stdout.strip()
     dirty = dirty_proc.stdout.strip()
     if branch != "main":
@@ -3502,10 +3507,20 @@ def stale_restart_allowed(repo_dir, *, guard=None) -> "tuple[bool, str]":
     the down path: a stale restart boots whatever is checked out HERE, so on a
     feature branch it silently ships unreviewed code (2026-07-29: four days of
     bridge restarts booted a branch 75 commits behind main).
+
+    Refuses only on a DETERMINED non-canonical checkout. An unreadable git
+    state is undetermined, and blocking recovery on that is the same
+    unmeasured-premise error this guard exists to prevent.
     """
     guard = guard or _checkout_is_canonical
     ok, why = guard(repo_dir)
-    return (True, "") if ok else (False, why)
+    if ok:
+        return (True, "")
+    if str(why).startswith(CHECKOUT_UNREADABLE):
+        # Undetermined is not "wrong branch". Refusing here would block a
+        # legitimate recovery on a premise nothing established.
+        return (True, why)
+    return (False, why)
 
 
 def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:

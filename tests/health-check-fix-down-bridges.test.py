@@ -906,9 +906,12 @@ def case_o_stale_restart_uses_launch_plan() -> list[str]:
         fails.append(f"o) missing 'restarted (stale code)' line; got: {out!r}")
     if killed != ["4242"]:
         fails.append(f"o) expected old pid 4242 killed, got {killed}")
-    if len(spawned) != 1 or spawned[0][0] != "/usr/local/bin/python3-probed":
+    # The canonical-checkout guard probes git before the relaunch, so filter to
+    # the bridge spawn itself rather than asserting on the whole recorded list.
+    bridge = [a for a in spawned if str(a[-1]).endswith("slack-bridge.py")]
+    if len(bridge) != 1 or bridge[0][0] != "/usr/local/bin/python3-probed":
         fails.append(f"o) spawn must use the plan's interpreter, got {spawned}")
-    if any(argv[0] == sys.executable for argv in spawned):
+    if any(argv[0] == sys.executable for argv in bridge):
         fails.append("o) stale restart still used sys.executable")
     return fails
 
