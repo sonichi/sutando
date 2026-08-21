@@ -346,16 +346,27 @@ _EVENT_CHANNEL = None
 # aliases for one release (remove next), with a one-line migration nudge, so the
 # bridge keeps connecting under any launcher. New onboards use REMOTE_TASK_*.
 _warned_legacy = set()
+
+
+def _unquote_env(v):
+    """Whitespace and surrounding quotes off a credential value.
+
+    The ONE definition every reader uses, so the env tier cannot disagree with
+    the file tiers about a quoted `.env` line.
+    """
+    return v.strip().strip("'\"") if v else v
+
+
 def _env_compat(new, old):
     v = os.environ.get(new)
     if v:
-        return v
+        return _unquote_env(v)
     v = os.environ.get(old)
     if v and old not in _warned_legacy:
         _warned_legacy.add(old)
         print(f"[remote-gateway-bridge] {old} is deprecated — rename to {new} in your .env",
               file=sys.stderr, flush=True)
-    return v
+    return _unquote_env(v)
 
 # One-token onboarding: REMOTE_TASK_TOKEN alone is enough. The onboarding
 # string may be the combined "https://<gateway>|<secret>" form (the URL travels
@@ -427,7 +438,7 @@ def _channel_env_candidates():
             if not ln or ln.startswith("#") or "=" not in ln:
                 continue
             key, _, val = ln.partition("=")
-            vals[key.strip()] = val.strip().strip('"').strip("'")
+            vals[key.strip()] = _unquote_env(val)
         out.append((path, vals))
     return out
 
@@ -1617,7 +1628,7 @@ def _read_token_file(path: str) -> str:
             line = line[len("export "):].lstrip()
         for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
             if line.startswith(key + "="):
-                found[key] = line[len(key) + 1:].strip().strip("'\"")
+                found[key] = _unquote_env(line[len(key) + 1:])
     for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
         if found.get(key):
             return found[key]
@@ -1649,7 +1660,7 @@ def _read_token_file_url(path: str) -> str:
             line = line[len("export "):].lstrip()
         for key in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
             if line.startswith(key + "="):
-                found[key] = line[len(key) + 1:].strip().strip("'\"")
+                found[key] = _unquote_env(line[len(key) + 1:])
     return found.get("REMOTE_TASK_URL") or found.get("AG2_REMOTE_URL") or ""
 
 
