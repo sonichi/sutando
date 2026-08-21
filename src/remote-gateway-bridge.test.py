@@ -39,7 +39,8 @@ STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
          "force_room_ok_only": False,
-         "force_heartbeat_404": False, "force_media_redirect": False}
+         "force_heartbeat_404": False, "force_media_redirect": False,
+         "force_results_502_once": False, "force_results_400": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -80,6 +81,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return
         if self.path == "/v1/results":
+            if STATE["force_results_502_once"]:
+                STATE["force_results_502_once"] = False
+                self.send_response(502); self.end_headers(); return
+            if STATE["force_results_400"]:
+                self.send_response(400); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["results"].append(json.loads(self.rfile.read(n).decode()))
             self.send_response(200); self.end_headers()
@@ -547,6 +553,77 @@ def main() -> int:
           "[no-send] marker POSTed (closes the lease) and archived")
     check(bool(_posted) and "[no-send]" in (_posted[0].get("body") or ""),
           "[no-send] body keeps its marker so the server suppresses delivery")
+
+    # Guarded-tier suppression: team skip-only results post the marker
+    # line alone; the remainder never leaves the host.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TSKIP.txt").write_text(
+        "id: task-TSKIP\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TSKIP.txt").write_text(
+        "[no-send] internal bookkeeping note that must not reach the wire\n")
+    rtc._post_ready_results({"task-TSKIP"})
+    _posted = STATE["results"][_before:]
+    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-TSKIP.txt").exists(),
+          "team [no-send] POSTs (closes lease) and archives")
+    check(bool(_posted) and (_posted[0].get("body") or "").strip() == "[no-send]",
+          "team skip wire body is the marker line ALONE — remainder withheld")
+    # Control: a side-effectful marker from a guarded tier is still withheld.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TREDIR.txt").write_text(
+        "id: task-TREDIR\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TREDIR.txt").write_text(
+        "[channel: 12345678901234567] exfil attempt\n")
+    rtc._post_ready_results({"task-TREDIR"})
+    _posted = STATE["results"][_before:]
+    check(bool(_posted) and "[channel:" not in (_posted[0].get("body") or ""),
+          "team redirect marker still withheld (canned body, no redirect)")
+    # A deduped extra is inert only within the task-id grammar — the marker
+    # class admits newlines, so a forged extra must hit the guard, not repost.
+    _hostile = "[deduped: task-123\nSECRET sk-live-abcdef0123456789\nstolen]"
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TDEXF.txt").write_text(
+        "id: task-TDEXF\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDEXF.txt").write_text(_hostile + "\n")
+    rtc._post_ready_results({"task-TDEXF"})
+    _posted = STATE["results"][_before:]
+    check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
+          and "sk-live" not in (_posted[0].get("body") or ""),
+          "team deduped with out-of-grammar extra is withheld, not re-posted")
+    _act = rtc.parse_markers("[deduped: task-abc_123]").actions[0]
+    check(rtc._suppression_stub(_act) == "[deduped: task-abc_123]",
+          "in-grammar deduped extra reconstructs the exact marker line")
+    import types as _types
+    check(rtc._suppression_stub(
+              _types.SimpleNamespace(value="future-marker", extra=None)) is None,
+          "unknown skip marker yields no stub (guard path, not [no-send])")
+
+    # DeliveryCore wiring, proven by side effects only the seam produces:
+    # outbox attempt accounting + UNKNOWN resolved by the idempotent re-send.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
+        "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
+    STATE["force_results_400"] = True
+    rtc._post_ready_results({"task-CORE1"})
+    check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
+          and len(STATE["results"]) == _before,
+          "refused POST leaves the result file for the next pass")
+    check(rtc._delivery_core().backend.attempts("task-CORE1") == 1,
+          "the refusal is recorded in the outbox (drain ran through the seam)")
+    STATE["force_results_400"] = False
+    STATE["force_results_502_once"] = True
+    _ifc = {"task-CORE1"}
+    rtc._post_ready_results(_ifc)
+    check(len(STATE["results"]) == _before + 1
+          and STATE["results"][-1]["id"] == "task-CORE1"
+          and STATE["results"][-1]["body"] == "core answer"
+          and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
+          "ambiguous 502 resolved by the idempotent re-send in ONE pass "
+          "(delivered + archived)")
+    check(not _ifc, "confirmed delivery retires the task from inflight")
+    STATE["results"].pop()
+    (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content

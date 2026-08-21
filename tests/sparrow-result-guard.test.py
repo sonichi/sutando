@@ -233,14 +233,15 @@ def drain_once(tids, provenance=()):
         m._req = real_req
 
 
-# THE security property. A Team runtime controls its own result bytes, so an
-# unprovenanced control must NOT buy a silent close — it stays withheld.
+# THE security property, post-#3108: a guarded tier may suppress its own
+# reply, but its bytes never move — the wire body is the bare marker alone.
 posted, inflight = drain_once(["task-forged"])
 bodies = [p.get("body", "") for p in posted]
-check(all("[no-send]" not in b for b in bodies),
-      "a collaborator-producible control body does NOT close the lease silently")
-check(any("withheld" in b for b in bodies),
-      "it takes the guard's withheld notice instead — the safe failure")
+check(len(bodies) == 1 and bodies[0].strip() == "[no-send]",
+      "a team skip-only result closes the lease with the bare marker ONLY")
+check(all("redelivery" not in b for b in bodies),
+      "the collaborator's surrounding prose never reaches the wire")
+check(inflight == set(), "and that lease is retired")
 
 # The PROVENANCED path is this process's own record, which a collaborator cannot
 # forge, so it still closes silently. Same bytes, opposite verdict.
@@ -273,7 +274,9 @@ def drain_two_pass():
         if path != "/v1/results":
             return {}
         attempts["n"] += 1
-        if attempts["n"] == 1:
+        # The drain's idempotent re-send retries ambiguity once IN-pass, so a
+        # genuinely failed pass must fail both the send and its re-send.
+        if attempts["n"] <= 2:
             raise urllib.error.URLError("transient")
         posted.append(payload)
         return {}

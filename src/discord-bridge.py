@@ -5141,13 +5141,28 @@ async def poll_proactive():
             # decision rule (last-active channel from
             # state/last-owner-activity.json; default discord on missing
             # state).
-            from proactive_routing import should_claim_proactive  # noqa: E402
-            if not should_claim_proactive(
+            import proactive_routing as _routing  # noqa: E402
+            # Round gate governs UNADDRESSED bodies only.
+            _round_claim = _routing.should_claim_proactive(
                 STATE_DIR / "last-owner-activity.json", "discord"
-            ):
-                await asyncio.sleep(3)
-                continue
-            for f in RESULTS_DIR.iterdir():
+            )
+            _marked = []
+            if not _round_claim:
+                _attribute = getattr(_routing, "claims_marked_proactive", None)
+                for _f in RESULTS_DIR.iterdir():
+                    if not (_f.name.startswith("proactive-")
+                            and _f.suffix == ".txt"):
+                        continue
+                    try:
+                        _body = _f.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    if _attribute and _attribute(_body, "discord") is True:
+                        _marked.append(_f)
+                if not _marked:
+                    await asyncio.sleep(3)
+                    continue
+            for f in (_marked or list(RESULTS_DIR.iterdir())):
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration

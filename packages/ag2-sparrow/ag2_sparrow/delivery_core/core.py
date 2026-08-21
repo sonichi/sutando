@@ -5,8 +5,10 @@ decides retry/UNKNOWN rules (acceptance criterion 2).
 Retry policy (normative):
 - only a confirmed NOT_DELIVERED auto-retries;
 - OUTCOME_UNKNOWN parks unless capabilities license reconcile (resolve,
-  then act on the resolved outcome) or idempotent-send (safe re-send);
-- ambiguous is never auto-relabeled NOT_DELIVERED.
+  then act on the resolved outcome) or idempotent-send (safe re-send;
+  still-ambiguous after the re-send completes as a retryable attempt —
+  the license makes every later re-send exactly as safe as this one);
+- absent such a license, ambiguous is never auto-relabeled NOT_DELIVERED.
 
 Delivered evidence is written only AFTER the send returns (evidence is
 risk control, not proof — invariant 8)."""
@@ -21,7 +23,9 @@ from .contract import (ClaimBackend, DeliveryOutcome, DeliveryProvider,
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    max_attempts: int = 3
+    """None removes the park ceiling: every confirmed NOT_DELIVERED stays
+    retryable (an adapter keeping legacy retry-every-pass semantics)."""
+    max_attempts: "int | None" = 3
 
 
 def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:
@@ -69,6 +73,10 @@ class DeliveryCore:
                     outcome = resolved.outcome
             elif caps.idempotent_send:
                 outcome = self._attempt(item_id, payload, key)
+                if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
+                    # Retryable by license: parking would strand an item a
+                    # later safe re-send could still deliver.
+                    outcome = DeliveryOutcome.NOT_DELIVERED
         # The ceiling rides WITH the completion: parking after the claim
         # is released lets a successor confirm in the gap.
         self.backend.complete(token, outcome,

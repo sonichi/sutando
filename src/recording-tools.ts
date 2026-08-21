@@ -629,6 +629,56 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 
 let lastResumeTime = 0;
 
+/**
+ * Pause-retry authorization. Exported so tests drive the real state machine
+ * instead of simulating its arithmetic — a test that recomputes the elapsed time
+ * by hand passes against a build with every reset deleted.
+ *
+ * `transcript` is the speech window that was current when the block was taken.
+ * A user asking again produces NEW ASR text; a model retrying because it is
+ * still hearing the video produces the same window, so comparing them separates
+ * the two callers without a timing heuristic.
+ */
+export const pauseRetryAuthorization = {
+	stamp: 0,
+	transcript: '',
+	recordBlock(now: number, recent: string): void { this.stamp = now; this.transcript = recent; },
+	clear(): void { this.stamp = 0; this.transcript = ''; },
+	msSinceBlock(now: number): number { return this.stamp === 0 ? Number.MAX_SAFE_INTEGER : now - this.stamp; },
+};
+
+/**
+ * Clear the pause-retry authorization. A block earned on one video must not
+ * authorize a keyword-less pause on the next: without this, a stray call within
+ * the retry window after ANY earlier block would pass, which is the single
+ * hallucinated pause the guard exists to stop.
+ */
+export function endPlaybackAuthorization(): void { pauseRetryAuthorization.clear(); }
+export const KEYWORD_BLOCK_RETRY_MS = 60_000;
+const PAUSE_KEYWORDS = /\b(pause|stop|hold|wait)\b/;
+
+/**
+ * Pause-guard policy. The keyword check exists so a Gemini hallucination outside
+ * the 8s audio cooldown cannot pause on its own. It fails closed against the user
+ * instead when ASR mangles the command — which is likeliest precisely when he is
+ * repeating a request that was already ignored. So a keyword-less pause is blocked
+ * on its FIRST occurrence and honoured if it recurs inside the retry window: one
+ * stray call still cannot pause, a persistent request gets through.
+ */
+export function pauseKeywordGuard(
+	recent: string,
+	msSinceLastBlock: number,
+	transcriptAtBlock = '',
+): 'allow' | 'block' {
+	if (!recent || PAUSE_KEYWORDS.test(recent)) return 'allow';
+	if (msSinceLastBlock > KEYWORD_BLOCK_RETRY_MS) return 'block';
+	// Inside the window, honour the repeat ONLY if the speech window moved on.
+	// An immediate re-call against the identical transcript is the hallucinating
+	// caller this guard exists to stop; it retries at once, while the user's own
+	// repeats were 13-20s apart and always carried new text.
+	return recent === transcriptAtBlock ? 'block' : 'allow';
+}
+
 export const playVideoTool: ToolDefinition = {
 	name: 'play_video',
 	description: 'Play the video from the beginning. Use ONLY when user explicitly says "play" or "play it".',
@@ -637,6 +687,7 @@ export const playVideoTool: ToolDefinition = {
 	async execute() {
 		console.log(`${ts()} [PlayVideo] called`);
 		lastResumeTime = Date.now(); // Set cooldown on play to prevent auto-pause
+		endPlaybackAuthorization();
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
 	},
 };
@@ -658,6 +709,7 @@ export const resumeVideoTool: ToolDefinition = {
 		try {
 			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 			lastResumeTime = Date.now();
+			endPlaybackAuthorization();
 			try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'play document 1', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 			// Restart audio stream to phone at current position
 			let seekSec = 0;
@@ -685,6 +737,7 @@ export const replayVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [ReplayVideo] called`);
+		endPlaybackAuthorization();
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
 	},
 };
@@ -710,10 +763,16 @@ export const pauseVideoTool: ToolDefinition = {
 		// outside the 8s cooldown still fires (Susan's 2026-04-16 report).
 		// Picks freshest of voice-agent vs phone transcript; fail-open if neither is fresh.
 		const recent = getRecentUserSpeech();
-		if (recent && !/\b(pause|stop|hold|wait)\b/.test(recent)) {
+		const sinceBlock = pauseRetryAuthorization.msSinceBlock(Date.now());
+		if (pauseKeywordGuard(recent, sinceBlock, pauseRetryAuthorization.transcript) === 'block') {
+			pauseRetryAuthorization.recordBlock(Date.now(), recent);
 			console.log(`${ts()} [PauseVideo] BLOCKED — no pause keyword in recent user speech: "${recent.slice(-80)}"`);
 			return { status: 'playing', instruction: 'Video is still playing. Only pause when user explicitly says "pause" or "stop".' };
 		}
+		if (recent && !PAUSE_KEYWORDS.test(recent)) {
+			console.log(`${ts()} [PauseVideo] keyword guard overridden — repeat call ${sinceBlock}ms after a block: "${recent.slice(-80)}"`);
+		}
+		pauseRetryAuthorization.clear();
 		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'if (count of documents) > 0 then', '-e', 'pause document 1', '-e', 'end if', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
@@ -728,6 +787,7 @@ export const closeVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [CloseVideo] called`);
+		endPlaybackAuthorization();
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'end tell', '-e', 'delay 0.3', '-e', 'tell application "System Events" to keystroke "w" using command down'], { timeout: 5_000 }); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}

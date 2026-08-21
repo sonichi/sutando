@@ -30,6 +30,7 @@ duplicate to every configured bridge.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 # Channels whose bridges actually deliver `proactive-*.txt` files.
@@ -103,3 +104,34 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     # most recently interacted on a surface that doesn't deliver DMs.
     # Default Discord rather than strand the proactive file.
     return this_channel == "discord"
+
+
+# An id shape only ONE transport can own. The cross-bridge race that
+# should_claim_proactive guards does not exist for a self-addressed body.
+_UNAMBIGUOUS_ID = {
+    "discord": re.compile(r"\A\d{17,20}\Z"),
+    "ag2space": re.compile(r"\A![^:\s]+:\S+\Z"),
+}
+
+
+def claims_marked_proactive(body: str, this_channel: str) -> "bool | None":
+    """Does an explicit ``[channel:]`` marker address THIS bridge?
+
+    ``None`` means no destination this function can attribute, so the caller
+    keeps :func:`should_claim_proactive` -- the last-active heuristic exists
+    precisely for that ambiguous case.
+
+    Claim is a property of the polling ROUND, destination a property of the
+    FILE, so an explicitly routed body was stranded whenever the owner was
+    last active on another surface.
+    """
+    from result_markers import parse_markers  # local: keep the import graph flat
+
+    dest = next((a.value for a in parse_markers(body).actions
+                 if a.kind == "redirect" and a.value), None)
+    if dest is None:
+        return None
+    owner = [ch for ch, rx in _UNAMBIGUOUS_ID.items() if rx.match(dest.strip())]
+    if len(owner) != 1:
+        return None
+    return owner[0] == this_channel
