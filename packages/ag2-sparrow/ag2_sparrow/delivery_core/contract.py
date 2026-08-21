@@ -80,6 +80,9 @@ class DeliveryReceipt:
     outcome: DeliveryOutcome
     provider_ref: Optional[str] = None
     detail: str = ""
+    # Where the side effect landed, in the provider's own address space.
+    # Only the provider knows this; the core must not infer it.
+    destination: Optional[str] = None
 
 
 @dataclass(frozen=True)

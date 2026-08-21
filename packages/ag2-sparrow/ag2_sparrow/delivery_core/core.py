@@ -55,7 +55,9 @@ class DeliveryCore:
         NOT_DELIVERED; anything else (programming, config, capability
         violation) propagates rather than masquerading as ambiguity."""
         try:
-            return self.provider.deliver(item_id, payload, key).outcome
+            receipt = self.provider.deliver(item_id, payload, key)
+            self._last_destination = getattr(receipt, "destination", None)
+            return receipt.outcome
         except ProviderIndeterminate:
             return DeliveryOutcome.OUTCOME_UNKNOWN
         except ProviderRefused:
@@ -103,7 +105,9 @@ class DeliveryCore:
         # The ceiling rides WITH the completion: parking after the claim
         # is released lets a successor confirm in the gap.
         self.backend.complete(token, outcome,
-                              park_at_attempts=self.policy.max_attempts)
+                              park_at_attempts=self.policy.max_attempts,
+                              provider=type(self.provider).__name__,
+                              destination=getattr(self, "_last_destination", None))
         return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome)
 
     def recover(self) -> RecoverReport:

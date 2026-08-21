@@ -78,7 +78,9 @@ class DesignAClaimBackend:
                               incarnation=incarnation)
 
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
-                 park_at_attempts: Optional[int] = None) -> bool:
+                 park_at_attempts: Optional[int] = None,
+                 provider: Optional[str] = None,
+                 destination: Optional[str] = None) -> bool:
         item_id = token.item_id
         # Validate -> transition -> retire, all under the item lock: a stale
         # incarnation must not mutate or park its successor's item.
@@ -88,9 +90,8 @@ class DesignAClaimBackend:
                     self._incarnation_of(item_id) != token.incarnation:
                 return False
             if outcome is DeliveryOutcome.CONFIRMED:
-                d = outbox._read_item(self.root, item_id)
-                d["status"] = "DELIVERED"
-                outbox._write_item(self.root, item_id, d)
+                outbox.record_delivered(self.root, item_id,
+                                        provider=provider, destination=destination)
             elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                 outbox.park_item(self.root, item_id, "outcome-unknown")
             else:
