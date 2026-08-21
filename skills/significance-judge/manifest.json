@@ -1,0 +1,11 @@
+{
+  "name": "significance-judge",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Judges sutando-life timeline events for significance by spawning the local agent CLI as a subagent.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
