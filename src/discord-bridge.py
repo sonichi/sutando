@@ -3814,10 +3814,8 @@ async def _handle_discord_message(message, force=False):
         except Exception:
             pass
 
-    # Dedup: the gateway/REST entry point `_dispatch_discord_message` already
-    # claimed this ID before its first await. Keeping the claim outside this
-    # large handler makes the concurrent check atomic; direct handler calls are
-    # reserved for focused tests that exercise the body in isolation.
+    # The claim happens in `_dispatch_discord_message` before its first await;
+    # keeping it outside this handler is what makes the check-and-add atomic.
 
     # Plugin "magic word" join trigger. THIN hook (CLAUDE.md core/skill
     # split): the bridge only checks "is this the owner saying the join

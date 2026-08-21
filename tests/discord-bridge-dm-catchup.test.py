@@ -661,11 +661,8 @@ def test_checkpoint_write_failure_does_not_break_the_handler():
 
 
 def test_dm_catchup_lock_is_lazy_and_survives_contention_on_a_fresh_loop():
-    # #2655 P1 (qingyun/sonichi): the lock must NOT be constructed at import — on
-    # Python 3.9 asyncio.Lock() binds the event loop at construction, so a
-    # module-scope lock binds the pre-run default loop and a CONTENDED acquire
-    # under asyncio.run() raises "Future ... attached to a different loop".
-    # Constructed lazily inside the running loop, contention is safe.
+    # asyncio.Lock() binds the event loop at construction, so a module-scope lock
+    # binds the pre-run loop and a contended acquire under asyncio.run() cross-loops.
     bridge._dm_catchup_lock = None
     assert bridge._dm_catchup_lock is None  # not constructed at import time
 
