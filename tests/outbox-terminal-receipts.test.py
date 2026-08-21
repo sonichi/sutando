@@ -733,6 +733,78 @@ def test_invalid_identity_and_clock_inputs_are_rejected():
                 raise AssertionError("invalid terminal receipt input was accepted")
 
 
+def test_content_digest_roundtrips_and_gates_replacement():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        item = "task-content-digest"
+        dig_a = "a" * 64
+        dig_b = "b" * 64
+
+        # First record persists the digest and read returns it.
+        r1 = outbox.record_terminal_receipt(
+            root, item, outbox.TerminalDisposition.DELIVERED,
+            now=100.0, content_digest=dig_a)
+        assert r1.state is outbox.TerminalReceiptState.TERMINAL
+        assert r1.content_digest == dig_a
+        assert outbox.read_terminal_receipt(
+            root, item, now=101.0).content_digest == dig_a
+
+        # Same digest within TTL is idempotent: the standing record wins, its
+        # timestamp does not move.
+        r2 = outbox.record_terminal_receipt(
+            root, item, outbox.TerminalDisposition.DELIVERED,
+            now=200.0, content_digest=dig_a)
+        assert r2.recorded_at == 100.0
+        assert r2.content_digest == dig_a
+
+        # A different digest is a follow-up/revision: it replaces the record.
+        r3 = outbox.record_terminal_receipt(
+            root, item, outbox.TerminalDisposition.DELIVERED,
+            now=300.0, content_digest=dig_b)
+        assert r3.recorded_at == 300.0
+        assert r3.content_digest == dig_b
+        assert outbox.read_terminal_receipt(
+            root, item, now=301.0).content_digest == dig_b
+
+
+def test_content_digest_must_be_nonempty_string_or_none():
+    with tempfile.TemporaryDirectory() as tmp:
+        for bad in ("", 123, b"x"):
+            try:
+                outbox.record_terminal_receipt(
+                    tmp, "x", outbox.TerminalDisposition.DELIVERED,
+                    now=1.0, content_digest=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid content_digest was accepted")
+
+
+def test_legacy_schema_receipt_reads_as_unknown():
+    # A v1 record (no content_digest field) predates this format; it must not
+    # be trusted as TERMINAL — corrupt/foreign state is UNKNOWN, never ABSENT.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        item = "task-legacy"
+        path = outbox._terminal_receipt_path(root, item, 0)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        base = {
+            "schema": 1,
+            "item_id": item,
+            "generation": 0,
+            "disposition": outbox.TerminalDisposition.DELIVERED.value,
+            "recorded_at": 100.0,
+        }
+        import hashlib as _h
+        import json as _j
+        canonical = _j.dumps(base, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        legacy = {**base, "checksum": _h.sha256(canonical).hexdigest()}
+        path.write_bytes(outbox._terminal_bytes(legacy))
+        assert outbox.read_terminal_receipt(
+            root, item, now=101.0).state is outbox.TerminalReceiptState.UNKNOWN
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

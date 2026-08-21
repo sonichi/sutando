@@ -9,6 +9,7 @@ from __future__ import annotations
 
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -4518,10 +4519,45 @@ def _terminal_receipt_state(task_id: str):
     return outbox.TerminalReceiptState.UNKNOWN
 
 
-def _record_terminal_receipt(task_id: str, disposition) -> bool:
+def _result_body_digest(task_id: str) -> str | None:
+    """sha256 of the raw result file, or None if it cannot be read.
+
+    Digests the bytes the producer wrote, so a recreated file with identical
+    content matches and a follow-up/revision with changed content does not.
+    """
+    try:
+        return hashlib.sha256(
+            (RESULTS_DIR / f"{task_id}.txt").read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def _recreated_should_suppress(task_id: str) -> bool:
+    """True when a recreated result repeats the delivered body (double-send).
+
+    A recreated result whose content DIFFERS from the delivered body is a
+    follow-up/revision and must be delivered, so this returns False for it.
+    Missing digest evidence (a pre-content-digest receipt or an unreadable
+    body) falls back to True — the pre-digest behavior — so the double-send
+    guard never weakens on absent information.
+    """
+    try:
+        receipt = outbox.read_terminal_receipt(_result_receipt_root(), task_id)
+    except Exception:
+        return True
+    stored = receipt.content_digest
+    current = _result_body_digest(task_id)
+    if stored is None or current is None:
+        return True
+    return stored == current
+
+
+def _record_terminal_receipt(task_id: str, disposition,
+                             content_digest: str | None = None) -> bool:
     try:
         receipt = outbox.record_terminal_receipt(
-            _result_receipt_root(), task_id, disposition)
+            _result_receipt_root(), task_id, disposition,
+            content_digest=content_digest)
         return receipt.state is outbox.TerminalReceiptState.TERMINAL
     except Exception as exc:
         print(f"  [delivered] receipt write failed for {task_id}: {exc}", flush=True)
@@ -4537,8 +4573,14 @@ def _mark_legacy_delivered(task_id: str) -> None:
 
 
 def _mark_delivered(task_id: str) -> None:
-    """Persist terminal delivery immediately after successful provider I/O."""
-    _record_terminal_receipt(task_id, outbox.TerminalDisposition.DELIVERED)
+    """Persist terminal delivery immediately after successful provider I/O.
+
+    Records the delivered body's digest so a later recreation with the SAME
+    content is suppressed while a follow-up/revision (different content) is
+    delivered anew.
+    """
+    _record_terminal_receipt(task_id, outbox.TerminalDisposition.DELIVERED,
+                             content_digest=_result_body_digest(task_id))
     _mark_legacy_delivered(task_id)
     # §7 audit ledger (Result Router S5): one line per delivered result, so
     # "did the user see this?" is answerable without grepping bridge logs. This
@@ -4732,7 +4774,8 @@ async def poll_results():
         )
         for task_id, channel_id_str in _adopted.items():
             _receipt_state = _terminal_receipt_state(task_id)
-            if _receipt_state is outbox.TerminalReceiptState.TERMINAL:
+            if (_receipt_state is outbox.TerminalReceiptState.TERMINAL
+                    and _recreated_should_suppress(task_id)):
                 result_file = RESULTS_DIR / f"{task_id}.txt"
                 if _archive_delivered_pair(result_file, task_id):
                     result_audit.record(task_id, "deduped", "discord")
@@ -4740,6 +4783,8 @@ async def poll_results():
                 continue
             if _receipt_state is outbox.TerminalReceiptState.UNKNOWN:
                 continue
+            # A differing recreated body fell through here: route it for
+            # delivery as a follow-up/revision.
             _recovered_replies.setdefault(task_id, channel_id_str)
 
         # Merge recovered replies into pending_replies (resolve channel objects)
@@ -4757,7 +4802,8 @@ async def poll_results():
             if result_file.exists():
                 import re
                 _receipt_state = _terminal_receipt_state(task_id)
-                if _receipt_state is outbox.TerminalReceiptState.TERMINAL:
+                if (_receipt_state is outbox.TerminalReceiptState.TERMINAL
+                        and _recreated_should_suppress(task_id)):
                     pending_replies.pop(task_id, None)
                     pending_reply_anchors.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
@@ -4768,6 +4814,8 @@ async def poll_results():
                     continue
                 if _receipt_state is outbox.TerminalReceiptState.UNKNOWN:
                     continue
+                # TERMINAL-but-differing falls through here as a follow-up: the
+                # recreated body is delivered and _mark_delivered re-receipts it.
                 reply_text = read_ready_result(result_file)
                 if reply_text is None:
                     await _note_empty_result(task_id, result_file)

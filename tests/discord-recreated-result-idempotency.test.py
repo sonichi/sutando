@@ -244,7 +244,9 @@ class DiscordRecreatedResultTest(unittest.TestCase):
             1,
         )
 
-    def test_recreated_confirmed_result_is_retired_without_another_send(self):
+    def test_recreated_identical_suppressed_but_changed_is_delivered(self):
+        # Identical recreation is the double-send (suppressed); a recreation
+        # whose content differs is a follow-up and must be delivered.
         task_id = "task-2000000000001"
         first = "first confirmed answer"
         changed = "completion narration written after the answer"
@@ -254,18 +256,26 @@ class DiscordRecreatedResultTest(unittest.TestCase):
         self._one_pass()
         self.assertEqual(self.channel.sent, [first])
 
+        # Identical recreation -> suppressed (digest matches).
         self._forget_runtime_routes()
         self._result(task_id, first)
         self._one_pass()
+        self.assertEqual(self.channel.sent, [first])
+
+        # Changed recreation -> delivered as a follow-up (digest differs).
         self._forget_runtime_routes()
         self._result(task_id, changed)
         self._one_pass()
 
-        self.assertEqual(self.channel.sent, [first])
-        self.assertEqual(self.client.fetches, 1)
+        self.assertEqual(self.channel.sent, [first, changed])
         self.assertFalse((bridge.RESULTS_DIR / f"{task_id}.txt").exists())
         self.assertNotIn(task_id, bridge.pending_replies)
-        self.assertEqual(self._archive_bodies(task_id), sorted([first, first, changed]))
+        # A second identical recreation of the follow-up is itself suppressed:
+        # _mark_delivered re-receipted the new digest.
+        self._forget_runtime_routes()
+        self._result(task_id, changed)
+        self._one_pass()
+        self.assertEqual(self.channel.sent, [first, changed])
 
     def test_archive_failure_retries_without_send_or_audit_then_audits_once(self):
         task_id = "task-2000000000002"
@@ -349,7 +359,9 @@ class DiscordRecreatedResultTest(unittest.TestCase):
         self.assertTrue(bridge._has_durable_terminal_receipt(task_id))
         self.assertFalse(bridge._delivered_sentinel_path(task_id).exists())
 
-        self._result(task_id, "recreated after process restart")
+        # Identical content recreated after a restart is a suppressed
+        # double-send (its digest matches the receipt).
+        self._result(task_id, first)
         fresh = _load_bridge("discord_recreated_result_bridge_restart")
         fresh.REPO = WORKSPACE
         fresh.RESULTS_DIR = WORKSPACE / "results"
