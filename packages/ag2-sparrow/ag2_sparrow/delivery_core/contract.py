@@ -173,7 +173,9 @@ class ClaimBackend(Protocol):
         ...
 
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
-                 park_at_attempts: Optional[int] = None) -> bool:
+                 park_at_attempts: Optional[int] = None,
+                 provider: Optional[str] = None,
+                 destination: Optional[str] = None) -> bool:
         """Validate the exact incarnation, apply the outcome transition, and
         retire the claim — ALL inside one backend critical section, in that
         order. A stale token must change nothing: validating after mutating
