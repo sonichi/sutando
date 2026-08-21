@@ -114,8 +114,8 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
                    or data.get("id") or event_id)[:120]
     conv = re.sub(r"[^A-Za-z0-9._:@-]", "-", conv_raw) or "unknown"
     stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
-    # No access_tier: the broker path drops it and the receiving core decides.
-    # That is why broker is opt-in — see DEFAULTS and _require_non_owner_broker.
+    # Tier belongs to the SOURCE, not the sink: an omitted access_tier is
+    # read as owner downstream, so every sink must carry it explicitly.
     return {
         "id": _safe_task_id(f"{etype}-{stable}"),
         "task": f"[Bee {etype}] {text}",
@@ -125,4 +125,6 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
         "channel_id": conv,
         "room_name": "Bee",
         "interaction_type": "message",
+        "access_tier": "ambient",
+        "priority": "low",
     }

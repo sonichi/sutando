@@ -379,6 +379,16 @@ class TestBeeWatcher(unittest.TestCase):
         # an in-alphabet short id passes through readable (the other branch)
         self.assertEqual(self.mod._safe_task_id("todo42"), "task-bee-todo42")
 
+    def test_every_sink_carries_a_non_owner_tier(self):
+        # An omitted access_tier is read as OWNER downstream, so the tier has
+        # to ride on the event itself rather than on one sink's write path.
+        for etype, data in (("new-utterance", {"utterance": {"id": 1, "text": "hi"}}),
+                            ("todo-created", {"todo": {"id": 2, "text": "buy milk"}})):
+            t = self.mod.event_to_task(etype, "e1", data)
+            self.assertEqual(t.get("access_tier"), "ambient", etype)
+            self.assertNotEqual(t.get("access_tier"), "owner", etype)
+            self.assertEqual(t.get("priority"), "low", etype)
+
     def test_event_normalizer_falls_back_to_compact_json(self):
         t = self.mod.event_to_task("todo-created", "e9", {"weird": {"nested": 1}})
         self.assertEqual(t["id"], "task-bee-todo-created-e9")
