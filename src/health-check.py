@@ -2458,15 +2458,33 @@ def check_onboarding_status() -> "dict | None":
         rows = data["rows"]
         # Carry each row's own detail: "gateway" alone cannot distinguish "not
         # running" from a reconnect. `str()` because a separate repo writes this.
-        todo = [f"{k} ({d})" if (d := str(v.get("detail") or "").strip()[:120]) else k
-                for k, v in sorted(rows.items())
-                if isinstance(v, dict) and v.get("state") == "todo"]
+        todo_keys = [k for k, v in sorted(rows.items())
+                     if isinstance(v, dict) and v.get("state") == "todo"]
+        # A heartbeat refutes only the runtime-DOWN row; the writer also emits
+        # "core running, Claude sign-in required", a real gap on a running core.
+        _core = rows.get("core") if isinstance(rows.get("core"), dict) else {}
+        _down = (_core.get("claude_authed") is not False
+                 and "not running" in str(_core.get("detail") or "").lower())
+        stale_core = "core" in todo_keys and _down and _fresh_local_core_record() is not None
+        if stale_core:
+            todo_keys.remove("core")
+        todo = [f"{k} ({d})" if (d := str(rows[k].get("detail") or "").strip()[:120]) else k
+                for k in todo_keys]
         # Absent/null/0 updated_at is UNKNOWN, not the epoch — int(None or 0)
         # rendered the whole unix time as an age (~56 years) on both lines.
         _updated = int(data.get("updated_at", 0) or 0)
         age_s = max(0, int(time.time()) - _updated) if _updated > 0 else None
     except (ValueError, OSError, TypeError):
         return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+    if stale_core:
+        rest = f"; still todo: {', '.join(todo)}" if todo else ""
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"Console mirror is stale — its core row says 'not running' but this "
+                       f"host's heartbeat is live; mirror last written {_age_phrase(age_s)}"
+                       f"{rest}"),
+        }
     if todo:
         return {
             "name": name,
@@ -3320,6 +3338,19 @@ def _default_local_notifier(msg: str) -> bool:
         return False
 
 
+# Per-bridge EXACT detail: gateway-bridge's other warns (not-serving, duplicate
+# pileup) describe a live process, so only this string may respawn one.
+GATEWAY_DOWN_DETAIL = (
+    "configured but NOT running — ag2.space mobile messages will not be delivered"
+)
+DOWN_BRIDGE_DETAILS = {
+    "telegram-bridge": "configured but not running",
+    "discord-bridge": "configured but not running",
+    "slack-bridge": "configured but not running",
+    "gateway-bridge": GATEWAY_DOWN_DETAIL,
+}
+
+
 def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
                      notifier=None) -> list:
     """Restart or alert on configured-but-not-running channel bridges."""
@@ -3354,10 +3385,12 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
 
     restarted = []
     for c in checks:
+        # The name gate is NOT redundant with the detail match: for an unknown
+        # name the lookup is None, and a check with no detail is also None.
         if not (
-            c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge")
+            c["name"] in DOWN_BRIDGE_DETAILS
             and c["status"] == "warn"
-            and c.get("detail") == "configured but not running"
+            and c.get("detail") == DOWN_BRIDGE_DETAILS[c["name"]]
         ):
             continue
         name = c["name"]
@@ -3396,6 +3429,19 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
         # No interpreter can import the bridge's dependency (startup.sh skips too).
         return None
     child_env = os.environ.copy()
+    if name == "gateway-bridge":
+        # The bridge exits without a token, and startup.sh sources the same
+        # channels/ag2space/.env before launching it.
+        gw_env = _load_channel_env("ag2space")
+        merged = {**os.environ, **gw_env}
+        token = merged.get("REMOTE_TASK_TOKEN") or merged.get("AG2_REMOTE_TOKEN")
+        if not token:
+            return None
+        child_env.update(gw_env)
+        child_env["REMOTE_TASK_TOKEN"] = token
+        # Marks the launch supervised so the bridge stamps launched_via and
+        # skips its own bare-launch file log (see remote_gateway_bridge._log).
+        child_env["SUTANDO_SUPERVISED"] = "1"
     if name == "slack-bridge":
         # slack-bridge exits without BOTH tokens non-empty; the Keychain vault is
         # a real source (same env -> .env -> vault tiering as the bridge itself).
@@ -3409,6 +3455,10 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
     return interp, child_env
 
 
+# Check name → src/<script>.py, for the bridges whose two names differ.
+_BRIDGE_SCRIPT = {"gateway-bridge": "remote-gateway-bridge"}
+
+
 def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
     """Spawn a bridge per _bridge_launch_plan; True if spawned."""
     plan = plan or _bridge_launch_plan(name)
@@ -3420,7 +3470,7 @@ def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
     # `with` closes the parent's handle after Popen; the child holds
     # its own dup of the fd, so the log stays writable.
     with open(str(log_path), "a") as log_f:
-        subprocess.Popen([interp, str(REPO_DIR / "src" / f"{name}.py")],
+        subprocess.Popen([interp, str(REPO_DIR / "src" / f"{_BRIDGE_SCRIPT.get(name, name)}.py")],
                          stdout=log_f, stderr=subprocess.STDOUT,
                          env=child_env, start_new_session=True)
     return True
@@ -3679,6 +3729,26 @@ def _filter_pids_this_checkout(pids: list) -> list:
         elif not argv:
             kept.append(pid)  # neither probe answered — fail open
     return kept
+
+
+def sutando_app_newest_source(app_dir: Optional[Path] = None) -> Path:
+    """Newest .swift under the app dir — the binary is stale if it predates any of them.
+
+    Globbed, not enumerated: the app is built from several sources now, and a
+    hardcoded list silently stops noticing the ones added after it was written.
+    """
+    d = app_dir if app_dir is not None else REPO_DIR / "src" / "Sutando"
+    main = d / "main.swift"
+    try:
+        srcs = [p for p in d.glob("*.swift") if p.is_file()]
+    except OSError:
+        return main
+    if not srcs:
+        return main
+    try:
+        return max(srcs, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return main
 
 
 def _binary_is_current(binary_path: Path, src_file: Path) -> bool:
@@ -5374,7 +5444,7 @@ def check_gateway_bridge() -> "dict | None":
         return {
             "name": "gateway-bridge",
             "status": "warn",
-            "detail": "configured but NOT running — ag2.space mobile messages will not be delivered",
+            "detail": GATEWAY_DOWN_DETAIL,
         }
     claimed = _gateway_lock_pids()
     if claimed:
@@ -6298,15 +6368,17 @@ def check_proactive_quarantine() -> dict:
     the owner never saw was also destroyed — observed live here as
     `413 Payload Too Large (error code: 40005)`. The fix (#2626) moves the body
     to `results/undelivered/` instead of deleting it, which is strictly better
-    and still ends with nobody being told: a scan of the whole tree at that
+    but left the body with no consumer: a scan of the whole tree at that
     change's head finds the writer and **no reader at all**. The nearest
     candidate, `friction-detector.check_stale_results()`, is a stub that returns
     `[]` and is never called.
 
-    That is the shape this probe exists to close. Preservation without a reader
-    is a message that exists on disk and reaches no one — the same failure as
-    deletion from the owner's side, minus the recoverability. Losing it loudly
-    at least surfaces; losing it quietly does not.
+    That is the shape this probe exists to close, which makes it the reader —
+    so "nobody has been told" stopped being true the moment this shipped, and
+    saying it here or in what this probe emits invites the output to be quoted
+    back as independent evidence that no reader exists. What stays true is
+    narrower: nothing drains or re-drives the directory, so a preserved body
+    reaches no one until someone acts. Warning is not delivering.
 
     Deliberately NOT a failure: quarantine is the correct end state for a body
     Discord will never accept (a 413 never becomes a 200). The action is for a
@@ -6351,8 +6423,9 @@ def check_proactive_quarantine() -> dict:
         "name": name,
         "status": "warn",
         "detail": (f"{len(kept)} proactive message(s) kept in results/undelivered/ that Discord "
-                   f"refused — preserved, but nothing reads this directory, so nobody has been "
-                   f"told; oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
+                   f"refused — preserved, but no consumer drains this directory, so they stay "
+                   f"until someone acts; oldest {oldest_name} "
+                   f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
                    f"{partial}"),
     }
 
@@ -8961,7 +9034,7 @@ def run_all_checks() -> list[dict]:
             if dev_bin.exists():
                 mark_stale_if_outdated(
                     check,
-                    REPO_DIR / "src" / "Sutando" / "main.swift",
+                    sutando_app_newest_source(),
                     "(Sutando|MacOS)/Sutando",
                     binary_path=dev_bin,
                 )
@@ -10426,7 +10499,7 @@ def main():
                     # here — the result string will say the restart failed.
                     result = fix_launchd(LAUNCHD_BACKED_CHECKS[c["name"]])  # pragma: no cover
                     print(f"  {c['name']}: {result}")  # pragma: no cover
-                elif c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge"):  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
+                elif c["name"] in DOWN_BRIDGE_DETAILS:  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
                     # LoginFailure means the token is bad — restarting won't help
                     # and would create a duplicate alongside the launchd-managed one.
                     if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):
@@ -10477,7 +10550,7 @@ def main():
                     #      observed 3 concurrent on 2026-04-19), so we
                     #      defer that path to a manual rebuild + relaunch.
                     binary = REPO_DIR / "src" / "Sutando" / "Sutando"
-                    source = REPO_DIR / "src" / "Sutando" / "main.swift"
+                    source = sutando_app_newest_source()
                     if (
                         c.get("status") == "warn"
                         and "not running" in (c.get("detail") or "")
