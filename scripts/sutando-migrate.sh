@@ -233,9 +233,8 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
-    # Accumulated grants, not a snapshot. newest-mtime discards the whole
-    # allow-set when a fresh install writes an empty one first; structural only
-    # sidecars the loser, which the Slack reader never loads. Both lose access.
+    # Accumulated grants, not a snapshot: newest-mtime drops the whole
+    # allow-set when a fresh install writes an empty one first.
     "state/slack-allowed-recipients.json|union-json-array"
     "state/*.json|newest-mtime"
     "state/*|structural"
@@ -270,6 +269,7 @@ CLASS_RULES=(
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$REPO_DIR/scripts/python-binary.sh"
 HELPER="$REPO_DIR/scripts/sutando-config.sh"
 
 if [ ! -x "$HELPER" ] && [ ! -f "$HELPER" ]; then
@@ -548,9 +548,8 @@ scan_source() {
                 n_newest=$((n_newest+1))
                 ;;
             union-json-array)
-                # Reported separately: the whole point is that it does NOT
-                # resolve to one file, so folding it into structural or
-                # newest-mtime would make the dry-run describe the wrong action.
+                # Reported separately: it resolves to no single file, so folding it
+                # in would make the dry-run describe the wrong action.
                 n_union=$((n_union+1))
                 ;;
             rehome-state)
@@ -967,15 +966,15 @@ copy_preserving_mtime() {
     cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"
 }
 
-# Merge an accumulated-grant JSON file into dest, in place of newest-wins.
-# Unions every top-level array field; non-array fields come from the newer file.
-# Malformed input returns non-zero rather than degrading to newest-wins — a
-# silent degrade is the access loss this class exists to prevent.
+# Unions top-level arrays; non-array fields follow the newer source.
+# Malformed input returns non-zero — a silent degrade is access loss.
 union_json_arrays_into() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"
     local tmp="$dst.tmp.$$"
-    if python3 - "$src" "$dst" "$tmp" <<'PY'
+    local py; py="$(resolve_python "$REPO_DIR")"
+    [ -n "$py" ] || return 1
+    if "$py" - "$src" "$dst" "$tmp" <<'PY'
 import json, os, sys
 
 src, dst, tmp = sys.argv[1:4]
@@ -1009,6 +1008,10 @@ for key in set(src_doc) | set(dst_doc):
 with open(tmp, "w", encoding="utf-8") as fh:
     json.dump(merged, fh, indent=2, sort_keys=True)
     fh.write("\n")
+# The union rewrites dst, so the result must carry the winner's mtime; otherwise
+# the next source compares against "now" and its scalars can never win.
+win = max(os.path.getmtime(src), os.path.getmtime(dst))
+os.utime(tmp, (win, win))
 PY
     then
         mv -f "$tmp" "$dst"
@@ -1150,9 +1153,8 @@ commit_one() {
                 echo "identical-drop"
                 return 0
             fi
-            # Both sides exist and differ: accumulate rather than pick a winner.
-            # An unreadable or non-conforming file aborts the run — degrading to
-            # newest-wins here would silently drop grants, which is the bug.
+            # Both sides exist and differ: accumulate, never pick a winner.
+            # A malformed file aborts rather than silently dropping grants.
             if ! union_json_arrays_into "$src_file" "$dst_path"; then
                 echo "ERROR: $rel — cannot union $src_file into $dst_path (malformed JSON" >&2
                 echo "       or a field that is an array in one file and not the other)." >&2

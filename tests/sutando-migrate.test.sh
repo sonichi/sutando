@@ -323,6 +323,51 @@ PY
     fi
 fi
 
+# 6i. Three-source accumulation: the scalar winner must be the NEWEST source,
+# not whichever ran last. Two-source cases cannot expose this — the union rewrites
+# dest and resets its mtime, so a genuinely newest third source looked older.
+U3="$TMP/union3"
+mkdir -p "$U3"
+printf '{"schemaVersion":1,"allowFrom":["U_C"]}\n' > "$U3/C.json"
+printf '{"schemaVersion":2,"allowFrom":["U_A"]}\n' > "$U3/A.json"
+printf '{"schemaVersion":3,"allowFrom":["U_B"]}\n' > "$U3/B.json"
+touch -t 202601010000 "$U3/C.json"
+touch -t 202601020000 "$U3/A.json"
+touch -t 202601030000 "$U3/B.json"
+cp "$U3/C.json" "$U3/dst.json"; touch -t 202601010000 "$U3/dst.json"
+# Call the production writer itself, not a reimplementation of the rule.
+u3_fn="$TMP/union_fn.sh"
+python3 - "$MIGRATE" "$u3_fn" "$REPO" <<'PYX'
+import sys
+src, out, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
+i = s.index("union_json_arrays_into() {")
+j = s.index("\n}\n", i) + 3
+open(out, "w").write(
+    f'SCRIPT_DIR="{repo}/scripts"\nREPO_DIR="{repo}"\n'
+    f'. "{repo}/scripts/python-binary.sh"\n\n' + s[i:j])
+PYX
+u3_check="$(
+  . "$u3_fn"
+  union_json_arrays_into "$U3/A.json" "$U3/dst.json" || echo "union A failed"
+  union_json_arrays_into "$U3/B.json" "$U3/dst.json" || echo "union B failed"
+  python3 - "$U3/dst.json" <<'PYX'
+import json, sys
+d = json.load(open(sys.argv[1]))
+problems = []
+if d.get("schemaVersion") != 3:
+    problems.append(f"schemaVersion={d.get('schemaVersion')!r}, expected 3 from the newest source")
+if sorted(d.get("allowFrom") or []) != ["U_A", "U_B", "U_C"]:
+    problems.append(f"allowFrom={d.get('allowFrom')!r}, expected all three accumulated")
+print("; ".join(problems) if problems else "OK")
+PYX
+)"
+if [ "$u3_check" = "OK" ]; then
+    echo "  OK: three-source union keeps the newest scalar and accumulates every array"
+else
+    echo "  FAIL: three-source union — $u3_check"; fail=1
+fi
+
 # 6h. Union idempotency against the REAL script, not a reimplementation of the
 # rule: migrate the same populated source into a dest that already holds the
 # unioned result. A second pass must not duplicate entries or drop fields.
