@@ -30,6 +30,10 @@ from pathlib import Path
 # these; any other target aborts rather than forwarding the owner's token.
 TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
 
+# Test seam. Empty in production: a redirect that downgrades to plaintext must
+# never replay the bearer token, so http is allowed only where a test opts in.
+INSECURE_REDIRECT_HOSTS: frozenset[str] = frozenset()
+
 
 def _redact(text: str) -> str:
     """Best-effort scrub of secrets/PII before a log excerpt leaves the machine.
@@ -170,10 +174,21 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
         if not loc:
             raise
         nxt = urllib.parse.urljoin(url, loc)
-        host = urllib.parse.urlsplit(nxt).hostname or ""
+        split = urllib.parse.urlsplit(nxt)
+        host = split.hostname or ""
+        # Userinfo lets a target read as a trusted host to this check while
+        # resolving elsewhere in other parsers; refuse rather than reconcile.
+        if split.username or split.password:
+            raise RuntimeError(
+                "refusing to forward credentials to a redirect target carrying userinfo"
+            ) from e
         if host not in TRUSTED_API_HOSTS:
             raise RuntimeError(
                 f"refusing to forward credentials to untrusted redirect host {host!r}"
+            ) from e
+        if split.scheme != "https" and host not in INSECURE_REDIRECT_HOSTS:
+            raise RuntimeError(
+                f"refusing to forward credentials over {split.scheme or 'no'} scheme to {host!r}"
             ) from e
         return post_feedback(nxt, payload, token, _hops + 1)
 

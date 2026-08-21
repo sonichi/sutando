@@ -65,6 +65,12 @@ class TestRedirect(unittest.TestCase):
         self._orig = rf.TRUSTED_API_HOSTS
         rf.TRUSTED_API_HOSTS = frozenset({self.host})
         self.addCleanup(lambda: setattr(rf, "TRUSTED_API_HOSTS", self._orig))
+        # The loopback server speaks http, so these cases opt into the seam
+        # explicitly. Production leaves it empty; see the downgrade tests below.
+        self._orig_insecure = rf.INSECURE_REDIRECT_HOSTS
+        rf.INSECURE_REDIRECT_HOSTS = frozenset({self.host})
+        self.addCleanup(
+            lambda: setattr(rf, "INSECURE_REDIRECT_HOSTS", self._orig_insecure))
 
     def test_no_redirect_posts_once(self):
         st = rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok")
@@ -100,6 +106,27 @@ class TestRedirect(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok")
         self.assertIn("untrusted redirect host", str(cm.exception))
+        self.assertEqual(RECEIVED, [])
+
+    def test_downgrade_to_http_makes_no_second_request(self):
+        """A 307 to http:// on a TRUSTED host must not replay the token."""
+        rf.INSECURE_REDIRECT_HOSTS = frozenset()          # production shape
+        Handler.redirect_to = f"http://{self.host}:{self.srv.server_port}/api/feedback2"
+        with self.assertRaises(RuntimeError) as cm:
+            rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok")
+        self.assertIn("scheme", str(cm.exception))
+        self.assertEqual(RECEIVED, [], "no second request may be made")
+
+    def test_production_seam_is_empty(self):
+        self.assertEqual(self._orig_insecure, frozenset(),
+                         "INSECURE_REDIRECT_HOSTS must ship empty")
+
+    def test_userinfo_in_redirect_target_is_refused(self):
+        rf.INSECURE_REDIRECT_HOSTS = frozenset()
+        Handler.redirect_to = f"https://attacker@{self.host}/api/feedback"
+        with self.assertRaises(RuntimeError) as cm:
+            rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok")
+        self.assertIn("userinfo", str(cm.exception))
         self.assertEqual(RECEIVED, [])
 
     def test_redirect_loop_is_bounded(self):
