@@ -1005,6 +1005,7 @@ TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
 # Registry-loss self-claim (backend #595): the code is device-visible only;
 # binding requires the owner's concierge approval. Disable: REMOTE_REENROLL=0.
+# Does NOT gate _auth_probe() — a token simply being accepted again isn't a relink.
 REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
     not in ("0", "false", "no", "off")
 REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
@@ -1097,7 +1098,12 @@ def _reenroll_clear(recovered: bool = False) -> None:
     """End the episode; recovered=True (probe-success path only) leaves the
     explicit terminal — disappearance alone must never read as success."""
     was_pending = bool(_reenroll_state.get("code"))
+    prior_attempt = _reenroll_state.get("last_attempt_at")
     _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
+    if not was_pending:
+        # No claim was granted this episode — preserve its cadence, or a
+        # probe-only resume lets every future episode re-claim immediately.
+        _reenroll_state["last_attempt_at"] = prior_attempt
     if recovered and was_pending:
         _reenroll_state["recovered_at"] = int(time.time())
     else:
@@ -1672,8 +1678,14 @@ def _recover_auth(code: int) -> bool:
             # loop, cadence-bounded internally (safe while nothing is parked).
             _reenroll_claim()
         cycle += 1
-        if pending and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
-            _log("re-link approved — the existing token is accepted again; resuming")
+        if cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
+            # Re-read: `pending` above predates this iteration's own claim,
+            # which can park a code the log line must not miss (review).
+            fresh_pending = bool(_reenroll_state["code"])
+            _log("token accepted again — resuming"
+                 + (" (re-link approved)" if fresh_pending else ""))
+            # _reenroll_clear re-reads current state for was_pending, so this
+            # is correct whether or not a code was parked when we got here.
             _reenroll_clear(recovered=True)
             return True
 
