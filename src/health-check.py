@@ -3495,6 +3495,19 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
 _BRIDGE_SCRIPT = {"gateway-bridge": "remote-gateway-bridge"}
 
 
+def stale_restart_allowed(repo_dir, *, guard=None) -> "tuple[bool, str]":
+    """Whether a STALE bridge may be auto-restarted from this checkout.
+
+    The canonical-checkout guard belongs to every auto-restart path, not only
+    the down path: a stale restart boots whatever is checked out HERE, so on a
+    feature branch it silently ships unreviewed code (2026-07-29: four days of
+    bridge restarts booted a branch 75 commits behind main).
+    """
+    guard = guard or _checkout_is_canonical
+    ok, why = guard(repo_dir)
+    return (True, "") if ok else (False, why)
+
+
 def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
     """Spawn a bridge per _bridge_launch_plan; True if spawned."""
     plan = plan or _bridge_launch_plan(name)
@@ -10531,6 +10544,13 @@ def main():
                         if plan is None:
                             print(f"  {c['name']}: no capable interpreter/env — restart skipped (see startup.sh launch requirements)")
                             continue
+                        if c["status"] == "stale":
+                            _ok, _why = stale_restart_allowed(REPO_DIR)
+                            if not _ok:
+                                print(f"  {c['name']}: stale, but NOT auto-restarted "
+                                      f"({_why}) — restarting here would ship whatever is "
+                                      "checked out. Restart deliberately once the checkout is canonical.")
+                                continue
                         # If stale (process older than source code), kill old PID first
                         # so the new process doesn't conflict with a still-running zombie.
                         if c["status"] == "stale":
