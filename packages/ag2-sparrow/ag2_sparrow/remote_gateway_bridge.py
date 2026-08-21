@@ -1668,8 +1668,11 @@ def _recover_auth(code: int) -> bool:
             # loop, cadence-bounded internally (safe while nothing is parked).
             _reenroll_claim()
         cycle += 1
-        if pending and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
-            _log("re-link approved — the existing token is accepted again; resuming")
+        if cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
+            _log("token accepted again — resuming"
+                 + (" (re-link approved)" if pending else ""))
+            # _reenroll_clear re-reads current state for was_pending, so this
+            # is correct whether or not a code was parked when we got here.
             _reenroll_clear(recovered=True)
             return True
 
