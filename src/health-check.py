@@ -6664,8 +6664,12 @@ def check_task_watcher() -> dict:
                     "detail": f"no live core heartbeat, but {len(idle_trees)} watcher tree(s) "
                               f"alive (pids {', '.join(sorted(idle_trees))}) — watcher health is "
                               "NOT asserted while the core signal is stale"}
+        # Say only what was established: a false _any_core_alive() means no
+        # FRESH heartbeat, and an empty _watcher_trees() can also be a failed ps.
         return {"name": name, "status": "ok",
-                "detail": "no core running and no watcher process — watcher not expected"}
+                "detail": "no live core heartbeat and no watcher tree observed — "
+                          "watcher health is NOT asserted (neither the core's "
+                          "absence nor the probe's success was established)"}
     trees = _watcher_trees()
     roots = sorted(trees)
     if not pid_file.exists():

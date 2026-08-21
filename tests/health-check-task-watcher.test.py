@@ -496,6 +496,35 @@ def case_a2_no_core_but_live_watcher_is_not_called_unexpected() -> list[str]:
     return out
 
 
+UNMEASURED = ("no core running", "no watcher process", "not expected")
+
+
+def case_a3_stale_heartbeat_no_trees_claims_only_what_it_measured() -> list[str]:
+    # A false _any_core_alive() means no FRESH heartbeat, not an absent core;
+    # an empty _watcher_trees() can equally be a failed ps probe.
+    r = run_check(core_alive=False, pid_text=None, trees={})
+    out = []
+    if r["status"] != "ok":
+        out.append(f"a3) must stay ok (anti-latch), got {r['status']}")
+    for claim in UNMEASURED:
+        if claim in r["detail"]:
+            out.append(f"a3) asserts unestablished {claim!r}: {r['detail']}")
+    return out
+
+
+def case_a4_unavailable_process_probe_is_not_an_absent_watcher() -> list[str]:
+    # _watcher_trees() collapses a failed probe into {} — indistinguishable
+    # from "no watcher", so the row must not report the outage as expected.
+    r = run_check(core_alive=False, pid_text=None, trees={})
+    out = []
+    for claim in UNMEASURED:
+        if claim in r["detail"]:
+            out.append(f"a4) a failed ps probe reads as {claim!r}: {r['detail']}")
+    if "NOT asserted" not in r["detail"]:
+        out.append(f"a4) does not say watcher health is unasserted: {r['detail']}")
+    return out
+
+
 def case_b_sentinel_absent_warns() -> list[str]:
     r = run_check(core_alive=True, pid_text=None)
     if r["status"] != "warn":
@@ -741,6 +770,8 @@ def main() -> int:
     cases = [
         ("a", case_a_no_core_is_ok),
         ("a2", case_a2_no_core_but_live_watcher_is_not_called_unexpected),
+        ("a3", case_a3_stale_heartbeat_no_trees_claims_only_what_it_measured),
+        ("a4", case_a4_unavailable_process_probe_is_not_an_absent_watcher),
         ("b", case_b_sentinel_absent_warns),
         ("c", case_c_dead_pid_warns),
         ("d", case_d_pid_reuse_warns),
