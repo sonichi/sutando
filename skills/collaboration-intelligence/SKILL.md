@@ -337,18 +337,19 @@ noise. So there are two tests before sending, and they key on different variable
 If neither test fires, the item is correctly in their queue — leave it.
 
 Measured on this repo: a PR sat **eleven days** on a blocking review its author had
-answered within the hour, while **three distinct reviewers approved it across six
-approval submissions** — the last of them the same morning anyone noticed. Nothing had
-changed on the author's side after day one, and the item was unambiguously owned, so
+answered within the hour, while **five approvals landed while the block stood, from
+three distinct reviewers** — the last of them the same morning anyone noticed. Nothing
+had changed on the author's side after day one, and the item was unambiguously owned, so
 "has anything changed on my side?" returned *no* every single day, correctly, while
 three people's work went unused. Elapsed time was the only thing that could have
 surfaced it.
 
-(Both figures are stated because they answer different questions and get confused for
-each other: the merge gate counts **reviewers**, so three is the number that binds,
-while six is the review *traffic* the item generated while going nowhere. Quoting one
-without naming which it is invites a reader to re-derive a third number that is neither
-— which is exactly what happened when this case was first written up.)
+(**Distinct reviewers is the figure that carries the argument** — it is what a merge
+gate counts, so three is what binds. The submission count is stated only to be honest
+about the window: a sixth approval exists but predates the block by five hours, so it
+never accumulated behind anything. This example reached its final wording after being
+published with a *fourth* number that was neither — the row count of a truncated
+terminal display. State which unit a count is in, or the next reader will invent one.)
 
 **And the ownership test has a floor beneath it: an item nobody was EVER asked to
 move.** There no holder's attention lapsed — none existed. Nothing of yours changes, by
