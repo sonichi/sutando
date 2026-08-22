@@ -24,3 +24,27 @@ session path.
 Provider hard and stall timeouts default to the values declared in
 `manifest.json`. CLI options override environment values, which override the
 manifest defaults.
+
+## Progress visibility
+
+A room-session invocation is otherwise silent for its whole run — up to the hard
+timeout — with nothing distinguishing "queued behind another message in this
+room" from "actively working" from "hung." Three best-effort notifications close
+most of that gap, each routed through the shared `task-progress` notifier using
+the task's own `source`/`channel_id` headers:
+
+- **On start** (once, the moment this invocation actually begins running, not
+  when it was received) — signals the message left the lock queue and work is
+  underway.
+- **Heartbeat**, every `SUTANDO_TIER_HEARTBEAT_INTERVAL` seconds (manifest
+  default 120s) while the provider is still running.
+- **On timeout** (hard or stall) — an explicit handoff notice before the task
+  falls back to the live core, so that fallback reply doesn't appear
+  disconnected from the original message.
+
+All three are best-effort and never affect the run itself: a broken or slow
+notifier only costs visibility, not correctness. **Known gap, not solved
+here:** the provider call itself is still killed outright on timeout with no
+checkpoint or partial-result recovery — the heartbeat says the room isn't dead,
+it doesn't rescue in-flight work that turns out to need longer than the hard
+timeout allows.

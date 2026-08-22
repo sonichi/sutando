@@ -435,6 +435,75 @@ def test_direct_failure_and_cli_edges() -> None:
             check(worker.main() == 18, "CLI main dispatches handle mode")
 
 
+def test_progress_notifications() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        workspace = Path(name)
+        results = workspace / "results"
+        results.mkdir()
+
+        # _notify: builds the shared task-progress notifier call from the task's own
+        # trusted headers, and never raises even when the subprocess itself fails.
+        notified = task(workspace, "task-notify")
+        with patch.object(worker.subprocess, "run") as run:
+            worker._notify(notified, "hello")
+        run_args = run.call_args.args[0]
+        check(run_args[0] == sys.executable and str(worker.REPO_ROOT) in " ".join(run_args),
+              "_notify invokes the shared notifier via the resolved interpreter")
+        check("--source" in run_args and "ag2space" in run_args, "_notify passes the task's source header")
+        check("--channel-id" in run_args and "!alpha:ag2.space" in run_args,
+              "_notify passes the task's channel_id header")
+        check("hello" in run_args, "_notify passes the message through")
+        with patch.object(worker.subprocess, "run", side_effect=OSError("no interpreter")):
+            worker._notify(notified, "hello")  # must not raise
+        check(True, "_notify swallows a subprocess failure rather than raising")
+        missing_headers = workspace / "tasks" / "task-bare.txt"
+        missing_headers.write_text("id: task-bare\ntask: no source or channel\n", encoding="utf-8")
+        with patch.object(worker.subprocess, "run") as run:
+            worker._notify(missing_headers, "hello")
+        check(not run.called, "_notify is a no-op without source/channel_id headers")
+
+        # handle(): fires exactly one ack, at the moment work starts, before the
+        # provider runs at all — not when the task was merely received.
+        started = task(workspace, "task-started")
+        calls: list[str] = []
+        with patch.object(worker, "_notify", side_effect=lambda _f, msg: calls.append(msg)), \
+             patch.object(worker, "_run_claude", return_value="ok") as run_claude:
+            check(worker.handle("claude", workspace, started, results, REPO) == 0,
+                  "handle succeeds with the ack wired in")
+        check(calls == ["On it — working on this now."],
+              "handle fires exactly one ack before the provider runs")
+        check(run_claude.call_args.kwargs.get("on_heartbeat") is not None,
+              "handle wires a heartbeat callback into the provider call")
+
+        # _run_bounded: heartbeat fires on a real elapsed-time cadence and skips ahead
+        # past overrun intervals rather than bursting catch-up pings.
+        sleeper = executable(Path(name) / "sleepy2", "#!/bin/sh\nsleep 0.5\n")
+        beats: list[float] = []
+        with patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "5", "SUTANDO_TIER_STALL_TIMEOUT": "5"}):
+            worker._run_bounded([str(sleeper)], Path(name),
+                                 heartbeat_interval_override=0.15, on_heartbeat=beats.append)
+        check(1 <= len(beats) <= 4, f"heartbeat fires a bounded number of times during a 0.5s run ({beats})")
+        check(all(b >= 0 for b in beats), "heartbeat receives non-negative elapsed seconds")
+
+        # On timeout, an explicit handoff notice fires (via _notify) before the
+        # exception surfaces as the ordinary watcher-fallback failure path.
+        stuck = task(workspace, "task-stuck", room_id="!stuck:a")
+        handoff: list[str] = []
+        with patch.object(worker, "_notify", side_effect=lambda _f, msg: handoff.append(msg)), \
+             patch.object(worker, "_run_claude", side_effect=TimeoutError("provider exceeded hard timeout")):
+            code = worker.handle("claude", workspace, stuck, results, REPO)
+        check(code == 1, "handle still returns the watcher-fallback signal on timeout")
+        check(handoff == ["On it — working on this now.",
+                           "This is taking longer than expected — handing off, a reply will "
+                           "follow through the normal path."],
+              "handle notifies both the start ack and an explicit timeout handoff")
+        check(not (results / stuck.name).exists(), "timeout publishes no result, same as any other failure")
+
+        with patch.dict(os.environ, {}, clear=True):
+            check(worker._timeout("SUTANDO_TIER_HEARTBEAT_INTERVAL", None) == 120,
+                  "manifest declares the heartbeat-interval default")
+
+
 def main() -> int:
     test_opt_in_and_cardinality()
     test_session_state_reuses_room_not_message()
@@ -444,6 +513,7 @@ def main() -> int:
     test_runtime_edges_and_adapter_wiring()
     test_cli_probe_and_empty_output()
     test_direct_failure_and_cli_edges()
+    test_progress_notifications()
     print(f"\nResults: {len(FAILURES)} failed")
     return 1 if FAILURES else 0
 

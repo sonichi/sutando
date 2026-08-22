@@ -20,7 +20,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 UNHANDLED = 3
@@ -192,9 +192,18 @@ def _run_bounded(
     cwd: Path,
     hard_timeout_override: Optional[float] = None,
     stall_timeout_override: Optional[float] = None,
+    heartbeat_interval_override: Optional[float] = None,
+    on_heartbeat: Optional[Callable[[float], None]] = None,
 ) -> tuple[int, str, str]:
     hard_timeout = _timeout("SUTANDO_TIER_HARD_TIMEOUT", hard_timeout_override)
     stall_timeout = _timeout("SUTANDO_TIER_STALL_TIMEOUT", stall_timeout_override)
+    # Heartbeat is best-effort progress visibility, not a correctness timer — reuse
+    # _timeout() only for its CLI>env>manifest precedence; a bad/missing value disables
+    # it rather than aborting the run (unlike hard/stall, which must fail closed).
+    try:
+        heartbeat_interval = _timeout("SUTANDO_TIER_HEARTBEAT_INTERVAL", heartbeat_interval_override)
+    except ValueError:
+        heartbeat_interval = 0.0
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -212,6 +221,18 @@ def _run_bounded(
         os.set_blocking(fd, False)
         selector.register(fd, selectors.EVENT_READ, name)
     started = last_progress = time.monotonic()
+    next_heartbeat = started + heartbeat_interval if heartbeat_interval > 0 else None
+
+    def _maybe_heartbeat(now: float) -> None:
+        nonlocal next_heartbeat
+        if next_heartbeat is None or now < next_heartbeat or on_heartbeat is None:
+            return
+        # Skip ahead past any interval(s) a slow select()/sleep() overran, rather than
+        # firing a burst of catch-up pings once the loop resumes.
+        while next_heartbeat is not None and now >= next_heartbeat:
+            next_heartbeat += heartbeat_interval
+        on_heartbeat(now - started)
+
     try:
         while selector.get_map():
             now = time.monotonic()
@@ -219,6 +240,7 @@ def _run_bounded(
                 raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
             if now - last_progress >= stall_timeout:
                 raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
+            _maybe_heartbeat(now)
             for key, _ in selector.select(timeout=min(0.2, stall_timeout)):
                 try:
                     chunk = os.read(key.fd, 65536)
@@ -235,6 +257,7 @@ def _run_bounded(
                 raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
             if now - last_progress >= stall_timeout:
                 raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
+            _maybe_heartbeat(now)
             time.sleep(min(0.05, stall_timeout))
         return (
             int(process.returncode or 0),
@@ -284,6 +307,35 @@ def _working_dir(repo: Path) -> Path:
     return Path(os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo))).expanduser()
 
 
+def _notify(task_file: Path, message: str) -> None:
+    """Best-effort progress ping via the shared task-progress notifier — reused rather
+    than reimplemented, matching the same delivery path the NOTIFY FIRST convention
+    already uses everywhere else in this codebase. Never raises: a broken or slow
+    notify path must not affect the room session itself, only its visibility."""
+    try:
+        headers = parse_task_headers_trusted(
+            task_file.read_text(encoding="utf-8", errors="replace")
+        ).headers
+    except OSError:
+        return
+    source = headers.get("source") or ""
+    channel_id = headers.get("channel_id") or ""
+    if not source or not channel_id:
+        return
+    notifier = REPO_ROOT / "skills" / "task-progress" / "scripts" / "notify.py"
+    if not notifier.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(notifier), "--source", source, "--channel-id", channel_id,
+             "--message", message],
+            timeout=15, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _claude_command(session_id: str, resume: bool, prompt: str) -> list[str]:
     command = ["claude", "-p", "--resume" if resume else "--session-id", session_id]
     command += ["--output-format", "text", "--dangerously-skip-permissions", "--add-dir", str(Path.home())]
@@ -321,6 +373,7 @@ def _run_claude(
     repo: Path,
     hard_timeout: Optional[float] = None,
     stall_timeout: Optional[float] = None,
+    on_heartbeat: Optional[Callable[[float], None]] = None,
 ) -> str:
     session_id, created = _session_id(workspace, "claude", room_key)
     return_code, stdout, stderr = _run_bounded(
@@ -328,6 +381,7 @@ def _run_claude(
         _working_dir(repo),
         hard_timeout,
         stall_timeout,
+        on_heartbeat=on_heartbeat,
     )
     if return_code:
         raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
@@ -343,6 +397,7 @@ def _run_codex(
     repo: Path,
     hard_timeout: Optional[float] = None,
     stall_timeout: Optional[float] = None,
+    on_heartbeat: Optional[Callable[[float], None]] = None,
 ) -> str:
     state = _read_json(_state_path(workspace))
     row = ((state.get("sessions") or {}).get("codex") or {}).get(room_key)
@@ -359,6 +414,7 @@ def _run_codex(
             _working_dir(repo),
             hard_timeout,
             stall_timeout,
+            on_heartbeat=on_heartbeat,
         )
         if return_code:
             raise RuntimeError(stderr.strip() or f"codex exited {return_code}")
@@ -416,11 +472,32 @@ def handle(
         with _locked(lock):
             if _completed_result_exists(results_dir, task_file.name):
                 return 0
-            body = (
-                _run_claude(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
-                if runtime == "claude"
-                else _run_codex(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
+            # Decoupled ack: fires once, the moment this task actually starts running
+            # (not when it was queued) — so a message stuck behind another room-session
+            # invocation's lock stays silent until its own turn, exactly like the live
+            # core's own step-2 NOTIFY FIRST convention for a task that's now underway.
+            _notify(task_file, "On it — working on this now.")
+            heartbeat = lambda elapsed: _notify(  # noqa: E731
+                task_file, f"Still working ({elapsed:.0f}s so far)…"
             )
+            try:
+                body = (
+                    _run_claude(workspace, room_key, _prompt(task_file), repo,
+                                hard_timeout, stall_timeout, on_heartbeat=heartbeat)
+                    if runtime == "claude"
+                    else _run_codex(workspace, room_key, _prompt(task_file), repo,
+                                     hard_timeout, stall_timeout, on_heartbeat=heartbeat)
+                )
+            except TimeoutError:
+                # Surface the handoff explicitly rather than leaving the room to
+                # discover it only when a *different* reply eventually shows up from
+                # the live-core fallback path with no visible connection to this one.
+                _notify(
+                    task_file,
+                    "This is taking longer than expected — handing off, a reply will "
+                    "follow through the normal path.",
+                )
+                raise
             if not body.strip():
                 raise RuntimeError(f"{runtime} returned an empty result")
             if not _publish_once(results_dir / task_file.name, body):
