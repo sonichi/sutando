@@ -123,6 +123,11 @@ def import_a_state(root: Path) -> dict:
     migrated_dir = root / ".items-migrated"
     report = {"ready": 0, "parked": 0, "delivered": 0, "unknown": 0,
               "skipped": 0, "verified": False, "fenced": False}
+    if items_dir.is_symlink():
+        # A symlink-to-directory passes is_dir(): migrating THROUGH it would
+        # fence this root against state that lives somewhere else. Fail closed.
+        report["unmigratable"] = ".items is a symlink"
+        return report
     if not items_dir.is_dir():
         if os.path.lexists(items_dir):
             # A FILE or dangling symlink at .items is ambiguous A-side state,
@@ -182,6 +187,18 @@ def import_a_state(root: Path) -> dict:
             dst = c._terminal_path(key)
             if dst.exists():
                 report["skipped"] += 1
+                continue
+            # Normative: a bare sentinel (no durable receipt) is
+            # OUTCOME_UNKNOWN, never upgraded to a confirmed terminal.
+            _ref = (rec.get("destination")
+                    if rec.get("provider") and rec.get("destination") else None)
+            if classify_legacy_sentinel(_ref) is not DeliveryOutcome.CONFIRMED:
+                marker = c._d("undelivered") / f"{key}{SEP}outcome-unknown{SEP}import"
+                if marker.exists():
+                    report["skipped"] += 1
+                else:
+                    marker.write_bytes(payload)
+                    report["unknown"] += 1
                 continue
             c._write_terminal(key, {
                 "schema": 1, "item_id": item_id, "outcome": "confirmed",
@@ -269,7 +286,13 @@ def resolve_delivery(root: Path, item_id: str) -> dict:
     if read_epoch(root) == "C":
         rec = dual_read(root, item_id)
         if rec is not None:
-            delivered = rec.get("status") == "DELIVERED"
+            # Same normative rule as the importer: DELIVERED without a
+            # durable receipt is OUTCOME_UNKNOWN, not a delivered answer.
+            _ref = (rec.get("destination")
+                    if rec.get("provider") and rec.get("destination") else None)
+            delivered = (rec.get("status") == "DELIVERED"
+                         and classify_legacy_sentinel(_ref)
+                         is DeliveryOutcome.CONFIRMED)
             receipt = ({"provider": rec.get("provider"),
                         "destination": rec.get("destination")}
                        if delivered else None)
@@ -298,20 +321,32 @@ def dual_read(root: Path, item_id: str) -> "dict | None":
     if migrated_dir.is_symlink() or not migrated_dir.is_dir():
         return None
     counter = root / FALLBACK_COUNTER
-    try:
-        prior = _json.loads(counter.read_text(encoding="utf-8"))
-        count = int(prior.get("count", 0)) if isinstance(prior, dict) else 0
-    except FileNotFoundError:
-        # Liveness marker: count 0 turns "file absent" from an assumed-benign
-        # state into "dual_read never ran here", which the release gate warns on.
-        count = 0
-        tmp = counter.with_suffix(".json.tmp")
-        tmp.write_text(_json.dumps({"count": 0,
-                                    "initialized_ts": _time.time()}),
-                       encoding="utf-8")
-        os.replace(tmp, counter)
-    except (OSError, ValueError):
-        count = 0
+
+    def _counter_rmw(update):
+        # One exclusive flock around the whole read-modify-write, and a
+        # per-writer tmp name: concurrent dual_read() calls lose no increments.
+        import fcntl
+        with open(counter.with_suffix(".lock"), "a+") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                prior = _json.loads(counter.read_text(encoding="utf-8"))
+                count = int(prior.get("count", 0)) if isinstance(prior, dict) else 0
+                existed = True
+            except FileNotFoundError:
+                count, existed = 0, False
+            except (OSError, ValueError):
+                count, existed = 0, True
+            payload = update(count, existed)
+            if payload is None:
+                return
+            tmp = counter.with_suffix(f".{os.getpid()}.{_time.time_ns()}.tmp")
+            tmp.write_text(_json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, counter)
+
+    # Liveness marker: count 0 turns "file absent" from an assumed-benign
+    # state into "dual_read never ran here", which the release gate warns on.
+    _counter_rmw(lambda count, existed: None if existed else
+                 {"count": 0, "initialized_ts": _time.time()})
     p = migrated_dir / f"{_a_safe_key(item_id)}.json"
     if p.is_symlink() or not p.is_file():
         return None
@@ -321,9 +356,7 @@ def dual_read(root: Path, item_id: str) -> "dict | None":
         return None
     if not isinstance(rec, dict) or rec.get("item_id") != item_id:
         return None
-    tmp = counter.with_suffix(".json.tmp")
-    tmp.write_text(_json.dumps({"count": count + 1,
-                                "last_hit_ts": _time.time(),
-                                "last_item": item_id}), encoding="utf-8")
-    os.replace(tmp, counter)
+    _counter_rmw(lambda count, existed:
+                 {"count": count + 1, "last_hit_ts": _time.time(),
+                  "last_item": item_id})
     return rec

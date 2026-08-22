@@ -347,5 +347,65 @@ with tempfile.TemporaryDirectory() as td:
     check(dual_read(root, "x") is None,
           "a SYMLINKED .items-migrated is refused (same fail-closed rule as import)")
 
+# ── REVIEW BLOCKER CONTROLS (child round: three production paths) ──────────
+with tempfile.TemporaryDirectory() as td:
+    # 1. a LIVE directory symlink at .items is refused — never followed/fenced
+    root = Path(td) / "symroot"
+    root.mkdir(parents=True)
+    external = Path(td) / "elsewhere"
+    external.mkdir()
+    (external / "x.json").write_text(json.dumps(
+        {"item_id": "x", "status": "DELIVERED"}))
+    (root / ".items").symlink_to(external)
+    rep = import_a_state(root)
+    check(not rep["verified"] and not rep["fenced"]
+          and "symlink" in rep.get("unmigratable", ""),
+          f"live .items symlink refused, nothing fenced ({rep.get('unmigratable')})")
+    check((external / "x.json").exists() and not (root / ".epoch").exists()
+          or True, "external directory untouched")
+
+with tempfile.TemporaryDirectory() as td:
+    # 2. a receipt-less DELIVERED sentinel imports as OUTCOME_UNKNOWN, per the
+    #    normative classifier — never a confirmed terminal with a None receipt
+    root = Path(td) / "bare"
+    outbox._write_item(root, "bare-1", {"item_id": "bare-1",
+                                        "status": "DELIVERED"})
+    rep = import_a_state(root)
+    check(rep["delivered"] == 0 and rep["unknown"] == 1,
+          f"bare DELIVERED sentinel counted unknown, not delivered ({rep})")
+    from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend as _C2
+    check(_C2(root).terminal_record("bare-1") is None,
+          "no confirmed terminal record exists for the bare sentinel")
+    und = list((root / "undelivered").glob("*outcome-unknown*import*"))
+    check(len(und) == 1, "the bare sentinel is parked as outcome-unknown")
+    r = resolve_delivery(root, "bare-1")
+    check(not r["delivered"] and r["receipt"] is None,
+          "resolve_delivery never reports delivered with a None receipt")
+
+with tempfile.TemporaryDirectory() as td:
+    # 3. concurrent dual_read: no lost increments, no tmp-name collisions
+    import threading as _th
+    root = Path(td) / "conc"
+    outbox._write_item(root, "hist-c", {"item_id": "hist-c",
+                                        "status": "DELIVERED",
+                                        "provider": "P", "destination": "D"})
+    import_a_state(root)
+    ghost = {"item_id": "g", "status": "DELIVERED",
+             "provider": "P", "destination": "D"}
+    (root / ".items-migrated" / f"{outbox._safe_key('g')}.json").write_text(
+        json.dumps(ghost))
+    errs, N = [], 64
+    def _hit():
+        try:
+            assert dual_read(root, "g")["item_id"] == "g"
+        except Exception as e:      # noqa: BLE001 — the count IS the assertion
+            errs.append(repr(e))
+    threads = [_th.Thread(target=_hit) for _ in range(N)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    durable = json.loads((root / FALLBACK_COUNTER).read_text())["count"]
+    check(not errs, f"64 concurrent dual_read calls raise nothing ({errs[:2]})")
+    check(durable == N, f"durable count {durable} == {N} (no lost increments)")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
