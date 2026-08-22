@@ -150,6 +150,10 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
             r = Path(td) / ".outbox-discord-proactive"
             r.mkdir(parents=True, exist_ok=True)
             (r / ".items").write_text("not a dir")
+        elif legacy_shape == "danglink":
+            r = Path(td) / ".outbox-discord-proactive"
+            r.mkdir(parents=True, exist_ok=True)
+            (r / ".items").symlink_to(Path(td) / "gone-target")
         elif legacy_shape == "subdir":
             d = Path(td) / ".outbox-discord-proactive" / ".items" / "nested"
             d.mkdir(parents=True)
@@ -204,6 +208,9 @@ check(kind == "DesignAClaimBackend",
 kind, out = _fence_with("c", activate=True, legacy_shape="subdir")
 check(kind == "DesignAClaimBackend",
       f"a subdir inside .items refuses the switch (got {kind})")
+kind, out = _fence_with("c", activate=True, legacy_shape="danglink")
+check(kind == "DesignAClaimBackend",
+      f"a DANGLING .items symlink refuses the switch (got {kind})")
 
 # The arm that matters: C is asked for, the root cannot serve it, and the
 # proactive leg must keep delivering rather than raise out of the fence.

@@ -5222,12 +5222,17 @@ def _proactive_fence():
             # A switch must not hide Design A state: items/attempt history in
             # .items would read as vanished under C and resurrect on rollback.
             items = root / ".items"
-            if items.is_dir():
-                entries = list(items.iterdir())  # ANY entry blocks, whatever its type
-            else:
-                # A FILE (or other non-dir) at .items is unrecognized A-side
-                # state, not proof of absence — same refusal, fail closed.
-                entries = [items] if items.exists() else []
+            try:
+                if items.is_dir():
+                    entries = list(items.iterdir())  # ANY entry blocks
+                elif os.path.lexists(items):
+                    # A file OR a dangling symlink at .items is unrecognized
+                    # A-side state, not proof of absence — refuse, fail closed.
+                    entries = [items]
+                else:
+                    entries = []
+            except OSError:
+                entries = [items]  # unreadable A-side state: fail closed
             if entries:
                 print(f"  [proactive] claim_backend=c refused: {len(entries)} "
                       f"unmigrated Design A entr(y/ies) at {items} — "
