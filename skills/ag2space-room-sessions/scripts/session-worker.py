@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -284,16 +285,243 @@ def _working_dir(repo: Path) -> Path:
     return Path(os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo))).expanduser()
 
 
-def _claude_command(session_id: str, resume: bool, prompt: str) -> list[str]:
-    command = ["claude", "-p", "--resume" if resume else "--session-id", session_id]
-    command += ["--output-format", "text", "--dangerously-skip-permissions", "--add-dir", str(Path.home())]
+def _notify(task_file: Path, message: str) -> None:
+    """Best-effort progress ping via the shared task-progress notifier. Never
+    raises: a broken or slow notify path only costs visibility."""
+    try:
+        headers = parse_task_headers_trusted(
+            task_file.read_text(encoding="utf-8", errors="replace")
+        ).headers
+    except OSError:
+        return
+    source = headers.get("source") or ""
+    channel_id = headers.get("channel_id") or ""
+    if not source or not channel_id:
+        return
+    notifier = REPO_ROOT / "skills" / "task-progress" / "scripts" / "notify.py"
+    if not notifier.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(notifier), "--source", source, "--channel-id", channel_id,
+             "--message", message],
+            timeout=15, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _tmux_socket(workspace: Path) -> Path:
+    # AF_UNIX paths cap at ~104 bytes on macOS, so the socket lives in a short
+    # per-user dir keyed by a hash of the workspace, never inside the workspace.
+    base = Path(os.environ.get("SUTANDO_ROOM_TMUX_DIR") or f"/tmp/sutando-room-tmux-{os.getuid()}")
+    digest = hashlib.sha256(str(workspace.resolve()).encode("utf-8")).hexdigest()[:12]
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    return base / f"{digest}.sock"
+
+
+def _tmux(workspace: Path, *args: str) -> subprocess.CompletedProcess:
+    # TMUX is dropped so this works from inside the core's own tmux session —
+    # with it set, tmux refuses to start nested sessions even on another socket.
+    env = os.environ.copy()
+    env.pop("TMUX", None)
+    return subprocess.run(
+        ["tmux", "-S", str(_tmux_socket(workspace)), *args],
+        capture_output=True, text=True, timeout=15, env=env,
+    )
+
+
+def _pane_name(runtime: str, room_key: str) -> str:
+    return f"room-{runtime}-{room_key[:12]}"
+
+
+def _pane_alive(workspace: Path, name: str) -> bool:
+    try:
+        return _tmux(workspace, "has-session", "-t", f"={name}").returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _pane_content(workspace: Path, name: str) -> str:
+    try:
+        # "=name:" = exact-match session, its active pane — pane-targeting verbs
+        # (capture-pane, send-keys) reject the bare "=name" session form.
+        done = _tmux(workspace, "capture-pane", "-p", "-t", f"={name}:")
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return done.stdout if done.returncode == 0 else ""
+
+
+def _standing_launch_command(session_id: str, resume: bool) -> list[str]:
+    command = ["claude", "--resume" if resume else "--session-id", session_id,
+               "--dangerously-skip-permissions", "--add-dir", str(Path.home())]
     model = os.environ.get("SUTANDO_CORE_MODEL", "").strip()
     settings = os.environ.get("SUTANDO_ISOLATED_CLAUDE_SETTINGS", "").strip()
     if model:
         command += ["--model", model]
     if settings:
         command += ["--settings", settings]
-    return command + ["--", prompt]
+    return command
+
+
+def _ensure_standing_session(workspace: Path, runtime: str, room_key: str, repo: Path) -> str:
+    """Ensure the room's standing provider pane exists and answered with output;
+    a respawn after crash/reboot resumes the recorded provider session id."""
+    name = _pane_name(runtime, room_key)
+    if _pane_alive(workspace, name):
+        return name
+    session_id, created = _session_id(workspace, runtime, room_key)
+    done = _tmux(workspace, "new-session", "-d", "-s", name, "-c", str(_working_dir(repo)),
+                 *_standing_launch_command(session_id, resume=not created))
+    if done.returncode != 0:
+        raise RuntimeError(f"tmux new-session failed: {done.stderr.strip()}")
+    if created:
+        _record_session(workspace, runtime, room_key, session_id)
+    deadline = time.monotonic() + _timeout("SUTANDO_ROOM_SPAWN_WAIT", None)
+    while time.monotonic() < deadline:
+        if _pane_content(workspace, name).strip():
+            return name
+        if not _pane_alive(workspace, name):
+            raise RuntimeError("standing session exited during startup")
+        time.sleep(0.1)
+    raise RuntimeError("standing session produced no output during startup")
+
+
+def _spool_dir(workspace: Path) -> Path:
+    return workspace / "state" / "ag2space-room-sessions" / "spool"
+
+
+def _write_spool_prompt(workspace: Path, task_file: Path, results_dir: Path) -> Path:
+    # Publication ownership flips here versus the inline path: the standing
+    # session writes the result itself, so the view must name the result path.
+    task_id = task_file.stem
+    prompt = (
+        "Handle the owner task below in this persistent AG2 Space room session. Follow "
+        "AGENTS.md for repository and safety policy, and keep this room's conversation "
+        "context across tasks. Do not read the original task file and do not touch any "
+        "other tasks/results tracking file. When done, write the exact result body - "
+        f"nothing else - to {results_dir / (task_id + '.txt')} in a single write.\n\n"
+        f"Trusted task view:\n{_task_view(task_file)}\n"
+    )
+    path = _spool_dir(workspace) / f"{task_id}.prompt.txt"
+    _atomic_text(path, prompt)
+    return path
+
+
+def _inject(workspace: Path, name: str, line: str) -> None:
+    for keys in (["-l", line], ["Enter"]):
+        done = _tmux(workspace, "send-keys", "-t", f"={name}:", *keys)
+        if done.returncode != 0:
+            raise RuntimeError(f"tmux send-keys failed: {done.stderr.strip()}")
+
+
+def _fail(task_file: Path, result: Path, reason: str) -> None:
+    _publish_once(
+        result,
+        f"This room session couldn't complete this message: {reason}.\n\n"
+        "Resend your message to continue - the conversation itself is preserved.",
+    )
+    _notify(task_file, f"Hit a problem: {reason}. Resend to continue.")
+
+
+def monitor(
+    runtime: str,
+    workspace: Path,
+    task_file: Path,
+    results_dir: Path,
+    hard_timeout: Optional[float] = None,
+    stall_timeout: Optional[float] = None,
+) -> None:
+    """Watchdog for one injected turn, in a detached process: heartbeats while it
+    runs, stall detection on frozen pane content, honest failure publishing."""
+    room_key = resolve_room_key(task_file)
+    if room_key is None:
+        return
+    name = _pane_name(runtime, room_key)
+    hard = _timeout("SUTANDO_TIER_HARD_TIMEOUT", hard_timeout)
+    stall = _timeout("SUTANDO_TIER_STALL_TIMEOUT", stall_timeout)
+    try:
+        interval = _timeout("SUTANDO_TIER_HEARTBEAT_INTERVAL", None)
+    except ValueError:
+        interval = 0.0
+    started = last_change = time.monotonic()
+    next_heartbeat = started + interval if interval > 0 else None
+    fingerprint = ""
+    result = results_dir / task_file.name
+    while True:
+        if read_ready_result(result) is not None:
+            return
+        now = time.monotonic()
+        if not _pane_alive(workspace, name):
+            time.sleep(2)  # grace: a final result write may still be landing
+            if read_ready_result(result) is None:
+                _fail(task_file, result, "the room's standing session exited before finishing")
+            return
+        content = _pane_content(workspace, name)
+        if content != fingerprint:
+            fingerprint = content
+            last_change = now
+        if now - last_change >= stall:
+            # A frozen pane is a hung process (a live provider at least animates its
+            # spinner). Kill BEFORE publishing so the session can't write after us.
+            _tmux(workspace, "kill-session", "-t", f"={name}")
+            if read_ready_result(result) is None:
+                _fail(task_file, result,
+                      f"the room's standing session froze for {stall:g}s and was stopped; "
+                      "the next message resumes the conversation")
+            return
+        if now - started >= hard:
+            # Safety ceiling bounds the WATCHDOG, not the work: a still-active turn
+            # is left running and its result still lands whenever it finishes.
+            _notify(task_file,
+                    f"This turn passed the {hard:g}s safety ceiling and is still running - "
+                    "the result will follow whenever it completes.")
+            return
+        if next_heartbeat is not None and now >= next_heartbeat:
+            while now >= next_heartbeat:
+                next_heartbeat += interval
+            # Off-thread: _notify can block up to 15s and must never delay the
+            # stall/ceiling checks (the exact bug qingyun's reviewer caught in #3259).
+            threading.Thread(
+                target=_notify,
+                args=(task_file, f"Still working ({now - started:.0f}s so far)..."),
+                daemon=True,
+            ).start()
+        time.sleep(min(1.0, stall / 4))
+
+
+def _spawn_monitor(
+    runtime: str,
+    workspace: Path,
+    task_file: Path,
+    results_dir: Path,
+    repo: Path,
+    hard_timeout: Optional[float],
+    stall_timeout: Optional[float],
+) -> None:
+    logs = workspace / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable, str(Path(__file__).resolve()), "--monitor",
+        "--runtime", runtime, "--workspace", str(workspace),
+        "--task-file", str(task_file), "--results-dir", str(results_dir), "--repo", str(repo),
+    ]
+    if hard_timeout is not None:
+        command += ["--hard-timeout", str(hard_timeout)]
+    if stall_timeout is not None:
+        command += ["--stall-timeout", str(stall_timeout)]
+    with (logs / f"ag2space-room-monitor-{task_file.stem}.log").open("a", encoding="utf-8") as log:
+        # setsid + not waited on: the monitor outlives this short-lived handler.
+        subprocess.Popen(
+            command, cwd=repo, env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True,
+        )
 
 
 def _codex_command(session_id: Optional[str], prompt: str, output_file: Path, repo: Path) -> list[str]:
@@ -312,28 +540,6 @@ def _codex_command(session_id: Optional[str], prompt: str, output_file: Path, re
     if model:
         command += ["-m", model]
     return command + ([session_id, prompt] if session_id else [prompt])
-
-
-def _run_claude(
-    workspace: Path,
-    room_key: str,
-    prompt: str,
-    repo: Path,
-    hard_timeout: Optional[float] = None,
-    stall_timeout: Optional[float] = None,
-) -> str:
-    session_id, created = _session_id(workspace, "claude", room_key)
-    return_code, stdout, stderr = _run_bounded(
-        _claude_command(session_id, not created, prompt),
-        _working_dir(repo),
-        hard_timeout,
-        stall_timeout,
-    )
-    if return_code:
-        raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
-    if created:
-        _record_session(workspace, "claude", room_key, session_id)
-    return stdout
 
 
 def _run_codex(
@@ -395,6 +601,34 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
     return 0 if resolve_room_key(task_file) else UNHANDLED
 
 
+def _handle_inline_codex(
+    workspace: Path,
+    room_key: str,
+    task_file: Path,
+    results_dir: Path,
+    repo: Path,
+    hard_timeout: Optional[float],
+    stall_timeout: Optional[float],
+) -> int:
+    """Per-message fallback executor (codex): the pre-standing-session design,
+    kept until interactive codex resume-id discovery is verified live."""
+    lock = workspace / "state" / "ag2space-room-session-locks" / f"codex-{room_key}.lock"
+    try:
+        with _locked(lock):
+            if _completed_result_exists(results_dir, task_file.name):
+                return 0
+            body = _run_codex(workspace, room_key, _prompt(task_file), repo,
+                              hard_timeout, stall_timeout)
+            if not body.strip():
+                raise RuntimeError("codex returned an empty result")
+            if not _publish_once(results_dir / task_file.name, body):
+                raise RuntimeError("result destination exists but is not ready")
+        return 0
+    except Exception as exc:
+        print(f"AG2 Space room-session worker: {exc}", file=sys.stderr)
+        return 1
+
+
 def handle(
     runtime: str,
     workspace: Path,
@@ -411,20 +645,22 @@ def handle(
     assert room_key is not None
     if _completed_result_exists(results_dir, task_file.name):
         return 0
+    if runtime != "claude":
+        return _handle_inline_codex(workspace, room_key, task_file, results_dir, repo,
+                                    hard_timeout, stall_timeout)
     lock = workspace / "state" / "ag2space-room-session-locks" / f"{runtime}-{room_key}.lock"
     try:
+        # The lock guards only spawn+inject ordering (seconds), never a whole
+        # provider turn - the standing session serializes its own turns natively.
         with _locked(lock):
             if _completed_result_exists(results_dir, task_file.name):
                 return 0
-            body = (
-                _run_claude(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
-                if runtime == "claude"
-                else _run_codex(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
-            )
-            if not body.strip():
-                raise RuntimeError(f"{runtime} returned an empty result")
-            if not _publish_once(results_dir / task_file.name, body):
-                raise RuntimeError("result destination exists but is not ready")
+            name = _ensure_standing_session(workspace, runtime, room_key, repo)
+            spool = _write_spool_prompt(workspace, task_file, results_dir)
+            _inject(workspace, name, f'Read the file "{spool}" and do exactly what it says.')
+        _spawn_monitor(runtime, workspace, task_file, results_dir, repo,
+                       hard_timeout, stall_timeout)
+        _notify(task_file, "On it - picked up in this room's standing session.")
         return 0
     except Exception as exc:
         print(f"AG2 Space room-session worker: {exc}", file=sys.stderr)
@@ -441,9 +677,14 @@ def main() -> int:
     parser.add_argument("--hard-timeout", type=float)
     parser.add_argument("--stall-timeout", type=float)
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--monitor", action="store_true")
     args = parser.parse_args()
     if args.probe:
         return probe(args.runtime, args.workspace, args.task_file)
+    if args.monitor:
+        monitor(args.runtime, args.workspace, args.task_file, args.results_dir,
+                args.hard_timeout, args.stall_timeout)
+        return 0
     return handle(
         args.runtime,
         args.workspace,
