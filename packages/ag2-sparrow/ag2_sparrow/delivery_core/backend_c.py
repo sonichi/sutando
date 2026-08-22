@@ -289,7 +289,11 @@ class DesignCClaimBackend:
         data = json.dumps(record).encode()
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
-            os.write(fd, data)
+            off = 0
+            while off < len(data):
+                # os.write may legally write fewer bytes; a truncated record
+                # finalizing as the item's only receipt is the hole C closes.
+                off += os.write(fd, data[off:])
             if self.durability != "lax":
                 os.fsync(fd)
         finally:
@@ -345,13 +349,17 @@ class DesignCClaimBackend:
         if staged.get("incarnation") != incarnation:
             return False                     # foreign or missing binding
         parts = incarnation.split(SEP)
-        if not staged.get("item_id") or _safe_key(staged["item_id"]) != parts[0]:
+        item_id = staged.get("item_id")
+        if not isinstance(item_id, str) or not item_id \
+                or _safe_key(item_id) != parts[0]:
             return False
         if staged.get("outcome") != DeliveryOutcome.CONFIRMED.value:
             return False                     # C stages terminals ONLY for confirmed
         if not isinstance(staged.get("receipt"), dict):
             return False
-        if len(parts) >= 2 and _safe_component(str(staged.get("worker"))) != parts[1]:
+        worker = staged.get("worker")
+        if len(parts) >= 2 and (not isinstance(worker, str) or not worker
+                                or _safe_component(worker) != parts[1]):
             return False                     # worker must match the claim's
         return isinstance(staged.get("completed_ns"), int) \
             and isinstance(staged.get("attempts"), int)

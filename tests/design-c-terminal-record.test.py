@@ -229,6 +229,76 @@ with tempfile.TemporaryDirectory() as td:
           or (b13.root / "ready" / _safe_key("item-13")).exists(),
           "and the delivery survives")
 
+    # ── REVIEW CONTROL: legal SHORT writes still persist the full record ─
+    from unittest import mock
+    b14 = fresh(td, "short-write")
+    b14.publish("item-14", b"p")
+    tok14 = b14.claim("item-14", "w0")
+    _real_write = os.write
+    with mock.patch.object(os, "write",
+                           side_effect=lambda fd, d: _real_write(fd, d[:7])):
+        ok14 = b14.complete(tok14, DeliveryOutcome.CONFIRMED,
+                            provider="P", destination="D")
+    check(ok14, "complete() succeeds under 7-byte short writes")
+    rec14 = b14.terminal_record("item-14")
+    check(rec14 is not None and rec14["receipt"]["destination"] == "D",
+          "short writes: the archived record is COMPLETE, not truncated")
+    check(not (b14.root / "inflight" / tok14.incarnation).exists(),
+          "and the claim released only after the full record landed")
+
+    # ── REVIEW CONTROL: crash MID-write keeps the claim (no lost proof) ─
+    b15 = fresh(td, "midwrite-crash")
+    b15.publish("item-15", b"p")
+    tok15 = b15.claim("item-15", "w0")
+    calls = {"n": 0}
+
+    def _one_then_crash(fd, d):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("simulated crash mid-write")
+        return _real_write(fd, d[:7])
+    try:
+        with mock.patch.object(os, "write", side_effect=_one_then_crash):
+            b15.complete(tok15, DeliveryOutcome.CONFIRMED,
+                         provider="P", destination="D")
+        crashed = False
+    except OSError:
+        crashed = True
+    check(crashed, "mid-write crash propagates out of complete()")
+    check((b15.root / "inflight" / tok15.incarnation).exists(),
+          "mid-write crash: the claim REMAINS held (release never ran)")
+    check(b15.terminal_record("item-15") is None,
+          "mid-write crash: no truncated record was finalized")
+    b15.recover()
+    check(not list((b15.root / "tmp").glob(f"{TERMINAL_TAG}{SEP}*.json")),
+          "recover() deletes the torn staging temp")
+    check((b15.root / "inflight" / tok15.incarnation).exists(),
+          "and the LIVE holder's claim survives recovery")
+
+    # ── REVIEW CONTROLS: malformed staged fields never abort recovery ──
+    for label, field, bad in (("int item_id", "item_id", 7),
+                              ("empty worker", "worker", "")):
+        bx = fresh(td, f"malformed-{field}")
+        bx.publish("item-x", b"p")
+        tokx = bx.claim("item-x", "w0")
+        recx = {"schema": 1, "item_id": "item-x", "outcome": "confirmed",
+                "receipt": {"provider": "P", "destination": "D"},
+                "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
+                "incarnation": tokx.incarnation, field: bad}
+        staged = bx.root / "tmp" / f"{TERMINAL_TAG}{SEP}{tokx.incarnation}{SEP}1.json"
+        staged.write_text(json.dumps(recx))
+        aborted = False
+        try:
+            bx.recover()
+            bx.recover()                     # a second pass must not wedge either
+        except (TypeError, ValueError):
+            aborted = True
+        check(not aborted, f"{label}: recovery passes complete without raising")
+        check(not staged.exists(), f"{label}: the malformed staging record is deleted")
+        check((bx.root / "inflight" / tokx.incarnation).exists()
+              or (bx.root / "ready" / _safe_key("item-x")).exists(),
+              f"{label}: the delivery is not lost")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")
