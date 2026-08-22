@@ -315,6 +315,17 @@ kind, out = _fence_with("a", activate=True)
 check(kind == "DesignAClaimBackend",
       f"activated-but-unoperated C root still lets A run (got {kind})")
 
+# MIXED state: A entries AND live C state — neither protocol is safe, and
+# the forward fence's fall-back-to-A path must not bypass the reverse fence.
+kind, out = _fence_with("c", legacy_items=2, c_state="files")
+check(kind == "TransitionRefusalBackend",
+      f"claim_backend=c over MIXED A+C state -> refusal, not the A fallback (got {kind})")
+check("BOTH" in out and "reconcile" in out,
+      "and the message names the mixed state and the reconcile requirement")
+kind, out = _fence_with("a", legacy_items=2, c_state="files")
+check(kind == "TransitionRefusalBackend",
+      f"claim_backend=a over MIXED A+C state is refused too (got {kind})")
+
 # The refusal backend is claim-inert: bodies stay queued, nothing processed.
 from ag2_sparrow.delivery_core.migration import TransitionRefusalBackend
 _rb = TransitionRefusalBackend("test")

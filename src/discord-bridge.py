@@ -5247,13 +5247,22 @@ def _proactive_fence():
                     print(f"  [proactive] claim_backend=c requested but unusable: "
                           f"{type(exc).__name__}: {exc} — running on Design A this cycle",
                           flush=True)
-        if isinstance(backend, DesignAClaimBackend) and not entries:
+        if isinstance(backend, DesignAClaimBackend):
             # REVERSE fence (C -> A): A over a root C has operated resets the
             # durable retry budget and resurrects parked items (duplicate DMs).
             from ag2_sparrow.delivery_core.migration import (
                 TransitionRefusalBackend, c_live_state)
             live = c_live_state(root)
-            if live:
+            if live and entries:
+                # MIXED state: neither protocol is safely authoritative —
+                # A resets C's budget, C hides A's items. Operator reconciles.
+                reason = (f"root carries BOTH unmigrated Design A entries and "
+                          f"live C state ({', '.join(live)} at {root})")
+                print(f"  [proactive] {reason} — proactive delivery DEFERRED; "
+                      "reconcile the root (migrate or clean one side) before "
+                      "either backend runs here", flush=True)
+                backend = TransitionRefusalBackend(reason)
+            elif live:
                 reason = (f"Design A refused on a C-operated root "
                           f"({', '.join(live)} at {root})")
                 print(f"  [proactive] {reason} — proactive delivery DEFERRED; "
