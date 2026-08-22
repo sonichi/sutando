@@ -49,6 +49,13 @@ class ProactiveClaimFence:
         # renamed here would vanish from its own consumer's glob.
         if not path.name.startswith("proactive-"):
             return None
+        # A refusing backend defers delivery outright: no rename, body stays
+        # queued for a later cycle — refusal is not the file-only fallback.
+        if getattr(self._backend, "refuses_claims", False):
+            reason = getattr(self._backend, "reason", "backend refuses claims")
+            print(f"  [fence] {path.name}: delivery deferred ({reason})",
+                  flush=True)
+            return None
         try:
             item = self._item_id(path)
         except FileNotFoundError:

@@ -131,6 +131,7 @@ class TransitionRefusalBackend:
     safely served by the selected protocol (e.g. A over live C state).
     Bodies stay queued on disk — delivery DEFERS, never duplicates."""
     persists_receipt_metadata = False
+    refuses_claims = True
 
     def __init__(self, reason: str):
         self.reason = reason

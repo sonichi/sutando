@@ -439,3 +439,25 @@ if fails:
     print(f"\n{len(fails)} FAILURE(S)")
     raise SystemExit(1)
 print("\nALL PASS — selection is policy, mapping is the adapter's, default is 'a'")
+
+# kewei P1: a refusing backend must DEFER — no rename, no send path returned.
+import tempfile as _tf
+from pathlib import Path as _P
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("pcf", REPO / "src" / "proactive_claim_fence.py")
+_pcf = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_pcf)
+with _tf.TemporaryDirectory() as _td:
+    _txt = _P(_td) / "proactive-refuse-check.txt"
+    _txt.write_text("body")
+    _fence = _pcf.ProactiveClaimFence.__new__(_pcf.ProactiveClaimFence)
+    from ag2_sparrow.delivery_core.migration import TransitionRefusalBackend as _RB
+    _fence._backend = _RB("A over live C state")
+    _fence._worker = "t"
+    _fence._tokens = {}
+    _claim = _fence.claim(_txt)
+    check(_claim is None, "refusing backend: claim() returns None (distinct skip)")
+    check(_txt.exists(), "refusing backend: the .txt stays queued (no rename)")
+    check(not _txt.with_suffix(".sending").exists(),
+          "refusing backend: no .sending claim is created")
+
