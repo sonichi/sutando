@@ -441,6 +441,30 @@ with tempfile.TemporaryDirectory() as td:
     check(not (b30.root / "ready" / k30).exists() and und30.exists(),
           "UNKNOWN item stays quarantined (no redelivery of a maybe-received item)")
 
+    # ── malformed quarantine entries never wedge or spoof recovery ──────
+    for label, maker, expect_requeue in (
+        ("dangling symlink", lambda r, k: (r / "undelivered" / f"{k}{SEP}dang{SEP}1").symlink_to(r / "gone"), True),
+        ("directory entry", lambda r, k: (r / "undelivered" / f"{k}{SEP}dir{SEP}1").mkdir(), True),
+        ("unrelated regular file", lambda r, k: (r / "undelivered" / f"{k}{SEP}other{SEP}1").write_text("x"), True),
+    ):
+        bq = fresh(td, f"qmal-{label.split()[0]}")
+        bq.publish("item-Q", b"p")
+        tq = bq.claim("item-Q", "w0")
+        kq = _safe_key("item-Q")
+        maker(bq.root, kq)
+        pq = tq.incarnation.split(SEP)
+        deadq = f"{pq[0]}{SEP}{pq[1]}{SEP}99999{SEP}1{SEP}{pq[4]}"
+        os.rename(str(bq.root / "inflight" / tq.incarnation),
+                  str(bq.root / "inflight" / deadq))
+        try:
+            repq = bq.recover()
+            raised = False
+        except OSError:
+            repq, raised = None, True
+        check(not raised, f"quarantine {label}: recover() never raises")
+        check(repq is not None and (kq in repq.recovered) == expect_requeue,
+              f"quarantine {label}: dead claim re-readied (not a real twin)")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")
