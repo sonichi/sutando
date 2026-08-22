@@ -54,29 +54,37 @@ def _fresh(label: str):
     return td, td / "root"
 
 
-def bench_cycle(kind: str, n: int, payload: bytes, rounds: int = 3) -> dict:
+def _pctl(xs_us: list) -> dict:
+    xs = sorted(xs_us)
+    ix = lambda q: xs[min(len(xs) - 1, int(q * len(xs)))]
+    return {"p50": ix(0.50), "p95": ix(0.95), "p99": ix(0.99), "max": xs[-1]}
+
+
+def bench_cycle(kind: str, n: int, payload: bytes) -> dict:
+    """Per-op latency distributions (owner: medians hide the tail)."""
     perf = _timer()
-    runs = []
-    for _ in range(rounds):
-        td, root = _fresh(f"cycle-{kind}")
-        try:
-            b = BACKENDS[kind](root)
-            t0 = perf()
-            for i in range(n):
-                b.publish(f"item-{i}", payload)
-            t1 = perf()
-            toks = [b.claim(f"item-{i}", "w0") for i in range(n)]
-            t2 = perf()
-            for t in toks:
-                b.complete(t, DeliveryOutcome.CONFIRMED)
-            t3 = perf()
-            runs.append((t1 - t0, t2 - t1, t3 - t2))
-        finally:
-            shutil.rmtree(td, ignore_errors=True)
-    med = [statistics.median(r[i] for r in runs) for i in range(3)]
-    return {"publish_us": med[0] * 1e6 / n, "claim_us": med[1] * 1e6 / n,
-            "complete_us": med[2] * 1e6 / n,
-            "cycle_us": sum(med) * 1e6 / n, "items": n, "rounds": rounds}
+    td, root = _fresh(f"cycle-{kind}")
+    try:
+        b = BACKENDS[kind](root)
+        lat = {"publish": [], "claim": [], "complete": []}
+        toks = []
+        for i in range(n):
+            t0 = perf(); b.publish(f"item-{i}", payload)
+            lat["publish"].append((perf() - t0) * 1e6)
+        for i in range(n):
+            t0 = perf(); toks.append(b.claim(f"item-{i}", "w0"))
+            lat["claim"].append((perf() - t0) * 1e6)
+        t_all = perf()
+        for t in toks:
+            t0 = perf(); b.complete(t, DeliveryOutcome.CONFIRMED)
+            lat["complete"].append((perf() - t0) * 1e6)
+        wall = perf() - t_all
+        out = {op: _pctl(v) for op, v in lat.items()}
+        out["items"] = n
+        out["complete_throughput_per_s"] = n / wall if wall else 0
+        return out
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def _proc_worker(kind: str, root: str, n: int, w: int, out_q) -> None:
@@ -156,6 +164,68 @@ def bench_archive_scale(kind: str, history: int, probe: int, payload: bytes) -> 
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _claim_and_hang(kind, root, item, ev_claimed):
+    b = BACKENDS[kind](Path(root)) if kind == "a" else DesignCClaimBackend(Path(root))
+    t = b.claim(item, "victim")
+    assert t is not None
+    ev_claimed.set()
+    import time
+    time.sleep(300)  # killed long before this returns
+
+
+def bench_crash_injection(kind: str, payload: bytes) -> dict:
+    """Gate 2: kill -9 a claim holder; recover() must free the DEAD claim,
+    must NOT touch a LIVE holder, and redelivery must be exactly-once."""
+    td, root = _fresh(f"crash-{kind}")
+    try:
+        # A's dead-claim reclaim is TTL-gated by design; a short TTL
+        # measures the policy instead of waiting out the 300 s default.
+        b = DesignAClaimBackend(root, reclaim_ttl_s=1.0) if kind == "a" \
+            else BACKENDS[kind](root)
+        for name in ("victim-item", "live-item"):
+            b.publish(name, payload)
+        ev = mp.Event()
+        p = mp.Process(target=_claim_and_hang, args=(kind, str(root), "victim-item", ev))
+        p.start()
+        assert ev.wait(timeout=30), "victim never claimed"
+        live_tok = b.claim("live-item", "survivor")
+        p.kill(); p.join(timeout=30)
+        import time
+        time.sleep(1.2)  # past A's (shortened) reclaim TTL
+        r1 = b.recover()
+        reclaim = b.claim("victim-item", "survivor2")
+        dup = b.claim("victim-item", "survivor3")
+        live_still_held = b.claim("live-item", "thief") is None
+        ok = (reclaim is not None) and (dup is None) and live_still_held \
+            and (live_tok is not None)
+        for t in (reclaim, live_tok):
+            if t is not None:
+                b.complete(t, DeliveryOutcome.CONFIRMED)
+        return {"dead_claim_recovered": reclaim is not None,
+                "no_double_owner": dup is None,
+                "live_holder_untouched": live_still_held,
+                "recover_report": str(r1)[:100], "ok": ok}
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def bench_publish_inflight_conflict(kind: str, payload: bytes) -> dict:
+    """Re-publishing an id that is CLAIMED must not clobber or double it."""
+    td, root = _fresh(f"conflict-{kind}")
+    try:
+        b = BACKENDS[kind](root)
+        b.publish("dup", payload)
+        tok = b.claim("dup", "w0")
+        second = b.publish("dup", payload)
+        thief = b.claim("dup", "w1")
+        b.complete(tok, DeliveryOutcome.CONFIRMED)
+        return {"republish_while_inflight_accepted": bool(second),
+                "double_owner_created": thief is not None,
+                "ok": thief is None}
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def head_sha() -> str:
     try:
         return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
@@ -167,53 +237,78 @@ def head_sha() -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--items", type=int, default=300)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--deep", action="store_true",
+                    help="add the 100k-item scale (minutes, not seconds)")
     ap.add_argument("--json", type=Path, default=None)
     ap.add_argument("--stamp", default=None,
                     help="caller-supplied ISO timestamp for the JSON record")
     args = ap.parse_args()
 
     import platform
-    result = {"host": platform.node(), "head": head_sha(), "scenarios": {}}
+    import resource
+    result = {"host": platform.node(), "head": head_sha(), "scenarios": {},
+              "fsync_note": ("neither backend calls fsync on the hot path today; "
+                             "durability is rename-atomicity + page cache (warm)")}
     if args.stamp:
         result["timestamp"] = args.stamp
     k1, k64 = b"x" * 1024, b"x" * 65536
+    scales = [100, 10_000] + ([100_000] if args.deep else [])
 
     for kind in ("a", "c"):
         s = result["scenarios"].setdefault(kind, {})
-        s["cycle_1k"] = bench_cycle(kind, args.items, k1)
-        s["cycle_64k"] = bench_cycle(kind, max(50, args.items // 6), k64)
-        s["procs"] = bench_procs(kind, max(100, args.items // 2), args.workers, k1)
-        s["unknown_recover"] = bench_unknown_recover(kind, max(100, args.items // 3), k1)
+        cpu0 = resource.getrusage(resource.RUSAGE_SELF)
+        for n in scales:
+            s[f"cycle_1k_{n}"] = bench_cycle(kind, n, k1)
+        s["cycle_64k"] = bench_cycle(kind, 100, k64)
+        for w in (1, 4, 16):
+            s[f"procs_{w}"] = bench_procs(kind, 400, w, k1)
+        s["unknown_recover"] = bench_unknown_recover(kind, 100, k1)
         s["archive_0"] = bench_archive_scale(kind, 0, 50, k1)
         s["archive_2k"] = bench_archive_scale(kind, 2000, 50, k1)
+        s["crash"] = bench_crash_injection(kind, k1)
+        s["conflict"] = bench_publish_inflight_conflict(kind, k1)
+        cpu1 = resource.getrusage(resource.RUSAGE_SELF)
+        s["cpu_s_selfproc"] = round((cpu1.ru_utime - cpu0.ru_utime)
+                                    + (cpu1.ru_stime - cpu0.ru_stime), 2)
 
     a, c = result["scenarios"]["a"], result["scenarios"]["c"]
     print(f"claim-backend benchmark @ {result['head']} on {result['host']}")
-    print(f"{'scenario':28} {'A':>12} {'C':>12}   note")
-    rows = [
-        ("cycle 1KiB (us/item)", a["cycle_1k"]["cycle_us"], c["cycle_1k"]["cycle_us"], ""),
-        ("  publish", a["cycle_1k"]["publish_us"], c["cycle_1k"]["publish_us"], ""),
-        ("  claim", a["cycle_1k"]["claim_us"], c["cycle_1k"]["claim_us"], ""),
-        ("  complete", a["cycle_1k"]["complete_us"], c["cycle_1k"]["complete_us"], ""),
-        ("cycle 64KiB (us/item)", a["cycle_64k"]["cycle_us"], c["cycle_64k"]["cycle_us"], ""),
-        (f"{a['procs']['workers']}-proc contention (us/item)", a["procs"]["per_item_us"],
-         c["procs"]["per_item_us"],
-         f"exactly-once A={a['procs']['exactly_once']} C={c['procs']['exactly_once']}"),
-        ("UNKNOWN complete (us/item)", a["unknown_recover"]["unknown_us"],
-         c["unknown_recover"]["unknown_us"], ""),
-        ("recover() total (ms)", a["unknown_recover"]["recover_total_ms"],
-         c["unknown_recover"]["recover_total_ms"], ""),
-        ("complete @ empty archive", a["archive_0"]["complete_us_at_history"],
-         c["archive_0"]["complete_us_at_history"], "us/item"),
-        ("complete @ 2k archive", a["archive_2k"]["complete_us_at_history"],
-         c["archive_2k"]["complete_us_at_history"], "us/item"),
-    ]
-    for label, av, cv, note in rows:
-        print(f"{label:28} {av:12.0f} {cv:12.0f}   {note}")
+    print(result["fsync_note"])
+    print(f"{'scenario':34} {'A':>26} {'C':>26}")
 
-    if not (a["procs"]["exactly_once"] and c["procs"]["exactly_once"]):
-        print("FAIL: exactly-once violated under contention", file=sys.stderr)
+    def fmt(d):
+        return f"{d['p50']:6.0f}/{d['p95']:6.0f}/{d['p99']:7.0f}/{d['max']:8.0f}"
+
+    for n in scales:
+        ka, kc = a[f"cycle_1k_{n}"], c[f"cycle_1k_{n}"]
+        print(f"-- {n} items, 1KiB (p50/p95/p99/max us) --")
+        for op in ("publish", "claim", "complete"):
+            print(f"{op:34} {fmt(ka[op]):>26} {fmt(kc[op]):>26}")
+        print(f"{'complete throughput (items/s)':34} "
+              f"{ka['complete_throughput_per_s']:26.0f} {kc['complete_throughput_per_s']:26.0f}")
+    print(f"{'64KiB complete p99 (us)':34} {a['cycle_64k']['complete']['p99']:26.0f} "
+          f"{c['cycle_64k']['complete']['p99']:26.0f}")
+    for w in (1, 4, 16):
+        pa, pc = a[f"procs_{w}"], c[f"procs_{w}"]
+        print(f"{f'{w}-proc contention (us/item)':34} {pa['per_item_us']:26.0f} "
+              f"{pc['per_item_us']:26.0f}   exactly-once A={pa['exactly_once']} C={pc['exactly_once']}")
+    print(f"{'UNKNOWN complete (us/item)':34} {a['unknown_recover']['unknown_us']:26.0f} "
+          f"{c['unknown_recover']['unknown_us']:26.0f}")
+    print(f"{'complete @ 2k archive (us/item)':34} "
+          f"{a['archive_2k']['complete_us_at_history']:26.0f} "
+          f"{c['archive_2k']['complete_us_at_history']:26.0f}")
+    for label in ("crash", "conflict"):
+        print(f"{label:34} A={a[label]} ")
+        print(f"{'':34} C={c[label]}")
+    print(f"{'CPU s (self, whole matrix)':34} {a['cpu_s_selfproc']:26} {c['cpu_s_selfproc']:26}")
+
+    hard_ok = all(x["exactly_once"] for k in (a, c) for x in
+                  (k["procs_1"], k["procs_4"], k["procs_16"])) \
+        and a["crash"]["ok"] and c["crash"]["ok"] \
+        and a["conflict"]["ok"] and c["conflict"]["ok"]
+    if not hard_ok:
+        print("FAIL: correctness invariant violated (exactly-once/crash/conflict)",
+              file=sys.stderr)
         return 1
     if args.json:
         args.json.write_text(json.dumps(result, indent=2))
