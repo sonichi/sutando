@@ -335,11 +335,8 @@ def _read_station_cache(path):
 
 
 def _write_station_cache(path, data):
-    # station-available.json is shared mutable state read by _station_cached()
-    # on the derive() hot path, and overlapping one-shot callers can both
-    # refresh it — so it takes the same unique-staging contract as every other
-    # shared write here. Best-effort remains the CALLER's policy: a cache write
-    # that fails must not fail the probe.
+    # Shared state on the derive() hot path, so it takes the same unique-staging
+    # contract; best-effort stays the caller's policy, not the writer's.
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         _write_json_atomic(path, data)
