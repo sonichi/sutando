@@ -41,6 +41,14 @@ import hashlib as _hl
 check(m.RUNTIME_IDENTITY.get("loader_sha256") == _hl.sha256(
       (REPO / "src" / "remote-gateway-bridge.py").read_bytes()).hexdigest(),
       "loader self-hash equals its on-disk bytes at startup")
+# fail-closed arms of the loader helpers (restored — a section rewrite ate them)
+check(m._git_head("/nonexistent-dir-xyz") is None,
+      "loader _git_head fails closed (None) outside a git repo")
+check(m._git_head("/etc/hosts") is None,
+      "loader _git_head fails closed on a non-directory repo argument")
+check(m._sha256_of("/nonexistent-file-abc") is None,
+      "loader _sha256_of fails closed (None) on an unreadable path")
+
 check(m.RUNTIME_IDENTITY.get("module_sha256") == _hl.sha256(
       (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" /
        "remote_gateway_bridge.py").read_bytes()).hexdigest(),
@@ -178,6 +186,16 @@ with tempfile.TemporaryDirectory() as td:
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
     check(r["status"] == "warn" and "module bytes drift" in r["detail"],
           "same-HEAD canonical-module byte change: warn module bytes drift")
+    # hash-compare disk-read failure (REPO_DIR unreadable): skip, never raise
+    p.write_text(json.dumps({"runtime": dict(GOOD, loader_sha256="1" * 64)}))
+    saved_repo2 = hc.REPO_DIR
+    try:
+        hc.REPO_DIR = Path(td) / "empty-nonrepo"
+        r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+        check(r["status"] in ("ok", "warn") and "drift" not in r["detail"],
+              "loader file unreadable on disk: hash compare skips, never raises")
+    finally:
+        hc.REPO_DIR = saved_repo2
     real_head = subprocess.check_output(
         ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
     p.write_text(json.dumps({"runtime": dict(GOOD, build_sha=real_head)}))
