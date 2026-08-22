@@ -197,6 +197,31 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
+   **⚠ THEN ASSERT THE WRITE LANDED — three misses in one session, 2026-08-22.** The append
+   reports success in every cheap way and still does not happen:
+
+   ```
+   printf '...' "$(date -u ...)"          # redirect dropped: renders to TERMINAL, reads as success
+   cat >> "$W/build_log.md" <<'EOF' ...   # landed
+   echo logged                            # proves the ECHO ran, never that the APPEND did
+   ```
+
+   Measured the same day: a `printf` whose `>> build_log.md` was omitted printed the entry to
+   stdout and looked identical to a successful write; a whole diagnosis was reported to the owner
+   and never written (`grep -c` returned **0** a pass later); and two completed owner tasks were
+   left with no result file at all. In every case the terminal showed the text.
+
+   **So close the write by reading it back, exactly as step 8 already does for the questions
+   reader** — same shape, different file:
+
+   ```bash
+   grep -c '<distinctive phrase from the entry you just wrote>' "$WORKSPACE/build_log.md"
+   # 0 = the entry is NOT in the file, whatever the terminal showed
+   ```
+
+   `echo logged` / `echo closed` is not this check. It asserts the *last* command in the chain
+   ran, which is true even when the append was the one that silently went elsewhere.
+
    **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or `pending-questions.md`? Typical relay-worthy events:
    - A PR opened, merged, or got a meaningful review reply
    - A pending question resolved (owner picked an option)
