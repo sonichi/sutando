@@ -58,9 +58,7 @@ What the sweep yields, on the sources that carry it:
 
 Record the result per [references/schema.md](references/schema.md), including `store_freshness` per source. Do not enumerate rooms, inboxes or accounts you were not already given.
 
-**2. Expect it to surface defects, and record them rather than smoothing them.** Run against a real corpus it immediately produced unnamed high-traffic rooms, hundreds of truncated rosters, and a service account misfiled as human by a two-way agent/human split. Each is a real map entry — an unknown to resolve, a partial-coverage flag, a classification gap — not noise to filter out.
-
-**3. (Already done at step 0 — kept here only as a pointer.)** See **Seed before you sweep** above; the ordering matters and the sweep does not substitute for it.
+**3. Expect the sweep to surface defects, and record them rather than smoothing them.** Run against a real corpus it immediately produced unnamed high-traffic rooms, hundreds of truncated rosters, and a service account misfiled as human by a two-way agent/human split. Each is a real map entry — an unknown to resolve, a partial-coverage flag, a classification gap — not noise to filter out.
 
 **4. Then let the scheduled work maintain it.** Only once the map holds something does the contract's load-first path mean anything.
 
