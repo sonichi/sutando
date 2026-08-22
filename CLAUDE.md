@@ -189,19 +189,7 @@ Readers prefer canonical paths and fall back to legacy for ~30 days post-migrate
 
 ## Durable per-host install state: `state/auth/`
 
-`<workspace>/state/auth/` holds **per-host install/identity state**
-that survives across upgrades and MUST NOT be wiped by transient-state cleanup
-jobs (or by clear-on-restart logic that targets `state/*.json` generically).
-Current contents:
-- `cloud-auth.json` — per-host cloud-side auth credentials
-- `device.json` — per-host device identity (UUID + provisioning metadata)
-
-Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
-were loose at workspace root, mistreated as transient JSON snapshots and
-sometimes wiped. Treat `state/auth/` like `state/cores/<hostname>.alive` —
-per-host, structural, never overwritten by newest-mtime resolution across
-sources. Codex + Mini confirmed the destination + the exemption from cleanup
-in #design 2026-06-02.
+`<workspace>/state/auth/` holds per-host install/identity state (`cloud-auth.json`, `device.json`) that survives upgrades and MUST NOT be wiped by transient-state cleanup or by clear-on-restart logic targeting `state/*.json` generically. Rationale + history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
 
 ## Core memory
 
@@ -386,6 +374,8 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 ## Skills
 
 Use skills available to the active runtime and under this repo's `skills/` directory when available. Prefer existing skills over writing new code from scratch.
+
+**Coordinating with a person or agent — recruiting a reviewer, delegating, escalating, resolving an identity — starts by invoking [`skills/collaboration-intelligence/`](skills/collaboration-intelligence/SKILL.md).** It derives *whom to ask* from the map, not recall: a memory answering "who do I ask?" fires first and is one past situation's cached answer, so treat it as a candidate and invoke the skill anyway. Feed the map back from real use — record who actually answered, owned, or reviewed, and correct it when a routing guess turns out wrong; a map only used and never updated decays into the recall it replaced.
 
 **Updating a skill mid-session.** Runtime behavior differs. For the Claude runtime, `skills/install.sh` places symlinks under its configured skills directory; after `git pull`, run `bash skills/refresh-skill.sh <name>` (or `--all`) to force its live watcher to re-read them. For the Codex runtime, `refresh-skill.sh` does not update Codex's skill cache; restart the core with `bash src/agent/start-cli.sh --restart` so Codex reloads its configured skill directories. Manifest-loaded `config`/`tools` and `src/` agent code require a service restart via `src/restart.sh`.
 
