@@ -52,3 +52,19 @@ don't know the field are unaffected.
 answer to "which socket?" — read by `sutando-config.sh runtime` so the
 AgentRuntime descriptor reports the real socket (custom sockets included)
 without trusting a foreign caller's ambient env.
+
+## Durable per-host install state: `state/auth/`
+
+`<workspace>/state/auth/` holds **per-host install/identity state**
+that survives across upgrades and MUST NOT be wiped by transient-state cleanup
+jobs (or by clear-on-restart logic that targets `state/*.json` generically).
+Current contents:
+- `cloud-auth.json` — per-host cloud-side auth credentials
+- `device.json` — per-host device identity (UUID + provisioning metadata)
+
+Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
+were loose at workspace root, mistreated as transient JSON snapshots and
+sometimes wiped. Treat `state/auth/` like `state/cores/<hostname>.alive` —
+per-host, structural, never overwritten by newest-mtime resolution across
+sources. Codex + Mini confirmed the destination + the exemption from cleanup
+in #design 2026-06-02.

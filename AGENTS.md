@@ -189,19 +189,7 @@ Readers prefer canonical paths and fall back to legacy for ~30 days post-migrate
 
 ## Durable per-host install state: `state/auth/`
 
-`<workspace>/state/auth/` holds **per-host install/identity state**
-that survives across upgrades and MUST NOT be wiped by transient-state cleanup
-jobs (or by clear-on-restart logic that targets `state/*.json` generically).
-Current contents:
-- `cloud-auth.json` — per-host cloud-side auth credentials
-- `device.json` — per-host device identity (UUID + provisioning metadata)
-
-Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
-were loose at workspace root, mistreated as transient JSON snapshots and
-sometimes wiped. Treat `state/auth/` like `state/cores/<hostname>.alive` —
-per-host, structural, never overwritten by newest-mtime resolution across
-sources. Codex + Mini confirmed the destination + the exemption from cleanup
-in #design 2026-06-02.
+`<workspace>/state/auth/` holds per-host install/identity state (`cloud-auth.json`, `device.json`) that survives upgrades and MUST NOT be wiped by transient-state cleanup or by clear-on-restart logic targeting `state/*.json` generically. Rationale + history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
 
 ## Core memory
 
