@@ -152,11 +152,20 @@ computable, so this is a step in a routine, not a judgement call:
 1. Another party must act.
 2. You have completed your part.
 3. No newer blocker puts the work back in your court.
-4. At least one of the two required channels is missing — **either** no capable party holds a
-   standing request, **or** no state-change notification has been delivered since the last state
-   change.
+4. There is something to do — **either** a required channel is missing (no capable party holds a
+   standing request, or no state-change notification has been delivered since the last state
+   change), **or** every required channel is satisfied and the recorded horizon has passed with the
+   state still unchanged.
 
 If (2) is false the ball is in your court and nudging is a way of not doing your own work.
+
+**Condition 4 has two arms because the routine has two jobs.** The first arm is a *gap*: a channel is
+missing, and steps 1-2 repair it. The second is a *wait that has expired*: every channel is satisfied,
+so there is nothing left to repair, and step 3 escalates. Written as the gap alone, condition 4 makes
+step 3 unreachable — the ordinary overdue state has no gap by construction, and that is exactly when
+escalation is the only remaining action. A recorded-unavailable durable channel counts as satisfied
+here too, so an item with one unusable channel reaches escalation through the second arm rather than
+waiting forever on a request that can never be created.
 
 **Condition 4 is evaluated per channel, and each is repaired on its own.** A present request must
 never suppress a missing notification, or the trigger would classify a request-only item as "waiting
