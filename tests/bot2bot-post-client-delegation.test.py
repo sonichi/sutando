@@ -26,7 +26,7 @@ b2b = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(b2b)
 
 sys.path.insert(0, str(REPO / "src"))
-from discord_rest_client import DiscordRestClient  # noqa: E402
+from channels.discord.client import DiscordRestClient  # noqa: E402
 
 _fails = []
 

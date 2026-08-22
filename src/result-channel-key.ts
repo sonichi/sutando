@@ -16,7 +16,7 @@
  *   - phone → Twilio call SID (per-call unique)
  *   (pull-side plugin surfaces build their own prefixed key on their side.)
  *
- * Twin of src/result_channel_key.py — keep in sync if a Python writer is
+ * Twin of src/delivery/channel_key.py — keep in sync if a Python writer is
  * added.
  */
 
@@ -24,7 +24,7 @@
 // stray channel id can never inject a path separator or a regex special.
 // The `u` flag makes the class match by code point, not UTF-16 code unit —
 // so an astral char (e.g. an emoji, a surrogate pair) collapses to a SINGLE
-// `-`, matching the Python twin's code-point `re.sub` (src/result_channel_key.py).
+// `-`, matching the Python twin's code-point `re.sub` (src/delivery/channel_key.py).
 // Without it, JS matched each surrogate half → two dashes → silent TS/PY drift.
 const KEY_SAFE_RE = /[^A-Za-z0-9_-]/gu;
 
@@ -89,7 +89,7 @@ export function resultBelongsTo(filename: string, channelKey: string): boolean {
 // future consumer types: a hypothetical new pull surface whose ID format
 // happens to be pure digits (like a chat snowflake) cannot accidentally claim
 // another consumer's prefixed filename. Writer and consumer MUST go through the
-// same constructor so the keys agree. Keep symmetric with `src/result_channel_key.py`.
+// same constructor so the keys agree. Keep symmetric with `src/delivery/channel_key.py`.
 
 /** Channel key for the phone-conversation consumer. Wraps a Twilio call SID. */
 export function phoneCallKey(callSid: string | null | undefined): string {
