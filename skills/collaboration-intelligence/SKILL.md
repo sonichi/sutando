@@ -268,6 +268,64 @@ When help is needed:
 5. Resolve ambiguous recipients before sending. Never guess among duplicate names or uncertain identity links.
 6. State why each recipient is included and provide the minimum context, desired action, and expected handoff.
 
+**A request made on the work platform is not solicitation.** A GitHub review
+request, a ticket assignment, a "requested changes" — these change a field in a
+system the recipient may not be watching. They create a *record* that you asked;
+they do not create *knowledge* that you asked. **Filing one and stopping is
+indistinguishable, from the recipient's side, from never having asked.**
+
+So for every reviewer/assignee you name on a platform, also **message their agent
+where that person is actually reachable** — resolve the identity from this map
+first, then reply-to or @-mention. Two properties make this non-optional:
+
+- **Nothing chases it.** A platform request sits indefinitely and emits no
+  reminder. Measured: a PR sat one approval short of its ruleset with **no
+  reviewer queued at all** — not blocked on anything, simply unattended, and
+  invisible to every "is it blocked?" check because unattended is not blocked.
+  One @-mention produced the missing review within minutes.
+- **Resolve the identity from this map before sending — never derive an agent id
+  from a display name or by transforming a user id**, and treat colliding display
+  names as unresolved until evidence separates them. **But an unresolved identity
+  is not a reason to withhold the message.** The two errors are not symmetric:
+  reaching someone who turns out not to be the right person costs them one message
+  they can ignore; failing to reach anyone leaves the work unattended, and
+  unattended is invisible to every "is it blocked?" check. **Owner directive
+  (2026-08-22): a false positive here is the more tolerable error.** So resolve
+  first, send anyway when resolution is imperfect, and say plainly in the message
+  why you think it is them — that lets a wrong recipient correct you in one line
+  instead of silently absorbing the ask.
+
+Carry what the platform page cannot show: why them specifically, the real cost
+(size, conflicts, prerequisites) so they can decline cheaply, and any known
+blocker on their side. One message per person covering all their items, not one
+per item.
+
+**Soliciting is the start of the obligation, not the discharge of it.** An item
+you asked someone to move — a review, a decision, an approval — needs stewardship
+until it reaches a terminal state, and the platform will not do that for you.
+
+**The trigger to message is a state change the other party would want to know
+about — most often "I addressed your finding."** A push updates a branch and a
+comment updates a page; **neither reaches a person.** The reviewer who blocked you
+is not watching your branch, so from where they sit an addressed finding and an
+ignored one look the same until they happen to look again. That gap is measured in
+however long it takes them to re-scan, and it is the single commonest reason a
+resolved item sits.
+
+Other state changes worth a message: a blocker of theirs is now cleared; the thing
+they were waiting on landed; you have changed direction on something they reviewed;
+you are handing the item to someone else.
+
+**And the discipline that keeps this from becoming noise: never nudge on no-change.**
+"Any update?" with nothing new on your side is what gets a channel muted, and a
+muted channel costs you every future nudge that mattered. The test before sending is
+not "has it been a while?" but **"has something changed since the last time I told
+them?"** If nothing has, the item is correctly in their queue — leave it.
+
+Track, per party you are waiting on: what they hold, and what has changed since you
+last contacted them. That pair is what makes the next message either necessary or
+noise, and it is the thing an issue tracker does not store.
+
 **Never a bare room post when you need someone to help.** The rule is scoped to
 *asking*, and the test before posting is not "is this addressed?" but **"am I
 asking for something?"**
