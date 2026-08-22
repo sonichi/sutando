@@ -39,6 +39,7 @@ The same measurement makes the weaker path explicit, and it is worth stating pla
 ## Operating contract
 
 1. Load the compact **quick-lookup index** first (see below) — it answers the common case in a small, bounded payload. Consult the full Collaboration Intelligence record only on a miss, or when the task needs deeper history. If no store is available, build a task-local view and say that persistence is unavailable.
+   **Carry freshness with every answer, including the empty one.** A hit reports its `observed_at`; a miss reports when that source was last swept and whether coverage was full — otherwise "not in the map" and "the map has not looked recently" are the same sentence. See `store_freshness` in [references/schema.md](references/schema.md).
 2. Observe only sources available for the current task. Do not enumerate private rooms, inboxes, or accounts merely to enrich the map.
 3. Normalize observations into rooms, identities, agents, people, relationships, responsibilities, and context. Follow [references/schema.md](references/schema.md).
    For Sutando-supported bridges, also load the matching section of [references/sutando-bridges.md](references/sutando-bridges.md) before interpreting identity, membership, room visibility, agent-versus-human status, or unfamiliar participants.

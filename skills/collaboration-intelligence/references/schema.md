@@ -138,6 +138,28 @@ confidence: 0.0-1.0
 access_scope: room-id | private | organization | public
 ```
 
+## Store freshness
+
+Per-record `observed_at` says how old a fact you *have* is. It cannot say anything about a fact you do **not** have — and an empty result is the most common thing a map returns. Without store-level freshness, "this person is not in the map" and "the map has not looked since Tuesday" are the same answer, and the second one silently reads as the first.
+
+Record it per source, not once for the whole store: sources go stale independently, and a store that swept AG2 Space an hour ago and GitHub last week is fresh and stale at the same time.
+
+```yaml
+store_freshness:
+  - source: provider-or-feed-id        # e.g. "matrix:ag2.space", "github:owner/repo"
+    last_swept_at: timestamp
+    cursor: opaque-provider-cursor | null   # resume point; null = full sweep only
+    coverage: full | partial | unknown      # partial when the provider truncated
+    coverage_note: string | null            # e.g. "roster capped at 10 members"
+    last_error_at: timestamp | null         # a failed sweep must not look like a quiet one
+```
+
+**Report freshness with every miss.** When a lookup returns nothing, the answer is "not in the map; this source last swept at `<t>`, coverage `<c>`", never a bare "not found". A miss against a stale or partial source is a *reason to go look*, not a fact about the world — and the caller cannot make that distinction unless you hand it over.
+
+`coverage: partial` is not a lesser `full`. A provider that caps a roster returns a complete-looking list, so partial coverage must be recorded at write time by comparing what was returned against the count the provider reported — it cannot be recovered afterwards by inspecting the stored data, which looks consistent either way.
+
+`last_error_at` exists because a sweep that failed and a sweep that found nothing new both leave the store unchanged. Only the error field separates them.
+
 ## Candidate identity link
 
 ```yaml
