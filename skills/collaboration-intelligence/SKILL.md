@@ -152,9 +152,16 @@ computable, so this is a step in a routine, not a judgement call:
 1. Another party must act.
 2. You have completed your part.
 3. No newer blocker puts the work back in your court.
-4. No capable party currently holds a standing request.
+4. At least one of the two required channels is missing — **either** no capable party holds a
+   standing request, **or** no state-change notification has been delivered since the last state
+   change.
 
 If (2) is false the ball is in your court and nudging is a way of not doing your own work.
+
+**Condition 4 is evaluated per channel, and each is repaired on its own.** A present request must
+never suppress a missing notification, or the trigger would classify a request-only item as "waiting
+on someone" and leave it in exactly the state this section opens by calling broken. Fire for the
+missing half only.
 
 Read state and timestamps from the artifact, and compare **timestamps, never dates** — a block and a
 head on the same day can be hours apart in either order. ⚠ On a shared account, comments after a
@@ -164,13 +171,16 @@ re-report that was correct.
 
 ### What to do
 
-Three channels, in order, once each. They escalate; do not fire them all at once.
+Three channels. **Gate each independently — do the ones that are missing, skip the ones that already
+exist**, once per state change per channel. Steps 1 and 2 are both required, so neither one's presence
+excuses the other's absence. Step 3 escalates and is time-gated rather than gap-gated.
 
-1. **Create the platform request** — request review, assign the issue, or establish the equivalent
-   durable state. Free, reversible, and the only step that survives an inbox sweep. Always first: if
-   it was missing, the party genuinely never had the item in their queue and later steps may be
-   unnecessary.
-2. **Notify their agent in the shared work room.** Resolve the person *and* their agent from the map
+1. **Create the platform request — only if none stands.** Request review, assign the issue, or
+   establish the equivalent durable state. Free, reversible, and the only step that survives an inbox
+   sweep. Do it first when it is missing: the party genuinely never had the item in their queue, and
+   the later steps may then be unnecessary.
+2. **Notify their agent in the shared work room — only if no state-change notification has been
+   delivered since the last state change.** Resolve the person *and* their agent from the map
    **before** addressing anyone — a nudge sent to a stale handle reads as answered to you and arrives
    nowhere. An agent stands in for its person and is reachable when the human is not.
 3. **Escalate to the person's own channel only after the recorded horizon.** Set `escalate_after`
@@ -182,10 +192,20 @@ Three channels, in order, once each. They escalate; do not fire them all at once
 
 Include the artifact, what changed, and the exact action needed.
 
+**Two cases the conditions must not collapse into "waiting on someone":**
+
+- **Request-only** — a standing request exists, no notification since the last state change. The item
+  sits in a queue nobody has looked at. **Fire step 2 alone**; do not create a second request.
+- **Notification-only** — the party was addressed, no standing request exists. The item was known
+  about once and is now in nobody's list. **Fire step 1 alone**; do not re-send the message.
+
+Each half keeps its own once-per-state-change record, so repairing one does not re-arm the other.
+
 ### Guardrails
 
 - **If the blocker is still in your court, fix it instead of nudging.**
-- **If a capable request already exists, do not create another.**
+- **If a capable request already exists, do not create another** — but check the notification half
+  separately; a present request is not evidence the party knows.
 - **Act once per state change, not once per sweep.** A standing gap that has not changed does not
   deserve a second message; re-sending teaches the recipient to filter you.
 - **Do not nudge someone who just acted.** Give a response time to be seen before treating silence as
