@@ -501,6 +501,38 @@ with tempfile.TemporaryDirectory() as td:
     check(rep["ready"] >= 1, "empty-string item id landed in ready")
     check(rep["parked"] >= 1, "operator/hold parked marker written (encoded)")
 
+# 4b) non-string JSON item_id values: no raise, quarantined, unfenced, idempotent
+with tempfile.TemporaryDirectory() as td:
+    for label, val in (("int", "7"), ("null", "null"),
+                       ("list", "[1]"), ("object", '{"a": 1}')):
+        root = Path(td) / f"r-{label}"
+        a = DesignAClaimBackend(root)
+        a.publish("good-1", b"fine")
+        (root / ".items" / "bad.json").write_text(
+            '{"item_id": %s, "status": "QUEUED", "payload": "x"}' % val)
+        try:
+            rep = import_a_state(root)
+            raised = None
+        except Exception as e:
+            raised = e
+            rep = {}
+        check(raised is None,
+              f"item_id={label}: import returns without raising ({raised})")
+        # Same class as unreadable JSON: quarantined with payload preserved,
+        # then the migration completes — never a crash-abort.
+        check(rep.get("unknown", 0) >= 1 and rep.get("verified"),
+              f"item_id={label}: record quarantined, migration completes ({rep})")
+        q = list((root / "undelivered").glob("*import-unreadable*"))
+        check(len(q) == 1 and q[0].read_bytes() != b"",
+              f"item_id={label}: quarantine marker preserves the record body")
+        try:
+            rep2 = import_a_state(root)
+            raised2 = None
+        except Exception as e:
+            raised2, rep2 = e, {}
+        check(raised2 is None and rep2.get("noop"),
+              f"item_id={label}: re-run is an idempotent no-op ({rep2})")
+
 # 5) counter durability: fsync(temp) precedes replace; dir fsync after
 import os
 with tempfile.TemporaryDirectory() as td:

@@ -273,10 +273,16 @@ def import_a_state(root: Path) -> dict:
     # Verify by MEMBERSHIP: every A item is represented somewhere in C.
     missing = []
     for f in sorted(items_dir.glob("*.json")):
+        # Same classification as the conversion pass: any record it would
+        # quarantine verifies under the quarantine key, never its raw value.
         try:
             rec = _json.loads(f.read_text(encoding="utf-8"))
-            k = _safe_key(rec.get("item_id", f.stem))
         except (OSError, ValueError):
+            rec = None
+        if (isinstance(rec, dict) and isinstance(rec.get("item_id"), str)
+                and f.stem == _a_key(rec["item_id"])):
+            k = _safe_key(rec["item_id"])
+        else:
             k = _safe_key(f.stem)
         from .backend_c import TOKEN_PARTS
 
