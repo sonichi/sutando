@@ -84,11 +84,26 @@ with tempfile.TemporaryDirectory() as td:
     (b3.root / "archive" / f"{k3}.json").write_text(json.dumps(
         {"schema": 1, "item_id": "item-3", "outcome": "confirmed",
          "receipt": {"provider": "P", "destination": "D"},
+         "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
          "incarnation": tok3.incarnation}))
     rep3 = b3.recover()
     check(k3 in rep3.retired, "M-D crash: stale claim retired, not re-readied")
     check(not (b3.root / "ready" / k3).exists(),
           "M-D crash: item is NOT redelivered (no double-send)")
+
+    # ── REVIEW CONTROL: a malformed archive record must not retire a
+    #    live claim (fail closed — the item would be silently lost) ──────
+    b3b = fresh(td, "md-malformed")
+    b3b.publish("item-3b", b"p")
+    tok3b = b3b.claim("item-3b", "w0")
+    k3b = _safe_key("item-3b")
+    (b3b.root / "archive" / f"{k3b}.json").write_text(json.dumps(
+        {"incarnation": tok3b.incarnation}))
+    rep3b = b3b.recover()
+    check(k3b not in rep3b.retired,
+          "malformed archive record does NOT authorize retirement")
+    check((b3b.root / "inflight" / tok3b.incarnation).exists(),
+          "the live claim survives a malformed archive record")
 
     # ── legacy filename-format archive entries: OWN incarnation retires,
     #    a FOREIGN one never touches a live claim ─────────────────────────
@@ -298,6 +313,25 @@ with tempfile.TemporaryDirectory() as td:
         check((bx.root / "inflight" / tokx.incarnation).exists()
               or (bx.root / "ready" / _safe_key("item-x")).exists(),
               f"{label}: the delivery is not lost")
+
+    # ── REVIEW CONTROL: publish("") is contract-legal; its staged terminal
+    #    must FINALIZE, not be deleted-and-redelivered (double-send) ──────
+    be = fresh(td, "empty-id")
+    be.publish("", b"p")
+    toke = be.claim("", "w0")
+    ke = _safe_key("")
+    rece = {"schema": 1, "item_id": "", "outcome": "confirmed",
+            "receipt": {"provider": "P", "destination": "D"},
+            "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
+            "incarnation": toke.incarnation}
+    stg = be.root / "tmp" / f"{TERMINAL_TAG}{SEP}{toke.incarnation}{SEP}1.json"
+    stg.write_text(json.dumps(rece))
+    repe = be.recover()
+    check(ke in repe.retired, 'empty item_id: R-M staged record finalizes')
+    check(be.terminal_record("") is not None,
+          'empty item_id: terminal record preserved (not deleted)')
+    check(not (be.root / "ready" / ke).exists(),
+          'empty item_id: NOT re-armed for redelivery')
 
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")

@@ -350,14 +350,17 @@ class DesignCClaimBackend:
             return False                     # foreign or missing binding
         parts = incarnation.split(SEP)
         item_id = staged.get("item_id")
-        if not isinstance(item_id, str) or not item_id \
-                or _safe_key(item_id) != parts[0]:
+        # "" is a legal id (publish("") is contract-valid); the _safe_key
+        # binding, not truthiness, is what discriminates.
+        if not isinstance(item_id, str) or _safe_key(item_id) != parts[0]:
             return False
         if staged.get("outcome") != DeliveryOutcome.CONFIRMED.value:
             return False                     # C stages terminals ONLY for confirmed
         if not isinstance(staged.get("receipt"), dict):
             return False
         worker = staged.get("worker")
+        # "" stays rejected here: _safe_component refuses it at claim time,
+        # so no real incarnation can carry an empty worker.
         if len(parts) >= 2 and (not isinstance(worker, str) or not worker
                                 or _safe_component(worker) != parts[1]):
             return False                     # worker must match the claim's
@@ -366,18 +369,22 @@ class DesignCClaimBackend:
 
     def _incarnation_is_terminal(self, key: str, incarnation: str) -> bool:
         """True iff an archive entry records THIS incarnation as completed:
-        a JSON record whose incarnation field matches, or a legacy rename whose
-        filename begins with the incarnation. Keyed by claim, never item id."""
+        a COMPLETE JSON record bound to it, or a legacy rename whose filename
+        begins with the incarnation. Keyed by claim, never item id."""
         for f in self._d(ARCHIVE).iterdir():
             if f.name.startswith(incarnation):
-                return True                        # legacy rename format
+                # Legacy renames are atomic claim-file moves: presence is
+                # complete evidence by construction; there is no torn state.
+                return True
             if not (f.name.startswith(f"{key}") and f.suffix == ".json"):
                 continue
             try:
                 rec = json.loads(f.read_text())
             except (OSError, ValueError):
                 continue
-            if isinstance(rec, dict) and rec.get("incarnation") == incarnation:
+            # A record authorizes retiring a LIVE claim only when it passes
+            # the same total validation as staging; malformed fails closed.
+            if self._staged_is_complete(rec, incarnation):
                 return True
         return False
 
