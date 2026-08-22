@@ -175,7 +175,7 @@ When help is needed:
    - **A low or zero count is not evidence of exclusion.** The metric has no early signal — a maintainer added yesterday is indistinguishable from an inactive one until they accumulate history, so the ranking is most confident about the longest-tenured and least reliable about the newest arrival, which is exactly who "whom do I ask?" is often about. Use counts to find candidates, never to rule one out; explicit responsibility and owner statements outrank them.
 
    Treat a derived set older than a few hours the way this skill treats a memory: a candidate to re-derive, not an answer.
-3. Prefer the room where the work already has context. Do not move sensitive context across rooms without checking visibility and membership.
+3. **Choose the person first, then choose where to reach them — they are separate decisions.** An identity existing is not the same as it being live: check `identities[].activity` for where that person is actually seen, and honour `exclusive: true` (some people are reachable on exactly one surface, and a message anywhere else reaches nobody). Defaulting to whichever surface you happen to be on is how a reachable person gets treated as unreachable. Prefer the room where the work already has context, subject to that.
    When customers or external collaborators are present, share only context appropriate to that relationship and work scope.
 4. Contact the responsible agent directly when it can act. Include its owner or a human when approval, escalation, or shared accountability is needed.
 5. Resolve ambiguous recipients before sending. Never guess among duplicate names or uncertain identity links.
@@ -211,6 +211,7 @@ Do not spam every plausible expert. Escalate outward only after the primary owne
 
 - Store professional collaboration facts needed for coordination; avoid protected traits, private-life profiling, sentiment scores, or speculative trust labels.
 - Keep provenance and access scope with facts so restricted observations are not leaked into broader rooms.
+- **Repeating something from a smaller room into a larger one requires an explicit signal, and the default is no.** Before carrying a fact across rooms, compare their visibility, audience and membership: narrower → wider is a disclosure decision, not a formatting one. Knowing something because you were present is not permission to restate it. This skill's daily action *is* cross-room routing, so it will meet this case constantly; when in doubt, say that context exists and let the person who owns it decide whether to share it.
 - Honor deletion/correction requests and retain superseded facts only when audit needs require it.
 - Ask before performing external outreach unless the user already authorized sending or coordination.
 
