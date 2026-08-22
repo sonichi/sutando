@@ -41,6 +41,10 @@ import hashlib as _hl
 check(m.RUNTIME_IDENTITY.get("loader_sha256") == _hl.sha256(
       (REPO / "src" / "remote-gateway-bridge.py").read_bytes()).hexdigest(),
       "loader self-hash equals its on-disk bytes at startup")
+check(m.RUNTIME_IDENTITY.get("module_sha256") == _hl.sha256(
+      (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" /
+       "remote_gateway_bridge.py").read_bytes()).hexdigest(),
+      "canonical-module digest recorded pre-exec equals disk")
 check(str(m.RUNTIME_IDENTITY.get("entrypoint", "")).endswith(
     "src/remote-gateway-bridge.py"), "entrypoint names the canonical loader")
 
@@ -168,6 +172,12 @@ with tempfile.TemporaryDirectory() as td:
     p.write_text(json.dumps({"runtime": dict(GOOD, loader_sha256=disk_fp)}))
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
     check(r["status"] == "ok", "matching loader hash: still ok")
+    # same-HEAD change to the CANONICAL module (reviewer P1): warn
+    p.write_text(json.dumps({"runtime": dict(GOOD, loader_sha256=disk_fp,
+                                             module_sha256="0" * 64)}))
+    r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+    check(r["status"] == "warn" and "module bytes drift" in r["detail"],
+          "same-HEAD canonical-module byte change: warn module bytes drift")
     real_head = subprocess.check_output(
         ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
     p.write_text(json.dumps({"runtime": dict(GOOD, build_sha=real_head)}))
