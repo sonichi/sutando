@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase-1a compat shims: each retired root-level module name must still import
-and expose the SAME objects as its canonical package module — identity, not a
-copy, so patching/config through either name reaches one implementation.
+and resolve to the CANONICAL MODULE OBJECT itself (sys.modules alias), so
+patching through either name reaches one implementation.
 Run: python3 tests/restructure-compat-shims.test.py
 """
 import importlib
@@ -29,8 +29,10 @@ for shim_name, (canon_name, attr) in SHIMS.items():
     try:
         shim = importlib.import_module(shim_name)
         canon = importlib.import_module(canon_name)
-        same = getattr(shim, attr) is getattr(canon, attr)
-        print(f"  {'ok  ' if same else 'FAIL'} {shim_name}.{attr} is {canon_name}.{attr}")
+        # True alias: the retired name must BE the canonical module object,
+        # so patching through either name reaches one implementation.
+        same = shim is canon and getattr(shim, attr) is getattr(canon, attr)
+        print(f"  {'ok  ' if same else 'FAIL'} {shim_name} is {canon_name} (module identity)")
         if not same:
             fails.append(shim_name)
     except Exception as e:

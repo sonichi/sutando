@@ -21,9 +21,8 @@ import urllib.request
 # Retry only these codes. 429 = rate limit; 5xx = transient upstream/edge error.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 DEFAULT_MAX_RETRIES = 5
-# Never honor a single Retry-After / backoff sleep longer than this. A pathological
-# Retry-After shouldn't wedge a reader for minutes; bounding it keeps the runaway
-# backstop meaningful.
+# Cap any single Retry-After/backoff sleep — a pathological Retry-After
+# must not wedge a reader for minutes.
 MAX_SLEEP_SECONDS = 60.0
 
 

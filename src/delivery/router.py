@@ -50,27 +50,24 @@ def late_result_body(body: str) -> str:
     text = body or ""
     if text.lstrip().startswith(LATE_RESULT_PREFIX):
         return text
-    # One blank line between prefix and body when the body is non-empty, so the
-    # prefix reads as its own line on chat surfaces; bare prefix if body empty
-    # (an empty late result is still surfaced — an empty result is a producer
-    # bug per §4 and must stay visible, not be swallowed).
+    # Blank line keeps the prefix on its own line; an empty late result stays
+    # visible (producer bug per §4), never swallowed.
     return f"{LATE_RESULT_PREFIX}\n\n{text}" if text.strip() else LATE_RESULT_PREFIX
 
 
 # ── §4 fallback trigger conditions ───────────────────────────────────────────
 
-# Triggers that MUST route a result to the fallback (owner DM) instead of, or
-# in addition to, the primary channel. Exhaustive per spec §4.
+# The four causes that MUST route to the owner-DM fallback (exhaustive, §4):
+# session end / API error post-retry / over hard limit post-chunking / channel gated.
 FallbackTrigger = Literal[
-    "session_closed",   # hang-up / voice disconnect / Matrix session ended
-    "delivery_error",   # surface API error after the adapter's own retry
-    "over_limit",       # exceeds a hard surface limit even after chunking
-    "channel_gated",    # serving channel gated (e.g. contextNotFrom) — don't drop
+    "session_closed",
+    "delivery_error",
+    "over_limit",
+    "channel_gated",
 ]
 
-# NON-triggers (spec §4): these must NOT cause a fallback. Slow delivery, an
-# idle user, or an empty-looking result are delivered as-is (an empty result is
-# a producer bug and must stay visible, not be rerouted or dropped).
+# NON-triggers (§4): slow delivery / idle user / empty-looking result deliver
+# as-is — an empty result is a producer bug and must stay visible.
 _NON_TRIGGERS = frozenset({"slow_delivery", "user_idle", "empty_result"})
 
 _FALLBACK_TRIGGERS = frozenset({
@@ -95,8 +92,9 @@ class DeliveryFailure:
 
     task_id: str
     tier: str            # "owner" | "team" | "other" (or "" if unknown)
-    surface: str         # "discord" | "slack" | "telegram" | "voice" | "phone" | ...
-    error: str           # short human-readable cause (API error / "session ended" / ...)
+    surface: str         # "discord" | "slack" | "telegram" | "voice" | ...
+
+    error: str  # short human-readable cause
 
 
 def delivery_failure_notice(f: DeliveryFailure) -> str:
@@ -115,14 +113,15 @@ def delivery_failure_notice(f: DeliveryFailure) -> str:
     )
 
 
-# Dispositions an audited result can end in (spec §3/§6/§7).
+# Audited dispositions (§3/§6/§7): delivered=primary; redirected=[channel:];
+# deduped/no_send=silent archive; late_result/failed=owner-DM fallback (+audit).
 Disposition = Literal[
-    "delivered",      # landed on the primary channel
-    "redirected",     # delivered to a [channel:] target
-    "deduped",        # [deduped:] — silently archived
-    "no_send",        # [no-send] / [REPLIED] — silently archived
-    "late_result",    # session ended → owner DM fallback
-    "failed",         # delivery error → owner DM + this audit line
+    "delivered",
+    "redirected",
+    "deduped",
+    "no_send",
+    "late_result",
+    "failed",
 ]
 
 

@@ -85,12 +85,8 @@ def result_belongs_to(filename: str, channel_key: str) -> bool:
     return key == sanitize_key(channel_key)
 
 
-# ── Typed channel-key constructors ────────────────────────────────────────
-# Per-consumer prefixes make key-namespace collisions impossible across
-# future consumer types: a hypothetical new pull surface whose ID format
-# happens to be pure digits (like a chat snowflake) cannot accidentally claim
-# another consumer's prefixed filename. Writer and consumer MUST go through the
-# same constructor so the keys agree. Keep symmetric with ``src/result-channel-key.ts``.
+# Typed constructors: per-consumer prefixes make cross-consumer key collisions
+# impossible; writer+consumer share one constructor. Symmetric with result-channel-key.ts.
 
 
 def phone_call_key(call_sid: Optional[str]) -> str:
