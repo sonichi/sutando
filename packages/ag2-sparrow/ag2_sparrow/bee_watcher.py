@@ -202,6 +202,10 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
                 backoff = 1
                 for etype, eid, data_raw in _sse_frames(resp):
                     if wanted and etype not in wanted:
+                        # A filtered frame is consumed: advance the cursor so a
+                        # long filtered run cannot stall Last-Event-ID replay.
+                        if eid:
+                            _write_cursor(eid)
                         continue
                     try:
                         data = json.loads(data_raw)

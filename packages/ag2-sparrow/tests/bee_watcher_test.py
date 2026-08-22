@@ -179,6 +179,17 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertEqual(_Server.last_event_id_seen[0], None)
         self.assertEqual(_Server.last_event_id_seen[1], "f:9/x")
 
+    def test_filtered_events_still_advance_the_cursor(self):
+        # A filtered frame is consumed: the cursor must not stall behind a
+        # filtered run and replay it all on reconnect (review finding).
+        cfg = {**self.cfg, "BEE_EVENT_TYPES": "todo-created"}
+        self.mod.run(cfg, once=True)
+        cursor = json.loads(self._cursor.read_text())["last_event_id"]
+        # e2 and f:9/x are both filtered under this config; the cursor must
+        # still reach the LAST frame, not stall at the last delivered one (e1).
+        self.assertEqual(cursor, "f:9/x")
+        self.assertEqual(len(_Server.ingested), 1)   # only e1 delivered
+
     def test_local_sink_writes_task_file_no_broker(self):
         # BEE_SINK=local (the fully-OSS mode): events land as task FILES on
         # the local file bridge — atomic, well-formed headers, idempotent on
