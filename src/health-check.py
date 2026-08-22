@@ -6858,6 +6858,37 @@ def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
                 pass
 
 
+def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
+    """A dual_read hit means C could not resolve an id the importer should have
+    covered — a finding, and the gate that blocks Design A's deletion."""
+    from datetime import datetime
+    name = "a-fallback-hits"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    hits = []
+    for root in sorted(results.glob(".outbox*")):
+        counter = root / "a-fallback-hits.json"
+        if not counter.is_file():
+            continue
+        try:
+            rec = json.loads(counter.read_text(encoding="utf-8"))
+            count = int(rec.get("count", 0))
+        except (OSError, ValueError):
+            hits.append(f"{root.name}: counter unreadable")
+            continue
+        if count > 0:
+            when = rec.get("last_hit_ts")
+            when_s = (datetime.fromtimestamp(when).strftime("%m-%d %H:%M")
+                      if isinstance(when, (int, float)) else "?")
+            hits.append(f"{root.name}: {count} hit(s), last {rec.get('last_item', '?')} at {when_s}")
+    if hits:
+        return {"name": name, "status": "warn",
+                "detail": "A-fallback (dual_read) HIT — importer coverage gap or "
+                          "phantom id; A deletion stays gated until a full release "
+                          "records zero new hits: " + "; ".join(hits)}
+    return {"name": name, "status": "ok",
+            "detail": "no migration-window fallback hits on any outbox root"}
+
+
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     """A claim whose task file still exists is queued or running, so no age condemns it;
     one whose task is archived is leaked at any age. Not a --fix: release may drop work."""
@@ -9092,6 +9123,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
+    checks.append(check_a_fallback_hits())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
