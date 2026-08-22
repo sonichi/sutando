@@ -321,9 +321,9 @@ def _discover_codex_session(since: float, expect_cwd: Path) -> Optional[str]:
         # cwd filter: other codex runs (e.g. exec) also write rollouts; only a
         # session started in OUR working dir can be this room's pane.
         cwd = str((meta.get("payload") or {}).get("cwd") or meta.get("cwd") or "")
-        # Resolve BOTH sides: macOS reports /var/... and /private/var/... for the
-        # same directory depending on who recorded it.
-        if cwd and Path(cwd).resolve() != expect_cwd.resolve():
+        # cwd is the ONLY identity check — fail closed on missing/malformed meta.
+        # Resolve both sides: macOS reports /var and /private/var for one dir.
+        if not cwd or Path(cwd).resolve() != expect_cwd.resolve():
             continue
         candidates.append((path.stat().st_mtime, matched.group(1)))
     if not candidates:

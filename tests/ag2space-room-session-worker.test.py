@@ -479,10 +479,15 @@ def test_codex_session_discovery() -> None:
         rollout(wrong_cwd, root / "elsewhere", marker + 30)
         rollout(right, wd, marker + 60)
         (sessions / "rollout-2026-08-22T03-00-00-not-a-uuid.jsonl").write_text("{}\n")
+        anonymous = sessions / f"rollout-2026-08-22T03-00-00-{uuid.uuid4()}.jsonl"
+        anonymous.write_text(json.dumps({"type": "session_meta", "payload": {}}) + "\n")
+        os.utime(anonymous, (marker + 120, marker + 120))
         with patch.dict(os.environ, {"CODEX_HOME": str(root / "codex-home")}):
             check(worker._discover_codex_session(marker, wd) == right,
                   "discovery picks the newest rollout matching our working dir")
             check(worker._discover_codex_session(marker + 90, wd) is None,
+                  "a rollout with no cwd in its meta is never bound to a room (fail closed)")
+            check(worker._discover_codex_session(marker + 130, wd) is None,
                   "discovery never matches rollouts older than the spawn marker")
 
         workspace = root / "workspace"
