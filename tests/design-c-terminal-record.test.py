@@ -185,6 +185,34 @@ with tempfile.TemporaryDirectory() as td:
     check(not (b10.root / "inflight" / tok10.incarnation).exists(),
           "and the claim released only after the barrier")
 
+    # ── INCOMPLETE staged records are torn, never promoted ─────────────
+    b11 = fresh(td, "schema-only")
+    b11.publish("victim", b"p")
+    tok11 = b11.claim("victim", "w0")
+    (b11.root / "tmp" / f"{TERMINAL_TAG}{SEP}{tok11.incarnation}{SEP}3.json").write_text(
+        '{"schema": 1}')
+    b11.recover()
+    check(b11.terminal_record("victim") is None,
+          "schema-only staged JSON is torn — not promoted")
+    check((b11.root / "inflight" / tok11.incarnation).exists()
+          or (b11.root / "ready" / _safe_key("victim")).exists(),
+          "and the delivery is NOT lost (claim intact or re-readied)")
+    b12 = fresh(td, "foreign-inc")
+    b12.publish("item-12", b"p")
+    tok12 = b12.claim("item-12", "w0")
+    full = {"schema": 1, "item_id": "item-12", "outcome": "confirmed",
+            "receipt": {"provider": "P", "destination": "D"},
+            "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
+            "incarnation": "someone~else~1~2~3"}
+    (b12.root / "tmp" / f"{TERMINAL_TAG}{SEP}{tok12.incarnation}{SEP}4.json").write_text(
+        json.dumps(full))
+    b12.recover()
+    check(b12.terminal_record("item-12") is None,
+          "a record bound to a FOREIGN incarnation is torn for this staging name")
+    check((b12.root / "inflight" / tok12.incarnation).exists()
+          or (b12.root / "ready" / _safe_key("item-12")).exists(),
+          "and that delivery is not lost either")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")

@@ -336,6 +336,18 @@ class DesignCClaimBackend:
         out.sort(key=lambda r: r.get("completed_ns") or 0)
         return out
 
+    @staticmethod
+    def _staged_is_complete(staged, incarnation: str) -> bool:
+        """A staged record is authoritative only when FULLY written AND bound
+        to the staging filename's incarnation — schema alone is a torn write."""
+        if not isinstance(staged, dict) or staged.get("schema") != 1:
+            return False
+        if staged.get("incarnation") != incarnation:
+            return False                     # foreign or missing binding
+        if not staged.get("item_id") or _safe_key(staged["item_id"]) != incarnation.split(SEP)[0]:
+            return False
+        return bool(staged.get("outcome")) and "receipt" in staged
+
     def _incarnation_is_terminal(self, key: str, incarnation: str) -> bool:
         """True iff an archive entry records THIS incarnation as completed:
         a JSON record whose incarnation field matches, or a legacy rename whose
@@ -370,7 +382,7 @@ class DesignCClaimBackend:
                     staged = json.loads(t.read_text())
                 except (OSError, ValueError):
                     staged = None
-                if not (isinstance(staged, dict) and staged.get("schema") == 1):
+                if not self._staged_is_complete(staged, inc):
                     t.unlink(missing_ok=True)      # torn write, never authoritative
                     continue
                 if self.durability != "lax":
