@@ -299,22 +299,42 @@ class DesignCClaimBackend:
             # Same id redelivered after a prior terminal: keep both records.
             dst = dst.with_name(f"{key}{SEP}{time.time_ns()}.json")
         os.rename(str(tmp), str(dst))
-        if self.durability == "strict":
-            dfd = os.open(str(dst.parent), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+        self._strict_dir_barrier()
+
+    def _strict_dir_barrier(self) -> None:
+        """strict mode: the archive DIRECTORY entry is durable before any
+        claim release — shared by complete() and recovery finalization."""
+        if self.durability != "strict":
+            return
+        dfd = os.open(str(self._d(ARCHIVE)), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def terminal_record(self, item_id: str) -> "dict | None":
-        """The persisted terminal record for `item_id`, or None (including
-        legacy filename-format archive entries, which carry no receipt)."""
-        p = self._terminal_path(_safe_key(item_id))
-        try:
-            data = json.loads(p.read_text())
-        except (OSError, ValueError):
-            return None
-        return data if isinstance(data, dict) else None
+        """The LATEST terminal record for `item_id` (max completed_ns), or
+        None. Republished ids accrete records; the current cycle wins here,
+        and terminal_records() returns the full history."""
+        recs = self.terminal_records(item_id)
+        return recs[-1] if recs else None
+
+    def terminal_records(self, item_id: str) -> "list[dict]":
+        """All terminal records for `item_id`, oldest first by completed_ns.
+        Legacy filename-format entries carry no receipt and are not listed."""
+        key = _safe_key(item_id)
+        out = []
+        for f in self._d(ARCHIVE).glob(f"{key}*.json"):
+            if f.name != f"{key}.json" and not f.name.startswith(f"{key}{SEP}"):
+                continue                      # a longer key sharing the prefix
+            try:
+                data = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("item_id") == item_id:
+                out.append(data)
+        out.sort(key=lambda r: r.get("completed_ns") or 0)
+        return out
 
     def _incarnation_is_terminal(self, key: str, incarnation: str) -> bool:
         """True iff an archive entry records THIS incarnation as completed:
@@ -353,11 +373,19 @@ class DesignCClaimBackend:
                 if not (isinstance(staged, dict) and staged.get("schema") == 1):
                     t.unlink(missing_ok=True)      # torn write, never authoritative
                     continue
+                if self.durability != "lax":
+                    # Parseable is not durable: the crashed writer may not
+                    # have reached its fsync. Re-barrier before finalizing.
+                    fd = os.open(str(t), os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
                 dst = self._terminal_path(key)
                 if dst.exists():
                     dst = dst.with_name(f"{key}{SEP}{time.time_ns()}.json")
                 os.rename(str(t), str(dst))
-                # Release exactly the claim that produced this record.
+                self._strict_dir_barrier()   # durable BEFORE the release
                 (self.root / INFLIGHT / inc).unlink(missing_ok=True)
                 rep.retired.append(key)
         for f in sorted(self._d(INFLIGHT).iterdir()):

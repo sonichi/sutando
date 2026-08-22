@@ -127,8 +127,11 @@ with tempfile.TemporaryDirectory() as td:
     k6 = _safe_key("item-6")
     recs = [f for f in (b6.root / "archive").iterdir() if f.suffix == ".json"]
     check(len(recs) == 2, f"both terminal records kept (got {len(recs)})")
-    check(b6.terminal_record("item-6")["receipt"]["destination"] == "D1",
-          "primary record is the first delivery; the suffix carries the second")
+    check(b6.terminal_record("item-6")["receipt"]["destination"] == "D2",
+          "terminal_record returns the LATEST cycle (D2), not the first")
+    hist = b6.terminal_records("item-6")
+    check([r["receipt"]["destination"] for r in hist] == ["D1", "D2"],
+          "terminal_records lists the full history oldest-first")
 
     # ── REVIEW CONTROL: older terminal must NOT retire a LIVE redelivery ─
     b8 = fresh(td, "redeliver-live")
@@ -157,6 +160,30 @@ with tempfile.TemporaryDirectory() as td:
     check(b9.terminal_record("item-9") is None,
           "torn staging temp is not promoted to a terminal record")
     check(not torn.exists(), "and the torn temp is cleaned up")
+
+    # ── strict recovery carries the SAME barrier as strict complete ────
+    fsyncs = []
+    _real_fsync = os.fsync
+    b10 = fresh(td, "strict-rec", durability="strict")
+    b10.publish("item-10", b"p")
+    tok10 = b10.claim("item-10", "w0")
+    rec10 = {"schema": 1, "item_id": "item-10", "outcome": "confirmed",
+             "receipt": {"provider": "P", "destination": "D"},
+             "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
+             "incarnation": tok10.incarnation}
+    (b10.root / "tmp" / f"{TERMINAL_TAG}{SEP}{tok10.incarnation}{SEP}2.json").write_text(
+        json.dumps(rec10))
+    os.fsync = lambda fd: (fsyncs.append(fd), _real_fsync(fd))[1]
+    try:
+        b10.recover()
+    finally:
+        os.fsync = _real_fsync
+    check(len(fsyncs) >= 2,
+          f"strict recovery fsyncs record AND archive dir before release ({len(fsyncs)})")
+    check(b10.terminal_record("item-10") is not None,
+          "and the staged record finalized")
+    check(not (b10.root / "inflight" / tok10.incarnation).exists(),
+          "and the claim released only after the barrier")
 
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
