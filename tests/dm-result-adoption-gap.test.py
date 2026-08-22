@@ -70,7 +70,7 @@ os.environ["SUTANDO_DM_OWNER_ID"] = "test-owner-id-not-real"
 _spec = importlib.util.spec_from_file_location("dm_result_gap", REPO / "src" / "dm-result.py")
 dm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dm)
-import discord_rest_client as _rest  # noqa: E402  — the seam _send installs into
+import channels.discord.client as _rest  # noqa: E402  — the seam _send installs into
 
 
 class _Resp:

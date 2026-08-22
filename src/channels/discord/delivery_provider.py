@@ -17,7 +17,7 @@ import json
 
 from ag2_sparrow.delivery_core.contract import (
     DeliveryAttempt, DeliveryOutcome, DeliveryReceipt, ProviderCapabilities)
-from discord_rest_client import DiscordRestClient
+from channels.discord.client import DiscordRestClient
 from outbox import DeliveryOutcome as TransportOutcome
 
 _OUTCOME_MAP = {

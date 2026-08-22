@@ -101,7 +101,7 @@ def _rest_client(token: str):
     """The shared Discord chokepoint + injected post-gate. Resolved and
     imported lazily so non-Discord sources never touch the Discord stack."""
     repo = next(p for p in Path(__file__).resolve().parents
-                if (p / "src" / "discord_rest_client.py").is_file())
+                if (p / "src" / "channels" / "discord" / "client.py").is_file())
     src = str(repo / "src")
     if src not in sys.path:
         sys.path.insert(0, src)

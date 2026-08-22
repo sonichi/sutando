@@ -25,7 +25,7 @@ import importlib.util
 import os
 import uuid
 from pathlib import Path
-from discord_rest_client import DiscordRestClient
+from channels.discord.client import DiscordRestClient
 
 
 def _configured_path(repo_root=None) -> str:
