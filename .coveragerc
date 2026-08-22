@@ -1,0 +1,33 @@
+# Coverage.py config for the unit-test coverage gate (scripts/coverage-gate.sh).
+#
+# Scope: the Python code the standalone test suite (tests/**/*.test.py) can
+# meaningfully exercise. Tests themselves, vendored deps, and generated
+# trees are excluded.
+#
+# parallel + sigterm: each test file runs as its own `coverage run` process
+# (they are standalone scripts, not a pytest session); per-run .coverage.*
+# fragments are merged by `coverage combine` in the gate script.
+
+[run]
+parallel = True
+sigterm = True
+source =
+    src
+    scripts
+    skills
+
+omit =
+    tests/*
+    */node_modules/*
+    */.venv/*
+    */venv/*
+    workspace/*
+
+[report]
+# Pragmas for genuinely unreachable / interactive-only branches.
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+
+[xml]
+output = coverage.xml
