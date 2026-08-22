@@ -1248,7 +1248,12 @@ echo ""
 # Verify services actually started (wait a moment, then check ports)
 sleep 3
 echo "Verifying services..."
-VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
+VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api"
+# Only verify 7845 when we actually tried to start it. Same condition as the start
+# branch: a deliberate skip must not render as a crash pointing at an empty log.
+if [ "${PERM_OK:-0}" = "1" ]; then
+  VERIFY_PORTS="$VERIFY_PORTS 7845:screen-capture"
+fi
 if [ "${SKIP_VOICE:-}" != "1" ]; then
   VERIFY_PORTS="9900:voice-agent $VERIFY_PORTS"
 fi
@@ -1258,11 +1263,24 @@ fi
 if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
+# A single probe races a service that is still binding: measured 2026-08-22, voice-agent
+# reported ✗ here and was serving a full session a minute later. Retry briefly before
+# declaring it down; a genuinely dead service costs the extra wait only once.
+VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
+  waited=0
+  while ! lsof -i :"$port" > /dev/null 2>&1 && [ "$waited" -lt "$VERIFY_SETTLE_S" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
   if lsof -i :"$port" > /dev/null 2>&1; then
-    echo "  ✓ $name (port $port)"
+    if [ "$waited" -gt 0 ]; then
+      echo "  ✓ $name (port $port, after ${waited}s)"
+    else
+      echo "  ✓ $name (port $port)"
+    fi
   else
     echo "  ✗ $name (port $port) — check $LOGS_DIR/${name}.log"
   fi
