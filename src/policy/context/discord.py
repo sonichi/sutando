@@ -26,7 +26,7 @@ import sys
 import urllib.request
 
 from util_paths import claude_home_path
-from discord_http import request_json
+from channels.discord.http import request_json
 
 ACCESS_FILE = claude_home_path("channels", "discord", "access.json")
 API = "https://discord.com/api/v10"

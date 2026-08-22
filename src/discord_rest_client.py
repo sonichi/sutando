@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from discord_http import request_json
+from channels.discord.http import request_json
 from outbox_adapter import DeliveryReceipt, classify_response
 from outbox import DeliveryOutcome, RetrySafety
 

@@ -18,7 +18,7 @@ from __future__ import annotations
 import urllib.parse
 import urllib.request
 
-from discord_http import request_json
+from channels.discord.http import request_json
 from chat_secret_filter import filter_chat_secrets
 from vault_intercept import redact_vault_commands
 

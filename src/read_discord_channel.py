@@ -23,7 +23,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from util_paths import claude_home_path
-from discord_http import request_json
+from channels.discord.http import request_json
 import policy.context.discord as _policy
 import channels.discord.reader as _reader
 from channels.discord.reader import _redact  # noqa: F401  — shared policy, re-exported
