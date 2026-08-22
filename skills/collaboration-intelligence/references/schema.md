@@ -1,0 +1,220 @@
+# Collaboration Intelligence record schema
+
+Use this conceptual schema with any available durable store. Preserve stable IDs and timestamps. JSON/YAML examples are illustrative; adapt to the provider without changing semantics.
+
+## Contents
+
+- [Entity](#entity)
+- [Room](#room)
+- [Relationship](#relationship)
+- [Evidenced fact](#evidenced-fact)
+- [Candidate identity link](#candidate-identity-link)
+- [Alert](#alert)
+- [Merge rules](#merge-rules)
+- [Suggested freshness windows](#suggested-freshness-windows)
+
+## Entity
+
+```yaml
+entity_id: stable-local-id
+kind: human | agent | service | organization | unknown
+canonical_name: string | null
+aliases: [string]
+identities:
+  - provider: matrix | slack | discord | teams | email | github | other
+    user_id: stable-provider-native-user-id
+    display_name: string | null
+    bridge_origin: string | null
+    verified: false
+owner_links:
+  - owner_entity_id: stable-local-id
+    relation: owner | operator | manager | sponsor | unknown
+    status: explicit | inferred | historical | disputed
+    fact: {source_ref: string, observed_at: timestamp, confidence: 0.0-1.0}
+affiliations:
+  - organization_entity_id: stable-local-organization-id | null
+    collaboration_role: internal | customer | external_collaborator | partner | vendor | unknown
+    scope_ref: organization-project-feature-contract-or-room-id | null
+    status: active | historical | disputed
+    fact: {source_ref: string, observed_at: timestamp, confidence: 0.0-1.0}
+attention_profile:
+  tier: standard | priority
+  label: VIP | string | null
+  designated_by_entity_id: stable-local-id | null
+  reason: string | null
+  scope_ref: organization-account-project-room-or-global-id | null
+  valid_from: timestamp | null
+  valid_until: timestamp | null
+  handling_preferences: [string]
+  source_ref: authoritative-reference | null
+roles: [evidenced_fact]
+expertise: [evidenced_fact]
+responsibilities: [evidenced_fact]
+behavior_patterns: [evidenced_fact]
+first_seen_at: timestamp
+last_seen_at: timestamp
+```
+
+## Room
+
+```yaml
+room_id: stable-local-room-id
+provider: string
+provider_room_id: stable-provider-native-room-or-channel-id
+provider_container_id: workspace-guild-server-community-id | null
+name: string | null
+kind: dm | group_dm | channel | room | issue | pr | email_thread | other
+bridge_origin: string | null
+visibility: private | internal | public | unknown
+audience: internal_only | mixed_external | external_only | public | unknown
+size_band: small_under_100 | large_100_or_more | unknown
+attention_priority: high | normal | low
+attention_reasons: [string]
+purpose: [evidenced_fact]
+workstreams: [evidenced_fact]
+membership:
+  completeness: full | partial | unknown
+  sync_mode: sweep | incremental | task_snapshot | observed_only
+  observed_at: timestamp
+  last_sweep_at: timestamp | null
+  last_incremental_at: timestamp | null
+  reported_member_count: integer | null
+  listed_member_count: integer | null
+  truncated: boolean | null
+  source_ref: string
+  members:
+    - entity_id: stable-local-id
+      provider_user_id: stable-provider-native-user-id
+      collaboration_role: internal | customer | external_collaborator | partner | vendor | unknown
+      membership: joined | invited | left | observed | unknown
+latest_context:
+  summary: string
+  decisions: [string]
+  blockers: [string]
+  handoffs: [string]
+  unresolved: [string]
+  through_at: timestamp
+  source_refs: [string]
+last_seen_at: timestamp
+```
+
+## Relationship
+
+Store durable organizational relationships separately from scoped work-item collaboration.
+
+```yaml
+relationship_id: stable-local-id
+from_entity_id: stable-local-id
+to_entity_id: stable-local-id
+relation: owner | operator | manager | teammate | customer_contact | external_collaborator | collaborator | reviewer | assignee | expert | other
+timescale: durable | scoped
+scope_type: team | organization | project | feature | pr | issue | incident | room | other
+scope_ref: stable-project-feature-pr-issue-or-room-id | null
+state: active | dormant | completed | historical | disputed
+valid_from: timestamp | null
+valid_until: timestamp | null
+last_observed_at: timestamp
+last_confirmed_at: timestamp | null
+facts: [evidenced_fact]
+```
+
+- Use `durable` for team, reporting, ownership, and recurring functional relationships that usually persist for weeks or months.
+- Use `scoped` for project, feature, PR, issue, or incident collaboration that commonly persists for days or weeks.
+- Tie every scoped relationship to `scope_ref` when available. On merge, close, resolution, cancellation, or another terminal event, mark it `completed` or `historical`; do not delete it or let it imply current responsibility.
+- Do not infer the end of a durable relationship from short-term inactivity. Require explicit change, contradictory evidence, or a much longer review interval.
+- Interpret `customer` and `external_collaborator` relative to an organization or owner and, when applicable, a project/contract scope. Do not encode them as human/agent entity kinds.
+- Keep priority/VIP status orthogonal to entity kind, affiliation, trust, and authority. Accept it only from explicit designation; never infer it from behavior or public status.
+
+## Evidenced fact
+
+```yaml
+value: string
+status: explicit | observed | inferred | disputed | superseded
+source_ref: provider-specific-stable-reference
+observed_at: timestamp
+valid_from: timestamp | null
+valid_until: timestamp | null
+confidence: 0.0-1.0
+access_scope: room-id | private | organization | public
+```
+
+## Candidate identity link
+
+```yaml
+left_identity: provider:id
+right_identity: provider:id
+confidence: 0.0-1.0
+evidence: [source_ref]
+conflicts: [string]
+state: proposed | confirmed | rejected
+```
+
+## Alert
+
+```yaml
+alert_key: unfamiliar:provider:id:room-id
+type: unfamiliar_identity | identity_conflict | ownership_change | stale_context | scope_risk
+severity: info | attention | urgent
+entity_or_room_id: string
+reason: string
+first_seen_at: timestamp
+last_seen_at: timestamp
+acknowledged: false
+```
+
+## Quick lookup index
+
+A compact, bounded cache loaded first (see SKILL.md "Quick lookup index"). Never
+authoritative — a miss means consult the full store, not that the entity is absent.
+
+```yaml
+quick_lookup:
+  updated_at: timestamp
+  recent_entities:            # capped, most-recent first; VIP/priority pinned
+    - entity_id: stable-local-id
+      kind: human | agent | service
+      one_line: "role/expertise, e.g. reviews backend delivery changes"
+      owner_entity_id: stable-local-id | null   # for agents
+      active_rooms: [room_id]
+      priority: none | priority | vip
+      last_seen_at: timestamp
+  active_rooms:               # capped, most-recent first
+    - room_id: provider:stable-channel-id
+      name: string
+      purpose: string
+      latest_context_line: string
+      size_band: small | large
+  active_scopes:              # open collaborations
+    - scope_ref: pr|issue|incident|feature:id
+      participants: [entity_id]
+  open_unknowns: [alert_key]
+```
+
+## Merge rules
+
+- Upsert identities by `(provider, user_id)` and rooms by `(provider, provider_room_id)` plus the provider container when required for uniqueness.
+- Never key an identity or room by display name, handle, nickname, or room title.
+- Merge cross-provider identities only with explicit confirmation or multiple independent strong signals totaling at least `0.9` confidence.
+- Never use display-name equality alone.
+- Keep aliases after a verified rename; do not treat a rename as a new entity.
+- Supersede time-varying facts rather than deleting them silently.
+- Decay inferred operational facts when not reconfirmed: room context quickly, active responsibility moderately, identity and explicit ownership slowly.
+- Deduplicate alerts by `alert_key`; update `last_seen_at` instead of repeatedly notifying.
+
+## Suggested freshness windows
+
+Treat these as defaults, not truth:
+
+| Fact | Review after |
+|---|---:|
+| Latest room context | 7 days or after a major decision |
+| Active workstream / blocker | 14 days |
+| PR/issue/incident collaboration | 3–7 days or at terminal state |
+| Project/feature collaboration | 7–30 days or at terminal state |
+| Durable team collaboration | 30–90 days |
+| Priority/VIP designation | At explicit expiry or every 90 days |
+| Feature responsibility | 30 days unless explicitly durable |
+| Behavior pattern | 60 days |
+| Explicit identity / ownership | 180 days |
+
+Explicit end dates and newer contradictory evidence override these windows.
