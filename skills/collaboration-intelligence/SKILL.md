@@ -178,8 +178,7 @@ For a material update, return only what changed:
 
 ## Runtimes
 
-Runtime-neutral. **Claude Code and Codex** load this skill from the SKILL.md
-front-matter above (the `name` + `description` drive implicit invocation); the
-OpenAI app surface (ChatGPT / Codex / API / Atlas) additionally reads
-`agents/openai.yaml`. Both manifests are present and consistent, and nothing in
-the body assumes a specific host, so behavior is identical across them.
+Runtime-neutral. **Claude Code and Codex** — the two runtimes Sutando supports —
+load this skill from the SKILL.md front-matter above; the `name` + `description`
+drive implicit invocation. Nothing in the body assumes a specific host, so
+behavior is identical across them.
