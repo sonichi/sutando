@@ -132,11 +132,19 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    ```bash
    # token = an entity from the warn TEXT (a path, filename, host, command), not the probe name
-   grep -in "<subject-token>" "$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)/pending-questions.md" | head
+   H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"
+   grep -in "<subject-token>" "$H/pending-questions.md" "$H/current-track.md" | head
    ```
 
+   **Grep BOTH parking files.** Warns get parked wherever the pass that triaged them was writing —
+   a second core measured two of its own parked analyses in `current-track.md` (a health-warning
+   triage heading, a cron-cause note), where a PQ-only grep misses them by construction.
+
    **A zero means "try another token", not "nothing is filed."** Two or three tokens from the warn
-   text, then investigate. One call each, before any investigation costing more than a couple of tool
+   text, then — before concluding absence — enumerate the headings instead of querying:
+   `grep -n '^## ' "$H"/*.md`. Reading ~25 headings takes seconds and cannot miss due to token
+   choice, which is exactly how a self-chosen token fails: the suspicion generates the tokens, and
+   the answer sits under a heading the suspicion never touches. Then investigate. One call each, before any investigation costing more than a couple of tool
    calls. It either returns nothing or hands you your own prior write-up — with the measurements, the mechanism, and usually the proposed fix already in it. When it hits: **extend it with what is genuinely new, or say plainly that nothing is new.** Re-filing a weaker duplicate is the failure mode, and surfacing one to the owner as a discovery makes them read the same thing twice.
 
    This lives in the loop file rather than only in a memory because a memory loads when RECALLED while this file loads EVERY PASS. The rule already existed, stated sharply, and still failed repeatedly — placement was the defect, not precision.
