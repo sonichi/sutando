@@ -81,9 +81,8 @@ for prim, owners in OWNERS.items():
           f"{prim}: every pinned owner still defines it (gone: {sorted(missing)})")
 
 # ── claim-backend INSTANTIATION is injected, never improvised (ratchet) ────
-# Adapters bind DeliveryCore via the sanctioned constructor; a new direct
-# instantiation site anywhere is a fork of delivery state. The discord
-# proactive leg is pinned MIGRATION DEBT (#3279 action 2), not precedent.
+# A new direct instantiation forks delivery state; the discord proactive
+# leg is pinned migration debt, not precedent.
 inst_sites: set[str] = set()
 for f in scan_files:
     try:
