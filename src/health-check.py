@@ -6865,12 +6865,23 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
     name = "a-fallback-hits"
     results = Path(workspace_dir or WORKSPACE_DIR) / "results"
     hits = []
+    migrated = 0
     for root in sorted(results.glob(".outbox*")):
         counter = root / "a-fallback-hits.json"
+        if (root / ".items-migrated").is_dir():
+            migrated += 1
+            if not counter.is_file():
+                # Absence of evidence, not evidence of absence: a gate must not
+                # pass on an instrument that never ran (dual_read inits count 0).
+                hits.append(f"{root.name}: migrated but no counter — dual_read "
+                            "never ran here (instrument absent, not a measured zero)")
+                continue
         if not counter.is_file():
             continue
         try:
             rec = json.loads(counter.read_text(encoding="utf-8"))
+            if not isinstance(rec, dict):
+                raise ValueError("counter is not a JSON object")
             count = int(rec.get("count", 0))
         except (OSError, ValueError):
             hits.append(f"{root.name}: counter unreadable")
@@ -6885,8 +6896,12 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
                 "detail": "A-fallback (dual_read) HIT — importer coverage gap or "
                           "phantom id; A deletion stays gated until a full release "
                           "records zero new hits: " + "; ".join(hits)}
+    if migrated:
+        return {"name": name, "status": "ok",
+                "detail": f"no fallback hits — {migrated} migrated root(s), "
+                          "each with a live counter (measured zero)"}
     return {"name": name, "status": "ok",
-            "detail": "no migration-window fallback hits on any outbox root"}
+            "detail": "no migrated outbox roots — dual-read window not active"}
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:

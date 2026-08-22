@@ -28,8 +28,8 @@ with tempfile.TemporaryDirectory() as td:
     ws = Path(td)
     (ws / "results").mkdir()
     r = hc.check_a_fallback_hits(ws)
-    check(r["status"] == "ok" and "no migration-window" in r["detail"],
-          "no outbox roots -> ok")
+    check(r["status"] == "ok" and "not active" in r["detail"],
+          "no outbox roots -> ok, honest about the window not being active")
 
     root = ws / "results" / ".outbox-discord-proactive"
     root.mkdir()
@@ -56,6 +56,29 @@ with tempfile.TemporaryDirectory() as td:
           "unreadable counter fails LOUD (warn), never silently green")
     check("task-abc" in r["detail"],
           "and the readable root's hit is still reported alongside")
+
+    # A counter that PARSES to a non-dict must be unreadable-loud, not a crash
+    # (null is the realistic shape: a truncated or half-written counter).
+    for bad in ("null", "[]", '"str"', "3"):
+        (root2 / "a-fallback-hits.json").write_text(bad)
+        r = hc.check_a_fallback_hits(ws)
+        check(r["status"] == "warn" and "unreadable" in r["detail"],
+              f"non-dict counter {bad!r} -> unreadable warn, not an escape")
+
+    # The gate must not pass on an ABSENT instrument: a migrated root with no
+    # counter means dual_read never ran there, which is not a measured zero.
+    root3 = ws / "results" / ".outbox-gateway"
+    root3.mkdir()
+    (root3 / ".items-migrated").mkdir()
+    r = hc.check_a_fallback_hits(ws)
+    check("never ran" in r["detail"] and root3.name in r["detail"],
+          "migrated root without counter -> instrument-absence warn, named")
+    (root3 / "a-fallback-hits.json").write_text(json.dumps({"count": 0}))
+    (root2 / "a-fallback-hits.json").write_text(json.dumps({"count": 0}))
+    (root / "a-fallback-hits.json").write_text(json.dumps({"count": 0}))
+    r = hc.check_a_fallback_hits(ws)
+    check(r["status"] == "ok" and "measured zero" in r["detail"],
+          "migrated root with a zero counter -> ok as a MEASURED zero")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
