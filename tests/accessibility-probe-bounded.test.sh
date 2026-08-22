@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Drives the REAL accessibility_probe and the REAL caller blocks. The previous
-# version tested a hand-copied perl invocation, so the bound could be defeated
-# while every case passed.
+# Drives the REAL accessibility_probe, not a copy: the previous version tested a
+# hand-copied perl invocation, so the bound could be defeated while all passed.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fails=0
