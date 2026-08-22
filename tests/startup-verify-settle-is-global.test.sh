@@ -62,24 +62,42 @@ LIVE_PORT=59741
 python3 -c "
 import socket,time,sys
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-s.bind(('127.0.0.1',$LIVE_PORT)); s.listen(1); time.sleep(8)" &
+s.bind(('127.0.0.1',$LIVE_PORT)); s.listen(1); time.sleep(20)" &
 listener=$!
 sleep 1
 if lsof -i :"$LIVE_PORT" >/dev/null 2>&1; then
-  out=$(VERIFY_PORTS="59731:dead $LIVE_PORT:ready" VERIFY_SETTLE_S=3 LOGS_DIR=/tmp bash -c "$BLOCK" 2>&1)
-  if printf '%s' "$out" | grep -q "ready (port $LIVE_PORT)$"; then
+  # Run repeatedly ACROSS a forced second boundary: a two-`date`-sample
+  # implementation passes here only by luck, so one run is not a control.
+  phantom=""
+  for _ in 1 2 3 4; do
+    python3 -c "import time;f=time.time()%1;time.sleep(max(0.0,0.985-f) if f<0.985 else 1.985-f)" 2>/dev/null
+    out=$(VERIFY_PORTS="59731:dead $LIVE_PORT:ready" VERIFY_SETTLE_S=3 LOGS_DIR=/tmp bash -c "$BLOCK" 2>&1)
+    printf '%s' "$out" | grep -qE "ready \(port $LIVE_PORT, after [1-9]" && phantom="$out"
+  done
+  if [ -z "$phantom" ]; then
     ok "a ready port behind a dead one reports no wait"
-  elif printf '%s' "$out" | grep -qE "ready \(port $LIVE_PORT, after [1-9]"; then
-    bad "a ready port behind a dead one reports no wait" \
-        "got: $(printf '%s' "$out" | grep "$LIVE_PORT")"
   else
-    bad "a ready port behind a dead one reports no wait" "unrecognised: $out"
+    bad "a ready port behind a dead one reports no wait" \
+        "got: $(printf '%s' "$phantom" | grep "$LIVE_PORT")"
   fi
 else
   bad "helper listener bound" "could not bind $LIVE_PORT"
 fi
 kill "$listener" 2>/dev/null; wait "$listener" 2>/dev/null
 
-total=6
+# The timing case above cannot fail RELIABLY: reproducing a second-boundary
+# straddle from outside the block is luck, and it passed against the known-bad
+# head. So assert the STRUCTURAL fact that moves with the defect — the reported
+# wait must count sleeps, not subtract two 1s-granularity `date` samples.
+if printf '%s' "$BLOCK" | grep -qE 'waited=\$\(\( *\$\(date \+%s\) *- *[a-z_]+ *\)\)'; then
+  bad "the reported wait counts sleeps, not two date samples" \
+      "found a two-sample subtraction; it reports 1s across a second rollover"
+elif printf '%s' "$BLOCK" | grep -q 'waited=$((waited + 1))'; then
+  ok "the reported wait counts sleeps, not two date samples"
+else
+  bad "the reported wait counts sleeps, not two date samples" "neither form found"
+fi
+
+total=7
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ] || exit 1

@@ -1288,18 +1288,17 @@ fi
 # A single probe races a service still binding, so retry briefly. The deadline is
 # GLOBAL: per-port it would serialise to ports x settle seconds before core launch.
 VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
-verify_started=$(date +%s)
-verify_deadline=$((verify_started + VERIFY_SETTLE_S))
+verify_deadline=$(( $(date +%s) + VERIFY_SETTLE_S ))
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
-  port_started=$(date +%s)
+  # COUNT SLEEPS, never two `date` samples: at 1s granularity the two can
+  # straddle a boundary and report 1s for a port that never waited at all.
+  waited=0
   while ! lsof -i :"$port" > /dev/null 2>&1 && [ "$(date +%s)" -lt "$verify_deadline" ]; do
     sleep 1
+    waited=$((waited + 1))
   done
-  # Per-port, not elapsed-since-loop-start: a global figure attributes an
-  # earlier port's wait to a service that was already listening.
-  waited=$(( $(date +%s) - port_started ))
   if lsof -i :"$port" > /dev/null 2>&1; then
     if [ "$waited" -gt 0 ]; then
       echo "  ✓ $name (port $port, after ${waited}s)"
