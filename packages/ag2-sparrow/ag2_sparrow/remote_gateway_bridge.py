@@ -3181,24 +3181,22 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             _r = next((a for a in parsed.actions if a.kind == "redirect"), None)
             if _r:
                 labeled = f"[channel: {_r.value}]\n{labeled}"
-        try:
-            _payload = {"id": _broker_tid(delivery), "body": labeled}
-            if skip:
-                _payload["no_send"] = True
-            _req("POST", "/v1/results", _payload)
-        except urllib.error.HTTPError as e:
-            if 400 <= e.code < 500:
-                # Lease long gone: no consumer will ever accept this POST.
-                if _quarantine_orphan(rfile, tid, "lease-gone"):
-                    _log(f"orphan sweep: {tid} lease gone (HTTP {e.code}) — quarantined")
-            else:
-                _log(f"orphan sweep: {tid} POST failed HTTP {e.code} — will retry")
+        # Same outcome owner as the live drain: a 2xx {"ok": false} is a
+        # refusal, and an unconfirmed close must keep its retryable result.
+        _btid = _broker_tid(delivery)
+        if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip)):
+            _archive_result(rfile, tid)
+            _log(f"orphan sweep: recovered + delivered {tid}")
             continue
-        except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"orphan sweep: {tid} network error {e} — will retry")
+        _tries = _delivery_core().backend.attempts(_btid)
+        if _tries >= MAX_TRANSIENT_ATTEMPTS:
+            # Permanent disposition (lease gone or standing refusal): the
+            # bounded-attempts ceiling replaces the raw 4xx probe the core hides.
+            if _quarantine_orphan(rfile, tid, "undeliverable-after-retries"):
+                _log(f"orphan sweep: {tid} unconfirmed after {_tries} attempts "
+                     "— quarantined")
             continue
-        _archive_result(rfile, tid)
-        _log(f"orphan sweep: recovered + delivered {tid}")
+        _log(f"orphan sweep: {tid} close not confirmed (attempt {_tries}) — will retry")
 
 
 # ── MC1 per-workspace singleton (dual-poller guard) ─────────────────────────

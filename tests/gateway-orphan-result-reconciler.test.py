@@ -105,15 +105,37 @@ class GenuinelyUndelivered(_Base):
                          "delivered result archived out of results/")
 
     def test_lease_gone_quarantines(self):
+        # The core hides the raw 4xx, so permanence is a bounded-attempts
+        # ceiling: unconfirmed closes retry, then quarantine — never forever.
         self._archived_task()
         self._result()
 
         def gone(m, path, payload=None):
             raise urllib.error.HTTPError(path, 410, "gone", {}, None)
         gw._req = gone
+        for _ in range(gw.MAX_TRANSIENT_ATTEMPTS + 1):
+            self._sweep()
+        q = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.undeliverable-after-retries.*"))
+        self.assertEqual(len(q), 1, "permanent 4xx quarantines after bounded retries")
+        self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists())
+
+    def test_ok_false_refusal_keeps_result_and_never_archives(self):
+        # kewei #3184 P1 regression: a 2xx {"ok": false} is a REFUSED close.
+        # The old branch ignored the response and archived the only retryable
+        # copy; the sweep must retain it and log no delivery.
+        self._archived_task()
+        self._result("[no-send]\nDECLINE_SENTINEL")
+        gw._req = lambda m, path, payload=None: {"ok": False}
         self._sweep()
-        q = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.lease-gone.*"))
-        self.assertEqual(len(q), 1, "permanent 4xx quarantines, never retries forever")
+        self.assertTrue((gw.RESULTS_DIR / f"{TID}.txt").exists(),
+                        "refused close must keep its retryable result")
+        self.assertFalse(any("recovered + delivered" in l for l in self.logs),
+                         "a refused close must not log as delivered")
+        # And the successful retry archives through the same gate.
+        gw._req = lambda m, path, payload=None: {"ok": True}
+        self._sweep()
+        self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists(),
+                         "confirmed retry archives")
 
     def test_network_error_leaves_for_next_sweep(self):
         self._archived_task()
