@@ -60,6 +60,7 @@ import signal
 import socket
 import sys
 import tempfile
+import select
 import threading
 import time
 import urllib.error
@@ -1015,7 +1016,8 @@ def _outbound_worker(inflight: "set[str]") -> None:
         _OUTBOUND_WAKE.clear()
         if _OUTBOUND_STOP.is_set():
             break                        # graceful: stop taking new items
-        # tuple(), not list(): tests anchor the DRAIN on its distinct spelling.
+        # tuple(): kept distinct from the drain's test anchor — redundant once
+        # the anchor is line-bounded, load-bearing until then.
         for tid in tuple(inflight):
             rfile = RESULTS_DIR / f"{tid}.txt"
             if tid not in first_seen and rfile.exists():
@@ -1039,6 +1041,68 @@ def _start_outbound_worker(inflight: "set[str]") -> threading.Thread:
     t.start()
     _log(f"outbound worker started (scan {OUTBOUND_SCAN_S}s + wake-on-kick) — "
          "outbound no longer rides the inbound long-poll")
+    return t
+
+
+OUTBOUND_WATCHER = os.environ.get("REMOTE_OUTBOUND_WATCHER", "auto")  # auto|off
+
+
+def _start_results_watcher() -> "threading.Thread | None":
+    """Darwin kqueue doorbell on RESULTS_DIR: advisory wakeups only, never
+    delivery state. Correctness stays in the durable drain; the bounded scan
+    guarantees progress whenever this thread is degraded or absent."""
+    if OUTBOUND_WATCHER == "off" or not hasattr(select, "kqueue"):
+        return None
+
+    VNODE_GONE = (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+                  | select.KQ_NOTE_REVOKE)
+
+    def run():
+        backoff = 1.0
+        while not _OUTBOUND_STOP.is_set():
+            fd, kq = -1, None
+            try:
+                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                # O_EVTONLY is absent on some supported pythons (Xcode 3.9);
+                # kqueue accepts an O_RDONLY fd — it just pins the mount.
+                fd = os.open(str(RESULTS_DIR),
+                             getattr(os, "O_EVTONLY", os.O_RDONLY))
+                kq = select.kqueue()
+                kq.control([select.kevent(
+                    fd, filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                    fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND
+                    | VNODE_GONE)], 0, 0)
+                backoff = 1.0
+                # Full sweep on every (re)registration: files that landed
+                # before the watch began are the first sweep's job.
+                wake_outbound()
+                while not _OUTBOUND_STOP.is_set():
+                    events = kq.control(None, 1, 1.0)
+                    if not events:
+                        continue
+                    wake_outbound()
+                    if events[0].fflags & VNODE_GONE:
+                        # Rate-cap rebuilds like the exception path: a flapping
+                        # dir must not spin the register loop.
+                        _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                        backoff = min(backoff * 2, 30.0)
+                        break            # dir vnode gone: rebuild registration
+            except Exception as e:  # noqa: BLE001 — degraded, never fatal
+                _log(f"results watcher degraded (scan remains the floor): {e}")
+                _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                backoff = min(backoff * 2, 30.0)
+            finally:
+                try:
+                    if kq is not None:
+                        kq.close()
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+
+    t = threading.Thread(target=run, name="results-watcher", daemon=True)
+    t.start()
+    _log("results watcher started (kqueue doorbell — advisory; scan is the floor)")
     return t
 
 
@@ -3406,6 +3470,7 @@ def main() -> None:
     last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
+    _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
     while True:
         try:
@@ -3416,6 +3481,8 @@ def main() -> None:
                      "— exiting to avoid dual-poll")
                 _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
                 _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
+                if _results_watcher is not None:
+                    _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
             _retry_pending_publications()
