@@ -152,7 +152,7 @@ def _is_discord_channel_id(value: str) -> bool:
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -169,7 +169,7 @@ REPLY_CHAIN_MAX_DEPTH = 8
 REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
-import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
+import delivery.router as result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 
 #: Consecutive polls each result file has been present-but-empty. Bridge-owned
 #: state; threshold and wording live in result_router so the bridges cannot drift.
