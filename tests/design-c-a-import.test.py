@@ -47,6 +47,16 @@ with tempfile.TemporaryDirectory() as td:
     rep = import_a_state(root)
     check(rep["verified"] and rep["fenced"],
           f"import verifies and fences ({rep})")
+    # The pseudo-incarnation property, measured on a REAL A DELIVERED record
+    # (review ask): 2 SEP-parts, never TOKEN_PARTS — cannot match any claim.
+    from ag2_sparrow.delivery_core.backend_c import (
+        SEP as _SEP, TOKEN_PARTS as _TP, DesignCClaimBackend as _C)
+    _rec = _C(root).terminal_record("done-1")
+    _parts = _rec["incarnation"].split(_SEP)
+    check(len(_parts) == 2 and len(_parts) != _TP,
+          f"imported incarnation has {len(_parts)} parts (2, not TOKEN_PARTS={_TP})")
+    check(_rec["imported"] is True and _rec["receipt"]["destination"] == "chan-9",
+          "the real A receipt survived the import intact")
     check(rep["ready"] == 2 and rep["delivered"] == 1 and rep["parked"] == 1,
           f"per-state counts match the fixture ({rep})")
     check(read_epoch(root) == "C", "epoch fence names C")
