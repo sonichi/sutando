@@ -5676,6 +5676,36 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     return out[-limit:]
 
 
+def _daily_completion_minutes(state: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-finished) from `state/<job>-YYYY-MM-DD.sentinel`.
+
+    Jobs that publish nothing dated into results/ still record completion here.
+    Prefer the body's ISO stamp; mtime is a fallback because a later touch
+    moves it while the recorded finish time cannot drift.
+    """
+    from datetime import datetime
+    out = []
+    if not state.is_dir():
+        return out
+    for f in state.glob(f"{job}-20*.sentinel"):
+        m = re.match(rf"{re.escape(job)}-(\d{{4}}-\d{{2}}-\d{{2}})\.sentinel$", f.name)
+        if not m:
+            continue
+        when = None
+        try:
+            when = datetime.fromisoformat(f.read_text(errors="ignore").strip()[:26])
+        except (OSError, ValueError):
+            when = None
+        if when is None:
+            try:
+                when = datetime.fromtimestamp(f.stat().st_mtime)
+            except OSError:
+                continue
+        out.append((m.group(1), when.hour * 60 + when.minute))
+    out.sort()
+    return out[-limit:]
+
+
 def check_daily_cron_punctuality() -> dict:
     """Report a daily job whose output never arrives at its scheduled time."""
     from datetime import datetime, time as dtime
@@ -5700,7 +5730,8 @@ def check_daily_cron_punctuality() -> dict:
     now = datetime.now()
     jobs, malformed = [], []
     for e in entries:
-        if not isinstance(e, dict) or e.get("launchd") or e.get("execution") == "codex-task":
+        # codex-task entries complete in another runtime that writes no sentinel.
+        if not isinstance(e, dict) or e.get("execution") == "codex-task":
             continue
         f = str(e.get("cron") or "").split()
         if len(f) != 5 or not f[0].isdigit() or not f[1].isdigit():
@@ -5719,12 +5750,18 @@ def check_daily_cron_punctuality() -> dict:
         # and never sees its real fleet-growth-<date>.mp4 output.
         declared = str(e.get("artifact") or "").strip()
         stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
-        arts = _daily_artifact_minutes(ws / "results", stem)
+        launchd = bool(e.get("launchd"))
+        # The launchd lane publishes no dated results file; its completion
+        # sentinel is the only dated record that it finished.
+        arts = (_daily_completion_minutes(ws / "state", jname) if launchd
+                else _daily_artifact_minutes(ws / "results", stem))
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
-            "stem": stem, "stem_declared": bool(declared),
+            # `artifact` names a results file, so it cannot vouch for a sentinel:
+            # only an observed history makes a missing sentinel today actionable.
+            "stem": stem, "stem_declared": bool(declared) and not launchd,
             # Renders only when new input exists, so a quiet day produces nothing
             # and absence is evidence of nothing rather than of a miss.
             "conditional": bool(e.get("conditional")),
@@ -5735,7 +5772,7 @@ def check_daily_cron_punctuality() -> dict:
                           f"fix the crons.json entry; punctuality unchecked for "
                           f"{len(malformed)} job(s)"}
     if not jobs:
-        return {"name": name, "status": "ok", "detail": "no session-owned daily jobs — skipped"}
+        return {"name": name, "status": "ok", "detail": "no plain-daily jobs — skipped"}
     return _interpret_daily_punctuality(jobs)
 
 
