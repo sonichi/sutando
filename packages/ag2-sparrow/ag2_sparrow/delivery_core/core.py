@@ -55,11 +55,12 @@ class DeliveryCore:
         NOT_DELIVERED; anything else (programming, config, capability
         violation) propagates rather than masquerading as ambiguity."""
         try:
-            return self.provider.deliver(item_id, payload, key).outcome
+            receipt = self.provider.deliver(item_id, payload, key)
+            return receipt.outcome, getattr(receipt, "destination", None)
         except ProviderIndeterminate:
-            return DeliveryOutcome.OUTCOME_UNKNOWN
+            return DeliveryOutcome.OUTCOME_UNKNOWN, None
         except ProviderRefused:
-            return DeliveryOutcome.NOT_DELIVERED
+            return DeliveryOutcome.NOT_DELIVERED, None
 
     def _reconcile(self, item_id: str, payload: bytes, key: str):
         """Resolve a prior ambiguity, or None when reconciliation resolved
@@ -77,7 +78,9 @@ class DeliveryCore:
                 DeliveryAttempt(item_id, payload, key))
         except (ProviderIndeterminate, ProviderRefused):
             return None
-        return None if resolved is None else resolved.outcome
+        if resolved is None:
+            return None
+        return resolved.outcome, getattr(resolved, "destination", None)
 
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
         """Claim -> deliver -> classify -> complete, with retry accounting."""
@@ -87,15 +90,17 @@ class DeliveryCore:
             # no external ambiguity to report — this is not an outcome.
             return DrainResult(status=DrainStatus.NOT_CLAIMED)
         key = idempotency_key(item_id)
-        outcome = self._attempt(item_id, payload, key)
+        outcome, destination = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
                 resolved = self._reconcile(item_id, payload, key)
                 if resolved is not None:
-                    outcome = resolved
+                    # The reconciliation receipt is the statement about THIS
+                    # item; its destination replaces the ambiguous attempt's.
+                    outcome, destination = resolved
             elif caps.idempotent_send:
-                outcome = self._attempt(item_id, payload, key)
+                outcome, destination = self._attempt(item_id, payload, key)
                 if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                     # Retryable by license: parking would strand an item a
                     # later safe re-send could still deliver.
@@ -103,7 +108,9 @@ class DeliveryCore:
         # The ceiling rides WITH the completion: parking after the claim
         # is released lets a successor confirm in the gap.
         self.backend.complete(token, outcome,
-                              park_at_attempts=self.policy.max_attempts)
+                              park_at_attempts=self.policy.max_attempts,
+                              provider=type(self.provider).__name__,
+                              destination=destination)
         return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome)
 
     def recover(self) -> RecoverReport:
