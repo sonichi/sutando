@@ -396,9 +396,12 @@ class DesignCClaimBackend:
         begins with the incarnation. Keyed by claim, never item id."""
         for f in self._d(ARCHIVE).iterdir():
             if f.name.startswith(incarnation):
-                # Legacy renames are atomic claim-file moves: presence is
-                # complete evidence by construction; there is no torn state.
-                return True
+                # Only the exact legacy grammar (regular file, incarnation+
+                # SEP+nanos) is rename-atomic evidence; prefix-shares are not.
+                suffix = f.name[len(incarnation):]
+                if f.is_file() and suffix.startswith(SEP)                         and suffix[len(SEP):].isdigit():
+                    return True
+                continue
             if not (f.name.startswith(f"{key}") and f.suffix == ".json"):
                 continue
             try:

@@ -408,6 +408,20 @@ with tempfile.TemporaryDirectory() as td:
           and b23.terminal_record("item-23") is None,
           "unbound token: no unfindable receipt was written")
 
+    # ── ROUND-5 CONTROLS: only the EXACT legacy grammar is evidence ────
+    for label, maker in (
+        (".partial file", lambda r, inc: (r / "archive" / f"{inc}.partial").write_text("torn")),
+        ("directory sharing prefix", lambda r, inc: (r / "archive" / f"{inc}{SEP}123").mkdir()),
+        ("non-numeric suffix", lambda r, inc: (r / "archive" / f"{inc}{SEP}xyz").write_text("")),
+    ):
+        bl = fresh(td, f"legacy-{label.split()[0].strip('.')}")
+        bl.publish("item-L", b"p")
+        tokL = bl.claim("item-L", "w0")
+        maker(bl.root, tokL.incarnation)
+        repL = bl.recover()
+        check((bl.root / "inflight" / tokL.incarnation).exists(),
+              f"legacy grammar: {label} never retires the live claim")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")
