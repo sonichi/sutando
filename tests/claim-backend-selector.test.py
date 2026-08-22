@@ -154,6 +154,10 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
             r = Path(td) / ".outbox-discord-proactive"
             r.mkdir(parents=True, exist_ok=True)
             (r / ".items").symlink_to(Path(td) / "gone-target")
+        elif legacy_shape == "unreadable":
+            d = Path(td) / ".outbox-discord-proactive" / ".items"
+            d.mkdir(parents=True)
+            os.chmod(d, 0o000)
         elif legacy_shape == "subdir":
             d = Path(td) / ".outbox-discord-proactive" / ".items" / "nested"
             d.mkdir(parents=True)
@@ -180,6 +184,9 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
             os.environ.pop("SUTANDO_CLAIM_BACKEND", None)
         else:
             os.environ["SUTANDO_CLAIM_BACKEND"] = saved_env
+        unreadable = Path(td) / ".outbox-discord-proactive" / ".items"
+        if unreadable.is_dir():
+            os.chmod(unreadable, 0o755)   # so rmtree can clean an 000 fixture
         shutil.rmtree(td, ignore_errors=True)
 
 
@@ -208,6 +215,12 @@ check(kind == "DesignAClaimBackend",
 kind, out = _fence_with("c", activate=True, legacy_shape="subdir")
 check(kind == "DesignAClaimBackend",
       f"a subdir inside .items refuses the switch (got {kind})")
+kind, out = _fence_with("c", activate=True, legacy_shape="unreadable")
+check(kind == "DesignAClaimBackend",
+      f"UNREADABLE .items (OSError on listing) -> fail closed on A (got {kind})")
+check("unmigrated Design A" in out,
+      "and the refusal message still fires for the unreadable shape")
+
 kind, out = _fence_with("c", activate=True, legacy_shape="danglink")
 check(kind == "DesignAClaimBackend",
       f"a DANGLING .items symlink refuses the switch (got {kind})")
