@@ -1,0 +1,475 @@
+# src/ root ownership manifest — the P2a root-freeze.
+#
+# Every entry at the top level of src/ is registered here with its FINAL
+# owner. This file freezes ownership only: it moves no code and changes no
+# behavior. tests/src-root-growth.test.py enforces it as a ratchet — a new
+# src/ root module that is not registered here fails the suite.
+#
+# Categories:
+#   sutando       core personal-agent logic; stays in src/ permanently
+#   ag2-sparrow   delivery/transport whose canonical home becomes the
+#                 ag2-sparrow package (ownership inversion happens in later,
+#                 separate PRs — registering here does NOT move anything)
+#   integration   provider adapters / edge wiring that binds concrete
+#                 channels to the shared cores
+#   policy        authorization, redaction, guardrail, envelope policy
+#   compatibility transition shims and aliases (see shim census below)
+#   entrypoint    launch, supervision, install, lifecycle scripts
+#   retire        slated for deletion; kept only until consumers are gone
+#
+# Migration debt (explicit): packages/ag2-sparrow/tools/sync_from_src.py —
+# the vendored-twin copier. It exists only while src/ remains the canonical
+# side of outbox.py / outbox_adapter.py / result_markers.py; the B/C1
+# ownership inversions retire it. Do not grow its file list.
+
+version: 1
+modules:
+  - path: Sutando/
+    owner: sutando
+  - path: accessibility_probe.sh
+    owner: sutando
+  - path: agent/
+    owner: entrypoint
+    note: launch/supervision scripts
+  - path: agent-api.py
+    owner: sutando
+  - path: agent_endpoint.py
+    owner: ag2-sparrow
+  - path: archive-stale-results.py
+    owner: sutando
+  - path: artifact-cache-tools.ts
+    owner: sutando
+  - path: auth-preflight-gate.sh
+    owner: sutando
+  - path: auth_preflight.py
+    owner: sutando
+  - path: body_file.py
+    owner: sutando
+  - path: browser-tools.ts
+    owner: sutando
+  - path: browser.mjs
+    owner: sutando
+  - path: call-stats.py
+    owner: sutando
+  - path: cartesia-stt-provider.ts
+    owner: sutando
+  - path: cartesia-tts.ts
+    owner: sutando
+  - path: channel_token.py
+    owner: policy
+  - path: channels/
+    owner: integration
+    note: provider adapters (API mechanics at the edge)
+  - path: chat-ui.ts
+    owner: sutando
+  - path: chat_redaction.py
+    owner: policy
+  - path: chat_secret_filter.py
+    owner: policy
+  - path: check-pending-questions.py
+    owner: sutando
+  - path: check-pending-tasks.sh
+    owner: sutando
+  - path: claude_config_dir.sh
+    owner: sutando
+  - path: context-drop-inline.txt
+    owner: sutando
+  - path: context-drop.sh
+    owner: entrypoint
+  - path: context_resume.py
+    owner: sutando
+  - path: conversation-store-migrations.ts
+    owner: sutando
+  - path: conversation-store.ts
+    owner: sutando
+  - path: core-input-watch.py
+    owner: sutando
+  - path: core-supervisor-gate.py
+    owner: sutando
+  - path: core-supervisor-relay.py
+    owner: sutando
+  - path: core_heartbeat.py
+    owner: sutando
+  - path: core_restart_intent.py
+    owner: sutando
+  - path: crash-only.ts
+    owner: sutando
+  - path: credential-resolver.ts
+    owner: sutando
+  - path: credential_resolver.py
+    owner: sutando
+  - path: cron-runner.py
+    owner: sutando
+  - path: cron_entry_digest.py
+    owner: sutando
+  - path: daily-insight.py
+    owner: sutando
+  - path: dashboard.py
+    owner: sutando
+  - path: dashboard_schedules.py
+    owner: sutando
+  - path: dedup_recovery.py
+    owner: sutando
+  - path: delivery/
+    owner: ag2-sparrow
+    note: delivery seam: channel_key/readiness/router
+  - path: discord-bridge.py
+    owner: integration
+    note: channel bridge (provider receive/send mechanics)
+  - path: discord-read.py
+    owner: integration
+  - path: discord_addressee.py
+    owner: integration
+  - path: discord_config.py
+    owner: integration
+  - path: discord_context_policy.py
+    owner: compatibility
+    note: phase-1a alias of policy.context.discord
+  - path: discord_delivery_provider.py
+    owner: compatibility
+    note: phase-1a alias of channels.discord.delivery_provider
+  - path: discord_http.py
+    owner: compatibility
+    note: phase-1a alias of channels.discord.http
+  - path: discord_post_gate.py
+    owner: compatibility
+    note: phase-1a alias of channels.discord.post_gate
+  - path: discord_proactive_send.py
+    owner: integration
+  - path: discord_reader.py
+    owner: compatibility
+    note: phase-1a alias of channels.discord.reader
+  - path: discord_rest_client.py
+    owner: compatibility
+    note: phase-1a alias of channels.discord.client
+  - path: dm-result.py
+    owner: integration
+  - path: emit-call-tiers.ts
+    owner: sutando
+  - path: event_log.py
+    owner: sutando
+  - path: fix-setup.sh
+    owner: retire
+    note: one-shot migration/rollout artifact
+  - path: friction-detector.py
+    owner: sutando
+  - path: git_binary.py
+    owner: sutando
+  - path: github-webhook.py
+    owner: integration
+    note: channel bridge (provider receive/send mechanics)
+  - path: health-check.py
+    owner: sutando
+  - path: http-body-limit.ts
+    owner: sutando
+  - path: init.sh
+    owner: entrypoint
+  - path: inject-delivery.ts
+    owner: sutando
+  - path: inject-framing.ts
+    owner: sutando
+  - path: inline-tools.ts
+    owner: sutando
+  - path: install-channel-bridge-launchd.sh
+    owner: entrypoint
+    note: launchd installer
+  - path: install-claude-hooks.sh
+    owner: entrypoint
+    note: launchd installer
+  - path: install-credential-proxy-launchd.sh
+    owner: entrypoint
+    note: launchd installer
+  - path: install-cron-runner-launchd.sh
+    owner: entrypoint
+    note: launchd installer
+  - path: install-gateway-bridge-launchd.sh
+    owner: entrypoint
+    note: launchd installer
+  - path: install-health-check-launchd.sh
+    owner: entrypoint
+    note: launchd installer
+  - path: install-sutando-app-launchd.sh
+    owner: entrypoint
+    note: launchd installer
+  - path: launchd/
+    owner: entrypoint
+    note: launch/supervision scripts
+  - path: live-agent-runtime.ts
+    owner: sutando
+  - path: local_task_protocol.py
+    owner: sutando
+  - path: meeting-tools.ts
+    owner: sutando
+  - path: message_chunking.py
+    owner: ag2-sparrow
+  - path: migrate-plists-to-logs-dir.sh
+    owner: retire
+    note: one-shot migration/rollout artifact
+  - path: migrate.sh
+    owner: entrypoint
+  - path: migration_safety_helpers.sh
+    owner: sutando
+  - path: morning-briefing.py
+    owner: sutando
+  - path: notify.sh
+    owner: entrypoint
+  - path: observability/
+    owner: sutando
+  - path: obsidian-mirror.py
+    owner: sutando
+  - path: optional_script.py
+    owner: sutando
+  - path: orphan_result_routes.py
+    owner: integration
+  - path: osascript-setup-hint.ts
+    owner: sutando
+    note: vendored twin (byte-identical copy in the package)
+  - path: outbox.py
+    owner: ag2-sparrow
+    note: vendored twin (byte-identical copy in the package)
+  - path: outbox_adapter.py
+    owner: ag2-sparrow
+    note: vendored twin (byte-identical copy in the package)
+  - path: outbox_log.py
+    owner: ag2-sparrow
+  - path: overlay-manager-ui.ts
+    owner: sutando
+  - path: owner_activity.py
+    owner: sutando
+  - path: peer-watch.py
+    owner: sutando
+  - path: pending_questions_md.py
+    owner: sutando
+  - path: personal-claude-compact-hint.sh
+    owner: sutando
+  - path: policy/
+    owner: policy
+    note: guardrail + context + egress policy tree
+  - path: presenter-mode.ts
+    owner: sutando
+  - path: presenter_mode.py
+    owner: sutando
+  - path: proactive_claim_fence.py
+    owner: ag2-sparrow
+  - path: proactive_recovery.py
+    owner: sutando
+  - path: proactive_routing.py
+    owner: integration
+  - path: progress_stream.py
+    owner: integration
+  - path: python-binary.ts
+    owner: sutando
+  - path: reachability-endpoints.ts
+    owner: sutando
+  - path: read_discord_channel.py
+    owner: compatibility
+    note: compat wrapper over channels.discord.reader + policy.context.discord
+  - path: recording-state.ts
+    owner: sutando
+  - path: recording-tools.ts
+    owner: sutando
+  - path: remote-gateway-bridge.py
+    owner: integration
+    note: channel bridge (provider receive/send mechanics)
+  - path: remote-gateway-bridge.test.py
+    owner: sutando
+  - path: remote-relay-bridge.py
+    owner: retire
+    note: deprecated name for remote-gateway-bridge.py
+  - path: render_plist_template.py
+    owner: sutando
+  - path: reply_chain.py
+    owner: integration
+  - path: repo_root.sh
+    owner: sutando
+  - path: restart.sh
+    owner: entrypoint
+  - path: result-channel-key.ts
+    owner: ag2-sparrow
+  - path: result_audit.py
+    owner: integration
+  - path: result_channel_key.py
+    owner: compatibility
+    note: phase-1a alias of delivery.channel_key
+  - path: result_markers.py
+    owner: ag2-sparrow
+    note: vendored twin (byte-identical copy in the package)
+  - path: result_ready.py
+    owner: compatibility
+    note: phase-1a alias of delivery.readiness
+  - path: result_router.py
+    owner: compatibility
+    note: phase-1a alias of delivery.router
+  - path: runtime-api/
+    owner: sutando
+  - path: runtime-cli/
+    owner: sutando
+  - path: runtime-health.py
+    owner: sutando
+  - path: scan-call-logs.py
+    owner: sutando
+  - path: schedule-crons-session-hint.sh
+    owner: sutando
+  - path: screen-capture-server.py
+    owner: sutando
+  - path: scroll-wheel.swift
+    owner: sutando
+  - path: secret_scanner.py
+    owner: policy
+  - path: send_allowlist.py
+    owner: compatibility
+    note: phase-1a alias of policy.egress.attachment
+  - path: send_failure_policy.py
+    owner: ag2-sparrow
+  - path: services_status.py
+    owner: sutando
+  - path: session-handoff.sh
+    owner: sutando
+  - path: single_instance.py
+    owner: ag2-sparrow
+  - path: skill_hooks.py
+    owner: sutando
+  - path: skip_marker_ownership.ts
+    owner: sutando
+  - path: slack-bridge.py
+    owner: integration
+    note: channel bridge (provider receive/send mechanics)
+  - path: slack_access.py
+    owner: integration
+  - path: slack_owner.py
+    owner: integration
+  - path: slack_proactive_receipts.py
+    owner: integration
+  - path: startup-runtime.sh
+    owner: entrypoint
+  - path: startup.sh
+    owner: entrypoint
+  - path: stop.sh
+    owner: entrypoint
+  - path: sutando_config.py
+    owner: sutando
+  - path: sutando_config.ts
+    owner: sutando
+  - path: task-bridge.ts
+    owner: sutando
+  - path: task-delegation.ts
+    owner: sutando
+  - path: task-emit.sh
+    owner: sutando
+  - path: task_archive.py
+    owner: sutando
+  - path: task_body_guard.py
+    owner: policy
+  - path: task_envelope.py
+    owner: policy
+  - path: task_envelope.ts
+    owner: policy
+  - path: task_envelope_census.py
+    owner: policy
+  - path: task_priority.py
+    owner: sutando
+  - path: task_workstreams.py
+    owner: sutando
+  - path: team_guardrail.py
+    owner: compatibility
+    note: phase-1a alias of policy.guardrail
+  - path: team_result_guard.py
+    owner: compatibility
+    note: phase-1a alias of policy.egress.result
+  - path: telegram-bridge.py
+    owner: integration
+    note: channel bridge (provider receive/send mechanics)
+  - path: telemetry.py
+    owner: sutando
+  - path: tmux-status.ts
+    owner: sutando
+  - path: url-scheme.ts
+    owner: sutando
+  - path: util_paths.py
+    owner: sutando
+  - path: util_paths.ts
+    owner: sutando
+  - path: vault_intercept.py
+    owner: policy
+  - path: vault_set_grammar.py
+    owner: policy
+  - path: verify-gemini-31.sh
+    owner: retire
+    note: one-shot migration/rollout artifact
+  - path: verify-setup.sh
+    owner: entrypoint
+  - path: vision-tools.ts
+    owner: sutando
+  - path: vision_push.py
+    owner: sutando
+  - path: voice-active-silence-watchdog.ts
+    owner: sutando
+  - path: voice-agent-config.ts
+    owner: sutando
+  - path: voice-agent-state.ts
+    owner: sutando
+  - path: voice-agent.config.json.example
+    owner: sutando
+  - path: voice-agent.ts
+    owner: sutando
+  - path: voice-audio-health-persist.ts
+    owner: sutando
+  - path: voice-audio-health.ts
+    owner: sutando
+  - path: voice-config-switch.ts
+    owner: sutando
+  - path: voice-config.ts
+    owner: sutando
+  - path: voice-connect-resolver.ts
+    owner: sutando
+  - path: voice-connect-watchdog.ts
+    owner: sutando
+  - path: voice-context.ts
+    owner: sutando
+  - path: voice-continuity.ts
+    owner: sutando
+  - path: voice-error-classifier.ts
+    owner: sutando
+  - path: voice-health-matrix.ts
+    owner: sutando
+  - path: voice-key.ts
+    owner: sutando
+  - path: voice-lock.ts
+    owner: sutando
+  - path: voice-mode-resolver.ts
+    owner: sutando
+  - path: voice-redial-scheduler.ts
+    owner: sutando
+  - path: voice-silence-recovery-coordinator.ts
+    owner: sutando
+  - path: voice-watchdog-ledger.ts
+    owner: sutando
+  - path: voice-watchdog-shadow.ts
+    owner: sutando
+  - path: watch-tasks-stream.sh
+    owner: sutando
+  - path: watcher_sentinel.sh
+    owner: sutando
+  - path: web-client.ts
+    owner: sutando
+  - path: web-voice-transport.ts
+    owner: sutando
+  - path: workspace_default.py
+    owner: sutando
+  - path: workspace_default.ts
+    owner: sutando
+  - path: workspace_layout.py
+    owner: sutando
+  - path: workspace_lock.py
+    owner: sutando
+  - path: workspace_resolve.sh
+    owner: sutando
+  - path: write_calendar_cache.py
+    owner: sutando
+
+# Registered ahead of merge (in-flight PRs); pending entries may be absent
+# on disk without failing the suite, but arrive pre-registered.
+pending:
+  - path: sparrowd.py
+    owner: entrypoint
+    note: adapter-edge launcher for the sparrowd daemon shell (PR 3295)
