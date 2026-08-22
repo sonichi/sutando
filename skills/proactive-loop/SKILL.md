@@ -191,7 +191,20 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    On the **first no-op** of a run (`streak >= 1`):
    1. **Generate, don't idle** — first widen the menu and actually try to produce a tangible artifact (peer-PR review, regression grep, parity verify, research, memory curation, own-PR CI). Gated ≠ nothing-to-do. Only if genuinely all-gated go to step 2.
-   2. **Surface once per changed set** — build the held-list (each item + who it's gated on), `sha1` it. If `hash != last_surfaced_hash`: post ONE concise "here's what's held / needs you (FYI, not a block)" line to the **owner's primary channel** (see `PERSONAL_CLAUDE.md` channel routing — NOT the `#bot2bot` coord channel), then set `last_surfaced_hash`. If `hash == last_surfaced_hash`: stay quiet **only if the owner is away/asleep** (`last-owner-activity.json` older than ~30 min); if he's been active in the last ~30 min, never go dark — drop a one-line progress/activity signal to his channel anyway.
+   2. **Surface once per changed set** — build the held-list as `(item_id, gated_on)` pairs, where
+   `gated_on` is a short stable token (`owner`, `ci`, `upstream`, `peer-review`), and hash it with:
+
+   ```bash
+   echo '[["3166","owner"],["3274","owner"]]' \\
+     | python3 skills/proactive-loop/scripts/idle-surface-hash.py \\
+         --state "$WORKSPACE/state/idle-streak.json" --commit
+   # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
+   ```
+
+   ⚠ **Do not compute this hash yourself.** The rule used to live here as "sha1 the held-list", and an
+   agent handed that instruction hashes the sentence it was about to send — so re-wording the same
+   items yields a new hash every pass and the guard never dedups anything. A guard described in prose
+   is not unimplemented; it is implemented with the executor's default as its body. If `hash != last_surfaced_hash`: post ONE concise "here's what's held / needs you (FYI, not a block)" line to the **owner's primary channel** (see `PERSONAL_CLAUDE.md` channel routing — NOT the `#bot2bot` coord channel), then set `last_surfaced_hash`. If `hash == last_surfaced_hash`: stay quiet **only if the owner is away/asleep** (`last-owner-activity.json` older than ~30 min); if he's been active in the last ~30 min, never go dark — drop a one-line progress/activity signal to his channel anyway.
 
    **Guardrails (all owner-corrected):** the surface is a non-blocking FYI footnote — NEVER a new wait-state ("awaiting your go" is not a reason to pause; keep doing the next unblocked thing). Don't spam: one signal per changed set / per work-shift, not per file. Presence is the discriminator: recently-active → never silent; genuinely-away → dedup-quiet is fine.
 

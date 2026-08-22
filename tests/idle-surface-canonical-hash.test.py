@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""The idle-surface dedup key is canonical, not a hash of the rendered prose.
+
+Step 6.5 posts a held-list once per changed set. While the rule lived only in
+skill prose the hash was built ad hoc each pass, and an agent handed "sha1 the
+held-list" hashes the sentence it was about to send — so re-wording the same
+items re-fires the guard every pass and it never dedups anything.
+
+The load-bearing property: any rendering of the same (id, blocker) set gives ONE
+hash, and a real change — item added or dropped, blocker changed — moves it.
+"""
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SCRIPT = REPO / "skills" / "proactive-loop" / "scripts" / "idle-surface-hash.py"
+_spec = importlib.util.spec_from_file_location("ish", SCRIPT)
+ish = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ish)
+
+failures = []
+
+
+def check(name, cond, detail=""):
+    print(("ok   " if cond else "FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
+    if not cond:
+        failures.append(name)
+
+
+BASE = [["3166", "owner"], ["3274", "owner"], ["hooks", "owner"]]
+h0 = ish.held_hash(BASE)
+
+# ── same set, different renderings → one hash ────────────────────────────────
+for label, variant in {
+    "reordered": [["3274", "owner"], ["hooks", "owner"], ["3166", "owner"]],
+    "dict form": [{"id": i, "gated_on": g} for i, g in BASE],
+    "case and whitespace": [["3166", "  OWNER "], ["3274", "Owner"], ["  hooks", "owner"]],
+    "duplicate entry": BASE + [["3166", "owner"]],
+}.items():
+    check(f"stable across: {label}", ish.held_hash(variant) == h0, ish.held_hash(variant))
+
+# ── a real change moves it ───────────────────────────────────────────────────
+for label, variant in {
+    "item dropped": BASE[:-1],
+    "item added": BASE + [["3297", "ci"]],
+    "blocker changed owner->ci": [["3166", "ci"], ["3274", "owner"], ["hooks", "owner"]],
+}.items():
+    check(f"moves on: {label}", ish.held_hash(variant) != h0)
+
+# ── an entry with no id is refused, not silently keyed as ":blocker" ─────────
+try:
+    ish.held_hash([["", "owner"]])
+    check("empty id is refused", False, "no ValueError raised")
+except ValueError:
+    check("empty id is refused", True)
+
+# ── state round trip: post once, then quiet, and --commit is what records ────
+ws = Path(tempfile.mkdtemp())
+state = ws / "state" / "idle-streak.json"
+state.parent.mkdir()
+state.write_text(json.dumps({"streak": 2, "last_surfaced_hash": "", "updated": "x"}))
+
+
+def run(items, commit=False):
+    argv = ["--state", str(state), "--items", json.dumps(items)] + (["--commit"] if commit else [])
+    out = subprocess.run([sys.executable, str(SCRIPT)] + argv,
+                         capture_output=True, text=True)
+    return out.stdout.strip(), out.returncode
+
+
+first, rc = run(BASE)
+check("first sight of a set says post", first.startswith("post") and rc == 0, first)
+again, _ = run(BASE)
+check("without --commit nothing is recorded, so it still says post",
+      again.startswith("post"), again)
+committed, _ = run(BASE, commit=True)
+check("--commit says post on the transition", committed.startswith("post"), committed)
+quiet, _ = run(BASE)
+check("the same set afterwards is quiet", quiet.startswith("quiet"), quiet)
+check("streak survives the state write",
+      json.loads(state.read_text()).get("streak") == 2, state.read_text())
+moved, _ = run(BASE + [["3297", "ci"]])
+check("a changed set posts again", moved.startswith("post"), moved)
+
+# ── malformed input is an error, never a silent 'quiet' ─────────────────────
+out = subprocess.run([sys.executable, str(SCRIPT), "--state", str(state), "--items", "{}"],
+                     capture_output=True, text=True)
+check("a JSON object instead of a list is rejected", out.returncode == 2, out.stderr.strip())
+out = subprocess.run([sys.executable, str(SCRIPT), "--state", str(state), "--items", "not json"],
+                     capture_output=True, text=True)
+check("unparseable input is rejected", out.returncode == 2, out.stderr.strip())
+
+print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
+sys.exit(1 if failures else 0)
