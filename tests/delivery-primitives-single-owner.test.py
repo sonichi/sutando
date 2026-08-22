@@ -96,12 +96,16 @@ def scan_instantiations(sources: dict) -> dict:
         # `Backend = DesignCClaimBackend` must not reopen the construction gate.
         alias: dict[str, str] = {}
         for node in ast.walk(tree):
-            if (isinstance(node, ast.Assign)
-                    and isinstance(node.value, ast.Name)
-                    and node.value.id in _CTORS):
-                for t in node.targets:
-                    if isinstance(t, ast.Name):
-                        alias[t.id] = node.value.id
+            if isinstance(node, ast.Assign):
+                # Name RHS (Backend = DesignCClaimBackend) and qualified
+                # Attribute RHS (Backend = dc.DesignCClaimBackend) both bind.
+                rhs = node.value
+                ctor = (rhs.id if isinstance(rhs, ast.Name) else
+                        rhs.attr if isinstance(rhs, ast.Attribute) else None)
+                if ctor in _CTORS:
+                    for t in node.targets:
+                        if isinstance(t, ast.Name):
+                            alias[t.id] = ctor
             elif isinstance(node, ast.ImportFrom):
                 for a in node.names:
                     if a.name in _CTORS and a.asname:
@@ -184,6 +188,17 @@ mviol4 = instantiation_violations(scan_instantiations(mutated4),
                                   INSTANTIATION_OWNERS)
 check(any("_import_alias_leg::DesignCClaimBackend" in v for v in mviol4),
       "import-as aliased constructor mutation FAILS the gate and names its site")
+# qualified-attribute rebinding: Backend = dc.DesignCClaimBackend (reviewer P1 r3)
+mutated5 = dict(prod_sources)
+mutated5[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core.backend_c as _dc\n"
+    "Backend = _dc.DesignCClaimBackend\n"
+    "def _qualified_rebind_leg():\n"
+    "    return Backend('improvised')\n")
+mviol5 = instantiation_violations(scan_instantiations(mutated5),
+                                  INSTANTIATION_OWNERS)
+check(any("_qualified_rebind_leg::DesignCClaimBackend" in v for v in mviol5),
+      "qualified-attribute rebinding mutation FAILS the gate and names its site")
 
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
