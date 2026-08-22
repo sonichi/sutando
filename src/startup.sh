@@ -603,14 +603,17 @@ fi
 # source under `set -e` aborts the whole run.
 __probe="$REPO/src/accessibility_probe.sh"
 [ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
-acc_rc=0
+# 125 = could not check. NOT 0: a missing probe would otherwise print
+# "✓ Accessibility", asserting a grant on a run where nothing was probed.
+acc_rc=125
 if [ -f "$__probe" ]; then
   # `|| rc=$?` keeps this exempt from `set -e`; a bare non-zero call aborts.
   source "$__probe"
-  accessibility_probe || acc_rc=$?
+  acc_rc=0; accessibility_probe || acc_rc=$?
 fi
 case $acc_rc in
   0)   echo "  ✓ Accessibility" ;;
+  125) echo "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked" ;;
   124) echo "  ⚠ Accessibility UNKNOWN — probe timed out after ${ACCESSIBILITY_PROBE_TIMEOUT_S}s"
        echo "    This session cannot answer the prompt (headless/SSH); the grant may be fine." ;;
   *)   echo "  ⚠ Accessibility not granted"

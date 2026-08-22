@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The probe must be BOUNDED and must distinguish a timeout from a denial:
-# only a denial should send someone to System Settings.
+# Drives the REAL accessibility_probe and the REAL caller blocks. The previous
+# version tested a hand-copied perl invocation, so the bound could be defeated
+# while every case passed.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fails=0
@@ -9,80 +10,63 @@ bad() { printf '  FAIL %s %s\n' "$1" "${2:-}"; fails=$((fails+1)); }
 
 echo "accessibility probe is bounded:"
 
-[ -f "$REPO/src/accessibility_probe.sh" ] \
-  && ok "the shared probe exists" \
-  || { bad "the shared probe exists" "src/accessibility_probe.sh missing"; echo "  Total: 1 — pass: 0, fail: 1"; exit 1; }
+PROBE="$REPO/src/accessibility_probe.sh"
+[ -f "$PROBE" ] && ok "the shared probe exists" \
+  || { bad "the shared probe exists" "missing"; echo "  Total: 1 — pass: 0, fail: 1"; exit 1; }
 
-# The defect existed in two places because the probe was duplicated, so a fix
-# in only one of them is not a fix.
-raw=0
-for f in src/startup.sh src/init.sh; do
-  if grep -q "osascript -e 'tell application \"System Events\" to get name of first process" "$REPO/$f"; then
-    bad "$f goes through the shared probe" "still calls osascript directly"; raw=1
-  fi
-done
-[ "$raw" -eq 0 ] && ok "both callers go through the shared probe"
+# shellcheck source=../src/accessibility_probe.sh
+. "$PROBE"
+type accessibility_probe >/dev/null 2>&1 \
+  && ok "the real function is what this file exercises" \
+  || bad "the real function is what this file exercises" "not defined after sourcing"
 
-for f in src/startup.sh src/init.sh; do
-  grep -q 'accessibility_probe' "$REPO/$f" \
-    && ok "$f calls accessibility_probe" \
-    || bad "$f calls accessibility_probe" "no call found"
-done
-
-. "$REPO/src/accessibility_probe.sh"
-
-# A hanging command must be killed at the bound, not waited on forever.
-start=$(date +%s)
-( perl -e 'my $s=shift; my $p=fork(); if(!$p){exec @ARGV; exit 127;}
-           $SIG{ALRM}=sub{kill "KILL",$p; waitpid $p,0; exit 124};
-           alarm $s; waitpid $p,0; alarm 0;
-           exit($?>>8 ? $?>>8 : ($? ? 1 : 0));' 2 sleep 30 ) >/dev/null 2>&1
-rc=$?; el=$(( $(date +%s) - start ))
-[ "$rc" -eq 124 ] && [ "$el" -lt 5 ] \
-  && ok "a hanging probe is killed at the bound (rc=124 after ${el}s)" \
-  || bad "a hanging probe is killed at the bound" "rc=$rc elapsed=${el}s"
-
-# Timeout and denial must not collapse: 142 means the ALRM handler was lost to
-# exec, and a caller cannot tell that from a genuine denial.
-probe_with() {
-  perl -e 'my $s=shift; my $p=fork(); if(!$p){exec @ARGV; exit 127;}
-           $SIG{ALRM}=sub{kill "KILL",$p; waitpid $p,0; exit 124};
-           alarm $s; waitpid $p,0; alarm 0;
-           exit($?>>8 ? $?>>8 : ($? ? 1 : 0));' "$@" >/dev/null 2>&1
+run_probe() {
+  local s0 rc
+  s0=$(date +%s)
+  ACCESSIBILITY_PROBE_CMD=(sleep 8)
+  ACCESSIBILITY_PROBE_TIMEOUT_S="$1" accessibility_probe; rc=$?
+  ELAPSED=$(( $(date +%s) - s0 ))
+  return $rc
 }
-probe_with 3 true;         [ $? -eq 0 ] && ok "success returns 0"        || bad "success returns 0"
-probe_with 3 sh -c 'exit 7'; [ $? -eq 7 ] && ok "a denial code survives (7)" || bad "a denial code survives (7)"
-probe_with 3 false;        [ $? -eq 1 ] && ok "a plain failure is 1, not 124" || bad "a plain failure is 1, not 124"
 
-# 5s is a guess and a slow host is not a denial, so the bound is overridable.
-grep -q 'ACCESSIBILITY_PROBE_TIMEOUT_S' "$REPO/src/accessibility_probe.sh" \
-  && ok "the bound is overridable" || bad "the bound is overridable"
+# Valid override HONOURED. Without this control the rows below are equally
+# consistent with a helper that ignores the variable and always waits 5s.
+run_probe 2; rc=$?
+[ "$rc" -eq 124 ] && [ "$ELAPSED" -ge 2 ] && [ "$ELAPSED" -lt 4 ] \
+  && ok "a valid bound is honoured (2s -> 124 in ${ELAPSED}s)" \
+  || bad "a valid bound is honoured" "rc=$rc elapsed=${ELAPSED}s"
 
-# Both callers run under `set -e`, where a bare non-zero call aborts the script
-# before its summary — measured: init.sh --preflight emitted 0 summary lines.
-for f in src/startup.sh src/init.sh; do
-  if grep -qE '^\s*accessibility_probe\s*$' "$REPO/$f"; then
-    bad "$f calls the probe set -e safely" "bare call aborts under set -e"
+# A bad bound must FAIL CLOSED: perl reads `alarm 0`, and anything coercing to
+# 0, as cancel — silently restoring the unbounded call this exists to prevent.
+for badv in 0 abc -1 ''; do
+  run_probe "$badv"; rc=$?
+  if [ "$rc" -eq 124 ] && [ "$ELAPSED" -lt 7 ]; then
+    ok "bound '$badv' fails closed to the default (124 in ${ELAPSED}s)"
   else
-    ok "$f calls the probe set -e safely"
+    bad "bound '$badv' fails closed to the default" "rc=$rc elapsed=${ELAPSED}s — UNBOUNDED"
   fi
 done
 
-# And prove the shape, not just its absence.
-if bash -c 'set -e; f(){ return 124; }; rc=0; f || rc=$?; [ "$rc" -eq 124 ]'; then
-  ok "the || rc=\$? form survives set -e and keeps the code"
-else
-  bad "the || rc=\$? form survives set -e and keeps the code"
-fi
+ACCESSIBILITY_PROBE_CMD=(true);           accessibility_probe; [ $? -eq 0 ] && ok "granted -> 0" || bad "granted -> 0"
+ACCESSIBILITY_PROBE_CMD=(sh -c 'exit 7'); accessibility_probe; [ $? -eq 7 ] && ok "a denial code survives (7)" || bad "a denial code survives (7)"
+ACCESSIBILITY_PROBE_CMD=(false);          accessibility_probe; [ $? -eq 1 ] && ok "a plain denial is 1, not 124" || bad "a plain denial is 1, not 124"
 
-# $REPO is overridable — tests point it at a scratch dir with no src/. An
-# unguarded `source "$REPO/..."` under `set -e` aborts before any output.
+# The defect existed in two files, so a fix in one is not a fix.
 for f in src/startup.sh src/init.sh; do
-  if grep -qE '^\s*(local )?source "\$REPO/src/accessibility_probe.sh"' "$REPO/$f"; then
-    bad "$f guards the probe source" "sources \$REPO unguarded; a scratch repo aborts it"
-  else
-    ok "$f guards the probe source"
-  fi
+  grep -q "osascript -e 'tell application \"System Events\" to get name of first process" "$REPO/$f" \
+    && bad "$f goes through the shared probe" "raw osascript remains" || ok "$f goes through the shared probe"
+  grep -qE '^\s*(local )?source "\$REPO/src/accessibility_probe.sh"' "$REPO/$f" \
+    && bad "$f guards the probe source" "unguarded \$REPO source" || ok "$f guards the probe source"
+  grep -qE '^\s*accessibility_probe\s*$' "$REPO/$f" \
+    && bad "$f keeps the call set -e exempt" "bare call aborts" || ok "$f keeps the call set -e exempt"
+done
+
+# Could-not-check must not read as granted: acc_rc=0 with no probe file would
+# print "✓ Accessibility" for a run where nothing was probed.
+for f in src/startup.sh src/init.sh; do
+  grep -qE '^\s*(local )?acc_rc=125' "$REPO/$f" \
+    && ok "$f defaults to could-not-check, not granted" \
+    || bad "$f defaults to could-not-check, not granted" "acc_rc starts at 0"
 done
 
 S="$(mktemp -d)"; mkdir -p "$S/.fake-home"
@@ -90,14 +74,11 @@ SUTANDO_REPO="$S" SUTANDO_WORKSPACE="$S/.workspace" SUTANDO_TEST_MODE=1 \
   HOME="$S/.fake-home" CLAUDE_CONFIG_DIR="$S/.fake-home/.claude" \
   bash "$REPO/src/init.sh" --preflight > "$S/out" 2>&1
 prc=$?
-if [ "$prc" -eq 0 ] && [ "$(grep -c 'Preflight' "$S/out")" -eq 1 ]; then
-  ok "--preflight exits 0 and emits its summary with SUTANDO_REPO on a scratch dir"
-else
-  bad "--preflight exits 0 and emits its summary with SUTANDO_REPO on a scratch dir" \
-      "rc=$prc summary_lines=$(grep -c 'Preflight' "$S/out")"
-fi
+[ "$prc" -eq 0 ] && [ "$(grep -c 'Preflight' "$S/out")" -eq 1 ] \
+  && ok "--preflight exits 0 and emits its summary under a scratch SUTANDO_REPO" \
+  || bad "--preflight exits 0 and emits its summary under a scratch SUTANDO_REPO" "rc=$prc"
 rm -rf "$S"
 
-total=15
+total=18
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ] || exit 1
