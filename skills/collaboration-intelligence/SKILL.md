@@ -1,11 +1,97 @@
 ---
 name: collaboration-intelligence
-description: Maintain and use a cross-channel collaboration map of rooms, people, agents, agent owners, relationships, expertise, feature ownership, purpose, roster, priority/VIP handling, and recent context. Trigger when an incoming task or message includes room/channel/sender/member metadata; the user asks who is in a room, what it is for, who owns or knows a component, where to ask, whom to contact or cc, or what recent context matters; you must coordinate, delegate, hand off, or escalate work to a person or agent — including when the task is phrased as an action you already know how to perform ("find a reviewer", "chase reviewers", "找reviewer", "ask someone to look at this", "who should I assign"), since naming it as a familiar action is how this trigger gets missed; a merge or approval gate reports a PR queued on nobody, short of the approvals its branch rule requires, or carrying an approval that is stale against the current head; a participant is unfamiliar, ambiguous, or explicitly designated VIP/priority; identities must be reconciled across AG2 Space/Matrix, Discord, Telegram, Slack, WhatsApp, email, GitHub, or another bridge; or a roster needs incremental refresh or sweep. Do not trigger for generic communication-platform questions or drafting that does not depend on room, identity, relationship, or collaboration context.
+description: Maintain and use a cross-channel collaboration map of rooms, people, agents, agent owners, relationships, expertise, ownership, roster, priority/VIP handling, and recent context. Trigger when a task or message carries room/channel/sender/member metadata; the user asks who is in a room, what it is for, who owns or knows a component, where to ask, or whom to contact or cc; you must coordinate, delegate, hand off, escalate, or pick who reviews something — including when phrased as an action you already know how to perform, since naming it as a familiar action is how this trigger gets missed; a merge or approval gate reports a PR queued on nobody, short of its required approvals, or carrying a stale approval; a participant is unfamiliar, ambiguous, or designated VIP/priority; identities must be reconciled across bridges; or a roster needs refresh. Do not trigger for generic communication-platform questions, or drafting that does not depend on room, identity, relationship, or collaboration context.
 ---
 
 # Collaboration Intelligence
 
 Build a living, evidence-backed collaboration map. Treat it as a coordination aid, not an authority or surveillance profile.
+
+## First run
+
+**A freshly installed map is empty, and the Operating contract below does not bootstrap it.** Step 1 there says to load the quick-lookup index first — on a new install there is no index, so an agent queries nothing, reports a miss, learns nothing, and stays empty. It never errors. An unbootstrapped map and a working one are indistinguishable from outside, which is the failure mode this skill exists to fight, turned on itself.
+
+So run this once, before relying on the contract.
+
+**0. Decide whether this pass may bootstrap at all — before seeding and before sweeping.**
+
+The test is per-pass, not per-agent: does *this* pass have a serving `channel_id`?
+
+- **with** one → do not bootstrap. Not the sweep, and **not the seeding either**: soliciting or recording cross-provider identity links is itself collection, and doing it while serving an ordinary room task persists sensitive cross-room associations before any privacy check. Report and stop.
+- **without** one (a maintenance pass, owner-tier, serving no channel) → proceed to step 1.
+
+Do not shortcut this by source type. "Cron passes carry no `channel_id`" is **host-specific and was measured false**: one host had 153 cron tasks with zero `channel_id`, another had 3 of 3 carrying one. Read the pass you are in.
+
+And do not read the gate as clearance. Measured: `gate(serving_channel_id=None, …)` returns **ALLOWED**, because the blacklist lookup misses and an empty blacklist permits — it fails **open**. That is an absence of jurisdiction, not a permission; the judgement stays yours.
+
+**1. Seed the owner-stated identity map before sweeping. The sweep enriches it; it never substitutes for it.**
+
+This ordering is measured, not stylistic. On a 7,810-file corpus the sweep produced immediately usable *room* knowledge — traffic ranking plus honest coverage flags — and, for *identities*, a schema-shaped pile: the top participant by traffic and **the owner themselves** both came back as bare unknown ids, because Discord headers carry no display name. Any heuristic of the form "high traffic ⇒ important human" would have misclassified the owner and a peer bot with identical confidence.
+
+Worse for derivation: a known cross-provider identity — one person holding a GitHub handle and a chat id whose display name collides with someone else's — was **underivable from that corpus at any confidence**. It existed in the map only as an owner-stated seed with provenance. That is what makes "owner-stated outranks derived" load-bearing rather than decorative.
+
+So: ask for a handful of mappings (GitHub handle ↔ chat id ↔ person) before sweeping. It is the highest-value minute available, and it is the part the sweep structurally cannot do for you.
+
+**The unresolved list is per-host, and so is the seed list.** The store is host-local by design (`data/` is outside the default vault sync set), so one machine's unknowns are not another's — two agents comparing notes found a Discord id that was authoritative on one host and absent from the other's config entirely. Do not ask someone else to enumerate your unknowns, and do not assume theirs are yours.
+
+**2. Then sweep the task-file stream.** Step 0 has already established that this pass may do so.
+
+> **The bootstrap is not permission-free, and "the bytes are already on disk" is not the test.** The context boundary is *serving-relative*: `src/discord_context_policy.py`'s `gate()` decides whether the channel you are **currently serving** may read some other channel, and it applies to owner-tier tasks too. Its fail-closed behaviour is **conditional**: it refuses an unresolvable guild only when the serving channel has a `contextNotFrom` blacklist at all — with no blacklist it returns ALLOWED before reaching that check (see the measured note above). So the boundary constrains a sweep only where someone configured it; elsewhere the judgement is yours. A sweep run while serving one channel would pull rooms that gate would have refused — and because the sweep **persists** what it reads, those rooms then inform every later answer. That is strictly worse than a single blocked read.
+>
+> So: run the bootstrap from an explicit owner/operator maintenance context, not as a side effect of handling a task. If you cannot establish that context, either filter every archived observation through the same serving-channel policy, or do not sweep. Record `access_scope` on each observation so a later answer cannot quietly widen it.
+
+**Header fields are source-specific — check, do not assume.** Writers differ, and the richest one is not representative:
+
+| source | provides | consequence |
+|---|---|---|
+| AG2 Space / Matrix | `channel_id`, `room_name`, `room_members`, `room_member_count`, `user_id` | rooms, names and rosters available |
+| Discord | `channel_id`, `channel_name`, `guild_name`, `user_id` | **no roster, no member count** — membership is `unknown`, not empty |
+| Slack | `channel_id`, `user_id` | id and speaker only; name and roster `unknown` |
+
+Treat a field the source never emits as **`unknown`**, never as absent-therefore-zero — a room with no roster field is not a room with no members. Set `coverage: unknown` for those sources and `coverage: partial` only where a roster was truncated (`+N more`), which is recordable **at sweep time** and unrecoverable afterwards.
+
+What the sweep yields, on the sources that carry it:
+
+- **rooms**, ranked by traffic, with provider-native ids and whatever name the source gave
+- **participants**, ranked by messages, classified `human` / `agent` / `service`
+- **unknowns worth resolving immediately** — rooms with real traffic but no name and no members observed
+
+Record the result per [references/schema.md](references/schema.md), including `store_freshness` per source. Do not enumerate rooms, inboxes or accounts you were not already given.
+
+**3. Expect the sweep to surface defects, and record them rather than smoothing them.** Run against a real corpus it immediately produced unnamed high-traffic rooms, hundreds of truncated rosters, and a service account misfiled as human by a two-way agent/human split. Each is a real map entry — an unknown to resolve, a partial-coverage flag, a classification gap — not noise to filter out.
+
+**4. Then let the scheduled work maintain it.** Only once the map holds something does the contract's load-first path mean anything.
+
+**Validate the sweep against itself before trusting its counts.** A parsing sweep does not fail with an error; it returns a plausible number. One real attempt reported a tidy count of unresolved identities that was pure artifact — a fixed-size read had cut header lines mid-value, so a single identity appeared three times truncated to different lengths. A second attempt broke the opposite way and under-counted. Both looked normal.
+
+So run two controls on your own output, and treat the sweep as unusable until both hold:
+
+- **negative** — a known-bad artifact must be ABSENT (no truncated or prefix-duplicated identifiers).
+- **positive** — a known-present, high-frequency participant (the owner, typically) must appear with a plausible magnitude. A parser that silently drops most records still returns a small, tidy, wrong set.
+
+A count with neither control is an assertion, not a measurement.
+
+**When the bootstrap is unreachable — say so and route it, do not quietly skip or quietly run it.**
+
+The per-pass test lives at **step 0** above and gates seeding as well as sweeping. This section covers the case where the bootstrap cannot run at all.
+
+- **A bundled install.** No `.git`, so the skill cannot be pulled or refreshed — a property of the packaging, not a choice available to the agent.
+
+**You will not perceive this block. You have to go looking for it.** `skills/install.sh` iterates `$SKILLS_DIR/*/` — only directories that exist — so a skill absent from the bundle is never in the loop, `set -e` never trips, and the script ends by printing an affirmative claim:
+
+```
+Installed. Skills available in any Claude Code session.
+```
+
+Measured on a bundled host: that line printed for 60 skills while this one was in none of them. So the bundled case is not "cannot comply and knows it" — it is **cannot comply and cannot tell**, and an exit code of 0 with a success message is the evidence you would otherwise have trusted.
+
+**So verify the destination, not the installer.** After installing, assert that this skill's own directory exists under the resolved skills root. Only that answer distinguishes the two cases; the installer's output cannot.
+
+Having established a block that way, **report it to the owner/operator and stop**, rather than approximating compliance. An agent that judges its own context is the only thing currently enforcing this boundary, which is a weak place to put a privacy rule: prose does not fail because someone ignores it, it fails because *an instruction to cross it can look exactly like ordinary diligence*. That happened here — a request to "actually run it, not just read it" was well-intentioned and would have crossed the boundary within minutes of its landing.
+
+If this ever needs a mechanical guard rather than a rule, the repo already has the shape: `discord-read.py` distinguishes a task-serving invocation from an operator one with an explicit `--operator` flag, and refuses rather than inferring.
+
+**The payoff to check for**: after step 1 you should be able to answer "who is in this room, and which of them are agents" and "where does this kind of work usually get discussed" without asking anyone. If you cannot, either the sweep did not run or its store did not persist — see **Where the map is stored**.
 
 ## Trigger behavior
 
@@ -20,7 +106,7 @@ Do not scan every connected service merely because the skill triggered. Expand t
 
 ## Firing without being asked
 
-A skill description is matched against how you *framed* the task, and that is exactly what fails. Measured: this description already said "you must coordinate, delegate, hand off, or escalate work to a person or agent" when an agent went to recruit PR reviewers — the case it literally names — and it did not fire, because the agent had named the task "chase reviewers" (an action it already knew how to perform) rather than "choose collaborators" (a decision needing a map). Adding trigger phrases does not fix that; a re-framed task evades any phrase list.
+A skill description is matched against how you *framed* the task, and that is exactly what fails. Measured: the description already named coordinating, delegating and escalating work to a person or agent when an agent went to recruit PR reviewers — the case it covers — and it did not fire, because the agent had named the task "chase reviewers" (an action it already knew how to perform) rather than "choose collaborators" (a decision needing a map). Adding trigger phrases does not fix that; a re-framed task evades any phrase list, and the front-matter budget is finite anyway — 1024 characters, which a phrase list burns fast.
 
 So do not rely on description matching alone. **Hook invocation to observable state, which does not depend on how anything was framed.** Each of these is a computed fact some routine already produces:
 
@@ -38,6 +124,7 @@ The same measurement makes the weaker path explicit, and it is worth stating pla
 
 ## Operating contract
 
+0. **If the map has never been populated, do the bootstrap in [First run](#first-run) first.** The steps below assume a map that already holds something.
 1. Load the compact **quick-lookup index** first (see below) — it answers the common case in a small, bounded payload. Consult the full Collaboration Intelligence record only on a miss, or when the task needs deeper history. If no store is available, build a task-local view and say that persistence is unavailable.
    **Carry freshness with every answer, including the empty one.** A hit reports its `observed_at`; a miss reports when that source was last swept and whether coverage was full — otherwise "not in the map" and "the map has not looked recently" are the same sentence. See `store_freshness` in [references/schema.md](references/schema.md).
 2. Observe only sources available for the current task. Do not enumerate private rooms, inboxes, or accounts merely to enrich the map.
@@ -175,11 +262,140 @@ When help is needed:
    - **A low or zero count is not evidence of exclusion.** The metric has no early signal — a maintainer added yesterday is indistinguishable from an inactive one until they accumulate history, so the ranking is most confident about the longest-tenured and least reliable about the newest arrival, which is exactly who "whom do I ask?" is often about. Use counts to find candidates, never to rule one out; explicit responsibility and owner statements outrank them.
 
    Treat a derived set older than a few hours the way this skill treats a memory: a candidate to re-derive, not an answer.
-3. Prefer the room where the work already has context. Do not move sensitive context across rooms without checking visibility and membership.
+3. **Choose the person first, then choose where to reach them — they are separate decisions.** An identity existing is not the same as it being live: check `identities[].activity` for where that person is actually seen, and honour `exclusive: true` (some people are reachable on exactly one surface, and a message anywhere else reaches nobody). Defaulting to whichever surface you happen to be on is how a reachable person gets treated as unreachable. Prefer the room where the work already has context, subject to that.
    When customers or external collaborators are present, share only context appropriate to that relationship and work scope.
 4. Contact the responsible agent directly when it can act. Include its owner or a human when approval, escalation, or shared accountability is needed.
-5. Resolve ambiguous recipients before sending. Never guess among duplicate names or uncertain identity links.
+5. **Resolve the recipient before sending anything that carries a payload**, and never guess
+   among duplicate names or uncertain identity links to deliver one. When the identity is
+   imperfectly resolved, the message is not simply blocked — what you may send is governed by
+   *what it carries*, under **"When resolution is imperfect"** below: a bare solicitation may
+   go, anything the *least-privileged candidate* could not already access may not. That rule is
+   the only exception
+   to this step, and it does not license guessing for a payload-bearing message.
 6. State why each recipient is included and provide the minimum context, desired action, and expected handoff.
+
+**A request made on the work platform is not solicitation.** A GitHub review
+request, a ticket assignment, a "requested changes" — these change a field in a
+system the recipient may not be watching. They create a *record* that you asked;
+they do not create *knowledge* that you asked. **Filing one and stopping is
+indistinguishable, from the recipient's side, from never having asked.**
+
+So for every reviewer/assignee you name on a platform, also **message their agent
+where that person is actually reachable** — resolve the identity from this map
+first, then reply-to or @-mention. Two properties make this non-optional:
+
+- **Nothing chases it.** A platform request sits indefinitely and emits no
+  reminder. Measured: a PR sat one approval short of its ruleset with **no
+  reviewer queued at all** — not blocked on anything, simply unattended, and
+  invisible to every "is it blocked?" check because unattended is not blocked.
+  One @-mention produced the missing review within minutes.
+- **Resolve the identity from this map before sending — never derive an agent id
+  from a display name or by transforming a user id**, and treat colliding display
+  names as unresolved until evidence separates them.
+
+  **When resolution is imperfect, what you may send is decided by what the message
+  contains — not by how confident you feel.** The asymmetry that justifies sending
+  anyway is real and it is bounded: it holds for the *ask*, never for the payload.
+
+  - **Send it: a bare solicitation.** "Will you review PR #N?", plus a pointer to
+    something the recipient could already reach on their own. A wrong recipient
+    costs them one message they can ignore; reaching nobody leaves the item
+    unattended, and unattended is invisible to every "is it blocked?" check.
+    **Owner directive (2026-08-22): a false positive here is the more tolerable
+    error.** Say plainly why you think it is them, so a wrong recipient can correct
+    you in one line instead of silently absorbing the ask.
+  - **Withhold it until identity is established: anything the *least-privileged
+    candidate* could not already access.** Not "the recipient" — when the identity is
+    unresolved that phrase has no determinate subject and quietly resolves to *the
+    person you think it is*, which is the exact case this rule exists for. Score it
+    against the least-privileged identity still consistent with the evidence.
+    Concretely: private repository contents, incident detail, personnel matters,
+    credentials and anything adjacent to them, and context carried from a narrower
+    room. Here a wrong recipient is not one ignorable message — it is a
+    disclosure, and no correction takes it back. The asymmetry inverts, so the
+    default inverts with it.
+  - **When it is ambiguous, ask in the open instead of guessing in private.**
+    Address the candidates by name in a room they are both in, carrying the request
+    and none of the payload. That reaches the right person without betting private
+    context on a guess, and a wrong guess costs nothing.
+
+  **Evidence that establishes identity for the second case:** an owner-stated
+  mapping, a provider-native id resolved from this map and marked `verified`, or a
+  self-identification the person made in a channel you can read. **A display-name
+  match is never sufficient**, and neither is an id you derived by transforming
+  another id.
+
+Carry what the platform page cannot show: why them specifically, the real cost
+(size, conflicts, prerequisites) so they can decline cheaply, and any known
+blocker on their side. One message per person covering all their items, not one
+per item.
+
+**Soliciting is the start of the obligation, not the discharge of it.** An item
+you asked someone to move — a review, a decision, an approval — needs stewardship
+until it reaches a terminal state, and the platform will not do that for you.
+
+**The trigger to message is a state change the other party would want to know
+about — most often "I addressed your finding."** A push updates a branch and a
+comment updates a page; **neither reaches a person.** The reviewer who blocked you
+is not watching your branch, so from where they sit an addressed finding and an
+ignored one look the same until they happen to look again. That gap is measured in
+however long it takes them to re-scan, and it is the single commonest reason a
+resolved item sits.
+
+Other state changes worth a message: a blocker of theirs is now cleared; the thing
+they were waiting on landed; you have changed direction on something they reviewed;
+you are handing the item to someone else.
+
+**And the discipline that keeps this from becoming noise: never send a contentless
+nudge.** "Any update?" with nothing new on your side is what gets a channel muted, and
+a muted channel costs you every future nudge that mattered.
+
+**But what elapsed time disqualifies is repeating yourself — not asking whether the
+item still has a live owner.** Those are different messages and only the first is
+noise. So there are two tests before sending, and they key on different variables:
+
+- **Do I have something new to tell them?** New information, an addressed finding, a
+  changed direction. This is the trigger that matters most and the one most often
+  skipped.
+- **Does this item still have a live owner?** Ownership is not established once and
+  then trusted forever. A holder's attention can lapse, and **that is invisible from
+  your side by construction** — nothing of yours changes when it happens, so elapsed
+  time is the *only* signal that can surface it. Pick that horizon deliberately and
+  write it down with the ask — an unnamed "eventually" is how eleven days happen — and
+  when it arrives send a reassignment question, never an "any update?".
+
+If neither test fires, the item is correctly in their queue — leave it.
+
+Measured on this repo: a PR sat **eleven days** on a blocking review its author had
+answered within the hour, and **approvals kept arriving the entire time** — reviewer
+after reviewer read it, approved it, and changed nothing, because the block was never
+theirs to clear. Nothing had changed on the author's side after day one, and the item
+was unambiguously owned, so "has anything changed on my side?" returned *no* every
+single day, correctly, while every one of those approvals went unused.
+
+(**This sentence used to headline the approval count. Don't.** The item was still open,
+so the figure moved four → six → five → six *while this paragraph was under review* —
+and only the first of those was a counting error; the rest were the item accumulating
+underneath the measurement. A count of a live item goes stale faster than the document
+quoting it. Freeze it with an explicit "as of &lt;timestamp&gt;" or, better, state the
+invariant that cannot move: **approvals accumulated and the item did not.** The
+first wrong figure was the row count of a truncated terminal display, which is its own
+lesson — state which unit a count is in, or the next reader will invent one.)
+
+**And the ownership test has a floor beneath it: an item nobody was EVER asked to
+move.** There no holder's attention lapsed — none existed. Nothing of yours changes, by
+construction, and there is no one whose silence elapsed time could measure, so both
+tests stay quiet indefinitely. That item is not waiting, it is dropped, and the action
+is to solicit — not to ask a reassignment question about a holder who was never
+assigned. **Never-owned and owned-then-quiet are indistinguishable from outside and
+have different fixes: the first needs a name on it, the second needs the name changed.**
+
+Track, per party you are waiting on: what they hold, and what has changed since you
+last contacted them. **That pair has no home today** — the record schema in
+`references/schema.md` carries entities, rooms, relationships and evidenced facts, but
+no outstanding-ask record, and an issue tracker does not store it either. Keep it with
+whatever working state you already have for the item, and do not assume a lookup can
+answer "what do they hold".
 
 **Never a bare room post when you need someone to help.** The rule is scoped to
 *asking*, and the test before posting is not "is this addressed?" but **"am I
@@ -211,6 +427,7 @@ Do not spam every plausible expert. Escalate outward only after the primary owne
 
 - Store professional collaboration facts needed for coordination; avoid protected traits, private-life profiling, sentiment scores, or speculative trust labels.
 - Keep provenance and access scope with facts so restricted observations are not leaked into broader rooms.
+- **Repeating something from a smaller room into a larger one requires an explicit signal, and the default is no.** Before carrying a fact across rooms, compare their visibility, audience and membership: narrower → wider is a disclosure decision, not a formatting one. Knowing something because you were present is not permission to restate it. This skill's daily action *is* cross-room routing, so it will meet this case constantly; when in doubt, say that context exists and let the person who owns it decide whether to share it.
 - Honor deletion/correction requests and retain superseded facts only when audit needs require it.
 - Ask before performing external outreach unless the user already authorized sending or coordination.
 
