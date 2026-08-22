@@ -146,8 +146,10 @@ worker2.join(timeout=5)
 #      the doorbell must ride the O_RDONLY fallback, not degrade to scan ─────
 rtc.OUTBOUND_SCAN_S = 30.0
 rtc._OUTBOUND_STOP.clear()
-_saved_evtonly = os.O_EVTONLY
-del os.O_EVTONLY
+_had_evtonly = hasattr(os, "O_EVTONLY")
+_saved_evtonly = getattr(os, "O_EVTONLY", None)
+if _had_evtonly:
+    del os.O_EVTONLY
 try:
     check(not hasattr(os, "O_EVTONLY"), "control precondition: O_EVTONLY absent")
     watcher3 = rtc._start_results_watcher()
@@ -161,7 +163,8 @@ try:
     lat = drain.calls[base] - t0 if drain.count() > base else 99
     check(lat < 2.0, f"fallback doorbell latency {lat*1000:.0f}ms — not the 30s scan")
 finally:
-    os.O_EVTONLY = _saved_evtonly
+    if _had_evtonly:
+        os.O_EVTONLY = _saved_evtonly
 rtc._OUTBOUND_STOP.set()
 rtc.wake_outbound()
 watcher3.join(timeout=5)
