@@ -201,6 +201,37 @@ class ReadTests(EnvCase):
 
 
 # ----- media ----- #
+class TopicTests(EnvCase):
+    def test_extracts_meta_and_reports_served(self):
+        import topic
+        from unittest import mock
+        res_events = {"events": [
+            {"type": "space.ag2.memo", "state_key": "k", "content": {}},
+            {"type": "m.room.name", "state_key": "", "content": {"name": "N"}},
+            {"type": "m.room.topic", "state_key": "", "content": {"topic": "T"}},
+        ]}
+        with mock.patch.object(topic, "gateway", return_value=("http://g", {})), \
+             mock.patch.object(topic, "http_json", return_value=(200, res_events)):
+            r = topic.room_topic("!r:x")
+        self.assertEqual((r["ok"], r["name"], r["topic"], r["alias"]),
+                         (True, "N", "T", None))
+        self.assertTrue(r["served_by_gateway"])
+
+    def test_pre_735_gateway_omits_meta_is_honest_degrade(self):
+        import topic
+        from unittest import mock
+        with mock.patch.object(topic, "gateway", return_value=("http://g", {})), \
+             mock.patch.object(topic, "http_json",
+                               return_value=(200, {"events": [
+                                   {"type": "space.ag2.memo", "content": {}}]})):
+            r = topic.room_topic("!r:x")
+        # ok:true with served_by_gateway:false — "not returned" is distinct
+        # from "the room has none", which would be served:true + nulls.
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["served_by_gateway"])
+        self.assertIsNone(r["name"])
+
+
 class MediaTests(EnvCase):
     def setUp(self):
         super().setUp()

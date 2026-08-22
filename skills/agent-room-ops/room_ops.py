@@ -153,6 +153,10 @@ def _main(argv):
     p.add_argument("room_id")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    p = sub.add_parser("topic", help="a room's declared name/topic/alias (needs backend #735 for non-null fields)")
+    p.add_argument("room_id")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
     p = sub.add_parser("events", help="event subscriptions + delivery (#184 client half)")
     esub = p.add_subparsers(dest="events_cmd", required=True)
     e = esub.add_parser("emit", help="send one typed space.ag2.* timeline event as this agent")
@@ -240,6 +244,9 @@ def _main(argv):
         res = _rooms.joined_rooms(a.agent_mxid)
     elif a.cmd == "members":
         res = _members.room_members(a.room_id, a.agent_mxid)
+    elif a.cmd == "topic":
+        import topic as _topic
+        res = _topic.room_topic(a.room_id, a.agent_mxid)
     elif a.cmd == "events":
         if a.events_cmd == "stream":
             return _events_stream(a)  # prints JSONL itself; summary is one line
