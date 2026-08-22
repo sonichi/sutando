@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -195,11 +196,8 @@ def _run_bounded(
     heartbeat_interval_override: Optional[float] = None,
     on_heartbeat: Optional[Callable[[float], None]] = None,
 ) -> tuple[int, str, str]:
-    # hard_timeout is a safety ceiling against a truly runaway process holding the
-    # room lock forever, not a normal completion boundary — the caller (run_detached)
-    # runs off the watcher's own request/response cycle, so a long-but-progressing
-    # run is expected and fine. stall_timeout is the real "this is actually stuck"
-    # signal: a working provider streams SOME output periodically.
+    # hard_timeout is a safety ceiling, not a completion boundary — this runs off the
+    # watcher's clock. stall_timeout (no output at all) is the real "stuck" signal.
     hard_timeout = _timeout("SUTANDO_TIER_HARD_TIMEOUT", hard_timeout_override)
     stall_timeout = _timeout("SUTANDO_TIER_STALL_TIMEOUT", stall_timeout_override)
     try:
@@ -233,7 +231,9 @@ def _run_bounded(
         # firing a burst of catch-up pings once the loop resumes.
         while next_heartbeat is not None and now >= next_heartbeat:
             next_heartbeat += heartbeat_interval
-        on_heartbeat(now - started)
+        # Off-thread: on_heartbeat can block (_notify's subprocess call has its own
+        # 15s timeout) and must never delay this loop's own deadline checks.
+        threading.Thread(target=on_heartbeat, args=(now - started,), daemon=True).start()
 
     try:
         while selector.get_map():
@@ -528,11 +528,8 @@ def run_detached(
                 if not body.strip():
                     raise RuntimeError(f"{runtime} returned an empty result")
             except Exception as exc:
-                # Unlike the old synchronous design, there is no watcher call left to
-                # return 1 to — the watcher was already told "0, handled" the moment
-                # this was spawned. The only honest options are silence (what this
-                # whole design exists to stop) or publishing an explicit failure, so:
-                # publish one, plainly, rather than let the room simply never hear back.
+                # No watcher call left to fall back to (it was already told "0,
+                # handled") — publish an honest failure rather than go silent.
                 print(f"AG2 Space room-session worker (detached): {exc}", file=sys.stderr)
                 _publish_once(
                     results_dir / task_file.name,
@@ -541,9 +538,7 @@ def run_detached(
                 )
                 return
             if not _publish_once(results_dir / task_file.name, body):
-                # Lost the publish race — something already occupies this task's
-                # result path (a genuine winner, or a stale non-ready placeholder).
-                # Never clobber; just make the loss visible instead of silent.
+                # Lost the publish race — never clobber; make the loss visible instead.
                 print(
                     f"AG2 Space room-session worker (detached): {runtime} completed "
                     "but lost the publish race for this task's result path",
@@ -575,10 +570,8 @@ def _spawn_detached(
     if stall_timeout is not None:
         command += ["--stall-timeout", str(stall_timeout)]
     with log_path.open("a", encoding="utf-8") as log_file:
-        # start_new_session=True (setsid) is what makes this survive the parent
-        # session-worker.py process exiting moments from now, the same primitive
-        # _run_bounded already uses for the provider subprocess itself. Deliberately
-        # not waited on: that's the entire point of detaching.
+        # start_new_session=True (setsid) survives the parent exiting; not waited
+        # on — that's the entire point of detaching.
         subprocess.Popen(
             command, cwd=repo, env=os.environ.copy(),
             stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file,

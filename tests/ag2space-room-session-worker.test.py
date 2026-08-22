@@ -83,9 +83,8 @@ def run_worker(runtime: str, workspace: Path, task_file: Path, env: dict[str, st
             runtime, workspace, task_file, workspace / "results", REPO
         )
     output = stderr.getvalue()
-    # run_detached always publishes SOMETHING on a genuine exception now (an honest
-    # failure body, not silence) — the exception log line, not file presence, is
-    # what distinguishes "failed" from "succeeded" here.
+    # run_detached always publishes something now (even a failure body) — the
+    # exception log line, not file presence, distinguishes failed from succeeded.
     return_code = 1 if "AG2 Space room-session worker (detached):" in output else 0
     return subprocess.CompletedProcess([], return_code, "", output)
 
@@ -340,6 +339,21 @@ def test_runtime_edges_and_adapter_wiring() -> None:
             else:
                 check(False, "non-positive provider timeout is rejected")
 
+        # A slow/blocking heartbeat callback must never delay the deadline check —
+        # it's dispatched off-thread, not called inline in the monitor loop.
+        with patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "0.2",
+                                     "SUTANDO_TIER_STALL_TIMEOUT": "2",
+                                     "SUTANDO_TIER_HEARTBEAT_INTERVAL": "0.01"}):
+            slow_heartbeat = lambda elapsed: time.sleep(1)  # noqa: E731
+            started = time.monotonic()
+            try:
+                worker._run_bounded([str(sleeper)], root, on_heartbeat=slow_heartbeat)
+            except TimeoutError:
+                check(time.monotonic() - started < 0.5,
+                      "a slow heartbeat callback never delays the hard-timeout check")
+            else:
+                check(False, "a slow heartbeat callback never delays the hard-timeout check")
+
         with patch.dict(os.environ, {}, clear=True):
             check(worker._timeout("SUTANDO_TIER_HARD_TIMEOUT", None) == 3600,
                   "manifest declares the hard-timeout safety-ceiling default")
@@ -434,9 +448,8 @@ def test_direct_failure_and_cli_edges() -> None:
         check(accepted and published.read_text() == "first\n",
               "publish-once accepts an already-ready winning writer")
 
-        # Double-checked completion now lives in run_detached, not handle() — this is
-        # what protects against a stale detached worker relaunching provider work a
-        # different one already finished while this one waited on the lock.
+        # Double-checked completion now lives in run_detached, not handle() — guards
+        # against a stale worker relaunching work another one already finished.
         raced = task(workspace, "task-raced")
         with patch.object(worker, "_completed_result_exists", side_effect=[False, True]), \
              patch.object(worker, "_run_codex") as provider:
@@ -479,8 +492,7 @@ def test_handle_spawns_detached_and_never_runs_provider() -> None:
               "handle acks immediately when no other worker is active for this room")
 
         # A second message for the SAME room, while the first's claim is still live,
-        # gets an honest "queued" ack instead of the same "on it" — the whole point
-        # Chi's design push was about: tell the room what's actually happening.
+        # gets an honest "queued" ack instead of the same "on it".
         room_key = worker.resolve_room_key(started)
         assert room_key
         claim = worker._claim_path(workspace, "claude", room_key)
