@@ -79,9 +79,17 @@ The per-pass test lives at **step 0** above and gates seeding as well as sweepin
 
 - **A bundled install.** No `.git`, so the skill cannot be pulled or refreshed — a property of the packaging, not a choice available to the agent.
 
-**That failure is silent, so check for it positively.** `skills/install.sh` iterates `$SKILLS_DIR/*/` — only directories that exist — so a skill absent from the bundle is never visited and the script still **exits 0**. Success there is not evidence the skill was installed. Assert the destination directly (does the skill's own directory exist under the resolved skills root?) and report the block on the answer, not on the installer's exit code.
+**You will not perceive this block. You have to go looking for it.** `skills/install.sh` iterates `$SKILLS_DIR/*/` — only directories that exist — so a skill absent from the bundle is never in the loop, `set -e` never trips, and the script ends by printing an affirmative claim:
 
-In either case the correct action is to **report the block to the owner/operator and stop**, not to approximate compliance. An agent that judges its own context is the only thing currently enforcing this boundary, which is a weak place to put a privacy rule: prose does not fail because someone ignores it, it fails because *an instruction to cross it can look exactly like ordinary diligence*. That happened here — a request to "actually run it, not just read it" was well-intentioned and would have crossed the boundary within minutes of its landing.
+```
+Installed. Skills available in any Claude Code session.
+```
+
+Measured on a bundled host: that line printed for 60 skills while this one was in none of them. So the bundled case is not "cannot comply and knows it" — it is **cannot comply and cannot tell**, and an exit code of 0 with a success message is the evidence you would otherwise have trusted.
+
+**So verify the destination, not the installer.** After installing, assert that this skill's own directory exists under the resolved skills root. Only that answer distinguishes the two cases; the installer's output cannot.
+
+Having established a block that way, **report it to the owner/operator and stop**, rather than approximating compliance. An agent that judges its own context is the only thing currently enforcing this boundary, which is a weak place to put a privacy rule: prose does not fail because someone ignores it, it fails because *an instruction to cross it can look exactly like ordinary diligence*. That happened here — a request to "actually run it, not just read it" was well-intentioned and would have crossed the boundary within minutes of its landing.
 
 If this ever needs a mechanical guard rather than a rule, the repo already has the shape: `discord-read.py` distinguishes a task-serving invocation from an operator one with an explicit `--operator` flag, and refuses rather than inferring.
 
