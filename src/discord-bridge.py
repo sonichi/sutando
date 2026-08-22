@@ -522,6 +522,29 @@ def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
         _clear_delivered(task_id)
 
 
+def _anchor_from_task_file(task_id: str):
+    """Recover the quote-reply anchor `pending_reply_anchors` lost to a restart.
+    By delivery time the task may be claimed or already archived, so try both."""
+    candidates = []
+    try:
+        live = find_task_file(TASKS_DIR, task_id)
+        if live is not None:
+            candidates.append(live)
+        for pattern in (f"*/{task_id}.txt", f"*/{task_id}.claimed-core-*.txt"):
+            candidates.extend(sorted(ARCHIVE_TASKS_DIR.glob(pattern)))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                if line.startswith("source_message_id:"):
+                    raw = line.split(":", 1)[1].strip()
+                    return int(raw) if raw.isdigit() else None
+        except Exception:
+            continue
+    return None
+
+
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
     """POST to agent-api /task-done so web UI flips status without waiting
     for its next /tasks/active poll. Best-effort; silent on failure (web UI
@@ -4714,6 +4737,10 @@ async def poll_results():
                 # messages instead of quote-replies. Caught by live test
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
+                if source_message_anchor is None:
+                    # Survives a bridge restart: the in-memory dict is gone but
+                    # the task file still carries source_message_id.
+                    source_message_anchor = _anchor_from_task_file(task_id)
                 # Clear the progress-streamer's tier map here (NOT only in
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
