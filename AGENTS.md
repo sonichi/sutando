@@ -12,17 +12,11 @@ For irreversible actions (sending email, deleting files, financial transactions)
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
 
-**"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — unless you have a
-better mechanism for that specific job. It is not "keep this in mind while doing other things", and
-it is not a licence to defer the work to a later session. If the ask is too large for your remaining
-context, that is the reason TO delegate it, not a reason to hand it back.
-If **no** delegation mechanism is available, do the work inline in this session and **say plainly
-that it ran inline, and why** — subagents are FULL-tier only under the quota gate, so an
-unavailable mechanism is a common state, not an edge case. Inline-with-disclosure is the
-satisfying branch. **Never report work as backgrounded or delegated when nothing was spawned:**
-claiming delegation you did not perform is indistinguishable from compliance from the outside,
-which is what makes it the worse of the two failures.
-More cases + model choice: `docs/subagent-delegation.md`.
+**"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — not "keep this in
+mind", and not a licence to defer to a later session. Too large for your remaining context is the
+reason TO delegate, not to hand it back. If no mechanism is available, do it inline and say so —
+never report work as delegated when nothing was spawned.
+Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
 
 ## Architecture rules
 
