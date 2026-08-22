@@ -479,20 +479,22 @@ class DesignCClaimBackend:
                     continue
                 # A crash inside _quarantine leaves the claim's INODE already
                 # linked in undelivered/; finish that quarantine, never re-ready.
-                def _is_twin(q, ino):
-                    # Non-throwing, fail-closed: the real twin is a REGULAR
-                    # file hardlink; symlinks/dirs/vanished entries are not.
+                def _is_twin(q, dev, ino):
+                    # Fail-closed: the real twin is a REGULAR-file hardlink,
+                    # same (st_dev, st_ino) — inodes repeat across filesystems.
                     try:
                         st = os.lstat(str(q))
                     except OSError:
                         return False
                     import stat as _stat
-                    return _stat.S_ISREG(st.st_mode) and st.st_ino == ino
+                    return (_stat.S_ISREG(st.st_mode)
+                            and st.st_dev == dev and st.st_ino == ino)
                 try:
-                    claim_ino = os.lstat(str(f)).st_ino
+                    _cst = os.lstat(str(f))
+                    claim_dev, claim_ino = _cst.st_dev, _cst.st_ino
                 except OSError:
                     continue
-                if any(_is_twin(q, claim_ino)
+                if any(_is_twin(q, claim_dev, claim_ino)
                        for q in self._d(PARKED).glob(f"{key}{SEP}*")):
                     f.unlink(missing_ok=True)
                     rep.quarantined.append(key)

@@ -465,6 +465,42 @@ with tempfile.TemporaryDirectory() as td:
         check(repq is not None and (kq in repq.recovered) == expect_requeue,
               f"quarantine {label}: dead claim re-readied (not a real twin)")
 
+    # ── ROUND-8 CONTROL: twin identity is (st_dev, st_ino) — a same-inode
+    #    entry on ANOTHER filesystem re-readies the dead claim, never twins ──
+    bxd = fresh(td, "qxdev")
+    bxd.publish("item-X", b"p")
+    txd = bxd.claim("item-X", "w0")
+    kxd = _safe_key("item-X")
+    xdev_name = f"{kxd}{SEP}xdev{SEP}1"
+    (bxd.root / "undelivered" / xdev_name).write_text("unrelated")
+    pxd = txd.incarnation.split(SEP)
+    deadxd = f"{pxd[0]}{SEP}{pxd[1]}{SEP}99999{SEP}1{SEP}{pxd[4]}"
+    os.rename(str(bxd.root / "inflight" / txd.incarnation),
+              str(bxd.root / "inflight" / deadxd))
+    claim_st = os.lstat(str(bxd.root / "inflight" / deadxd))
+    _real_lstat = os.lstat
+
+    def _xdev_lstat(path, *a, **kw):
+        st = _real_lstat(path, *a, **kw)
+        if str(path).endswith(xdev_name):
+            # Same st_ino as the dead claim, different st_dev: the cross-
+            # device shape an inode-only comparison misclassifies as a twin.
+            return os.stat_result((st.st_mode, claim_st.st_ino,
+                                   claim_st.st_dev + 1, st.st_nlink,
+                                   st.st_uid, st.st_gid, st.st_size,
+                                   st.st_atime, st.st_mtime, st.st_ctime))
+        return st
+
+    os.lstat = _xdev_lstat
+    try:
+        repxd = bxd.recover()
+    finally:
+        os.lstat = _real_lstat
+    check(kxd in repxd.recovered and kxd not in repxd.quarantined,
+          "same-inode/different-device entry is NOT a twin: dead claim re-readied")
+    check((bxd.root / "ready" / kxd).exists(),
+          "cross-device false-twin: the item is deliverable again, not suppressed")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")
