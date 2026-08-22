@@ -89,13 +89,24 @@ def resolve_claim_backend(repo_root: Optional[Path] = None) -> str:
     config must not take the proactive leg down. That includes a `delivery`
     of the wrong SHAPE: this loader is schema-lenient by design, so a scalar
     or list there must degrade like a typo, not raise AttributeError.
+    Never-raise does not mean never-warn: each unrecognised value gets one
+    stderr line, and an unparseable env override defers to the CONFIGURED
+    value rather than discarding it (garbage is not an override).
     """
     delivery = load_config(repo_root).get("delivery")
     if not isinstance(delivery, dict):
         delivery = {}
     configured = str(delivery.get("claim_backend") or "a").strip().lower()
-    chosen = os.environ.get("SUTANDO_CLAIM_BACKEND", "").strip().lower() or configured
-    return chosen if chosen in _CLAIM_BACKENDS else "a"
+    if configured not in _CLAIM_BACKENDS:
+        print(f"sutando_config: unrecognised delivery.claim_backend "
+              f"{configured!r} — using \"a\"", file=sys.stderr)
+        configured = "a"
+    env = os.environ.get("SUTANDO_CLAIM_BACKEND", "").strip().lower()
+    if env and env not in _CLAIM_BACKENDS:
+        print(f"sutando_config: unrecognised SUTANDO_CLAIM_BACKEND {env!r} — "
+              f"keeping configured {configured!r}", file=sys.stderr)
+        env = ""
+    return env or configured
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:

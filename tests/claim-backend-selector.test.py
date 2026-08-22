@@ -74,6 +74,25 @@ check(_resolve(cfg="design-c") == "a", "unrecognised config value falls back to 
 check(_resolve(env="zzz") == "a", "unrecognised env value falls back to 'a'")
 check(_resolve(cfg="") == "a", "empty config value falls back to 'a'")
 
+# Review findings (sutando-rui, bounded pass on dc38adbc): never-raise is not
+# never-warn, and garbage in the env is not an override of a valid config.
+check(_resolve(env="zzz", cfg="c") == "c",
+      "unparseable env DEFERS to the configured 'c' instead of discarding it")
+import io as _io
+_err = _io.StringIO()
+with contextlib.redirect_stderr(_err):
+    _resolve(cfg="design-c")
+    _resolve(env="zzz", cfg="c")
+check("claim_backend 'design-c'" in _err.getvalue(),
+      "an unrecognised config value warns on stderr (typo is visible in logs)")
+check("SUTANDO_CLAIM_BACKEND 'zzz'" in _err.getvalue()
+      and "keeping configured 'c'" in _err.getvalue(),
+      "an unparseable env override warns and names what it kept")
+_err2 = _io.StringIO()
+with contextlib.redirect_stderr(_err2):
+    check(_resolve(cfg="c") == "c", "valid config resolves silently")
+check(_err2.getvalue() == "", "and the happy path writes nothing to stderr")
+
 
 def _resolve_raw_delivery(value):
     """Set `delivery` ITSELF to `value` — _resolve only reaches claim_backend."""
