@@ -8,9 +8,11 @@ never imports or locates a repo-specific loop.
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
-sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+_SRC = Path(__file__).resolve().parent
+REPO = _SRC.parent
+for _p in (str(_SRC), str(REPO / "packages" / "ag2-sparrow")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from workspace_default import resolve_workspace  # noqa: E402
 from ag2_sparrow.sparrowd import WorkerSpec, run  # noqa: E402
