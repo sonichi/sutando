@@ -201,10 +201,20 @@ excuses the other's absence. Step 3 escalates and is time-gated rather than gap-
    sweep. Do it first when it is missing: the party genuinely never had the item in their queue, so
    **escalation (step 3) may then be unnecessary — step 2 is not.** Creating the request never
    discharges the notification; if both were missing, both are still owed.
-2. **Notify their agent in the shared work room — only if no state-change notification has been
-   delivered since the last state change.** Resolve the person *and* their agent from the map
-   **before** addressing anyone — a nudge sent to a stale handle reads as answered to you and arrives
-   nowhere. An agent stands in for its person and is reachable when the human is not.
+2. **Notify the responsible party where their resolved identity is actually live — only if no
+   state-change notification has been delivered since the last state change.** Resolve the person
+   *and* their agent from the map **before** addressing anyone — a nudge sent to a stale handle reads
+   as answered to you and arrives nowhere. An agent stands in for its person and is reachable when the
+   human is not. **Prefer the shared work room when the party is reachable there** (the work already
+   has context); otherwise use whatever addressed surface the map says is live, honouring
+   `exclusive: true` — the reachability contract below is explicit that some people are reachable on
+   exactly one surface and a message anywhere else reaches nobody. **Hard-wiring this step to the
+   shared room contradicts that contract and produces the defect this section exists to remove:** a
+   durable request created while a reachable person stays unaware, with no immediate-awareness action
+   available until the horizon. If no addressed route is constructible at all, **record the
+   immediate-notification channel as unavailable** — that is satisfied, not pending, exactly as the
+   durable-request branch is. Step 3 remains the later escalation; it must never be used to delay
+   first awareness.
 3. **Escalate to the person's own channel only after the recorded horizon.** Set `escalate_after`
    **when the ask is first made**, derived from the item's urgency and the team's conventions, and
    record it with the ask. Escalate only when the horizon has passed, **every constructible channel
