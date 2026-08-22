@@ -599,13 +599,16 @@ else
 fi
 
 # Check Accessibility (needed for context drop shortcut)
-if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
-  echo "  ⚠ Accessibility not granted"
-  echo "    → System Settings → Privacy & Security → Accessibility"
-  echo "    → Add Terminal.app or Shortcuts.app"
-else
-  echo "  ✓ Accessibility"
-fi
+source "$REPO/src/accessibility_probe.sh"
+accessibility_probe
+case $? in
+  0)   echo "  ✓ Accessibility" ;;
+  124) echo "  ⚠ Accessibility UNKNOWN — probe timed out after ${ACCESSIBILITY_PROBE_TIMEOUT_S}s"
+       echo "    This session cannot answer the prompt (headless/SSH); the grant may be fine." ;;
+  *)   echo "  ⚠ Accessibility not granted"
+       echo "    → System Settings → Privacy & Security → Accessibility"
+       echo "    → Add Terminal.app or Shortcuts.app" ;;
+esac
 echo ""
 
 # Install Claude Code skills (runs every startup, idempotent)

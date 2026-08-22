@@ -382,10 +382,15 @@ preflight() {
     log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant the app running this terminal, then quit + relaunch it)"
     perms_warn=1
   fi
-  if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
-    log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
-    perms_warn=1
-  fi
+  source "$REPO/src/accessibility_probe.sh"
+  accessibility_probe
+  case $? in
+    0)   : ;;
+    124) log "  ⚠ Accessibility UNKNOWN — probe timed out (headless session cannot answer)"
+         perms_warn=1 ;;
+    *)   log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
+         perms_warn=1 ;;
+  esac
 
   # One-line summary regardless of mode (this is the value-add)
   local cli_str="all-ok"
