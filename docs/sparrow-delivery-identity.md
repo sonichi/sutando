@@ -24,10 +24,12 @@ no schema, and no code path — B's later slices do that, referencing this text.
 
 One cross-boundary delivery: a specific object (task, result, event, permission
 message) moving across one trust/durability boundary. **One task may produce
-many deliveries** (inbound handoff, result outbound, a re-drive); **one delivery
-may span many attempts**; a delivery never becomes a second logical task.
+many deliveries** (inbound handoff, result outbound, a post-reconciliation
+RE-SEND per R2's table); **one delivery may span many attempts**; a delivery
+never becomes a second logical task.
 
-- Stable across restart, crash recovery, and manual re-drive (ratchet 2).
+- Stable across restart, crash recovery, and operator REQUEUE (R2's
+  preserved rows); only a post-reconciliation RE-SEND mints a successor.
 - Today's shipped approximations, PER LEG (the equality is not universal):
   the gateway result leg publishes the broker task id as `item_id`
   (`remote_gateway_bridge.py`, publish site) — there `item_id == task_id`,
