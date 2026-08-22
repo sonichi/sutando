@@ -169,8 +169,8 @@ REPLY_CHAIN_MAX_DEPTH = 8
 # reached within this bound, an explicit truncation marker is emitted.
 REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
-import result_audit
-import discord_result_delivery as _drd  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
+import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink)
+import discord_result_delivery as _drd  # noqa: E402  (top-level so hooks carry no lazy import)
 import delivery.router as result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 
 #: Consecutive polls each result file has been present-but-empty. Bridge-owned
