@@ -12,6 +12,12 @@ For irreversible actions (sending email, deleting files, financial transactions)
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
 
+**"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — not "keep this in
+mind", and not a licence to defer to a later session. Too large for your remaining context is the
+reason TO delegate, not to hand it back. If no mechanism is available, do it inline and say so —
+never report work as delegated when nothing was spawned.
+Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
+
 ## Architecture rules
 
 - **Core services** (`src/`, `skills/phone-conversation/`) are general-purpose infrastructure. They provide generic capabilities (audio streaming, task bridge, tool execution) but must NOT contain feature-specific logic.
@@ -101,7 +107,7 @@ All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`,
 
 **Resolution (every service reads the same):**
 
-**Default:** the workspace lives at `<repo>/workspace/` (in-repo). To override, edit `sutando.config.local.json` (per-clone, gitignored) — see [`docs/workspace-config.md`](docs/workspace-config.md). The `$SUTANDO_WORKSPACE` env var is no longer honored for workspace resolution as of v0.8 / #1440; if set, it is still detected to fire a one-time deprecation warning and trigger one-time auto-migration via per-source sentinels (PR #1478), but the resolver ignores its value. Historic anti-pattern: bridges fell back to the script's repo root via `Path(__file__).resolve().parent.parent`, which polluted `git status` and — when invoked from an app-bundled `src/` symlink — stranded owner DMs in a bundle-tasks/ dir while the watcher polled workspace-tasks/.
+**Default:** the workspace lives at `<repo>/workspace/` (in-repo). To override, edit `sutando.config.local.json` (per-clone, gitignored). `$SUTANDO_WORKSPACE` is no longer honored as of v0.8 / #1440 — see [`docs/workspace-config.md`](docs/workspace-config.md) for its deprecation behaviour and the repo-root fallback anti-pattern.
 
 **Use the helper, don't reinvent the fallback:**
 - Python: `from workspace_default import resolve_workspace` → returns a `Path`.
@@ -298,7 +304,7 @@ Tasks arrive from multiple channels via the same file bridge:
 MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`), and derive
 attachments from actions whose `kind == "attach"`. **Do not add a new private parser.**
 
-Attachment-path authorization is owned by `src/send_allowlist.py` before the upload sink. Migration status + the no-leak guard history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md). The dependency direction is one-way:
+Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. Migration status + the no-leak guard history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md). The dependency direction is one-way:
 
     parse_markers()  ->  send_allowlist.is_path_sendable()  ->  transport upload
 
@@ -311,7 +317,7 @@ delivered to the owner as literal text. Guarded by `tests/bridge-marker-no-leak.
 
 **Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix. The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
 
-Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/result_channel_key.py` (Python).
+Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python).
 
 **IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
 

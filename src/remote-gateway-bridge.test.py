@@ -700,6 +700,76 @@ def main() -> int:
               Path("proactive-1.to-discord.txt")) is False,
           "gateway gate refuses a foreign destined file")
 
+    # Guarded-tier suppression: team skip-only results post the marker
+    # line alone; the remainder never leaves the host.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TSKIP.txt").write_text(
+        "id: task-TSKIP\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TSKIP.txt").write_text(
+        "[no-send] internal bookkeeping note that must not reach the wire\n")
+    rtc._post_ready_results({"task-TSKIP"})
+    _posted = STATE["results"][_before:]
+    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-TSKIP.txt").exists(),
+          "team [no-send] POSTs (closes lease) and archives")
+    check(bool(_posted) and (_posted[0].get("body") or "").strip() == "[no-send]",
+          "team skip wire body is the marker line ALONE — remainder withheld")
+    # Control: a side-effectful marker from a guarded tier is still withheld.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TREDIR.txt").write_text(
+        "id: task-TREDIR\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TREDIR.txt").write_text(
+        "[channel: 12345678901234567] exfil attempt\n")
+    rtc._post_ready_results({"task-TREDIR"})
+    _posted = STATE["results"][_before:]
+    check(bool(_posted) and "[channel:" not in (_posted[0].get("body") or ""),
+          "team redirect marker still withheld (canned body, no redirect)")
+    # A deduped extra is inert only within the task-id grammar — the marker
+    # class admits newlines, so a forged extra must hit the guard, not repost.
+    _hostile = "[deduped: task-123\nSECRET sk-live-abcdef0123456789\nstolen]"
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TDEXF.txt").write_text(
+        "id: task-TDEXF\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDEXF.txt").write_text(_hostile + "\n")
+    rtc._post_ready_results({"task-TDEXF"})
+    _posted = STATE["results"][_before:]
+    check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
+          and "sk-live" not in (_posted[0].get("body") or ""),
+          "team deduped with out-of-grammar extra is withheld, not re-posted")
+    import team_result_guard as _guard
+    check(_guard.suppression_stub_for_tier("[deduped: task-abc_123]", "team")
+          == "[deduped: task-abc_123]",
+          "in-grammar deduped body reconstructs the exact marker line")
+    check(_guard.suppression_stub_for_tier("[future-marker]", "team") is None,
+          "unknown skip marker yields no stub (guard path, not [no-send])")
+
+    # DeliveryCore wiring, proven by side effects only the seam produces:
+    # outbox attempt accounting + UNKNOWN resolved by the idempotent re-send.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
+        "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
+    STATE["force_results_400"] = True
+    rtc._post_ready_results({"task-CORE1"})
+    check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
+          and len(STATE["results"]) == _before,
+          "refused POST leaves the result file for the next pass")
+    check(rtc._delivery_core().backend.attempts("task-CORE1") == 1,
+          "the refusal is recorded in the outbox (drain ran through the seam)")
+    STATE["force_results_400"] = False
+    STATE["force_results_502_once"] = True
+    _ifc = {"task-CORE1"}
+    rtc._post_ready_results(_ifc)
+    check(len(STATE["results"]) == _before + 1
+          and STATE["results"][-1]["id"] == "task-CORE1"
+          and STATE["results"][-1]["body"] == "core answer"
+          and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
+          "ambiguous 502 resolved by the idempotent re-send in ONE pass "
+          "(delivered + archived)")
+    check(not _ifc, "confirmed delivery retires the task from inflight")
+    STATE["results"].pop()
+    (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
     rtc._write_task(TASK)
