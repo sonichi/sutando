@@ -96,8 +96,16 @@ def _git_head(repo):
     except Exception:
         return None
 
+def _self_sha256():
+    import hashlib
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
 RUNTIME_IDENTITY = {"build_sha": _git_head(_REPO),
-                    "entrypoint": str(Path(__file__).resolve())}
+                    "entrypoint": str(Path(__file__).resolve()),
+                    "loader_sha256": _self_sha256()}
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
 

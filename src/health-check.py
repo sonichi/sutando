@@ -5645,8 +5645,27 @@ def check_runtime_identity(path: "Path | None" = None,
                 "detail": f"build drift: process runs {sha[:8]}, checkout "
                           f"HEAD is {head_sha[:8]} — restart to converge; "
                           + " ".join(bits)}
+    reported_fp = rt.get("loader_sha256")
+    if isinstance(reported_fp, str) and reported_fp:
+        import hashlib
+        try:
+            disk_fp = hashlib.sha256(
+                (REPO_DIR / "src" / "remote-gateway-bridge.py").read_bytes()).hexdigest()
+        except OSError:
+            disk_fp = None
+        if disk_fp and disk_fp != reported_fp:
+            return {"name": name, "status": "warn",
+                    "detail": "loader bytes drift: the running process was started "
+                              "from different loader contents than now on disk "
+                              "(same-HEAD dirty change?) — restart to converge; "
+                              + " ".join(bits)}
     expected = (REPO_DIR / "src" / "remote-gateway-bridge.py").resolve()
-    actual = Path(ep).resolve()
+    try:
+        actual = Path(ep).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return {"name": name, "status": "warn",
+                "detail": f"entrypoint path unresolvable (damaged telemetry): {ep!r}; "
+                          + " ".join(bits)}
     if actual != expected:
         return {"name": name, "status": "warn",
                 "detail": f"non-canonical entrypoint {ep} (expected {expected}); "

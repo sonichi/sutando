@@ -37,6 +37,10 @@ head = subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"],
                                text=True).strip()
 check(m.RUNTIME_IDENTITY.get("build_sha") == head,
       "loader injects the checkout HEAD as build_sha (pre-exec, exec-proof)")
+import hashlib as _hl
+check(m.RUNTIME_IDENTITY.get("loader_sha256") == _hl.sha256(
+      (REPO / "src" / "remote-gateway-bridge.py").read_bytes()).hexdigest(),
+      "loader self-hash equals its on-disk bytes at startup")
 check(str(m.RUNTIME_IDENTITY.get("entrypoint", "")).endswith(
     "src/remote-gateway-bridge.py"), "entrypoint names the canonical loader")
 
@@ -138,6 +142,32 @@ with tempfile.TemporaryDirectory() as td:
               "checkout HEAD unreadable: WARN — identity cannot be verified")
     finally:
         hc.REPO_DIR = saved_repo
+    # symlink-loop entrypoint (reviewer P1): probe warns, never raises
+    loop = Path(td) / "loop-link"
+    try:
+        loop.symlink_to(loop)
+    except OSError:
+        pass
+    p.write_text(json.dumps({"runtime": dict(GOOD, entrypoint=str(loop))}))
+    try:
+        r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+        raised = None
+    except Exception as e:                          # noqa: BLE001
+        r, raised = None, repr(e)
+    check(raised is None and r["status"] == "warn",
+          f"symlink-loop entrypoint: warn, probe never raises ({raised})")
+    # same-HEAD byte-change (reviewer P1): reported loader hash != disk -> warn
+    import hashlib
+    p.write_text(json.dumps({"runtime": dict(
+        GOOD, loader_sha256="0" * 64)}))
+    r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+    check(r["status"] == "warn" and "bytes drift" in r["detail"],
+          "same-HEAD loader byte change: warn bytes drift")
+    disk_fp = hashlib.sha256(
+        (REPO / "src" / "remote-gateway-bridge.py").read_bytes()).hexdigest()
+    p.write_text(json.dumps({"runtime": dict(GOOD, loader_sha256=disk_fp)}))
+    r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+    check(r["status"] == "ok", "matching loader hash: still ok")
     real_head = subprocess.check_output(
         ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
     p.write_text(json.dumps({"runtime": dict(GOOD, build_sha=real_head)}))
