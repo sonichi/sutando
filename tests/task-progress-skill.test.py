@@ -149,7 +149,7 @@ class TestSendSlack(unittest.TestCase):
 
 
 class TestSendDiscord(unittest.TestCase):
-    """send_discord routes through the shared src/discord_rest_client.py
+    """send_discord routes through the shared src/channels/discord/client.py
     chokepoint. The PRODUCTION client stays in the loop with a scripted
     delivery transport; `get_user` (a retried read, not part of the gated
     delivery class) is stubbed at method level."""
@@ -160,7 +160,7 @@ class TestSendDiscord(unittest.TestCase):
     def _bind_client(self, post_steps=None, get_user_steps=None):
         """Bind a scripted client; returns the recorded delivery requests."""
         sys.path.insert(0, str(REPO / "src"))
-        from discord_rest_client import DiscordRestClient
+        from channels.discord.client import DiscordRestClient
 
         calls = []
         steps = list(post_steps or [])
@@ -192,7 +192,7 @@ class TestSendDiscord(unittest.TestCase):
 
     def test_rest_client_factory_builds_shared_client(self):
         sys.path.insert(0, str(REPO / "src"))
-        from discord_rest_client import DiscordRestClient
+        from channels.discord.client import DiscordRestClient
         client = self.mod._rest_client("Bot-fake")
         self.assertIsInstance(client, DiscordRestClient)
         self.assertEqual(client._timeout, 10)
