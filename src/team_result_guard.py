@@ -81,20 +81,22 @@ def resolve_access_tier(task_file) -> str:
         content = Path(task_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return "guest"
-    before_task = content.split("\ntask:", 1)[0]
-    candidates = [
-        line.partition(":")[2].strip().lower()
-        for line in before_task.splitlines()
-        if line.startswith("access_tier:")
-    ]
-    if not candidates:
-        candidates = [
+    # LF-only split: the writer strips only \r/\n, so a Unicode line
+    # boundary in a field must not forge a header. str.splitlines() would.
+    def _tiers(text):
+        return [
             line.partition(":")[2].strip().lower()
-            for line in content.splitlines()
+            for line in text.split("\n")
             if line.startswith("access_tier:")
         ]
+    before_task = content.split("\ntask:", 1)[0]
+    candidates = _tiers(before_task) or _tiers(content)
     if not candidates:
         return "owner"
+    # Conflicting explicit tiers can only come from injection — fail closed.
+    normed = {"guest" if t == "other" else t for t in candidates}
+    if len(normed) > 1:
+        return "guest"
     tier = candidates[-1]
     if tier == "other":
         tier = "guest"
@@ -109,15 +111,17 @@ def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
         content = Path(task_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return True
-    before_task = content.split("\ntask:", 1)[0]
+    # LF-only split (see resolve_access_tier): a Unicode line boundary in a
+    # field must not forge a filter-off / collaborator stamp.
+    before_task = content.split("\ntask:", 1)[0].split("\n")
     filter_values = [
         line.partition(":")[2].strip()
-        for line in before_task.splitlines()
+        for line in before_task
         if line.startswith("sensitive_data_filter:")
     ]
     collaborator_values = [
         line.partition(":")[2].strip()
-        for line in before_task.splitlines()
+        for line in before_task
         if line.startswith("collaborator:")
     ]
     return filter_values != ["false"] or collaborator_values != ["true"]
