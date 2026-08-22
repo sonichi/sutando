@@ -66,8 +66,18 @@ A count with neither control is an assertion, not a measurement.
 
 Two install shapes cannot satisfy step 1's precondition, and both were found by agents trying honestly to comply:
 
-- **An agent that is always serving a task.** Every pass carries a `channel_id`, so there is no moment that is an operator context. The precondition is not merely inconvenient there; it is never satisfiable.
-- **A bundled install.** No `.git`, so the skill cannot be pulled or refreshed at all — a property of the packaging, not a choice available to the agent.
+**The test is per-pass, not per-agent.** Ask whether *this* pass has a serving `channel_id`:
+
+- **with** one → never bootstrap, no exceptions;
+- **without** one (a maintenance pass, owner-tier, serving no channel) → that *is* the operator context the boundary describes.
+
+Do not shortcut this by source type. "Cron passes carry no `channel_id`" is **host-specific and was measured false**: one host had 153 cron tasks with zero `channel_id`, another had 3 of 3 carrying one. Read the pass you are in.
+
+And do not read the gate as clearance when there is no serving channel. Measured: `gate(serving_channel_id=None, …)` returns **ALLOWED**, because the blacklist lookup misses and an empty blacklist permits — it fails **open**, not closed. That is an absence of jurisdiction, not a permission. A vacuous pass proves nothing, so the operator-context judgement stays yours; the gate cannot make it for you.
+
+The genuinely unreachable case is narrower than first written:
+
+- **A bundled install.** No `.git`, so the skill cannot be pulled or refreshed at all — a property of the packaging, not a choice available to the agent. Report the block and stop.
 
 In either case the correct action is to **report the block to the owner/operator and stop**, not to approximate compliance. An agent that judges its own context is the only thing currently enforcing this boundary, which is a weak place to put a privacy rule: prose does not fail because someone ignores it, it fails because *an instruction to cross it can look exactly like ordinary diligence*. That happened here — a request to "actually run it, not just read it" was well-intentioned and would have crossed the boundary within minutes of its landing.
 
