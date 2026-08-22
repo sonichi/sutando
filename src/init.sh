@@ -382,10 +382,19 @@ preflight() {
     log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant the app running this terminal, then quit + relaunch it)"
     perms_warn=1
   fi
-  source "$REPO/src/accessibility_probe.sh"
-  # `|| rc=$?` keeps this exempt from `set -e`; a bare non-zero call aborts
-  # init.sh before it ever emits its [Preflight] summary.
-  local acc_rc=0; accessibility_probe || acc_rc=$?
+  # $REPO is overridable (tests point it at a scratch dir), so fall back to
+  # alongside this script — an unguarded source under `set -e` aborts the run.
+  local __probe="$REPO/src/accessibility_probe.sh"
+  [ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
+  local acc_rc=0
+  if [ -f "$__probe" ]; then
+    # `|| rc=$?` keeps this exempt from `set -e`: a bare non-zero call would
+    # abort init.sh before it ever emits its [Preflight] summary.
+    source "$__probe"
+    accessibility_probe || acc_rc=$?
+  else
+    acc_rc=0   # no probe available: do not invent a permission verdict
+  fi
   case $acc_rc in
     0)   : ;;
     124) log "  ⚠ Accessibility UNKNOWN — probe timed out (headless session cannot answer)"

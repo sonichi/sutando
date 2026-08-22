@@ -75,6 +75,29 @@ else
   bad "the || rc=\$? form survives set -e and keeps the code"
 fi
 
-total=12
+# $REPO is overridable — tests point it at a scratch dir with no src/. An
+# unguarded `source "$REPO/..."` under `set -e` aborts before any output.
+for f in src/startup.sh src/init.sh; do
+  if grep -qE '^\s*(local )?source "\$REPO/src/accessibility_probe.sh"' "$REPO/$f"; then
+    bad "$f guards the probe source" "sources \$REPO unguarded; a scratch repo aborts it"
+  else
+    ok "$f guards the probe source"
+  fi
+done
+
+S="$(mktemp -d)"; mkdir -p "$S/.fake-home"
+SUTANDO_REPO="$S" SUTANDO_WORKSPACE="$S/.workspace" SUTANDO_TEST_MODE=1 \
+  HOME="$S/.fake-home" CLAUDE_CONFIG_DIR="$S/.fake-home/.claude" \
+  bash "$REPO/src/init.sh" --preflight > "$S/out" 2>&1
+prc=$?
+if [ "$prc" -eq 0 ] && [ "$(grep -c 'Preflight' "$S/out")" -eq 1 ]; then
+  ok "--preflight exits 0 and emits its summary with SUTANDO_REPO on a scratch dir"
+else
+  bad "--preflight exits 0 and emits its summary with SUTANDO_REPO on a scratch dir" \
+      "rc=$prc summary_lines=$(grep -c 'Preflight' "$S/out")"
+fi
+rm -rf "$S"
+
+total=15
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ] || exit 1
