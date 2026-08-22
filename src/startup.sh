@@ -1231,7 +1231,19 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
         echo "  ✓ ngrok ($NGROK_URL — reserved domain, no Twilio update needed)"
       else
         echo "  ✓ ngrok ($NGROK_URL)"
-        echo "  ⚠ Update Twilio webhook to: $NGROK_URL"
+        # Only warn when the tunnel actually moved. This used to fire on every
+        # boot regardless, so the one time it mattered was indistinguishable
+        # from the times it did not — and chasing it cost a round trip on
+        # 2026-08-22 for a webhook that was already correct.
+        TWILIO_CFG_URL=$(grep -E '^TWILIO_WEBHOOK_URL=' .env 2>/dev/null | head -1 \
+          | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs)
+        if [ -z "$TWILIO_CFG_URL" ]; then
+          echo "  ⚠ Point the Twilio webhook at: $NGROK_URL (no TWILIO_WEBHOOK_URL recorded)"
+        elif [ "$TWILIO_CFG_URL" != "$NGROK_URL" ]; then
+          echo "  ⚠ ngrok URL moved — update the Twilio webhook:"
+          echo "      was: $TWILIO_CFG_URL"
+          echo "      now: $NGROK_URL"
+        fi
       fi
     else
       echo "  ✗ ngrok (failed to start)"
