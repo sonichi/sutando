@@ -186,8 +186,9 @@ excuses the other's absence. Step 3 escalates and is time-gated rather than gap-
    nowhere. An agent stands in for its person and is reachable when the human is not.
 3. **Escalate to the person's own channel only after the recorded horizon.** Set `escalate_after`
    **when the ask is first made**, derived from the item's urgency and the team's conventions, and
-   record it with the ask. Escalate only when the horizon has passed, steps 1–2 are confirmed
-   *delivered*, and the state has still not changed. A fixed number of hours invented here would
+   record it with the ask. Escalate only when the horizon has passed, **every constructible channel
+   is confirmed *delivered*** — a channel recorded unavailable counts as **satisfied, not pending** —
+   and the state has still not changed. A fixed number of hours invented here would
    impose a uniform SLA on teams that do not share one; no horizon at all is "wait forever" wearing
    patience's clothes.
 
@@ -214,6 +215,10 @@ one; a rule with no terminal branch re-fires on every sweep.
   This is the case a "later steps may be unnecessary" reading would truncate into request-only, which
   is the state this section opens by calling broken.
 
+- **Unavailable-and-overdue** — the durable channel was recorded unavailable, step 2 was delivered,
+  and the horizon has passed. **Escalate.** Requiring an undeliverable step 1 first would strand this
+  item permanently, which is the one outcome every rule above exists to prevent.
+
 Each half keeps its own once-per-state-change record, so repairing one does not re-arm the other.
 
 ### Guardrails
@@ -229,7 +234,8 @@ Each half keeps its own once-per-state-change record, so repairing one does not 
   your owner; do not push, comment, or chase on their behalf.
 - **Send state-changing messages** — *"I addressed X; please re-review"* — never contentless
   *"any update?"* pings.
-- **A nudge is not a wait-state.** Verify that someone now holds the request, then keep working and
+- **A nudge is not a wait-state.** Verify that someone now holds the request — or that the durable
+  channel is recorded unavailable, which discharges this check rather than failing it — then keep working and
   track the item to completion, reassignment, or release. Blocked-on-someone is a cue to switch
   lanes, never to stop.
 - **Record what you did and when**, with the timestamp read from the artifact rather than the moment
