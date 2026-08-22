@@ -225,6 +225,56 @@ Keep stable team relationships separate from short-lived work-item collaboration
 
 Never convert one interaction into a stable behavior claim. Require repeated observations or an explicit statement. Use neutral, operational wording such as “usually reviews backend delivery changes” rather than personality judgments.
 
+## Work with customers
+
+Customer collaboration needs a clear owner, a shared working surface, and a durable record. Track,
+per customer:
+
+- the customer organization and its key contacts
+- each contact's role: decision-maker, champion, technical owner, user, or procurement
+- the internal owner and the responsible agent
+- active scope, commitments, blockers, deadlines, and the next action
+- preferred channels, response expectations, and VIP/priority status
+
+### Use each venue for the right purpose
+
+| Venue | Purpose |
+|---|---|
+| Slack Connect, AG2 Space, WhatsApp | day-to-day coordination |
+| GitHub or issue tracker | technical work and delivery status |
+| Email, documents, contracts, CRM | formal decisions and commitments |
+| Meetings | synchronous discussion — record the outcome in a durable venue afterward |
+
+**Always identify the source of truth, and do not let an important decision exist only in chat.** A
+decision that lives in a message thread has no owner, no version, and no reader after scrollback.
+
+### Keep the work moving
+
+1. Acknowledge customer requests promptly.
+2. Clarify the desired outcome, the urgency, and who the decision-maker is.
+3. Assign one internal owner and one clear next action.
+4. Give progress updates **when the state changes**, and before an agreed update deadline **even if
+   the work is not finished** — an update whose content is "still working" is still a state report.
+5. Surface blockers with options and a recommendation, not only a problem statement.
+6. Close the loop: record the outcome and confirm completion with the customer.
+
+⇒ **A customer request must never remain "waiting on nobody."** If ownership is unclear, establish an
+internal owner *before* promising a result. An unowned internal item stalls quietly; an unowned
+customer item stalls while someone outside is waiting on an answer they were led to expect.
+
+### Protect the boundary
+
+- Treat customer-facing rooms as **external or mixed-audience** spaces.
+- Do not carry internal discussion, blame, private incidents, credentials, or personnel context into
+  them.
+- **Distinguish a customer request from an accepted commitment.** The two look alike in a chat log and
+  differ entirely in what they oblige.
+- Do not promise scope, dates, pricing, or policy exceptions without the appropriate authority.
+- Keep an internal backchannel for private coordination, **and keep the customer-facing status
+  accurate and consistent with it** — a backchannel that diverges from what the customer has been told
+  is worse than no backchannel.
+
+
 ## Handle VIP and priority participants
 
 - Apply VIP status only from an explicit owner/organization designation or an authoritative configured source. Record who designated it, why, its scope, and any expiry.
