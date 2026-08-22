@@ -13,7 +13,15 @@ Build a living, evidence-backed collaboration map. Treat it as a coordination ai
 
 So run this once, before relying on the contract.
 
-**1. Sweep the task-file stream — as an owner/operator maintenance action, never mid-task.**
+**0. Seed the owner-stated identity map FIRST. The sweep enriches it; it never substitutes for it.**
+
+This ordering is measured, not stylistic. On a 7,810-file corpus the sweep produced immediately usable *room* knowledge — traffic ranking plus honest coverage flags — and, for *identities*, a schema-shaped pile: the top participant by traffic and **the owner themselves** both came back as bare unknown ids, because Discord headers carry no display name. Any heuristic of the form "high traffic ⇒ important human" would have misclassified the owner and a peer bot with identical confidence.
+
+Worse for derivation: a known cross-provider identity — one person holding a GitHub handle and a chat id whose display name collides with someone else's — was **underivable from that corpus at any confidence**. It existed in the map only as an owner-stated seed with provenance. That is what makes "owner-stated outranks derived" load-bearing rather than decorative.
+
+So: ask for a handful of mappings (GitHub handle ↔ chat id ↔ person) before sweeping. It is the highest-value minute available, and it is the part the sweep structurally cannot do for you.
+
+**1. Then sweep the task-file stream — as an owner/operator maintenance action, never mid-task.**
 
 > **The bootstrap is not permission-free, and "the bytes are already on disk" is not the test.** The context boundary is *serving-relative*: `src/discord_context_policy.py`'s `gate()` decides whether the channel you are **currently serving** may read some other channel, it fails closed, and it applies to owner-tier tasks too. A sweep run while serving one channel would pull rooms that gate would have refused — and because the sweep **persists** what it reads, those rooms then inform every later answer. That is strictly worse than a single blocked read.
 >
@@ -39,9 +47,20 @@ Record the result per [references/schema.md](references/schema.md), including `s
 
 **2. Expect it to surface defects, and record them rather than smoothing them.** Run against a real corpus it immediately produced unnamed high-traffic rooms, hundreds of truncated rosters, and a service account misfiled as human by a two-way agent/human split. Each is a real map entry — an unknown to resolve, a partial-coverage flag, a classification gap — not noise to filter out.
 
-**3. Hand-state the identities you already know.** A few cross-channel mappings (GitHub handle ↔ chat id ↔ person) are the highest-value minute available, because an owner-stated mapping outranks any derived one and carries its provenance. Derivation is *least* reliable exactly where it matters most: activity counts have no early signal, so someone who joined yesterday is indistinguishable from someone inactive.
+**3. (Already done at step 0 — kept here only as a pointer.)** See **Seed before you sweep** above; the ordering matters and the sweep does not substitute for it.
 
 **4. Then let the scheduled work maintain it.** Only once the map holds something does the contract's load-first path mean anything.
+
+**When the bootstrap is unreachable — say so and route it, do not quietly skip or quietly run it.**
+
+Two install shapes cannot satisfy step 1's precondition, and both were found by agents trying honestly to comply:
+
+- **An agent that is always serving a task.** Every pass carries a `channel_id`, so there is no moment that is an operator context. The precondition is not merely inconvenient there; it is never satisfiable.
+- **A bundled install.** No `.git`, so the skill cannot be pulled or refreshed at all — a property of the packaging, not a choice available to the agent.
+
+In either case the correct action is to **report the block to the owner/operator and stop**, not to approximate compliance. An agent that judges its own context is the only thing currently enforcing this boundary, which is a weak place to put a privacy rule: prose does not fail because someone ignores it, it fails because *an instruction to cross it can look exactly like ordinary diligence*. That happened here — a request to "actually run it, not just read it" was well-intentioned and would have crossed the boundary within minutes of its landing.
+
+If this ever needs a mechanical guard rather than a rule, the repo already has the shape: `discord-read.py` distinguishes a task-serving invocation from an operator one with an explicit `--operator` flag, and refuses rather than inferring.
 
 **The payoff to check for**: after step 1 you should be able to answer "who is in this room, and which of them are agents" and "where does this kind of work usually get discussed" without asking anyone. If you cannot, either the sweep did not run or its store did not persist — see **Where the map is stored**.
 
