@@ -67,9 +67,11 @@ def read_terminal_records(root: Path, item_id: str) -> "list[dict]":
             data = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        if isinstance(data, dict) and data.get("item_id") == item_id:
+        # Resolved at call time; the class is defined below in this module.
+        if DesignCClaimBackend._record_is_terminal_proof(data) \
+                and data.get("item_id") == item_id:
             out.append(data)
-    out.sort(key=lambda r: r.get("completed_ns") or 0)
+    out.sort(key=lambda r: r["completed_ns"])
     return out
 
 
@@ -235,6 +237,10 @@ class DesignCClaimBackend:
         if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker):
             return False                    # forged: worker != the record's
         key = parts[0]
+        # item_id must bind to the incarnation's key BEFORE any mutation: an
+        # inconsistent token would archive an unfindable receipt (round-4 P1).
+        if _safe_key(token.item_id) != key:
+            return False
         src = self.root / INFLIGHT / token.incarnation
         with self._lock(key):
             # The filename IS the record: presence + worker match above are
@@ -311,7 +317,11 @@ class DesignCClaimBackend:
         data = json.dumps(record).encode()
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
-            os.write(fd, data)
+            off = 0
+            while off < len(data):
+                # os.write may legally write fewer bytes; a truncated record
+                # finalizing as the item's only receipt is the hole C closes.
+                off += os.write(fd, data[off:])
             if self.durability != "lax":
                 os.fsync(fd)
         finally:
@@ -343,43 +353,72 @@ class DesignCClaimBackend:
 
     def terminal_records(self, item_id: str) -> "list[dict]":
         """All terminal records for `item_id`, oldest first by completed_ns.
-        Legacy filename-format entries carry no receipt and are not listed."""
+        Legacy filename-format entries carry no receipt and are not listed.
+        Records failing the total validator are never returned as proof."""
         return read_terminal_records(self.root, item_id)
 
     @staticmethod
-    def _staged_is_complete(staged, incarnation: str) -> bool:
+    def _record_is_terminal_proof(rec) -> bool:
+        """The ONE total validator — shared by staged promotion, archive
+        retirement, and reads (divergent copies were round-4's P1 #2)."""
+        if not isinstance(rec, dict) or rec.get("schema") != 1:
+            return False
+        item_id = rec.get("item_id")
+        # "" is a legal id (publish("") is contract-valid); the _safe_key
+        # binding, not truthiness, is what discriminates.
+        if not isinstance(item_id, str):
+            return False
+        if rec.get("outcome") != DeliveryOutcome.CONFIRMED.value:
+            return False                     # C stages terminals ONLY for confirmed
+        receipt = rec.get("receipt")
+        # _write_terminal always emits both keys (values may be None); a
+        # receipt without them was not produced by the writer.
+        if not isinstance(receipt, dict) \
+                or "provider" not in receipt or "destination" not in receipt:
+            return False
+        if not isinstance(rec.get("completed_ns"), int) \
+                or not isinstance(rec.get("attempts"), int):
+            return False
+        worker = rec.get("worker")
+        # "" stays rejected here: _safe_component refuses it at claim time,
+        # so no real incarnation can carry an empty worker.
+        if not isinstance(worker, str) or not worker:
+            return False
+        inc = rec.get("incarnation")
+        if not isinstance(inc, str):
+            return False
+        iparts = inc.split(SEP)
+        if not iparts or iparts[0] != _safe_key(item_id):
+            return False                     # record's own incarnation/id split
+        if len(iparts) >= 2 and _safe_component(worker) != iparts[1]:
+            return False
+        return True
+
+    @classmethod
+    def _staged_is_complete(cls, staged, incarnation: str) -> bool:
         """Authoritative = a record _write_terminal() could have produced,
         bound to the staging filename's incarnation. Anything less is torn."""
-        if not isinstance(staged, dict) or staged.get("schema") != 1:
-            return False
-        if staged.get("incarnation") != incarnation:
-            return False                     # foreign or missing binding
-        parts = incarnation.split(SEP)
-        if not staged.get("item_id") or _safe_key(staged["item_id"]) != parts[0]:
-            return False
-        if staged.get("outcome") != DeliveryOutcome.CONFIRMED.value:
-            return False                     # C stages terminals ONLY for confirmed
-        if not isinstance(staged.get("receipt"), dict):
-            return False
-        if len(parts) >= 2 and _safe_component(str(staged.get("worker"))) != parts[1]:
-            return False                     # worker must match the claim's
-        return isinstance(staged.get("completed_ns"), int) \
-            and isinstance(staged.get("attempts"), int)
+        return cls._record_is_terminal_proof(staged) \
+            and staged.get("incarnation") == incarnation
 
     def _incarnation_is_terminal(self, key: str, incarnation: str) -> bool:
         """True iff an archive entry records THIS incarnation as completed:
-        a JSON record whose incarnation field matches, or a legacy rename whose
-        filename begins with the incarnation. Keyed by claim, never item id."""
+        a COMPLETE JSON record bound to it, or a legacy rename whose filename
+        begins with the incarnation. Keyed by claim, never item id."""
         for f in self._d(ARCHIVE).iterdir():
             if f.name.startswith(incarnation):
-                return True                        # legacy rename format
+                # Legacy renames are atomic claim-file moves: presence is
+                # complete evidence by construction; there is no torn state.
+                return True
             if not (f.name.startswith(f"{key}") and f.suffix == ".json"):
                 continue
             try:
                 rec = json.loads(f.read_text())
             except (OSError, ValueError):
                 continue
-            if isinstance(rec, dict) and rec.get("incarnation") == incarnation:
+            # A record authorizes retiring a LIVE claim only when it passes
+            # the same total validation as staging; malformed fails closed.
+            if self._staged_is_complete(rec, incarnation):
                 return True
         return False
 
@@ -428,6 +467,9 @@ class DesignCClaimBackend:
             if self._incarnation_is_terminal(key, f.name):
                 with self._lock(key):
                     if f.exists():
+                        # M-D: the archive ENTRY must be durable before the
+                        # claim dies, or a crash strands neither proof nor claim.
+                        self._strict_dir_barrier()
                         f.unlink(missing_ok=True)
                         rep.retired.append(key)
                 continue

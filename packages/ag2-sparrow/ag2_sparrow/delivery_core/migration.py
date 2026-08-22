@@ -116,7 +116,7 @@ def import_a_state(root: Path) -> dict:
     import json as _json
     import time as _time
 
-    from .backend_c import SEP, DesignCClaimBackend, _safe_key
+    from .backend_c import SEP, DesignCClaimBackend, _safe_component, _safe_key
 
     root = Path(root)
     items_dir = root / ".items"
@@ -188,7 +188,10 @@ def import_a_state(root: Path) -> dict:
                 "receipt": {"provider": rec.get("provider"),
                              "destination": rec.get("destination")},
                 "completed_ns": _time.time_ns(), "worker": "a-import",
-                "attempts": n, "incarnation": None, "imported": True,
+                # 2-part pseudo-incarnation: binds id+worker for the total
+                # validator, can never equal a real 5-part claim filename.
+                "attempts": n, "imported": True,
+                "incarnation": f"{key}{SEP}{_safe_component('a-import')}",
             }, f"a-import{SEP}{key}")
             report["delivered"] += 1
         elif status == "PARKED":

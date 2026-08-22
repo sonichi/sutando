@@ -84,11 +84,26 @@ with tempfile.TemporaryDirectory() as td:
     (b3.root / "archive" / f"{k3}.json").write_text(json.dumps(
         {"schema": 1, "item_id": "item-3", "outcome": "confirmed",
          "receipt": {"provider": "P", "destination": "D"},
+         "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
          "incarnation": tok3.incarnation}))
     rep3 = b3.recover()
     check(k3 in rep3.retired, "M-D crash: stale claim retired, not re-readied")
     check(not (b3.root / "ready" / k3).exists(),
           "M-D crash: item is NOT redelivered (no double-send)")
+
+    # ── REVIEW CONTROL: a malformed archive record must not retire a
+    #    live claim (fail closed — the item would be silently lost) ──────
+    b3b = fresh(td, "md-malformed")
+    b3b.publish("item-3b", b"p")
+    tok3b = b3b.claim("item-3b", "w0")
+    k3b = _safe_key("item-3b")
+    (b3b.root / "archive" / f"{k3b}.json").write_text(json.dumps(
+        {"incarnation": tok3b.incarnation}))
+    rep3b = b3b.recover()
+    check(k3b not in rep3b.retired,
+          "malformed archive record does NOT authorize retirement")
+    check((b3b.root / "inflight" / tok3b.incarnation).exists(),
+          "the live claim survives a malformed archive record")
 
     # ── legacy filename-format archive entries: OWN incarnation retires,
     #    a FOREIGN one never touches a live claim ─────────────────────────
@@ -228,6 +243,170 @@ with tempfile.TemporaryDirectory() as td:
     check((b13.root / "inflight" / tok13.incarnation).exists()
           or (b13.root / "ready" / _safe_key("item-13")).exists(),
           "and the delivery survives")
+
+    # ── REVIEW CONTROL: legal SHORT writes still persist the full record ─
+    from unittest import mock
+    b14 = fresh(td, "short-write")
+    b14.publish("item-14", b"p")
+    tok14 = b14.claim("item-14", "w0")
+    _real_write = os.write
+    with mock.patch.object(os, "write",
+                           side_effect=lambda fd, d: _real_write(fd, d[:7])):
+        ok14 = b14.complete(tok14, DeliveryOutcome.CONFIRMED,
+                            provider="P", destination="D")
+    check(ok14, "complete() succeeds under 7-byte short writes")
+    rec14 = b14.terminal_record("item-14")
+    check(rec14 is not None and rec14["receipt"]["destination"] == "D",
+          "short writes: the archived record is COMPLETE, not truncated")
+    check(not (b14.root / "inflight" / tok14.incarnation).exists(),
+          "and the claim released only after the full record landed")
+
+    # ── REVIEW CONTROL: crash MID-write keeps the claim (no lost proof) ─
+    b15 = fresh(td, "midwrite-crash")
+    b15.publish("item-15", b"p")
+    tok15 = b15.claim("item-15", "w0")
+    calls = {"n": 0}
+
+    def _one_then_crash(fd, d):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("simulated crash mid-write")
+        return _real_write(fd, d[:7])
+    try:
+        with mock.patch.object(os, "write", side_effect=_one_then_crash):
+            b15.complete(tok15, DeliveryOutcome.CONFIRMED,
+                         provider="P", destination="D")
+        crashed = False
+    except OSError:
+        crashed = True
+    check(crashed, "mid-write crash propagates out of complete()")
+    check((b15.root / "inflight" / tok15.incarnation).exists(),
+          "mid-write crash: the claim REMAINS held (release never ran)")
+    check(b15.terminal_record("item-15") is None,
+          "mid-write crash: no truncated record was finalized")
+    b15.recover()
+    check(not list((b15.root / "tmp").glob(f"{TERMINAL_TAG}{SEP}*.json")),
+          "recover() deletes the torn staging temp")
+    check((b15.root / "inflight" / tok15.incarnation).exists(),
+          "and the LIVE holder's claim survives recovery")
+
+    # ── REVIEW CONTROLS: malformed staged fields never abort recovery ──
+    for label, field, bad in (("int item_id", "item_id", 7),
+                              ("empty worker", "worker", "")):
+        bx = fresh(td, f"malformed-{field}")
+        bx.publish("item-x", b"p")
+        tokx = bx.claim("item-x", "w0")
+        recx = {"schema": 1, "item_id": "item-x", "outcome": "confirmed",
+                "receipt": {"provider": "P", "destination": "D"},
+                "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
+                "incarnation": tokx.incarnation, field: bad}
+        staged = bx.root / "tmp" / f"{TERMINAL_TAG}{SEP}{tokx.incarnation}{SEP}1.json"
+        staged.write_text(json.dumps(recx))
+        aborted = False
+        try:
+            bx.recover()
+            bx.recover()                     # a second pass must not wedge either
+        except (TypeError, ValueError):
+            aborted = True
+        check(not aborted, f"{label}: recovery passes complete without raising")
+        check(not staged.exists(), f"{label}: the malformed staging record is deleted")
+        check((bx.root / "inflight" / tokx.incarnation).exists()
+              or (bx.root / "ready" / _safe_key("item-x")).exists(),
+              f"{label}: the delivery is not lost")
+
+    # ── REVIEW CONTROL: publish("") is contract-legal; its staged terminal
+    #    must FINALIZE, not be deleted-and-redelivered (double-send) ──────
+    be = fresh(td, "empty-id")
+    be.publish("", b"p")
+    toke = be.claim("", "w0")
+    ke = _safe_key("")
+    rece = {"schema": 1, "item_id": "", "outcome": "confirmed",
+            "receipt": {"provider": "P", "destination": "D"},
+            "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
+            "incarnation": toke.incarnation}
+    stg = be.root / "tmp" / f"{TERMINAL_TAG}{SEP}{toke.incarnation}{SEP}1.json"
+    stg.write_text(json.dumps(rece))
+    repe = be.recover()
+    check(ke in repe.retired, 'empty item_id: R-M staged record finalizes')
+    check(be.terminal_record("") is not None,
+          'empty item_id: terminal record preserved (not deleted)')
+    check(not (be.root / "ready" / ke).exists(),
+          'empty item_id: NOT re-armed for redelivery')
+
+    # ── ROUND-4 CONTROLS (keweichen) ───────────────────────────────────
+    # 1. Strict M-D recovery barriers the archive dir BEFORE the claim dies.
+    b20 = fresh(td, "strict-md", durability="strict")
+    b20.publish("item-20", b"p")
+    tok20 = b20.claim("item-20", "w0")
+    k20 = _safe_key("item-20")
+    (b20.root / "archive" / f"{k20}.json").write_text(json.dumps(
+        {"schema": 1, "item_id": "item-20", "outcome": "confirmed",
+         "receipt": {"provider": "P", "destination": "D"},
+         "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
+         "incarnation": tok20.incarnation}))
+    barriers = []
+    orig_barrier = b20._strict_dir_barrier
+    b20._strict_dir_barrier = lambda: barriers.append(
+        (b20.root / "inflight" / tok20.incarnation).exists()) or orig_barrier()
+    rep20 = b20.recover()
+    b20._strict_dir_barrier = orig_barrier
+    check(k20 in rep20.retired, "strict M-D: claim retired")
+    check(len(barriers) >= 1 and barriers[0] is True,
+          "strict M-D: archive dir barrier fires BEFORE the claim unlink")
+
+    # 2a. An empty receipt {} never authorizes retirement nor reads as proof.
+    b21 = fresh(td, "empty-receipt")
+    b21.publish("item-21", b"p")
+    tok21 = b21.claim("item-21", "w0")
+    k21 = _safe_key("item-21")
+    (b21.root / "archive" / f"{k21}.json").write_text(json.dumps(
+        {"schema": 1, "item_id": "item-21", "outcome": "confirmed",
+         "receipt": {}, "completed_ns": time.time_ns(), "worker": "w0",
+         "attempts": 0, "incarnation": tok21.incarnation}))
+    rep21 = b21.recover()
+    check(k21 not in rep21.retired
+          and (b21.root / "inflight" / tok21.incarnation).exists(),
+          "empty receipt: live claim survives (not writer-produced)")
+    check(b21.terminal_record("item-21") is None,
+          "empty receipt: never returned as terminal proof")
+
+    # 2b. A malformed record beside a valid one: reads return the valid one
+    #     and never raise on unsortable metadata.
+    b22 = fresh(td, "malformed-read")
+    b22.publish("item-22", b"p")
+    b22.complete(b22.claim("item-22", "w0"), DeliveryOutcome.CONFIRMED,
+                 provider="P", destination="D")
+    k22 = _safe_key("item-22")
+    (b22.root / "archive" / f"{k22}{SEP}999.json").write_text(json.dumps(
+        {"schema": 1, "item_id": "item-22", "outcome": "confirmed",
+         "receipt": {"provider": "P", "destination": "D"},
+         "completed_ns": "newest", "worker": "w0", "attempts": 0,
+         "incarnation": "bogus"}))
+    try:
+        rec22 = b22.terminal_record("item-22")
+        raised = False
+    except TypeError:
+        rec22, raised = None, True
+    check(not raised, "malformed completed_ns: read does not raise")
+    check(rec22 is not None and rec22["receipt"]["provider"] == "P",
+          "malformed record beside valid: the VALID one is returned")
+
+    # 3. A token whose item_id does not bind to the incarnation key is
+    #    refused before any mutation.
+    b23 = fresh(td, "unbound-token")
+    b23.publish("item-23", b"p")
+    tok23 = b23.claim("item-23", "w0")
+    from ag2_sparrow.delivery_core.contract import ClaimToken
+    forged = ClaimToken(item_id="different-item", worker="w0",
+                        incarnation=tok23.incarnation)
+    ok23 = b23.complete(forged, DeliveryOutcome.CONFIRMED,
+                        provider="P", destination="D")
+    check(ok23 is False, "unbound token: complete() refuses")
+    check((b23.root / "inflight" / tok23.incarnation).exists(),
+          "unbound token: claim intact, nothing archived")
+    check(b23.terminal_record("different-item") is None
+          and b23.terminal_record("item-23") is None,
+          "unbound token: no unfindable receipt was written")
 
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
