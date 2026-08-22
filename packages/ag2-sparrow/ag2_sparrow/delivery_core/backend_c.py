@@ -407,9 +407,13 @@ class DesignCClaimBackend:
         begins with the incarnation. Keyed by claim, never item id."""
         for f in self._d(ARCHIVE).iterdir():
             if f.name.startswith(incarnation):
-                # Legacy renames are atomic claim-file moves: presence is
-                # complete evidence by construction; there is no torn state.
-                return True
+                # Only the exact legacy grammar (regular file, incarnation+
+                # SEP+nanos) is rename-atomic evidence; prefix-shares are not.
+                suffix = f.name[len(incarnation):]
+                # is_file() follows symlinks; a symlink is never rename-atomic.
+                if not f.is_symlink() and f.is_file() and suffix.startswith(SEP)                         and suffix[len(SEP):].isdigit():
+                    return True
+                continue
             if not (f.name.startswith(f"{key}") and f.suffix == ".json"):
                 continue
             try:
@@ -423,7 +427,8 @@ class DesignCClaimBackend:
         return False
 
     def recover(self) -> RecoverReport:
-        """Dead OWNERS' items return to ready/; UNKNOWN never touched. The
+        """Dead OWNERS' items return to ready/; OwnerState.UNKNOWN (process
+        liveness, NOT DeliveryOutcome.OUTCOME_UNKNOWN) never touched. The
         owner is the INCARNATION, not the pid: an ALIVE pid whose birth
         mismatches the token is a reused pid — the claimant is dead."""
         rep = RecoverReport()
@@ -482,6 +487,28 @@ class DesignCClaimBackend:
                 continue                    # genuinely the live holder
             with self._lock(key):
                 if not f.exists():
+                    continue
+                # A crash inside _quarantine leaves the claim's INODE already
+                # linked in undelivered/; finish that quarantine, never re-ready.
+                def _is_twin(q, dev, ino):
+                    # Fail-closed: the real twin is a REGULAR-file hardlink,
+                    # same (st_dev, st_ino) — inodes repeat across filesystems.
+                    try:
+                        st = os.lstat(str(q))
+                    except OSError:
+                        return False
+                    import stat as _stat
+                    return (_stat.S_ISREG(st.st_mode)
+                            and st.st_dev == dev and st.st_ino == ino)
+                try:
+                    _cst = os.lstat(str(f))
+                    claim_dev, claim_ino = _cst.st_dev, _cst.st_ino
+                except OSError:
+                    continue
+                if any(_is_twin(q, claim_dev, claim_ino)
+                       for q in self._d(PARKED).glob(f"{key}{SEP}*")):
+                    f.unlink(missing_ok=True)
+                    rep.quarantined.append(key)
                     continue
                 live, _dead = self._live_and_dead(key)
                 if any(t.name != f.name for t in live):

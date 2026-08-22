@@ -408,6 +408,99 @@ with tempfile.TemporaryDirectory() as td:
           and b23.terminal_record("item-23") is None,
           "unbound token: no unfindable receipt was written")
 
+    # ── ROUND-5 CONTROLS: only the EXACT legacy grammar is evidence ────
+    for label, maker in (
+        (".partial file", lambda r, inc: (r / "archive" / f"{inc}.partial").write_text("torn")),
+        ("directory sharing prefix", lambda r, inc: (r / "archive" / f"{inc}{SEP}123").mkdir()),
+        ("non-numeric suffix", lambda r, inc: (r / "archive" / f"{inc}{SEP}xyz").write_text("")),
+        ("exact-grammar SYMLINK", lambda r, inc: ((r / "outside.txt").write_text("x"), (r / "archive" / f"{inc}{SEP}123").symlink_to(r / "outside.txt"))),
+    ):
+        bl = fresh(td, f"legacy-{label.split()[0].strip('.')}")
+        bl.publish("item-L", b"p")
+        tokL = bl.claim("item-L", "w0")
+        maker(bl.root, tokL.incarnation)
+        repL = bl.recover()
+        check((bl.root / "inflight" / tokL.incarnation).exists(),
+              f"legacy grammar: {label} never retires the live claim")
+
+    # ── interrupted QUARANTINE (link done, unlink not): finish it,
+    #    never re-ready — UNKNOWN must not become a redelivery ─────────────
+    b30 = fresh(td, "quarantine-crash")
+    b30.publish("item-30", b"p")
+    tok30 = b30.claim("item-30", "w0")
+    k30 = _safe_key("item-30")
+    und30 = b30.root / "undelivered" / f"{k30}{SEP}outcome-unknown{SEP}123"
+    os.link(str(b30.root / "inflight" / tok30.incarnation), str(und30))
+    p30 = tok30.incarnation.split(SEP)
+    dead30 = f"{p30[0]}{SEP}{p30[1]}{SEP}99999{SEP}1{SEP}{p30[4]}"
+    os.rename(str(b30.root / "inflight" / tok30.incarnation),
+              str(b30.root / "inflight" / dead30))
+    rep30 = b30.recover()
+    check(k30 in rep30.quarantined and k30 not in rep30.recovered,
+          "interrupted quarantine is FINISHED by recovery, not re-readied")
+    check(not (b30.root / "ready" / k30).exists() and und30.exists(),
+          "UNKNOWN item stays quarantined (no redelivery of a maybe-received item)")
+
+    # ── malformed quarantine entries never wedge or spoof recovery ──────
+    for label, maker, expect_requeue in (
+        ("dangling symlink", lambda r, k: (r / "undelivered" / f"{k}{SEP}dang{SEP}1").symlink_to(r / "gone"), True),
+        ("directory entry", lambda r, k: (r / "undelivered" / f"{k}{SEP}dir{SEP}1").mkdir(), True),
+        ("unrelated regular file", lambda r, k: (r / "undelivered" / f"{k}{SEP}other{SEP}1").write_text("x"), True),
+    ):
+        bq = fresh(td, f"qmal-{label.split()[0]}")
+        bq.publish("item-Q", b"p")
+        tq = bq.claim("item-Q", "w0")
+        kq = _safe_key("item-Q")
+        maker(bq.root, kq)
+        pq = tq.incarnation.split(SEP)
+        deadq = f"{pq[0]}{SEP}{pq[1]}{SEP}99999{SEP}1{SEP}{pq[4]}"
+        os.rename(str(bq.root / "inflight" / tq.incarnation),
+                  str(bq.root / "inflight" / deadq))
+        try:
+            repq = bq.recover()
+            raised = False
+        except OSError:
+            repq, raised = None, True
+        check(not raised, f"quarantine {label}: recover() never raises")
+        check(repq is not None and (kq in repq.recovered) == expect_requeue,
+              f"quarantine {label}: dead claim re-readied (not a real twin)")
+
+    # ── ROUND-8 CONTROL: twin identity is (st_dev, st_ino) — a same-inode
+    #    entry on ANOTHER filesystem re-readies the dead claim, never twins ──
+    bxd = fresh(td, "qxdev")
+    bxd.publish("item-X", b"p")
+    txd = bxd.claim("item-X", "w0")
+    kxd = _safe_key("item-X")
+    xdev_name = f"{kxd}{SEP}xdev{SEP}1"
+    (bxd.root / "undelivered" / xdev_name).write_text("unrelated")
+    pxd = txd.incarnation.split(SEP)
+    deadxd = f"{pxd[0]}{SEP}{pxd[1]}{SEP}99999{SEP}1{SEP}{pxd[4]}"
+    os.rename(str(bxd.root / "inflight" / txd.incarnation),
+              str(bxd.root / "inflight" / deadxd))
+    claim_st = os.lstat(str(bxd.root / "inflight" / deadxd))
+    _real_lstat = os.lstat
+
+    def _xdev_lstat(path, *a, **kw):
+        st = _real_lstat(path, *a, **kw)
+        if str(path).endswith(xdev_name):
+            # Same st_ino as the dead claim, different st_dev: the cross-
+            # device shape an inode-only comparison misclassifies as a twin.
+            return os.stat_result((st.st_mode, claim_st.st_ino,
+                                   claim_st.st_dev + 1, st.st_nlink,
+                                   st.st_uid, st.st_gid, st.st_size,
+                                   st.st_atime, st.st_mtime, st.st_ctime))
+        return st
+
+    os.lstat = _xdev_lstat
+    try:
+        repxd = bxd.recover()
+    finally:
+        os.lstat = _real_lstat
+    check(kxd in repxd.recovered and kxd not in repxd.quarantined,
+          "same-inode/different-device entry is NOT a twin: dead claim re-readied")
+    check((bxd.root / "ready" / kxd).exists(),
+          "cross-device false-twin: the item is deliverable again, not suppressed")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")
