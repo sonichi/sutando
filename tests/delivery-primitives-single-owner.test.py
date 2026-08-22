@@ -92,12 +92,21 @@ def scan_instantiations(sources: dict) -> dict:
             tree = ast.parse(text, filename=path)
         except SyntaxError:
             continue
-        # Aliases count as the constructor they bind, resolved TRANSITIVELY
-        # to a fixed point over Assign+AnnAssign (fail-closed rebinding).
-        alias: dict[str, str] = {}
+        # Aliases bind the SET of constructors referenced anywhere in the
+        # RHS (any expression shape) — fail-closed over conditional selection.
+        alias: dict[str, set] = {}
         pending: list = []
+
+        def _refs(expr):
+            names = set()
+            for n in ast.walk(expr):
+                nm = (n.id if isinstance(n, ast.Name) else
+                      n.attr if isinstance(n, ast.Attribute) else None)
+                if nm:
+                    names.add(nm)
+            return names
+
         for node in ast.walk(tree):
-            tgt = rhs = None
             if isinstance(node, ast.Assign):
                 rhs = node.value
                 tgts = [t for t in node.targets if isinstance(t, ast.Name)]
@@ -107,26 +116,27 @@ def scan_instantiations(sources: dict) -> dict:
             elif isinstance(node, ast.ImportFrom):
                 for a in node.names:
                     if a.name in _CTORS and a.asname:
-                        alias[a.asname] = a.name
+                        alias.setdefault(a.asname, set()).add(a.name)
                 continue
             else:
                 continue
-            name = (rhs.id if isinstance(rhs, ast.Name) else
-                    rhs.attr if isinstance(rhs, ast.Attribute) else None)
-            if name is None:
-                continue
+            refs = _refs(rhs)
+            direct = refs & set(_CTORS)
+            indirect = refs - set(_CTORS)
             for t in tgts:
-                if name in _CTORS:
-                    alias[t.id] = name
-                else:
-                    pending.append((t.id, name))
+                if direct:
+                    alias.setdefault(t.id, set()).update(direct)
+                for src in indirect:
+                    pending.append((t.id, src))
         changed = True
         while changed:
             changed = False
             for tgt_id, src_name in pending:
-                if src_name in alias and tgt_id not in alias:
-                    alias[tgt_id] = alias[src_name]
-                    changed = True
+                if src_name in alias:
+                    tgt_set = alias.setdefault(tgt_id, set())
+                    if not alias[src_name] <= tgt_set:
+                        tgt_set.update(alias[src_name])
+                        changed = True
 
         def visit(node, enclosing):
             for child in ast.iter_child_nodes(node):
@@ -137,8 +147,9 @@ def scan_instantiations(sources: dict) -> dict:
                     fn = child.func
                     name = fn.id if isinstance(fn, ast.Name) else (
                         fn.attr if isinstance(fn, ast.Attribute) else None)
-                    ctor = name if name in _CTORS else alias.get(name or "")
-                    if ctor:
+                    ctors = ({name} if name in _CTORS
+                             else alias.get(name or "", set()))
+                    for ctor in sorted(ctors):
                         key = f"{path}::{enclosing}::{ctor}"
                         out[key] = out.get(key, 0) + 1
                 visit(child, enc)
@@ -238,6 +249,21 @@ mviol7 = instantiation_violations(scan_instantiations(mutated7),
                                   INSTANTIATION_OWNERS)
 check(any("_annotated_alias_leg::DesignCClaimBackend" in v for v in mviol7),
       "annotated alias mutation FAILS the gate and names its site")
+# conditional-selection alias (reviewer P1 r5, kewei's exact mutation shape):
+# an IfExp choosing between BOTH constructors binds both — either leg counts.
+mutated8 = dict(prod_sources)
+mutated8[_db] = prod_sources[_db] + (
+    "\n\nfrom ag2_sparrow.delivery_core import DesignAClaimBackend, "
+    "DesignCClaimBackend\n"
+    "def _selected_backend_leg(use_c):\n"
+    "    Backend = DesignCClaimBackend if use_c else DesignAClaimBackend\n"
+    "    return Backend('improvised')\n")
+mviol8 = instantiation_violations(scan_instantiations(mutated8),
+                                  INSTANTIATION_OWNERS)
+check(any("_selected_backend_leg::DesignCClaimBackend" in v for v in mviol8),
+      "conditional-selection mutation FAILS the gate (C leg named)")
+check(any("_selected_backend_leg::DesignAClaimBackend" in v for v in mviol8),
+      "conditional-selection mutation FAILS the gate (A leg named)")
 
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
