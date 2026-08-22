@@ -80,6 +80,32 @@ for prim, owners in OWNERS.items():
     check(not missing,
           f"{prim}: every pinned owner still defines it (gone: {sorted(missing)})")
 
+# ── claim-backend INSTANTIATION is injected, never improvised (ratchet) ────
+# Adapters bind DeliveryCore via the sanctioned constructor; a new direct
+# instantiation site anywhere is a fork of delivery state. The discord
+# proactive leg is pinned MIGRATION DEBT (#3279 action 2), not precedent.
+inst_sites: set[str] = set()
+for f in scan_files:
+    try:
+        tree = ast.parse(f.read_text(), filename=str(f))
+    except SyntaxError:
+        continue
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else (
+                fn.attr if isinstance(fn, ast.Attribute) else None)
+            if name in ("DesignAClaimBackend", "DesignCClaimBackend"):
+                inst_sites.add(rel(f))
+
+INSTANTIATION_OWNERS = {
+    "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",  # _delivery_core()
+    "src/discord-bridge.py",  # proactive-leg migration debt, ratcheted
+}
+extra_inst = inst_sites - INSTANTIATION_OWNERS
+check(not extra_inst,
+      f"claim backends instantiated only at sanctioned sites (new: {sorted(extra_inst)})")
+
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
     a, b = REPO / "src" / name, PKG / name
