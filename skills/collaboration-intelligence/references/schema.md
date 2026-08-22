@@ -158,9 +158,28 @@ store_freshness:
     coverage: full | partial | unknown      # partial when the provider truncated
     coverage_note: string | null            # e.g. "roster capped at 10 members"
     last_error_at: timestamp | null         # a failed sweep must not look like a quiet one
+    unknown_kind: unreachable_here | unsupported_by_provider | null
 ```
 
-**Report freshness with every miss.** When a lookup returns nothing, the answer is "not in the map; this source last swept at `<t>`, coverage `<c>`", never a bare "not found". A miss against a stale or partial source is a *reason to go look*, not a fact about the world — and the caller cannot make that distinction unless you hand it over.
+**`unknown_kind` answers the only question a miss actually raises: is it worth asking
+again?** Without it, a provider that structurally cannot enumerate members and one that
+merely lacks a token on this host return the same empty result, and the skill gives both
+the same advice — go look. For the structural case that sends the caller into a wall that
+produces no error, just another empty result indistinguishable from "not asked yet".
+
+- `unsupported_by_provider` — retrying is pointless anywhere. The gap is in the provider.
+- `unreachable_here` — retrying is pointless *on this host*, and may succeed on another
+  or after configuration. **It is host-local, so it must not be synced across hosts as a
+  fact**; one machine's "cannot reach" is another's ordinary success. Only
+  `unsupported_by_provider` is safely shareable.
+
+Record it per source at sweep time, not per lookup — it is a property of the source's
+capability, not of any one sweep, and re-deriving it per lookup means deriving it
+unverified every time.
+
+**Report freshness with every miss.** When a lookup returns nothing, the answer is "not in the map; this source last swept at `<t>`, coverage `<c>`", never a bare "not found". A miss against a stale or partial source is usually a *reason to go look*, not a fact about the world — and the caller cannot make that distinction unless you hand it over.
+
+The exception is `unknown_kind: unsupported_by_provider`, where going to look is the wall described above: report the miss as a property of the source, and do not advise a retry that cannot succeed. Hand over `unknown_kind` alongside `last_swept_at` and `coverage` so the caller can tell the two apart.
 
 `coverage: partial` is not a lesser `full`. A provider that caps a roster returns a complete-looking list, so partial coverage must be recorded at write time by comparing what was returned against the count the provider reported — it cannot be recovered afterwards by inspecting the stored data, which looks consistent either way.
 
