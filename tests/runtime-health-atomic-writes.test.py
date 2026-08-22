@@ -4,8 +4,12 @@ truncates before it writes, so a reader landing in that window sees an empty
 file. That is the #3156 shape: a zero-length read of shared state is not
 "absent", it is mid-write, and a consumer cannot tell the two apart.
 
-The module already had the correct pattern in `_write_station_cache` (tmp +
-os.replace) and did not use it for `runtime-health.json` / `core-verdict.json`.
+`_write_station_cache` was HALF right and was originally cited here as "the
+correct pattern": it staged and replaced, but through a FIXED `<path>.tmp`,
+which is itself shared state. Two overlapping callers stage on one inode and
+race the replace; one publishes, the other gets ENOENT, and its best-effort
+suppression reports success. Both writers now share one unique-staging
+contract, and best-effort stays the caller's policy at the edge.
 
 Run: python3 tests/runtime-health-atomic-writes.test.py
 """
@@ -126,6 +130,51 @@ class AtomicSharedStateWrites(unittest.TestCase):
         self.assertIn("ORIGINAL", str(ctx.exception),
                       f"cleanup error masked the write error: {ctx.exception}")
         self.assertNotIn("CLEANUP", str(ctx.exception))
+
+    def test_station_cache_also_stages_uniquely(self):
+        """Same production writer, same contract: `station-available.json` is
+        read by _station_cached() on the derive() hot path, so a concurrent
+        refresh must not collide on one staging inode."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        dest = d / "station-available.json"
+        seen = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            seen.append(os.path.basename(src))
+            return real_replace(src, dst)
+
+        os.replace = spy
+        try:
+            for i in range(4):
+                rh._write_station_cache(str(dest), {"n": i})
+        finally:
+            os.replace = real_replace
+
+        self.assertEqual(len(seen), 4)
+        self.assertEqual(len(set(seen)), 4, f"station cache reused a staging name: {seen}")
+        self.assertNotIn("station-available.json.tmp", seen,
+                         "the fixed staging name is the defect this contract removes")
+        self.assertEqual(json.loads(dest.read_text())["n"], 3)
+
+    def test_station_cache_stays_best_effort_and_leaves_no_staging_file(self):
+        """The caller's contract is unchanged: a failed cache write must not
+        raise into the probe, and must not strand a staging file either."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        dest = d / "station-available.json"
+        real_replace = os.replace
+
+        def boom(src, dst):
+            raise OSError("injected")
+
+        os.replace = boom
+        try:
+            rh._write_station_cache(str(dest), {"n": 1})   # must NOT raise
+        finally:
+            os.replace = real_replace
+
+        self.assertEqual([x.name for x in d.iterdir()], [],
+                         "a failed station-cache write stranded a staging file")
 
     def test_control_the_truncating_shape_really_does_expose_an_empty_file(self):
         """Without this, the assertions above could pass for the wrong reason."""
