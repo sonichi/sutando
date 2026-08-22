@@ -26,6 +26,11 @@ identities:
     display_name: string | null
     bridge_origin: string | null
     verified: false
+    activity:                       # WHERE this identity is live, not merely that it exists
+      last_seen_at: timestamp | null
+      rooms: [room-id]              # where it was actually observed
+      relative: primary | secondary | dormant | unknown
+      exclusive: true | false | unknown   # true = this person is reachable ONLY here
 owner_links:
   - owner_entity_id: stable-local-id
     relation: owner | operator | manager | sponsor | unknown
@@ -63,6 +68,7 @@ provider: string
 provider_room_id: stable-provider-native-room-or-channel-id
 provider_container_id: workspace-guild-server-community-id | null
 name: string | null
+topic: string | null              # the room's SELF-DECLARED purpose, read from provider state
 kind: dm | group_dm | channel | room | issue | pr | email_thread | other
 bridge_origin: string | null
 visibility: private | internal | public | unknown
@@ -220,6 +226,10 @@ quick_lookup:
 - Never use display-name equality alone. Two people can render the same name on one homeserver, so a display-name join does not merely lose precision — it returns *a* stable ID with full confidence, and the wrong one is indistinguishable from the right one downstream.
 - **An owner-stated mapping outranks any derived one.** Record it as an evidenced fact with `source: owner_stated` and the time it was stated, and do not let a later derivation silently supersede it. A derivation that disagrees with an owner statement is a conflict to surface, not a correction to apply.
 - Keep aliases after a verified rename; do not treat a rename as a new entity.
+- `name` and `topic` are mutable aliases, never keys. **`topic` is the room's self-declared
+  purpose (provider state); `purpose` is what the map inferred from traffic.** Store both, and
+  treat a divergence between them as a signal in its own right — usually a room whose real use
+  drifted while nobody updated the topic. Do not silently overwrite either with the other.
 - Supersede time-varying facts rather than deleting them silently.
 - Decay inferred operational facts when not reconfirmed: room context quickly, active responsibility moderately, identity and explicit ownership slowly.
 - Deduplicate alerts by `alert_key`; update `last_seen_at` instead of repeatedly notifying.

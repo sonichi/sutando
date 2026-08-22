@@ -1,11 +1,49 @@
 ---
 name: collaboration-intelligence
-description: Maintain and use a cross-channel collaboration map of rooms, people, agents, agent owners, relationships, expertise, feature ownership, purpose, roster, priority/VIP handling, and recent context. Trigger when an incoming task or message includes room/channel/sender/member metadata; the user asks who is in a room, what it is for, who owns or knows a component, where to ask, whom to contact or cc, or what recent context matters; you must coordinate, delegate, hand off, or escalate work to a person or agent — including when the task is phrased as an action you already know how to perform ("find a reviewer", "chase reviewers", "找reviewer", "ask someone to look at this", "who should I assign"), since naming it as a familiar action is how this trigger gets missed; a merge or approval gate reports a PR queued on nobody, short of the approvals its branch rule requires, or carrying an approval that is stale against the current head; a participant is unfamiliar, ambiguous, or explicitly designated VIP/priority; identities must be reconciled across AG2 Space/Matrix, Discord, Telegram, Slack, WhatsApp, email, GitHub, or another bridge; or a roster needs incremental refresh or sweep. Do not trigger for generic communication-platform questions or drafting that does not depend on room, identity, relationship, or collaboration context.
+description: Maintain and use a cross-channel collaboration map of rooms, people, agents, agent owners, relationships, expertise, ownership, roster, priority/VIP handling, and recent context. Trigger when a task or message carries room/channel/sender/member metadata; the user asks who is in a room, what it is for, who owns or knows a component, where to ask, or whom to contact or cc; you must coordinate, delegate, hand off, escalate, or pick who reviews something — including when phrased as an action you already know how to perform, since naming it as a familiar action is how this trigger gets missed; a merge or approval gate reports a PR queued on nobody, short of its required approvals, or carrying a stale approval; a participant is unfamiliar, ambiguous, or designated VIP/priority; identities must be reconciled across bridges; or a roster needs refresh. Do not trigger for generic communication-platform questions, or drafting that does not depend on room, identity, relationship, or collaboration context.
 ---
 
 # Collaboration Intelligence
 
 Build a living, evidence-backed collaboration map. Treat it as a coordination aid, not an authority or surveillance profile.
+
+## First run
+
+**A freshly installed map is empty, and the Operating contract below does not bootstrap it.** Step 1 there says to load the quick-lookup index first — on a new install there is no index, so an agent queries nothing, reports a miss, learns nothing, and stays empty. It never errors. An unbootstrapped map and a working one are indistinguishable from outside, which is the failure mode this skill exists to fight, turned on itself.
+
+So run this once, before relying on the contract.
+
+**1. Sweep the task-file stream — as an owner/operator maintenance action, never mid-task.**
+
+> **The bootstrap is not permission-free, and "the bytes are already on disk" is not the test.** The context boundary is *serving-relative*: `src/discord_context_policy.py`'s `gate()` decides whether the channel you are **currently serving** may read some other channel, it fails closed, and it applies to owner-tier tasks too. A sweep run while serving one channel would pull rooms that gate would have refused — and because the sweep **persists** what it reads, those rooms then inform every later answer. That is strictly worse than a single blocked read.
+>
+> So: run the bootstrap from an explicit owner/operator maintenance context, not as a side effect of handling a task. If you cannot establish that context, either filter every archived observation through the same serving-channel policy, or do not sweep. Record `access_scope` on each observation so a later answer cannot quietly widen it.
+
+**Header fields are source-specific — check, do not assume.** Writers differ, and the richest one is not representative:
+
+| source | provides | consequence |
+|---|---|---|
+| AG2 Space / Matrix | `channel_id`, `room_name`, `room_members`, `room_member_count`, `user_id` | rooms, names and rosters available |
+| Discord | `channel_id`, `channel_name`, `guild_name`, `user_id` | **no roster, no member count** — membership is `unknown`, not empty |
+| Slack | `channel_id`, `user_id` | id and speaker only; name and roster `unknown` |
+
+Treat a field the source never emits as **`unknown`**, never as absent-therefore-zero — a room with no roster field is not a room with no members. Set `coverage: unknown` for those sources and `coverage: partial` only where a roster was truncated (`+N more`), which is recordable **at sweep time** and unrecoverable afterwards.
+
+What the sweep yields, on the sources that carry it:
+
+- **rooms**, ranked by traffic, with provider-native ids and whatever name the source gave
+- **participants**, ranked by messages, classified `human` / `agent` / `service`
+- **unknowns worth resolving immediately** — rooms with real traffic but no name and no members observed
+
+Record the result per [references/schema.md](references/schema.md), including `store_freshness` per source. Do not enumerate rooms, inboxes or accounts you were not already given.
+
+**2. Expect it to surface defects, and record them rather than smoothing them.** Run against a real corpus it immediately produced unnamed high-traffic rooms, hundreds of truncated rosters, and a service account misfiled as human by a two-way agent/human split. Each is a real map entry — an unknown to resolve, a partial-coverage flag, a classification gap — not noise to filter out.
+
+**3. Hand-state the identities you already know.** A few cross-channel mappings (GitHub handle ↔ chat id ↔ person) are the highest-value minute available, because an owner-stated mapping outranks any derived one and carries its provenance. Derivation is *least* reliable exactly where it matters most: activity counts have no early signal, so someone who joined yesterday is indistinguishable from someone inactive.
+
+**4. Then let the scheduled work maintain it.** Only once the map holds something does the contract's load-first path mean anything.
+
+**The payoff to check for**: after step 1 you should be able to answer "who is in this room, and which of them are agents" and "where does this kind of work usually get discussed" without asking anyone. If you cannot, either the sweep did not run or its store did not persist — see **Where the map is stored**.
 
 ## Trigger behavior
 
@@ -20,7 +58,7 @@ Do not scan every connected service merely because the skill triggered. Expand t
 
 ## Firing without being asked
 
-A skill description is matched against how you *framed* the task, and that is exactly what fails. Measured: this description already said "you must coordinate, delegate, hand off, or escalate work to a person or agent" when an agent went to recruit PR reviewers — the case it literally names — and it did not fire, because the agent had named the task "chase reviewers" (an action it already knew how to perform) rather than "choose collaborators" (a decision needing a map). Adding trigger phrases does not fix that; a re-framed task evades any phrase list.
+A skill description is matched against how you *framed* the task, and that is exactly what fails. Measured: the description already named coordinating, delegating and escalating work to a person or agent when an agent went to recruit PR reviewers — the case it covers — and it did not fire, because the agent had named the task "chase reviewers" (an action it already knew how to perform) rather than "choose collaborators" (a decision needing a map). Adding trigger phrases does not fix that; a re-framed task evades any phrase list, and the front-matter budget is finite anyway — 1024 characters, which a phrase list burns fast.
 
 So do not rely on description matching alone. **Hook invocation to observable state, which does not depend on how anything was framed.** Each of these is a computed fact some routine already produces:
 
@@ -38,6 +76,7 @@ The same measurement makes the weaker path explicit, and it is worth stating pla
 
 ## Operating contract
 
+0. **If the map has never been populated, do the bootstrap in [First run](#first-run) first.** The steps below assume a map that already holds something.
 1. Load the compact **quick-lookup index** first (see below) — it answers the common case in a small, bounded payload. Consult the full Collaboration Intelligence record only on a miss, or when the task needs deeper history. If no store is available, build a task-local view and say that persistence is unavailable.
    **Carry freshness with every answer, including the empty one.** A hit reports its `observed_at`; a miss reports when that source was last swept and whether coverage was full — otherwise "not in the map" and "the map has not looked recently" are the same sentence. See `store_freshness` in [references/schema.md](references/schema.md).
 2. Observe only sources available for the current task. Do not enumerate private rooms, inboxes, or accounts merely to enrich the map.
@@ -175,7 +214,7 @@ When help is needed:
    - **A low or zero count is not evidence of exclusion.** The metric has no early signal — a maintainer added yesterday is indistinguishable from an inactive one until they accumulate history, so the ranking is most confident about the longest-tenured and least reliable about the newest arrival, which is exactly who "whom do I ask?" is often about. Use counts to find candidates, never to rule one out; explicit responsibility and owner statements outrank them.
 
    Treat a derived set older than a few hours the way this skill treats a memory: a candidate to re-derive, not an answer.
-3. Prefer the room where the work already has context. Do not move sensitive context across rooms without checking visibility and membership.
+3. **Choose the person first, then choose where to reach them — they are separate decisions.** An identity existing is not the same as it being live: check `identities[].activity` for where that person is actually seen, and honour `exclusive: true` (some people are reachable on exactly one surface, and a message anywhere else reaches nobody). Defaulting to whichever surface you happen to be on is how a reachable person gets treated as unreachable. Prefer the room where the work already has context, subject to that.
    When customers or external collaborators are present, share only context appropriate to that relationship and work scope.
 4. Contact the responsible agent directly when it can act. Include its owner or a human when approval, escalation, or shared accountability is needed.
 5. Resolve ambiguous recipients before sending. Never guess among duplicate names or uncertain identity links.
@@ -211,6 +250,7 @@ Do not spam every plausible expert. Escalate outward only after the primary owne
 
 - Store professional collaboration facts needed for coordination; avoid protected traits, private-life profiling, sentiment scores, or speculative trust labels.
 - Keep provenance and access scope with facts so restricted observations are not leaked into broader rooms.
+- **Repeating something from a smaller room into a larger one requires an explicit signal, and the default is no.** Before carrying a fact across rooms, compare their visibility, audience and membership: narrower → wider is a disclosure decision, not a formatting one. Knowing something because you were present is not permission to restate it. This skill's daily action *is* cross-room routing, so it will meet this case constantly; when in doubt, say that context exists and let the person who owns it decide whether to share it.
 - Honor deletion/correction requests and retain superseded facts only when audit needs require it.
 - Ask before performing external outreach unless the user already authorized sending or coordination.
 
