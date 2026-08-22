@@ -73,12 +73,21 @@ def task(
 
 
 def run_worker(runtime: str, workspace: Path, task_file: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    """Drives run_detached() directly — the actual provider-running body, now off
+    handle()'s own call entirely. Named run_worker (not run_detached_worker) to
+    keep the diff against the pre-detachment test suite legible; it exercises the
+    same locked-run-then-publish contract handle() used to run inline."""
     stderr = io.StringIO()
-    with patch.dict(os.environ, env), redirect_stderr(stderr):
-        return_code = worker.handle(
+    with patch.dict(os.environ, env), redirect_stderr(stderr), patch.object(worker, "_notify"):
+        worker.run_detached(
             runtime, workspace, task_file, workspace / "results", REPO
         )
-    return subprocess.CompletedProcess([], return_code, "", stderr.getvalue())
+    output = stderr.getvalue()
+    # run_detached always publishes SOMETHING on a genuine exception now (an honest
+    # failure body, not silence) — the exception log line, not file presence, is
+    # what distinguishes "failed" from "succeeded" here.
+    return_code = 1 if "AG2 Space room-session worker (detached):" in output else 0
+    return subprocess.CompletedProcess([], return_code, "", output)
 
 
 def test_opt_in_and_cardinality() -> None:
@@ -190,8 +199,10 @@ print('claude room result')
         failed = task(workspace, "task-claude-fail", room_id="!failure:a")
         result = run_worker("claude", workspace, failed, {**env, "FAIL_PROVIDER": "1"})
         check(result.returncode == 1 and "provider failed" in result.stderr,
-              "provider failure returns watcher fallback signal")
-        check(not (workspace / "results" / failed.name).exists(), "provider failure publishes no result")
+              "provider failure is logged")
+        failure_body = (workspace / "results" / failed.name).read_text(encoding="utf-8")
+        check("couldn't complete" in failure_body and "provider failed" in failure_body,
+              "provider failure publishes an explicit failure result, not silence")
 
 
 def test_codex_create_resume_and_result_ownership() -> None:
@@ -330,8 +341,10 @@ def test_runtime_edges_and_adapter_wiring() -> None:
                 check(False, "non-positive provider timeout is rejected")
 
         with patch.dict(os.environ, {}, clear=True):
-            check(worker._timeout("SUTANDO_TIER_HARD_TIMEOUT", None) == 900,
-                  "manifest declares the hard-timeout default")
+            check(worker._timeout("SUTANDO_TIER_HARD_TIMEOUT", None) == 3600,
+                  "manifest declares the hard-timeout safety-ceiling default")
+            check(worker._timeout("SUTANDO_TIER_HEARTBEAT_INTERVAL", None) == 120,
+                  "manifest declares the heartbeat-interval default")
             check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", None) == 180,
                   "manifest declares the stall-timeout default")
         with patch.dict(os.environ, {"SUTANDO_TIER_STALL_TIMEOUT": "12"}):
@@ -401,7 +414,7 @@ def test_cli_probe_and_empty_output() -> None:
         executable(root / "claude", "#!/bin/sh\nprintf '   \\n'\n")
         result = run_worker("claude", workspace, room_task, {"PATH": f"{root}:{os.environ['PATH']}"})
         check(result.returncode == 1 and "empty result" in result.stderr,
-              "empty provider output falls back without publishing")
+              "empty provider output is treated as a failure, not a real result")
 
 
 def test_direct_failure_and_cli_edges() -> None:
@@ -421,11 +434,14 @@ def test_direct_failure_and_cli_edges() -> None:
         check(accepted and published.read_text() == "first\n",
               "publish-once accepts an already-ready winning writer")
 
+        # Double-checked completion now lives in run_detached, not handle() — this is
+        # what protects against a stale detached worker relaunching provider work a
+        # different one already finished while this one waited on the lock.
         raced = task(workspace, "task-raced")
         with patch.object(worker, "_completed_result_exists", side_effect=[False, True]), \
              patch.object(worker, "_run_codex") as provider:
-            code = worker.handle("codex", workspace, raced, results, REPO)
-        check(code == 0 and not provider.called, "locked completion check prevents a duplicate launch")
+            worker.run_detached("codex", workspace, raced, results, REPO)
+        check(not provider.called, "locked completion check in run_detached prevents a duplicate launch")
 
         argv = ["session-worker", "--runtime", "codex", "--workspace", str(workspace),
                 "--task-file", str(raced), "--results-dir", str(results), "--repo", str(REPO)]
@@ -433,6 +449,85 @@ def test_direct_failure_and_cli_edges() -> None:
             check(worker.main() == 17, "CLI main dispatches probe mode")
         with patch.object(sys, "argv", argv), patch.object(worker, "handle", return_value=18):
             check(worker.main() == 18, "CLI main dispatches handle mode")
+        with patch.object(sys, "argv", argv + ["--run-detached"]), \
+             patch.object(worker, "run_detached", return_value=None) as detached:
+            check(worker.main() == 0, "CLI main dispatches run-detached mode")
+        check(detached.call_args.args[:5] == ("codex", workspace, raced, results, REPO),
+              "run-detached mode passes the same identifying arguments through")
+
+
+def test_handle_spawns_detached_and_never_runs_provider() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        workspace = Path(name)
+        results = workspace / "results"
+        results.mkdir()
+        started = task(workspace, "task-dispatch")
+        spawned: list = []
+
+        def fake_spawn(runtime, ws, task_file, results_dir, repo, hard_timeout, stall_timeout):
+            spawned.append((runtime, task_file.name))
+
+        with patch.object(worker, "_run_claude") as run_claude, \
+             patch.object(worker, "_run_codex") as run_codex, \
+             patch.object(worker, "_notify") as notify:
+            code = worker.handle("claude", workspace, started, results, REPO, spawn=fake_spawn)
+        check(code == 0, "handle returns 0 (claimed) once the detached worker is spawned")
+        check(not run_claude.called and not run_codex.called,
+              "handle never runs a provider inline — that only happens in run_detached")
+        check(spawned == [("claude", started.name)], "handle hands the task off to the spawn function")
+        check(notify.call_args.args[1] == "On it — working on this now.",
+              "handle acks immediately when no other worker is active for this room")
+
+        # A second message for the SAME room, while the first's claim is still live,
+        # gets an honest "queued" ack instead of the same "on it" — the whole point
+        # Chi's design push was about: tell the room what's actually happening.
+        room_key = worker.resolve_room_key(started)
+        assert room_key
+        claim = worker._claim_path(workspace, "claude", room_key)
+        worker._write_claim(claim, started.stem)
+        second = task(workspace, "task-dispatch-two")
+        with patch.object(worker, "_notify") as notify:
+            worker.handle("claude", workspace, second, results, REPO, spawn=fake_spawn)
+        check(notify.call_args.args[1].startswith("Queued behind an earlier message"),
+              "handle acks 'queued' when a live claim already holds this room")
+
+        def failing_spawn(*_args, **_kwargs):
+            raise OSError("no interpreter")
+        with patch.object(worker, "_notify"):
+            code = worker.handle("claude", workspace, second, results, REPO, spawn=failing_spawn)
+        check(code == 1, "handle surfaces a spawn failure as the ordinary watcher-fallback signal")
+
+
+def test_run_detached_claim_lifecycle_and_failure_reporting() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        workspace = root / "workspace"
+        (workspace / "results").mkdir(parents=True)
+        crashy = task(workspace, "task-crashy")
+        room_key = worker.resolve_room_key(crashy)
+        assert room_key
+        claim = worker._claim_path(workspace, "claude", room_key)
+
+        def crash(*_args, **_kwargs):
+            check(claim.exists(), "claim file is present for the duration of the locked run")
+            raise RuntimeError("boom")
+
+        with patch.object(worker, "_run_claude", side_effect=crash), patch.object(worker, "_notify") as notify:
+            worker.run_detached("claude", workspace, crashy, workspace / "results", REPO)
+        check(not claim.exists(), "claim is cleared even when the run raises")
+        failure_body = (workspace / "results" / crashy.name).read_text(encoding="utf-8")
+        check("boom" in failure_body, "the explicit failure body names the actual error")
+        acks = [call.args[1] for call in notify.call_args_list]
+        check(acks[0] == "On it — working on this now.", "run_detached itself also acks before running")
+
+        check(not worker._claim_is_live(root / "missing.json"),
+              "a missing claim file is never treated as live")
+        worker._atomic_text(claim, json.dumps({"pid": "not-an-int"}))
+        check(not worker._claim_is_live(claim), "a claim with a non-integer pid is never treated as live")
+        # PID 1 always exists (init/launchd) and this test doesn't own it, so a
+        # permission-denied kill(pid, 0) must still read as live, not absent.
+        worker._atomic_text(claim, json.dumps({"pid": 1}))
+        check(worker._claim_is_live(claim), "a claim naming a real but unowned pid is treated as live")
 
 
 def main() -> int:
@@ -444,6 +539,8 @@ def main() -> int:
     test_runtime_edges_and_adapter_wiring()
     test_cli_probe_and_empty_output()
     test_direct_failure_and_cli_edges()
+    test_handle_spawns_detached_and_never_runs_provider()
+    test_run_detached_claim_lifecycle_and_failure_reporting()
     print(f"\nResults: {len(FAILURES)} failed")
     return 1 if FAILURES else 0
 

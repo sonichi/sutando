@@ -20,7 +20,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 UNHANDLED = 3
@@ -192,9 +192,20 @@ def _run_bounded(
     cwd: Path,
     hard_timeout_override: Optional[float] = None,
     stall_timeout_override: Optional[float] = None,
+    heartbeat_interval_override: Optional[float] = None,
+    on_heartbeat: Optional[Callable[[float], None]] = None,
 ) -> tuple[int, str, str]:
+    # hard_timeout is a safety ceiling against a truly runaway process holding the
+    # room lock forever, not a normal completion boundary — the caller (run_detached)
+    # runs off the watcher's own request/response cycle, so a long-but-progressing
+    # run is expected and fine. stall_timeout is the real "this is actually stuck"
+    # signal: a working provider streams SOME output periodically.
     hard_timeout = _timeout("SUTANDO_TIER_HARD_TIMEOUT", hard_timeout_override)
     stall_timeout = _timeout("SUTANDO_TIER_STALL_TIMEOUT", stall_timeout_override)
+    try:
+        heartbeat_interval = _timeout("SUTANDO_TIER_HEARTBEAT_INTERVAL", heartbeat_interval_override)
+    except ValueError:
+        heartbeat_interval = 0.0
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -212,6 +223,18 @@ def _run_bounded(
         os.set_blocking(fd, False)
         selector.register(fd, selectors.EVENT_READ, name)
     started = last_progress = time.monotonic()
+    next_heartbeat = started + heartbeat_interval if heartbeat_interval > 0 else None
+
+    def _maybe_heartbeat(now: float) -> None:
+        nonlocal next_heartbeat
+        if next_heartbeat is None or now < next_heartbeat or on_heartbeat is None:
+            return
+        # Skip ahead past any interval(s) a slow select()/sleep() overran, rather than
+        # firing a burst of catch-up pings once the loop resumes.
+        while next_heartbeat is not None and now >= next_heartbeat:
+            next_heartbeat += heartbeat_interval
+        on_heartbeat(now - started)
+
     try:
         while selector.get_map():
             now = time.monotonic()
@@ -219,6 +242,7 @@ def _run_bounded(
                 raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
             if now - last_progress >= stall_timeout:
                 raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
+            _maybe_heartbeat(now)
             for key, _ in selector.select(timeout=min(0.2, stall_timeout)):
                 try:
                     chunk = os.read(key.fd, 65536)
@@ -235,6 +259,7 @@ def _run_bounded(
                 raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
             if now - last_progress >= stall_timeout:
                 raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
+            _maybe_heartbeat(now)
             time.sleep(min(0.05, stall_timeout))
         return (
             int(process.returncode or 0),
@@ -284,6 +309,72 @@ def _working_dir(repo: Path) -> Path:
     return Path(os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo))).expanduser()
 
 
+def _notify(task_file: Path, message: str) -> None:
+    """Best-effort progress ping via the shared task-progress notifier — the same
+    delivery path the NOTIFY FIRST convention already uses everywhere else in this
+    codebase. Never raises: a broken or slow notify path only costs visibility."""
+    try:
+        headers = parse_task_headers_trusted(
+            task_file.read_text(encoding="utf-8", errors="replace")
+        ).headers
+    except OSError:
+        return
+    source = headers.get("source") or ""
+    channel_id = headers.get("channel_id") or ""
+    if not source or not channel_id:
+        return
+    notifier = REPO_ROOT / "skills" / "task-progress" / "scripts" / "notify.py"
+    if not notifier.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(notifier), "--source", source, "--channel-id", channel_id,
+             "--message", message],
+            timeout=15, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _claim_path(workspace: Path, runtime: str, room_key: str) -> Path:
+    return workspace / "state" / "ag2space-room-session-locks" / f"{runtime}-{room_key}.active"
+
+
+def _claim_is_live(path: Path) -> bool:
+    """Informational only — the flock in run_detached() is what actually prevents two
+    workers touching the same provider session; a crashed holder's flock releases on
+    its own when the OS closes that process's file descriptors. This just answers
+    'should the ack say queued or working' and 'did the previous attempt crash', so a
+    wrong answer here costs a slightly-off status message, never correctness."""
+    data = _read_json(path)
+    pid = data.get("pid")
+    if not isinstance(pid, int):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _write_claim(path: Path, task_id: str) -> None:
+    _atomic_text(path, json.dumps({
+        "pid": os.getpid(),
+        "task_id": task_id,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }))
+
+
+def _clear_claim(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _claude_command(session_id: str, resume: bool, prompt: str) -> list[str]:
     command = ["claude", "-p", "--resume" if resume else "--session-id", session_id]
     command += ["--output-format", "text", "--dangerously-skip-permissions", "--add-dir", str(Path.home())]
@@ -321,6 +412,7 @@ def _run_claude(
     repo: Path,
     hard_timeout: Optional[float] = None,
     stall_timeout: Optional[float] = None,
+    on_heartbeat: Optional[Callable[[float], None]] = None,
 ) -> str:
     session_id, created = _session_id(workspace, "claude", room_key)
     return_code, stdout, stderr = _run_bounded(
@@ -328,6 +420,7 @@ def _run_claude(
         _working_dir(repo),
         hard_timeout,
         stall_timeout,
+        on_heartbeat=on_heartbeat,
     )
     if return_code:
         raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
@@ -343,6 +436,7 @@ def _run_codex(
     repo: Path,
     hard_timeout: Optional[float] = None,
     stall_timeout: Optional[float] = None,
+    on_heartbeat: Optional[Callable[[float], None]] = None,
 ) -> str:
     state = _read_json(_state_path(workspace))
     row = ((state.get("sessions") or {}).get("codex") or {}).get(room_key)
@@ -359,6 +453,7 @@ def _run_codex(
             _working_dir(repo),
             hard_timeout,
             stall_timeout,
+            on_heartbeat=on_heartbeat,
         )
         if return_code:
             raise RuntimeError(stderr.strip() or f"codex exited {return_code}")
@@ -395,6 +490,102 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
     return 0 if resolve_room_key(task_file) else UNHANDLED
 
 
+def run_detached(
+    runtime: str,
+    workspace: Path,
+    task_file: Path,
+    results_dir: Path,
+    repo: Path,
+    hard_timeout: Optional[float] = None,
+    stall_timeout: Optional[float] = None,
+) -> None:
+    """The actual provider run, off the watcher's request/response cycle entirely —
+    invoked only via `--run-detached` in a process `handle()` spawned and did not
+    wait for. A long-but-progressing run is expected here; nothing upstream is
+    blocked on this function returning."""
+    room_key = resolve_room_key(task_file)
+    if room_key is None or _completed_result_exists(results_dir, task_file.name):
+        return
+    lock = workspace / "state" / "ag2space-room-session-locks" / f"{runtime}-{room_key}.lock"
+    claim = _claim_path(workspace, runtime, room_key)
+    try:
+        with _locked(lock):
+            if _completed_result_exists(results_dir, task_file.name):
+                return
+            _write_claim(claim, task_file.stem)
+            _notify(task_file, "On it — working on this now.")
+            heartbeat = lambda elapsed: _notify(  # noqa: E731
+                task_file, f"Still working ({elapsed:.0f}s so far)…"
+            )
+            try:
+                body = (
+                    _run_claude(workspace, room_key, _prompt(task_file), repo,
+                                hard_timeout, stall_timeout, on_heartbeat=heartbeat)
+                    if runtime == "claude"
+                    else _run_codex(workspace, room_key, _prompt(task_file), repo,
+                                     hard_timeout, stall_timeout, on_heartbeat=heartbeat)
+                )
+                if not body.strip():
+                    raise RuntimeError(f"{runtime} returned an empty result")
+            except Exception as exc:
+                # Unlike the old synchronous design, there is no watcher call left to
+                # return 1 to — the watcher was already told "0, handled" the moment
+                # this was spawned. The only honest options are silence (what this
+                # whole design exists to stop) or publishing an explicit failure, so:
+                # publish one, plainly, rather than let the room simply never hear back.
+                print(f"AG2 Space room-session worker (detached): {exc}", file=sys.stderr)
+                _publish_once(
+                    results_dir / task_file.name,
+                    "This room session hit an error and couldn't complete: "
+                    f"{exc}\n\nResend your message for a fresh attempt.",
+                )
+                return
+            if not _publish_once(results_dir / task_file.name, body):
+                # Lost the publish race — something already occupies this task's
+                # result path (a genuine winner, or a stale non-ready placeholder).
+                # Never clobber; just make the loss visible instead of silent.
+                print(
+                    f"AG2 Space room-session worker (detached): {runtime} completed "
+                    "but lost the publish race for this task's result path",
+                    file=sys.stderr,
+                )
+    finally:
+        _clear_claim(claim)
+
+
+def _spawn_detached(
+    runtime: str,
+    workspace: Path,
+    task_file: Path,
+    results_dir: Path,
+    repo: Path,
+    hard_timeout: Optional[float],
+    stall_timeout: Optional[float],
+) -> None:
+    logs = workspace / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log_path = logs / f"ag2space-room-session-{task_file.stem}.log"
+    command = [
+        sys.executable, str(Path(__file__).resolve()), "--run-detached",
+        "--runtime", runtime, "--workspace", str(workspace),
+        "--task-file", str(task_file), "--results-dir", str(results_dir), "--repo", str(repo),
+    ]
+    if hard_timeout is not None:
+        command += ["--hard-timeout", str(hard_timeout)]
+    if stall_timeout is not None:
+        command += ["--stall-timeout", str(stall_timeout)]
+    with log_path.open("a", encoding="utf-8") as log_file:
+        # start_new_session=True (setsid) is what makes this survive the parent
+        # session-worker.py process exiting moments from now, the same primitive
+        # _run_bounded already uses for the provider subprocess itself. Deliberately
+        # not waited on: that's the entire point of detaching.
+        subprocess.Popen(
+            command, cwd=repo, env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file,
+            start_new_session=True,
+        )
+
+
 def handle(
     runtime: str,
     workspace: Path,
@@ -403,7 +594,11 @@ def handle(
     repo: Path,
     hard_timeout: Optional[float] = None,
     stall_timeout: Optional[float] = None,
+    spawn: Optional[Callable[..., None]] = None,
 ) -> int:
+    """Fast foreground path only: validate, ack, hand off, return — never runs the
+    provider inline. The actual work happens in run_detached(), off this call
+    entirely, so a long-running room turn never occupies a watcher worker slot."""
     if probe(runtime, workspace, task_file) != 0:
         return UNHANDLED
     task_file = task_file.resolve()
@@ -411,24 +606,19 @@ def handle(
     assert room_key is not None
     if _completed_result_exists(results_dir, task_file.name):
         return 0
-    lock = workspace / "state" / "ag2space-room-session-locks" / f"{runtime}-{room_key}.lock"
+    claim = _claim_path(workspace, runtime, room_key)
+    if _claim_is_live(claim):
+        _notify(task_file, "Queued behind an earlier message in this room — "
+                            "you'll get a reply as soon as it's your turn.")
+    else:
+        _notify(task_file, "On it — working on this now.")
+    launcher = spawn or _spawn_detached
     try:
-        with _locked(lock):
-            if _completed_result_exists(results_dir, task_file.name):
-                return 0
-            body = (
-                _run_claude(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
-                if runtime == "claude"
-                else _run_codex(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
-            )
-            if not body.strip():
-                raise RuntimeError(f"{runtime} returned an empty result")
-            if not _publish_once(results_dir / task_file.name, body):
-                raise RuntimeError("result destination exists but is not ready")
-        return 0
-    except Exception as exc:
-        print(f"AG2 Space room-session worker: {exc}", file=sys.stderr)
+        launcher(runtime, workspace, task_file, results_dir, repo, hard_timeout, stall_timeout)
+    except OSError as exc:
+        print(f"AG2 Space room-session worker: failed to start detached worker: {exc}", file=sys.stderr)
         return 1
+    return 0
 
 
 def main() -> int:
@@ -441,9 +631,16 @@ def main() -> int:
     parser.add_argument("--hard-timeout", type=float)
     parser.add_argument("--stall-timeout", type=float)
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--run-detached", action="store_true")
     args = parser.parse_args()
     if args.probe:
         return probe(args.runtime, args.workspace, args.task_file)
+    if args.run_detached:
+        run_detached(
+            args.runtime, args.workspace, args.task_file, args.results_dir, args.repo,
+            args.hard_timeout, args.stall_timeout,
+        )
+        return 0
     return handle(
         args.runtime,
         args.workspace,

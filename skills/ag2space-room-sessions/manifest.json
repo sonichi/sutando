@@ -11,8 +11,9 @@
     "secrets": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
   },
   "config": {
-    "SUTANDO_TIER_HARD_TIMEOUT": "900",
-    "SUTANDO_TIER_STALL_TIMEOUT": "180"
+    "SUTANDO_TIER_HARD_TIMEOUT": "3600",
+    "SUTANDO_TIER_STALL_TIMEOUT": "180",
+    "SUTANDO_TIER_HEARTBEAT_INTERVAL": "120"
   },
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
