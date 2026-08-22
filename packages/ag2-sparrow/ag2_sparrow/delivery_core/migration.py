@@ -239,3 +239,45 @@ def import_a_state(root: Path) -> dict:
     write_fence(root, "C")
     report["fenced"] = True
     return report
+
+
+FALLBACK_COUNTER = "a-fallback-hits.json"
+
+
+def dual_read(root: Path, item_id: str) -> "dict | None":
+    """C-miss fallback during the migration window: read-only lookup of the
+    PRESERVED A record under .items-migrated/. Returns the parsed record or
+    None. Every hit bumps the per-root fallback counter — A's deletion gate
+    is that counter staying unchanged across a full release, so a hit is a
+    FINDING (an id the importer should have covered), not a silent rescue.
+    Never writes to either store; never resurrects the item."""
+    import json as _json
+    import time as _time
+
+    from ag2_sparrow.outbox import _safe_key as _a_safe_key
+
+    root = Path(root)
+    migrated_dir = root / ".items-migrated"
+    if migrated_dir.is_symlink() or not migrated_dir.is_dir():
+        return None
+    p = migrated_dir / f"{_a_safe_key(item_id)}.json"
+    if p.is_symlink() or not p.is_file():
+        return None
+    try:
+        rec = _json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("item_id") != item_id:
+        return None
+    counter = root / FALLBACK_COUNTER
+    try:
+        prior = _json.loads(counter.read_text(encoding="utf-8"))
+        count = int(prior.get("count", 0))
+    except (OSError, ValueError):
+        count = 0
+    tmp = counter.with_suffix(".json.tmp")
+    tmp.write_text(_json.dumps({"count": count + 1,
+                                "last_hit_ts": _time.time(),
+                                "last_item": item_id}), encoding="utf-8")
+    os.replace(tmp, counter)
+    return rec

@@ -194,5 +194,62 @@ with tempfile.TemporaryDirectory() as td:
     markers2 = [e.name for e in c._d("undelivered").iterdir() if "import-unreadable" in e.name]
     check(markers2 == markers1, "repeated import creates no duplicate markers")
 
+# ── dual_read: the migration-window C-miss fallback ────────────────────
+from ag2_sparrow.delivery_core.migration import (  # noqa: E402
+    FALLBACK_COUNTER, dual_read)
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "dr"
+    outbox._write_item(root, "hist-1", {"item_id": "hist-1", "status": "DELIVERED",
+                                 "provider": "P", "destination": "D",
+                                 "attempts": 2})
+    rep = import_a_state(root)
+    check(rep["fenced"], "dual_read fixture: import fenced")
+    before = {d: sorted(x.name for x in (root / d).iterdir())
+              for d in ("ready", "inflight", "undelivered")}
+
+    rec = dual_read(root, "hist-1")
+    check(rec is not None and rec.get("destination") == "D",
+          "dual_read returns the preserved A record on a hit")
+    ctr = json.loads((root / FALLBACK_COUNTER).read_text())
+    check(ctr["count"] == 1 and ctr["last_item"] == "hist-1",
+          "a hit writes the fallback counter (deletion release-gate metric)")
+    dual_read(root, "hist-1")
+    check(json.loads((root / FALLBACK_COUNTER).read_text())["count"] == 2,
+          "counter is cumulative across hits")
+
+    check(dual_read(root, "no-such-id") is None,
+          "a miss returns None")
+    check(json.loads((root / FALLBACK_COUNTER).read_text())["count"] == 2,
+          "and a miss does not bump the counter")
+
+    after = {d: sorted(x.name for x in (root / d).iterdir())
+             for d in ("ready", "inflight", "undelivered")}
+    check(after == before,
+          "dual_read never writes to C — no resurrection into any state dir")
+    a_name = f"{outbox._safe_key('hist-1')}.json"
+    check((root / ".items-migrated" / a_name).exists(),
+          "and the preserved A record is untouched")
+
+    # a record whose body names a different item_id is not served, even
+    # though the file EXISTS at the looked-up name (discriminates from a miss)
+    (root / ".items-migrated" / f"{outbox._safe_key('alias')}.json").write_text(
+        json.dumps({"item_id": "somebody-else"}))
+    check(dual_read(root, "alias") is None,
+          "body/item_id mismatch is refused (no serving mislabeled records)")
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "nofall"
+    root.mkdir(parents=True)
+    check(dual_read(root, "x") is None,
+          "no .items-migrated dir: dual_read is None, no counter write")
+    check(not (root / FALLBACK_COUNTER).exists(),
+          "and no counter file appears")
+    real = Path(td) / "elsewhere"
+    real.mkdir()
+    (root / ".items-migrated").symlink_to(real)
+    check(dual_read(root, "x") is None,
+          "a SYMLINKED .items-migrated is refused (same fail-closed rule as import)")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
