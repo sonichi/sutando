@@ -30,7 +30,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from workspace_default import resolve_workspace  # noqa: E402
-import result_router  # noqa: E402
+import delivery.router as result_router  # noqa: E402
 
 
 def _audit_path() -> Path:

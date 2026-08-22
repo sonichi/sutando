@@ -8,7 +8,7 @@ sync" comments, copies drift — and they already had: dm-result was
 missing personal-notes / Desktop / Documents roots.
 
 The fix extracted both `SEND_ALLOWED_ROOTS` / `SEND_ALLOWED_PREFIXES`
-and `is_path_sendable()` into `src/send_allowlist.py`. This test
+and `is_path_sendable()` into `src/policy/egress/attachment.py`. This test
 pins:
 
   1. Both consumers import from the shared module (no inline
@@ -31,9 +31,9 @@ SRC = REPO / "src"
 
 
 def test_shared_module_exists():
-    """`src/send_allowlist.py` is the new canonical location."""
-    assert (SRC / "send_allowlist.py").is_file(), (
-        "src/send_allowlist.py missing — this module is the single source "
+    """`src/policy/egress/attachment.py` is the canonical location."""
+    assert (SRC / "policy" / "egress" / "attachment.py").is_file(), (
+        "src/policy/egress/attachment.py missing — this module is the single source "
         "of truth for the send-allowlist policy, shared between "
         "discord-bridge.py and dm-result.py."
     )
@@ -43,10 +43,10 @@ def test_discord_bridge_imports_from_shared_module():
     """`discord-bridge.py` must import the policy, not define a copy."""
     src = (SRC / "discord-bridge.py").read_text()
     assert re.search(
-        r"from\s+send_allowlist\s+import",
+        r"from\s+policy\.egress\.attachment\s+import",
         src,
     ), (
-        "discord-bridge.py must `from send_allowlist import` the policy. "
+        "discord-bridge.py must `from policy.egress.attachment import` the policy. "
         "If you reverted to an inline copy, the policy will drift from "
         "dm-result.py — exactly what @liususan091219 warned about on "
         "PR #1029."
@@ -57,9 +57,9 @@ def test_dm_result_imports_from_shared_module():
     """`dm-result.py` must import the same policy."""
     src = (SRC / "dm-result.py").read_text()
     assert re.search(
-        r"from\s+send_allowlist\s+import",
+        r"from\s+policy\.egress\.attachment\s+import",
         src,
-    ), "dm-result.py must `from send_allowlist import` the policy."
+    ), "dm-result.py must `from policy.egress.attachment import` the policy."
 
 
 def test_no_inline_send_allowed_roots_definitions():
@@ -78,7 +78,7 @@ def test_no_inline_send_allowed_roots_definitions():
         # is via aliasing the import.
         for line in src.split("\n"):
             stripped = line.strip()
-            # Allow `from send_allowlist import ... SEND_ALLOWED_ROOTS ...`
+            # Allow `from policy.egress.attachment import ... SEND_ALLOWED_ROOTS ...`
             # and `SEND_ALLOWED_ROOTS as _SEND_ALLOWED_ROOTS,` (in
             # `from X import (... as ...,)` blocks).
             if "SEND_ALLOWED_ROOTS" in stripped and stripped.startswith("SEND_ALLOWED_ROOTS = ("):
@@ -116,7 +116,7 @@ def test_send_allowlist_module_has_documented_set():
     prefixes. A silent tightening (e.g. dropping `/tmp/echo-`) would
     quietly break the echo skill's file delivery — make a tightening
     update this test deliberately."""
-    src = (SRC / "send_allowlist.py").read_text()
+    src = (SRC / "policy" / "egress" / "attachment.py").read_text()
     must_appear = [
         # Prefixes
         '"/tmp/sutando-"',
@@ -133,7 +133,7 @@ def test_send_allowlist_module_has_documented_set():
     ]
     missing = [s for s in must_appear if s not in src]
     assert missing == [], (
-        f"send_allowlist.py missing documented allowlist entries: {missing}. "
+        f"policy/egress/attachment.py missing documented allowlist entries: {missing}. "
         f"If you intentionally tightened the policy, update this test."
     )
 
@@ -142,7 +142,7 @@ def test_rendered_episode_root_is_allowed():
     """Renders land under the legacy workspace's notes tree, outside every
     other root, so without this root every rendered mp4 is refused."""
     sys.path.insert(0, str(SRC))
-    import send_allowlist as sa
+    import policy.egress.attachment as sa
     from util_paths import legacy_dotted_workspace_path
 
     wanted = str(legacy_dotted_workspace_path("notes", "generated"))
@@ -158,7 +158,7 @@ def test_symlinked_root_resolves_and_stays_scoped():
     import tempfile
 
     sys.path.insert(0, str(SRC))
-    import send_allowlist as sa
+    import policy.egress.attachment as sa
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

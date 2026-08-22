@@ -42,6 +42,7 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+  REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
 """
@@ -59,6 +60,7 @@ import signal
 import socket
 import sys
 import tempfile
+import select
 import threading
 import time
 import urllib.error
@@ -162,7 +164,7 @@ from . import local_task_protocol
 from .result_markers import parse_markers
 from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROVENANCE
 from . import team_result_guard
-from .outbox import DeliveryOutcome
+from .outbox import DeliveryOutcome, record_delivered
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -994,6 +996,116 @@ PROACTIVE_TRUST_OK = (
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 _AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+OUTBOUND_SCAN_S = float(os.environ.get("REMOTE_OUTBOUND_SCAN_S") or "1.0")
+# Outbound worker: decouples outbound progress from inbound long-poll
+# progress; delivery machinery untouched — owns ONLY lifecycle/scheduling.
+_OUTBOUND_WAKE = threading.Event()
+_OUTBOUND_STOP = threading.Event()
+_INFLIGHT_MUTEX = threading.RLock()
+
+
+def wake_outbound() -> None:
+    """Kick the outbound worker (e.g. right after a local result write)."""
+    _OUTBOUND_WAKE.set()
+
+
+def _outbound_worker(inflight: "set[str]") -> None:
+    first_seen: "dict[str, float]" = {}
+    while not _OUTBOUND_STOP.is_set():
+        _OUTBOUND_WAKE.wait(OUTBOUND_SCAN_S)
+        _OUTBOUND_WAKE.clear()
+        if _OUTBOUND_STOP.is_set():
+            break                        # graceful: stop taking new items
+        # tuple(): kept distinct from the drain's test anchor — redundant once
+        # the anchor is line-bounded, load-bearing until then.
+        for tid in tuple(inflight):
+            rfile = RESULTS_DIR / f"{tid}.txt"
+            if tid not in first_seen and rfile.exists():
+                first_seen[tid] = time.monotonic()
+        try:
+            _post_ready_results(inflight)
+        except Exception as e:  # noqa: BLE001 — failure isolation per cycle
+            _log(f"outbound worker: results drain error (isolated): {e}")
+        try:
+            _post_proactive()
+        except Exception as e:  # noqa: BLE001
+            _log(f"outbound worker: proactive drain error (isolated): {e}")
+        for tid in [t for t in first_seen if t not in inflight]:
+            ms = (time.monotonic() - first_seen.pop(tid)) * 1000.0
+            _log(f"outbound worker: {tid} seen->retired {ms:.0f}ms (monotonic)")
+
+
+def _start_outbound_worker(inflight: "set[str]") -> threading.Thread:
+    t = threading.Thread(target=_outbound_worker, args=(inflight,),
+                         name="outbound-worker", daemon=True)
+    t.start()
+    _log(f"outbound worker started (scan {OUTBOUND_SCAN_S}s + wake-on-kick) — "
+         "outbound no longer rides the inbound long-poll")
+    return t
+
+
+OUTBOUND_WATCHER = os.environ.get("REMOTE_OUTBOUND_WATCHER", "auto")  # auto|off
+
+
+def _start_results_watcher() -> "threading.Thread | None":
+    """Darwin kqueue doorbell on RESULTS_DIR: advisory wakeups only, never
+    delivery state. Correctness stays in the durable drain; the bounded scan
+    guarantees progress whenever this thread is degraded or absent."""
+    if OUTBOUND_WATCHER == "off" or not hasattr(select, "kqueue"):
+        return None
+
+    VNODE_GONE = (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+                  | select.KQ_NOTE_REVOKE)
+
+    def run():
+        backoff = 1.0
+        while not _OUTBOUND_STOP.is_set():
+            fd, kq = -1, None
+            try:
+                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                # O_EVTONLY is absent on some supported pythons (Xcode 3.9);
+                # kqueue accepts an O_RDONLY fd — it just pins the mount.
+                fd = os.open(str(RESULTS_DIR),
+                             getattr(os, "O_EVTONLY", os.O_RDONLY))
+                kq = select.kqueue()
+                kq.control([select.kevent(
+                    fd, filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                    fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND
+                    | VNODE_GONE)], 0, 0)
+                backoff = 1.0
+                # Full sweep on every (re)registration: files that landed
+                # before the watch began are the first sweep's job.
+                wake_outbound()
+                while not _OUTBOUND_STOP.is_set():
+                    events = kq.control(None, 1, 1.0)
+                    if not events:
+                        continue
+                    wake_outbound()
+                    if events[0].fflags & VNODE_GONE:
+                        # Rate-cap rebuilds like the exception path: a flapping
+                        # dir must not spin the register loop.
+                        _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                        backoff = min(backoff * 2, 30.0)
+                        break            # dir vnode gone: rebuild registration
+            except Exception as e:  # noqa: BLE001 — degraded, never fatal
+                _log(f"results watcher degraded (scan remains the floor): {e}")
+                _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                backoff = min(backoff * 2, 30.0)
+            finally:
+                try:
+                    if kq is not None:
+                        kq.close()
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+
+    t = threading.Thread(target=run, name="results-watcher", daemon=True)
+    t.start()
+    _log("results watcher started (kqueue doorbell — advisory; scan is the floor)")
+    return t
+
+
 HEARTBEAT_INTERVAL = 60
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
@@ -2487,6 +2599,18 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
     return ("send", None, parsed.body)
 
 
+def _record_proactive_receipt(item_id: str, room: str) -> None:
+    """Durable "delivered where" for the proactive leg. The log line naming the
+    room rotates; this outlives it. Fail-open: a receipt write must never
+    unwind a delivery that already happened."""
+    try:
+        record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
+                         provider="ag2space-proactive", destination=room)
+    except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
+        _log(f"proactive receipt write failed for {item_id}: {e} "
+             "(delivery unaffected)")
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -2668,10 +2792,11 @@ def _post_proactive() -> None:
                  "— dead-lettering, it can never be delivered")
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
+        dest_room = room_override or PROACTIVE_ROOM
         try:
             resp = _req("POST", "/v1/room",
                         {"op": "message",
-                         "room_id": room_override or PROACTIVE_ROOM,
+                         "room_id": dest_room,
                          "body": body},
                         timeout=15)
             # A bare 200 is NOT proof of delivery: the gateway can swallow a
@@ -2703,13 +2828,14 @@ def _post_proactive() -> None:
             outcome = _resolve_send_failure(claim, f, e)
             _log(f"proactive send network error for {f.name}: {e} — {outcome}")
             continue
+        _record_proactive_receipt(f.stem, dest_room)
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
         except OSError:
             claim.unlink(missing_ok=True)
         _PROACTIVE_ATTEMPTS.pop(f.name, None)
-        _log(f"delivered proactive {f.name}")
+        _log(f"delivered proactive {f.name} to {dest_room}")
 
 
 def _load_inflight() -> set[str]:
@@ -2725,16 +2851,20 @@ def _load_inflight() -> set[str]:
 
 
 def _save_inflight(inflight: set[str]) -> None:
-    """Atomically persist the in-flight set. Best-effort (never blocks the loop)."""
-    try:
-        INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
-        # second sparrow instance ever runs. os.replace is atomic overwrite.
-        tmp = INFLIGHT_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(sorted(inflight)))
-        os.replace(tmp, INFLIGHT_FILE)
-    except Exception as e:  # noqa: BLE001
-        _log(f"inflight persist failed ({e}) — continuing")
+    """Atomically persist the in-flight set. Best-effort (never blocks the loop).
+    The mutex covers snapshot+write: the poll loop and the outbound worker both
+    save, and an unguarded interleave could persist a state missing the other
+    thread's mutation (resurrecting a delivered id or dropping a fresh one)."""
+    with _INFLIGHT_MUTEX:
+        try:
+            INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if
+            # a second sparrow instance ever runs. os.replace is atomic overwrite.
+            tmp = INFLIGHT_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(sorted(inflight)))
+            os.replace(tmp, INFLIGHT_FILE)
+        except Exception as e:  # noqa: BLE001
+            _log(f"inflight persist failed ({e}) — continuing")
 
 
 # (tid, path) pairs already uploaded this process — result-POST retry guard.
@@ -3340,6 +3470,8 @@ def main() -> None:
     last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
+    _results_watcher = _start_results_watcher()
+    _outbound_thread = _start_outbound_worker(inflight)
     while True:
         try:
             if not _heartbeat_singleton():
@@ -3347,6 +3479,10 @@ def main() -> None:
                 # polling immediately so we don't dual-poll the relay bearer with
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
                      "— exiting to avoid dual-poll")
+                _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
+                _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
+                if _results_watcher is not None:
+                    _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
             _retry_pending_publications()
@@ -3381,8 +3517,8 @@ def main() -> None:
             # durable, so a crash after ack does not strand the eventual result.
             for tid in pending_ack:
                 _post_task_ack(tid)
-            _post_ready_results(inflight)
-            _post_proactive()
+            if added:
+                wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _reconcile_orphan_results(inflight)
             _post_heartbeat(inflight)
