@@ -176,7 +176,7 @@
         },
         "discord_post_gate": {
           "type": "string",
-          "description": "Path to a Python file exporting validate(channel_id, payload) — the Discord post-gate policy src/discord_post_gate.py resolves for every Discord sender. Unset: ungated. A configured path that fails to load refuses all sends (fail-closed). Env override: $SUTANDO_DISCORD_POST_GATE."
+          "description": "Path to a Python file exporting validate(channel_id, payload) — the Discord post-gate policy src/channels/discord/post_gate.py resolves for every Discord sender. Unset: ungated. A configured path that fails to load refuses all sends (fail-closed). Env override: $SUTANDO_DISCORD_POST_GATE."
         }
       }
     },
