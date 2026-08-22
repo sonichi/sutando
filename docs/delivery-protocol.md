@@ -14,13 +14,17 @@ what the directories contain is the whole truth, which is why GC and manual
 
 ## Namespaces (Design C, per root)
 
+The separator is `~` throughout. The quarantine namespace's logical name is
+PARKED; its **physical directory is `undelivered/`** — readers grepping the
+filesystem must use the physical name.
+
 | dir | meaning | record shape |
 |---|---|---|
-| `tmp/` | writes in flight, never authoritative | `{key}·{pid}·{ns}` payload staging |
+| `tmp/` | writes in flight, never authoritative | `{key}~{pid}~{ns}` payload staging |
 | `ready/` | published, undelivered; the single retry slot | `{key}` (payload file) |
-| `inflight/` | claimed by exactly one worker incarnation | `{key}·{worker}·{pid}·{start_usec}·{generation}` — the filename IS the claim token |
-| `archive/` | terminal: delivered | rename of the claim file (`{incarnation}·{ns}`) |
-| `parked/` | terminal-until-operator: quarantined | `{key}·{reason}·{tag}` |
+| `inflight/` | claimed by exactly one worker incarnation | `{key}~{worker}~{pid}~{start_usec}~{generation}` — the filename IS the claim token |
+| `archive/` | terminal: delivered | rename of the claim file (`{incarnation}~{ns}`) |
+| `undelivered/` | terminal-until-operator: quarantined (logical name PARKED) | `{key}~{reason}~{tag}` |
 | `attempts/` | retry accounting | `{key}` containing an integer |
 
 `{key}` = `_safe_key(item_id)` — a sanitized stub plus a sha256 prefix, total
@@ -30,20 +34,30 @@ asymmetry is deliberate and load-bearing (see #3260 review history).
 
 ## Transitions and their linearization points
 
-| transition | operation | linearization point | guarded by |
+Two mechanisms exist, and they have different crash shapes:
+
+- **`os.rename`** (claim; legacy confirm): one operation, no intermediate
+  state — a crash leaves exactly one of the two entries.
+- **`os.link` then `os.unlink`** (`_move()`; publish's tmp→ready transfer):
+  the **LINK is the linearization point** (atomic create-if-absent — the loser
+  of a race gets EEXIST, not a clobber). A crash between link and unlink
+  leaves **both** directory entries. That duplicate-name window is REAL and
+  the protocol absorbs it, never denies it: a stale `inflight/` twin of a
+  re-readied item is exactly what `recover()`'s live-and-dead classification
+  and the `collision` quarantine reason exist for; a leftover `tmp/` twin is
+  never authoritative by rule.
+
+| transition | mechanism | linearization point | guarded by |
 |---|---|---|---|
-| publish | write `tmp/` → rename to `ready/{key}` | the rename | per-key lock |
+| publish | write `tmp/` → link to `ready/{key}` → unlink tmp | the link | per-key lock; EEXIST = slot occupied, publish returns False |
 | claim | rename `ready/{key}` → `inflight/{token}` | the rename | per-key lock; loser gets ENOENT, returns None |
 | complete(CONFIRMED) | rename `inflight/{token}` → `archive/` | the rename | worker-component check on the token (forged tokens refused before any fs op) |
-| complete(retryable) | rename `inflight/{token}` → `ready/{key}` | the rename | collision with a re-publish quarantines this copy |
-| complete(OUTCOME_UNKNOWN) | rename → `parked/` | the rename | never auto-retried: the remote may have received it |
-| park / max-attempts | rename → `parked/` | the rename | reason encoded in the filename |
-| recover (dead owner) | rename `inflight/` → `ready/` | the rename | liveness verdict first (below), then per-key lock, then live-holder re-check |
+| complete(retryable) | link `inflight/{token}` → `ready/{key}` → unlink | the link | link-loss = re-publish won the slot; this copy quarantines as `collision` |
+| complete(OUTCOME_UNKNOWN) | link+unlink → `undelivered/` | the link | never auto-retried: the remote may have received it |
+| park / max-attempts | link+unlink → `undelivered/` | the link | reason encoded in the filename |
+| recover (dead owner) | link `inflight/` → `ready/` → unlink | the link | liveness verdict first (below), then per-key lock, then live-holder re-check |
 
-Every transition is a single `os.rename` under the per-key striped lock
-(`outbox._item_lock`). Nothing observes an intermediate state because there is
-no intermediate state — a crash between any two operations leaves exactly one
-of the two directory entries, and `recover()`'s job is to classify which.
+All transitions run under the per-key striped lock (`outbox._item_lock`).
 
 ## Ownership and fencing
 
@@ -82,6 +96,7 @@ authoritative.
 | crash window | outcome | pinned by |
 |---|---|---|
 | during `tmp/` write | orphan tmp file, no state change | `design-c-backend.test.py` (ghost states) |
+| between link and unlink (`_move`/publish) | BOTH names exist: tmp twin is never authoritative; an inflight/ready twin is classified by recover() (live-and-dead → `collision` quarantine) | backend suite (structural one-slot + collision rows) |
 | after publish rename, before ack to caller | item deliverable exactly once anyway | contract suite |
 | between claim rename and work | dead-owner recovery re-readies | `design-c-backend.test.py` |
 | worker dies mid-delivery | recovery re-readies (at-least-once) or UNKNOWN parks | contract + enforcement suites |
@@ -100,11 +115,15 @@ authoritative.
 
 ## Garbage collection: mechanism exists and is unwired; the POLICY is the open item
 
-The pruning primitive already exists: `cleanup(max_age_s)` (contract-level,
-implemented on both backends) age-prunes exactly `archive/`, `parked/`,
-`tmp/` and `attempts/`, and its `attempts/` branch carries the required
-guard — a LIVE item's counter is never pruned by age, since it is the item's
-park ceiling. **What is missing is a caller**: no production site invokes it,
+The pruning primitive exists **on Design C only**: its `cleanup(max_age_s)`
+age-prunes `archive/`, `undelivered/`, `tmp/` and `attempts/`, and its
+`attempts/` branch carries the required guard — a LIVE item's counter is
+never pruned by age, since it is the item's park ceiling. `cleanup` is on the
+shared contract, but **Design A's implementation is a deliberate no-op**
+("bounded by lock striping") — interface availability, per-backend
+implementation, and live policy are three different facts and only the first
+is uniform. **What is missing everywhere is a caller**: no production site
+invokes either,
 so the directories grow without bound today. The open item is choosing a
 schedule and retention (and whether archive pruning must first export the
 receipt elsewhere), then wiring the existing primitive — not designing GC
