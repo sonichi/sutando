@@ -7,6 +7,29 @@ description: Maintain and use a cross-channel collaboration map of rooms, people
 
 Build a living, evidence-backed collaboration map. Treat it as a coordination aid, not an authority or surveillance profile.
 
+## First run
+
+**A freshly installed map is empty, and the Operating contract below does not bootstrap it.** Step 1 there says to load the quick-lookup index first — on a new install there is no index, so an agent queries nothing, reports a miss, learns nothing, and stays empty. It never errors. An unbootstrapped map and a working one are indistinguishable from outside, which is the failure mode this skill exists to fight, turned on itself.
+
+So run this once, before relying on the contract.
+
+**1. Sweep what you already have.** The task-file stream is an observation source readable with no new permissions and no network: every task header carries `channel_id`, `room_name`, `room_members`, `room_member_count`, `user_id`. Sweeping `tasks/` plus `tasks/archive/` yields, on day one:
+
+- **rooms**, ranked by traffic, with provider-native ids and names
+- **participants**, ranked by messages, classified `human` / `agent` / `service`
+- **coverage flags** — a header showing `+N more` means the roster was truncated, so that room is `coverage: partial` and must be recorded as such *at sweep time*; a truncated list looks complete afterwards
+- **unknowns worth resolving immediately** — rooms with real traffic but no name and no members observed
+
+Record the result per [references/schema.md](references/schema.md), including `store_freshness` per source. Do not enumerate rooms, inboxes or accounts you were not already given: this sweep observes traffic already received, which is what makes it permission-free.
+
+**2. Expect it to surface defects, and record them rather than smoothing them.** Run against a real corpus it immediately produced unnamed high-traffic rooms, hundreds of truncated rosters, and a service account misfiled as human by a two-way agent/human split. Each is a real map entry — an unknown to resolve, a partial-coverage flag, a classification gap — not noise to filter out.
+
+**3. Hand-state the identities you already know.** A few cross-channel mappings (GitHub handle ↔ chat id ↔ person) are the highest-value minute available, because an owner-stated mapping outranks any derived one and carries its provenance. Derivation is *least* reliable exactly where it matters most: activity counts have no early signal, so someone who joined yesterday is indistinguishable from someone inactive.
+
+**4. Then let the scheduled work maintain it.** Only once the map holds something does the contract's load-first path mean anything.
+
+**The payoff to check for**: after step 1 you should be able to answer "who is in this room, and which of them are agents" and "where does this kind of work usually get discussed" without asking anyone. If you cannot, either the sweep did not run or its store did not persist — see **Where the map is stored**.
+
 ## Trigger behavior
 
 When triggered implicitly:
@@ -38,6 +61,7 @@ The same measurement makes the weaker path explicit, and it is worth stating pla
 
 ## Operating contract
 
+0. **If the map has never been populated, do the bootstrap in [First run](#first-run) first.** The steps below assume a map that already holds something.
 1. Load the compact **quick-lookup index** first (see below) — it answers the common case in a small, bounded payload. Consult the full Collaboration Intelligence record only on a miss, or when the task needs deeper history. If no store is available, build a task-local view and say that persistence is unavailable.
    **Carry freshness with every answer, including the empty one.** A hit reports its `observed_at`; a miss reports when that source was last swept and whether coverage was full — otherwise "not in the map" and "the map has not looked recently" are the same sentence. See `store_freshness` in [references/schema.md](references/schema.md).
 2. Observe only sources available for the current task. Do not enumerate private rooms, inboxes, or accounts merely to enrich the map.
