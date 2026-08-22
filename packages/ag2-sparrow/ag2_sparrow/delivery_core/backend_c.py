@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import threading
 import time
@@ -31,6 +32,8 @@ from .contract import (BackendCapabilities, ClaimToken, CleanupReport,
 
 TMP, READY, INFLIGHT, ARCHIVE, PARKED, ATTEMPTS = (
     "tmp", "ready", "inflight", "archive", "undelivered", "attempts")
+# tmp-stage terminal records carry this tag so publish's tmp files never match.
+TERMINAL_TAG = "terminal"
 SEP = "~"
 TOKEN_PARTS = 5
 
@@ -91,13 +94,16 @@ class DesignCClaimBackend:
     """C: one live object per item, moved between state directories under a
     striped host-local lock. force-release exists as administrative requeue."""
 
-    # The FILENAME is the record here — an archived rename carries no field
-    # to hold receipt metadata, so complete() accepts and drops it.
-    persists_receipt_metadata = False
+    # Terminal records are JSON (archive/<key>.json), so receipts persist.
+    persists_receipt_metadata = True
 
     capabilities = BackendCapabilities(supports_force_release=True)
 
-    def __init__(self, root: Path, activate: bool = False):
+    def __init__(self, root: Path, activate: bool = False,
+                 durability: str = "default"):
+        # "default": fsync the terminal record before its archive rename;
+        # "strict": also fsync the archive dir; "lax": no fsync (tests/bench).
+        self.durability = durability
         self.root = Path(root)
         for name in (TMP, READY, INFLIGHT, ARCHIVE, PARKED, ATTEMPTS):
             self._d(name)
@@ -214,8 +220,15 @@ class DesignCClaimBackend:
             if not src.exists():
                 return False
             if outcome is DeliveryOutcome.CONFIRMED:
-                dst = self._d(ARCHIVE) / f"{token.incarnation}{SEP}{time.time_ns()}"
-                os.rename(str(src), str(dst))
+                record = {
+                    "schema": 1, "item_id": token.item_id,
+                    "outcome": outcome.value,
+                    "receipt": {"provider": provider, "destination": destination},
+                    "completed_ns": time.time_ns(),
+                    "worker": token.worker, "attempts": self.attempts(token.item_id),
+                }
+                self._write_terminal(key, record)
+                src.unlink(missing_ok=True)          # D: release the claim
                 self._attempts_path(key).unlink(missing_ok=True)
                 return True
             if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
@@ -263,16 +276,81 @@ class DesignCClaimBackend:
                 self._quarantine(f, key, _safe_component(reason),
                                  str(time.time_ns()))
 
+    def _terminal_path(self, key: str) -> Path:
+        return self._d(ARCHIVE) / f"{key}.json"
+
+    def _write_terminal(self, key: str, record: dict) -> None:
+        """R->F->M of the terminal protocol: atomic tmp write, fsync per the
+        durability mode, then rename into archive/. Caller releases the claim."""
+        tmp = self._d(TMP) / f"{key}{SEP}{TERMINAL_TAG}{SEP}{time.time_ns()}.json"
+        data = json.dumps(record).encode()
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, data)
+            if self.durability != "lax":
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        dst = self._terminal_path(key)
+        if dst.exists():
+            # Same id redelivered after a prior terminal: keep both records.
+            dst = dst.with_name(f"{key}{SEP}{time.time_ns()}.json")
+        os.rename(str(tmp), str(dst))
+        if self.durability == "strict":
+            dfd = os.open(str(dst.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+
+    def terminal_record(self, item_id: str) -> "dict | None":
+        """The persisted terminal record for `item_id`, or None (including
+        legacy filename-format archive entries, which carry no receipt)."""
+        p = self._terminal_path(_safe_key(item_id))
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _has_terminal(self, key: str) -> bool:
+        """Any archive entry for `key` — JSON record or legacy rename."""
+        if self._terminal_path(key).exists():
+            return True
+        return any(f.name.startswith(f"{key}{SEP}")
+                   for f in self._d(ARCHIVE).iterdir())
+
     def recover(self) -> RecoverReport:
         """Dead OWNERS' items return to ready/; UNKNOWN never touched. The
         owner is the INCARNATION, not the pid: an ALIVE pid whose birth
         mismatches the token is a reused pid — the claimant is dead."""
         rep = RecoverReport()
+        # R-M crash window: a tmp terminal record means the outcome is already
+        # decided and durable-in-progress — finalize it, never re-ask the provider.
+        for t in sorted(self._d(TMP).glob(f"*{SEP}{TERMINAL_TAG}{SEP}*.json")):
+            key = t.name.split(SEP)[0]
+            with self._lock(key):
+                if not t.exists():
+                    continue
+                dst = self._terminal_path(key)
+                if dst.exists():
+                    t.unlink(missing_ok=True)      # record already finalized
+                else:
+                    os.rename(str(t), str(dst))
+                rep.retired.append(key)
         for f in sorted(self._d(INFLIGHT).iterdir()):
             parts = f.name.split(SEP)
             if len(parts) != TOKEN_PARTS or not parts[2].isdigit():
                 continue
             key = parts[0]
+            # M-D crash window: terminal already durable -> the claim is stale
+            # bookkeeping, not recoverable work. Retire it; never re-ready.
+            if self._has_terminal(key):
+                with self._lock(key):
+                    if f.exists():
+                        f.unlink(missing_ok=True)
+                        rep.retired.append(key)
+                continue
             ident = outbox.process_identity(int(parts[2]))
             if ident.state is outbox.OwnerState.UNKNOWN:
                 continue
