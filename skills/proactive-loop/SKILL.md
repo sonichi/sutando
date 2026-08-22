@@ -212,12 +212,26 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    left with no result file at all. In every case the terminal showed the text.
 
    **So close the write by reading it back, exactly as step 8 already does for the questions
-   reader** — same shape, different file:
+   reader** — same shape, different file. **But do NOT re-type the phrase to search for.** A probe
+   typed a second time from memory drifts from the text it is checking, and then fails the same way
+   the write fails. Measured on a peer node the same day: an audit of seven appends reported
+   **1 MISSING** because the probe used wording from the *commit message* while the entry said
+   something else. False MISSING is the dangerous polarity — it invites redoing work already done,
+   and a check that cries wolf gets demoted to the category that never fires.
 
-   ```bash
-   grep -c '<distinctive phrase from the entry you just wrote>' "$WORKSPACE/build_log.md"
-   # 0 = the entry is NOT in the file, whatever the terminal showed
+   **Define the marker ONCE and assert on the same variable**, so the probe cannot drift from its
+   subject and a dropped redirect cannot satisfy it:
+
+   ```python
+   MARK  = "step7-append-check"              # defined ONCE
+   entry = f"### {ts} — ...  [{MARK}]\n..."  # interpolated into what is WRITTEN
+   p.write_text(p.read_text() + entry)
+   assert p.read_text().count(MARK) == 1     # reads the FILE, never the terminal
    ```
+
+   `== 1`, not `> 0` — a 300 KB log may already contain the phrase somewhere else. And check that
+   the probe can produce a positive at all: a marker matching nothing scores 0 by construction and
+   cannot fail, which is a control that certifies nothing.
 
    `echo logged` / `echo closed` is not this check. It asserts the *last* command in the chain
    ran, which is true even when the append was the one that silently went elsewhere.
