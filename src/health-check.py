@@ -6998,6 +6998,56 @@ def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
                 pass
 
 
+def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
+    """A dual_read hit means C could not resolve an id the importer should have
+    covered — a finding, and the gate that blocks Design A's deletion."""
+    from datetime import datetime
+    name = "a-fallback-hits"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    hits = []
+    migrated = 0
+    for root in sorted(results.glob(".outbox*")):
+        counter = root / "a-fallback-hits.json"
+        if (root / ".items-migrated").is_dir():
+            migrated += 1
+            if not counter.is_file():
+                # Absence of evidence, not evidence of absence: a gate must not
+                # pass on an instrument that never ran (dual_read inits count 0).
+                hits.append(f"{root.name}: migrated but no counter — dual_read "
+                            "never ran here (instrument absent, not a measured zero)")
+                continue
+        if not counter.is_file():
+            continue
+        try:
+            rec = json.loads(counter.read_text(encoding="utf-8"))
+            if not isinstance(rec, dict):
+                raise ValueError("counter is not a JSON object")
+            count = int(rec.get("count", 0))
+        except (OSError, ValueError, TypeError):
+            hits.append(f"{root.name}: counter unreadable")
+            continue
+        if count > 0:
+            # fromtimestamp raises on domain garbage (inf/nan/1e30) that
+            # isinstance passes; a probe on the gate path must never raise.
+            try:
+                when_s = datetime.fromtimestamp(
+                    rec.get("last_hit_ts")).strftime("%m-%d %H:%M")
+            except (TypeError, ValueError, OSError, OverflowError):
+                when_s = "?"
+            hits.append(f"{root.name}: {count} hit(s), last {rec.get('last_item', '?')} at {when_s}")
+    if hits:
+        return {"name": name, "status": "warn",
+                "detail": "A-fallback (dual_read) HIT — importer coverage gap or "
+                          "phantom id; A deletion stays gated until a full release "
+                          "records zero new hits: " + "; ".join(hits)}
+    if migrated:
+        return {"name": name, "status": "ok",
+                "detail": f"no fallback hits — {migrated} migrated root(s), "
+                          "each with a live counter (measured zero)"}
+    return {"name": name, "status": "ok",
+            "detail": "no migrated outbox roots — dual-read window not active"}
+
+
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     """A claim whose task file still exists is queued or running, so no age condemns it;
     one whose task is archived is leaked at any age. Not a --fix: release may drop work."""
@@ -9232,6 +9282,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
+    checks.append(check_a_fallback_hits())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
