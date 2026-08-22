@@ -376,7 +376,7 @@
         "contributors",
         "maintainers"
       ],
-      "status": "frozen",
+      "status": "canonical",
       "canonical_for": "the five delivery/agent-boundary identities (delivery_id, task_id, attempt_id, idempotency_key, incarnation_id) and the three identity ratchets that gate B's format changes",
       "last_verified": "2026-08-22"
     }
