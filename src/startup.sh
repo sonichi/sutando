@@ -1231,18 +1231,22 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
         echo "  ✓ ngrok ($NGROK_URL — reserved domain, no Twilio update needed)"
       else
         echo "  ✓ ngrok ($NGROK_URL)"
-        # Only warn when the tunnel actually moved. This used to fire on every
-        # boot regardless, so the one time it mattered was indistinguishable
-        # from the times it did not — and chasing it cost a round trip on
-        # 2026-08-22 for a webhook that was already correct.
+        # Trailing slash is stripped because conversation-server.ts strips it
+        # before binding WEBHOOK_BASE_URL; comparing unnormalised reads as drift.
         TWILIO_CFG_URL=$(grep -E '^TWILIO_WEBHOOK_URL=' .env 2>/dev/null | head -1 \
-          | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs)
+          | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs | sed 's:/*$::')
+        NGROK_CMP="${NGROK_URL%/}"
         if [ -z "$TWILIO_CFG_URL" ]; then
           echo "  ⚠ Point the Twilio webhook at: $NGROK_URL (no TWILIO_WEBHOOK_URL recorded)"
-        elif [ "$TWILIO_CFG_URL" != "$NGROK_URL" ]; then
-          # TWILIO_WEBHOOK_URL is not just a note of the console value: the
-          # conversation server binds WEBHOOK_BASE_URL to it and skips ngrok, so
-          # a stale one leaves TwiML and <Stream> pointing at a dead tunnel.
+        elif [ "$TWILIO_CFG_URL" = "$NGROK_CMP" ]; then
+          :
+        elif ! printf '%s' "$TWILIO_CFG_URL" | grep -qE '\.ngrok(-free)?\.(app|io)$'; then
+          # A non-ngrok tunnel (e.g. Funnel) is authoritative: the phone server
+          # binds it and never starts ngrok, so this ngrok is not its tunnel.
+          :
+        else
+          # The server binds WEBHOOK_BASE_URL from this var, so a stale value
+          # leaves TwiML and <Stream> pointing at a tunnel that no longer exists.
           echo "  ⚠ ngrok URL moved — BOTH sides are stale:"
           echo "      was: $TWILIO_CFG_URL"
           echo "      now: $NGROK_URL"
@@ -1281,18 +1285,18 @@ fi
 if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
-# A single probe races a service that is still binding: measured 2026-08-22, voice-agent
-# reported ✗ here and was serving a full session a minute later. Retry briefly before
-# declaring it down; a genuinely dead service costs the extra wait only once.
+# A single probe races a service still binding, so retry briefly. The deadline is
+# GLOBAL: per-port it would serialise to ports x settle seconds before core launch.
 VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
+verify_started=$(date +%s)
+verify_deadline=$((verify_started + VERIFY_SETTLE_S))
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
-  waited=0
-  while ! lsof -i :"$port" > /dev/null 2>&1 && [ "$waited" -lt "$VERIFY_SETTLE_S" ]; do
+  while ! lsof -i :"$port" > /dev/null 2>&1 && [ "$(date +%s)" -lt "$verify_deadline" ]; do
     sleep 1
-    waited=$((waited + 1))
   done
+  waited=$(( $(date +%s) - verify_started ))
   if lsof -i :"$port" > /dev/null 2>&1; then
     if [ "$waited" -gt 0 ]; then
       echo "  ✓ $name (port $port, after ${waited}s)"

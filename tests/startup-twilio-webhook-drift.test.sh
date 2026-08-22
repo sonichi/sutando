@@ -1,19 +1,7 @@
 #!/usr/bin/env bash
 # The Twilio-webhook diagnostic in startup.sh, driven from the SOURCE.
-#
-# The block is extracted out of src/startup.sh by its own anchors rather than
-# copied here, so deleting or renaming it fails this file instead of leaving a
-# green test guarding a recipe nothing runs.
-#
-# Two things are pinned. First the silence: the value in .env carries a trailing
-# `# run: ngrok http 3100` comment on the host this was written for, and a parse
-# that keeps it never matches, so the "fixed" warning would fire forever on the
-# exact machine it was written for. Second the repair, which is TWO-SIDED --
-# `TWILIO_WEBHOOK_URL` is not a note of the console value. conversation-server.ts
-# binds WEBHOOK_BASE_URL to it and then SKIPS ngrok entirely, and that value is
-# embedded in generated TwiML, StatusCallback, and the <Stream wss://> the call
-# audio rides on. Telling the operator to update only the Twilio console leaves
-# the server generating callbacks against a tunnel that no longer exists.
+# The block is extracted by its own anchors, so deleting it fails this file
+# rather than leaving a green test over a recipe nothing runs.
 #
 # Run: bash tests/startup-twilio-webhook-drift.test.sh
 set -uo pipefail
@@ -75,7 +63,19 @@ case "$out" in
   *) bad "mismatch names the required restart" "no restart named" ;;
 esac
 
-# 6. the claim above is about real code -- pin that conversation-server really
+# 6. equivalent URLs are NOT drift: conversation-server strips the trailing slash
+#    before binding, so comparing unnormalised prescribes a restart for nothing.
+out="$(run_case "TWILIO_WEBHOOK_URL=$LIVE/" "$LIVE")"
+[ -z "$out" ] && ok "trailing-slash-equivalent is silent" \
+  || bad "trailing-slash-equivalent is silent" "got: $out"
+
+# 7. a non-ngrok tunnel is authoritative: the server binds it and never starts
+#    ngrok, so startup's disposable ngrok is not its tunnel and not drift.
+out="$(run_case "TWILIO_WEBHOOK_URL=https://host.tail1234.ts.net" "$LIVE")"
+[ -z "$out" ] && ok "configured Funnel tunnel is not reported as drift" \
+  || bad "configured Funnel tunnel is not reported as drift" "got: $out"
+
+# 8. the claim above is about real code -- pin that conversation-server really
 #    does bind this var and skip ngrok, so this test fails if that stops being
 #    true and the two-sided advice becomes wrong.
 CS="$REPO/skills/phone-conversation/scripts/conversation-server.ts"
@@ -89,6 +89,6 @@ else
   ok "conversation-server absent (optional skill) — binding check skipped"
 fi
 
-total=$((8))
+total=$((10))
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ] || exit 1
