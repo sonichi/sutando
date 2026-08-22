@@ -279,6 +279,57 @@ mviol12 = instantiation_violations(scan_instantiations(mutated12),
 check(any("_caller_leg::DesignCClaimBackend" in v for v in mviol12),
       "factory-argument mutation FAILS the gate at the passing site")
 
+
+# ── kewei r7: module-import ratchet — dynamic getattr needs the module, and
+#    importing a concrete backend MODULE outside its package home fails closed ─
+_BACKEND_MODS = ("delivery_core.backend_a", "delivery_core.backend_c")
+
+def scan_backend_module_imports(sources: dict) -> list[str]:
+    out = []
+    for path, text in sources.items():
+        if "/delivery_core/" in path:
+            continue  # the package's own internals compose the seam
+        try:
+            tree = ast.parse(text, filename=path)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if any(m in a.name for m in _BACKEND_MODS):
+                        out.append(f"{path} imports {a.name}")
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if any(m in mod for m in _BACKEND_MODS):
+                    out.append(f"{path} imports from {mod}")
+                elif mod.endswith("delivery_core"):
+                    for a in node.names:
+                        if a.name in ("backend_a", "backend_c"):
+                            out.append(f"{path} imports {mod}.{a.name}")
+    return sorted(out)
+
+mod_viol = scan_backend_module_imports(prod_sources)
+check(not mod_viol,
+      f"no file outside delivery_core imports a concrete backend module: {mod_viol}")
+
+# kewei's exact dynamic-lookup mutation: getattr over the imported module —
+# invisible to name scanning, caught at the import line by the module ratchet.
+mutated13 = dict(prod_sources)
+mutated13[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core.backend_c as dc\n"
+    "def _dynamic_backend_leg():\n"
+    "    Backend = getattr(dc, 'DesignC' + 'ClaimBackend')\n"
+    "    return Backend('improvised')\n")
+mv13 = scan_backend_module_imports(mutated13)
+check(any(_db in v and "backend_c" in v for v in mv13),
+      "dynamic getattr mutation FAILS the module-import ratchet at its import")
+mutated14 = dict(prod_sources)
+mutated14[_db] = prod_sources[_db] + (
+    "\n\nfrom ag2_sparrow.delivery_core import backend_c as bc\n")
+mv14 = scan_backend_module_imports(mutated14)
+check(any(_db in v for v in mv14),
+      "from-package submodule import FAILS the module-import ratchet")
+
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
     a, b = REPO / "src" / name, PKG / name
