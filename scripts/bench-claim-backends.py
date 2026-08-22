@@ -30,7 +30,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root (package import + git -C, no per-user state)
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.delivery_core.backend_a import DesignAClaimBackend  # noqa: E402
