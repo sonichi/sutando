@@ -11,9 +11,16 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+sys.path.insert(0, str(REPO / "scripts"))
 
-from ag2_sparrow.bench_claim_backends import main  # noqa: E402
+from bench_claim_backends import main  # noqa: E402
+
+# Shim import covers its lines; only the __main__ body is CLI-only.
+import importlib.util as _ilu  # noqa: E402
+_spec = _ilu.spec_from_file_location("bench_shim", REPO / "scripts" / "bench-claim-backends.py")
+_shim = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_shim)
+assert _shim.main is main, "shim must re-export the module's main"
 
 
 def run() -> None:

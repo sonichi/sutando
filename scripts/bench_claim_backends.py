@@ -30,8 +30,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-# repo root only for `git -C` in head_sha; package imports are native now.
-REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root (git -C only, no per-user state)
+REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root (package path + git -C, no per-user state)
+sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.delivery_core.backend_a import DesignAClaimBackend  # noqa: E402
 from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend  # noqa: E402
