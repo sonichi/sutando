@@ -195,7 +195,8 @@ quick_lookup:
 - Upsert identities by `(provider, user_id)` and rooms by `(provider, provider_room_id)` plus the provider container when required for uniqueness.
 - Never key an identity or room by display name, handle, nickname, or room title.
 - Merge cross-provider identities only with explicit confirmation or multiple independent strong signals totaling at least `0.9` confidence.
-- Never use display-name equality alone.
+- Never use display-name equality alone. Two people can render the same name on one homeserver, so a display-name join does not merely lose precision — it returns *a* stable ID with full confidence, and the wrong one is indistinguishable from the right one downstream.
+- **An owner-stated mapping outranks any derived one.** Record it as an evidenced fact with `source: owner_stated` and the time it was stated, and do not let a later derivation silently supersede it. A derivation that disagrees with an owner statement is a conflict to surface, not a correction to apply.
 - Keep aliases after a verified rename; do not treat a rename as a new entity.
 - Supersede time-varying facts rather than deleting them silently.
 - Decay inferred operational facts when not reconfirmed: room context quickly, active responsibility moderately, identity and explicit ownership slowly.

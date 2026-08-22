@@ -61,6 +61,10 @@ Under Sutando, the map is per-user state, so it lives under the **workspace**, n
 
 Resolve `<workspace>` with `bash scripts/sutando-config.sh workspace` — never hardcode a path and never use a bare relative path, because the process CWD is the repo, not the workspace.
 
+**The store belongs to the running core's workspace, not to whichever checkout the process happens to sit in.** That resolver answers per-checkout, so on a machine with more than one (an installed engine plus a developer-mode clone) the same command returns two different roots. An agent invoked from the second one writes a *second, divergent* map, and nothing reports a conflict: each store is internally consistent and neither knows the other exists. Resolve against the core that owns the session, and if you cannot establish which core that is, say so rather than writing into the checkout you were launched from.
+
+**`data/` is not in the default vault sync include set** (`notes/`, `talks/`, `hosts/` are), so the map is per-host by default and will not follow the user to another machine. That is the safe default — a collaboration map is host-local observation, not a document — but it should be a stated choice. A user who wants it to travel adds `data/collaboration-intelligence/` to `vault.sync.include`.
+
 **Why this location and not the checkout.** The engine tree is REPLACED on app update; anything written there is destroyed without warning. A skill whose whole purpose is a *durable* map is the worst possible thing to lose that way, and the loss is silent — the next run finds no store, builds a task-local view, and reports "persistence unavailable" as if that were normal.
 
 On a host with no workspace, build the task-local view and say persistence is unavailable, as the operating contract requires. Do not invent a fallback directory.
@@ -144,6 +148,14 @@ When help is needed:
 
 1. Derive required capabilities and the affected component.
 2. Rank candidates using explicit responsibility first, recent demonstrated expertise second, room relevance third, and availability evidence last.
+
+   **A ranking you derived from activity counts is a measurement, not a standing fact, and it is the most dangerous thing in this file** — it arrives with the authority of arithmetic and none of the caveats of a recollection. Three properties to respect, each of which produced a wrong answer in practice:
+
+   - **State the counting unit.** "Approvals" is ambiguous between approval *events* and *distinct items approved*; on one real 40-PR window the same person scored 52 and 24 under the two readings. Two people computing "the same" number will disagree and neither will be wrong.
+   - **Store the window with the number** (`window_start`, `window_end`, `computed_at`) and re-derive rather than quote. A last-N window slides as new items land: on an active repo, two derivations ninety minutes apart disagreed on every row, and one person moved from inside the set to absent from it.
+   - **A low or zero count is not evidence of exclusion.** The metric has no early signal — a maintainer added yesterday is indistinguishable from an inactive one until they accumulate history, so the ranking is most confident about the longest-tenured and least reliable about the newest arrival, which is exactly who "whom do I ask?" is often about. Use counts to find candidates, never to rule one out; explicit responsibility and owner statements outrank them.
+
+   Treat a derived set older than a few hours the way this skill treats a memory: a candidate to re-derive, not an answer.
 3. Prefer the room where the work already has context. Do not move sensitive context across rooms without checking visibility and membership.
    When customers or external collaborators are present, share only context appropriate to that relationship and work scope.
 4. Contact the responsible agent directly when it can act. Include its owner or a human when approval, escalation, or shared accountability is needed.
