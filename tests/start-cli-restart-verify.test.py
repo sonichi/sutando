@@ -67,8 +67,11 @@ exit 1
 """ % FAKEPID
 
 PS_STUB = r"""#!/bin/bash
-# core_claude_pids does: ps -p <pid> -o args=
-# Report the matching cmdline only for our fake pid while CORE_MARK exists.
+# core_claude_pids does: ps -p <pid> -o args=; the ownership gate additionally
+# asks for the env blob (-E). The staged core models THIS launcher's own core,
+# so the env response must stamp the launcher's socket (TMUX=<socket>,) — a
+# markerless core on a private socket is now correctly treated as foreign
+# (sonichi/sutando#2884) and would be invisible to the restart flow.
 want=""
 prev=""
 for a in "$@"; do
@@ -76,7 +79,10 @@ for a in "$@"; do
   prev="$a"
 done
 if [ "$want" = "%s" ] && [ -f "$CORE_MARK" ]; then
-  echo "claude --name sutando-core"
+  case "$*" in
+    *-E*) echo "claude --name sutando-core TMUX=${SUTANDO_TMUX_SOCKET},1,0" ;;
+    *) echo "claude --name sutando-core" ;;
+  esac
 fi
 exit 0
 """ % FAKEPID

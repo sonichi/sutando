@@ -15,6 +15,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- start-cli.sh no longer adopts (or restarts/kills) a coexisting install's `sutando-core` claude: core-process matching is scoped to the launcher's own tmux socket via exec-time env markers (`TMUX=`, `SUTANDO_TMUX_SOCKET=`) with a parent-tmux-server fallback, and a refused adoption now names the foreign pid instead of silently exiting 0. ([#2884])
 
 ## Changed
 

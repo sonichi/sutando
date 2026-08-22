@@ -143,7 +143,11 @@ tmux_core_session_running() {
   core_claude_running
 }
 
-core_claude_pids() {
+# Machine-global `--name $SESSION` match. Diagnostics only — never a basis for
+# adopting or killing: two installs (OSS checkout + desktop bundle) legitimately
+# run cores with the same session name on different sockets (#2884), so a
+# name-only match cannot tell ours from theirs. Use core_claude_pids for that.
+any_session_named_core_pids() {
   # -a: BSD/macOS pgrep excludes the caller's ANCESTORS by default, so when this
   # script runs from inside the core (startup.sh via the core's own Bash tool)
   # the live core is invisible → "core Claude is gone" → heal spawns a duplicate
@@ -153,6 +157,113 @@ core_claude_pids() {
     case "$args" in
       *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
     esac
+  done
+}
+
+# On macOS /tmp, /var and /etc are symlinks into /private, and env markers
+# record whichever spelling their writer was handed — compare against both.
+# Prints the twin spelling, or nothing when the path has none.
+sock_twin() {
+  case "$1" in
+    /private/*) printf '%s' "${1#/private}" ;;
+    /tmp/*|/var/*|/etc/*) printf '/private%s' "$1" ;;
+  esac
+}
+
+# The candidate's exec-time environment, best-effort ("" when unreadable —
+# e.g. another user's process). Linux exposes it at /proc/<pid>/environ
+# (NUL-separated); macOS appends it to `ps -E` output, space-separated and
+# unquoted, in the same blob as argv. Both are snapshots from exec time,
+# which is the point: they still name the socket after the tmux server that
+# stamped them has died.
+core_pid_env_blob() {
+  if [ -r "/proc/$1/environ" ]; then
+    tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null
+  else
+    ps -Ewwo command= -p "$1" 2>/dev/null
+  fi
+}
+
+# Match SUTANDO_TMUX_SOCKET=$2 in blob $1 with a hard right boundary (newline
+# from /proc, space from the ps blob, or end-of-blob) so a socket that is a
+# prefix of another path can never false-match. The value itself may contain
+# spaces (app-support paths do); searching for the full value + boundary is
+# still exact because the boundary only has to terminate the TRUE value.
+_sock_env_match() {
+  local nl='
+'
+  [ -n "$2" ] || return 1
+  case "$1" in
+    *"SUTANDO_TMUX_SOCKET=$2"|*"SUTANDO_TMUX_SOCKET=$2 "*|*"SUTANDO_TMUX_SOCKET=$2$nl"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Does this pid's core belong to THIS launcher's socket? Judged from env
+# markers, strongest first:
+#   TMUX=<socket>,<pid>,<idx> — stamped by tmux into every pane child; the
+#     comma is a natural delimiter, and the snapshot survives the server's
+#     death — exactly the legitimate-orphan case adoption must keep serving.
+#   SUTANDO_TMUX_SOCKET=…     — this launcher's own forwarding (CORE_ENV_ARGS).
+# A marker naming a DIFFERENT socket → not ours. No marker at all → the core
+# was launched outside tmux, which only the default-socket install does:
+# treat it as /tmp/sutando-tmux.sock's.
+core_pid_owned_here() {
+  local blob twin
+  blob="$(core_pid_env_blob "$1")"
+  twin="$(sock_twin "$TMUX_SOCKET")"
+  case "$blob" in
+    *"TMUX=$TMUX_SOCKET,"*) return 0 ;;
+  esac
+  if [ -n "$twin" ]; then
+    case "$blob" in
+      *"TMUX=$twin,"*) return 0 ;;
+    esac
+  fi
+  case "$blob" in
+    *"TMUX="*) return 1 ;;
+  esac
+  if _sock_env_match "$blob" "$TMUX_SOCKET" || _sock_env_match "$blob" "$twin"; then
+    return 0
+  fi
+  case "$blob" in
+    *"SUTANDO_TMUX_SOCKET="*) return 1 ;;
+  esac
+  # Env told us nothing (SIP hides procargs for platform-binary processes, and
+  # another user's env is never readable). Ask the parent instead: a LIVE pane
+  # child's parent is the tmux server itself, whose argv names its socket
+  # (`tmux -S <socket> …`). An orphan's parent is init/launchd — no tmux
+  # there, fall through to the default rule.
+  local ppid pargs
+  ppid="$(ps -p "$1" -o ppid= 2>/dev/null || true)"
+  ppid="${ppid//[[:space:]]/}"
+  if [ -n "$ppid" ] && [ "$ppid" -gt 1 ] 2>/dev/null; then
+    pargs="$(ps -p "$ppid" -o args= 2>/dev/null || true)"
+    case "$pargs" in
+      *tmux*"-S $TMUX_SOCKET "*|*tmux*"-S $TMUX_SOCKET") return 0 ;;
+    esac
+    if [ -n "$twin" ]; then
+      case "$pargs" in
+        *tmux*"-S $twin "*|*tmux*"-S $twin") return 0 ;;
+      esac
+    fi
+    case "$pargs" in
+      *tmux*" -S "*) return 1 ;;
+    esac
+  fi
+  [ "$TMUX_SOCKET" = /tmp/sutando-tmux.sock ] || [ "$TMUX_SOCKET" = /private/tmp/sutando-tmux.sock ]
+}
+
+# Cores that verifiably belong to THIS install's socket. Everything that
+# adopts, attaches to, or kills "the core" must go through this — a global
+# name match falsely adopted a coexisting install's core (#2884: launcher
+# exits 0, its own socket never gets a server, every tmux consumer downstream
+# fails with "no server running").
+core_claude_pids() {
+  any_session_named_core_pids | while read -r pid; do
+    if core_pid_owned_here "$pid"; then
+      echo "$pid"
+    fi
   done
 }
 
@@ -645,10 +756,23 @@ fi
 # claude seen here is either still dying (the SIGKILL escalation above should
 # have reaped it) or one a competing launcher spawned in the race window.
 # Reusing it would defeat the restart and re-introduce the false-success path.
-if [ -z "$RESTART_REQUESTED" ] && core_claude_running; then
-  echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
-  echo "To recycle it cleanly: bash $0 --restart"
-  exit 0
+if [ -z "$RESTART_REQUESTED" ]; then
+  if core_claude_running; then
+    echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
+    echo "To recycle it cleanly: bash $0 --restart"
+    exit 0
+  fi
+  # A '--name $SESSION' claude exists but is NOT ours (its env names a
+  # different socket, or none while we manage a private one). Adopting it was
+  # the #2884 failure: exit 0 with no server ever created on our socket. Say
+  # whose it is and fall through to launch our own core — the two installs
+  # watch different workspaces, so they do not race each other's tasks.
+  _foreign_pid="$(any_session_named_core_pids)"
+  _foreign_pid="${_foreign_pid%%$'\n'*}"
+  if [ -n "$_foreign_pid" ]; then
+    echo "  ⚠ a '$SESSION' claude (pid $_foreign_pid) is running but belongs to another install (different tmux socket) — not adopting it; launching this install's core on $TMUX_SOCKET" >&2
+    echo "    To stop the other core instead: run ITS checkout's start-cli.sh --restart, or kill $_foreign_pid" >&2
+  fi
 fi
 
 if tmux_session_exists; then
