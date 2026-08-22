@@ -322,9 +322,20 @@ muted channel costs you every future nudge that mattered. The test before sendin
 not "has it been a while?" but **"has something changed since the last time I told
 them?"** If nothing has, the item is correctly in their queue — leave it.
 
+**But first confirm someone actually holds it.** No-change is a reason not to re-ping
+a person; it is never a reason to leave an item with no owner. On an item nobody was
+ever asked to move, nothing changes on your side *by construction* — so the test above
+returns "leave it" forever. That item is not waiting, it is dropped, and the action is
+to solicit, not to wait quietly. The two states are indistinguishable from outside and
+have opposite fixes: an item someone holds needs silence, an item no one holds needs a
+name on it.
+
 Track, per party you are waiting on: what they hold, and what has changed since you
-last contacted them. That pair is what makes the next message either necessary or
-noise, and it is the thing an issue tracker does not store.
+last contacted them. **That pair has no home today** — the record schema in
+`references/schema.md` carries entities, rooms, relationships and evidenced facts, but
+no outstanding-ask record, and an issue tracker does not store it either. Keep it with
+whatever working state you already have for the item, and do not assume a lookup can
+answer "what do they hold".
 
 **Never a bare room post when you need someone to help.** The rule is scoped to
 *asking*, and the test before posting is not "is this addressed?" but **"am I
