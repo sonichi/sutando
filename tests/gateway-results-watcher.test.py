@@ -142,5 +142,31 @@ rtc._OUTBOUND_STOP.set()
 rtc.wake_outbound()
 worker2.join(timeout=5)
 
+# ── 8. partial-capability runtime (Xcode 3.9): kqueue WITHOUT os.O_EVTONLY —
+#      the doorbell must ride the O_RDONLY fallback, not degrade to scan ─────
+rtc.OUTBOUND_SCAN_S = 30.0
+rtc._OUTBOUND_STOP.clear()
+_saved_evtonly = os.O_EVTONLY
+del os.O_EVTONLY
+try:
+    check(not hasattr(os, "O_EVTONLY"), "control precondition: O_EVTONLY absent")
+    watcher3 = rtc._start_results_watcher()
+    check(watcher3 is not None, "watcher starts without O_EVTONLY")
+    worker3 = rtc._start_outbound_worker(set())
+    base = drain.count()
+    t0 = time.monotonic()
+    (RD / "no-evtonly.txt").write_text("fallback fd")
+    check(wait_for(lambda: drain.count() > base, 3.0),
+          "kqueue-without-O_EVTONLY: create still wakes a drain")
+    lat = drain.calls[base] - t0 if drain.count() > base else 99
+    check(lat < 2.0, f"fallback doorbell latency {lat*1000:.0f}ms — not the 30s scan")
+finally:
+    os.O_EVTONLY = _saved_evtonly
+rtc._OUTBOUND_STOP.set()
+rtc.wake_outbound()
+watcher3.join(timeout=5)
+worker3.join(timeout=5)
+check(not watcher3.is_alive(), "partial-capability watcher shuts down cleanly")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

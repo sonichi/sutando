@@ -1063,7 +1063,10 @@ def _start_results_watcher() -> "threading.Thread | None":
             fd, kq = -1, None
             try:
                 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-                fd = os.open(str(RESULTS_DIR), os.O_EVTONLY)
+                # O_EVTONLY is absent on some supported pythons (Xcode 3.9);
+                # kqueue accepts an O_RDONLY fd — it just pins the mount.
+                fd = os.open(str(RESULTS_DIR),
+                             getattr(os, "O_EVTONLY", os.O_RDONLY))
                 kq = select.kqueue()
                 kq.control([select.kevent(
                     fd, filter=select.KQ_FILTER_VNODE,
