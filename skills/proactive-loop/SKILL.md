@@ -192,7 +192,11 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    On the **first no-op** of a run (`streak >= 1`):
    1. **Generate, don't idle** — first widen the menu and actually try to produce a tangible artifact (peer-PR review, regression grep, parity verify, research, memory curation, own-PR CI). Gated ≠ nothing-to-do. Only if genuinely all-gated go to step 2.
    2. **Surface once per changed set** — build the held-list as `(item_id, gated_on)` pairs, where
-   `gated_on` is a short stable token (`owner`, `ci`, `upstream`, `peer-review`), and hash it with:
+   `gated_on` is a short stable token (`owner`, `ci`, `upstream`, `peer-review`) — it is reduced
+   to its leading token, so re-describing one blocker cannot make a second key. ⚠ **`item_id`
+   is NOT reduced**: use a stable identifier (a PR number, a fixed slug), never a rendered
+   description — an id carrying a live count re-hashes on a change nobody needs told about.
+   Hash it with:
 
    ```bash
    echo '[["3166","owner"],["3274","owner"]]' |

@@ -9,7 +9,7 @@ Existing as a script is the point: while the rule lived in skill prose the hash
 was built ad hoc by the agent each pass, and an agent handed "sha1 the
 held-list" naturally hashes the sentence it was about to send.
 
-  echo '[["3166","owner: restart window"],["3274","owner: gateway credential"]]' \\
+  echo '[["3166","owner"],["3274","owner"]]' \\
       | idle-surface-hash.py --state <workspace>/state/idle-streak.json
   -> post   c0ffee...        (differs from last_surfaced_hash)
   -> quiet  c0ffee...        (unchanged)
@@ -28,17 +28,24 @@ from pathlib import Path
 
 
 def _token(s) -> str:
-    """Case- and whitespace-insensitive. `gated_on` is a token, not a sentence:
-    prose in the key reintroduces the re-wording instability one level down."""
+    """Case- and whitespace-insensitive."""
     return " ".join(str(s or "").split()).casefold()
+
+
+def _blocker(s) -> str:
+    """Leading token only. `gated_on` names WHO the item waits on, not why, so
+    two descriptions of one blocker must not produce two keys."""
+    t = _token(s).split(":")[0].split()
+    return t[0] if t else ""
 
 
 def canonical_key(items) -> str:
     """`id:blocker` lines, sorted. Order- and wording-independent by construction.
 
-    `gated_on` should be a short stable token — `owner`, `ci`, `upstream`,
+    `gated_on` is reduced to its leading token — `owner`, `ci`, `upstream`,
     `peer-review` — so a blocker CHANGING re-surfaces while re-describing the
-    same blocker does not.
+    same blocker does not. `id` is NOT reduced: it must already be a stable
+    identifier (a PR number, a fixed slug), never a rendered description.
     """
     out = []
     for it in items:
@@ -49,7 +56,7 @@ def canonical_key(items) -> str:
         ident = _token(ident)
         if not ident:
             raise ValueError(f"held-list entry has no id: {it!r}")
-        out.append(f"{ident}:{_token(gate)}")
+        out.append(f"{ident}:{_blocker(gate)}")
     return "\n".join(sorted(set(out)))
 
 

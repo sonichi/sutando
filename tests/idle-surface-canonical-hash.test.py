@@ -41,6 +41,11 @@ for label, variant in {
     "reordered": [["3274", "owner"], ["hooks", "owner"], ["3166", "owner"]],
     "dict form": [{"id": i, "gated_on": g} for i, g in BASE],
     "case and whitespace": [["3166", "  OWNER "], ["3274", "Owner"], ["  hooks", "owner"]],
+    # the rule the docstring states: gated_on names WHO, so re-describing one
+    # blocker must not produce a second key.
+    "prose descriptions of one blocker": [["3166", "owner: restart window"],
+                                          ["3274", "owner: gateway credential"],
+                                          ["hooks", "owner - waiting on a/b/c"]],
     "duplicate entry": BASE + [["3166", "owner"]],
 }.items():
     check(f"stable across: {label}", ish.held_hash(variant) == h0, ish.held_hash(variant))
