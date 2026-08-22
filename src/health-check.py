@@ -3347,10 +3347,16 @@ CHECKOUT_NONGIT = "non-git install"
 
 def _checkout_is_canonical(repo_dir) -> tuple:
     """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?"""
-    # .git presence is the bundle discriminator — checked BEFORE any git call,
-    # so a probe failure can never masquerade as a bundle (or vice versa).
-    if not (Path(repo_dir) / ".git").exists():
-        return (False, f"{CHECKOUT_NONGIT} (no .git in {repo_dir})")
+    # Decided BEFORE any git call, and the bundle exception needs POSITIVE
+    # provenance: the parent-dir manifest check_engine_revision_drift keys on.
+    git_meta = Path(repo_dir) / ".git"
+    if not git_meta.exists():
+        if os.path.lexists(git_meta):
+            # A name that resolves nowhere is damaged metadata, not a bundle.
+            return (False, f"{CHECKOUT_UNREADABLE} (.git is a broken link)")
+        if (Path(repo_dir).parent / "ENGINE_MANIFEST.json").exists():
+            return (False, f"{CHECKOUT_NONGIT} (bundled engine manifest present)")
+        return (False, f"{CHECKOUT_UNREADABLE} (no .git and no engine manifest)")
     try:
         # Route through git_argv, never a bare "git": a bare-string PATH lookup resolves to
         # the /usr/bin/git SHIM on a macOS host without the Xcode command line tools, which

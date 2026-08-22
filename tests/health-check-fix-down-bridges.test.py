@@ -824,15 +824,27 @@ def case_s_checkout_is_canonical() -> list[str]:
         if ok or "unreadable" not in why:
             fails.append(f"s) unreadable git state should fail-closed, got ({ok},{why})")
 
-    # No .git at all is a BUNDLE, not a probe failure — and it must be decided
-    # before any git call (no subprocess mock here; nothing may run).
+    # No .git is decided BEFORE any git call, and it is a bundle only with
+    # the parent-dir engine manifest; bare absence stays fail-closed.
     def no_calls(*a, **k):
         raise AssertionError("git must not be invoked for a non-git dir")
     with tempfile.TemporaryDirectory() as td, \
          mock.patch.object(hc.subprocess, "run", side_effect=no_calls):
-        ok, why = hc._checkout_is_canonical(td)
+        inner = Path(td) / "engine" / "sutando"
+        inner.mkdir(parents=True)
+        ok, why = hc._checkout_is_canonical(inner)
+        if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):
+            fails.append(f"s) no .git + no manifest should be UNREADABLE, got ({ok},{why})")
+        (inner.parent / "ENGINE_MANIFEST.json").write_text('{"sha": "x"}')
+        ok, why = hc._checkout_is_canonical(inner)
         if ok or not why.startswith(hc.CHECKOUT_NONGIT):
-            fails.append(f"s) non-git dir should report {hc.CHECKOUT_NONGIT!r}, got ({ok},{why})")
+            fails.append(f"s) manifest bundle should report {hc.CHECKOUT_NONGIT!r}, got ({ok},{why})")
+        broken = Path(td) / "broken"
+        broken.mkdir()
+        (broken / ".git").symlink_to(Path(td) / "gone")
+        ok, why = hc._checkout_is_canonical(broken)
+        if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):
+            fails.append(f"s) broken .git symlink should be UNREADABLE, got ({ok},{why})")
     return fails
 
 
@@ -993,6 +1005,7 @@ def case_p2_stale_guard_verdicts_wire_through_main() -> list[str]:
         ("bundle", (False, f"{hcm.CHECKOUT_NONGIT} (no .git in /x)"), True),
         ("non-canonical", (False, "checkout on 'feat/x', not main"), False),
         ("probe-failure", (False, f"{hcm.CHECKOUT_UNREADABLE} (git exit 128)"), False),
+        ("broken-git-link", (False, f"{hcm.CHECKOUT_UNREADABLE} (.git is a broken link)"), False),
     ]
     for label, verdict, restarts in cases:
         out, spawned, killed = _run_main_fix_with_stale(stale, plan, stale_guard=verdict)
@@ -1020,10 +1033,16 @@ def case_p3_pinned_config_full_wiring() -> list[str]:
         pinned = Path(td) / "pinned"
         pinned.mkdir()
         (pinned / ".gitignore").write_text("sutando.config.local.json\n")
-        for argv in (["git", "init", "-q"], ["git", "checkout", "-q", "-b", "pinned-branch"],
-                     ["git", "add", ".gitignore"],
-                     ["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                      "commit", "-q", "-m", "seed"]):
+        try:
+            hc.git_argv("--version")
+        except FileNotFoundError:
+            print("  SKIP p3: no runnable git (resolver)")
+            return fails
+        for argv in (hc.git_argv("init", "-q"),
+                     hc.git_argv("checkout", "-q", "-b", "pinned-branch"),
+                     hc.git_argv("add", ".gitignore"),
+                     hc.git_argv("-c", "user.email=t@t", "-c", "user.name=t",
+                                 "commit", "-q", "-m", "seed")):
             subprocess.run(argv, cwd=pinned, check=True, capture_output=True)
         (pinned / "sutando.config.local.json").write_text(
             '{"core": {"expected_branch": "pinned-branch"}}')

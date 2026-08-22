@@ -81,16 +81,23 @@ def main() -> int:
     import subprocess
     import tempfile
     env_no_override = {k: v for k, v in os.environ.items() if k != "SUTANDO_EXPECTED_BRANCH"}
+    try:
+        hc.git_argv("--version")
+    except FileNotFoundError:
+        print("SKIP: no runnable git (resolver) — real-checkout cases skipped")
+        print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
+        return 1 if failures else 0
     with tempfile.TemporaryDirectory() as td:
         pinned = Path(td) / "pinned"
         pinned.mkdir()
         # gitignored per-clone in the real repo too — an ignored config file
         # must not read as "uncommitted changes" and mask the branch verdict.
         (pinned / ".gitignore").write_text("sutando.config.local.json\n")
-        for argv in (["git", "init", "-q"], ["git", "checkout", "-q", "-b", "pinned-branch"],
-                     ["git", "add", ".gitignore"],
-                     ["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                      "commit", "-q", "--allow-empty", "-m", "seed"]):
+        for argv in (hc.git_argv("init", "-q"),
+                     hc.git_argv("checkout", "-q", "-b", "pinned-branch"),
+                     hc.git_argv("add", ".gitignore"),
+                     hc.git_argv("-c", "user.email=t@t", "-c", "user.name=t",
+                                 "commit", "-q", "--allow-empty", "-m", "seed")):
             subprocess.run(argv, cwd=pinned, check=True, capture_output=True)
         from unittest import mock
         with mock.patch.dict(os.environ, env_no_override, clear=True):
@@ -112,14 +119,32 @@ def main() -> int:
             allowed_pin, _ = hc.stale_restart_allowed(pinned)
             check(allowed_pin is True,
                   "and the stale path permits the restart on the configured pin")
-        nongit = Path(td) / "bundle"
-        nongit.mkdir()
-        (nongit / "src").mkdir()
-        ok_ng, why_ng = hc._checkout_is_canonical(nongit)
+        # Bundle needs POSITIVE provenance: the engine-manifest layout the
+        # build ships (manifest in the PARENT dir, .git stripped).
+        engine = Path(td) / "engine"
+        (engine / "sutando" / "src").mkdir(parents=True)
+        bare = engine / "sutando"
+        ok_bare, why_bare = hc._checkout_is_canonical(bare)
+        check(ok_bare is False and why_bare.startswith(hc.CHECKOUT_UNREADABLE),
+              f"no .git AND no manifest is UNREADABLE, not a bundle ({why_bare})")
+        allowed_bare, _ = hc.stale_restart_allowed(bare)
+        check(allowed_bare is False, "and the stale path refuses it (fail-closed)")
+        (engine / "ENGINE_MANIFEST.json").write_text('{"sha": "abc"}')
+        ok_ng, why_ng = hc._checkout_is_canonical(bare)
         check(ok_ng is False and why_ng.startswith(hc.CHECKOUT_NONGIT),
-              f"a dir with no .git reports {hc.CHECKOUT_NONGIT!r}, not unreadable ({why_ng})")
-        allowed_ng, _ = hc.stale_restart_allowed(nongit)
+              f"manifest in the parent makes it a verified bundle ({why_ng})")
+        allowed_ng, _ = hc.stale_restart_allowed(bare)
         check(allowed_ng is True, "and the stale path permits bundle recovery")
+        # A .git that resolves nowhere is damaged metadata, never a bundle.
+        broken = Path(td) / "broken"
+        broken.mkdir()
+        (broken / ".git").symlink_to(Path(td) / "gone")
+        (broken / "ENGINE_MANIFEST.json").parent.mkdir(exist_ok=True)
+        ok_bl, why_bl = hc._checkout_is_canonical(broken)
+        check(ok_bl is False and why_bl.startswith(hc.CHECKOUT_UNREADABLE),
+              f"a broken .git symlink is UNREADABLE, not a bundle ({why_bl})")
+        allowed_bl, _ = hc.stale_restart_allowed(broken)
+        check(allowed_bl is False, "and the stale path refuses the broken-link checkout")
 
     print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
     return 1 if failures else 0
