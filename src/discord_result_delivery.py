@@ -40,8 +40,12 @@ def is_delivered(results_dir: Path, task_id: str,
     if outbox.item_status(root, task_id) == "DELIVERED":
         return True
     if legacy_sentinel_dir is not None:
-        # exists() is total (pathlib swallows OSError into False) — no guard.
-        return (Path(legacy_sentinel_dir) / f"{task_id}.sentinel").exists()
+        # pathlib < 3.12 re-raises EACCES from exists() (only ENOENT-class
+        # errnos are swallowed); newer pathlib is total. Guard for both.
+        try:
+            return (Path(legacy_sentinel_dir) / f"{task_id}.sentinel").exists()
+        except OSError:
+            return False
     return False
 
 
