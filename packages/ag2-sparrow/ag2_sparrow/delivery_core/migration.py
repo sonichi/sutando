@@ -120,11 +120,31 @@ def import_a_state(root: Path) -> dict:
 
     root = Path(root)
     items_dir = root / ".items"
+    migrated_dir = root / ".items-migrated"
     report = {"ready": 0, "parked": 0, "delivered": 0, "unknown": 0,
               "skipped": 0, "verified": False, "fenced": False}
     if not items_dir.is_dir():
-        report["verified"] = True            # nothing to import is a clean state
-        return report
+        if os.path.lexists(items_dir):
+            # A FILE or dangling symlink at .items is ambiguous A-side state,
+            # not proof of absence. Fail closed; nothing is fenced.
+            report["unmigratable"] = ".items exists but is not a directory"
+            return report
+        if migrated_dir.is_dir() and read_epoch(root) != "C":
+            # Rename-to-fence crash window: re-verify against the preserved
+            # copies, then finish the fence.
+            items_dir = migrated_dir
+            resume_rename_done = True
+        else:
+            # Genuinely clean root (nothing to import, nothing half-moved):
+            # complete the activation INTENTIONALLY so the epoch is decided.
+            from .backend_c import DesignCClaimBackend
+            DesignCClaimBackend(root, activate=True)
+            write_fence(root, "C")
+            report["verified"] = True
+            report["fenced"] = True
+            return report
+    else:
+        resume_rename_done = False
     c = DesignCClaimBackend(root, activate=True)
     for f in sorted(items_dir.glob("*.json")):
         try:
@@ -132,11 +152,13 @@ def import_a_state(root: Path) -> dict:
         except (OSError, ValueError):
             rec = None
         if not isinstance(rec, dict) or not rec.get("item_id"):
-            report["unknown"] += 1           # unreadable A record: park by name
             key = _safe_key(f.stem)
-            marker = c._d("undelivered") / f"{key}{SEP}import-unreadable{SEP}{_time.time_ns()}"
-            if not marker.exists():
+            marker = c._d("undelivered") / f"{key}{SEP}import-unreadable{SEP}import"
+            if marker.exists():
+                report["skipped"] += 1       # idempotent: one marker per record
+            else:
                 marker.write_bytes(f.read_bytes() if f.exists() else b"")
+                report["unknown"] += 1
             continue
         item_id = rec["item_id"]
         key = _safe_key(item_id)
@@ -206,7 +228,8 @@ def import_a_state(root: Path) -> dict:
         report["missing"] = missing[:5]
         return report                        # fence NOT written; re-run resumes
     report["verified"] = True
-    items_dir.rename(root / ".items-migrated")
+    if not resume_rename_done:
+        items_dir.rename(migrated_dir)
     write_fence(root, "C")
     report["fenced"] = True
     return report

@@ -109,5 +109,70 @@ with tempfile.TemporaryDirectory() as td:
               for e in c._d("undelivered").iterdir()),
           "and the marker names the reconcile reason")
 
+
+with tempfile.TemporaryDirectory() as td:
+    # CRASH WINDOW (Codex control): rename done, fence never written.
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("w-1", b"x")
+    a.publish("w-2", b"y")
+    import ag2_sparrow.delivery_core.migration as mig
+    real_fence = mig.write_fence
+    def crashing_fence(r, e):
+        raise RuntimeError("simulated crash inside write_fence")
+    mig.write_fence = crashing_fence
+    try:
+        try:
+            import_a_state(root)
+        except RuntimeError:
+            pass
+    finally:
+        mig.write_fence = real_fence
+    check(not (root / ".items").exists() and (root / ".items-migrated").is_dir(),
+          "crash window reproduced: renamed but unfenced")
+    check(read_epoch(root) == "A", "epoch still A after the crash")
+    rep = import_a_state(root)                     # the rerun must RECOVER
+    check(rep["verified"] and rep["fenced"],
+          f"rerun re-verifies the preserved originals and finishes the fence ({rep})")
+    check(read_epoch(root) == "C", "epoch reaches C — migration not stranded")
+    c = DesignCClaimBackend(root)
+    check((c._d("ready") / _safe_key("w-1")).exists(),
+          "and the imported items are intact")
+
+with tempfile.TemporaryDirectory() as td:
+    # Ambiguous .items shapes fail closed; a clean root fences intentionally.
+    root = Path(td) / "file-shape"
+    root.mkdir()
+    (root / ".items").write_text("not a dir")
+    rep = import_a_state(root)
+    check(not rep["verified"] and not rep["fenced"] and "unmigratable" in rep,
+          f"a FILE at .items fails closed ({rep})")
+    root2 = Path(td) / "danglink"
+    root2.mkdir()
+    (root2 / ".items").symlink_to(Path(td) / "gone")
+    rep2 = import_a_state(root2)
+    check(not rep2["verified"] and not rep2["fenced"],
+          "a dangling .items symlink fails closed")
+    root3 = Path(td) / "clean"
+    root3.mkdir()
+    rep3 = import_a_state(root3)
+    check(rep3["verified"] and rep3["fenced"] and read_epoch(root3) == "C",
+          f"a genuinely clean root completes activation and fences ({rep3})")
+
+with tempfile.TemporaryDirectory() as td:
+    # Malformed A record: ONE stable marker across repeated imports.
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("good-1", b"x")
+    (root / ".items" / "broken.json").write_text("{not json")
+    rep1 = import_a_state(root)
+    # the malformed record blocks nothing; re-import the migrated root twice
+    c = DesignCClaimBackend(root)
+    markers1 = [e.name for e in c._d("undelivered").iterdir() if "import-unreadable" in e.name]
+    check(len(markers1) == 1, f"one marker for the malformed record ({markers1})")
+    import_a_state(root)                            # no-op post-fence
+    markers2 = [e.name for e in c._d("undelivered").iterdir() if "import-unreadable" in e.name]
+    check(markers2 == markers1, "repeated import creates no duplicate markers")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
