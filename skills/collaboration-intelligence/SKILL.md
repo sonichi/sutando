@@ -330,17 +330,25 @@ noise. So there are two tests before sending, and they key on different variable
 - **Does this item still have a live owner?** Ownership is not established once and
   then trusted forever. A holder's attention can lapse, and **that is invisible from
   your side by construction** — nothing of yours changes when it happens, so elapsed
-  time is the *only* signal that can surface it. Ask on a horizon, as a reassignment
-  question, never as "any update?".
+  time is the *only* signal that can surface it. Pick that horizon deliberately and
+  write it down with the ask — an unnamed "eventually" is how eleven days happen — and
+  when it arrives send a reassignment question, never an "any update?".
 
 If neither test fires, the item is correctly in their queue — leave it.
 
 Measured on this repo: a PR sat **eleven days** on a blocking review its author had
-answered within the hour, while **four approvals accumulated on it** — the last of them
-the same morning anyone noticed. Nothing had changed on the author's side after day
-one, and the item was unambiguously owned, so "has anything changed on my side?"
-returned *no* every single day, correctly, while three other reviewers' work went
-unused. Elapsed time was the only thing that could have surfaced it.
+answered within the hour, while **three distinct reviewers approved it across six
+approval submissions** — the last of them the same morning anyone noticed. Nothing had
+changed on the author's side after day one, and the item was unambiguously owned, so
+"has anything changed on my side?" returned *no* every single day, correctly, while
+three people's work went unused. Elapsed time was the only thing that could have
+surfaced it.
+
+(Both figures are stated because they answer different questions and get confused for
+each other: the merge gate counts **reviewers**, so three is the number that binds,
+while six is the review *traffic* the item generated while going nowhere. Quoting one
+without naming which it is invites a reader to re-derive a third number that is neither
+— which is exactly what happened when this case was first written up.)
 
 **And the ownership test has a floor beneath it: an item nobody was EVER asked to
 move.** There no holder's attention lapsed — none existed. Nothing of yours changes, by
