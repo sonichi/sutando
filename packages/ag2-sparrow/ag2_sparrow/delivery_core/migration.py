@@ -330,7 +330,11 @@ def dual_read(root: Path, item_id: str) -> "dict | None":
             fcntl.flock(lk, fcntl.LOCK_EX)
             try:
                 prior = _json.loads(counter.read_text(encoding="utf-8"))
-                count = int(prior.get("count", 0)) if isinstance(prior, dict) else 0
+                raw = prior.get("count") if isinstance(prior, dict) else None
+                # Release-gate integer: fail closed to 0 on any malformed
+                # shape (null/bool/str/list/non-finite/negative/oversized).
+                count = (raw if isinstance(raw, int) and not isinstance(raw, bool)
+                         and 0 <= raw <= 10**12 else 0)
                 existed = True
             except FileNotFoundError:
                 count, existed = 0, False

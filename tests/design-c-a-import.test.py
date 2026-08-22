@@ -361,8 +361,10 @@ with tempfile.TemporaryDirectory() as td:
     check(not rep["verified"] and not rep["fenced"]
           and "symlink" in rep.get("unmigratable", ""),
           f"live .items symlink refused, nothing fenced ({rep.get('unmigratable')})")
-    check((external / "x.json").exists() and not (root / ".epoch").exists()
-          or True, "external directory untouched")
+    check((external / "x.json").read_text() == json.dumps(
+              {"item_id": "x", "status": "DELIVERED"})
+          and not (root / "protocol-epoch").exists(),
+          "external record unchanged AND no protocol-epoch fence written")
 
 with tempfile.TemporaryDirectory() as td:
     # 2. a receipt-less DELIVERED sentinel imports as OUTCOME_UNKNOWN, per the
@@ -406,6 +408,24 @@ with tempfile.TemporaryDirectory() as td:
     durable = json.loads((root / FALLBACK_COUNTER).read_text())["count"]
     check(not errs, f"64 concurrent dual_read calls raise nothing ({errs[:2]})")
     check(durable == N, f"durable count {durable} == {N} (no lost increments)")
+
+    # malformed shared-counter shapes (reviewer P1): dual_read never raises,
+    # the count fails closed and repairs to a valid int on the next hit
+    for label, payload in (("null", '{"count": null}'), ("bool", '{"count": true}'),
+                           ("list", '{"count": [1]}'), ("negative", '{"count": -5}'),
+                           ("huge", '{"count": 99999999999999999999}'),
+                           ("nonfinite", '{"count": NaN}'), ("junk", 'not json')):
+        (root / FALLBACK_COUNTER).write_text(payload)
+        try:
+            r = dual_read(root, "g")
+            raised = None
+        except Exception as e:                     # noqa: BLE001
+            r, raised = None, repr(e)
+        check(raised is None and r is not None and r["item_id"] == "g",
+              f"malformed counter ({label}): dual_read serves, never raises")
+        after = json.loads((root / FALLBACK_COUNTER).read_text())["count"]
+        check(isinstance(after, int) and not isinstance(after, bool) and after >= 1,
+              f"malformed counter ({label}): repaired to valid int ({after})")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
