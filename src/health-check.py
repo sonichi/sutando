@@ -5581,6 +5581,49 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
     return max(0.0, (now - float(last)) / 3600.0)
 
 
+def check_runtime_identity(path: "Path | None" = None,
+                           head_sha: "str | None" = None) -> dict:
+    """#3279 verification layer 3: the RUNNING gateway process self-reports
+    build SHA / entry point / delivery engine into its status sidecar; this
+    probe compares that against the checkout so 'the code on disk' and 'the
+    code in memory' can no longer silently diverge. Absent block = the
+    process predates the self-report (info, not proof of drift)."""
+    name = "runtime-identity"
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    try:
+        rt = json.loads(Path(p).read_text()).get("runtime")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {"name": name, "status": "ok",
+                "detail": "no gateway sidecar — nothing to verify (probe idle)"}
+    if not isinstance(rt, dict):
+        return {"name": name, "status": "warn",
+                "detail": "running bridge predates the runtime self-report — "
+                          "restart onto current code to enable layer-3 checks"}
+    if head_sha is None:
+        try:
+            head_sha = subprocess.check_output(
+                ["git", "-C", str(REPO_DIR), "rev-parse", "HEAD"],
+                text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        except Exception:
+            head_sha = None
+    bits = [f"engine={rt.get('engine')}",
+            f"core_confirmed={rt.get('core_confirmed')}",
+            f"legacy_sends={rt.get('legacy_sends')}"]
+    sha = rt.get("build_sha")
+    if head_sha and sha and sha != head_sha:
+        return {"name": name, "status": "warn",
+                "detail": f"build drift: process runs {str(sha)[:8]}, checkout "
+                          f"HEAD is {head_sha[:8]} — restart to converge; "
+                          + " ".join(bits)}
+    ep = rt.get("entrypoint") or ""
+    if ep and not ep.endswith("src/remote-gateway-bridge.py"):
+        return {"name": name, "status": "warn",
+                "detail": f"non-canonical entrypoint {ep}; " + " ".join(bits)}
+    return {"name": name, "status": "ok",
+            "detail": (f"sha={str(sha)[:8] if sha else 'unreported'} "
+                       f"entrypoint=canonical " + " ".join(bits))}
+
+
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
     """Whether the gateway bridge's own sidecar says the connection is serving.
 
@@ -9125,6 +9168,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
+    checks.append(check_runtime_identity())
     checks.append(check_disk_space())
 
     return checks

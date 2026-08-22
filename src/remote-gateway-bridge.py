@@ -83,6 +83,20 @@ for _root in (
 # (``rtc._ack_disabled_until = 0.0``) must hit the same namespace the running code
 # uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+
+# Runtime self-report, injected BEFORE the exec (anything after it is
+# unreachable when the exec'd source's own __main__ guard fires; see #3285).
+def _git_head(repo):
+    import subprocess
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+    except Exception:
+        return None
+
+RUNTIME_IDENTITY = {"build_sha": _git_head(_REPO),
+                    "entrypoint": str(Path(__file__).resolve())}
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
 
