@@ -241,6 +241,23 @@ def bench_publish_inflight_conflict(kind: str, payload: bytes) -> dict:
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _select_matrix(quick: bool, items, deep: bool):
+    """(scales, proc_counts, proc_items) for the three CLI modes."""
+    if quick:
+        return [40], (1, 2), 30
+    if items is not None:
+        return [items], (1, 4, 16), max(20, items // 2)
+    return [100, 10_000] + ([100_000] if deep else []), (1, 4, 16), 400
+
+
+def _verdict(a: dict, c: dict, proc_counts) -> bool:
+    """True iff every correctness invariant held for both backends."""
+    return all(k[f"procs_{w}"]["exactly_once"]
+               for k in (a, c) for w in proc_counts) \
+        and a["crash"]["ok"] and c["crash"]["ok"] \
+        and a["conflict"]["ok"] and c["conflict"]["ok"]
+
+
 def head_sha() -> str:
     """Via src/git_binary's resolver — a bare `git` can hit the Xcode-CLT stub."""
     try:
@@ -274,14 +291,7 @@ def main(argv=None) -> int:
     if args.stamp:
         result["timestamp"] = args.stamp
     k1, k64 = b"x" * 1024, b"x" * 65536
-    if args.quick:
-        scales, proc_counts, proc_items = [40], (1, 2), 30
-    elif args.items is not None:
-        scales, proc_counts = [args.items], (1, 4, 16)
-        proc_items = max(20, args.items // 2)
-    else:
-        scales = [100, 10_000] + ([100_000] if args.deep else [])
-        proc_counts, proc_items = (1, 4, 16), 400
+    scales, proc_counts, proc_items = _select_matrix(args.quick, args.items, args.deep)
 
     for kind in ("a", "c"):
         s = result["scenarios"].setdefault(kind, {})
@@ -331,11 +341,7 @@ def main(argv=None) -> int:
         print(f"{'':34} C={c[label]}")
     print(f"{'CPU s (self, whole matrix)':34} {a['cpu_s_selfproc']:26} {c['cpu_s_selfproc']:26}")
 
-    hard_ok = all(k[f"procs_{w}"]["exactly_once"]
-                  for k in (a, c) for w in proc_counts) \
-        and a["crash"]["ok"] and c["crash"]["ok"] \
-        and a["conflict"]["ok"] and c["conflict"]["ok"]
-    if not hard_ok:
+    if not _verdict(a, c, proc_counts):
         print("FAIL: correctness invariant violated (exactly-once/crash/conflict)",
               file=sys.stderr)
         return 1
