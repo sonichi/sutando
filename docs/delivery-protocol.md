@@ -98,14 +98,18 @@ authoritative.
   detects that misconfiguration today (a mount-type probe would be a reasonable
   hardening item).
 
-## Garbage collection: current policy is NONE (open item)
+## Garbage collection: mechanism exists and is unwired; the POLICY is the open item
 
-`archive/` and `parked/` grow without bound; `attempts/` entries for parked
-items persist. This is deliberate for now — every deletion in this protocol is
-a state transition, so GC must be specified (age- or count-bounded archive
-pruning that provably cannot delete the only evidence of a delivery) rather
-than improvised by an operator with `rm`. Tracked under #3279; until then,
-**manual deletion inside a root is a protocol violation**, not cleanup.
+The pruning primitive already exists: `cleanup(max_age_s)` (contract-level,
+implemented on both backends) age-prunes exactly `archive/`, `parked/`,
+`tmp/` and `attempts/`, and its `attempts/` branch carries the required
+guard — a LIVE item's counter is never pruned by age, since it is the item's
+park ceiling. **What is missing is a caller**: no production site invokes it,
+so the directories grow without bound today. The open item is choosing a
+schedule and retention (and whether archive pruning must first export the
+receipt elsewhere), then wiring the existing primitive — not designing GC
+from scratch. Tracked under #3279; until a caller exists, **manual deletion
+inside a root is a protocol violation**, not cleanup.
 
 ## In review, not yet on main (fenced)
 
