@@ -94,3 +94,119 @@ def convert_epoch(root: Path, items: Iterable[str],
         done += 1
     write_fence(root, target_epoch)
     return done
+
+
+def import_a_state(root: Path) -> dict:
+    """Idempotent A->C import of one outbox root, run in a QUIESCE window
+    (no drainer of either protocol may be running).
+
+    Mapping (ruling's table): READY/QUEUED unclaimed -> C ready/; PARKED ->
+    C undelivered/ with A's reason; DELIVERED -> a C terminal record carrying
+    A's persisted receipt (imported=True, no incarnation — there is no live
+    claim to bind); any CLAIMED non-terminal item -> C undelivered/ as
+    import-outcome-unknown (reconcile territory: the claim's fate is exactly
+    as unknowable as a mid-delivery crash). Attempt counts carry over.
+
+    Originals are PRESERVED: after every item converts and the per-state
+    counts verify, .items is renamed to .items-migrated (rollback = rename
+    back) and the epoch fence is written LAST — a crash anywhere earlier
+    leaves .items and the A fence intact, and a re-run resumes.
+    Returns per-state counts plus verified/fence flags.
+    """
+    import json as _json
+    import time as _time
+
+    from .backend_c import SEP, DesignCClaimBackend, _safe_key
+
+    root = Path(root)
+    items_dir = root / ".items"
+    report = {"ready": 0, "parked": 0, "delivered": 0, "unknown": 0,
+              "skipped": 0, "verified": False, "fenced": False}
+    if not items_dir.is_dir():
+        report["verified"] = True            # nothing to import is a clean state
+        return report
+    c = DesignCClaimBackend(root, activate=True)
+    for f in sorted(items_dir.glob("*.json")):
+        try:
+            rec = _json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            rec = None
+        if not isinstance(rec, dict) or not rec.get("item_id"):
+            report["unknown"] += 1           # unreadable A record: park by name
+            key = _safe_key(f.stem)
+            marker = c._d("undelivered") / f"{key}{SEP}import-unreadable{SEP}{_time.time_ns()}"
+            if not marker.exists():
+                marker.write_bytes(f.read_bytes() if f.exists() else b"")
+            continue
+        item_id = rec["item_id"]
+        key = _safe_key(item_id)
+        status = rec.get("status", "QUEUED")
+        payload = rec.get("payload", "").encode("utf-8")
+        n = int(rec.get("attempts", 0) or 0)
+        if n:
+            ap = c._attempts_path(key)
+            if not ap.exists():
+                ap.write_text(str(n))
+        from . import contract as _contract  # noqa: F401 — outcome names below
+        import ag2_sparrow.outbox as _outbox
+        claim = _outbox.read_delivery_claim(root, item_id)
+        if status == "DELIVERED":
+            dst = c._terminal_path(key)
+            if dst.exists():
+                report["skipped"] += 1
+                continue
+            c._write_terminal(key, {
+                "schema": 1, "item_id": item_id, "outcome": "confirmed",
+                "receipt": {"provider": rec.get("provider"),
+                             "destination": rec.get("destination")},
+                "completed_ns": _time.time_ns(), "worker": "a-import",
+                "attempts": n, "incarnation": None, "imported": True,
+            }, f"a-import{SEP}{key}")
+            report["delivered"] += 1
+        elif status == "PARKED":
+            reason = str(rec.get("reason") or "parked")[:40].replace(SEP, "-")
+            marker = c._d("undelivered") / f"{key}{SEP}{reason}{SEP}import"
+            if marker.exists():
+                report["skipped"] += 1
+            else:
+                marker.write_bytes(payload)
+                report["parked"] += 1
+        elif claim is not None:
+            marker = c._d("undelivered") / f"{key}{SEP}import-outcome-unknown{SEP}import"
+            if marker.exists():
+                report["skipped"] += 1
+            else:
+                marker.write_bytes(payload)
+                report["unknown"] += 1
+        else:
+            if (c._d("ready") / key).exists():
+                report["skipped"] += 1
+            elif c.publish(item_id, payload):
+                report["ready"] += 1
+            else:
+                report["skipped"] += 1       # tokens present: C already owns it
+    # Verify by MEMBERSHIP: every A item is represented somewhere in C.
+    missing = []
+    for f in sorted(items_dir.glob("*.json")):
+        try:
+            rec = _json.loads(f.read_text(encoding="utf-8"))
+            k = _safe_key(rec.get("item_id", f.stem))
+        except (OSError, ValueError):
+            k = _safe_key(f.stem)
+        present = ((c._d("ready") / k).exists()
+                   or c._terminal_path(k).exists()
+                   or any(e.name.startswith(f"{k}{SEP}")
+                          for e in c._d("undelivered").iterdir())
+                   or any(e.name.startswith(f"{k}{SEP}")
+                          for e in c._d("archive").iterdir())
+                   or c._tokens(k))
+        if not present:
+            missing.append(k)
+    if missing:
+        report["missing"] = missing[:5]
+        return report                        # fence NOT written; re-run resumes
+    report["verified"] = True
+    items_dir.rename(root / ".items-migrated")
+    write_fence(root, "C")
+    report["fenced"] = True
+    return report
