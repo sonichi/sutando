@@ -40,10 +40,8 @@ def is_delivered(results_dir: Path, task_id: str,
     if outbox.item_status(root, task_id) == "DELIVERED":
         return True
     if legacy_sentinel_dir is not None:
-        try:
-            return (Path(legacy_sentinel_dir) / f"{task_id}.sentinel").exists()
-        except OSError:
-            return False
+        # exists() is total (pathlib swallows OSError into False) — no guard.
+        return (Path(legacy_sentinel_dir) / f"{task_id}.sentinel").exists()
     return False
 
 

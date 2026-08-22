@@ -40,6 +40,9 @@ with tempfile.TemporaryDirectory() as td:
     check(drd.claim_for_send(rd, "task-A") is None,
           "delivered item is never re-claimed (crash-window idempotency)")
 
+    check(drd.is_delivered(rd, "task-Z") is False,
+          "unknown item, no legacy dir: not delivered")
+
     # double-claim race: a held claim yields None for the second caller
     t1 = drd.claim_for_send(rd, "task-B")
     check(t1 is not None and drd.claim_for_send(rd, "task-B") is None,
@@ -66,6 +69,59 @@ with tempfile.TemporaryDirectory() as td:
           "legacy sentinel alone reads as delivered (no double-send on migrate)")
     check(outbox.item_status(drd.result_backend(rd).root, "task-L") is None,
           "…and reading it writes NOTHING to the outbox (read-only compat)")
+
+    # retry-variant contract (the two-line follow-up API): re-readied, then
+    # parked at the attempt cap — never an infinite retry loop
+    t3 = drd.claim_for_send(rd, "task-R")
+    for i in range(drd.PARK_AT_ATTEMPTS):
+        check(drd.failed(rd, t3) is True, f"failed() attempt {i+1} completes")
+        t3 = drd.claim_for_send(rd, "task-R")
+        if t3 is None:
+            break
+    check(t3 is None and outbox.item_status(
+              drd.result_backend(rd).root, "task-R") == "PARKED",
+          "failed() re-readies until the cap, then parks (no infinite retry)")
+
+    # unreadable legacy sentinel dir (permission denied): OSError arm -> False
+    import os as _os
+    locked = Path(td) / "locked-sentinels"
+    locked.mkdir()
+    _os.chmod(locked, 0)
+    try:
+        check(drd.is_delivered(rd, "task-U", locked) is False,
+              "permission-denied sentinel dir: False, never raises")
+    finally:
+        _os.chmod(locked, 0o755)
+
+    # the vendored twin ships the same item_status — exercise it directly
+    import ag2_sparrow.outbox as twin_outbox
+    rt = Path(td) / "twin-root"
+    check(twin_outbox.item_status(rt, "task-T") is None,
+          "twin item_status: no record -> None")
+    tb = drd.result_backend(rd)
+    check(twin_outbox.item_status(tb.root, "task-A") == "DELIVERED",
+          "twin item_status reads the same record shape")
+    tp = twin_outbox._item_path(rt, "task-T2")
+    tp.parent.mkdir(parents=True)
+    tp.write_text('{"status": "READY"}')
+    _os.chmod(tp, 0)
+    try:
+        check(twin_outbox.item_status(rt, "task-T2") is None,
+              "twin item_status: unreadable record -> None, never raises")
+    finally:
+        _os.chmod(tp, 0o644)
+
+    # item_status total-exception arm: unreadable record file -> None
+    r2 = Path(td) / "corrupt-root"
+    cp = outbox._item_path(r2, "task-C2")
+    cp.parent.mkdir(parents=True)
+    cp.write_text('{"status": "READY"}')
+    _os.chmod(cp, 0)
+    try:
+        check(outbox.item_status(r2, "task-C2") is None,
+              "unreadable item record: item_status None, never raises")
+    finally:
+        _os.chmod(cp, 0o644)
 
 # ── wiring: the bridge delegates at its choke points ───────────────────────
 src = (REPO / "src" / "discord-bridge.py").read_text()
