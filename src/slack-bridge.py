@@ -170,7 +170,7 @@ if not BOT_TOKEN or not APP_TOKEN:
 # silently dropped files other bridges would send). Slack extends it with its
 # OWN inbound dir so an uploaded file can be echoed back; that root stays
 # Slack-local rather than becoming global.
-from send_allowlist import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
+from policy.egress.attachment import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
 
 
 def _is_path_sendable(fpath: str) -> bool:

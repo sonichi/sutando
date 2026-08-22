@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-One entry per agent-facing module. 3 without a usable header comment.
+One entry per agent-facing module. 4 without a usable header comment.
 
 ## `src/`
 
@@ -54,13 +54,13 @@ One entry per agent-facing module. 3 without a usable header comment.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
-- **`discord_context_policy.py`** — Compatibility shim — canonical module is `policy.context.discord` (phase-1a restructure).
-- **`discord_delivery_provider.py`** — Compatibility shim — canonical module is `channels.discord.delivery_provider` (phase-1a restructure).
-- **`discord_http.py`** — Compatibility shim — canonical module is `channels.discord.http` (phase-1a restructure).
-- **`discord_post_gate.py`** — Compatibility shim — canonical module is `channels.discord.post_gate` (phase-1a restructure).
+- **`discord_context_policy.py`** — Alias of `policy.context.discord` (phase-1a restructure); one transition window.
+- **`discord_delivery_provider.py`** — Alias of `channels.discord.delivery_provider` (phase-1a restructure); one transition window.
+- **`discord_http.py`** — Alias of `channels.discord.http` (phase-1a restructure); one transition window.
+- **`discord_post_gate.py`** — Alias of `channels.discord.post_gate` (phase-1a restructure); one transition window.
 - **`discord_proactive_send.py`** — Send-leg of proactive text delivery through the shared DeliveryProvider.
-- **`discord_reader.py`** — Compatibility shim — canonical module is `channels.discord.reader` (phase-1a restructure).
-- **`discord_rest_client.py`** — Compatibility shim — canonical module is `channels.discord.client` (phase-1a restructure).
+- **`discord_reader.py`** — Alias of `channels.discord.reader` (phase-1a restructure); one transition window.
+- **`discord_rest_client.py`** — Alias of `channels.discord.client` (phase-1a restructure); one transition window.
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
@@ -121,17 +121,17 @@ One entry per agent-facing module. 3 without a usable header comment.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
-- **`result_channel_key.py`** — Compatibility shim — canonical module is `delivery.channel_key` (phase-1a restructure).
+- **`result_channel_key.py`** — Alias of `delivery.channel_key` (phase-1a restructure); one transition window.
 - **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every delivery consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the `src/dm-result.py` REST fallback).
-- **`result_ready.py`** — Compatibility shim — canonical module is `delivery.readiness` (phase-1a restructure).
-- **`result_router.py`** — Compatibility shim — canonical module is `delivery.router` (phase-1a restructure).
+- **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
+- **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
-- **`send_allowlist.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
+- **`send_allowlist.py`** — Alias of `policy.egress.attachment` (phase-1a restructure); one transition window.
 - **`send_failure_policy.py`** — Classify an outbound-send failure as transient (retry) or permanent (park).
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
@@ -157,8 +157,8 @@ One entry per agent-facing module. 3 without a usable header comment.
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
-- **`team_guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
-- **`team_result_guard.py`** — Final scan applied to a Team-tier result before any router reads its markers.
+- **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.
+- **`team_result_guard.py`** — Alias of `policy.egress.result` (phase-1a restructure); one transition window.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
@@ -310,11 +310,18 @@ One entry per agent-facing module. 3 without a usable header comment.
 ## `src/policy/`
 
 - **`__init__.py`** — _(no header comment)_
+- **`guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
 
 ## `src/policy/context/`
 
 - **`__init__.py`** — _(no header comment)_
 - **`discord.py`** — contextNotFrom gate — the single policy deciding whether a serving channel may pull another Discord channel's content into context.
+
+## `src/policy/egress/`
+
+- **`__init__.py`** — _(no header comment)_
+- **`attachment.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
+- **`result.py`** — Final scan applied to a Team-tier result before any router reads its markers.
 
 ## `src/runtime-api/`
 

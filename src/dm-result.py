@@ -51,7 +51,7 @@ USAGE = "Usage: python3 src/dm-result.py 'text' | --file path"
 # roots that discord-bridge had; the shared import fixes that drift.
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
-from send_allowlist import (  # noqa: E402
+from policy.egress.attachment import (  # noqa: E402
     is_path_sendable as _is_path_sendable,
     SEND_ALLOWED_PREFIXES as _SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS as _SEND_ALLOWED_ROOTS,

@@ -22,6 +22,9 @@ SHIMS = {
     "discord_reader": ("channels.discord.reader", "render_line"),
     "discord_delivery_provider": ("channels.discord.delivery_provider", "DiscordDeliveryProvider"),
     "discord_context_policy": ("policy.context.discord", "gate"),
+    "send_allowlist": ("policy.egress.attachment", "is_path_sendable"),
+    "team_result_guard": ("policy.egress.result", "scan_team_result"),
+    "team_guardrail": ("policy.guardrail", "TEAM_GUARDRAIL"),
 }
 
 fails = []

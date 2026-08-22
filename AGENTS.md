@@ -310,7 +310,7 @@ Tasks arrive from multiple channels via the same file bridge:
 MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`), and derive
 attachments from actions whose `kind == "attach"`. **Do not add a new private parser.**
 
-Attachment-path authorization is owned by `src/send_allowlist.py` before the upload sink. Migration status + the no-leak guard history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md). The dependency direction is one-way:
+Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. Migration status + the no-leak guard history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md). The dependency direction is one-way:
 
     parse_markers()  ->  send_allowlist.is_path_sendable()  ->  transport upload
 

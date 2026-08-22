@@ -150,8 +150,9 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
-from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+
 from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
@@ -354,7 +355,7 @@ OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 # `src/dm-result.py`'s REST-fallback delivery (per liususan091219
 # review on PR #1029: keeping the policy as a copy in each file will
 # drift, even with "keep in sync" comments).
-from send_allowlist import (  # noqa: E402
+from policy.egress.attachment import (  # noqa: E402
     SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS,
     is_path_sendable as _is_path_sendable_shared,

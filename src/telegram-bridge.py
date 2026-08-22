@@ -82,7 +82,7 @@ RESULTS_DIR = REPO / "results"
 # lacked the personal-notes, iclr-backups and launch-assets roots, so a file
 # Discord would happily send was silently dropped from a Telegram reply.
 # Telegram inherits the complete canonical policy with no extra roots.
-from send_allowlist import is_path_sendable as _is_path_sendable  # noqa: E402
+from policy.egress.attachment import is_path_sendable as _is_path_sendable  # noqa: E402
 
 
 # --- Config loading (independent of _is_path_sendable above) ---

@@ -9,7 +9,7 @@ regex::
 That shape only recognised values beginning `/` or `~/`, and excluded any
 value containing a colon. The canonical parser in `src/result_markers.py`
 recognises the documented marker shape and leaves *path authorization* to
-`src/send_allowlist.py`.
+`src/policy/egress/attachment.py`.
 
 The divergence was user-visible: a marker the canonical parser strips was
 left untouched by the private regex, so the REST fallback delivered the
@@ -40,7 +40,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from send_allowlist import is_path_sendable  # noqa: E402
+from policy.egress.attachment import is_path_sendable  # noqa: E402
 
 # Hermetic load: dm-result reads DISCORD_BOT_TOKEN from the environment, so
 # no token file is created and $HOME is never touched. (The older
