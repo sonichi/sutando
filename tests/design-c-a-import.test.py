@@ -196,7 +196,7 @@ with tempfile.TemporaryDirectory() as td:
 
 # ── dual_read: the migration-window C-miss fallback ────────────────────
 from ag2_sparrow.delivery_core.migration import (  # noqa: E402
-    FALLBACK_COUNTER, dual_read)
+    FALLBACK_COUNTER, dual_read, resolve_delivery)
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td) / "dr"
@@ -245,6 +245,71 @@ with tempfile.TemporaryDirectory() as td:
         json.dumps({"item_id": "somebody-else"}))
     check(dual_read(root, "alias") is None,
           "body/item_id mismatch is refused (no serving mislabeled records)")
+
+with tempfile.TemporaryDirectory() as td:
+    # ── resolve_delivery: the consumer-wiring surface over C + dual_read ──
+    root = Path(td) / "resolver"
+    outbox._write_item(root, "old-1", {"item_id": "old-1", "status": "DELIVERED",
+                                       "provider": "P", "destination": "D9",
+                                       "attempts": 1})
+    import_a_state(root)
+    r = resolve_delivery(root, "old-1")
+    check(r["source"] == "c" and r["delivered"]
+          and r["receipt"] == {"provider": "P", "destination": "D9"},
+          "resolve_delivery answers an imported id from C (source=c, receipt)")
+    ctr_missing = not (root / FALLBACK_COUNTER).exists()
+    check(ctr_missing, "a C answer consults no fallback (no counter yet)")
+
+    # an id the importer never covered, present only in the preserved A copy
+    ghost = {"item_id": "ghost-7", "status": "DELIVERED",
+             "provider": "P", "destination": "G"}
+    (root / ".items-migrated" / f"{outbox._safe_key('ghost-7')}.json").write_text(
+        json.dumps(ghost))
+    r = resolve_delivery(root, "ghost-7")
+    check(r["source"] == "a-fallback" and r["delivered"]
+          and r["receipt"]["destination"] == "G",
+          "C-miss on a fenced root falls through to the preserved A record")
+    check(json.loads((root / FALLBACK_COUNTER).read_text())["count"] == 1,
+          "and the fallback answer is COUNTED (release-gate metric)")
+
+    r = resolve_delivery(root, "never-was")
+    check(r["source"] is None and not r["delivered"],
+          "unknown id resolves to source=None, not an invented answer")
+    check(json.loads((root / FALLBACK_COUNTER).read_text())["count"] == 1,
+          "and a total miss does not bump the counter")
+
+    # a non-DELIVERED preserved record answers with NO receipt
+    (root / ".items-migrated" / f"{outbox._safe_key('parked-a')}.json").write_text(
+        json.dumps({"item_id": "parked-a", "status": "PARKED"}))
+    r = resolve_delivery(root, "parked-a")
+    check(r["source"] == "a-fallback" and not r["delivered"]
+          and r["receipt"] is None,
+          "a preserved non-DELIVERED record is not laundered into a receipt")
+
+with tempfile.TemporaryDirectory() as td:
+    # the migration-window-ONLY rule: an epoch-A root gets no fallback even
+    # if a .items-migrated dir exists — its live A store owns the answer
+    root = Path(td) / "still-a"
+    (root / ".items-migrated").mkdir(parents=True)
+    (root / ".items-migrated" / f"{outbox._safe_key('x')}.json").write_text(
+        json.dumps({"item_id": "x", "status": "DELIVERED"}))
+    r = resolve_delivery(root, "x")
+    check(r["source"] is None,
+          "an un-fenced (epoch A) root never falls back — A tooling owns it")
+
+with tempfile.TemporaryDirectory() as td:
+    # extraction pin: the backend method and the module reader agree
+    from ag2_sparrow.delivery_core.backend_c import (
+        DesignCClaimBackend, read_terminal_records)
+    from ag2_sparrow.delivery_core.contract import DeliveryOutcome
+    root = Path(td) / "pin"
+    b = DesignCClaimBackend(root, activate=True)
+    b.publish("p-1", b"x")
+    b.complete(b.claim("p-1", "w0"), DeliveryOutcome.CONFIRMED,
+               provider="P", destination="D")
+    check(b.terminal_records("p-1") == read_terminal_records(root, "p-1")
+          and len(read_terminal_records(root, "p-1")) == 1,
+          "terminal_records() delegates to the module-level reader (one impl)")
 
 with tempfile.TemporaryDirectory() as td:
     # First consult (even a miss) initializes the counter at 0, so an absent

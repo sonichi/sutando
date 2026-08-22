@@ -244,6 +244,38 @@ def import_a_state(root: Path) -> dict:
 FALLBACK_COUNTER = "a-fallback-hits.json"
 
 
+def resolve_delivery(root: Path, item_id: str) -> dict:
+    """Audit/re-drive resolver — the ONLY consumers of the migration-window
+    fallback (design_a_retirement_dual_read.md). The claim/deliver hot path
+    never calls this: a live item C cannot see does not exist.
+
+    C is authoritative: a C terminal record answers outright. Only a C-miss
+    on a C-FENCED root consults the preserved A state via dual_read (read-
+    only, counted); a root still on epoch A keeps its live A store and gets
+    no fallback. Returns {"source": "c"|"a-fallback"|None, "delivered",
+    "receipt", "record"}.
+    """
+    from .backend_c import read_terminal_records
+
+    root = Path(root)
+    recs = read_terminal_records(root, item_id)
+    if recs:
+        r = recs[-1]
+        return {"source": "c", "delivered": r.get("outcome") == "confirmed",
+                "receipt": r.get("receipt"), "record": r}
+    if read_epoch(root) == "C":
+        rec = dual_read(root, item_id)
+        if rec is not None:
+            delivered = rec.get("status") == "DELIVERED"
+            receipt = ({"provider": rec.get("provider"),
+                        "destination": rec.get("destination")}
+                       if delivered else None)
+            return {"source": "a-fallback", "delivered": delivered,
+                    "receipt": receipt, "record": rec}
+    return {"source": None, "delivered": False, "receipt": None,
+            "record": None}
+
+
 def dual_read(root: Path, item_id: str) -> "dict | None":
     """C-miss fallback during the migration window: read-only lookup of the
     PRESERVED A record under .items-migrated/. Returns the parsed record or

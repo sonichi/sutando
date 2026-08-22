@@ -51,6 +51,28 @@ class InvariantError(RuntimeError):
     Raw-token plurality is NOT this error (dead ghosts are anticipated)."""
 
 
+def read_terminal_records(root: Path, item_id: str) -> "list[dict]":
+    """Pure read of a root's terminal records — no dir creation, no fence
+    check, usable on a root no backend has been constructed for (audit and
+    migration-window resolvers). The backend method delegates here."""
+    key = _safe_key(item_id)
+    out = []
+    arch = Path(root) / ARCHIVE
+    if not arch.is_dir():
+        return out
+    for f in arch.glob(f"{key}*.json"):
+        if f.name != f"{key}.json" and not f.name.startswith(f"{key}{SEP}"):
+            continue                      # a longer key sharing the prefix
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("item_id") == item_id:
+            out.append(data)
+    out.sort(key=lambda r: r.get("completed_ns") or 0)
+    return out
+
+
 def _safe_key(item_id: str) -> str:
     stub = "".join(c if (c.isalnum() or c in "-._") else "_" for c in item_id)[:60]
     return f"{stub}={hashlib.sha256(item_id.encode('utf-8')).hexdigest()[:16]}"
@@ -322,19 +344,7 @@ class DesignCClaimBackend:
     def terminal_records(self, item_id: str) -> "list[dict]":
         """All terminal records for `item_id`, oldest first by completed_ns.
         Legacy filename-format entries carry no receipt and are not listed."""
-        key = _safe_key(item_id)
-        out = []
-        for f in self._d(ARCHIVE).glob(f"{key}*.json"):
-            if f.name != f"{key}.json" and not f.name.startswith(f"{key}{SEP}"):
-                continue                      # a longer key sharing the prefix
-            try:
-                data = json.loads(f.read_text())
-            except (OSError, ValueError):
-                continue
-            if isinstance(data, dict) and data.get("item_id") == item_id:
-                out.append(data)
-        out.sort(key=lambda r: r.get("completed_ns") or 0)
-        return out
+        return read_terminal_records(self.root, item_id)
 
     @staticmethod
     def _staged_is_complete(staged, incarnation: str) -> bool:
