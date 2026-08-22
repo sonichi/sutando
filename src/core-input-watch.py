@@ -263,12 +263,16 @@ def _gateway_status(state_dir):
     is present and fresh, else None (meaning: no opinion, fall back to pgrep).
 
     `connected: false` covers three different conditions and only two are down.
-    The bridge writes `backoff_s` ONLY on a retryable transport failure
-    (`network: …` / `HTTP 5xx`); an auth rejection writes `backoff_s` 0, and a
-    sustained outage ages `last_ok_ts` past the window while backoff grows. So a
-    retry whose last success is still inside GATEWAY_STATUS_MAX_AGE_S is a
-    reconnecting-but-serving link, not a dead one — the sidecar preserves
-    `last_ok_ts` across reconnect writes specifically so a consumer can tell.
+    A retryable transport failure (`network: …` / `HTTP 5xx`) writes a growing
+    `backoff_s`; the initial auth rejection writes 0; a sustained outage ages
+    `last_ok_ts` past the window while backoff grows. So a retry whose last
+    success is still inside GATEWAY_STATUS_MAX_AGE_S is a reconnecting-but-
+    serving link, not a dead one — the sidecar preserves `last_ok_ts` across
+    reconnect writes specifically so a consumer can tell.
+
+    Known bound: the bridge's auth re-check loop ALSO writes a non-zero
+    `backoff_s`, so a mid-session token revocation reads alive until
+    `last_ok_ts` ages past the window, then reads down.
     """
     if not state_dir:
         return None
