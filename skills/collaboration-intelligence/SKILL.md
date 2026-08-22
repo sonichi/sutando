@@ -177,8 +177,9 @@ excuses the other's absence. Step 3 escalates and is time-gated rather than gap-
 
 1. **Create the platform request — only if none stands.** Request review, assign the issue, or
    establish the equivalent durable state. Free, reversible, and the only step that survives an inbox
-   sweep. Do it first when it is missing: the party genuinely never had the item in their queue, and
-   the later steps may then be unnecessary.
+   sweep. Do it first when it is missing: the party genuinely never had the item in their queue, so
+   **escalation (step 3) may then be unnecessary — step 2 is not.** Creating the request never
+   discharges the notification; if both were missing, both are still owed.
 2. **Notify their agent in the shared work room — only if no state-change notification has been
    delivered since the last state change.** Resolve the person *and* their agent from the map
    **before** addressing anyone — a nudge sent to a stale handle reads as answered to you and arrives
@@ -192,12 +193,26 @@ excuses the other's absence. Step 3 escalates and is time-gated rather than gap-
 
 Include the artifact, what changed, and the exact action needed.
 
-**Two cases the conditions must not collapse into "waiting on someone":**
+**When the durable channel cannot represent the party, say so instead of creating a false one.**
+Step 1 assumes the platform can name the capable party; sometimes it cannot — a shared account, a bot
+identity several humans push under, an external reviewer with no account. Measured in this repo: three
+distinct display names resolve to one platform identity, so a request "assigned" there names no one.
+
+In that case the condition is **satisfied, not pending**: record that the durable channel is
+unavailable for this party and why, then treat step 2 as the only channel it has — and make the ask
+name the person explicitly, since the shared identity will otherwise absorb it. Do not create a
+request against an identity that cannot act, and do not leave condition 4 true forever waiting for
+one; a rule with no terminal branch re-fires on every sweep.
+
+**Three cases the conditions must not collapse into "waiting on someone":**
 
 - **Request-only** — a standing request exists, no notification since the last state change. The item
   sits in a queue nobody has looked at. **Fire step 2 alone**; do not create a second request.
 - **Notification-only** — the party was addressed, no standing request exists. The item was known
   about once and is now in nobody's list. **Fire step 1 alone**; do not re-send the message.
+- **Both missing** — the common case on a newly stalled item. **Fire steps 1 AND 2**, in that order.
+  This is the case a "later steps may be unnecessary" reading would truncate into request-only, which
+  is the state this section opens by calling broken.
 
 Each half keeps its own once-per-state-change record, so repairing one does not re-arm the other.
 
