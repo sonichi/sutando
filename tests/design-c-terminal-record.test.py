@@ -423,6 +423,24 @@ with tempfile.TemporaryDirectory() as td:
         check((bl.root / "inflight" / tokL.incarnation).exists(),
               f"legacy grammar: {label} never retires the live claim")
 
+    # ── interrupted QUARANTINE (link done, unlink not): finish it,
+    #    never re-ready — UNKNOWN must not become a redelivery ─────────────
+    b30 = fresh(td, "quarantine-crash")
+    b30.publish("item-30", b"p")
+    tok30 = b30.claim("item-30", "w0")
+    k30 = _safe_key("item-30")
+    und30 = b30.root / "undelivered" / f"{k30}{SEP}outcome-unknown{SEP}123"
+    os.link(str(b30.root / "inflight" / tok30.incarnation), str(und30))
+    p30 = tok30.incarnation.split(SEP)
+    dead30 = f"{p30[0]}{SEP}{p30[1]}{SEP}99999{SEP}1{SEP}{p30[4]}"
+    os.rename(str(b30.root / "inflight" / tok30.incarnation),
+              str(b30.root / "inflight" / dead30))
+    rep30 = b30.recover()
+    check(k30 in rep30.quarantined and k30 not in rep30.recovered,
+          "interrupted quarantine is FINISHED by recovery, not re-readied")
+    check(not (b30.root / "ready" / k30).exists() and und30.exists(),
+          "UNKNOWN item stays quarantined (no redelivery of a maybe-received item)")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")

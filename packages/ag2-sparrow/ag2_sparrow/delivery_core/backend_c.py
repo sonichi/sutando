@@ -476,6 +476,14 @@ class DesignCClaimBackend:
             with self._lock(key):
                 if not f.exists():
                     continue
+                # A crash inside _quarantine leaves the claim's INODE already
+                # linked in undelivered/; finish that quarantine, never re-ready.
+                claim_ino = f.stat().st_ino
+                if any(q.stat().st_ino == claim_ino
+                       for q in self._d(PARKED).glob(f"{key}{SEP}*")):
+                    f.unlink(missing_ok=True)
+                    rep.quarantined.append(key)
+                    continue
                 live, _dead = self._live_and_dead(key)
                 if any(t.name != f.name for t in live):
                     self._quarantine(f, key, "live-holder", parts[2])
