@@ -1015,7 +1015,8 @@ def _outbound_worker(inflight: "set[str]") -> None:
         _OUTBOUND_WAKE.clear()
         if _OUTBOUND_STOP.is_set():
             break                        # graceful: stop taking new items
-        for tid in list(inflight):
+        # tuple(), not list(): tests anchor the DRAIN on its distinct spelling.
+        for tid in tuple(inflight):
             rfile = RESULTS_DIR / f"{tid}.txt"
             if tid not in first_seen and rfile.exists():
                 first_seen[tid] = time.monotonic()
