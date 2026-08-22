@@ -104,13 +104,23 @@ def c_live_state(root: Path) -> "list[str]":
     Read-only; an unreadable namespace is REPORTED as state (fail closed)."""
     root = Path(root)
     found = []
-    if read_epoch(root) == "C":
-        found.append("epoch=C")
+    try:
+        if read_epoch(root) == "C":
+            found.append("epoch=C")
+    except OSError:
+        # A directory or unreadable blob at protocol-epoch is ambiguous C-side
+        # state, not proof of absence — classify, never raise into startup.
+        found.append("epoch(unreadable)")
     for name in ("ready", "inflight", "undelivered", "attempts"):
         d = root / name
         try:
-            if d.is_dir() and any(d.iterdir()):
-                found.append(name)
+            if d.is_dir() and not d.is_symlink():
+                if any(d.iterdir()):
+                    found.append(name)
+            elif os.path.lexists(d):
+                # A file, symlink, or anything else at a C namespace name is
+                # unrecognized C-side state — fail closed on lexical presence.
+                found.append(f"{name}(unrecognized)")
         except OSError:
             found.append(f"{name}(unreadable)")
     return found

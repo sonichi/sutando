@@ -213,6 +213,17 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
             (r / "ready" / "hot-item=deadbeef00000000").write_bytes(b"payload")
             (r / "attempts").mkdir(exist_ok=True)
             (r / "attempts" / "hot-item=deadbeef00000000").write_text("5")
+        elif c_state == "attempts-file":
+            r = Path(td) / ".outbox-discord-proactive"
+            r.mkdir(parents=True, exist_ok=True)
+            (r / "attempts").write_text("5")
+        elif c_state == "ready-danglink":
+            r = Path(td) / ".outbox-discord-proactive"
+            r.mkdir(parents=True, exist_ok=True)
+            (r / "ready").symlink_to(r / "gone-target")
+        elif c_state == "epoch-dir":
+            r = Path(td) / ".outbox-discord-proactive"
+            (r / "protocol-epoch").mkdir(parents=True)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             fence = db._proactive_fence()
@@ -325,6 +336,15 @@ check("BOTH" in out and "reconcile" in out,
 kind, out = _fence_with("a", legacy_items=2, c_state="files")
 check(kind == "TransitionRefusalBackend",
       f"claim_backend=a over MIXED A+C state is refused too (got {kind})")
+
+# Malformed C-namespace SHAPES fail closed too, and startup stays alive: a
+# FILE at attempts/, a dangling ready symlink, a DIRECTORY at protocol-epoch.
+for shape in ("attempts-file", "ready-danglink", "epoch-dir"):
+    kind, out = _fence_with("a", c_state=shape)
+    check(kind == "TransitionRefusalBackend",
+          f"malformed C shape {shape!r} -> refusal, not silent A (got {kind})")
+check("unreadable" in out or "unrecognized" in out or "epoch" in out,
+      "and the last refusal names the ambiguous state")
 
 # The refusal backend is claim-inert: bodies stay queued, nothing processed.
 from ag2_sparrow.delivery_core.migration import TransitionRefusalBackend
