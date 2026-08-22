@@ -97,6 +97,23 @@ class TestShouldEscalate(unittest.TestCase):
         self.assertFalse(esc2)
         self.assertEqual(h1, h2)
 
+    def test_login_spinner_churn_fires_once(self):
+        """One stuck login, three spinner repaints -> ONE alert (2026-08-21:
+        the spinner text was in the hash, so it fired three times)."""
+        spin1 = dict(_LOGIN, prompt="\u273b Running scheduled task (Aug 21 5:10pm)")
+        spin2 = dict(_LOGIN, prompt="\u273b Cooked for 0s \u00b7 1 shell, 1 monitor still running")
+        esc1, h1 = should_escalate(spin1, None)
+        self.assertTrue(esc1)
+        esc2, h2 = should_escalate(spin2, h1)
+        self.assertFalse(esc2, "a cosmetic spinner repaint re-fired the same login blocker")
+        self.assertEqual(h1, h2)
+        # logged-out is the other login-class shape; same invariant.
+        lo2 = dict(_LOGGED_OUT, prompt="some transient console text")
+        _, h3 = should_escalate(_LOGGED_OUT, None)
+        esc4, h4 = should_escalate(lo2, h3)
+        self.assertFalse(esc4)
+        self.assertEqual(h3, h4)
+
     def test_new_prompt_reescalates(self):
         _, h1 = should_escalate(_LOGIN, None)
         other = {"state": "blocked-human", "detail": "awaiting user: permission",

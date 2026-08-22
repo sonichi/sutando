@@ -52,8 +52,18 @@ HARD_ESCALATE = {"blocked-human", "logged-out"}
 
 
 def _sig_hash(signal: dict) -> str:
-    """Stable hash of the escalation-relevant fields (state + prompt)."""
-    key = f"{signal.get('state')}\x00{signal.get('prompt') or ''}"
+    """Stable hash of the escalation-relevant fields.
+
+    For a login-class blocker the prompt excerpt is the live terminal's
+    SPINNER line, which churns while the blocker itself is unchanged —
+    hashing it re-fires one stuck login on every cosmetic repaint (3 alerts
+    for one blocker, observed 2026-08-21). The remedy is identical whatever
+    the spinner says, so state alone keys the debounce there; a genuine
+    awaiting-user question keeps prompt identity so a NEW question still
+    escalates.
+    """
+    prompt = "" if _is_login_class(signal) else (signal.get("prompt") or "")
+    key = f"{signal.get('state')}\x00{prompt}"
     return hashlib.sha1(key.encode()).hexdigest()
 
 
