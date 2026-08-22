@@ -42,6 +42,7 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+  REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
 """
@@ -994,6 +995,53 @@ PROACTIVE_TRUST_OK = (
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 _AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+OUTBOUND_SCAN_S = float(os.environ.get("REMOTE_OUTBOUND_SCAN_S") or "1.0")
+# Outbound worker: decouples outbound progress from inbound long-poll
+# progress; delivery machinery untouched — owns ONLY lifecycle/scheduling.
+_OUTBOUND_WAKE = threading.Event()
+_OUTBOUND_STOP = threading.Event()
+_INFLIGHT_MUTEX = threading.RLock()
+
+
+def wake_outbound() -> None:
+    """Kick the outbound worker (e.g. right after a local result write)."""
+    _OUTBOUND_WAKE.set()
+
+
+def _outbound_worker(inflight: "set[str]") -> None:
+    first_seen: "dict[str, float]" = {}
+    while not _OUTBOUND_STOP.is_set():
+        _OUTBOUND_WAKE.wait(OUTBOUND_SCAN_S)
+        _OUTBOUND_WAKE.clear()
+        if _OUTBOUND_STOP.is_set():
+            break                        # graceful: stop taking new items
+        # tuple(), not list(): tests anchor the DRAIN on its distinct spelling.
+        for tid in tuple(inflight):
+            rfile = RESULTS_DIR / f"{tid}.txt"
+            if tid not in first_seen and rfile.exists():
+                first_seen[tid] = time.monotonic()
+        try:
+            _post_ready_results(inflight)
+        except Exception as e:  # noqa: BLE001 — failure isolation per cycle
+            _log(f"outbound worker: results drain error (isolated): {e}")
+        try:
+            _post_proactive()
+        except Exception as e:  # noqa: BLE001
+            _log(f"outbound worker: proactive drain error (isolated): {e}")
+        for tid in [t for t in first_seen if t not in inflight]:
+            ms = (time.monotonic() - first_seen.pop(tid)) * 1000.0
+            _log(f"outbound worker: {tid} seen->retired {ms:.0f}ms (monotonic)")
+
+
+def _start_outbound_worker(inflight: "set[str]") -> threading.Thread:
+    t = threading.Thread(target=_outbound_worker, args=(inflight,),
+                         name="outbound-worker", daemon=True)
+    t.start()
+    _log(f"outbound worker started (scan {OUTBOUND_SCAN_S}s + wake-on-kick) — "
+         "outbound no longer rides the inbound long-poll")
+    return t
+
+
 HEARTBEAT_INTERVAL = 60
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
@@ -2739,16 +2787,20 @@ def _load_inflight() -> set[str]:
 
 
 def _save_inflight(inflight: set[str]) -> None:
-    """Atomically persist the in-flight set. Best-effort (never blocks the loop)."""
-    try:
-        INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
-        # second sparrow instance ever runs. os.replace is atomic overwrite.
-        tmp = INFLIGHT_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(sorted(inflight)))
-        os.replace(tmp, INFLIGHT_FILE)
-    except Exception as e:  # noqa: BLE001
-        _log(f"inflight persist failed ({e}) — continuing")
+    """Atomically persist the in-flight set. Best-effort (never blocks the loop).
+    The mutex covers snapshot+write: the poll loop and the outbound worker both
+    save, and an unguarded interleave could persist a state missing the other
+    thread's mutation (resurrecting a delivered id or dropping a fresh one)."""
+    with _INFLIGHT_MUTEX:
+        try:
+            INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if
+            # a second sparrow instance ever runs. os.replace is atomic overwrite.
+            tmp = INFLIGHT_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(sorted(inflight)))
+            os.replace(tmp, INFLIGHT_FILE)
+        except Exception as e:  # noqa: BLE001
+            _log(f"inflight persist failed ({e}) — continuing")
 
 
 # (tid, path) pairs already uploaded this process — result-POST retry guard.
@@ -3354,6 +3406,7 @@ def main() -> None:
     last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
+    _outbound_thread = _start_outbound_worker(inflight)
     while True:
         try:
             if not _heartbeat_singleton():
@@ -3361,6 +3414,8 @@ def main() -> None:
                 # polling immediately so we don't dual-poll the relay bearer with
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
                      "— exiting to avoid dual-poll")
+                _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
+                _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
                 return
             _post_heartbeat(inflight)
             _retry_pending_publications()
@@ -3395,8 +3450,8 @@ def main() -> None:
             # durable, so a crash after ack does not strand the eventual result.
             for tid in pending_ack:
                 _post_task_ack(tid)
-            _post_ready_results(inflight)
-            _post_proactive()
+            if added:
+                wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _reconcile_orphan_results(inflight)
             _post_heartbeat(inflight)
