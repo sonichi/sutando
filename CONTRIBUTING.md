@@ -213,23 +213,31 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    posted **+19s, +10s and +12s** after each push and the status was **still absent days later**.
    Its presence is not evidence of anything; close+reopen is what actually clears this case.
 
-   **One ABSENT PR never gets that comment at all, and it needs a smaller fix.** The workflow triggers
-   on `pull_request_target: [synchronize]` — a push to an *already-open* PR. A branch pushed **before**
-   its PR was opened, and never touched since, produces no `synchronize` event, so the automation has
-   nothing to fire on and the PR is structurally outside it. Measured on #3253: head committed
-   `00:10:18Z`, PR opened `00:11:51Z` — the head predates its own PR by 93 seconds, one commit, no
-   pushes after. Tell it apart with:
+   **One ABSENT PR never gets that comment at all — which is worth knowing, but is not a fix.**
+   The workflow triggers on `pull_request_target: [synchronize]`, which fires on a head-SHA change.
+   A PR whose head has never moved since it was opened has produced no such event, so the automation
+   has never run on it and its absence from the comment log means nothing about the PR. Measured on
+   #3253: one commit, zero force-pushes, and `headRefOid` identical to that sole commit.
 
    ```bash
-   gh pr view <N> --json createdAt,headRefOid --jq '.createdAt + " opened / head " + .headRefOid'
-   gh api repos/<owner>/<repo>/commits/<head> --jq '.commit.committer.date + " head pushed"'
-   # head pushed BEFORE opened  ->  no synchronize has ever fired for this head
+   gh pr view <N> --json headRefOid,commits \
+     --jq '"head=" + .headRefOid + " sole-commit-is-head=" + (.headRefOid == .commits[0].oid | tostring)'
+   # true with commits==1  ->  the head has never changed, so no synchronize has ever fired
    ```
 
-   For that shape **any push to the branch** fires the workflow and clears it — a smaller instrument
-   than close+reopen, which also re-runs all of CI. Note the sub-case is about push-vs-open ordering,
-   not about forks: #3253 was also the only fork among the four, which is a correlation at n=1 and
-   not the cause.
+   Prove it from the **static head**, not from timestamps: `/commits/<sha>` returns `author.date` and
+   `committer.date`, and **neither is a push time** — on #3253 they differ by seven minutes. GitHub
+   does not expose push time there, so a date comparison cannot witness a `synchronize`.
+
+   **Do not conclude "so just push it".** The workflow's only effect is posting that comment, and the
+   paragraph above measures the comment as inert for ABSENT. A push would buy the same inert comment,
+   plus a fresh SHA that starts with no status of its own and a full CI rerun. Whether the comment
+   would help *this* PR is an open question with no evidence either way; **close+reopen remains the
+   documented remedy.** The useful content here is that the absence of a recheck comment on such a PR
+   is structural and tells you nothing — not that a push resolves it.
+
+   The sub-case is about head-never-moved, not about forks: #3253 was also the only fork among the
+   four, which is a correlation at n=1 and not the cause.
 
    **Give it a minute or two before concluding it failed.** The status is posted asynchronously: on one PR it was still `total=0` immediately after reopening and `license/cla=success` on the next check. Re-running the command above is the way to tell; an immediate zero means nothing yet.
 
