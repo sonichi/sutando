@@ -115,9 +115,8 @@ mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
 check("unparseable body falls back to mtime",
       mins and mins[-1][1] == 23 * 60 + 30, f"got {mins[-1] if mins else None}")
 
-# ── names that are not this job's dated sentinel must not be collected ───────
-# Two distinct exclusions: `-extra-` never matches the glob, while a trailing
-# suffix does and is refused by the regex anchor — only the second reaches it.
+# `-extra-` never matches the glob; a trailing suffix does and is refused by
+# the anchor — only the second actually reaches the regex branch.
 (ws / "state" / f"morning-briefing-extra-{d}.sentinel").write_text(f"{d}T05:00:00")
 mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
 check("a differently-prefixed job is excluded",
