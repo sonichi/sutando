@@ -1240,9 +1240,15 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
         if [ -z "$TWILIO_CFG_URL" ]; then
           echo "  ⚠ Point the Twilio webhook at: $NGROK_URL (no TWILIO_WEBHOOK_URL recorded)"
         elif [ "$TWILIO_CFG_URL" != "$NGROK_URL" ]; then
-          echo "  ⚠ ngrok URL moved — update the Twilio webhook:"
+          # TWILIO_WEBHOOK_URL is not just a note of the console value: the
+          # conversation server binds WEBHOOK_BASE_URL to it and skips ngrok, so
+          # a stale one leaves TwiML and <Stream> pointing at a dead tunnel.
+          echo "  ⚠ ngrok URL moved — BOTH sides are stale:"
           echo "      was: $TWILIO_CFG_URL"
           echo "      now: $NGROK_URL"
+          echo "      1. update the Twilio console webhook to the new URL"
+          echo "      2. set TWILIO_WEBHOOK_URL=$NGROK_URL in .env and restart the"
+          echo "         phone conversation server — it binds this at startup"
         fi
       fi
     else
