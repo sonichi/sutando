@@ -87,6 +87,8 @@ class StartWalker(Walker):
 
 
 StartWalker().visit(tree)
+check("_start_outbound_worker" in defined,
+      "_start_outbound_worker is still defined in the bridge module")
 check(len(starter_sites) == 1 and starter_sites[0][0] == "main",
       f"_start_outbound_worker called exactly once, from main() "
       f"(found {starter_sites})")
