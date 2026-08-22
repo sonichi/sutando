@@ -162,7 +162,7 @@ from . import local_task_protocol
 from .result_markers import parse_markers
 from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROVENANCE
 from . import team_result_guard
-from .outbox import DeliveryOutcome
+from .outbox import DeliveryOutcome, record_delivered
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -2487,6 +2487,18 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
     return ("send", None, parsed.body)
 
 
+def _record_proactive_receipt(item_id: str, room: str) -> None:
+    """Durable "delivered where" for the proactive leg. The log line naming the
+    room rotates; this outlives it. Fail-open: a receipt write must never
+    unwind a delivery that already happened."""
+    try:
+        record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
+                         provider="ag2space-proactive", destination=room)
+    except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
+        _log(f"proactive receipt write failed for {item_id}: {e} "
+             "(delivery unaffected)")
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -2668,10 +2680,11 @@ def _post_proactive() -> None:
                  "— dead-lettering, it can never be delivered")
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
+        dest_room = room_override or PROACTIVE_ROOM
         try:
             resp = _req("POST", "/v1/room",
                         {"op": "message",
-                         "room_id": room_override or PROACTIVE_ROOM,
+                         "room_id": dest_room,
                          "body": body},
                         timeout=15)
             # A bare 200 is NOT proof of delivery: the gateway can swallow a
@@ -2703,13 +2716,14 @@ def _post_proactive() -> None:
             outcome = _resolve_send_failure(claim, f, e)
             _log(f"proactive send network error for {f.name}: {e} — {outcome}")
             continue
+        _record_proactive_receipt(f.stem, dest_room)
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
         except OSError:
             claim.unlink(missing_ok=True)
         _PROACTIVE_ATTEMPTS.pop(f.name, None)
-        _log(f"delivered proactive {f.name}")
+        _log(f"delivered proactive {f.name} to {dest_room}")
 
 
 def _load_inflight() -> set[str]:

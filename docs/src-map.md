@@ -57,6 +57,7 @@ One entry per agent-facing module.
 - **`discord_context_policy.py`** — contextNotFrom gate — the single policy deciding whether a serving channel may pull another Discord channel's content into context.
 - **`discord_delivery_provider.py`** — DiscordDeliveryProvider: binds the shared DiscordRestClient into the 3013 delivery-core seam — the first production provider behind it.
 - **`discord_http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
+- **`discord_post_gate.py`** — Production injection seam for the Discord post-gate.
 - **`discord_proactive_send.py`** — Send-leg of proactive text delivery through the shared DeliveryProvider.
 - **`discord_reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
 - **`discord_rest_client.py`** — Outcome-aware Discord REST client — one transport, three request classes.

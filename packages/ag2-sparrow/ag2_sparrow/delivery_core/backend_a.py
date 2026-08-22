@@ -18,6 +18,8 @@ class DesignAClaimBackend:
     Reclaim TTL is A's dead-owner recovery window; force-release exists
     (declared) as the administrative-destruction mechanism."""
 
+    persists_receipt_metadata = True   # record_delivered() stores both
+
     capabilities = BackendCapabilities(supports_force_release=True)
 
     def __init__(self, root: Path, reclaim_ttl_s: float = 300.0):
@@ -78,7 +80,9 @@ class DesignAClaimBackend:
                               incarnation=incarnation)
 
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
-                 park_at_attempts: Optional[int] = None) -> bool:
+                 park_at_attempts: Optional[int] = None,
+                 provider: Optional[str] = None,
+                 destination: Optional[str] = None) -> bool:
         item_id = token.item_id
         # Validate -> transition -> retire, all under the item lock: a stale
         # incarnation must not mutate or park its successor's item.
@@ -88,9 +92,8 @@ class DesignAClaimBackend:
                     self._incarnation_of(item_id) != token.incarnation:
                 return False
             if outcome is DeliveryOutcome.CONFIRMED:
-                d = outbox._read_item(self.root, item_id)
-                d["status"] = "DELIVERED"
-                outbox._write_item(self.root, item_id, d)
+                outbox.record_delivered(self.root, item_id,
+                                        provider=provider, destination=destination)
             elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                 outbox.park_item(self.root, item_id, "outcome-unknown")
             else:
