@@ -201,6 +201,16 @@ def case_k_sustained_outage_stays_down() -> list[str]:
     return [] if v is False else [f"k) a 4.9h outage must read down, got {v!r}"]
 
 
+def case_l_never_connected_stays_down() -> list[str]:
+    # Never-connected: backoff_s grows, last_ok_ts ABSENT. Reads down only via
+    # isinstance(None, ...), so a `.get(..., time.time())` default would flip it.
+    v, _ = with_status(
+        {"connected": False, "ts": time.time(), "backoff_s": 4,
+         "error": "network: no route"},
+        pgrep_returns=True)
+    return [] if v is False else [f"l) never-connected must read down, got {v!r}"]
+
+
 def main() -> int:
     cases = [
         ("a", case_a_fresh_connected),
@@ -214,6 +224,7 @@ def main() -> int:
         ("i", case_i_transient_backoff_is_alive),
         ("j", case_j_auth_rejection_stays_down),
         ("k", case_k_sustained_outage_stays_down),
+        ("l", case_l_never_connected_stays_down),
     ]
     all_failures = []
     for label, fn in cases:

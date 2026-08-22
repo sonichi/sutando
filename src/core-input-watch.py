@@ -257,6 +257,10 @@ def _pgrep(pattern):
 # genuinely stalled bridge read as alive.
 GATEWAY_STATUS_MAX_AGE_S = 90.0
 
+# How long a reconnecting link may go without a SUCCESSFUL poll before it reads
+# down. Independent of the staleness bound above; equal today, retune separately.
+GATEWAY_OUTAGE_MAX_AGE_S = 90.0
+
 
 def _gateway_status(state_dir):
     """Read the bridge's own liveness sidecar. Returns True/False if the file
@@ -266,7 +270,7 @@ def _gateway_status(state_dir):
     A retryable transport failure (`network: …` / `HTTP 5xx`) writes a growing
     `backoff_s`; the initial auth rejection writes 0; a sustained outage ages
     `last_ok_ts` past the window while backoff grows. So a retry whose last
-    success is still inside GATEWAY_STATUS_MAX_AGE_S is a reconnecting-but-
+    success is still inside GATEWAY_OUTAGE_MAX_AGE_S is a reconnecting-but-
     serving link, not a dead one — the sidecar preserves `last_ok_ts` across
     reconnect writes specifically so a consumer can tell.
 
@@ -289,7 +293,7 @@ def _gateway_status(state_dir):
             return True
         last_ok = data.get("last_ok_ts")
         if data.get("backoff_s") and isinstance(last_ok, (int, float)):
-            return time.time() - last_ok <= GATEWAY_STATUS_MAX_AGE_S
+            return time.time() - last_ok <= GATEWAY_OUTAGE_MAX_AGE_S
         return False
     except Exception:
         return None
