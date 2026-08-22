@@ -33,7 +33,7 @@ def rel(p: Path) -> str:
 
 
 # ── enumerate definition sites over every production module ────────────────
-scan_files = [p for p in list((REPO / "src").glob("*.py")) + list(PKG.rglob("*.py"))
+scan_files = [p for p in list((REPO / "src").rglob("*.py")) + list(PKG.rglob("*.py"))
               if ".test" not in p.name]
 
 sites: dict[str, set[str]] = {"DeliveryOutcome": set(), "ClaimBackend": set(),
@@ -81,8 +81,7 @@ for prim, owners in OWNERS.items():
           f"{prim}: every pinned owner still defines it (gone: {sorted(missing)})")
 
 # ── claim-backend INSTANTIATION is injected, never improvised (ratchet) ────
-# A new direct instantiation forks delivery state; the discord proactive
-# leg is pinned migration debt, not precedent.
+# Discord's proactive leg is pinned migration debt, not precedent.
 inst_sites: set[str] = set()
 for f in scan_files:
     try:
