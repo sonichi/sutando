@@ -152,6 +152,19 @@
         }
       }
     },
+    "health_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Behavior of src/health-check.py.",
+      "properties": {
+        "down_bridge_action": {
+          "type": "string",
+          "enum": ["restart", "alert", "off"],
+          "default": "alert",
+          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout — clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
+        }
+      }
+    },
     "bridges": {
       "type": "object",
       "description": "Bridge-wide toggles shared by the Discord/Telegram/Slack bridges.",
@@ -160,6 +173,10 @@
         "progress_stream": {
           "type": "boolean",
           "description": "Emit in-channel '\u23f3 working\u2026 (Ns)' progress placeholders while a task runs."
+        },
+        "discord_post_gate": {
+          "type": "string",
+          "description": "Path to a Python file exporting validate(channel_id, payload) — the Discord post-gate policy src/discord_post_gate.py resolves for every Discord sender. Unset: ungated. A configured path that fails to load refuses all sends (fail-closed). Env override: $SUTANDO_DISCORD_POST_GATE."
         }
       }
     },

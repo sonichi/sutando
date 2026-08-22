@@ -82,12 +82,6 @@ WORKING_DIR="${WORKING_DIR/#\~/$HOME}"
 mkdir -p "$WORKING_DIR"
 WORKING_DIR="$(cd "$WORKING_DIR" && pwd -P)"
 
-WORKSTREAM_SESSION_HANDLER="$REPO/skills/task-workstream-sessions/scripts/session-worker.py"
-if [ -x "$WORKSTREAM_SESSION_HANDLER" ]; then
-  export SUTANDO_TASK_EVENT_HANDLER="$WORKSTREAM_SESSION_HANDLER"
-  export SUTANDO_ISOLATED_WORKING_DIR="$WORKING_DIR"
-fi
-
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
 [ -n "${CODEX_HOME:-}" ] && CORE_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
@@ -125,7 +119,6 @@ ensure_task_notifier() {
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
   )
-  [ -f "$WORKSTREAM_SESSION_HANDLER" ] && version_files+=("$WORKSTREAM_SESSION_HANDLER")
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'

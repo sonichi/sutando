@@ -21,6 +21,8 @@ Each entry has:
 - `loop` (optional, value `"dynamic"`) — declares a **dynamic (self-pacing) loop** using the built-in `/loop` primitive. An entry with **no interval** (no `cron` field) + `loop: "dynamic"` is run by schedule-crons as `/loop` *without an interval* (see step 3) — which is exactly the built-in adaptive mode: the loop self-paces via ScheduleWakeup, deciding each next delay by its own judgment. Optional `loop_hint` (free text) guides that pacing (e.g. "~10 min when owner active, ~40 min quiet"). **Durable** because schedule-crons re-launches it every boot; **adaptive** because that's what `/loop`-no-interval already is. No min/max/signal schema and no custom gate — the built-in does the pacing. Example: `{name:"inbox-score", prompt_skill:"inbox-score", loop:"dynamic", loop_hint:"…"}`.
 - `execution` (optional, value `"codex-task"`) — opt this entry into the durable OS-backed Codex runner instead of session cron registration. Codex entries may also set `timezone` (IANA name, default `America/Los_Angeles`), `delivery: "proactive"`, `retry_minutes` (default 15), `max_attempts` (default 3), and `active_stale_minutes` (default 60). Jobs require this explicit opt-in except for the canonical `main-loop` while the selected runtime is Codex; the runtime-specific exception is described below.
 - `launchd` (optional bool) — when `true`, the entry is owned by the OS-level cron-runner (`src/cron-runner.py`, installed via `src/install-cron-runner-launchd.sh`), NOT by this session skill. `/schedule-crons` skips these so the two schedulers never double-fire. Use it for daily-deliverable crons that must fire even when no Claude session is idle (the reliability fix for the 2026-07-02 silent 6am-digest miss).
+- `artifact` (optional string) — the filename STEM of the dated output this job produces, e.g. `"fleet-growth"` for `fleet-growth-2026-08-18.mp4`. Read by `health-check.py`'s `daily-cron-punctuality` probe. Without it the probe infers a stem from the last hyphenated token of the job name, so `talk-events-nightly` looks for `nightly-<date>.*`, never observes the real artifact, and reports the job UNCHECKED forever. Declare it whenever the name does not already equal the stem.
+- `conditional` (optional bool) — set `true` when the job runs on schedule but produces output only if there is new input (a nightly render with no new beats). The punctuality probe then treats "no artifact today" as evidence of nothing rather than a miss; lateness is still measured from the artifacts that do exist.
   On macOS, the Codex core launcher automatically reconciles ordinary fixed-interval entries to this owner because Codex has no session `CronCreate` surface. It preserves `main-loop`, dynamic loops, and entries already owned by `execution: "codex-task"`, and initializes the runner boundary before changing ownership so activation never replays an old action backlog.
 
 ### Durable Codex schedules
@@ -55,7 +57,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
      and every cheap check agreed the config was right.
      Observed on a long-lived core: it booted 2026-07-30, the `pr-flag` entry gained
      `--stand "<stand>"` on 2026-08-03, and the registered job kept firing the pre-edit text for two
-     days. That flag is what makes `pr_flag.py` populate `is_mine` (it is deliberately `null`
+     days. That flag is what makes the pr-triage skill's `pr_flag.py` populate `is_mine` (it is deliberately `null`
      without one), so the cron's own instruction — "judge from `ci/mergeable/review/approvals/
      is_mine`" — was reading a field that was structurally always null, with a correct script *and*
      a correct config file. Re-registering fixed it: `is_mine` went from null on all 27 PRs to
@@ -80,8 +82,24 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    m = importlib.util.module_from_spec(s)
    try: s.loader.exec_module(m)
    except SystemExit: pass
-   sys.exit(0 if m._watcher_trees() else 1)" && echo skip || echo start
+   ps = m._ps_snapshot()
+   sys.exit(2 if ps is None else (0 if m._watcher_trees(ps) else 1))"
+   case $? in
+     0) echo skip;;
+     1) echo start;;
+     *) echo 'UNKNOWN: ps did not run — do NOT start; a watcher may be live';;
+   esac
    ```
+
+   **Three states, not two: an unavailable `ps` is UNKNOWN, not "no watcher".**
+   `_watcher_trees()` catches every `ps` timeout/error and returns `{}`, which is
+   byte-identical to a clean empty scan — so the earlier `0 if m._watcher_trees()
+   else 1` form printed `start` when enumeration merely failed. Starting there is
+   exactly the duplicate this step exists to prevent, and it is the same
+   can't-distinguish defect the paragraph below names for the sentinel, pointing
+   the other way. `_ps_snapshot()` separates them: `None` means ps did not run,
+   `""` means it ran and found nothing. On UNKNOWN, do nothing — a missing
+   watcher costs delayed tasks, a duplicate one processes every task twice.
 
    **Do not gate on the sentinel alone.** `watch-tasks-stream.sh` writes it once at startup, so an absent file means "no watcher" OR "a live watcher whose file was removed" — indistinguishable. Measured 2026-08-07 on a live core: `_watcher_trees()` returned `{'12631': ['12631']}` (functioning — it emitted `TASK_FILE:` for a probe) with the sentinel absent from disk. Gating on the sentinel there would have started a **second** watcher, and both then emit every task, so every task is processed twice. `_watcher_trees()` is also what makes the `pgrep` warning below unnecessary to re-solve: it drops its own pid and matches on argv shape. Don't use `pgrep -f watch-tasks-stream`: pgrep's `-f` argument matches the literal string `watch-tasks-stream` against full argv, which matches the bash wrapper invoking this very pgrep call (the wrapper's argv contains the search string), producing a transient self-match that returns a PID for a subshell that's already gone by the next `ps`. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 0 — single anti-pattern, single fix. Documented as F5 in `workspace/build_log.md` 2026-06-03T00:02Z validation pass; replayed on the very next session bootstrap (07:25Z) — Sutando.app's checkWatcher Timer caught the gap and sent a `watcher` keystroke, but two owner DMs were silently held in `tasks/` for ~5 min first. Don't kick off `bash src/watch-tasks.sh` (retired 2026-05-14).
 5.5. **Ensure the core heartbeat is running (sonichi/sutando#2198 prerequisite).** `src/core_heartbeat.py` (the writer of `state/cores/<hostname>.alive`) is started by `src/startup.sh` — but the CLI boot path lands here without ever running startup.sh (observed 2026-07-20: desktop-supervised core running for 20+ min with `state/cores/` empty, so the dashboard/health-check read the core as dead and the stop-path had no pid/socket target). Check freshness of `"$WORKSPACE/state/cores/$(bash scripts/sutando-config.sh host-label).alive"` — if the file is missing or its mtime is older than 90 seconds (the documented staleness threshold), start the heartbeat: `nohup python3 src/core_heartbeat.py > /tmp/core-heartbeat.log 2>&1 &`. Freshness-of-.alive is the running-check by design — do NOT use `pgrep -f core_heartbeat` (same wrapper-argv self-match anti-pattern as step 5's watcher note), and a fresh mtime is exactly the signal every other reader of the file trusts. Idempotent on mid-session re-runs: a live heartbeat keeps the mtime younger than 90s, so the start is skipped.
@@ -173,6 +191,27 @@ bash src/install-cron-runner-launchd.sh --uninstall
 ```
 
 This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner.py`), which reads the same `crons.json`, decides which `"launchd": true` entries are DUE since their last recorded fire, and emits a task file into `tasks/` for each. The streaming watcher hands it to the session — same OS-level → emit-task → process pipeline as `com.sutando.health-check-fallback`. Missed fires (machine asleep/off) catch up exactly once on the next tick, never a backlog storm.
+
+### Mechanical shell jobs
+
+Launchd-owned entries may set `"shell_command"` for work that should not wake a
+model session (for example, a polling or sync script):
+
+```json
+{
+  "name": "sync-workspace",
+  "cron": "*/30 * * * *",
+  "launchd": true,
+  "shell_command": "bash scripts/sync-workspace.sh"
+}
+```
+
+`src/cron-runner.py` executes the command from the repository root, logs its
+command, stdout, stderr, and exit code to `<workspace>/logs/cron-runner.log`,
+and reports non-zero exits on stderr. A shell job runs even when the core
+heartbeat is absent and never creates a `tasks/` file. If an entry contains
+more than one execution form, precedence is `shell_command` > `prompt_skill` >
+`prompt`; use only one form in new configuration.
 
 When the selected core runtime is Codex on macOS, `src/agent/codex/cli/start-cli.sh` performs this installation/reconciliation automatically. Manual installation remains the opt-in path for Claude-core hosts.
 

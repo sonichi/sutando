@@ -114,8 +114,34 @@ def _socket_path() -> str:
 
 
 def core_session() -> str:
-    """The tmux session the core runs in. Mirrors both launchers' default."""
+    """The tmux session the core runs in, per the env/default contract.
+    NOT authoritative: this is an unverified claim from the environment, not a
+    confirmed live session (the Claude launcher honors SUTANDO_TMUX_SESSION as
+    of claude/cli/start-cli.sh, but an exported value can still name a session
+    that never started). Prefer _observed_session() for anything recorded."""
     return os.environ.get("SUTANDO_TMUX_SESSION", "sutando-core")
+
+
+def _observed_session(sock: str) -> str:
+    """Inside tmux display-message is authoritative; outside, the contract name is only
+    a claim — validated against a live pid and real sessions, else returned unverified."""
+    if os.environ.get("TMUX"):
+        r = _tmux(sock, "display-message", "-p", "#{session_name}")
+        if r is not None and r.returncode == 0:
+            name = (r.stdout or "").strip()
+            if name:
+                return name
+    # $TMUX is inherited when startup.sh runs inside the pane, but absent when it
+    # runs outside one — there the env value is a claim, so verify it.
+    candidate = core_session()
+    if core_pid(sock, candidate) is not None:
+        return candidate
+    r = _tmux(sock, "list-sessions", "-F", "#{session_name}")
+    if r is not None and r.returncode == 0:
+        for name in (r.stdout or "").split():
+            if name != candidate and core_pid(sock, name) is not None:
+                return name
+    return candidate
 
 
 def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess | None:
@@ -353,6 +379,10 @@ def write_beat(status: str = "running") -> None:
         # app, whose ambient SUTANDO_TMUX_SOCKET points at a *different* bundled
         # socket). Mirrors start-cli.sh's resolution exactly.
         "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+        # Same runtime-authored argument as `socket`, but the env cannot be
+        # trusted here: the Claude launcher hardcodes the session, so ask tmux.
+        "session": _observed_session(
+            os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")),
         # Self-reported locality (Track 10): {kind: local|cloud, host}. Additive
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.

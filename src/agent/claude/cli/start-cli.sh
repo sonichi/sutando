@@ -49,7 +49,7 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 # A tmux server inherits its GLOBAL environment from whichever process starts it,
 # and `start-server` on a serverless socket is a no-op — so unset before any tmux.
 unset SUTANDO_CORE_MODEL
-SESSION="sutando-core"
+SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 
 # Marker identifying THIS process as the long-lived sutando-core session (as
 # opposed to an ad-hoc `claude` in the same checkout — PR review, codex, etc.).
@@ -62,6 +62,8 @@ SESSION="sutando-core"
 export SUTANDO_CORE_SESSION=1
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
+[ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
+[ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
@@ -85,9 +87,29 @@ fi
 # only wire up when a LISTENer actually holds the proxy port — never point
 # the core at a dead port (the #1086/#1291 failure class; same
 # LISTEN-not-any-socket rule as src/restart.sh).
-if [ -z "${ANTHROPIC_BASE_URL:-}" ] \
-   && lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1; then
-  export ANTHROPIC_BASE_URL=http://localhost:7846
+proxy_listener_up() {
+  lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
+}
+if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
+  # A loaded launchd job means the proxy is EXPECTED on this host even when its
+  # listener hasn't bound yet (same loaded-job check as startup.sh/restart.sh).
+  PROXY_EXPECTED=""
+  if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
+    PROXY_EXPECTED=1
+  fi
+  if [ -n "$PROXY_EXPECTED" ]; then
+    # Bounded wait (~10s): a supervised proxy can bind seconds after the core on
+    # a cold boot, and a one-shot check would leave the core unrouted for life.
+    for _ in $(seq 1 20); do
+      proxy_listener_up && break
+      sleep 0.5
+    done
+  fi
+  if proxy_listener_up; then
+    export ANTHROPIC_BASE_URL=http://localhost:7846
+  elif [ -n "$PROXY_EXPECTED" ]; then
+    echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — core runs unrouted this session (no proxy protection, no quota telemetry)" >&2
+  fi
 fi
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   CORE_ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
@@ -383,18 +405,6 @@ fi
 # Optional feature-owned task handler.  The adapter injects the capability at
 # the edge; the generic watcher remains unaware of concrete skills and falls
 # back to its legacy TASK_FILE event whenever this script is absent/unhandled.
-WORKSTREAM_SESSION_HANDLER="$REPO/skills/task-workstream-sessions/scripts/session-worker.py"
-if [ -x "$WORKSTREAM_SESSION_HANDLER" ]; then
-  export SUTANDO_TASK_EVENT_HANDLER="$WORKSTREAM_SESSION_HANDLER"
-  export SUTANDO_ISOLATED_WORKING_DIR="${SUTANDO_CLAUDE_WORKING_DIR:-$REPO}"
-  CORE_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
-  CORE_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
-  if [ -n "${CORE_SETTINGS_JSON:-}" ]; then
-    export SUTANDO_ISOLATED_CLAUDE_SETTINGS="$CORE_SETTINGS_JSON"
-    CORE_ENV_ARGS+=(-e "SUTANDO_ISOLATED_CLAUDE_SETTINGS=$SUTANDO_ISOLATED_CLAUDE_SETTINGS")
-  fi
-fi
-
 # ---- obs metering (CC native OTel token + cost) -----------------------------
 # Hooks give obs events but carry NO tokens. Claude Code's OTel
 # `claude_code.token.usage` / `cost.usage` metrics are the authoritative usage

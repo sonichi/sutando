@@ -59,7 +59,7 @@ Or add to your voice agent's launchd plist:
 ```bash
 python3 "$SKILL_DIR/scripts/read-quota.py"           # human readable
 python3 "$SKILL_DIR/scripts/read-quota.py" --json     # machine readable
-python3 "$SKILL_DIR/scripts/read-quota.py" --gate     # exit 1 if exhausted
+python3 "$SKILL_DIR/scripts/read-quota.py" --gate     # exit 1 if exhausted, not routed, OR stale
 ```
 
 ## Requirements
