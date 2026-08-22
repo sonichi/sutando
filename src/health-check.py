@@ -5645,19 +5645,23 @@ def check_runtime_identity(path: "Path | None" = None,
                 "detail": f"build drift: process runs {sha[:8]}, checkout "
                           f"HEAD is {head_sha[:8]} — restart to converge; "
                           + " ".join(bits)}
-    reported_fp = rt.get("loader_sha256")
-    if isinstance(reported_fp, str) and reported_fp:
-        import hashlib
+    import hashlib
+    for key, rel in (("loader_sha256", ("src", "remote-gateway-bridge.py")),
+                     ("module_sha256", ("packages", "ag2-sparrow",
+                                        "ag2_sparrow", "remote_gateway_bridge.py"))):
+        reported_fp = rt.get(key)
+        if not (isinstance(reported_fp, str) and reported_fp):
+            continue
         try:
             disk_fp = hashlib.sha256(
-                (REPO_DIR / "src" / "remote-gateway-bridge.py").read_bytes()).hexdigest()
+                REPO_DIR.joinpath(*rel).read_bytes()).hexdigest()
         except OSError:
             disk_fp = None
         if disk_fp and disk_fp != reported_fp:
             return {"name": name, "status": "warn",
-                    "detail": "loader bytes drift: the running process was started "
-                              "from different loader contents than now on disk "
-                              "(same-HEAD dirty change?) — restart to converge; "
+                    "detail": f"{key.split('_')[0]} bytes drift: the running "
+                              "process executes different contents than now on "
+                              "disk (same-HEAD change?) — restart to converge; "
                               + " ".join(bits)}
     expected = (REPO_DIR / "src" / "remote-gateway-bridge.py").resolve()
     try:

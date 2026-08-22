@@ -96,16 +96,19 @@ def _git_head(repo):
     except Exception:
         return None
 
-def _self_sha256():
+def _sha256_of(path):
     import hashlib
     try:
-        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
         return None
 
+# BOTH executed source inputs: the loader (this file) and the canonical
+# implementation it compiles — a same-HEAD change to either must be visible.
 RUNTIME_IDENTITY = {"build_sha": _git_head(_REPO),
                     "entrypoint": str(Path(__file__).resolve()),
-                    "loader_sha256": _self_sha256()}
+                    "loader_sha256": _sha256_of(__file__),
+                    "module_sha256": _sha256_of(_IMPL)}
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
 
