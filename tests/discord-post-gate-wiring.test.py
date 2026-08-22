@@ -52,7 +52,7 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-import discord_post_gate as dpg  # noqa: E402
+import channels.discord.post_gate as dpg  # noqa: E402
 from outbox import DeliveryOutcome  # noqa: E402
 
 _policy_dir = Path(tempfile.mkdtemp(prefix="post-gate-policy-"))

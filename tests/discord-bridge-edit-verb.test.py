@@ -48,7 +48,7 @@ def check(cond: bool, msg: str) -> None:
         FAILS += 1
 
 
-from discord_rest_client import DiscordRestClient  # noqa: E402
+from channels.discord.client import DiscordRestClient  # noqa: E402
 
 
 def _bind_transport(calls, script=None, default=(200, {"id": "9999"})):

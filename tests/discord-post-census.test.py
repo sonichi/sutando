@@ -36,13 +36,13 @@ SUFFIXES = {".py", ".ts", ".sh", ".swift", ".js"}
 # The chokepoint plus the GET-only readers (each held read-only by
 # invariant 2 below, so an allowlisted file cannot grow into a sender).
 ALLOWED = {
-    "src/discord_rest_client.py",
-    "src/discord_reader.py",
-    "src/discord_context_policy.py",
+    "src/channels/discord/client.py",
+    "src/channels/discord/reader.py",
+    "src/policy/context/discord.py",
     "src/read_discord_channel.py",
     "hooks/context-source-guard.py",
 }
-READERS = ALLOWED - {"src/discord_rest_client.py"}
+READERS = ALLOWED - {"src/channels/discord/client.py"}
 
 _MUTATING = re.compile(r"""method\s*=\s*["'](POST|PATCH|DELETE|PUT)["']""")
 
@@ -94,7 +94,7 @@ for rel in sorted(READERS):
 
 # Positive control: the pattern DOES fire on the client itself, so an empty
 # reader result above means "clean", not "pattern never matches anything".
-client_text = (REPO / "src" / "discord_rest_client.py").read_text()
+client_text = (REPO / "src" / "channels" / "discord" / "client.py").read_text()
 check("positive control: the mutating-verb pattern fires on the client",
       bool(_MUTATING.search(client_text)))
 check("positive control: the literal scan fires on the client",
