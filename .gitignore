@@ -42,6 +42,14 @@ telegram-inbox/
 discord-inbox/
 archive/
 assets/
+# the blanket assets/ rule above is for workspace runtime dirs; the package's
+# brand assets are versioned source
+!packages/ag2-sparrow/assets/
+!packages/ag2-sparrow/assets/**
+# skill assets are versioned source too: a Codex/OpenAI skill manifest
+# references ./assets/ icons, so the blanket rule must not swallow them.
+!skills/*/assets/
+!skills/*/assets/**
 stand-identity.json
 stand-avatar.png
 docs/youtube/

@@ -31,6 +31,11 @@ check "# and // comment lines not flagged"            clean $'+++ b/c.js\n@@ -1,
 check "fixture paths (/usr/fake,/nonexistent,/tmp)"   clean $'+++ b/f.js\n@@ -1,0 +1,3 @@\n+a = "/usr/fake/p"\n+b = "/nonexistent/p"\n+c = "/tmp/scratch"'
 check "mixed forbidden+allowed line still flags real" flag  $'+++ b/m.js\n@@ -1,0 +1,1 @@\n+x = "/Users/alice/app"; y = "https://example.com";'
 check "real /Users/tmp/ not masked by /tmp/ allow"    flag  $'+++ b/t.js\n@@ -1,0 +1,1 @@\n+p = "/Users/tmp/keep"'
+# The send-allowlist tokens are exempt, but ONLY those two: a sibling path under
+# the same root must still flag, or the allow would blanket /private/tmp.
+check "allowed /private/tmp/sutando- token"           clean $'+++ b/a.py\n@@ -1,0 +1,1 @@\n+    "/private/tmp/sutando-",'
+check "allowed /private/tmp/echo- token"              clean $'+++ b/a.py\n@@ -1,0 +1,1 @@\n+    "/private/tmp/echo-",'
+check "other /private/tmp/ path still flagged"        flag  $'+++ b/a.py\n@@ -1,0 +1,1 @@\n+    p = "/private/tmp/unrelated-cache"'
 check "~/.claude flagged"                             flag  $'+++ b/g.sh\n@@ -1,0 +1,1 @@\n+cfg=~/.claude/settings.json'
 check "/home/ flagged"                                flag  $'+++ b/i.py\n@@ -1,0 +1,1 @@\n+p = "/home/bob/.config"'
 check "clean diff passes"                             clean $'+++ b/h.js\n@@ -1,0 +1,1 @@\n+const x = resolveWorkspace();'

@@ -16,6 +16,15 @@ Guards:
   b) other bridge warns (multiple PIDs, token invalid, stale log) → untouched
   c) non-bridge checks with the same detail → untouched
   d) ok/fail bridge statuses → untouched (fail belongs to the main fix loop)
+  y) gateway-bridge down → restarted, spawning remote-gateway-bridge.py
+  z) gateway-bridge's non-down warns describe a LIVE process → never respawned
+ aa) a tokenless gateway yields no launch plan (alert, not a crash-loop)
+ ab) AG2_REMOTE_TOKEN alone is enough, matching _gateway_configured()
+ ac) a non-bridge name with absent/None detail is NEVER restarted
+
+Second incident (2026-08-20): the gateway bridge — the ag2.space carrier — was
+the one channel bridge this path excluded, and its check name differs from its
+script name, so it was down 67 minutes with three tasks held gateway-side.
 
 Run: python3 tests/health-check-fix-down-bridges.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -24,6 +33,7 @@ Exit code: 0 on pass, 1 on fail.
 from __future__ import annotations
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -45,7 +55,21 @@ def check(name: str, status: str, detail: str) -> dict:
     return {"name": name, "status": status, "detail": detail}
 
 
-def run_with_popen_stub(checks: list) -> tuple[list, list]:
+# Channel-aware: a flat dict gives the gateway slack's tokens, so every gateway
+# case would fail for the wrong reason (no token) and hide a real regression.
+_CHANNEL_ENV = {
+    "slack": {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_APP_TOKEN": "xapp-test"},
+    "ag2space": {"REMOTE_TASK_TOKEN": "gw-test-token"},
+}
+
+
+def _channel_env(channel: str) -> dict:
+    return dict(_CHANNEL_ENV.get(channel, {}))
+
+
+def run_with_popen_stub(checks: list, *, action="restart",
+                        guard=lambda repo: (True, "test-clean"),
+                        sender=None, notifier=None) -> tuple[list, list]:
     """Call fix_down_bridges with Popen stubbed; return (restarted, spawn argvs).
 
     Also stubs the interpreter probe and slack-env load so the test is
@@ -56,6 +80,7 @@ def run_with_popen_stub(checks: list) -> tuple[list, list]:
     is stubbed empty (never the real Keychain).
     """
     spawned = []
+    notified = []
 
     def fake_popen(argv, **kwargs):
         spawned.append(argv)
@@ -64,10 +89,18 @@ def run_with_popen_stub(checks: list) -> tuple[list, list]:
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
-             mock.patch.object(hc, "_load_channel_env", return_value={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_APP_TOKEN": "xapp-test"}), \
+             mock.patch.object(hc, "_load_channel_env", side_effect=_channel_env), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
-            restarted = hc.fix_down_bridges(checks)
+            restarted = hc.fix_down_bridges(
+                checks, action=action, guard=guard,
+                sender=(sender if sender is not None else (lambda _m: True)),
+                # Injected so the local-notification fallback never reaches the
+                # patched Popen — `spawned` must stay a record of RESTARTS only.
+                notifier=(notifier if notifier is not None
+                          else (lambda _m: notified.append(_m) or False)),
+            )
+    run_with_popen_stub.last_notified = notified
     return restarted, spawned
 
 
@@ -86,6 +119,108 @@ def case_a_down_bridges_restarted() -> list[str]:
     for argv in spawned:
         if not str(argv[1]).endswith("-bridge.py"):
             fails.append(f"a) spawn argv doesn't target a bridge script: {argv}")
+    return fails
+
+
+def case_y_gateway_bridge_down_is_restarted() -> list[str]:
+    """The gateway bridge carries ag2.space; it was the one channel bridge this
+    path excluded, so a death went unattended until someone ran health-check by
+    hand. Observed 2026-08-20: 67 minutes down, three tasks held gateway-side."""
+    fails = []
+    checks = [check("gateway-bridge", "warn", hc.GATEWAY_DOWN_DETAIL)]
+    restarted, spawned = run_with_popen_stub(checks)
+    if restarted != ["gateway-bridge"]:
+        fails.append(f"y) expected gateway-bridge restarted, got {restarted}")
+    if len(spawned) != 1:
+        fails.append(f"y) expected 1 spawn, got {len(spawned)}")
+    elif not str(spawned[0][1]).endswith("remote-gateway-bridge.py"):
+        # src/gateway-bridge.py does not exist, so a bare f"{name}.py" Popens a
+        # missing path and the "restart" is a no-op that still reports True.
+        fails.append(f"y) spawn must target remote-gateway-bridge.py: {spawned[0]}")
+    return fails
+
+
+def case_z_gateway_other_warns_never_respawn() -> list[str]:
+    """Only the DOWN detail may respawn. gateway-bridge's other warns describe a
+    bridge that IS running (not serving / duplicate pileup); spawning another
+    against a live one is the dual-poll state its singleton lock exists to avoid."""
+    fails = []
+    checks = [
+        check("gateway-bridge", "warn",
+              "process running but NOT serving — 12m; last ok 2026-08-20T11:54:15Z"),
+        check("gateway-bridge", "warn",
+              "2 gateway process(es) claimed by no instance lock (PIDs: 1,2); locks held: gateway-bridge=3"),
+        check("gateway-bridge", "warn",
+              "running; last poll did not succeed, last one that did was 9m ago"),
+        check("gateway-bridge", "ok", "running + connected"),
+    ]
+    restarted, spawned = run_with_popen_stub(checks)
+    if restarted or spawned:
+        fails.append(f"z) non-down gateway warns must not respawn: {restarted} {spawned}")
+    return fails
+
+
+def case_ac_unknown_name_without_detail_is_untouched() -> list[str]:
+    """Reported by Sutando (rui) on #3203 and reproduced against the production
+    function before fixing. Matching only on the per-bridge detail lets an
+    unknown name through: the lookup is None, a check with no `detail` is also
+    None, and `None == None` restarts it — `_launch_bridge` then puts the check
+    NAME into a path, so `voice-agent` spawned `src/voice-agent.py`.
+
+    Existing case (c) cannot catch this: it pairs a non-bridge name with a real
+    bridge detail, which fails the match either way. The discriminator is a
+    non-bridge name whose detail is absent or None."""
+    fails = []
+    for label, chk in (
+        ("no detail key", {"name": "voice-agent", "status": "warn"}),
+        ("detail None", {"name": "voice-agent", "status": "warn", "detail": None}),
+        ("unknown + gateway detail", {"name": "voice-agent", "status": "warn",
+                                      "detail": hc.GATEWAY_DOWN_DETAIL}),
+    ):
+        restarted, spawned = run_with_popen_stub([chk])
+        if restarted or spawned:
+            fails.append(f"ac) {label}: non-bridge check must never restart — "
+                         f"got {restarted} {spawned}")
+    return fails
+
+
+def case_aa_gateway_plan_requires_a_token() -> list[str]:
+    """No token → no plan → alert instead of a crash-looping spawn, matching the
+    slack branch and startup.sh's labeled skip."""
+    fails = []
+    with mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+         mock.patch.object(hc, "_load_channel_env", return_value={}), \
+         mock.patch.dict(os.environ, {}, clear=True):
+        if hc._bridge_launch_plan("gateway-bridge") is not None:
+            fails.append("aa) tokenless gateway must yield no launch plan")
+    with mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+         mock.patch.object(hc, "_load_channel_env", side_effect=_channel_env), \
+         mock.patch.dict(os.environ, {}, clear=True):
+        plan = hc._bridge_launch_plan("gateway-bridge")
+        if plan is None:
+            fails.append("aa) gateway with a channel-env token must yield a plan")
+        else:
+            _, env = plan
+            if env.get("REMOTE_TASK_TOKEN") != "gw-test-token":
+                fails.append(f"aa) plan must carry the resolved token, got {env.get('REMOTE_TASK_TOKEN')!r}")
+            if env.get("SUTANDO_SUPERVISED") != "1":
+                fails.append("aa) plan must mark the launch supervised")
+    return fails
+
+
+def case_ab_ag2_remote_token_alias_is_accepted() -> list[str]:
+    """_gateway_configured() treats AG2_REMOTE_TOKEN as configuring the gateway,
+    so a host with only that alias must be launchable — otherwise the check warns
+    forever about a bridge --fix structurally refuses to start."""
+    fails = []
+    with mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+         mock.patch.object(hc, "_load_channel_env", return_value={"AG2_REMOTE_TOKEN": "alias-tok"}), \
+         mock.patch.dict(os.environ, {}, clear=True):
+        plan = hc._bridge_launch_plan("gateway-bridge")
+        if plan is None:
+            fails.append("ab) AG2_REMOTE_TOKEN alone must yield a plan")
+        elif plan[1].get("REMOTE_TASK_TOKEN") != "alias-tok":
+            fails.append(f"ab) alias must be normalised into REMOTE_TASK_TOKEN, got {plan[1].get('REMOTE_TASK_TOKEN')!r}")
     return fails
 
 
@@ -217,7 +352,9 @@ def case_g_launch_parity_interpreter_and_env() -> list[str]:
              mock.patch.object(hc, "_bridge_interpreter", return_value="/opt/homebrew/bin/python3"), \
              mock.patch.object(hc, "_load_channel_env", return_value={"SLACK_BOT_TOKEN": "xoxb-abc", "SLACK_APP_TOKEN": "xapp-xyz"}), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
-            restarted = hc.fix_down_bridges(checks)
+            restarted = hc.fix_down_bridges(
+                checks, action="restart",
+                guard=lambda repo: (True, "test-clean"), sender=lambda _m: True)
 
     if restarted != ["discord-bridge", "slack-bridge"]:
         fails.append(f"g) expected both restarted, got {restarted}")
@@ -256,7 +393,9 @@ def case_h_launch_parity_failsafe_skips() -> list[str]:
              mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.dict(hc.os.environ, clean_env, clear=True), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
-            restarted = hc.fix_down_bridges(checks)
+            restarted = hc.fix_down_bridges(
+                checks, action="restart",
+                guard=lambda repo: (True, "test-clean"), sender=lambda _m: True)
 
     if restarted:
         fails.append(f"h) expected no restarts (fail-safe), got {restarted}")
@@ -416,6 +555,298 @@ def case_n_load_channel_env_unreadable_file() -> list[str]:
     return fails
 
 
+def case_u_defaults_from_config_and_module() -> list[str]:
+    """Cover the default-resolution branches when action/sender/guard are omitted:"""
+    fails = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+             mock.patch.object(hc, "resolve_down_bridge_action", return_value="restart"), \
+             mock.patch.object(hc, "_checkout_is_canonical", return_value=(True, "clean")), \
+             mock.patch.object(hc, "_default_slack_sender", return_value=True), \
+             mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+             mock.patch.object(hc.subprocess, "Popen", side_effect=lambda a, **k: mock.MagicMock()):
+            restarted = hc.fix_down_bridges(checks)  # no kwargs → module defaults
+    if restarted != ["discord-bridge"]:
+        fails.append(f"u) default-resolution path should restart, got {restarted}")
+    return fails
+
+
+def case_v_alert_send_failure_is_swallowed() -> list[str]:
+    """_alert must swallow a sender that raises — alerting never breaks the check."""
+    fails = []
+
+    def boom(_m):
+        raise RuntimeError("slack unreachable")
+
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    try:
+        restarted, spawned = run_with_popen_stub(checks, action="alert", sender=boom)
+    except Exception as e:  # pragma: no cover — a leak here IS the failure
+        return [f"v) a raising sender propagated out of fix_down_bridges: {e!r}"]
+    if restarted or spawned:
+        fails.append(f"v) alert mode must not restart: {restarted}/{spawned}")
+    return fails
+
+
+def case_x_failed_sender_falls_back_to_a_local_owner_surface() -> list[str]:
+    """A failed primary sender must reach an owner surface, not just a log line."""
+    import contextlib
+    import io
+
+    fails = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+
+    # 1. primary False + fallback True -> delivered, and NO undelivered marker
+    got = []
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: False,
+                            notifier=lambda m: got.append(m) or True)
+    out = buf.getvalue()
+    if not got:
+        fails.append("x) primary sender returned False but the fallback was never called")
+    if hc.ALERT_UNDELIVERED_MARKER in out:
+        fails.append(f"x) fallback delivered yet {hc.ALERT_UNDELIVERED_MARKER} was printed: {out!r}")
+    if "local notification" not in out:
+        fails.append(f"x) fallback delivery was not stated in the output: {out!r}")
+    if got and "discord-bridge" not in got[0]:
+        fails.append(f"x) the fallback got a message naming no bridge: {got[0]!r}")
+
+    # 2. BOTH fail -> marker still present (the fallback must not mask it)
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: False,
+                            notifier=lambda _m: False)
+    out2 = buf2.getvalue()
+    if hc.ALERT_UNDELIVERED_MARKER not in out2:
+        fails.append(f"x) both surfaces failed but no {hc.ALERT_UNDELIVERED_MARKER}: {out2!r}")
+
+    # 3. a fallback that RAISES is undelivered, never an exception out of the check
+    buf3 = io.StringIO()
+    def boom(_m):
+        raise RuntimeError("notifier exploded")
+    try:
+        with contextlib.redirect_stdout(buf3):
+            run_with_popen_stub(checks, action="alert", sender=lambda _m: False,
+                                notifier=boom)
+    except Exception as e:  # noqa: BLE001
+        fails.append(f"x) a raising fallback escaped the check: {e!r}")
+    if hc.ALERT_UNDELIVERED_MARKER not in buf3.getvalue():
+        fails.append("x) a raising fallback did not report undelivered")
+
+    # 4. CONTROL: a working primary must never reach the fallback
+    reached = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: True,
+                            notifier=lambda m: reached.append(m) or True)
+    if reached:
+        fails.append(f"x) fallback fired despite a DELIVERED primary: {reached!r}")
+
+    # 5. the shipped default reports False on a non-zero exit rather than assuming success
+    if hc._default_local_notifier.__doc__ is None:
+        fails.append("x) _default_local_notifier lost its contract docstring")
+    with mock.patch.object(hc.subprocess, "run",
+                           return_value=mock.MagicMock(returncode=1)):
+        if hc._default_local_notifier("m") is not False:
+            fails.append("x) default notifier reported success on a non-zero exit")
+    with mock.patch.object(hc.subprocess, "run",
+                           return_value=mock.MagicMock(returncode=0)):
+        if hc._default_local_notifier("m") is not True:
+            fails.append("x) default notifier reported failure on a zero exit")
+    return fails
+
+
+def case_w_alert_undelivered_is_observable() -> list[str]:
+    """A sender that RETURNS False (not raises) must be observable."""
+    import io
+    import contextlib
+
+    fails = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+
+    # 1. sender returns False -> marker present
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: False)
+    out_false = buf.getvalue()
+    if hc.ALERT_UNDELIVERED_MARKER not in out_false:
+        fails.append(
+            "w) a sender returning False produced no "
+            f"{hc.ALERT_UNDELIVERED_MARKER} signal: {out_false!r}"
+        )
+
+    # 2. CONTROL: sender returns True -> marker absent
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: True)
+    out_true = buf.getvalue()
+    if hc.ALERT_UNDELIVERED_MARKER in out_true:
+        fails.append(
+            f"w) a DELIVERED alert wrongly printed {hc.ALERT_UNDELIVERED_MARKER}: {out_true!r}"
+        )
+
+    # 3. a RAISING sender is undelivered too — same observable signal, and it
+    #    still must not propagate (case_v pins the non-propagation).
+    def boom(_m):
+        raise RuntimeError("slack unreachable")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert", sender=boom)
+    if hc.ALERT_UNDELIVERED_MARKER not in buf.getvalue():
+        fails.append("w) a RAISING sender produced no undelivered signal")
+
+    return fails
+
+
+def case_o_action_off_is_noop() -> list[str]:
+    """down_bridge_action="off": never restart, never alert (return [])."""
+    fails = []
+    sent = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    restarted, spawned = run_with_popen_stub(checks, action="off", sender=sent.append)
+    if restarted or spawned:
+        fails.append(f"o) action=off restarted/spawned: {restarted}/{spawned}")
+    if sent:
+        fails.append(f"o) action=off should be silent, sent: {sent}")
+    return fails
+
+
+def case_p_action_alert_alerts_not_restarts() -> list[str]:
+    """down_bridge_action="alert": alert the owner per down bridge, no restart."""
+    fails = []
+    sent = []
+    checks = [
+        check("discord-bridge", "warn", "configured but not running"),
+        check("slack-bridge", "warn", "configured but not running"),
+    ]
+    restarted, spawned = run_with_popen_stub(checks, action="alert", sender=sent.append)
+    if restarted or spawned:
+        fails.append(f"p) action=alert must not restart: {restarted}/{spawned}")
+    if len(sent) != 2 or not all("alert-only" in m for m in sent):
+        fails.append(f"p) expected 2 alert-only messages, got {sent}")
+    return fails
+
+
+def case_q_restart_guard_fail_downgrades_to_alert() -> list[str]:
+    """action="restart" but the checkout guard fails → alert, do NOT restart:
+    a non-canonical checkout must never be the code an auto-restart relaunches."""
+    fails = []
+    sent = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    restarted, spawned = run_with_popen_stub(
+        checks, action="restart",
+        guard=lambda repo: (False, "checkout on 'feature-x', not main"),
+        sender=sent.append)
+    if restarted or spawned:
+        fails.append(f"q) guard-fail must not restart: {restarted}/{spawned}")
+    if not (sent and "NOT auto-restarted" in sent[0] and "feature-x" in sent[0]):
+        fails.append(f"q) expected a downgrade alert naming the reason, got {sent}")
+    return fails
+
+
+def case_r_restart_guard_ok_restarts_and_alerts() -> list[str]:
+    """action="restart" + canonical checkout → restart AND alert (visibility)."""
+    fails = []
+    sent = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    restarted, spawned = run_with_popen_stub(
+        checks, action="restart",
+        guard=lambda repo: (True, "clean + on main"), sender=sent.append)
+    if restarted != ["discord-bridge"] or len(spawned) != 1:
+        fails.append(f"r) expected 1 restart, got {restarted}/{spawned}")
+    if not (sent and "auto-restarted" in sent[0]):
+        fails.append(f"r) expected an auto-restarted alert, got {sent}")
+    return fails
+
+
+def case_s_checkout_is_canonical() -> list[str]:
+    """_checkout_is_canonical: True only for clean + on main; False for a
+    branch, a dirty tree, or unreadable git state (fail-closed)."""
+    fails = []
+
+    def fake_run(argv, **kwargs):
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=fake_run.branch + "\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=fake_run.dirty, stderr="")
+
+    with mock.patch.object(hc.subprocess, "run", side_effect=fake_run):
+        fake_run.branch, fake_run.dirty = "main", ""
+        ok, why = hc._checkout_is_canonical("/repo")
+        if not ok:
+            fails.append(f"s) clean+main should be canonical, got {why}")
+        fake_run.branch, fake_run.dirty = "feature-x", ""
+        ok, why = hc._checkout_is_canonical("/repo")
+        if ok or "not main" not in why:
+            fails.append(f"s) non-main should fail, got ({ok},{why})")
+        fake_run.branch, fake_run.dirty = "main", " M src/x.py"
+        ok, why = hc._checkout_is_canonical("/repo")
+        if ok or "uncommitted" not in why:
+            fails.append(f"s) dirty tree should fail, got ({ok},{why})")
+
+    # A NONZERO git exit with empty stdout must fail closed — an errored `git status
+    # --porcelain` (empty output) must not read as "clean" and green-light an auto-restart
+    def fail_status(argv, **kwargs):
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="main\n", stderr="")
+        return subprocess.CompletedProcess(argv, 128, stdout="", stderr="fatal")
+    with mock.patch.object(hc.subprocess, "run", side_effect=fail_status):
+        ok, why = hc._checkout_is_canonical("/repo")
+        if ok or "unreadable" not in why:
+            fails.append(f"s) nonzero git exit should fail-closed, got ({ok},{why})")
+
+    def boom(*a, **k):
+        raise OSError("git missing")
+    with mock.patch.object(hc.subprocess, "run", side_effect=boom):
+        ok, why = hc._checkout_is_canonical("/repo")
+        if ok or "unreadable" not in why:
+            fails.append(f"s) unreadable git state should fail-closed, got ({ok},{why})")
+    return fails
+
+
+def case_t_resolve_down_bridge_action() -> list[str]:
+    """resolve_down_bridge_action: default ALERT, env override, unknown -> alert.
+
+    The default is alert because a restart that looks successful but leaves the
+    bridge unable to deliver is worse than one that is visibly down. Stubs the
+    config loader: reading the host's own sutando.config.json made the default
+    assertion pass for the wrong reason on a machine that sets it explicitly."""
+    fails = []
+    import sutando_config
+    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
+    with mock.patch.object(sutando_config, "load_config", lambda *a, **k: {}):
+        with mock.patch.dict(os.environ, env, clear=True):
+            if sutando_config.resolve_down_bridge_action() != "alert":
+                fails.append(f"t) default should be 'alert', got "
+                             f"{sutando_config.resolve_down_bridge_action()!r}")
+        with mock.patch.dict(os.environ, {"SUTANDO_DOWN_BRIDGE_ACTION": "restart"}):
+            if sutando_config.resolve_down_bridge_action() != "restart":
+                fails.append("t) env override to 'restart' ignored")
+        with mock.patch.dict(os.environ, {"SUTANDO_DOWN_BRIDGE_ACTION": "bogus"}):
+            if sutando_config.resolve_down_bridge_action() != "alert":
+                fails.append("t) unknown value should fall back to 'alert'")
+
+    # The stubs above cover the missing-key fallback, a state no install is in:
+    # sutando.config.json sets the key, so only an unstubbed read sees what ships.
+    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_DOWN_BRIDGE_ACTION"}
+    with mock.patch.dict(os.environ, env, clear=True):
+        shipped = sutando_config.resolve_down_bridge_action(REPO)
+        if shipped != "alert":
+            fails.append(f"t) the TRACKED sutando.config.json must ship 'alert', "
+                         f"got {shipped!r} — a code-side default cannot override it")
+    tracked = json.loads((REPO / "sutando.config.json").read_text())
+    if (tracked.get("health_check") or {}).get("down_bridge_action") != "alert":
+        fails.append("t) sutando.config.json health_check.down_bridge_action must be 'alert'")
+
+    # Opt-in still reaches the restart arm, from the config rather than the env.
+    with mock.patch.object(sutando_config, "load_config",
+                           lambda *a, **k: {"health_check": {"down_bridge_action": "restart"}}):
+        with mock.patch.dict(os.environ, env, clear=True):
+            if sutando_config.resolve_down_bridge_action() != "restart":
+                fails.append("t) explicit config opt-in to 'restart' ignored")
+    return fails
+
 def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambient_env=None):
     """Drive main() --fix with `checks` in issues; return (stdout, spawns, kills).
     plan="REAL" resolves the real plan (interpreter stubbed, channel env/ambient injectable)."""
@@ -513,7 +944,11 @@ def case_q_down_path_requires_both_slack_tokens() -> list[str]:
                  mock.patch.object(hc, "token_from_vault", return_value=""), \
                  mock.patch.dict(hc.os.environ, clean_env, clear=True), \
                  mock.patch.object(hc.subprocess, "Popen", side_effect=lambda *a, **k: spawned.append(a) or mock.MagicMock()):
-                restarted = hc.fix_down_bridges(checks)
+                # The guard and alert path also shell out, so this stub records
+                # them too: an unstubbed layer would read as "slack was launched".
+                restarted = hc.fix_down_bridges(
+                    checks, guard=lambda repo: (True, "test"),
+                    sender=lambda msg: True, notifier=lambda msg: True)
         if restarted or spawned:
             fails.append(f"q) {label}-app-token slack was launched anyway: {restarted or spawned}")
     return fails
@@ -704,13 +1139,28 @@ def main() -> int:
                  case_l_load_channel_env_parses_file,
                  case_m_load_channel_env_absent_file,
                  case_n_load_channel_env_unreadable_file,
+                 case_o_action_off_is_noop,
+                 case_p_action_alert_alerts_not_restarts,
+                 case_q_restart_guard_fail_downgrades_to_alert,
+                 case_r_restart_guard_ok_restarts_and_alerts,
+                 case_s_checkout_is_canonical,
+                 case_t_resolve_down_bridge_action,
+                 case_u_defaults_from_config_and_module,
+                 case_v_alert_send_failure_is_swallowed,
+                 case_w_alert_undelivered_is_observable,
+                 case_x_failed_sender_falls_back_to_a_local_owner_surface,
                  case_o_stale_restart_uses_launch_plan,
                  case_p_stale_no_plan_skips_without_kill,
                  case_q_down_path_requires_both_slack_tokens,
                  case_r_stale_missing_app_token_no_kill_no_spawn,
                  case_s_vault_only_slack_tokens_launchable,
                  case_t_interpreter_probe_never_execs_bare_python3,
-                 case_u_resolved_bare_python3_policy):
+                 case_u_resolved_bare_python3_policy,
+                 case_y_gateway_bridge_down_is_restarted,
+                 case_z_gateway_other_warns_never_respawn,
+                 case_aa_gateway_plan_requires_a_token,
+                 case_ab_ag2_remote_token_alias_is_accepted,
+                 case_ac_unknown_name_without_detail_is_untouched):
         fails = case()
         status = "PASS" if not fails else "FAIL"
         print(f"  {status} {case.__name__}")

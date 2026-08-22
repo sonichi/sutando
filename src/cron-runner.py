@@ -411,6 +411,13 @@ def emit_task(name: str, entry: dict) -> Path:
             except OSError:
                 pass
     path = TASKS_DIR / f"{task_id}.txt"
+    # HMAC envelope (#3014 writer census): stamp at this writer's edge, fail-open
+    # so a stamping error costs the stamp and never the fire.
+    try:
+        from task_envelope import stamp_text  # sibling module (src/ on sys.path)
+        body = stamp_text(body, WORKSPACE)
+    except Exception:
+        pass
     path.write_text(body)
     _emit_cron_telemetry()
     return path
@@ -493,8 +500,11 @@ def run(now_epoch: Optional[int] = None) -> list:
                         emit_task(name, entry)
                         emitted.append(name)
                     else:
+                        # The drop is the only record a slot was skipped; undated,
+                        # it cannot be tied to a sleep window or counted per day.
+                        _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                         print(
-                            f"cron-runner: dropping stale slot for {name} "
+                            f"{_ts} cron-runner: dropping stale slot for {name} "
                             f"({lateness}s late)",
                             file=sys.stderr,
                         )
@@ -508,4 +518,5 @@ def run(now_epoch: Optional[int] = None) -> list:
 if __name__ == "__main__":
     names = run()
     if names:
-        print("cron-runner emitted: " + ", ".join(names))
+        _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"{_ts} cron-runner emitted: " + ", ".join(names))

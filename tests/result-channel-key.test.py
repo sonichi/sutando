@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for src/result_channel_key.py — the per-channel pull path
+"""Unit tests for src/delivery/channel_key.py — the per-channel pull path
 for task-result files in `results/`.
 
 Twin of tests/result-channel-key.test.ts. Same invariants, same shape.
@@ -16,7 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from result_channel_key import (  # noqa: E402
+from delivery.channel_key import (  # noqa: E402
     sanitize_key,
     result_filename,
     parse_result_filename,
@@ -220,7 +220,7 @@ class TestTypedKeyConstructors(unittest.TestCase):
 class TestCrossLanguageParityFixture(unittest.TestCase):
     """Asserts the SAME shared fixture the TS twin loads
     (tests/result-channel-key.test.ts) — one input/output table, asserted in
-    both languages, so the Python impl (src/result_channel_key.py) and the TS
+    both languages, so the Python impl (src/delivery/channel_key.py) and the TS
     impl (src/result-channel-key.ts) can never silently drift. Change an impl →
     the matching row fails in the OTHER language's test too. (Lucy on #1595.)
     """

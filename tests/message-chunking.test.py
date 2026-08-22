@@ -164,6 +164,88 @@ check("_closes_fence: ``` closes ```python", mc._closes_fence("```", "```python"
 check("_closes_fence: ~~~ does NOT close ```", not mc._closes_fence("~~~", "```"))
 check("_fence_run: counts leading run", mc._fence_run("````md") == 4 and mc._fence_run("~~~") == 3)
 
+# chunk_plain_text: the plain-transport contract is byte-identity — nothing
+# inserted (no synthetic fences), nothing dropped, every chunk bounded.
+run9k = "x" * 9000
+pc = mc.chunk_plain_text(run9k, 4000)
+check("plain: unbreakable 9k run hard-cuts within bound",
+      "".join(pc) == run9k and max(map(len, pc)) <= 4000, str(list(map(len, pc))))
+body = "intro\n```python\n" + "\n".join(f"line {i} of a long listing" for i in range(300)) + "\n```\ntail"
+pc2 = mc.chunk_plain_text(body, 4000)
+check("plain: fenced body reassembles byte-identical (no fence bytes added)",
+      "".join(pc2) == body and len(pc2) > 1, f"{sum(map(len, pc2))} vs {len(body)}")
+check("plain: splits land after newlines when available",
+      all(c.endswith("\n") for c in pc2[:-1]))
+check("plain: empty input -> no chunks", mc.chunk_plain_text("", 4000) == [])
+check("plain: exact-limit input is one chunk",
+      mc.chunk_plain_text("y" * 4000, 4000) == ["y" * 4000])
+
+# --- paragraph-aware splits + fence keep-whole (2026-08-19, "wider" gates) ---
+
+# Paragraph preference: paragraphs of ~400 chars; a forced split must land at a
+# blank line (chunk ends on a paragraph's last line), not mid-paragraph.
+paras = ["para %d line one is quite long %s\npara %d line two %s" % (i, "w" * 150, i, "v" * 150)
+         for i in range(8)]
+para_text = "\n\n".join(paras)
+pchunks = list(chunk_message(para_text, 1900))
+check("para: multiple chunks generated", len(pchunks) > 1)
+# Each non-final chunk's last line is a paragraph's SECOND line (ends with the
+# v-run), never a first line (w-run) — a mid-paragraph cut.
+check("para: no chunk ends mid-paragraph",
+      all(c.split("\n")[-1].endswith("v" * 10) for c in pchunks[:-1]),
+      str([c.split("\n")[-1][-20:] for c in pchunks[:-1]]))
+
+# Fence keep-whole: a block that fits alone must land intact in one chunk —
+# no synthetic close/reopen (the parent chunker's behavior).
+prose = "\n".join("prose line %d %s" % (i, "p" * 80) for i in range(18))
+fence_block = "```python\n" + "\n".join("code line %d" % i for i in range(30)) + "\n```"
+ftext = prose + "\n" + fence_block
+fchunks = list(chunk_message(ftext, 1900))
+intact = ["```python" in c and c.rstrip().endswith("```") and c.count("```") == 2
+          for c in fchunks if "code line" in c]
+check("fence: whole block lands intact in one chunk",
+      len(intact) == 1 and intact[0], str([c[:40] for c in fchunks]))
+
+# Invariant 1 of this file's docstring, asserted across every fixture above.
+for _label, _chunks, _cap in [
+    ("inline", out_inline, 1900),
+    ("big_fenced", chunks, 120),
+    ("slack", slack_chunks, 4000),
+    ("longline", ll_chunks, 4000),
+    ("tilde", tilde_chunks, 100),
+    ("midfence", mf, 40),
+    ("nested", nc, 4000),
+    ("paragraph", pchunks, 1900),
+    ("fence_whole", fchunks, 1900),
+]:
+    _over = [len(c) for c in _chunks if len(c) > _cap]
+    check("len<=max_len: %s" % _label, not _over, "over-limit: %s (cap %d)" % (_over, _cap))
+
+# A cut retains a tail, so the line that follows must not overflow the buffer.
+# Two caps: the overflow scales with max_len//4.
+for _cap in (1900, 4000):
+    _a = "\n".join("A" * 99 for _ in range(14))
+    _b = "\n".join("B" * 99 for _ in range(4))
+    _tail_line = "L" * (_cap - 50)
+    _cut_chunks = list(chunk_message(_a + "\n\n" + _b + "\n" + _tail_line, _cap))
+    _over = [len(c) for c in _cut_chunks if len(c) > _cap]
+    check("para-cut then long line stays within cap %d" % _cap, not _over,
+          "over-limit: %s" % _over)
+
+# Lookback discriminator: several SHORT lines after the last blank, so the
+# buffer grows past the blank before overflowing. The parent cuts mid-B here.
+_a16 = "\n".join("A" * 99 for _ in range(16))
+_b5 = "\n".join("B" * 80 for _ in range(5))
+_lb = list(chunk_message(_a16 + "\n\n" + _b5, 1900))
+check("lookback: paragraph B is never split across chunks",
+      len(_lb) == 2 and "B" not in _lb[0] and _lb[1].count("B" * 80) == 5,
+      str([len(c) for c in _lb]))
+
+# fits_one_message: the compose-time half of the cap.
+check("fits: short body is one message", mc.fits_one_message("hello"))
+check("fits: 3k body is not", not mc.fits_one_message("z\n" * 1500))
+check("fits: empty body is one message", mc.fits_one_message(""))
+
 if failures:
     print(f"\nFAIL — {len(failures)} check(s) failed: {failures}")
     raise SystemExit(1)

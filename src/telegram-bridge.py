@@ -56,8 +56,9 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 import local_task_protocol  # noqa: E402
-from result_markers import parse_markers  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from result_markers import parse_markers
+from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -81,7 +82,7 @@ RESULTS_DIR = REPO / "results"
 # lacked the personal-notes, iclr-backups and launch-assets roots, so a file
 # Discord would happily send was silently dropped from a Telegram reply.
 # Telegram inherits the complete canonical policy with no extra roots.
-from send_allowlist import is_path_sendable as _is_path_sendable  # noqa: E402
+from policy.egress.attachment import is_path_sendable as _is_path_sendable  # noqa: E402
 
 
 # --- Config loading (independent of _is_path_sendable above) ---
@@ -407,14 +408,17 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     parsed = parse_markers(text)
     files = [a.value for a in parsed.actions if a.kind == "attach"]
     clean_text = parsed.body
-    text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
+    # Fence-aware chunks via the shared chunker — naive [i:i+4000] slicing tore
+    # code fences at the boundary and re-declared policy discord/slack share.
+    chunks = chunk_plain_text(clean_text, 4000) if clean_text else []
+    text_chunks = len(chunks)
     delivered_ok = True
     files_sent = 0
 
     # Send text (if any remains after extracting file refs)
     if clean_text:
-        for i in range(0, len(clean_text), 4000):
-            resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+        for piece in chunks:
+            resp = api("sendMessage", chat_id=chat_id, text=piece)
             if not (isinstance(resp, dict) and resp.get("ok")):
                 delivered_ok = False
         try:
@@ -442,6 +446,12 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
         elif os.path.isfile(fpath):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
+        elif not fpath:
+            # An EMPTY target is malformed, not a prose quotation — surface it,
+            # or a file-only result is retired with zero user-visible output.
+            api("sendMessage", chat_id=chat_id,
+                text="(a file marker in this reply had no path — nothing attached)")
+            print("  file marker with EMPTY path — malformed, surfaced", flush=True)
         else:
             # Prose-quoted `[file:/path]` substrings extract as markers
             # but reference no actual file. Don't ship the warning to
@@ -940,7 +950,7 @@ def main():  # pragma: no cover
                 # body copy while these authentic ones pass through.
                 media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
                     attachment_refs, bool(text and text.strip()))
-                task_file.write_text(
+                _task_content = (
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                     f"source: telegram\n"
@@ -954,6 +964,14 @@ def main():  # pragma: no cover
                     f"{tg_skill_hints}"
                     f"{secret_notice}"
                 )
+                # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+                # fail-open so a stamping error costs the stamp and never the task.
+                try:
+                    from task_envelope import stamp_text  # sibling (src/ on sys.path)
+                    _task_content = stamp_text(_task_content, REPO)
+                except Exception:
+                    pass
+                task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 # Observability: one inbound accepted-message event. Source the
@@ -988,12 +1006,10 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import should_claim_proactive
+        from proactive_routing import (body_claimable_by,
+                                       should_claim_proactive_file)
         try:
-            if (
-                not presenter_mode_active(REPO)
-                and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
-            ):
+            if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
                 # friction-*.txt via FALLBACK_PREFIXES; telegram-bridge only
                 # matched `proactive-`, so morning-briefing output (which
@@ -1003,18 +1019,22 @@ def main():  # pragma: no cover
                 # cron-originated results land in the owner's DM regardless
                 # of which bridge is the active channel.
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
+                def _tg_claims(name: str) -> bool:
+                    # Destination outranks activity routing, uniformly;
+                    # discord's DM fallback stays the after-grace catch-all.
+                    return should_claim_proactive_file(
+                        name, OWNER_ACTIVITY_FILE, "telegram")
+
                 for f in RESULTS_DIR.iterdir():
-                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
-                        # Peek before claiming: skip Discord-targeted proactive files.
-                        # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                        # claiming it here sends the literal text to Telegram DM instead
-                        # of leaving it for discord-bridge. (#1401)
+                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
+                            and f.suffix == ".txt" and _tg_claims(f.name):
+                        # Peek before claiming: a body addressed to another bridge
+                        # is delivered by that bridge, not sent here as literal text.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if peek.startswith("[channel:") and \
-                                re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                        if not body_claimable_by(peek, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.

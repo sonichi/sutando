@@ -74,7 +74,9 @@ def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
     if core_alive:
         cores = state / "cores"
         cores.mkdir(exist_ok=True)
-        beat = cores / "testhost.alive"
+        # Host-labelled: the probe asks whether THIS host's core is alive,
+        # so a fixed name would only ever satisfy the fleet-wide reader.
+        beat = cores / f"{hc._host_label()}.alive"
         beat.write_text("{}")
         # _any_core_alive uses a 90s window; a just-written file is inside it.
     if pid_text is not None:
@@ -83,21 +85,31 @@ def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
 
 
 def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None,
-              trees: dict | None = None) -> dict:
+              trees: dict | None = None, parents: dict | None = None) -> dict:
     """Call check_task_watcher against a temp WORKSPACE_DIR. `argv` patches
     the _proc_argv probe: None = leave the real one (only used where no PID
-    is read), "" = process gone, any string = that process's argv."""
+    is read), "" = process gone, any string = that process's argv.
+
+    `parents` maps a fabricated tree root to its parent pid; a root absent from
+    it has unknown parentage. The parent probes are stubbed unconditionally —
+    `trees` invents pids, and an unstubbed probe reads the HOST's process table,
+    where a fabricated pid may really exist and carry a real parent.
+    """
     with tempfile.TemporaryDirectory() as td:
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
-        orig_ws, orig_probe, orig_trees = hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees
+        saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
+                 hc._ps_snapshot, hc._pid_parent)
         try:
             hc.WORKSPACE_DIR = Path(td)
             if argv is not None:
                 hc._proc_argv = lambda pid: argv
             hc._watcher_trees = lambda *a, **k: (trees or {})
+            hc._ps_snapshot = lambda *a, **k: ""
+            hc._pid_parent = lambda pid, ps=None: (parents or {}).get(pid)
             return hc.check_task_watcher()
         finally:
-            hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees = orig_ws, orig_probe, orig_trees
+            (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
+             hc._ps_snapshot, hc._pid_parent) = saved
 
 
 @contextlib.contextmanager
@@ -616,6 +628,22 @@ def case_m_absent_sentinel_with_live_orphan() -> list[str]:
     return fails
 
 
+def case_m2_fabricated_pid_ignores_the_host_process_table() -> list[str]:
+    """`trees` invents pids; the verdict must not depend on whether the host
+    happens to be running one. Unstubbed, the parent probe read the real table,
+    so on a runner where 9000 existed under kthreadd case m flipped to the
+    supervised branch — a green suite elsewhere and a red one there."""
+    saved = hc._pid_parent
+    try:
+        hc._pid_parent = lambda pid, ps=None: "2"   # host really runs pid 9000
+        r = run_check(core_alive=True, pid_text=None, trees={"9000": {"9000"}})
+    finally:
+        hc._pid_parent = saved
+    if "orphaned" not in r["detail"]:
+        return [f"m2) host pid table leaked into the verdict, got {r['detail']!r}"]
+    return []
+
+
 def case_n_trees_group_a_process_chain() -> list[str]:
     """The grouping algorithm: script + subshell is ONE watcher, not two.
     Counting matching processes would double it."""
@@ -710,6 +738,7 @@ def main() -> int:
         ("k", case_k_sentinels_own_tree_is_not_an_extra),
         ("l", case_l_dead_sentinel_with_live_orphan),
         ("m", case_m_absent_sentinel_with_live_orphan),
+        ("m2", case_m2_fabricated_pid_ignores_the_host_process_table),
         ("n", case_n_trees_group_a_process_chain),
         ("n2", case_n2_mentioning_the_script_is_not_running_it),
         ("o", case_o_trees_excludes_our_own_pid),
