@@ -413,7 +413,7 @@ with tempfile.TemporaryDirectory() as td:
         (".partial file", lambda r, inc: (r / "archive" / f"{inc}.partial").write_text("torn")),
         ("directory sharing prefix", lambda r, inc: (r / "archive" / f"{inc}{SEP}123").mkdir()),
         ("non-numeric suffix", lambda r, inc: (r / "archive" / f"{inc}{SEP}xyz").write_text("")),
-        ("exact-grammar SYMLINK", lambda r, inc: (r / "archive" / f"{inc}{SEP}123").symlink_to(r / "ready")),
+        ("exact-grammar SYMLINK", lambda r, inc: ((r / "outside.txt").write_text("x"), (r / "archive" / f"{inc}{SEP}123").symlink_to(r / "outside.txt"))),
     ):
         bl = fresh(td, f"legacy-{label.split()[0].strip('.')}")
         bl.publish("item-L", b"p")
