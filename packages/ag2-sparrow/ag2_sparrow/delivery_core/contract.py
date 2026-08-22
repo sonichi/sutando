@@ -80,6 +80,9 @@ class DeliveryReceipt:
     outcome: DeliveryOutcome
     provider_ref: Optional[str] = None
     detail: str = ""
+    # Where the side effect landed, in the provider's own address space.
+    # Only the provider knows this; the core must not infer it.
+    destination: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -169,8 +172,14 @@ class ClaimBackend(Protocol):
         """Acquire exclusive local ownership, or None on a lost race."""
         ...
 
+    # False = complete() accepts provider/destination and DROPS them.
+    # Check this; a signature does not imply durable storage.
+    persists_receipt_metadata: bool = False
+
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
-                 park_at_attempts: Optional[int] = None) -> bool:
+                 park_at_attempts: Optional[int] = None,
+                 provider: Optional[str] = None,
+                 destination: Optional[str] = None) -> bool:
         """Validate the exact incarnation, apply the outcome transition, and
         retire the claim — ALL inside one backend critical section, in that
         order. A stale token must change nothing: validating after mutating

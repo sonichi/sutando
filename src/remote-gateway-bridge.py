@@ -84,6 +84,10 @@ for _root in (
 # uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
+# The exec'd source's own __main__ guard must not fire mid-file: main() never
+# returns, so every assignment below the exec stayed unreached in production.
+_RUN_MAIN = __name__ == "__main__"
+__name__ = "ag2_sparrow.remote_gateway_bridge"
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
 
 _CHANNEL = "ag2space"
@@ -176,3 +180,7 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
+
+if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
+    __name__ = "__main__"
+    main()  # noqa: F821  (defined by the exec above)
