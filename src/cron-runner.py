@@ -500,8 +500,11 @@ def run(now_epoch: Optional[int] = None) -> list:
                         emit_task(name, entry)
                         emitted.append(name)
                     else:
+                        # The drop is the only record a slot was skipped; undated,
+                        # it cannot be tied to a sleep window or counted per day.
+                        _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                         print(
-                            f"cron-runner: dropping stale slot for {name} "
+                            f"{_ts} cron-runner: dropping stale slot for {name} "
                             f"({lateness}s late)",
                             file=sys.stderr,
                         )
@@ -515,4 +518,5 @@ def run(now_epoch: Optional[int] = None) -> list:
 if __name__ == "__main__":
     names = run()
     if names:
-        print("cron-runner emitted: " + ", ".join(names))
+        _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"{_ts} cron-runner emitted: " + ", ".join(names))

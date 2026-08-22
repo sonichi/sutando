@@ -91,6 +91,10 @@ class DesignCClaimBackend:
     """C: one live object per item, moved between state directories under a
     striped host-local lock. force-release exists as administrative requeue."""
 
+    # The FILENAME is the record here — an archived rename carries no field
+    # to hold receipt metadata, so complete() accepts and drops it.
+    persists_receipt_metadata = False
+
     capabilities = BackendCapabilities(supports_force_release=True)
 
     def __init__(self, root: Path, activate: bool = False):
@@ -196,7 +200,9 @@ class DesignCClaimBackend:
                               incarnation=fname)
 
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
-                 park_at_attempts: Optional[int] = None) -> bool:
+                 park_at_attempts: Optional[int] = None,
+                 provider: Optional[str] = None,
+                 destination: Optional[str] = None) -> bool:
         parts = token.incarnation.split(SEP)
         if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker):
             return False                    # forged: worker != the record's

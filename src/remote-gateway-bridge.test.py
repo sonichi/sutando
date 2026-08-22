@@ -996,6 +996,39 @@ def main() -> int:
                   for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
           "[no-send] proactive nudge is archived silently, never posted")
 
+    # Durable delivery receipts (the log line naming the room rotates; the
+    # receipt outlives it — parallel of the reply leg's #3252).
+    import importlib as _il
+    _ob = _il.import_module("ag2_sparrow.outbox")
+    _rroot = rtc.RESULTS_DIR / ".outbox-ag2space-proactive"
+    (rtc.RESULTS_DIR / "proactive-r1.txt").write_text("receipt nudge\n")
+    rtc._post_proactive()
+    _it = _ob._read_item(_rroot, "proactive-r1")
+    check(_it.get("status") == "DELIVERED"
+          and _it.get("provider") == "ag2space-proactive"
+          and _it.get("destination") == "!owner:example.org",
+          "delivered default-room nudge records a durable receipt with the room")
+    (rtc.RESULTS_DIR / "proactive-r2.txt").write_text(
+        "[channel: !other:example.org]\nrouted receipt nudge\n")
+    rtc._post_proactive()
+    _it2 = _ob._read_item(_rroot, "proactive-r2")
+    check(_it2.get("destination") == "!other:example.org",
+          "a routed nudge's receipt records the OVERRIDE room, not the default")
+    # A failed POST must record NOTHING — a receipt is proof of delivery,
+    # never of an attempt.
+    (rtc.RESULTS_DIR / "proactive-r3.txt").write_text("failing nudge\n")
+    STATE["force_room_502"] = True
+    rtc._post_proactive()
+    STATE["force_room_502"] = False
+    _it3 = _ob._read_item(_rroot, "proactive-r3")
+    check(_it3.get("status") != "DELIVERED" and "destination" not in _it3,
+          "a failed POST records no receipt")
+    rtc._post_proactive()
+    _it3b = _ob._read_item(_rroot, "proactive-r3")
+    check(_it3b.get("status") == "DELIVERED"
+          and _it3b.get("destination") == "!owner:example.org",
+          "the successful retry records the receipt")
+
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is
     # configured, so an ambient ~/.claude would decide these cases from the
