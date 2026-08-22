@@ -337,19 +337,20 @@ noise. So there are two tests before sending, and they key on different variable
 If neither test fires, the item is correctly in their queue — leave it.
 
 Measured on this repo: a PR sat **eleven days** on a blocking review its author had
-answered within the hour, while **five approvals landed while the block stood, from
-three distinct reviewers** — the last of them the same morning anyone noticed. Nothing
-had changed on the author's side after day one, and the item was unambiguously owned, so
-"has anything changed on my side?" returned *no* every single day, correctly, while
-three people's work went unused. Elapsed time was the only thing that could have
-surfaced it.
+answered within the hour, and **approvals kept arriving the entire time** — reviewer
+after reviewer read it, approved it, and changed nothing, because the block was never
+theirs to clear. Nothing had changed on the author's side after day one, and the item
+was unambiguously owned, so "has anything changed on my side?" returned *no* every
+single day, correctly, while every one of those approvals went unused.
 
-(**Distinct reviewers is the figure that carries the argument** — it is what a merge
-gate counts, so three is what binds. The submission count is stated only to be honest
-about the window: a sixth approval exists but predates the block by five hours, so it
-never accumulated behind anything. This example reached its final wording after being
-published with a *fourth* number that was neither — the row count of a truncated
-terminal display. State which unit a count is in, or the next reader will invent one.)
+(**This sentence used to headline the approval count. Don't.** The item was still open,
+so the figure moved four → six → five → six *while this paragraph was under review* —
+and only the first of those was a counting error; the rest were the item accumulating
+underneath the measurement. A count of a live item goes stale faster than the document
+quoting it. Freeze it with an explicit "as of &lt;timestamp&gt;" or, better, state the
+invariant that cannot move: **approvals accumulated and the item did not.** The
+first wrong figure was the row count of a truncated terminal display, which is its own
+lesson — state which unit a count is in, or the next reader will invent one.)
 
 **And the ownership test has a floor beneath it: an item nobody was EVER asked to
 move.** There no holder's attention lapsed — none existed. Nothing of yours changes, by
