@@ -600,8 +600,10 @@ fi
 
 # Check Accessibility (needed for context drop shortcut)
 source "$REPO/src/accessibility_probe.sh"
-accessibility_probe
-case $? in
+# `|| rc=$?` keeps this exempt from `set -e`: a bare non-zero call aborts the
+# whole script, and the probe returns non-zero on every host without the grant.
+acc_rc=0; accessibility_probe || acc_rc=$?
+case $acc_rc in
   0)   echo "  ✓ Accessibility" ;;
   124) echo "  ⚠ Accessibility UNKNOWN — probe timed out after ${ACCESSIBILITY_PROBE_TIMEOUT_S}s"
        echo "    This session cannot answer the prompt (headless/SSH); the grant may be fine." ;;

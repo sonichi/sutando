@@ -58,6 +58,23 @@ probe_with 3 false;        [ $? -eq 1 ] && ok "a plain failure is 1, not 124" ||
 grep -q 'ACCESSIBILITY_PROBE_TIMEOUT_S' "$REPO/src/accessibility_probe.sh" \
   && ok "the bound is overridable" || bad "the bound is overridable"
 
-total=9
+# Both callers run under `set -e`, where a bare non-zero call aborts the script
+# before its summary — measured: init.sh --preflight emitted 0 summary lines.
+for f in src/startup.sh src/init.sh; do
+  if grep -qE '^\s*accessibility_probe\s*$' "$REPO/$f"; then
+    bad "$f calls the probe set -e safely" "bare call aborts under set -e"
+  else
+    ok "$f calls the probe set -e safely"
+  fi
+done
+
+# And prove the shape, not just its absence.
+if bash -c 'set -e; f(){ return 124; }; rc=0; f || rc=$?; [ "$rc" -eq 124 ]'; then
+  ok "the || rc=\$? form survives set -e and keeps the code"
+else
+  bad "the || rc=\$? form survives set -e and keeps the code"
+fi
+
+total=12
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ] || exit 1

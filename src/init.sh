@@ -383,8 +383,10 @@ preflight() {
     perms_warn=1
   fi
   source "$REPO/src/accessibility_probe.sh"
-  accessibility_probe
-  case $? in
+  # `|| rc=$?` keeps this exempt from `set -e`; a bare non-zero call aborts
+  # init.sh before it ever emits its [Preflight] summary.
+  local acc_rc=0; accessibility_probe || acc_rc=$?
+  case $acc_rc in
     0)   : ;;
     124) log "  ⚠ Accessibility UNKNOWN — probe timed out (headless session cannot answer)"
          perms_warn=1 ;;
