@@ -19,7 +19,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-import discord_rest_client as drc  # noqa: E402
+import channels.discord.client as drc  # noqa: E402
 from outbox import DeliveryOutcome, RetrySafety  # noqa: E402
 
 FAILS = []
