@@ -243,7 +243,9 @@ def _tmux(workspace: Path, *args: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.pop("TMUX", None)
     return subprocess.run(
-        ["tmux", "-S", str(_tmux_socket(workspace)), *args],
+        # -f /dev/null: never load the host's tmux.conf. A scripted socket must
+        # not depend on ambient config a version bump can start rejecting.
+        ["tmux", "-f", "/dev/null", "-S", str(_tmux_socket(workspace)), *args],
         capture_output=True, text=True, timeout=15, env=env,
     )
 
