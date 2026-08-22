@@ -27,6 +27,7 @@ observer; it starts nothing and kills nothing.
 import json
 import math
 import os
+import tempfile
 import socket
 import subprocess
 import sys
@@ -346,11 +347,25 @@ def _write_station_cache(path, data):
 
 def _write_json_atomic(path, obj):
     """`open(path, "w")` truncates before it writes, so a reader polling in that
-    window sees an empty or partial file. Swap a fully-written temp file in."""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
-    os.replace(tmp, path)
+    window sees an empty or partial file. Swap a fully-written temp file in.
+
+    The staging name must be UNIQUE per writer: a fixed `<path>.tmp` is itself
+    shared state, and this module is an on-demand one-shot, so two callers can
+    truncate the same staging inode, write through separate descriptors and race
+    os.replace() -- publishing interleaved bytes, or raising ENOENT once the
+    shared path has already moved."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _cache_ts(x):

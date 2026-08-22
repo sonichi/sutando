@@ -55,6 +55,52 @@ class AtomicSharedStateWrites(unittest.TestCase):
                 if name in line and 'open(' in line and '"w"' in line:
                     self.fail(f"{name} is written with a truncating open(): {line.strip()}")
 
+    def test_staging_names_are_unique_per_writer(self):
+        """A fixed `<path>.tmp` is itself shared state: two concurrent callers
+        truncate the same staging inode and race os.replace(), publishing
+        interleaved bytes or raising ENOENT once the path has moved. Recorded
+        deterministically rather than by timing, so it cannot flake."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        dest = d / "core-verdict.json"
+        seen = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            seen.append(src)
+            return real_replace(src, dst)
+
+        os.replace = spy
+        try:
+            for i in range(5):
+                rh._write_json_atomic(str(dest), {"n": i})
+        finally:
+            os.replace = real_replace
+
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(len(set(seen)), 5,
+                         f"staging names must differ per writer, got {sorted(set(seen))}")
+        self.assertEqual(json.loads(dest.read_text())["n"], 4)
+
+    def test_a_failed_replace_leaves_no_staging_file(self):
+        """Cleanup on every failure path -- otherwise a raising replace strands
+        a temp file beside the destination on each attempt."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        dest = d / "runtime-health.json"
+        real_replace = os.replace
+
+        def boom(src, dst):
+            raise OSError("injected replace failure")
+
+        os.replace = boom
+        try:
+            with self.assertRaises(OSError):
+                rh._write_json_atomic(str(dest), {"health": "ok"})
+        finally:
+            os.replace = real_replace
+
+        self.assertEqual(list(d.iterdir()), [],
+                         f"staging file left behind: {[x.name for x in d.iterdir()]}")
+
     def test_control_the_truncating_shape_really_does_expose_an_empty_file(self):
         """Without this, the assertions above could pass for the wrong reason."""
         d = pathlib.Path(tempfile.mkdtemp())
