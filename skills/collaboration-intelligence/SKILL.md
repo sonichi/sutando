@@ -146,7 +146,11 @@ never moved, because *reading it* was never the missing step. **Nobody had been 
 
 ### When to act
 
-Fire once per `(blocker, state change)` — never once per sweep — when **all four** hold. These are
+Fire once per `(blocker, action, that action's own trigger)` — never once per sweep — when
+**all four** hold. **The key is per ACTION, not per routine**: steps 1-2 trigger on their channel
+being missing, step 3 triggers on the horizon crossing. A single routine-wide key would let the
+initial repair consume the one permitted firing and leave escalation unreachable for ever after,
+since crossing a horizon is not a state change of the work item. These are
 computable, so this is a step in a routine, not a judgement call:
 
 1. Another party must act.
@@ -181,7 +185,7 @@ re-report that was correct.
 ### What to do
 
 Three channels. **Gate each independently — do the ones that are missing, skip the ones that already
-exist**, once per state change per channel. Steps 1 and 2 are both required, so neither one's presence
+exist**, once per trigger per **action, step 3 included**. Steps 1 and 2 are both required, so neither one's presence
 excuses the other's absence. Step 3 escalates and is time-gated rather than gap-gated.
 
 1. **Create the platform request — only if none stands.** Request review, assign the issue, or
@@ -228,15 +232,18 @@ one; a rule with no terminal branch re-fires on every sweep.
   and the horizon has passed. **Escalate.** Requiring an undeliverable step 1 first would strand this
   item permanently, which is the one outcome every rule above exists to prevent.
 
-Each half keeps its own once-per-state-change record, so repairing one does not re-arm the other.
+Each action keeps its own once-per-trigger record, so repairing one does not re-arm another — and
+step 3 has one too, keyed on `(blocker, state, horizon)`. A horizon can be crossed only once, so that
+key bounds escalation to a single message without borrowing the repair steps' key.
 
 ### Guardrails
 
 - **If the blocker is still in your court, fix it instead of nudging.**
 - **If a capable request already exists, do not create another** — but check the notification half
   separately; a present request is not evidence the party knows.
-- **Act once per state change, not once per sweep.** A standing gap that has not changed does not
-  deserve a second message; re-sending teaches the recipient to filter you.
+- **Act once per trigger, not once per sweep.** A standing gap that has not changed does not deserve
+  a second message; re-sending teaches the recipient to filter you. Read this per action: a repair
+  already made is not re-made, and a horizon already crossed and escalated is not escalated again.
 - **Do not nudge someone who just acted.** Give a response time to be seen before treating silence as
   a gap.
 - **Never chase work you do not own or shepherd.** On someone else's item, prepare and surface it to
