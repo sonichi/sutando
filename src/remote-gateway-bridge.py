@@ -181,6 +181,6 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
 
-if _RUN_MAIN:
+if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"
     main()  # noqa: F821  (defined by the exec above)
