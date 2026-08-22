@@ -133,7 +133,8 @@ def emit(room_id, event_type, content, agent_mxid=None, *, gate=None):
     """op `event` → one typed TIMELINE event sent as this agent.
 
     The accepted type namespace is the SERVER's rule, not re-encoded here — a
-    client copy would drift, and its refusal already arrives as `reason`.
+    client copy would drift. Do NOT infer the refusal SHAPE either: a rejected
+    type may return a bare HTTP 502 with no `reason` rather than refuse legibly.
     """
     res = _op_call("event", room_id, agent_mxid, gate,
                    {"type": event_type, "content": content})
