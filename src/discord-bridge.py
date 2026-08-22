@@ -5217,22 +5217,22 @@ def _proactive_fence():
         # adapter's job, which keeps delivery-core imports out of the config module.
         root = RESULTS_DIR / ".outbox-discord-proactive"
         backend = DesignAClaimBackend(root)
+        # A switch must not hide Design A state: items/attempt history in
+        # .items would read as vanished under C and resurrect on rollback.
+        items = root / ".items"
+        try:
+            if items.is_dir():
+                entries = list(items.iterdir())  # ANY entry blocks
+            elif os.path.lexists(items):
+                # A file OR a dangling symlink at .items is unrecognized
+                # A-side state, not proof of absence — refuse, fail closed.
+                entries = [items]
+            else:
+                entries = []
+        except OSError:
+            entries = [items]  # unreadable A-side state: fail closed
         if resolve_claim_backend() == "c":
             from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
-            # A switch must not hide Design A state: items/attempt history in
-            # .items would read as vanished under C and resurrect on rollback.
-            items = root / ".items"
-            try:
-                if items.is_dir():
-                    entries = list(items.iterdir())  # ANY entry blocks
-                elif os.path.lexists(items):
-                    # A file OR a dangling symlink at .items is unrecognized
-                    # A-side state, not proof of absence — refuse, fail closed.
-                    entries = [items]
-                else:
-                    entries = []
-            except OSError:
-                entries = [items]  # unreadable A-side state: fail closed
             if entries:
                 print(f"  [proactive] claim_backend=c refused: {len(entries)} "
                       f"unmigrated Design A entr(y/ies) at {items} — "
@@ -5247,6 +5247,19 @@ def _proactive_fence():
                     print(f"  [proactive] claim_backend=c requested but unusable: "
                           f"{type(exc).__name__}: {exc} — running on Design A this cycle",
                           flush=True)
+        if isinstance(backend, DesignAClaimBackend) and not entries:
+            # REVERSE fence (C -> A): A over a root C has operated resets the
+            # durable retry budget and resurrects parked items (duplicate DMs).
+            from ag2_sparrow.delivery_core.migration import (
+                TransitionRefusalBackend, c_live_state)
+            live = c_live_state(root)
+            if live:
+                reason = (f"Design A refused on a C-operated root "
+                          f"({', '.join(live)} at {root})")
+                print(f"  [proactive] {reason} — proactive delivery DEFERRED; "
+                      "re-select claim_backend=c or migrate C state back to A "
+                      "before running A here", flush=True)
+                backend = TransitionRefusalBackend(reason)
         _PROACTIVE_FENCE = ProactiveClaimFence(
             backend, RESULTS_DIR, worker="discord-proactive")
     return _PROACTIVE_FENCE

@@ -147,8 +147,13 @@ _spec.loader.exec_module(db)
 
 
 def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
-                legacy_items=0, legacy_shape=None):
-    """Build the fence the way the bridge does, and report what it chose."""
+                legacy_items=0, legacy_shape=None, c_state=None,
+                inspect=None):
+    """Build the fence the way the bridge does, and report what it chose.
+    c_state="operated" drives the REAL C backend to a 5-attempt retry state
+    (keweichen's repro); "files" writes raw C-namespace entries so the root
+    shows C state without this process activating it. inspect(root) runs
+    after the fence for state-preservation assertions."""
     saved_env = os.environ.get("SUTANDO_CLAIM_BACKEND")
     saved_results, saved_fence = db.RESULTS_DIR, db._PROACTIVE_FENCE
     td = tempfile.mkdtemp(prefix="sel-adapter-")
@@ -193,9 +198,27 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
             from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
             DesignCClaimBackend(Path(td) / ".outbox-discord-proactive",
                                 activate=True)
+        if c_state == "operated":
+            from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
+            from ag2_sparrow.delivery_core.contract import DeliveryOutcome
+            r = Path(td) / ".outbox-discord-proactive"
+            cb = DesignCClaimBackend(r, activate=True)
+            cb.publish("hot-item", b"payload")
+            for _ in range(5):
+                tok = cb.claim("hot-item", "w0")
+                cb.complete(tok, DeliveryOutcome.NOT_DELIVERED)
+        elif c_state == "files":
+            r = Path(td) / ".outbox-discord-proactive"
+            (r / "ready").mkdir(parents=True, exist_ok=True)
+            (r / "ready" / "hot-item=deadbeef00000000").write_bytes(b"payload")
+            (r / "attempts").mkdir(exist_ok=True)
+            (r / "attempts" / "hot-item=deadbeef00000000").write_text("5")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             fence = db._proactive_fence()
+        extra = inspect(Path(td) / ".outbox-discord-proactive") if inspect else None
+        if inspect:
+            return type(fence._backend).__name__, buf.getvalue(), extra
         return type(fence._backend).__name__, buf.getvalue()
     finally:
         db.RESULTS_DIR, db._PROACTIVE_FENCE = saved_results, saved_fence
@@ -261,6 +284,43 @@ check("claim_backend=c" in out and "Design A" in out,
       "the filesystem failure is announced like the activation refusal")
 check(any(n in out for n in ("Error", "error")),
       f"and the announcement names the failure class, not just 'unusable': {out.strip()[:90]!r}")
+
+# 6. REVERSE fence (keweichen P1, exact repro): C operated this root to a
+# 5-attempt retry state; selecting A must NOT reset the durable retry budget.
+def _attempts(root):
+    ad = root / "attempts"
+    return sorted(f.read_text() for f in ad.iterdir()) if ad.is_dir() else []
+
+kind, out, att = _fence_with("a", c_state="operated", inspect=_attempts)
+check(kind == "TransitionRefusalBackend",
+      f"claim_backend=a over a C-OPERATED root is REFUSED (got {kind})")
+check("DEFERRED" in out and "C-operated" in out,
+      "and the refusal says delivery is deferred, naming the C state")
+check(att == ["5"],
+      f"C's 5-attempt budget is preserved untouched (got {att})")
+
+kind, out, att = _fence_with(None, c_state="operated", inspect=_attempts)
+check(kind == "TransitionRefusalBackend",
+      f"the DEFAULT (no selection = a) is refused the same way (got {kind})")
+check(att == ["5"], "and preserves the budget the same way")
+
+# The C-unusable fallback must also honor the reverse fence: raw C-namespace
+# state + a corrupt stripe fence = C raises, but A is still not safe.
+kind, out = _fence_with("c", corrupt_fence=True, c_state="files")
+check(kind == "TransitionRefusalBackend",
+      f"C-unusable + C live state -> refusal, NOT the A fallback (got {kind})")
+
+# A C-ACTIVATED but never-operated root carries no state to lose: A may run.
+kind, out = _fence_with("a", activate=True)
+check(kind == "DesignAClaimBackend",
+      f"activated-but-unoperated C root still lets A run (got {kind})")
+
+# The refusal backend is claim-inert: bodies stay queued, nothing processed.
+from ag2_sparrow.delivery_core.migration import TransitionRefusalBackend
+_rb = TransitionRefusalBackend("test")
+check(_rb.publish("x", b"p") is False and _rb.claim("x", "w") is None
+      and _rb.recover().recovered == [],
+      "refusal backend publishes nothing, claims nothing, recovers nothing")
 
 # The whole point of the fallback: delivery keeps working on the same root.
 with tempfile.TemporaryDirectory() as td:

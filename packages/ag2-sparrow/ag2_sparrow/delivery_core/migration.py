@@ -94,3 +94,52 @@ def convert_epoch(root: Path, items: Iterable[str],
         done += 1
     write_fence(root, target_epoch)
     return done
+
+
+def c_live_state(root: Path) -> "list[str]":
+    """Evidence Design C has OPERATED on this root: entries in its live
+    namespaces, or the epoch fence naming C. Fences the REVERSE transition
+    (C -> A): A over such a root resets the durable retry budget (a body C
+    parked at N attempts retries from zero) and resurrects parked items.
+    Read-only; an unreadable namespace is REPORTED as state (fail closed)."""
+    root = Path(root)
+    found = []
+    if read_epoch(root) == "C":
+        found.append("epoch=C")
+    for name in ("ready", "inflight", "undelivered", "attempts"):
+        d = root / name
+        try:
+            if d.is_dir() and any(d.iterdir()):
+                found.append(name)
+        except OSError:
+            found.append(f"{name}(unreadable)")
+    return found
+
+
+class TransitionRefusalBackend:
+    """ClaimBackend that claims nothing: installed when a root cannot be
+    safely served by the selected protocol (e.g. A over live C state).
+    Bodies stay queued on disk — delivery DEFERS, never duplicates."""
+    persists_receipt_metadata = False
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def publish(self, item_id, payload):
+        return False                       # record kept where it already is
+
+    def claim(self, item_id, worker):
+        return None                        # nothing is ever processed
+
+    def complete(self, token, outcome, **kw):
+        return False
+
+    def park(self, item_id, reason):
+        return None
+
+    def attempts(self, item_id):
+        return 0
+
+    def recover(self):
+        from .contract import RecoverReport
+        return RecoverReport()
