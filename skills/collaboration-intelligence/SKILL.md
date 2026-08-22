@@ -122,6 +122,86 @@ The rule to carry: **when a routine you are already running computes one of thes
 
 The same measurement makes the weaker path explicit, and it is worth stating plainly rather than implying the trigger is solved: on the night this was written, the gate had *already printed* the queued-on-nobody verdict before the agent acted, and the agent still did not invoke the skill. A signal nothing is obliged to read changes nothing.
 
+## Blocker removal
+
+Detecting a stalled item is not clearing one. The section above finds the observable; this one turns
+it into an action. A blocked item sits in two states that look identical from outside:
+
+- **Waiting on someone** — a capable party already holds a standing request. Do not ask again on every
+  sweep.
+- **Waiting on nobody** — the work needs action and no capable party is assigned. This is the common
+  case, and the only one that is yours.
+
+⇒ **A platform request creates durable queue state; an addressed message creates awareness. Both are
+required and neither substitutes for the other.** The request survives the reader's next inbox pass
+but is invisible until they look; the mention reaches them once and then decays into scrollback. An
+item carrying only the first is queued to someone who does not know; an item carrying only the second
+was known about once and is now in nobody's list. **Check that both exist — not that either does.**
+
+Measured 2026-08-22: a change-request latch was set at 09:22, the author answered it at 09:37 asking
+the reviewer to choose between two unblock options, and `reviewRequests` stayed **empty for eight
+hours**. The reviewer had been mentioned, so a notification existed; nothing stood in their queue
+afterwards. A merge gate reported `MAYBE-ANSWERED → READ IT` on four consecutive sweeps and the state
+never moved, because *reading it* was never the missing step. **Nobody had been asked.**
+
+### When to act
+
+Fire once per `(blocker, state change)` — never once per sweep — when **all four** hold. These are
+computable, so this is a step in a routine, not a judgement call:
+
+1. Another party must act.
+2. You have completed your part.
+3. No newer blocker puts the work back in your court.
+4. No capable party currently holds a standing request.
+
+If (2) is false the ball is in your court and nudging is a way of not doing your own work.
+
+Read state and timestamps from the artifact, and compare **timestamps, never dates** — a block and a
+head on the same day can be hours apart in either order. ⚠ On a shared account, comments after a
+block may be a **peer's**, not yours: verify who actually responded before recording a reply or
+claiming the block is addressed. Recording someone else's work as your own launders it and silences a
+re-report that was correct.
+
+### What to do
+
+Three channels, in order, once each. They escalate; do not fire them all at once.
+
+1. **Create the platform request** — request review, assign the issue, or establish the equivalent
+   durable state. Free, reversible, and the only step that survives an inbox sweep. Always first: if
+   it was missing, the party genuinely never had the item in their queue and later steps may be
+   unnecessary.
+2. **Notify their agent in the shared work room.** Resolve the person *and* their agent from the map
+   **before** addressing anyone — a nudge sent to a stale handle reads as answered to you and arrives
+   nowhere. An agent stands in for its person and is reachable when the human is not.
+3. **Escalate to the person's own channel only after the recorded horizon.** Set `escalate_after`
+   **when the ask is first made**, derived from the item's urgency and the team's conventions, and
+   record it with the ask. Escalate only when the horizon has passed, steps 1–2 are confirmed
+   *delivered*, and the state has still not changed. A fixed number of hours invented here would
+   impose a uniform SLA on teams that do not share one; no horizon at all is "wait forever" wearing
+   patience's clothes.
+
+Include the artifact, what changed, and the exact action needed.
+
+### Guardrails
+
+- **If the blocker is still in your court, fix it instead of nudging.**
+- **If a capable request already exists, do not create another.**
+- **Act once per state change, not once per sweep.** A standing gap that has not changed does not
+  deserve a second message; re-sending teaches the recipient to filter you.
+- **Do not nudge someone who just acted.** Give a response time to be seen before treating silence as
+  a gap.
+- **Never chase work you do not own or shepherd.** On someone else's item, prepare and surface it to
+  your owner; do not push, comment, or chase on their behalf.
+- **Send state-changing messages** — *"I addressed X; please re-review"* — never contentless
+  *"any update?"* pings.
+- **A nudge is not a wait-state.** Verify that someone now holds the request, then keep working and
+  track the item to completion, reassignment, or release. Blocked-on-someone is a cue to switch
+  lanes, never to stop.
+- **Record what you did and when**, with the timestamp read from the artifact rather than the moment
+  of recording. A log that misstates when you asked misleads the next reader about whether the party
+  has had time to answer.
+
+
 ## Operating contract
 
 0. **If the map has never been populated, do the bootstrap in [First run](#first-run) first.** The steps below assume a map that already holds something.
