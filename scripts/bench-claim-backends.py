@@ -114,7 +114,22 @@ def bench_procs(kind: str, n: int, workers: int, payload: bytes) -> dict:
         for p in procs:
             p.join(timeout=120)
         dt = perf() - t0
-        wins = [q.get() for _ in range(workers)]
+        # A dead/hung worker never put()s; an untimed get would hang forever.
+        wins = []
+        import queue as _q
+        for _ in range(workers):
+            try:
+                wins.append(q.get(timeout=10))
+            except _q.Empty:
+                break
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=10)
+        if len(wins) != workers:
+            raise RuntimeError(
+                f"{kind}: only {len(wins)}/{workers} workers reported — "
+                f"worker crash or hang; exitcodes={[p.exitcode for p in procs]}")
         return {"total_s": dt, "per_item_us": dt * 1e6 / n, "wins": sorted(wins),
                 "exactly_once": sum(wins) == n, "workers": workers, "items": n}
     finally:
@@ -227,8 +242,11 @@ def bench_publish_inflight_conflict(kind: str, payload: bytes) -> dict:
 
 
 def head_sha() -> str:
+    """Via src/git_binary's resolver — a bare `git` can hit the Xcode-CLT stub."""
     try:
-        return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+        sys.path.insert(0, str(REPO / "src"))
+        from git_binary import git_argv
+        return subprocess.run([*git_argv("-C", str(REPO), "rev-parse", "--short", "HEAD")],
                               capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception:
         return "unknown"
@@ -239,6 +257,9 @@ def main() -> int:
     ap.add_argument("--items", type=int, default=300)
     ap.add_argument("--deep", action="store_true",
                     help="add the 100k-item scale (minutes, not seconds)")
+    ap.add_argument("--quick", action="store_true",
+                    help="CI smoke: tiny scales, 1/2 procs — exercises every "
+                         "scenario and correctness assert in seconds")
     ap.add_argument("--json", type=Path, default=None)
     ap.add_argument("--stamp", default=None,
                     help="caller-supplied ISO timestamp for the JSON record")
@@ -252,7 +273,11 @@ def main() -> int:
     if args.stamp:
         result["timestamp"] = args.stamp
     k1, k64 = b"x" * 1024, b"x" * 65536
-    scales = [100, 10_000] + ([100_000] if args.deep else [])
+    if args.quick:
+        scales, proc_counts, proc_items = [40], (1, 2), 30
+    else:
+        scales = [100, 10_000] + ([100_000] if args.deep else [])
+        proc_counts, proc_items = (1, 4, 16), 400
 
     for kind in ("a", "c"):
         s = result["scenarios"].setdefault(kind, {})
@@ -260,8 +285,8 @@ def main() -> int:
         for n in scales:
             s[f"cycle_1k_{n}"] = bench_cycle(kind, n, k1)
         s["cycle_64k"] = bench_cycle(kind, 100, k64)
-        for w in (1, 4, 16):
-            s[f"procs_{w}"] = bench_procs(kind, 400, w, k1)
+        for w in proc_counts:
+            s[f"procs_{w}"] = bench_procs(kind, proc_items, w, k1)
         s["unknown_recover"] = bench_unknown_recover(kind, 100, k1)
         s["archive_0"] = bench_archive_scale(kind, 0, 50, k1)
         s["archive_2k"] = bench_archive_scale(kind, 2000, 50, k1)
@@ -288,7 +313,7 @@ def main() -> int:
               f"{ka['complete_throughput_per_s']:26.0f} {kc['complete_throughput_per_s']:26.0f}")
     print(f"{'64KiB complete p99 (us)':34} {a['cycle_64k']['complete']['p99']:26.0f} "
           f"{c['cycle_64k']['complete']['p99']:26.0f}")
-    for w in (1, 4, 16):
+    for w in proc_counts:
         pa, pc = a[f"procs_{w}"], c[f"procs_{w}"]
         print(f"{f'{w}-proc contention (us/item)':34} {pa['per_item_us']:26.0f} "
               f"{pc['per_item_us']:26.0f}   exactly-once A={pa['exactly_once']} C={pc['exactly_once']}")
@@ -302,8 +327,8 @@ def main() -> int:
         print(f"{'':34} C={c[label]}")
     print(f"{'CPU s (self, whole matrix)':34} {a['cpu_s_selfproc']:26} {c['cpu_s_selfproc']:26}")
 
-    hard_ok = all(x["exactly_once"] for k in (a, c) for x in
-                  (k["procs_1"], k["procs_4"], k["procs_16"])) \
+    hard_ok = all(k[f"procs_{w}"]["exactly_once"]
+                  for k in (a, c) for w in proc_counts) \
         and a["crash"]["ok"] and c["crash"]["ok"] \
         and a["conflict"]["ok"] and c["conflict"]["ok"]
     if not hard_ok:
