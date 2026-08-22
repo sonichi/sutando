@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit coverage for src/result_router.py — the Result Router fallback & audit
+"""Unit coverage for src/delivery/router.py — the Result Router fallback & audit
 policy (spec §4/§7/§9). Pure functions, no I/O, so no fixtures/stubs needed.
 
 Run: python3 tests/result-router-fallback.test.py
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("result_router", _ROOT / "src" / "result_router.py")
+spec = importlib.util.spec_from_file_location("result_router", _ROOT / "src" / "delivery" / "router.py")
 rr = importlib.util.module_from_spec(spec)
 # Register before exec so @dataclass can resolve string annotations (the module
 # uses `from __future__ import annotations`); mirrors a normal `import`.
