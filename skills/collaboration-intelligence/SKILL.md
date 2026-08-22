@@ -49,6 +49,22 @@ record: a miss means "consult the full store," not "does not exist." Shape in
 [references/schema.md](references/schema.md); a `quick-lookup-refresh` job in
 [references/maintenance.md](references/maintenance.md) keeps it bounded and fresh.
 
+## Where the map is stored
+
+Under Sutando, the map is per-user state, so it lives under the **workspace**, never in the code checkout:
+
+```
+<workspace>/data/collaboration-intelligence/
+  quick-lookup.yaml     # the bounded hot set (see above)
+  ...                   # the full record, per references/schema.md
+```
+
+Resolve `<workspace>` with `bash scripts/sutando-config.sh workspace` — never hardcode a path and never use a bare relative path, because the process CWD is the repo, not the workspace.
+
+**Why this location and not the checkout.** The engine tree is REPLACED on app update; anything written there is destroyed without warning. A skill whose whole purpose is a *durable* map is the worst possible thing to lose that way, and the loss is silent — the next run finds no store, builds a task-local view, and reports "persistence unavailable" as if that were normal.
+
+On a host with no workspace, build the task-local view and say persistence is unavailable, as the operating contract requires. Do not invent a fallback directory.
+
 ## Scheduled maintenance
 
 Use event-driven updates as the primary path. Use scheduled jobs to converge after missed events, refresh stale records, and produce compact summaries. Follow [references/maintenance.md](references/maintenance.md).
