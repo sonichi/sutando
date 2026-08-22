@@ -47,6 +47,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 	'health_check',
 	'bridges',
 	'stand',
+	'delivery',
 ]);
 
 /**

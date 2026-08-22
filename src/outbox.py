@@ -270,6 +270,12 @@ def _stripe_mode(root: Path) -> bool:
         return False
     except (OSError, ValueError) as e:
         raise RuntimeError(f"unreadable stripes fence {fp}: {e}") from e
+    if not isinstance(data, dict):
+        # Valid JSON of the wrong shape is corruption, not a missing fence:
+        # refuse in the same class, so callers need one boundary, not two.
+        raise RuntimeError(
+            f"stripes fence {fp} is {type(data).__name__}, not an object: "
+            f"migration required, refusing to guess")
     if data.get("stripes") != LOCK_STRIPES:
         # Mixed stripe counts are the same defect class as mixed namespaces.
         raise RuntimeError(

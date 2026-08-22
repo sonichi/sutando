@@ -159,9 +159,13 @@
       "properties": {
         "down_bridge_action": {
           "type": "string",
-          "enum": ["restart", "alert", "off"],
+          "enum": [
+            "restart",
+            "alert",
+            "off"
+          ],
           "default": "alert",
-          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout — clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
+          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout \u2014 clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
         }
       }
     },
@@ -204,6 +208,22 @@
     "stand": {
       "type": "string",
       "description": "This instance's `Stand:` commit-trailer value (e.g. \"Echo Act IV Mini\"). Per-clone identity, so it belongs in sutando.config.local.json rather than the tracked default config. Read by scripts/sutando-config.sh stand and src/daily-insight.py to tell co-located Sutando instances apart, since both commit under the owner's GH-mapped email so --author cannot separate them."
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Outbound delivery behaviour shared by the bridges.",
+      "properties": {
+        "claim_backend": {
+          "type": "string",
+          "enum": [
+            "a",
+            "c"
+          ],
+          "default": "a",
+          "description": "Which ClaimBackend the proactive delivery leg constructs. `a` (the default): the shipped Design A backend. `c`: the Design C striped backend, which requires an activated outbox root and falls back to Design A for the cycle if the root is not activated. Overridable via $SUTANDO_CLAIM_BACKEND. See resolve_claim_backend() in src/sutando_config.py."
+        }
+      }
     }
   }
 }
