@@ -6912,13 +6912,17 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
             if not isinstance(rec, dict):
                 raise ValueError("counter is not a JSON object")
             count = int(rec.get("count", 0))
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             hits.append(f"{root.name}: counter unreadable")
             continue
         if count > 0:
-            when = rec.get("last_hit_ts")
-            when_s = (datetime.fromtimestamp(when).strftime("%m-%d %H:%M")
-                      if isinstance(when, (int, float)) else "?")
+            # fromtimestamp raises on domain garbage (inf/nan/1e30) that
+            # isinstance passes; a probe on the gate path must never raise.
+            try:
+                when_s = datetime.fromtimestamp(
+                    rec.get("last_hit_ts")).strftime("%m-%d %H:%M")
+            except (TypeError, ValueError, OSError, OverflowError):
+                when_s = "?"
             hits.append(f"{root.name}: {count} hit(s), last {rec.get('last_item', '?')} at {when_s}")
     if hits:
         return {"name": name, "status": "warn",

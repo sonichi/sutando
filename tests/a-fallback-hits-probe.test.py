@@ -65,6 +65,26 @@ with tempfile.TemporaryDirectory() as td:
         check(r["status"] == "warn" and "unreadable" in r["detail"],
               f"non-dict counter {bad!r} -> unreadable warn, not an escape")
 
+    # int() on a container/None count raised TypeError past the old except;
+    # every garbage shape must land on the same unreadable warn.
+    for badv in ('{"count": {}}', '{"count": [1]}', '{"count": null}',
+                 '{"count": {"total": 3}}'):
+        (root2 / "a-fallback-hits.json").write_text(badv)
+        r = hc.check_a_fallback_hits(ws)
+        check(r["status"] == "warn" and "unreadable" in r["detail"],
+              f"non-int count value {badv} -> unreadable warn, not a raise")
+
+    # last_hit_ts domain garbage passes isinstance but raises inside
+    # fromtimestamp — and only on the hit branch, the gate path itself.
+    for badts in ("1e+30", "-1e+30", "NaN", "null", '"x"'):
+        (root2 / "a-fallback-hits.json").write_text(
+            '{"count": 2, "last_hit_ts": %s, "last_item": "task-q"}' % badts)
+        r = hc.check_a_fallback_hits(ws)
+        check(r["status"] == "warn" and "2 hit(s)" in r["detail"]
+              and "at ?" in r["detail"],
+              f"hit with last_hit_ts={badts} -> reported with '?', no raise")
+    (root2 / "a-fallback-hits.json").write_text('{"count": 0}')
+
     # The gate must not pass on an ABSENT instrument: a migrated root with no
     # counter means dual_read never ran there, which is not a measured zero.
     root3 = ws / "results" / ".outbox-gateway"
