@@ -240,7 +240,10 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    minutes). Both describe the present; the claim is about the past.
 
    **Do not conclude "so just push it".** The workflow's only effect is posting that comment, and the
-   paragraph above measures the comment as inert for ABSENT across 33 pushes on three PRs. A push
+   paragraph above measures the comment as inert for ABSENT across **29 push-triggered runs** on three PRs — counted from
+   `cla-recheck-on-push.yml`'s own `pull_request_target` run history (8 / 15 / 6), not from commit counts,
+   since one push can carry several commits and the workflow deletes its prior trigger
+   comments, so the surviving comment cannot witness a count. A push
    would buy the same inert comment, plus a fresh SHA that starts with no status of its own and a
    full CI rerun. Whether the comment would help *this* PR is an open question with no evidence either
    way; **close+reopen remains the documented remedy.** The useful content here is that the absence of
