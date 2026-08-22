@@ -54,7 +54,13 @@ One entry per agent-facing module. 3 without a usable header comment.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
+- **`discord_context_policy.py`** — Compatibility shim — canonical module is `policy.context.discord` (phase-1a restructure).
+- **`discord_delivery_provider.py`** — Compatibility shim — canonical module is `channels.discord.delivery_provider` (phase-1a restructure).
+- **`discord_http.py`** — Compatibility shim — canonical module is `channels.discord.http` (phase-1a restructure).
+- **`discord_post_gate.py`** — Compatibility shim — canonical module is `channels.discord.post_gate` (phase-1a restructure).
 - **`discord_proactive_send.py`** — Send-leg of proactive text delivery through the shared DeliveryProvider.
+- **`discord_reader.py`** — Compatibility shim — canonical module is `channels.discord.reader` (phase-1a restructure).
+- **`discord_rest_client.py`** — Compatibility shim — canonical module is `channels.discord.client` (phase-1a restructure).
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
@@ -115,7 +121,10 @@ One entry per agent-facing module. 3 without a usable header comment.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
+- **`result_channel_key.py`** — Compatibility shim — canonical module is `delivery.channel_key` (phase-1a restructure).
 - **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every delivery consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the `src/dm-result.py` REST fallback).
+- **`result_ready.py`** — Compatibility shim — canonical module is `delivery.readiness` (phase-1a restructure).
+- **`result_router.py`** — Compatibility shim — canonical module is `delivery.router` (phase-1a restructure).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
