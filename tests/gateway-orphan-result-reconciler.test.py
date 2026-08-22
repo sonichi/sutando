@@ -120,9 +120,8 @@ class GenuinelyUndelivered(_Base):
         self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists())
 
     def test_ok_false_refusal_keeps_result_and_never_archives(self):
-        # kewei #3184 P1 regression: a 2xx {"ok": false} is a REFUSED close.
-        # The old branch ignored the response and archived the only retryable
-        # copy; the sweep must retain it and log no delivery.
+        # A 2xx {"ok": false} is a REFUSED close, not a delivery: the sweep
+        # must retain the only retryable copy instead of archiving it.
         self._archived_task()
         self._result("[no-send]\nDECLINE_SENTINEL")
         gw._req = lambda m, path, payload=None: {"ok": False}
