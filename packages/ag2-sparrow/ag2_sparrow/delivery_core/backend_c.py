@@ -416,7 +416,8 @@ class DesignCClaimBackend:
         return False
 
     def recover(self) -> RecoverReport:
-        """Dead OWNERS' items return to ready/; UNKNOWN never touched. The
+        """Dead OWNERS' items return to ready/; OwnerState.UNKNOWN (process
+        liveness, NOT DeliveryOutcome.OUTCOME_UNKNOWN) never touched. The
         owner is the INCARNATION, not the pid: an ALIVE pid whose birth
         mismatches the token is a reused pid — the claimant is dead."""
         rep = RecoverReport()
