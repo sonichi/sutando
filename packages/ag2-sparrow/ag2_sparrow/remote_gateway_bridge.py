@@ -1080,6 +1080,10 @@ def _start_results_watcher() -> "threading.Thread | None":
                         continue
                     wake_outbound()
                     if events[0].fflags & VNODE_GONE:
+                        # Rate-cap rebuilds like the exception path: a flapping
+                        # dir must not spin the register loop.
+                        _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                        backoff = min(backoff * 2, 30.0)
                         break            # dir vnode gone: rebuild registration
             except Exception as e:  # noqa: BLE001 — degraded, never fatal
                 _log(f"results watcher degraded (scan remains the floor): {e}")
