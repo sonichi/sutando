@@ -5194,7 +5194,7 @@ def _proactive_provider():
     client (and its 30s upload timeout pin)."""
     global _PROACTIVE_PROVIDER
     if _PROACTIVE_PROVIDER is None:
-        from discord_post_gate import make_client
+        from channels.discord.post_gate import make_client
         from discord_delivery_provider import DiscordDeliveryProvider
         _PROACTIVE_PROVIDER = DiscordDeliveryProvider(
             make_client(TOKEN, timeout=30))
@@ -5871,7 +5871,7 @@ def _rest_client(timeout: int = 10):
     """The shared Discord REST chokepoint for the CLI send/edit paths. A test
     binds a scripted transport through here so the PRODUCTION client stays in
     the loop; make_client resolves the injected post-gate for this process."""
-    from discord_post_gate import make_client
+    from channels.discord.post_gate import make_client
     return make_client(TOKEN, timeout=timeout)
 
 

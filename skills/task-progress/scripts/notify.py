@@ -105,7 +105,7 @@ def _rest_client(token: str):
     src = str(repo / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
-    from discord_post_gate import make_client
+    from channels.discord.post_gate import make_client
     return make_client(token, timeout=10)
 
 
