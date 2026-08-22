@@ -265,7 +265,12 @@ When help is needed:
 3. **Choose the person first, then choose where to reach them — they are separate decisions.** An identity existing is not the same as it being live: check `identities[].activity` for where that person is actually seen, and honour `exclusive: true` (some people are reachable on exactly one surface, and a message anywhere else reaches nobody). Defaulting to whichever surface you happen to be on is how a reachable person gets treated as unreachable. Prefer the room where the work already has context, subject to that.
    When customers or external collaborators are present, share only context appropriate to that relationship and work scope.
 4. Contact the responsible agent directly when it can act. Include its owner or a human when approval, escalation, or shared accountability is needed.
-5. Resolve ambiguous recipients before sending. Never guess among duplicate names or uncertain identity links.
+5. **Resolve the recipient before sending anything that carries a payload**, and never guess
+   among duplicate names or uncertain identity links to deliver one. When the identity is
+   imperfectly resolved, the message is not simply blocked — what you may send is governed by
+   *what it carries*, under **"When resolution is imperfect"** below: a bare solicitation may
+   go, anything the recipient could not already access may not. That rule is the only exception
+   to this step, and it does not license guessing for a payload-bearing message.
 6. State why each recipient is included and provide the minimum context, desired action, and expected handoff.
 
 **A request made on the work platform is not solicitation.** A GitHub review
