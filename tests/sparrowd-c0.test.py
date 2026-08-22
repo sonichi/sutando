@@ -208,6 +208,47 @@ with tempfile.TemporaryDirectory() as td6:
     check(rc_dup == 0, "run() with lock held exits 0 cleanly (no duplicate daemon)")
     inst_hold.release()
 
+# REGRESSION (owner P0-1): the control plane stays available during backoff.
+# Default (stop-interruptible) pause, long backoff — no injected sleep.
+with tempfile.TemporaryDirectory() as td8:
+    sup8 = Supervisor([WorkerSpec("ghost8", [str(Path(td8) / "missing-bin")])],
+                      backoff_initial_s=30.0)
+    sup8.start()
+    check(wait_for(lambda: sup8.status()["workers"]["ghost8"]["state"] == "backoff"),
+          "regression: worker enters backoff (spawn failure, default pause)")
+    t0 = time.monotonic()
+    st8 = sup8.status()
+    dt_status = time.monotonic() - t0
+    check(dt_status < 1.0 and st8["workers"]["ghost8"]["state"] == "backoff",
+          f"regression: status() returns immediately mid-backoff ({dt_status*1000:.0f}ms)")
+    t0 = time.monotonic()
+    sup8.stop(grace_s=0)
+    dt_stop = time.monotonic() - t0
+    check(dt_stop < 2.0,
+          f"regression: stop(grace=0) is immediate mid-backoff ({dt_stop*1000:.0f}ms)")
+
+# REGRESSION (owner P0-2): a half-open client never starves the control plane.
+with tempfile.TemporaryDirectory() as td9:
+    sup9 = Supervisor([])
+    stopped9 = threading.Event()
+    ctl9 = ControlServer(Path(td9) / "c.sock", sup9, stopped9.set)
+    ctl9.start()
+    half = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    half.connect(str(Path(td9) / "c.sock"))
+    half.sendall(b"{")  # no newline, held open
+    time.sleep(0.1)
+    t0 = time.monotonic()
+    c9 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c9.connect(str(Path(td9) / "c.sock"))
+    c9.sendall(b'{"op": "status"}\n')
+    r9 = json.loads(c9.makefile("r").readline())
+    dt9 = time.monotonic() - t0
+    c9.close()
+    check(r9["ok"] and dt9 < 1.0,
+          f"regression: full status succeeds beside a half-open client ({dt9*1000:.0f}ms)")
+    half.close()
+    ctl9.close()
+
 # the real run() entry, end to end in a subprocess: lock + socket + stop
 with tempfile.TemporaryDirectory() as td2:
     t2 = Path(td2)
