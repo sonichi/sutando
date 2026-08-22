@@ -218,7 +218,7 @@ name the person explicitly, since the shared identity will otherwise absorb it. 
 request against an identity that cannot act, and do not leave condition 4 true forever waiting for
 one; a rule with no terminal branch re-fires on every sweep.
 
-**Three cases the conditions must not collapse into "waiting on someone":**
+**Four cases the conditions must not collapse into "waiting on someone":**
 
 - **Request-only** — a standing request exists, no notification since the last state change. The item
   sits in a queue nobody has looked at. **Fire step 2 alone**; do not create a second request.
