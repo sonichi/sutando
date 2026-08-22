@@ -9,7 +9,9 @@ items re-fires the guard every pass and it never dedups anything.
 The load-bearing property: any rendering of the same (id, blocker) set gives ONE
 hash, and a real change — item added or dropped, blocker changed — moves it.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -66,10 +68,13 @@ state.write_text(json.dumps({"streak": 2, "last_surfaced_hash": "", "updated": "
 
 
 def run(items, commit=False):
+    """In-process so the production main() is measured, not a subprocess the
+    coverage instrumentation cannot see. One real subprocess run is below."""
     argv = ["--state", str(state), "--items", json.dumps(items)] + (["--commit"] if commit else [])
-    out = subprocess.run([sys.executable, str(SCRIPT)] + argv,
-                         capture_output=True, text=True)
-    return out.stdout.strip(), out.returncode
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = ish.main(argv)
+    return buf.getvalue().strip(), rc
 
 
 first, rc = run(BASE)
@@ -87,12 +92,29 @@ moved, _ = run(BASE + [["3297", "ci"]])
 check("a changed set posts again", moved.startswith("post"), moved)
 
 # ── malformed input is an error, never a silent 'quiet' ─────────────────────
-out = subprocess.run([sys.executable, str(SCRIPT), "--state", str(state), "--items", "{}"],
-                     capture_output=True, text=True)
-check("a JSON object instead of a list is rejected", out.returncode == 2, out.stderr.strip())
-out = subprocess.run([sys.executable, str(SCRIPT), "--state", str(state), "--items", "not json"],
-                     capture_output=True, text=True)
-check("unparseable input is rejected", out.returncode == 2, out.stderr.strip())
+err = io.StringIO()
+with contextlib.redirect_stderr(err):
+    rc_obj = ish.main(["--state", str(state), "--items", "{}"])
+    rc_bad = ish.main(["--state", str(state), "--items", "not json"])
+check("a JSON object instead of a list is rejected", rc_obj == 2, err.getvalue())
+check("unparseable input is rejected", rc_bad == 2, err.getvalue())
+check("an entry with no id is rejected at the CLI too",
+      ish.main(["--state", str(state), "--items", '[["", "owner"]]']) == 2)
+
+# a torn or corrupt state file must not suppress the surface
+state.write_text("{not json")
+posted, rc = run(BASE)
+check("a corrupt state file is treated as no prior hash, so the surface posts",
+      posted.startswith("post") and rc == 0, posted)
+state.write_text(json.dumps({"streak": 2, "last_surfaced_hash": "", "updated": "x"}))
+run(BASE, commit=True)          # restore the recorded hash the next check needs
+
+# the shipped entry point runs as a real process with identical argv
+proc = subprocess.run([sys.executable, str(SCRIPT), "--state", str(state),
+                       "--items", json.dumps(BASE)], capture_output=True, text=True)
+check("the script runs as a subprocess with the same verdict",
+      proc.returncode == 0 and proc.stdout.strip().startswith("quiet"),
+      f"{proc.returncode} {proc.stdout!r} {proc.stderr!r}")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
