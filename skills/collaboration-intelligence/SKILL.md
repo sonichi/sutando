@@ -118,7 +118,15 @@ So do not rely on description matching alone. **Hook invocation to observable st
 | An identity appears that no stable ID in the map resolves | Resolve before addressing, never after. |
 | A request is about to go out addressed to nobody | Publishing is fine unaddressed; asking is not. |
 
-The rule to carry: **when a routine you are already running computes one of these, invoke this skill from that routine** — as a step, not as a hope that the description matches. A step executes regardless of framing; a description does not. Bound it to once per `(subject, action, that action's own trigger)` — **the same key shape the section below uses**, so a standing gap does not re-fire on every pass while a newly-available action still gets in. A caller keyed on `(subject, state-change)` alone is wrong in both directions: it never re-invokes when a horizon crosses (crossing one is not a work-item state change, so escalation is unreachable no matter what the section's internal keys say), and it invokes on the first sweep of a subject even when no action is available at all.
+The rule to carry: **when a routine you are already running computes one of these, invoke this
+skill from that routine** — as a step, not as a hope that the description matches. A step executes
+regardless of framing; a description does not. Bound it to once per `(subject, action, that
+action's own trigger)` — **the same key shape the section below uses**, so a standing gap does not
+re-fire on every pass while a newly-available action still gets in. A caller keyed on `(subject,
+state-change)` alone is wrong in both directions: it never re-invokes when a horizon crosses
+(crossing one is not a work-item state change, so escalation is unreachable no matter what the
+section's internal keys say), and it invokes on the first sweep of a subject even when no action
+is available at all.
 
 The same measurement makes the weaker path explicit, and it is worth stating plainly rather than implying the trigger is solved: on the night this was written, the gate had *already printed* the queued-on-nobody verdict before the agent acted, and the agent still did not invoke the skill. A signal nothing is obliged to read changes nothing.
 
