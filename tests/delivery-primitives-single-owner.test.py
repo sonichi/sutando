@@ -86,70 +86,40 @@ _CTORS = ("DesignAClaimBackend", "DesignCClaimBackend")
 
 
 def scan_instantiations(sources: dict) -> dict:
+    """Reference ratchet: every mention of a constructor name counts, keyed
+    path::enclosing_function::ctor with multiplicity. No aliasing analysis —
+    default params, attributes, subscripts, factory args all count, because
+    a call cannot exist without a reference (kewei r6 fail-closed rule)."""
     out: dict[str, int] = {}
     for path, text in sources.items():
         try:
             tree = ast.parse(text, filename=path)
         except SyntaxError:
             continue
-        # Aliases bind the SET of constructors referenced anywhere in the
-        # RHS (any expression shape) — fail-closed over conditional selection.
-        alias: dict[str, set] = {}
-        pending: list = []
-
-        def _refs(expr):
-            names = set()
-            for n in ast.walk(expr):
-                nm = (n.id if isinstance(n, ast.Name) else
-                      n.attr if isinstance(n, ast.Attribute) else None)
-                if nm:
-                    names.add(nm)
-            return names
-
+        recognized = set(_CTORS)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                rhs = node.value
-                tgts = [t for t in node.targets if isinstance(t, ast.Name)]
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                rhs = node.value
-                tgts = [node.target] if isinstance(node.target, ast.Name) else []
-            elif isinstance(node, ast.ImportFrom):
+            if isinstance(node, ast.ImportFrom):
                 for a in node.names:
                     if a.name in _CTORS and a.asname:
-                        alias.setdefault(a.asname, set()).add(a.name)
-                continue
-            else:
-                continue
-            refs = _refs(rhs)
-            direct = refs & set(_CTORS)
-            indirect = refs - set(_CTORS)
-            for t in tgts:
-                if direct:
-                    alias.setdefault(t.id, set()).update(direct)
-                for src in indirect:
-                    pending.append((t.id, src))
-        changed = True
-        while changed:
-            changed = False
-            for tgt_id, src_name in pending:
-                if src_name in alias:
-                    tgt_set = alias.setdefault(tgt_id, set())
-                    if not alias[src_name] <= tgt_set:
-                        tgt_set.update(alias[src_name])
-                        changed = True
+                        recognized.add(a.asname)
+
+        def hits(node):
+            if isinstance(node, ast.Name) and node.id in recognized:
+                yield node.id if node.id in _CTORS else next(
+                    c for c in _CTORS
+                    if any(isinstance(n, ast.ImportFrom) and any(
+                        a.name == c and a.asname == node.id for a in n.names)
+                        for n in ast.walk(tree)))
+            elif isinstance(node, ast.Attribute) and node.attr in _CTORS:
+                yield node.attr
 
         def visit(node, enclosing):
             for child in ast.iter_child_nodes(node):
                 enc = enclosing
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     enc = child.name
-                if isinstance(child, ast.Call):
-                    fn = child.func
-                    name = fn.id if isinstance(fn, ast.Name) else (
-                        fn.attr if isinstance(fn, ast.Attribute) else None)
-                    ctors = ({name} if name in _CTORS
-                             else alias.get(name or "", set()))
-                    for ctor in sorted(ctors):
+                if not isinstance(child, (ast.Import, ast.ImportFrom)):
+                    for ctor in hits(child):
                         key = f"{path}::{enclosing}::{ctor}"
                         out[key] = out.get(key, 0) + 1
                 visit(child, enc)
@@ -225,7 +195,7 @@ mutated5[_db] = prod_sources[_db] + (
     "    return Backend('improvised')\n")
 mviol5 = instantiation_violations(scan_instantiations(mutated5),
                                   INSTANTIATION_OWNERS)
-check(any("_qualified_rebind_leg::DesignCClaimBackend" in v for v in mviol5),
+check(any("<module>::DesignCClaimBackend" in v for v in mviol5),
       "qualified-attribute rebinding mutation FAILS the gate and names its site")
 # chained + annotated aliases (reviewer P1 r4): both permanent controls
 mutated6 = dict(prod_sources)
@@ -237,7 +207,7 @@ mutated6[_db] = prod_sources[_db] + (
     "    return Selected('improvised')\n")
 mviol6 = instantiation_violations(scan_instantiations(mutated6),
                                   INSTANTIATION_OWNERS)
-check(any("_chained_alias_leg::DesignCClaimBackend" in v for v in mviol6),
+check(any("<module>::DesignCClaimBackend" in v for v in mviol6),
       "chained alias mutation FAILS the gate and names its site")
 mutated7 = dict(prod_sources)
 mutated7[_db] = prod_sources[_db] + (
@@ -247,7 +217,7 @@ mutated7[_db] = prod_sources[_db] + (
     "    return BackendT('improvised')\n")
 mviol7 = instantiation_violations(scan_instantiations(mutated7),
                                   INSTANTIATION_OWNERS)
-check(any("_annotated_alias_leg::DesignCClaimBackend" in v for v in mviol7),
+check(any("<module>::DesignCClaimBackend" in v for v in mviol7),
       "annotated alias mutation FAILS the gate and names its site")
 # conditional-selection alias (reviewer P1 r5, kewei's exact mutation shape):
 # an IfExp choosing between BOTH constructors binds both — either leg counts.
@@ -264,6 +234,50 @@ check(any("_selected_backend_leg::DesignCClaimBackend" in v for v in mviol8),
       "conditional-selection mutation FAILS the gate (C leg named)")
 check(any("_selected_backend_leg::DesignAClaimBackend" in v for v in mviol8),
       "conditional-selection mutation FAILS the gate (A leg named)")
+# kewei r6 permanent controls: reference ratchet catches forms alias
+# analysis cannot — default parameter, instance attribute, subscript, factory.
+mutated9 = dict(prod_sources)
+mutated9[_db] = prod_sources[_db] + (
+    "\n\nfrom ag2_sparrow.delivery_core import DesignCClaimBackend\n"
+    "def _default_backend_leg(Backend=DesignCClaimBackend):\n"
+    "    return Backend('improvised')\n")
+mviol9 = instantiation_violations(scan_instantiations(mutated9),
+                                  INSTANTIATION_OWNERS)
+check(any("_default_backend_leg::DesignCClaimBackend" in v for v in mviol9),
+      "default-parameter mutation FAILS the gate and names its site")
+mutated10 = dict(prod_sources)
+mutated10[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core.backend_c as _dc9\n"
+    "class _Holder:\n"
+    "    def __init__(self):\n"
+    "        self.Backend = _dc9.DesignCClaimBackend\n"
+    "    def make(self):\n"
+    "        return self.Backend('improvised')\n")
+mviol10 = instantiation_violations(scan_instantiations(mutated10),
+                                   INSTANTIATION_OWNERS)
+check(any("__init__::DesignCClaimBackend" in v for v in mviol10),
+      "instance-attribute mutation FAILS the gate at the binding site")
+mutated11 = dict(prod_sources)
+mutated11[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core.backend_c as _dc10\n"
+    "def _registry_leg(kind):\n"
+    "    REG = {'c': _dc10.DesignCClaimBackend}\n"
+    "    return REG[kind]('improvised')\n")
+mviol11 = instantiation_violations(scan_instantiations(mutated11),
+                                   INSTANTIATION_OWNERS)
+check(any("_registry_leg::DesignCClaimBackend" in v for v in mviol11),
+      "registry-subscript mutation FAILS the gate and names its site")
+mutated12 = dict(prod_sources)
+mutated12[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core.backend_c as _dc11\n"
+    "def _factory_leg(make):\n"
+    "    return make('improvised')\n"
+    "def _caller_leg():\n"
+    "    return _factory_leg(_dc11.DesignCClaimBackend)\n")
+mviol12 = instantiation_violations(scan_instantiations(mutated12),
+                                   INSTANTIATION_OWNERS)
+check(any("_caller_leg::DesignCClaimBackend" in v for v in mviol12),
+      "factory-argument mutation FAILS the gate at the passing site")
 
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
