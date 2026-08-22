@@ -226,8 +226,9 @@ class DesignCClaimBackend:
                     "receipt": {"provider": provider, "destination": destination},
                     "completed_ns": time.time_ns(),
                     "worker": token.worker, "attempts": self.attempts(token.item_id),
+                    "incarnation": token.incarnation,
                 }
-                self._write_terminal(key, record)
+                self._write_terminal(key, record, token.incarnation)
                 src.unlink(missing_ok=True)          # D: release the claim
                 self._attempts_path(key).unlink(missing_ok=True)
                 return True
@@ -279,10 +280,12 @@ class DesignCClaimBackend:
     def _terminal_path(self, key: str) -> Path:
         return self._d(ARCHIVE) / f"{key}.json"
 
-    def _write_terminal(self, key: str, record: dict) -> None:
+    def _write_terminal(self, key: str, record: dict, incarnation: str) -> None:
         """R->F->M of the terminal protocol: atomic tmp write, fsync per the
-        durability mode, then rename into archive/. Caller releases the claim."""
-        tmp = self._d(TMP) / f"{key}{SEP}{TERMINAL_TAG}{SEP}{time.time_ns()}.json"
+        durability mode, then rename into archive/. Caller releases the claim.
+        The staging name embeds the INCARNATION so recovery can bind a staged
+        record to exactly the claim that produced it, never a sibling's."""
+        tmp = self._d(TMP) / f"{TERMINAL_TAG}{SEP}{incarnation}{SEP}{time.time_ns()}.json"
         data = json.dumps(record).encode()
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
@@ -313,39 +316,58 @@ class DesignCClaimBackend:
             return None
         return data if isinstance(data, dict) else None
 
-    def _has_terminal(self, key: str) -> bool:
-        """Any archive entry for `key` — JSON record or legacy rename."""
-        if self._terminal_path(key).exists():
-            return True
-        return any(f.name.startswith(f"{key}{SEP}")
-                   for f in self._d(ARCHIVE).iterdir())
+    def _incarnation_is_terminal(self, key: str, incarnation: str) -> bool:
+        """True iff an archive entry records THIS incarnation as completed:
+        a JSON record whose incarnation field matches, or a legacy rename whose
+        filename begins with the incarnation. Keyed by claim, never item id."""
+        for f in self._d(ARCHIVE).iterdir():
+            if f.name.startswith(incarnation):
+                return True                        # legacy rename format
+            if not (f.name.startswith(f"{key}") and f.suffix == ".json"):
+                continue
+            try:
+                rec = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict) and rec.get("incarnation") == incarnation:
+                return True
+        return False
 
     def recover(self) -> RecoverReport:
         """Dead OWNERS' items return to ready/; UNKNOWN never touched. The
         owner is the INCARNATION, not the pid: an ALIVE pid whose birth
         mismatches the token is a reused pid — the claimant is dead."""
         rep = RecoverReport()
-        # R-M crash window: a tmp terminal record means the outcome is already
-        # decided and durable-in-progress — finalize it, never re-ask the provider.
-        for t in sorted(self._d(TMP).glob(f"*{SEP}{TERMINAL_TAG}{SEP}*.json")):
-            key = t.name.split(SEP)[0]
+        # R-M window: a PARSEABLE staged record finalizes (outcome decided);
+        # a torn temp is deleted — dead-claim recovery redelivers instead.
+        for t in sorted(self._d(TMP).glob(f"{TERMINAL_TAG}{SEP}*.json")):
+            inc = t.name[len(TERMINAL_TAG) + len(SEP):].rsplit(SEP, 1)[0]
+            key = inc.split(SEP)[0]
             with self._lock(key):
                 if not t.exists():
                     continue
+                try:
+                    staged = json.loads(t.read_text())
+                except (OSError, ValueError):
+                    staged = None
+                if not (isinstance(staged, dict) and staged.get("schema") == 1):
+                    t.unlink(missing_ok=True)      # torn write, never authoritative
+                    continue
                 dst = self._terminal_path(key)
                 if dst.exists():
-                    t.unlink(missing_ok=True)      # record already finalized
-                else:
-                    os.rename(str(t), str(dst))
+                    dst = dst.with_name(f"{key}{SEP}{time.time_ns()}.json")
+                os.rename(str(t), str(dst))
+                # Release exactly the claim that produced this record.
+                (self.root / INFLIGHT / inc).unlink(missing_ok=True)
                 rep.retired.append(key)
         for f in sorted(self._d(INFLIGHT).iterdir()):
             parts = f.name.split(SEP)
             if len(parts) != TOKEN_PARTS or not parts[2].isdigit():
                 continue
             key = parts[0]
-            # M-D crash window: terminal already durable -> the claim is stale
-            # bookkeeping, not recoverable work. Retire it; never re-ready.
-            if self._has_terminal(key):
+            # M-D window: retire ONLY a claim whose OWN incarnation is
+            # terminal — an older record must not kill a live redelivery.
+            if self._incarnation_is_terminal(key, f.name):
                 with self._lock(key):
                     if f.exists():
                         f.unlink(missing_ok=True)
