@@ -223,11 +223,18 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    subject and a dropped redirect cannot satisfy it:
 
    ```python
-   MARK  = "step7-append-check"              # defined ONCE
+   MARK  = f"step7-{ts}"                     # UNIQUE PER WRITE — ts is already in scope
    entry = f"### {ts} — ...  [{MARK}]\n..."  # interpolated into what is WRITTEN
    p.write_text(p.read_text() + entry)
    assert p.read_text().count(MARK) == 1     # reads the FILE, never the terminal
    ```
+
+   **The marker must be unique per write, and `== 1` is why.** A literal constant passes on pass 1
+   and then fails forever: the marker survives in the log, so pass 2 finds it twice and a *correct*
+   append fails its own assertion — inside a loop step, where `assert` raises and takes the rest of
+   the pass with it. With `ts` in the marker, `== 1` means *this entry landed exactly once*; with a
+   constant it means *this log has been written to exactly once ever*, which is a different claim
+   and almost always false.
 
    `== 1`, not `> 0` — a 300 KB log may already contain the phrase somewhere else. And check that
    the probe can produce a positive at all: a marker matching nothing scores 0 by construction and
