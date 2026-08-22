@@ -316,19 +316,39 @@ Other state changes worth a message: a blocker of theirs is now cleared; the thi
 they were waiting on landed; you have changed direction on something they reviewed;
 you are handing the item to someone else.
 
-**And the discipline that keeps this from becoming noise: never nudge on no-change.**
-"Any update?" with nothing new on your side is what gets a channel muted, and a
-muted channel costs you every future nudge that mattered. The test before sending is
-not "has it been a while?" but **"has something changed since the last time I told
-them?"** If nothing has, the item is correctly in their queue — leave it.
+**And the discipline that keeps this from becoming noise: never send a contentless
+nudge.** "Any update?" with nothing new on your side is what gets a channel muted, and
+a muted channel costs you every future nudge that mattered.
 
-**But first confirm someone actually holds it.** No-change is a reason not to re-ping
-a person; it is never a reason to leave an item with no owner. On an item nobody was
-ever asked to move, nothing changes on your side *by construction* — so the test above
-returns "leave it" forever. That item is not waiting, it is dropped, and the action is
-to solicit, not to wait quietly. The two states are indistinguishable from outside and
-have opposite fixes: an item someone holds needs silence, an item no one holds needs a
-name on it.
+**But what elapsed time disqualifies is repeating yourself — not asking whether the
+item still has a live owner.** Those are different messages and only the first is
+noise. So there are two tests before sending, and they key on different variables:
+
+- **Do I have something new to tell them?** New information, an addressed finding, a
+  changed direction. This is the trigger that matters most and the one most often
+  skipped.
+- **Does this item still have a live owner?** Ownership is not established once and
+  then trusted forever. A holder's attention can lapse, and **that is invisible from
+  your side by construction** — nothing of yours changes when it happens, so elapsed
+  time is the *only* signal that can surface it. Ask on a horizon, as a reassignment
+  question, never as "any update?".
+
+If neither test fires, the item is correctly in their queue — leave it.
+
+Measured on this repo: a PR sat **eleven days** on a blocking review its author had
+answered within the hour, while **four approvals accumulated on it** — the last of them
+the same morning anyone noticed. Nothing had changed on the author's side after day
+one, and the item was unambiguously owned, so "has anything changed on my side?"
+returned *no* every single day, correctly, while three other reviewers' work went
+unused. Elapsed time was the only thing that could have surfaced it.
+
+**And the ownership test has a floor beneath it: an item nobody was EVER asked to
+move.** There no holder's attention lapsed — none existed. Nothing of yours changes, by
+construction, and there is no one whose silence elapsed time could measure, so both
+tests stay quiet indefinitely. That item is not waiting, it is dropped, and the action
+is to solicit — not to ask a reassignment question about a holder who was never
+assigned. **Never-owned and owned-then-quiet are indistinguishable from outside and
+have different fixes: the first needs a name on it, the second needs the name changed.**
 
 Track, per party you are waiting on: what they hold, and what has changed since you
 last contacted them. **That pair has no home today** — the record schema in
