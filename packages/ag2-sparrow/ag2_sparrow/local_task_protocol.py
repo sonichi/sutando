@@ -141,7 +141,13 @@ KNOWN_HEADER_KEYS = (
     # them, and the guard defangs forged body copies of the same names.
     "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
+    # Which instance took delivery. Same namespace as the addressee in the body, so a
+    # non-addressed core can tell; header status defangs a forged body copy.
+    "receiving_instance",
     "from", "call_sid", "hint", "instructions", "transcript",
+    # Durable schedule identity (#2723): the codex scheduler stamps which
+    # schedule and which slot produced the task.
+    "schedule_name", "schedule_slot",
     # interaction-model 4D, step 1.5 — structured media metadata. Listing them
     # here promotes them to headers AND (via the guard's shared import) defangs
     # them in untrusted bodies, so a forged `attachments:` body line can never

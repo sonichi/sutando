@@ -94,7 +94,9 @@ const _HEADER_KEYS = [
 	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
 	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
 	'thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
+	'receiving_instance',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
+	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
