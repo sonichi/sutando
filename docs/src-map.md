@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-One entry per agent-facing module.
+One entry per agent-facing module. 3 without a usable header comment.
 
 ## `src/`
 
@@ -54,13 +54,7 @@ One entry per agent-facing module.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
-- **`discord_context_policy.py`** — contextNotFrom gate — the single policy deciding whether a serving channel may pull another Discord channel's content into context.
-- **`discord_delivery_provider.py`** — DiscordDeliveryProvider: binds the shared DiscordRestClient into the 3013 delivery-core seam — the first production provider behind it.
-- **`discord_http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
-- **`discord_post_gate.py`** — Production injection seam for the Discord post-gate.
 - **`discord_proactive_send.py`** — Send-leg of proactive text delivery through the shared DeliveryProvider.
-- **`discord_reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
-- **`discord_rest_client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
@@ -121,10 +115,7 @@ One entry per agent-facing module.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
-- **`result_channel_key.py`** — Per-channel pull path for task-result files in `results/`.
 - **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every delivery consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the `src/dm-result.py` REST fallback).
-- **`result_ready.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
-- **`result_router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
@@ -228,6 +219,26 @@ One entry per agent-facing module.
 - **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
+## `src/channels/`
+
+- **`__init__.py`** — AG2 Space / Sutando channel adapters.
+
+## `src/channels/discord/`
+
+- **`__init__.py`** — Discord channel: API mechanics + injected post-gate (bridge, client, http, reader, post_gate).
+- **`client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
+- **`delivery_provider.py`** — DiscordDeliveryProvider: binds the shared DiscordRestClient into the 3013 delivery-core seam — the first production provider behind it.
+- **`http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
+- **`post_gate.py`** — Production injection seam for the Discord post-gate.
+- **`reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
+
+## `src/delivery/`
+
+- **`__init__.py`** — _(no header comment)_
+- **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
+- **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
+
 ## `src/launchd/`
 
 - **`channel-bridge-wrapper.sh`** — launchd entry point shared by Slack, Discord, and Telegram bridges.
@@ -286,6 +297,15 @@ One entry per agent-facing module.
 - **`collector.ts`** — Collector — the single, source-agnostic local ingestion point.
 - **`normalizer.ts`** — Normalizer — turns ONE source's raw payload into the universal spine vocabulary (ObsEvent / UsageRecord).
 - **`server.ts`** — HTTP shell for the Collector — the long-running local daemon.
+
+## `src/policy/`
+
+- **`__init__.py`** — _(no header comment)_
+
+## `src/policy/context/`
+
+- **`__init__.py`** — _(no header comment)_
+- **`discord.py`** — contextNotFrom gate — the single policy deciding whether a serving channel may pull another Discord channel's content into context.
 
 ## `src/runtime-api/`
 
