@@ -254,7 +254,8 @@ def head_sha() -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--items", type=int, default=300)
+    ap.add_argument("--items", type=int, default=None,
+                    help="override the scale list with ONE custom size")
     ap.add_argument("--deep", action="store_true",
                     help="add the 100k-item scale (minutes, not seconds)")
     ap.add_argument("--quick", action="store_true",
@@ -275,6 +276,9 @@ def main() -> int:
     k1, k64 = b"x" * 1024, b"x" * 65536
     if args.quick:
         scales, proc_counts, proc_items = [40], (1, 2), 30
+    elif args.items is not None:
+        scales, proc_counts = [args.items], (1, 4, 16)
+        proc_items = max(20, args.items // 2)
     else:
         scales = [100, 10_000] + ([100_000] if args.deep else [])
         proc_counts, proc_items = (1, 4, 16), 400
