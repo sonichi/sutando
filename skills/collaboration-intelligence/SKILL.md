@@ -269,7 +269,8 @@ When help is needed:
    among duplicate names or uncertain identity links to deliver one. When the identity is
    imperfectly resolved, the message is not simply blocked — what you may send is governed by
    *what it carries*, under **"When resolution is imperfect"** below: a bare solicitation may
-   go, anything the recipient could not already access may not. That rule is the only exception
+   go, anything the *least-privileged candidate* could not already access may not. That rule is
+   the only exception
    to this step, and it does not license guessing for a payload-bearing message.
 6. State why each recipient is included and provide the minimum context, desired action, and expected handoff.
 
@@ -303,10 +304,14 @@ first, then reply-to or @-mention. Two properties make this non-optional:
     **Owner directive (2026-08-22): a false positive here is the more tolerable
     error.** Say plainly why you think it is them, so a wrong recipient can correct
     you in one line instead of silently absorbing the ask.
-  - **Withhold it until identity is established: anything the recipient could not
-    already access.** Private repository contents, incident detail, personnel
-    matters, credentials and anything adjacent to them, and context carried from a
-    narrower room. Here a wrong recipient is not one ignorable message — it is a
+  - **Withhold it until identity is established: anything the *least-privileged
+    candidate* could not already access.** Not "the recipient" — when the identity is
+    unresolved that phrase has no determinate subject and quietly resolves to *the
+    person you think it is*, which is the exact case this rule exists for. Score it
+    against the least-privileged identity still consistent with the evidence.
+    Concretely: private repository contents, incident detail, personnel matters,
+    credentials and anything adjacent to them, and context carried from a narrower
+    room. Here a wrong recipient is not one ignorable message — it is a
     disclosure, and no correction takes it back. The asymmetry inverts, so the
     default inverts with it.
   - **When it is ambiguous, ask in the open instead of guessing in private.**
