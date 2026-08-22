@@ -5219,14 +5219,24 @@ def _proactive_fence():
         backend = DesignAClaimBackend(root)
         if resolve_claim_backend() == "c":
             from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
-            try:
-                backend = DesignCClaimBackend(root)
-            except (RuntimeError, OSError) as exc:
-                # C refuses an un-activated root (RuntimeError) and its namespace
-                # mkdirs raise OSError; both must fall back, not reach on_ready.
-                print(f"  [proactive] claim_backend=c requested but unusable: "
-                      f"{type(exc).__name__}: {exc} — running on Design A this cycle",
+            # A switch must not hide Design A state: items/attempt history in
+            # .items would read as vanished under C and resurrect on rollback.
+            legacy = [q for q in (root / ".items").glob("*") if q.is_file()] \
+                if (root / ".items").is_dir() else []
+            if legacy:
+                print(f"  [proactive] claim_backend=c refused: {len(legacy)} "
+                      f"unmigrated Design A item(s) in {root / '.items'} — "
+                      "complete the A->C migration first; running on Design A",
                       flush=True)
+            else:
+                try:
+                    backend = DesignCClaimBackend(root)
+                except (RuntimeError, OSError) as exc:
+                    # C refuses an un-activated root (RuntimeError); namespace
+                    # mkdirs raise OSError; both fall back, not reach on_ready.
+                    print(f"  [proactive] claim_backend=c requested but unusable: "
+                          f"{type(exc).__name__}: {exc} — running on Design A this cycle",
+                          flush=True)
         _PROACTIVE_FENCE = ProactiveClaimFence(
             backend, RESULTS_DIR, worker="discord-proactive")
     return _PROACTIVE_FENCE

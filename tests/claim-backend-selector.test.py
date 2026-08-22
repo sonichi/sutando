@@ -127,7 +127,8 @@ sys.modules["dbridge_sel"] = db
 _spec.loader.exec_module(db)
 
 
-def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False):
+def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
+                legacy_items=0):
     """Build the fence the way the bridge does, and report what it chose."""
     saved_env = os.environ.get("SUTANDO_CLAIM_BACKEND")
     saved_results, saved_fence = db.RESULTS_DIR, db._PROACTIVE_FENCE
@@ -145,6 +146,11 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False):
             (r / _o.LOCKS_DIR).mkdir(parents=True)
             _o._fence_path(r).write_text("[]")
             _o._STRIPE_MODE.pop(_o._root_key(r), None)
+        if legacy_items:
+            d = Path(td) / ".outbox-discord-proactive" / ".items"
+            d.mkdir(parents=True)
+            for i in range(legacy_items):
+                (d / f"legacy-{i}.json").write_text('{"attempts": 4}')
         if malform:
             # A file where C's namespace mkdir expects a directory.
             (Path(td) / ".outbox-discord-proactive").mkdir()
@@ -173,6 +179,15 @@ check(out == "", "and the default arm says nothing")
 kind, out = _fence_with("c", activate=True)
 check(kind == "DesignCClaimBackend",
       f"claim_backend=c on an ACTIVATED root -> Design C (got {kind})")
+
+# 5. A switch must not hide Design A state (Codex transition blocker):
+# unmigrated .items refuses C and stays on A, so attempt history remains live.
+kind, out = _fence_with("c", activate=True, legacy_items=4)
+check(kind == "DesignAClaimBackend",
+      f"unmigrated A items -> selector stays on Design A (got {kind})")
+check("unmigrated Design A item" in out and "4" in out,
+      "and the refusal names the count and the migration prerequisite")
+check("migration" in out, "and points at the migration as the fix")
 
 # The arm that matters: C is asked for, the root cannot serve it, and the
 # proactive leg must keep delivering rather than raise out of the fence.
