@@ -42,10 +42,25 @@ check(m.RUNTIME_IDENTITY.get("loader_sha256") == _hl.sha256(
       (REPO / "src" / "remote-gateway-bridge.py").read_bytes()).hexdigest(),
       "loader self-hash equals its on-disk bytes at startup")
 # fail-closed arms of the loader helpers (restored — a section rewrite ate them)
-check(m._git_head("/nonexistent-dir-xyz") is None,
-      "loader _git_head fails closed (None) outside a git repo")
-check(m._git_head("/etc/hosts") is None,
-      "loader _git_head fails closed on a non-directory repo argument")
+check(m._build_sha("/nonexistent-dir-xyz") is None,
+      "loader _build_sha fails closed (None) outside git with no manifest")
+check(m._build_sha("/etc/hosts") is None,
+      "loader _build_sha fails closed on a non-directory repo argument")
+
+# bundle install: no git, but ENGINE_MANIFEST.json carries the revision
+import tempfile as _tf
+import json as _json
+with _tf.TemporaryDirectory() as _bd:
+    _mf = Path(_bd) / "ENGINE_MANIFEST.json"
+    _mf.write_text(_json.dumps({"sha": "23c3c94d4b2068b647ef55c507bfa0c13ee100ce",
+                                "built_at": "2026-08-21T17:28:59Z"}))
+    check(m._build_sha(_bd) == "23c3c94d4b2068b647ef55c507bfa0c13ee100ce",
+          "loader falls back to the manifest sha on a non-git install")
+    _mf.write_text(_json.dumps({"sha": 42, "built_at": "x"}))
+    check(m._build_sha(_bd) is None,
+          "non-string manifest sha is refused, not injected")
+    _mf.write_text("not json")
+    check(m._build_sha(_bd) is None, "corrupt manifest fails closed")
 check(m._sha256_of("/nonexistent-file-abc") is None,
       "loader _sha256_of fails closed (None) on an unreadable path")
 
@@ -145,15 +160,53 @@ with tempfile.TemporaryDirectory() as td:
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
     check(r["status"] == "warn" and "non-canonical" in r["detail"],
           "suffix-matching foreign path: warn non-canonical (resolved compare)")
-    p.write_text(json.dumps({"runtime": GOOD}))
+    # build_sha present but garbage (not a sha string): still malformed
+    p.write_text(json.dumps({"runtime": dict(GOOD, build_sha=12345)}))
+    r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+    check(r["status"] == "warn" and "not a sha string" in r["detail"],
+          "garbage build_sha: warn malformed (None is the only allowed absence)")
+
+    # BUNDLE INSTALL (yixuan P1): build_sha=None + no git + no manifest is an
+    # install shape, not damage — digests become the verification evidence
+    import hashlib as _hl
+    bundle = Path(td) / "bundle"
+    (bundle / "src").mkdir(parents=True)
+    (bundle / "packages" / "ag2-sparrow" / "ag2_sparrow").mkdir(parents=True)
+    ldr = bundle / "src" / "remote-gateway-bridge.py"
+    mod = bundle / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+    ldr.write_text("# loader bytes")
+    mod.write_text("# module bytes")
+    bundle_rt = {"build_sha": None, "entrypoint": str(ldr), "engine": "E",
+                 "core_confirmed": 0, "legacy_sends": 0,
+                 "loader_sha256": _hl.sha256(ldr.read_bytes()).hexdigest(),
+                 "module_sha256": _hl.sha256(mod.read_bytes()).hexdigest()}
+    p.write_text(json.dumps({"runtime": bundle_rt}))
     saved_repo = hc.REPO_DIR
     try:
-        hc.REPO_DIR = Path(td)
+        hc.REPO_DIR = bundle
         r = hc.check_runtime_identity(path=p)
-        check(r["status"] == "warn" and "HEAD unreadable" in r["detail"],
-              "checkout HEAD unreadable: WARN — identity cannot be verified")
+        check(r["status"] == "ok" and "revision comparison unavailable" in r["detail"],
+              "bundle (no git/manifest): OK via digests, never 'malformed'")
+        # digest drift is still caught with no revision authority at all
+        mod.write_text("# CHANGED bytes")
+        r = hc.check_runtime_identity(path=p)
+        check(r["status"] == "warn" and "bytes drift" in r["detail"],
+              "bundle: digest drift warns even without any sha to compare")
+        mod.write_text("# module bytes")
+        # manifest as the revision authority: sha compared, built_at ignored
+        (bundle / "ENGINE_MANIFEST.json").write_text(json.dumps(
+            {"sha": "c" * 40, "built_at": "2026-08-21T17:28:59Z"}))
+        p.write_text(json.dumps({"runtime": dict(bundle_rt, build_sha="c" * 40)}))
+        r = hc.check_runtime_identity(path=p)
+        check(r["status"] == "ok" and "sha=cccccccc" in r["detail"],
+              "bundle with manifest: sha verified against manifest sha")
+        p.write_text(json.dumps({"runtime": dict(bundle_rt, build_sha="d" * 40)}))
+        r = hc.check_runtime_identity(path=p)
+        check(r["status"] == "warn" and "build drift" in r["detail"],
+              "bundle with manifest: mismatched sha still warns drift")
     finally:
         hc.REPO_DIR = saved_repo
+    p.write_text(json.dumps({"runtime": GOOD}))
     # symlink-loop entrypoint (reviewer P1): probe warns, never raises
     loop = Path(td) / "loop-link"
     try:

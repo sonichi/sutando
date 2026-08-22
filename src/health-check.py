@@ -5616,8 +5616,10 @@ def check_runtime_identity(path: "Path | None" = None,
         return _bad("runtime block is not an object")
     sha = rt.get("build_sha")
     ep = rt.get("entrypoint")
-    if not (isinstance(sha, str) and len(sha) >= 8):
-        return _bad("build_sha missing or not a sha string")
+    # None is the loader's honest report on a non-git (bundle) install — a
+    # property of the install, not damage. Only present-but-garbage is bad.
+    if sha is not None and not (isinstance(sha, str) and len(sha) >= 8):
+        return _bad("build_sha present but not a sha string")
     if not (isinstance(ep, str) and ep):
         return _bad("entrypoint missing")
     if not isinstance(rt.get("engine"), str):
@@ -5637,14 +5639,26 @@ def check_runtime_identity(path: "Path | None" = None,
         except Exception:
             head_sha = None
     if not head_sha:
-        return {"name": name, "status": "warn",
-                "detail": "checkout HEAD unreadable — cannot verify build "
-                          "identity; " + " ".join(bits)}
-    if sha != head_sha:
-        return {"name": name, "status": "warn",
-                "detail": f"build drift: process runs {sha[:8]}, checkout "
-                          f"HEAD is {head_sha[:8]} — restart to converge; "
-                          + " ".join(bits)}
+        # Bundle install: ENGINE_MANIFEST.json's `sha` is the revision
+        # authority. Compare ONLY sha — built_at is a time, not a revision.
+        try:
+            mf = json.loads((REPO_DIR / "ENGINE_MANIFEST.json").read_text())
+            m_sha = mf.get("sha") if isinstance(mf, dict) else None
+            head_sha = m_sha if isinstance(m_sha, str) and len(m_sha) >= 8 else None
+        except (OSError, ValueError):
+            head_sha = None
+    # The SHA comparison needs both sides; either absent is an install shape,
+    # not a failure — the digest checks below are the git-free evidence.
+    if sha and head_sha:
+        if sha != head_sha:
+            return {"name": name, "status": "warn",
+                    "detail": f"build drift: process runs {sha[:8]}, checkout "
+                              f"HEAD is {head_sha[:8]} — restart to converge; "
+                              + " ".join(bits)}
+        bits.insert(0, f"sha={sha[:8]}")
+    else:
+        bits.insert(0, "revision comparison unavailable (non-git install) — "
+                       "digest verification only")
     import hashlib
     for key, rel in (("loader_sha256", ("src", "remote-gateway-bridge.py")),
                      ("module_sha256", ("packages", "ag2-sparrow",
@@ -5675,7 +5689,7 @@ def check_runtime_identity(path: "Path | None" = None,
                 "detail": f"non-canonical entrypoint {ep} (expected {expected}); "
                           + " ".join(bits)}
     return {"name": name, "status": "ok",
-            "detail": (f"sha={sha[:8]} entrypoint=canonical " + " ".join(bits))}
+            "detail": ("entrypoint=canonical " + " ".join(bits))}
 
 
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":

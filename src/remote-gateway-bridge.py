@@ -86,7 +86,7 @@ _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bri
 
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
-def _git_head(repo):
+def _build_sha(repo):
     import subprocess
     from git_binary import git_argv  # resolver: never the bare CLT stub
     try:
@@ -94,6 +94,15 @@ def _git_head(repo):
             git_argv("-C", str(repo), "rev-parse", "HEAD"),
             text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
     except Exception:
+        pass
+    # Bundle install: the manifest's `sha` is the revision authority (its
+    # built_at is a time, not a revision — never substituted here).
+    try:
+        import json as _json
+        mf = _json.loads((Path(repo) / "ENGINE_MANIFEST.json").read_text())
+        m = mf.get("sha") if isinstance(mf, dict) else None
+        return m if isinstance(m, str) and len(m) >= 8 else None
+    except (OSError, ValueError):
         return None
 
 def _sha256_of(path):
@@ -105,7 +114,7 @@ def _sha256_of(path):
 
 # BOTH executed source inputs: the loader (this file) and the canonical
 # implementation it compiles — a same-HEAD change to either must be visible.
-RUNTIME_IDENTITY = {"build_sha": _git_head(_REPO),
+RUNTIME_IDENTITY = {"build_sha": _build_sha(_REPO),
                     "entrypoint": str(Path(__file__).resolve()),
                     "loader_sha256": _sha256_of(__file__),
                     "module_sha256": _sha256_of(_IMPL)}
