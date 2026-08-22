@@ -434,6 +434,9 @@ class CliTests(EnvCase):
     def test_read_exits_zero(self):
         self.assertEqual(room_ops._main(["read", ROOM, "--agent", HS]), 0)
 
+    def test_topic_dispatch_exits_zero(self):
+        self.assertEqual(room_ops._main(["topic", ROOM, "--agent", HS]), 0)
+
     def test_send_exits_zero_on_no_context(self):
         self.assertEqual(room_ops._main(["send", ROOM, "/nope/x.png", "--agent", HS]), 0)
 
