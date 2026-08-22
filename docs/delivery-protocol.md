@@ -41,11 +41,16 @@ Two mechanisms exist, and they have different crash shapes:
 - **`os.link` then `os.unlink`** (`_move()`; publish's tmp→ready transfer):
   the **LINK is the linearization point** (atomic create-if-absent — the loser
   of a race gets EEXIST, not a clobber). A crash between link and unlink
-  leaves **both** directory entries. That duplicate-name window is REAL and
-  the protocol absorbs it, never denies it: a stale `inflight/` twin of a
-  re-readied item is exactly what `recover()`'s live-and-dead classification
-  and the `collision` quarantine reason exist for; a leftover `tmp/` twin is
-  never authoritative by rule.
+  leaves **both** directory entries. That duplicate-name window is REAL, and
+  its handling differs by row: a leftover `tmp/` twin is never authoritative
+  by rule, and an `inflight/`↔`ready/` twin is absorbed by `recover()`'s
+  live-and-dead classification and the `collision` quarantine. **The
+  quarantine rows are NOT absorbed today (known hazard):** a crash after
+  linking into `undelivered/` but before unlinking the claim leaves both, and
+  `recover()` does not consult `undelivered/` — the dead claim is re-readied,
+  violating OUTCOME_UNKNOWN's never-auto-retry promise (reproduced on main;
+  fix owned by the terminal-record line: the twin shares the claim's inode,
+  so recovery can finish the interrupted quarantine instead).
 
 | transition | mechanism | linearization point | guarded by |
 |---|---|---|---|
