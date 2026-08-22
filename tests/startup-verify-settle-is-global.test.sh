@@ -85,10 +85,8 @@ else
 fi
 kill "$listener" 2>/dev/null; wait "$listener" 2>/dev/null
 
-# The timing case above cannot fail RELIABLY: reproducing a second-boundary
-# straddle from outside the block is luck, and it passed against the known-bad
-# head. So assert the STRUCTURAL fact that moves with the defect — the reported
-# wait must count sleeps, not subtract two 1s-granularity `date` samples.
+# The timing arm cannot fail reliably, so assert the structural fact instead:
+# the wait must count sleeps, never subtract two 1s-granularity `date` samples.
 if printf '%s' "$BLOCK" | grep -qE 'waited=\$\(\( *\$\(date \+%s\) *- *[a-z_]+ *\)\)'; then
   bad "the reported wait counts sleeps, not two date samples" \
       "found a two-sample subtraction; it reports 1s across a second rollover"
@@ -98,6 +96,32 @@ else
   bad "the reported wait counts sleeps, not two date samples" "neither form found"
 fi
 
-total=7
+# A listener that becomes ready DURING the retry window must be reported ✓ with a
+# nonzero wait — the arm neither the all-dead nor the already-ready case reaches.
+SLOW_PORT=59743
+if lsof -i :"$SLOW_PORT" >/dev/null 2>&1; then
+  bad "slow-port probe is free" "something listens on $SLOW_PORT"
+else
+  python3 -c "
+import socket,time
+time.sleep(2)
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',$SLOW_PORT)); s.listen(1); time.sleep(20)" &
+  slow=$!
+  out=$(VERIFY_PORTS="$SLOW_PORT:slow" VERIFY_SETTLE_S=8 LOGS_DIR=/tmp bash -c "$BLOCK" 2>&1)
+  case "$out" in
+    *"✓ slow (port $SLOW_PORT, after "*)
+      ok "a listener that appears during the window is ✓ with a nonzero wait" ;;
+    *"✓ slow (port $SLOW_PORT)"*)
+      bad "a listener that appears during the window is ✓ with a nonzero wait" \
+          "reported ready with NO wait — the retry is not being counted" ;;
+    *)
+      bad "a listener that appears during the window is ✓ with a nonzero wait" \
+          "got: $out" ;;
+  esac
+  kill "$slow" 2>/dev/null; wait "$slow" 2>/dev/null
+fi
+
+total=8
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ] || exit 1
