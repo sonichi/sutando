@@ -16,6 +16,12 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 better mechanism for that specific job. It is not "keep this in mind while doing other things", and
 it is not a licence to defer the work to a later session. If the ask is too large for your remaining
 context, that is the reason TO delegate it, not a reason to hand it back.
+If **no** delegation mechanism is available, do the work inline in this session and **say plainly
+that it ran inline, and why** — subagents are FULL-tier only under the quota gate, so an
+unavailable mechanism is a common state, not an edge case. Inline-with-disclosure is the
+satisfying branch. **Never report work as backgrounded or delegated when nothing was spawned:**
+claiming delegation you did not perform is indistinguishable from compliance from the outside,
+which is what makes it the worse of the two failures.
 More cases + model choice: `docs/subagent-delegation.md`.
 
 ## Architecture rules
@@ -195,19 +201,7 @@ Readers prefer canonical paths and fall back to legacy for ~30 days post-migrate
 
 ## Durable per-host install state: `state/auth/`
 
-`<workspace>/state/auth/` holds **per-host install/identity state**
-that survives across upgrades and MUST NOT be wiped by transient-state cleanup
-jobs (or by clear-on-restart logic that targets `state/*.json` generically).
-Current contents:
-- `cloud-auth.json` — per-host cloud-side auth credentials
-- `device.json` — per-host device identity (UUID + provisioning metadata)
-
-Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
-were loose at workspace root, mistreated as transient JSON snapshots and
-sometimes wiped. Treat `state/auth/` like `state/cores/<hostname>.alive` —
-per-host, structural, never overwritten by newest-mtime resolution across
-sources. Codex + Mini confirmed the destination + the exemption from cleanup
-in #design 2026-06-02.
+`<workspace>/state/auth/` holds per-host install/identity state (`cloud-auth.json`, `device.json`) that survives upgrades and MUST NOT be wiped by transient-state cleanup or by clear-on-restart logic targeting `state/*.json` generically. Rationale + history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
 
 ## Core memory
 
@@ -316,7 +310,7 @@ Tasks arrive from multiple channels via the same file bridge:
 MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`), and derive
 attachments from actions whose `kind == "attach"`. **Do not add a new private parser.**
 
-Attachment-path authorization is owned by `src/send_allowlist.py` before the upload sink. Migration status + the no-leak guard history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md). The dependency direction is one-way:
+Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. Migration status + the no-leak guard history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md). The dependency direction is one-way:
 
     parse_markers()  ->  send_allowlist.is_path_sendable()  ->  transport upload
 
@@ -329,7 +323,7 @@ delivered to the owner as literal text. Guarded by `tests/bridge-marker-no-leak.
 
 **Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix. The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
 
-Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/result_channel_key.py` (Python).
+Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python).
 
 **IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
 
@@ -392,6 +386,8 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 ## Skills
 
 Use skills available to the active runtime and under this repo's `skills/` directory when available. Prefer existing skills over writing new code from scratch.
+
+**Coordinating with a person or agent — recruiting a reviewer, delegating, escalating, resolving an identity — starts by invoking [`skills/collaboration-intelligence/`](skills/collaboration-intelligence/SKILL.md).** It derives *whom to ask* from the map, not recall: a memory answering "who do I ask?" fires first and is one past situation's cached answer, so treat it as a candidate and invoke the skill anyway. Feed the map back from real use — record who actually answered, owned, or reviewed, and correct it when a routing guess turns out wrong; a map only used and never updated decays into the recall it replaced.
 
 **Updating a skill mid-session.** Runtime behavior differs. For the Claude runtime, `skills/install.sh` places symlinks under its configured skills directory; after `git pull`, run `bash skills/refresh-skill.sh <name>` (or `--all`) to force its live watcher to re-read them. For the Codex runtime, `refresh-skill.sh` does not update Codex's skill cache; restart the core with `bash src/agent/start-cli.sh --restart` so Codex reloads its configured skill directories. Manifest-loaded `config`/`tools` and `src/` agent code require a service restart via `src/restart.sh`.
 

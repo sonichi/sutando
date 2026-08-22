@@ -359,6 +359,16 @@
       "status": "active",
       "canonical_for": "subagent delegation triggers beyond the explicit at-background rule, the do-not-delegate list, and per-spawn model selection",
       "last_verified": "2026-08-21"
+    },
+    "docs/delivery-protocol.md": {
+      "title": "The file delivery protocol as a formal state machine",
+      "audience": [
+        "contributors",
+        "maintainers"
+      ],
+      "status": "active",
+      "canonical_for": "delivery_core file-protocol transitions, fencing, crash matrix, support boundary, GC status",
+      "last_verified": "2026-08-22"
     }
   }
 }
