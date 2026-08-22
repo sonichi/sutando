@@ -5195,7 +5195,7 @@ def _proactive_provider():
     global _PROACTIVE_PROVIDER
     if _PROACTIVE_PROVIDER is None:
         from channels.discord.post_gate import make_client
-        from discord_delivery_provider import DiscordDeliveryProvider
+        from channels.discord.delivery_provider import DiscordDeliveryProvider
         _PROACTIVE_PROVIDER = DiscordDeliveryProvider(
             make_client(TOKEN, timeout=30))
     return _PROACTIVE_PROVIDER
