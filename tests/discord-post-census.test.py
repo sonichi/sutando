@@ -37,8 +37,8 @@ SUFFIXES = {".py", ".ts", ".sh", ".swift", ".js"}
 # invariant 2 below, so an allowlisted file cannot grow into a sender).
 ALLOWED = {
     "src/discord_rest_client.py",
-    "src/discord_reader.py",
-    "src/discord_context_policy.py",
+    "src/channels/discord/reader.py",
+    "src/policy/context/discord.py",
     "src/read_discord_channel.py",
     "hooks/context-source-guard.py",
 }
