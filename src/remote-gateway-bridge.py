@@ -83,6 +83,29 @@ for _root in (
 # (``rtc._ack_disabled_until = 0.0``) must hit the same namespace the running code
 # uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+
+# Runtime self-report, injected BEFORE the exec (anything after it is
+# unreachable when the exec'd source's own __main__ guard fires; see #3285).
+def _git_head(repo):
+    import subprocess
+    from git_binary import git_argv  # resolver: never the bare CLT stub
+    try:
+        return subprocess.check_output(
+            git_argv("-C", str(repo), "rev-parse", "HEAD"),
+            text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+    except Exception:
+        return None
+
+def _self_sha256():
+    import hashlib
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+RUNTIME_IDENTITY = {"build_sha": _git_head(_REPO),
+                    "entrypoint": str(Path(__file__).resolve()),
+                    "loader_sha256": _self_sha256()}
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
 # The exec'd source's own __main__ guard must not fire mid-file: main() never
 # returns, so every assignment below the exec stayed unreached in production.

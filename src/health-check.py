@@ -5581,6 +5581,99 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
     return max(0.0, (now - float(last)) / 3600.0)
 
 
+def check_runtime_identity(path: "Path | None" = None,
+                           head_sha: "str | None" = None) -> dict:
+    """#3279 verification layer 3: the RUNNING gateway process self-reports
+    build SHA / entry point / delivery engine into its status sidecar; this
+    probe compares that against the checkout so 'the code on disk' and 'the
+    code in memory' can no longer silently diverge. Absent sidecar = idle;
+    an UNREADABLE or MALFORMED one warns — the probe's own input being
+    damaged must never render as a clean pass."""
+    name = "runtime-identity"
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = Path(p)
+    if not p.exists():
+        return {"name": name, "status": "ok",
+                "detail": "no gateway sidecar — nothing to verify (probe idle)"}
+    try:
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"name": name, "status": "warn",
+                "detail": "gateway sidecar exists but is unreadable/unparseable "
+                          "— layer-3 verification is blind; inspect the file"}
+    if not isinstance(doc, dict):
+        return {"name": name, "status": "warn",
+                "detail": "gateway sidecar is not a JSON object — malformed"}
+    rt = doc.get("runtime")
+    if rt is None:
+        return {"name": name, "status": "warn",
+                "detail": "running bridge predates the runtime self-report — "
+                          "restart onto current code to enable layer-3 checks"}
+    def _bad(reason):
+        return {"name": name, "status": "warn",
+                "detail": f"runtime self-report malformed: {reason}"}
+    if not isinstance(rt, dict):
+        return _bad("runtime block is not an object")
+    sha = rt.get("build_sha")
+    ep = rt.get("entrypoint")
+    if not (isinstance(sha, str) and len(sha) >= 8):
+        return _bad("build_sha missing or not a sha string")
+    if not (isinstance(ep, str) and ep):
+        return _bad("entrypoint missing")
+    if not isinstance(rt.get("engine"), str):
+        return _bad("engine missing")
+    for k in ("core_confirmed", "legacy_sends"):
+        v = rt.get(k)
+        if not (isinstance(v, int) and not isinstance(v, bool) and v >= 0):
+            return _bad(f"{k} is not a non-negative int")
+    bits = [f"engine={rt.get('engine')}",
+            f"core_confirmed={rt.get('core_confirmed')}",
+            f"legacy_sends={rt.get('legacy_sends')}"]
+    if head_sha is None:
+        try:
+            head_sha = subprocess.check_output(
+                git_argv("-C", str(REPO_DIR), "rev-parse", "HEAD"),
+                text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        except Exception:
+            head_sha = None
+    if not head_sha:
+        return {"name": name, "status": "warn",
+                "detail": "checkout HEAD unreadable — cannot verify build "
+                          "identity; " + " ".join(bits)}
+    if sha != head_sha:
+        return {"name": name, "status": "warn",
+                "detail": f"build drift: process runs {sha[:8]}, checkout "
+                          f"HEAD is {head_sha[:8]} — restart to converge; "
+                          + " ".join(bits)}
+    reported_fp = rt.get("loader_sha256")
+    if isinstance(reported_fp, str) and reported_fp:
+        import hashlib
+        try:
+            disk_fp = hashlib.sha256(
+                (REPO_DIR / "src" / "remote-gateway-bridge.py").read_bytes()).hexdigest()
+        except OSError:
+            disk_fp = None
+        if disk_fp and disk_fp != reported_fp:
+            return {"name": name, "status": "warn",
+                    "detail": "loader bytes drift: the running process was started "
+                              "from different loader contents than now on disk "
+                              "(same-HEAD dirty change?) — restart to converge; "
+                              + " ".join(bits)}
+    expected = (REPO_DIR / "src" / "remote-gateway-bridge.py").resolve()
+    try:
+        actual = Path(ep).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return {"name": name, "status": "warn",
+                "detail": f"entrypoint path unresolvable (damaged telemetry): {ep!r}; "
+                          + " ".join(bits)}
+    if actual != expected:
+        return {"name": name, "status": "warn",
+                "detail": f"non-canonical entrypoint {ep} (expected {expected}); "
+                          + " ".join(bits)}
+    return {"name": name, "status": "ok",
+            "detail": (f"sha={sha[:8]} entrypoint=canonical " + " ".join(bits))}
+
+
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
     """Whether the gateway bridge's own sidecar says the connection is serving.
 
@@ -9125,6 +9218,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
+    checks.append(check_runtime_identity())
     checks.append(check_disk_space())
 
     return checks
