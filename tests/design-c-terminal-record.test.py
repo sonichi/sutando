@@ -213,6 +213,22 @@ with tempfile.TemporaryDirectory() as td:
           or (b12.root / "ready" / _safe_key("item-12")).exists(),
           "and that delivery is not lost either")
 
+    # ── non-confirmed outcome / null receipt are torn too ──────────────
+    b13 = fresh(td, "retryable")
+    b13.publish("item-13", b"p")
+    tok13 = b13.claim("item-13", "w0")
+    bad = {"schema": 1, "item_id": "item-13", "outcome": "retryable",
+           "receipt": None, "completed_ns": time.time_ns(), "worker": "w0",
+           "attempts": 0, "incarnation": tok13.incarnation}
+    (b13.root / "tmp" / f"{TERMINAL_TAG}{SEP}{tok13.incarnation}{SEP}5.json").write_text(
+        json.dumps(bad))
+    b13.recover()
+    check(b13.terminal_record("item-13") is None,
+          "outcome=retryable + receipt=null is torn — never promoted")
+    check((b13.root / "inflight" / tok13.incarnation).exists()
+          or (b13.root / "ready" / _safe_key("item-13")).exists(),
+          "and the delivery survives")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")

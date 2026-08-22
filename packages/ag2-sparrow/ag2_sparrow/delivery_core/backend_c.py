@@ -338,15 +338,23 @@ class DesignCClaimBackend:
 
     @staticmethod
     def _staged_is_complete(staged, incarnation: str) -> bool:
-        """A staged record is authoritative only when FULLY written AND bound
-        to the staging filename's incarnation — schema alone is a torn write."""
+        """Authoritative = a record _write_terminal() could have produced,
+        bound to the staging filename's incarnation. Anything less is torn."""
         if not isinstance(staged, dict) or staged.get("schema") != 1:
             return False
         if staged.get("incarnation") != incarnation:
             return False                     # foreign or missing binding
-        if not staged.get("item_id") or _safe_key(staged["item_id"]) != incarnation.split(SEP)[0]:
+        parts = incarnation.split(SEP)
+        if not staged.get("item_id") or _safe_key(staged["item_id"]) != parts[0]:
             return False
-        return bool(staged.get("outcome")) and "receipt" in staged
+        if staged.get("outcome") != DeliveryOutcome.CONFIRMED.value:
+            return False                     # C stages terminals ONLY for confirmed
+        if not isinstance(staged.get("receipt"), dict):
+            return False
+        if len(parts) >= 2 and _safe_component(str(staged.get("worker"))) != parts[1]:
+            return False                     # worker must match the claim's
+        return isinstance(staged.get("completed_ns"), int) \
+            and isinstance(staged.get("attempts"), int)
 
     def _incarnation_is_terminal(self, key: str, incarnation: str) -> bool:
         """True iff an archive entry records THIS incarnation as completed:
