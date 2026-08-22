@@ -158,6 +158,26 @@ with tempfile.TemporaryDirectory() as td:
     rep3 = import_a_state(root3)
     check(rep3["verified"] and rep3["fenced"] and read_epoch(root3) == "C",
           f"a genuinely clean root completes activation and fences ({rep3})")
+    root4 = Path(td) / "mig-symlink"
+    root4.mkdir()
+    ext = Path(td) / "external-empty"
+    ext.mkdir()
+    (root4 / ".items-migrated").symlink_to(ext)
+    rep4 = import_a_state(root4)
+    check(not rep4["verified"] and not rep4["fenced"] and "unmigratable" in rep4,
+          f"a SYMLINKED .items-migrated fails closed, unfenced ({rep4})")
+    root5 = Path(td) / "mig-file"
+    root5.mkdir()
+    (root5 / ".items-migrated").write_text("x")
+    rep5 = import_a_state(root5)
+    check(not rep5["verified"] and not rep5["fenced"],
+          "a FILE at .items-migrated fails closed")
+    root6 = Path(td) / "mig-danglink"
+    root6.mkdir()
+    (root6 / ".items-migrated").symlink_to(Path(td) / "nope")
+    rep6 = import_a_state(root6)
+    check(not rep6["verified"] and not rep6["fenced"],
+          "a dangling .items-migrated symlink fails closed")
 
 with tempfile.TemporaryDirectory() as td:
     # Malformed A record: ONE stable marker across repeated imports.

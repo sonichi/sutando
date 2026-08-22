@@ -129,6 +129,12 @@ def import_a_state(root: Path) -> dict:
             # not proof of absence. Fail closed; nothing is fenced.
             report["unmigratable"] = ".items exists but is not a directory"
             return report
+        if os.path.lexists(migrated_dir) and (
+                migrated_dir.is_symlink() or not migrated_dir.is_dir()):
+            # A symlinked or non-directory rollback namespace is not evidence
+            # the rename completed — ambiguous state fails closed, unfenced.
+            report["unmigratable"] = ".items-migrated exists but is not a real directory"
+            return report
         if migrated_dir.is_dir() and read_epoch(root) != "C":
             # Rename-to-fence crash window: re-verify against the preserved
             # copies, then finish the fence.
