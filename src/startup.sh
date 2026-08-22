@@ -1293,10 +1293,13 @@ verify_deadline=$((verify_started + VERIFY_SETTLE_S))
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
+  port_started=$(date +%s)
   while ! lsof -i :"$port" > /dev/null 2>&1 && [ "$(date +%s)" -lt "$verify_deadline" ]; do
     sleep 1
   done
-  waited=$(( $(date +%s) - verify_started ))
+  # Per-port, not elapsed-since-loop-start: a global figure attributes an
+  # earlier port's wait to a service that was already listening.
+  waited=$(( $(date +%s) - port_started ))
   if lsof -i :"$port" > /dev/null 2>&1; then
     if [ "$waited" -gt 0 ]; then
       echo "  ✓ $name (port $port, after ${waited}s)"

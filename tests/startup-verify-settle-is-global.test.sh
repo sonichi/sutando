@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# The settle deadline is GLOBAL, not per-port. Per-port it serialises to
-# ports x VERIFY_SETTLE_S of dead time before the core launches.
-#
-# Run: bash tests/startup-verify-settle-is-global.test.sh
+# The settle deadline is GLOBAL; the reported wait is PER-PORT. Per-port
+# deadlines serialise, and a global wait misreports an already-ready service.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO/src/startup.sh"
@@ -57,6 +55,31 @@ else
   bad "all 3 dead ports still reported" "got $n of 3"
 fi
 
-total=5
+# A port that is ALREADY listening behind a dead one must report its own wait,
+# not the dead port's. This is the case the all-dead run structurally cannot see.
+LIVE_PORT=59741
+(exec 9<>/dev/tcp/127.0.0.1/1 2>/dev/null) 2>/dev/null || true
+python3 -c "
+import socket,time,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',$LIVE_PORT)); s.listen(1); time.sleep(8)" &
+listener=$!
+sleep 1
+if lsof -i :"$LIVE_PORT" >/dev/null 2>&1; then
+  out=$(VERIFY_PORTS="59731:dead $LIVE_PORT:ready" VERIFY_SETTLE_S=3 LOGS_DIR=/tmp bash -c "$BLOCK" 2>&1)
+  if printf '%s' "$out" | grep -q "ready (port $LIVE_PORT)$"; then
+    ok "a ready port behind a dead one reports no wait"
+  elif printf '%s' "$out" | grep -qE "ready \(port $LIVE_PORT, after [1-9]"; then
+    bad "a ready port behind a dead one reports no wait" \
+        "got: $(printf '%s' "$out" | grep "$LIVE_PORT")"
+  else
+    bad "a ready port behind a dead one reports no wait" "unrecognised: $out"
+  fi
+else
+  bad "helper listener bound" "could not bind $LIVE_PORT"
+fi
+kill "$listener" 2>/dev/null; wait "$listener" 2>/dev/null
+
+total=6
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ] || exit 1

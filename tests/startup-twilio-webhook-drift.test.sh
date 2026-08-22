@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# The Twilio-webhook diagnostic in startup.sh, driven from the SOURCE.
-# The block is extracted by its own anchors, so deleting it fails this file
-# rather than leaving a green test over a recipe nothing runs.
-#
-# Run: bash tests/startup-twilio-webhook-drift.test.sh
+# Drives the Twilio diagnostic extracted from src/startup.sh by its own anchors,
+# so deleting the block fails this file instead of leaving it green.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO/src/startup.sh"
@@ -75,9 +72,8 @@ out="$(run_case "TWILIO_WEBHOOK_URL=https://host.tail1234.ts.net" "$LIVE")"
 [ -z "$out" ] && ok "configured Funnel tunnel is not reported as drift" \
   || bad "configured Funnel tunnel is not reported as drift" "got: $out"
 
-# 8. the claim above is about real code -- pin that conversation-server really
-#    does bind this var and skip ngrok, so this test fails if that stops being
-#    true and the two-sided advice becomes wrong.
+# 8. pin that conversation-server really binds this var and skips ngrok, so the
+#    two-sided advice fails here if that stops being true.
 CS="$REPO/skills/phone-conversation/scripts/conversation-server.ts"
 if [ -f "$CS" ]; then
   if grep -q 'process.env.TWILIO_WEBHOOK_URL' "$CS" && grep -q 'WEBHOOK_BASE_URL = externalUrl' "$CS"; then
