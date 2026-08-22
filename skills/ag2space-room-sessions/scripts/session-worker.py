@@ -10,8 +10,6 @@ import hashlib
 import json
 import os
 import re
-import selectors
-import signal
 import subprocess
 import sys
 import tempfile
@@ -157,20 +155,6 @@ def _record_session(workspace: Path, runtime: str, room_key: str, session_id: st
         _atomic_text(_state_path(workspace), json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
-def _terminate(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=2)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=2)
-
-
 def _manifest_config(key: str) -> str:
     try:
         manifest = json.loads((Path(__file__).resolve().parents[1] / "manifest.json").read_text())
@@ -186,69 +170,6 @@ def _timeout(key: str, cli_value: Optional[float]) -> float:
     if value <= 0:
         raise ValueError("provider timeouts must be positive")
     return value
-
-
-def _run_bounded(
-    command: list[str],
-    cwd: Path,
-    hard_timeout_override: Optional[float] = None,
-    stall_timeout_override: Optional[float] = None,
-) -> tuple[int, str, str]:
-    hard_timeout = _timeout("SUTANDO_TIER_HARD_TIMEOUT", hard_timeout_override)
-    stall_timeout = _timeout("SUTANDO_TIER_STALL_TIMEOUT", stall_timeout_override)
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=os.environ.copy(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    assert process.stdout is not None and process.stderr is not None
-    streams = {process.stdout.fileno(): "stdout", process.stderr.fileno(): "stderr"}
-    selector = selectors.DefaultSelector()
-    output = {"stdout": [], "stderr": []}
-    for fd, name in streams.items():
-        os.set_blocking(fd, False)
-        selector.register(fd, selectors.EVENT_READ, name)
-    started = last_progress = time.monotonic()
-    try:
-        while selector.get_map():
-            now = time.monotonic()
-            if now - started >= hard_timeout:
-                raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
-            if now - last_progress >= stall_timeout:
-                raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
-            for key, _ in selector.select(timeout=min(0.2, stall_timeout)):
-                try:
-                    chunk = os.read(key.fd, 65536)
-                except BlockingIOError:
-                    continue
-                if chunk:
-                    output[key.data].append(chunk)
-                    last_progress = time.monotonic()
-                else:
-                    selector.unregister(key.fd)
-        while process.poll() is None:
-            now = time.monotonic()
-            if now - started >= hard_timeout:
-                raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
-            if now - last_progress >= stall_timeout:
-                raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
-            time.sleep(min(0.05, stall_timeout))
-        return (
-            int(process.returncode or 0),
-            b"".join(output["stdout"]).decode("utf-8", "replace"),
-            b"".join(output["stderr"]).decode("utf-8", "replace"),
-        )
-    except BaseException:
-        _terminate(process)
-        raise
-    finally:
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
 
 
 def _task_view(task_file: Path) -> str:
@@ -269,16 +190,6 @@ def _task_view(task_file: Path) -> str:
         if parsed.headers.get(key)
     }
     return json.dumps({"context": context, "task": body}, ensure_ascii=False)
-
-
-def _prompt(task_file: Path) -> str:
-    return (
-        "Handle the owner task in this persistent AG2 Space room session. Follow "
-        "AGENTS.md for repository and safety policy. Do not read the original task "
-        "file or create or modify any tasks/results tracking file; the parent worker "
-        "exclusively owns result publication. Return only the exact result body.\n\n"
-        f"Trusted task view:\n{_task_view(task_file)}"
-    )
 
 
 def _working_dir(repo: Path) -> Path:
@@ -368,16 +279,63 @@ def _pane_content(workspace: Path, name: str) -> str:
     return done.stdout if done.returncode == 0 else ""
 
 
-def _standing_launch_command(session_id: str, resume: bool) -> list[str]:
+def _standing_launch_command(runtime: str, session_id: str, resume: bool) -> list[str]:
+    model = os.environ.get("SUTANDO_CORE_MODEL", "").strip()
+    if runtime == "codex":
+        # Codex chooses its own session id at first turn (discovered from the
+        # rollout file afterwards), so create-mode launches with no id at all.
+        command = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+        if model:
+            command += ["-m", model]
+        if resume:
+            command += ["resume", session_id]
+        return command
     command = ["claude", "--resume" if resume else "--session-id", session_id,
                "--dangerously-skip-permissions", "--add-dir", str(Path.home())]
-    model = os.environ.get("SUTANDO_CORE_MODEL", "").strip()
     settings = os.environ.get("SUTANDO_ISOLATED_CLAUDE_SETTINGS", "").strip()
     if model:
         command += ["--model", model]
     if settings:
         command += ["--settings", settings]
     return command
+
+
+def _codex_sessions_root() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "sessions"
+
+
+def _discover_codex_session(since: float, expect_cwd: Path) -> Optional[str]:
+    """The codex TUI names its own session: a rollout-<ts>-<uuid>.jsonl appears
+    under the sessions tree at the FIRST turn, its meta line carrying the cwd."""
+    candidates = []
+    root = _codex_sessions_root()
+    if not root.is_dir():
+        return None
+    for path in root.rglob("rollout-*.jsonl"):
+        try:
+            if path.stat().st_mtime < since:
+                continue
+        except OSError:
+            continue
+        matched = re.search(r"rollout-.*-([0-9a-f-]{36})\.jsonl$", path.name, re.IGNORECASE)
+        if not matched or not SESSION_ID.fullmatch(matched.group(1)):
+            continue
+        try:
+            with path.open(encoding="utf-8") as handle:
+                meta = json.loads(handle.readline() or "{}")
+        except (OSError, ValueError):
+            continue
+        # cwd filter: other codex runs (e.g. exec) also write rollouts; only a
+        # session started in OUR working dir can be this room's pane.
+        cwd = str((meta.get("payload") or {}).get("cwd") or meta.get("cwd") or "")
+        # Resolve BOTH sides: macOS reports /var/... and /private/var/... for the
+        # same directory depending on who recorded it.
+        if cwd and Path(cwd).resolve() != expect_cwd.resolve():
+            continue
+        candidates.append((path.stat().st_mtime, matched.group(1)))
+    if not candidates:
+        return None
+    return max(candidates)[1]
 
 
 def _startup_failure(workspace: Path, name: str, reason: str) -> RuntimeError:
@@ -389,6 +347,10 @@ def _startup_failure(workspace: Path, name: str, reason: str) -> RuntimeError:
                         + (f"; last pane output:\n{tail}" if tail else ""))
 
 
+def _spawn_marker(workspace: Path, name: str) -> Path:
+    return _spool_dir(workspace) / f"{name}.spawned"
+
+
 def _ensure_standing_session(workspace: Path, runtime: str, room_key: str, repo: Path) -> str:
     """Ensure the room's standing provider pane exists and proved itself with
     output; a respawn after crash/reboot resumes the recorded provider session id."""
@@ -397,21 +359,34 @@ def _ensure_standing_session(workspace: Path, runtime: str, room_key: str, repo:
         return name
     session_id, created = _session_id(workspace, runtime, room_key)
     done = _tmux(workspace, "new-session", "-d", "-s", name, "-c", str(_working_dir(repo)),
-                 *_standing_launch_command(session_id, resume=not created))
+                 *_standing_launch_command(runtime, session_id, resume=not created))
     if done.returncode != 0:
         raise RuntimeError(f"tmux new-session failed: {done.stderr.strip()}")
     # Keep a dying startup pane around for post-mortem capture (turned off again
     # once startup is confirmed, so a later natural exit still cleans up).
     _tmux(workspace, "set-option", "-w", "-t", f"={name}:", "remain-on-exit", "on")
+    trust_answered = False
     deadline = time.monotonic() + _timeout("SUTANDO_ROOM_SPAWN_WAIT", None)
     while time.monotonic() < deadline:
         if _pane_dead(workspace, name) or _pane_alive(workspace, name) is False:
             raise _startup_failure(workspace, name, "exited")
-        if _pane_content(workspace, name).strip():
+        content = _pane_content(workspace, name)
+        if not trust_answered and "Do you trust the contents of this directory" in content:
+            # Codex's first-use-in-a-directory dialog; Enter selects "Yes,
+            # continue" (verified live on 0.149.0). Answered at most once.
+            _tmux(workspace, "send-keys", "-t", f"={name}:", "Enter")
+            trust_answered = True
+            time.sleep(0.5)
+            continue
+        if content.strip():
             # Record only after the pane proves itself: an earlier record poisons
             # every later --resume with a session that may never have existed.
-            if created:
+            if created and runtime == "claude":
                 _record_session(workspace, runtime, room_key, session_id)
+            if created and runtime == "codex":
+                # Codex's self-chosen id is discovered by the monitor from the
+                # rollout file the FIRST TURN creates; the marker bounds the scan.
+                _atomic_text(_spawn_marker(workspace, name), f"{time.time():.3f}\n")
             _tmux(workspace, "set-option", "-w", "-t", f"={name}:", "remain-on-exit", "off")
             return name
         time.sleep(0.1)
@@ -468,6 +443,9 @@ def _inject(workspace: Path, name: str, line: str) -> None:
         done = _tmux(workspace, "send-keys", "-t", f"={name}:", *keys)
         if done.returncode != 0:
             raise RuntimeError(f"tmux send-keys failed: {done.stderr.strip()}")
+        # Paste-guard: an Enter arriving in the same burst as the text is folded
+        # into the composer, not submitted (verified live on the codex TUI).
+        time.sleep(0.5)
 
 
 def _fail(task_file: Path, result: Path, reason: str) -> None:
@@ -494,6 +472,7 @@ def monitor(
     workspace: Path,
     task_file: Path,
     results_dir: Path,
+    repo: Path = REPO_ROOT,
     hard_timeout: Optional[float] = None,
     stall_timeout: Optional[float] = None,
 ) -> None:
@@ -516,7 +495,19 @@ def monitor(
     fingerprint = ""
     result = results_dir / task_file.name
     out = _out_path(workspace, task_file.stem)
+    marker = _spawn_marker(workspace, name)
     while True:
+        if marker.is_file():
+            # Codex-create: the first turn just named its own session; persist it
+            # so the NEXT respawn can resume, then retire the marker.
+            try:
+                since = float(marker.read_text().strip())
+            except (OSError, ValueError):
+                since = started
+            discovered = _discover_codex_session(since, _working_dir(repo))
+            if discovered is not None:
+                _record_session(workspace, runtime, room_key, discovered)
+                marker.unlink(missing_ok=True)
         if read_ready_result(result) is not None:
             return
         body = _stable_output(out)
@@ -595,70 +586,6 @@ def _spawn_monitor(
         )
 
 
-def _codex_command(session_id: Optional[str], prompt: str, output_file: Path, repo: Path) -> list[str]:
-    model = os.environ.get("SUTANDO_CORE_MODEL", "").strip()
-    if session_id:
-        command = [
-            "codex", "--search", "exec", "resume", "--json", "-o", str(output_file),
-            "--dangerously-bypass-approvals-and-sandbox",
-        ]
-    else:
-        command = [
-            "codex", "--search", "exec", "--json", "-o", str(output_file),
-            "-C", str(_working_dir(repo)), "--add-dir", str(Path.home()),
-            "--dangerously-bypass-approvals-and-sandbox",
-        ]
-    if model:
-        command += ["-m", model]
-    return command + ([session_id, prompt] if session_id else [prompt])
-
-
-def _run_codex(
-    workspace: Path,
-    room_key: str,
-    prompt: str,
-    repo: Path,
-    hard_timeout: Optional[float] = None,
-    stall_timeout: Optional[float] = None,
-) -> str:
-    state = _read_json(_state_path(workspace))
-    row = ((state.get("sessions") or {}).get("codex") or {}).get(room_key)
-    session_id = str(row.get("session_id") or "") if isinstance(row, dict) else ""
-    if session_id and not SESSION_ID.fullmatch(session_id):
-        session_id = ""
-    (workspace / "state").mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=".room-result.", suffix=".txt", dir=workspace / "state")
-    os.close(fd)
-    output_file = Path(name)
-    try:
-        return_code, stdout, stderr = _run_bounded(
-            _codex_command(session_id or None, prompt, output_file, repo),
-            _working_dir(repo),
-            hard_timeout,
-            stall_timeout,
-        )
-        if return_code:
-            raise RuntimeError(stderr.strip() or f"codex exited {return_code}")
-        discovered = ""
-        if not session_id:
-            for line in stdout.splitlines():
-                try:
-                    event = json.loads(line)
-                except (TypeError, ValueError):
-                    continue
-                if event.get("type") == "thread.started":
-                    candidate = str(event.get("thread_id") or "")
-                    if SESSION_ID.fullmatch(candidate):
-                        discovered = candidate
-        if not session_id and not discovered:
-            raise RuntimeError("codex did not report a valid thread.started session id")
-        if discovered:
-            _record_session(workspace, "codex", room_key, discovered)
-        return output_file.read_text(encoding="utf-8")
-    finally:
-        output_file.unlink(missing_ok=True)
-
-
 def probe(runtime: str, workspace: Path, task_file: Path) -> int:
     if runtime not in {"claude", "codex"}:
         return UNHANDLED
@@ -670,34 +597,6 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
     if task_file.parent != tasks_dir or task_file.suffix != ".txt":
         return UNHANDLED
     return 0 if resolve_room_key(task_file) else UNHANDLED
-
-
-def _handle_inline_codex(
-    workspace: Path,
-    room_key: str,
-    task_file: Path,
-    results_dir: Path,
-    repo: Path,
-    hard_timeout: Optional[float],
-    stall_timeout: Optional[float],
-) -> int:
-    """Per-message fallback executor (codex): the pre-standing-session design,
-    kept until interactive codex resume-id discovery is verified live."""
-    lock = workspace / "state" / "ag2space-room-session-locks" / f"codex-{room_key}.lock"
-    try:
-        with _locked(lock):
-            if _completed_result_exists(results_dir, task_file.name):
-                return 0
-            body = _run_codex(workspace, room_key, _prompt(task_file), repo,
-                              hard_timeout, stall_timeout)
-            if not body.strip():
-                raise RuntimeError("codex returned an empty result")
-            if not _publish_once(results_dir / task_file.name, body):
-                raise RuntimeError("result destination exists but is not ready")
-        return 0
-    except Exception as exc:
-        print(f"AG2 Space room-session worker: {exc}", file=sys.stderr)
-        return 1
 
 
 def handle(
@@ -716,9 +615,6 @@ def handle(
     assert room_key is not None
     if _completed_result_exists(results_dir, task_file.name):
         return 0
-    if runtime != "claude":
-        return _handle_inline_codex(workspace, room_key, task_file, results_dir, repo,
-                                    hard_timeout, stall_timeout)
     lock = workspace / "state" / "ag2space-room-session-locks" / f"{runtime}-{room_key}.lock"
     try:
         # The lock guards only spawn+inject ordering (seconds), never a whole
@@ -754,7 +650,7 @@ def main() -> int:
         return probe(args.runtime, args.workspace, args.task_file)
     if args.monitor:
         monitor(args.runtime, args.workspace, args.task_file, args.results_dir,
-                args.hard_timeout, args.stall_timeout)
+                args.repo, args.hard_timeout, args.stall_timeout)
         return 0
     return handle(
         args.runtime,

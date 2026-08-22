@@ -13,7 +13,7 @@ key and gives that room one durable provider conversation.
 Missing, malformed, or future scope values, non-AG2 sources, and Team or Guest
 tasks remain unhandled and follow their established paths.
 
-## Standing-session execution (Claude runtime)
+## Standing-session execution (both runtimes)
 
 Each opted-in room runs a **standing session**: a long-lived interactive
 `claude` process in a dedicated tmux pane (skill-owned socket, one pane per
@@ -75,12 +75,24 @@ Explicit non-goal: a runaway turn that keeps producing output forever is only
 bounded by the room noticing its heartbeats — kill it manually with
 `tmux -S <socket> kill-session -t <pane>` if needed.
 
-## Codex runtime — per-message fallback
+## Codex specifics (live-verified on codex-cli 0.149.0)
 
-Codex tasks keep the previous per-message `codex exec` / `exec resume` path
-unchanged (turn-length lock, watcher fallback on failure). Interactive codex
-resume-id discovery inside a pane is unverified; moving codex onto the standing
-path is follow-up work, not silently claimed here.
+Codex runs the same pane flow with three runtime differences:
+
+- **It names its own session.** Create-mode launches bare `codex`; the id is
+  discovered from the rollout file the FIRST TURN creates
+  (`$CODEX_HOME/sessions/**/rollout-<ts>-<uuid>.jsonl`, filtered to files newer
+  than the spawn marker whose meta `cwd` matches our working dir — other codex
+  runs, e.g. `exec`, also write rollouts). The monitor records the discovered
+  id; the next respawn uses `codex resume <id>`.
+- **First use in a directory shows a trust dialog** — the spawn readiness loop
+  detects and answers it (Enter = "Yes, continue") at most once.
+- **Injection needs the paste-guard delay** (applies to both runtimes): an
+  Enter arriving in the same burst as the text is folded into the composer,
+  not submitted. `_inject` pauses between text and Enter for this reason.
+
+Mid-turn queueing is native: codex explicitly shows "Messages to be submitted
+after next tool call" for a message injected during a running turn.
 
 ## State and configuration
 

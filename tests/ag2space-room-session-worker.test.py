@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
 import os
 import shutil
@@ -14,9 +13,8 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import redirect_stderr
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -73,15 +71,6 @@ def task(
         encoding="utf-8",
     )
     return path
-
-
-def run_worker(runtime: str, workspace: Path, task_file: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
-    stderr = io.StringIO()
-    with patch.dict(os.environ, env), redirect_stderr(stderr):
-        return_code = worker.handle(
-            runtime, workspace, task_file, workspace / "results", REPO
-        )
-    return subprocess.CompletedProcess([], return_code, "", stderr.getvalue())
 
 
 def test_opt_in_and_cardinality() -> None:
@@ -354,12 +343,10 @@ def test_claude_handle_dispatch_without_tmux() -> None:
         with patch.object(worker, "_ensure_standing_session", return_value="pane") as ensure, \
              patch.object(worker, "_inject") as inject, \
              patch.object(worker, "_spawn_monitor") as monitor, \
-             patch.object(worker, "_notify") as notify, \
-             patch.object(worker, "_run_codex") as codex:
+             patch.object(worker, "_notify") as notify:
             code = worker.handle("claude", workspace, started, results, REPO)
         check(code == 0 and ensure.called and inject.called and monitor.called,
               "claude handle ensures the pane, injects, and detaches the monitor")
-        check(not codex.called, "claude handle never runs a per-message provider")
         check("standing session" in notify.call_args.args[1],
               "claude handle acks the room after a successful injection")
         spool = worker._spool_dir(workspace) / f"{started.stem}.prompt.txt"
@@ -402,194 +389,47 @@ def test_startup_failure_never_poisons_the_session_id() -> None:
         check(created, "a failed startup never records the session id (no poisoned resume)")
 
 
-def test_codex_create_resume_and_result_ownership() -> None:
-    with tempfile.TemporaryDirectory() as name:
-        root = Path(name)
-        workspace = root / "workspace"
-        (workspace / "results").mkdir(parents=True)
-        log = root / "codex.jsonl"
-        thread_id = str(uuid.uuid4())
-        executable(root / "codex", f"""#!/usr/bin/env python3
-import json, os, pathlib, sys
-args = sys.argv[1:]
-with pathlib.Path(os.environ['ARG_LOG']).open('a') as out:
-    out.write(json.dumps(args) + '\\n')
-pathlib.Path(args[args.index('-o') + 1]).write_text('codex room result\\n')
-if 'resume' not in args:
-    print(json.dumps({{'type': 'thread.started', 'thread_id': '{thread_id}'}}))
-""")
-        env = {"PATH": f"{root}:{os.environ['PATH']}", "ARG_LOG": str(log)}
-        first = task(workspace, "task-codex-one")
-        second = task(workspace, "task-codex-two")
-        check(run_worker("codex", workspace, first, env).returncode == 0, "Codex creates room thread")
-        check(run_worker("codex", workspace, second, env).returncode == 0, "Codex resumes room thread")
-        args = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-        check("resume" not in args[0] and "resume" in args[1], "Codex uses exec then exec resume")
-        check(thread_id in args[1], "Codex resumes the reported thread id")
-        state = json.loads(worker._state_path(workspace).read_text(encoding="utf-8"))
-        room_key = worker.resolve_room_key(first)
-        assert room_key
-        check(state["sessions"]["codex"][room_key]["session_id"] == thread_id,
-              "Codex reported thread id is persisted")
-
-        existing = task(workspace, "task-existing", room_id="!existing:a")
-        (workspace / "results" / existing.name).write_text("consumer wins\n")
-        before = len(log.read_text().splitlines())
-        check(run_worker("codex", workspace, existing, env).returncode == 0,
-              "existing consumer result settles task")
-        check(len(log.read_text().splitlines()) == before, "settled task never launches provider")
-        check((workspace / "results" / existing.name).read_text() == "consumer wins\n",
-              "publish-once contract never clobbers consumer")
-
-        whitespace = task(workspace, "task-whitespace", room_id="!whitespace:a")
-        (workspace / "results" / whitespace.name).write_text("  \n")
-        before = len(log.read_text().splitlines())
-        result = run_worker("codex", workspace, whitespace, env)
-        check(result.returncode == 1 and len(log.read_text().splitlines()) == before + 1,
-              "whitespace live result invokes provider then falls back without clobbering")
-
-        archived = task(workspace, "task-archived", room_id="!archived:a")
-        archive = workspace / "results" / "archive"
-        archive.mkdir()
-        (archive / f"{archived.stem}-123.txt").write_text("already sent\n")
-        before = len(log.read_text().splitlines())
-        check(run_worker("codex", workspace, archived, env).returncode == 0,
-              "gateway-archived result settles task")
-        check(len(log.read_text().splitlines()) == before, "archived task is never replayed")
-
-        retained = task(workspace, "task-retained", room_id="!retained:a")
-        retention = workspace / "results" / "archive-2026-08-21"
-        retention.mkdir()
-        (retention / retained.name).write_text("already sent\n")
-        check(run_worker("codex", workspace, retained, env).returncode == 0,
-              "retention archive also prevents replay")
-
-        archived_blank = task(workspace, "task-archived-blank", room_id="!archived-blank:a")
-        (archive / archived_blank.name).write_text("\n")
-        before = len(log.read_text().splitlines())
-        check(run_worker("codex", workspace, archived_blank, env).returncode == 0,
-              "whitespace archived result is not treated as completion")
-        check(len(log.read_text().splitlines()) == before + 1,
-              "whitespace archive invokes the provider path")
-
-
-def test_codex_event_and_state_edges() -> None:
-    with tempfile.TemporaryDirectory() as name:
-        root = Path(name)
-        workspace = root / "workspace"
-        (workspace / "results").mkdir(parents=True)
-        valid_id = str(uuid.uuid4())
-        executable(root / "codex", f"""#!/usr/bin/env python3
-import json, os, pathlib, sys
-args = sys.argv[1:]
-pathlib.Path(args[args.index('-o') + 1]).write_text('edge result\\n')
-mode = os.environ.get('MODE')
-if mode == 'fail':
-    print('codex failed', file=sys.stderr)
-    raise SystemExit(8)
-if mode == 'events':
-    print('not-json')
-    print(json.dumps({{'type': 'thread.started', 'thread_id': 'bad'}}))
-    print(json.dumps({{'type': 'other', 'thread_id': '{valid_id}'}}))
-    print(json.dumps({{'type': 'thread.started', 'thread_id': '{valid_id}'}}))
-""")
-        env = {"PATH": f"{root}:{os.environ['PATH']}"}
-        edge = task(workspace, "task-events")
-        room_key = worker.resolve_room_key(edge)
-        assert room_key
-        worker._atomic_text(
-            worker._state_path(workspace),
-            json.dumps({"schema_version": 1, "sessions": {"codex": {
-                room_key: {"session_id": "corrupt"}
-            }}}),
-        )
-        check(run_worker("codex", workspace, edge, {**env, "MODE": "events"}).returncode == 0,
-              "Codex ignores malformed events and replaces corrupt state")
-
-        no_id = task(workspace, "task-no-id", room_id="!no-id:a")
-        result = run_worker("codex", workspace, no_id, env)
-        check(result.returncode == 1 and "valid thread.started" in result.stderr,
-              "Codex requires a valid new thread id")
-
-        failed = task(workspace, "task-codex-failure", room_id="!codex-failure:a")
-        result = run_worker("codex", workspace, failed, {**env, "MODE": "fail"})
-        check(result.returncode == 1 and "codex failed" in result.stderr,
-              "Codex provider failure returns watcher fallback signal")
-
-
 def test_runtime_edges_and_adapter_wiring() -> None:
-    with tempfile.TemporaryDirectory() as name:
-        root = Path(name)
-        sleeper = executable(root / "sleepy", "#!/bin/sh\nsleep 2\n")
-        with patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "0.1", "SUTANDO_TIER_STALL_TIMEOUT": "0.05"}):
-            started = time.monotonic()
-            try:
-                worker._run_bounded([str(sleeper)], root)
-            except TimeoutError:
-                check(time.monotonic() - started < 1, "stalled provider is terminated within bound")
-            else:
-                check(False, "stalled provider is terminated within bound")
+    with patch.dict(os.environ, {}, clear=True):
+        check(worker._timeout("SUTANDO_TIER_HARD_TIMEOUT", None) == 3600,
+              "manifest declares the hard-timeout safety-ceiling default")
+        check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", None) == 180,
+              "manifest declares the stall-timeout default")
+        check(worker._timeout("SUTANDO_TIER_HEARTBEAT_INTERVAL", None) == 120,
+              "manifest declares the heartbeat-interval default")
+        check(worker._timeout("SUTANDO_ROOM_SPAWN_WAIT", None) == 30,
+              "manifest declares the spawn-wait default")
+    with patch.dict(os.environ, {"SUTANDO_TIER_STALL_TIMEOUT": "12"}):
+        check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", None) == 12,
+              "environment overrides the manifest timeout")
+        check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", 13) == 13,
+              "CLI timeout overrides the environment")
+    try:
         with patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "0"}):
-            try:
-                worker._run_bounded(["true"], root)
-            except ValueError:
-                check(True, "non-positive provider timeout is rejected")
-            else:
-                check(False, "non-positive provider timeout is rejected")
+            worker._timeout("SUTANDO_TIER_HARD_TIMEOUT", None)
+    except ValueError:
+        check(True, "non-positive timeout is rejected")
+    else:
+        check(False, "non-positive timeout is rejected")
 
-        with patch.dict(os.environ, {}, clear=True):
-            check(worker._timeout("SUTANDO_TIER_HARD_TIMEOUT", None) == 3600,
-                  "manifest declares the hard-timeout safety-ceiling default")
-            check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", None) == 180,
-                  "manifest declares the stall-timeout default")
-            check(worker._timeout("SUTANDO_TIER_HEARTBEAT_INTERVAL", None) == 120,
-                  "manifest declares the heartbeat-interval default")
-            check(worker._timeout("SUTANDO_ROOM_SPAWN_WAIT", None) == 30,
-                  "manifest declares the spawn-wait default")
-        with patch.dict(os.environ, {"SUTANDO_TIER_STALL_TIMEOUT": "12"}):
-            check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", None) == 12,
-                  "environment overrides the manifest timeout")
-            check(worker._timeout("SUTANDO_TIER_STALL_TIMEOUT", 13) == 13,
-                  "CLI timeout overrides the environment")
-
-        with patch.dict(os.environ, {"SUTANDO_TIER_HARD_TIMEOUT": "0.05",
-                                     "SUTANDO_TIER_STALL_TIMEOUT": "2"}):
-            for command, message in [
-                ([str(sleeper)], "hard timeout terminates a provider with open streams"),
-                (["sh", "-c", "exec 1>&- 2>&-; sleep 2"],
-                 "hard timeout terminates a provider after streams close"),
-            ]:
-                try:
-                    worker._run_bounded(command, root)
-                except TimeoutError:
-                    check(True, message)
-                else:
-                    check(False, message)
-
-        ended = MagicMock()
-        ended.poll.return_value = 0
-        worker._terminate(ended)
-        check(not ended.wait.called, "termination is a no-op for an exited provider")
-        stubborn = MagicMock(pid=123)
-        stubborn.poll.return_value = None
-        stubborn.wait.side_effect = [subprocess.TimeoutExpired("provider", 2), None]
-        with patch.object(worker.os, "killpg") as killpg:
-            worker._terminate(stubborn)
-        check(killpg.call_count == 2, "termination escalates an unresponsive provider")
-
-        model = "test-model"
-        settings = '{"hooks":{}}'
-        session = str(uuid.uuid4())
-        with patch.dict(os.environ, {"SUTANDO_CORE_MODEL": model,
-                                     "SUTANDO_ISOLATED_CLAUDE_SETTINGS": settings}):
-            create = worker._standing_launch_command(session, resume=False)
-            resume = worker._standing_launch_command(session, resume=True)
-            codex = worker._codex_command(None, "prompt", root / "out", REPO)
-        check("--model" in create and "--settings" in create,
-              "standing launch inherits model and hook settings")
-        check("--session-id" in create and "--resume" in resume,
-              "standing launch distinguishes create from resume")
-        check("-m" in codex, "Codex inherits selected core model")
+    model = "test-model"
+    settings = '{"hooks":{}}'
+    session = str(uuid.uuid4())
+    with patch.dict(os.environ, {"SUTANDO_CORE_MODEL": model,
+                                 "SUTANDO_ISOLATED_CLAUDE_SETTINGS": settings}):
+        create = worker._standing_launch_command("claude", session, resume=False)
+        resume = worker._standing_launch_command("claude", session, resume=True)
+        codex_create = worker._standing_launch_command("codex", session, resume=False)
+        codex_resume = worker._standing_launch_command("codex", session, resume=True)
+    check("--model" in create and "--settings" in create,
+          "claude standing launch inherits model and hook settings")
+    check("--session-id" in create and "--resume" in resume,
+          "claude standing launch distinguishes create from resume")
+    check(codex_create[0] == "codex" and session not in codex_create,
+          "codex create launches with no preassigned session id")
+    check("-m" in codex_create, "codex standing launch inherits selected core model")
+    check(codex_resume[-2:] == ["resume", session],
+          "codex respawn resumes the discovered session id")
 
     relative = "skills/ag2space-room-sessions/scripts/session-worker.py"
     claude_start = (REPO / "src/agent/claude/cli/start-cli.sh").read_text(encoding="utf-8")
@@ -602,7 +442,56 @@ def test_runtime_edges_and_adapter_wiring() -> None:
     check("ag2space-room-sessions" not in watcher, "generic watcher does not name concrete skill")
 
 
-def test_cli_probe_and_empty_output() -> None:
+def test_codex_session_discovery() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        wd = root / "wd"
+        wd.mkdir()
+        sessions = root / "codex-home" / "sessions" / "2026" / "08" / "22"
+        sessions.mkdir(parents=True)
+        marker = time.time() - 60
+        right = str(uuid.uuid4())
+        wrong_cwd = str(uuid.uuid4())
+        stale = str(uuid.uuid4())
+
+        def rollout(session_uuid: str, cwd: Path, mtime: float) -> None:
+            path = sessions / f"rollout-2026-08-22T03-00-00-{session_uuid}.jsonl"
+            path.write_text(json.dumps({"type": "session_meta",
+                                        "payload": {"cwd": str(cwd)}}) + "\n")
+            os.utime(path, (mtime, mtime))
+
+        rollout(stale, wd, marker - 120)
+        rollout(wrong_cwd, root / "elsewhere", marker + 30)
+        rollout(right, wd, marker + 60)
+        (sessions / "rollout-2026-08-22T03-00-00-not-a-uuid.jsonl").write_text("{}\n")
+        with patch.dict(os.environ, {"CODEX_HOME": str(root / "codex-home")}):
+            check(worker._discover_codex_session(marker, wd) == right,
+                  "discovery picks the newest rollout matching our working dir")
+            check(worker._discover_codex_session(marker + 90, wd) is None,
+                  "discovery never matches rollouts older than the spawn marker")
+
+        workspace = root / "workspace"
+        (workspace / "results").mkdir(parents=True)
+        settled = task(workspace, "task-codex-settle")
+        (workspace / "results" / settled.name).write_text("already done\n")
+        room_key = worker.resolve_room_key(settled)
+        assert room_key
+        pane = worker._pane_name("codex", room_key)
+        worker._atomic_text(worker._spawn_marker(workspace, pane), f"{marker:.3f}\n")
+        env = {"CODEX_HOME": str(root / "codex-home"),
+               "SUTANDO_TIER_HARD_TIMEOUT": "5", "SUTANDO_TIER_STALL_TIMEOUT": "1",
+               "SUTANDO_TIER_HEARTBEAT_INTERVAL": "0",
+               "SUTANDO_ISOLATED_WORKING_DIR": str(wd)}
+        with patch.dict(os.environ, env), patch.object(worker, "_notify"):
+            worker.monitor("codex", workspace, settled, workspace / "results", REPO)
+        state = json.loads(worker._state_path(workspace).read_text(encoding="utf-8"))
+        check(state["sessions"]["codex"][room_key]["session_id"] == right,
+              "monitor records the discovered codex session id for future resumes")
+        check(not worker._spawn_marker(workspace, pane).is_file(),
+              "the spawn marker retires once the session id is recorded")
+
+
+def test_cli_probe() -> None:
     with tempfile.TemporaryDirectory() as name:
         root = Path(name)
         workspace = root / "workspace"
@@ -615,16 +504,6 @@ def test_cli_probe_and_empty_output() -> None:
             cwd=REPO, check=False,
         )
         check(probe.returncode == 0, "CLI probe delegates to room policy")
-        thread_id = str(uuid.uuid4())
-        executable(root / "codex", f"""#!/usr/bin/env python3
-import json, pathlib, sys
-args = sys.argv[1:]
-pathlib.Path(args[args.index('-o') + 1]).write_text('   \\n')
-print(json.dumps({{'type': 'thread.started', 'thread_id': '{thread_id}'}}))
-""")
-        result = run_worker("codex", workspace, room_task, {"PATH": f"{root}:{os.environ['PATH']}"})
-        check(result.returncode == 1 and "empty result" in result.stderr,
-              "empty provider output falls back without publishing")
 
 
 def test_direct_failure_and_cli_edges() -> None:
@@ -646,9 +525,9 @@ def test_direct_failure_and_cli_edges() -> None:
 
         raced = task(workspace, "task-raced")
         with patch.object(worker, "_completed_result_exists", side_effect=[False, True]), \
-             patch.object(worker, "_run_codex") as provider:
+             patch.object(worker, "_ensure_standing_session") as spawn:
             code = worker.handle("codex", workspace, raced, results, REPO)
-        check(code == 0 and not provider.called, "locked completion check prevents a duplicate launch")
+        check(code == 0 and not spawn.called, "locked completion check prevents a duplicate launch")
 
         argv = ["session-worker", "--runtime", "codex", "--workspace", str(workspace),
                 "--task-file", str(raced), "--results-dir", str(results), "--repo", str(REPO)]
@@ -668,10 +547,9 @@ def main() -> int:
     test_monitor_watchdog_policies()
     test_claude_handle_dispatch_without_tmux()
     test_startup_failure_never_poisons_the_session_id()
-    test_codex_create_resume_and_result_ownership()
-    test_codex_event_and_state_edges()
+    test_codex_session_discovery()
     test_runtime_edges_and_adapter_wiring()
-    test_cli_probe_and_empty_output()
+    test_cli_probe()
     test_direct_failure_and_cli_edges()
     print(f"\nResults: {len(FAILURES)} failed")
     return 1 if FAILURES else 0
