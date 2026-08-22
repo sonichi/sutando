@@ -282,13 +282,25 @@ check(any("_caller_leg::DesignCClaimBackend" in v for v in mviol12),
 
 # ── kewei r7: module-import ratchet — dynamic getattr needs the module, and
 #    importing a concrete backend MODULE outside its package home fails closed ─
-_BACKEND_MODS = ("delivery_core.backend_a", "delivery_core.backend_c")
+def _path_parts(dotted):
+    return tuple(dotted.split("."))
+
+def _is_backend_mod(dotted):
+    parts = _path_parts(dotted)
+    return ("delivery_core" in parts and
+            (parts[-1] in ("backend_a", "backend_c")))
+
+def _is_facade_mod(dotted):
+    return _path_parts(dotted)[-1] == "delivery_core"
 
 def scan_backend_module_imports(sources: dict) -> list[str]:
+    """Module ratchet: outside delivery_core, importing a concrete backend
+    module OR holding the facade as a module object fails closed — getattr
+    needs a module object, and names must arrive by from-import instead."""
     out = []
     for path, text in sources.items():
         if "/delivery_core/" in path:
-            continue  # the package's own internals compose the seam
+            continue
         try:
             tree = ast.parse(text, filename=path)
         except SyntaxError:
@@ -296,16 +308,22 @@ def scan_backend_module_imports(sources: dict) -> list[str]:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    if any(m in a.name for m in _BACKEND_MODS):
+                    if _is_backend_mod(a.name):
                         out.append(f"{path} imports {a.name}")
+                    elif _is_facade_mod(a.name):
+                        out.append(f"{path} imports facade module {a.name}")
             elif isinstance(node, ast.ImportFrom):
                 mod = node.module or ""
-                if any(m in mod for m in _BACKEND_MODS):
+                if _is_backend_mod(mod):
                     out.append(f"{path} imports from {mod}")
-                elif mod.endswith("delivery_core"):
+                elif _is_facade_mod(mod):
                     for a in node.names:
                         if a.name in ("backend_a", "backend_c"):
                             out.append(f"{path} imports {mod}.{a.name}")
+                elif mod and _path_parts(mod)[-1] == "ag2_sparrow":
+                    for a in node.names:
+                        if a.name == "delivery_core":
+                            out.append(f"{path} imports facade module {mod}.{a.name}")
     return sorted(out)
 
 mod_viol = scan_backend_module_imports(prod_sources)
@@ -329,6 +347,29 @@ mutated14[_db] = prod_sources[_db] + (
 mv14 = scan_backend_module_imports(mutated14)
 check(any(_db in v for v in mv14),
       "from-package submodule import FAILS the module-import ratchet")
+# kewei r8: the same getattr through the PUBLIC FACADE module object —
+# caught at the facade import line; names must arrive by from-import.
+mutated15 = dict(prod_sources)
+mutated15[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core as dcf\n"
+    "def _facade_dynamic_leg():\n"
+    "    Backend = getattr(dcf, 'DesignC' + 'ClaimBackend')\n"
+    "    return Backend('improvised')\n")
+mv15 = scan_backend_module_imports(mutated15)
+check(any(_db in v and "facade module" in v for v in mv15),
+      "facade-getattr mutation FAILS the ratchet at its module-object import")
+mutated16 = dict(prod_sources)
+mutated16[_db] = prod_sources[_db] + (
+    "\n\nfrom ag2_sparrow import delivery_core as dcf2\n")
+mv16 = scan_backend_module_imports(mutated16)
+check(any(_db in v and "facade module" in v for v in mv16),
+      "from-package facade module import FAILS the ratchet")
+# path-component equality: a future sibling like backend_adapter is NOT a hit
+mutated17 = dict(prod_sources)
+mutated17[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core_backend_adapter_x as bax  # noqa\n")
+mv17 = [v for v in scan_backend_module_imports(mutated17) if "backend_adapter" in v]
+check(not mv17, "sibling-name module is NOT a false positive (path components)")
 
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
