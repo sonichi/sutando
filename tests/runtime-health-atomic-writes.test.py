@@ -101,6 +101,32 @@ class AtomicSharedStateWrites(unittest.TestCase):
         self.assertEqual(list(d.iterdir()), [],
                          f"staging file left behind: {[x.name for x in d.iterdir()]}")
 
+    def test_a_failing_cleanup_does_not_mask_the_original_error(self):
+        """If unlink ALSO fails, the caller must still see the write's error --
+        not the cleanup's. Swallowing the unlink is only correct because the
+        original exception is re-raised; a bare `raise` inside the inner except
+        would surface the wrong one."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        dest = d / "core-verdict.json"
+        real_replace, real_unlink = os.replace, os.unlink
+
+        def boom_replace(src, dst):
+            raise OSError("ORIGINAL: replace failed")
+
+        def boom_unlink(p):
+            raise OSError("CLEANUP: unlink failed")
+
+        os.replace, os.unlink = boom_replace, boom_unlink
+        try:
+            with self.assertRaises(OSError) as ctx:
+                rh._write_json_atomic(str(dest), {"health": "ok"})
+        finally:
+            os.replace, os.unlink = real_replace, real_unlink
+
+        self.assertIn("ORIGINAL", str(ctx.exception),
+                      f"cleanup error masked the write error: {ctx.exception}")
+        self.assertNotIn("CLEANUP", str(ctx.exception))
+
     def test_control_the_truncating_shape_really_does_expose_an_empty_file(self):
         """Without this, the assertions above could pass for the wrong reason."""
         d = pathlib.Path(tempfile.mkdtemp())
