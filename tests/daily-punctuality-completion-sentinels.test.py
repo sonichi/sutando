@@ -115,11 +115,18 @@ mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
 check("unparseable body falls back to mtime",
       mins and mins[-1][1] == 23 * 60 + 30, f"got {mins[-1] if mins else None}")
 
-# ── a name that merely prefixes another must not be collected ────────────────
+# ── names that are not this job's dated sentinel must not be collected ───────
+# Two distinct exclusions: `-extra-` never matches the glob, while a trailing
+# suffix does and is refused by the regex anchor — only the second reaches it.
 (ws / "state" / f"morning-briefing-extra-{d}.sentinel").write_text(f"{d}T05:00:00")
 mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
-check("prefix collision is excluded by the anchored date pattern",
+check("a differently-prefixed job is excluded",
       all(m[1] != 5 * 60 for m in mins), f"got {mins}")
+
+(ws / "state" / f"morning-briefing-{d}-old.sentinel").write_text(f"{d}T04:00:00")
+mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
+check("a trailing suffix is refused by the anchored date pattern",
+      all(m[1] != 4 * 60 for m in mins), f"got {mins}")
 
 # ── absent state/ dir is empty, not an exception ─────────────────────────────
 check("missing state dir returns empty",

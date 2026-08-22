@@ -5699,7 +5699,7 @@ def _daily_completion_minutes(state: Path, job: str, limit: int = 7) -> list:
         if when is None:
             try:
                 when = datetime.fromtimestamp(f.stat().st_mtime)
-            except OSError:
+            except OSError:  # pragma: no cover - file vanished between glob and stat
                 continue
         out.append((m.group(1), when.hour * 60 + when.minute))
     out.sort()
