@@ -2868,6 +2868,21 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+def _resolve_expected_branch(repo) -> str:
+    """One resolver for the expected-branch contract: env override, then
+    ``core.expected_branch`` in config, then ``main``. Shared by the
+    live-checkout probe and the canonical-checkout guard so a pinned host
+    cannot pass one and fail the other."""
+    expected = os.environ.get("SUTANDO_EXPECTED_BRANCH")
+    if not expected:
+        try:
+            from sutando_config import load_config  # noqa: PLC0415
+            expected = (load_config(repo_root=Path(repo)).get("core") or {}).get("expected_branch")
+        except Exception:
+            expected = None  # config unreadable — fall through to the default
+    return expected or "main"
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -2893,14 +2908,7 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """
     name = "live-checkout-branch"
     repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
-    expected = os.environ.get("SUTANDO_EXPECTED_BRANCH")
-    if not expected:
-        try:
-            from sutando_config import load_config  # noqa: PLC0415
-            expected = (load_config(repo_root=repo).get("core") or {}).get("expected_branch")
-        except Exception:
-            expected = None  # config unreadable — fall through to the default
-    expected = expected or "main"
+    expected = _resolve_expected_branch(repo)
     # Resolve the git binary ONCE for both subprocesses in this probe.
     #
     # This used to be `git_bin = "git"` with a comment promising that #2469's
@@ -3332,9 +3340,17 @@ def fix_screen_capture() -> str:
 # "the branch is wrong" — the two justify different actions.
 CHECKOUT_UNREADABLE = "git state unreadable"
 
+# A shipped install with no .git at all (desktop bundle, CI tarball). Distinct
+# from CHECKOUT_UNREADABLE: there git EXISTS to probe and the probe failed.
+CHECKOUT_NONGIT = "non-git install"
+
 
 def _checkout_is_canonical(repo_dir) -> tuple:
     """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?"""
+    # .git presence is the bundle discriminator — checked BEFORE any git call,
+    # so a probe failure can never masquerade as a bundle (or vice versa).
+    if not (Path(repo_dir) / ".git").exists():
+        return (False, f"{CHECKOUT_NONGIT} (no .git in {repo_dir})")
     try:
         # Route through git_argv, never a bare "git": a bare-string PATH lookup resolves to
         # the /usr/bin/git SHIM on a macOS host without the Xcode command line tools, which
@@ -3355,11 +3371,14 @@ def _checkout_is_canonical(repo_dir) -> tuple:
         return (False, f"{CHECKOUT_UNREADABLE} (git exit {rc})")
     branch = branch_proc.stdout.strip()
     dirty = dirty_proc.stdout.strip()
-    if branch != "main":
-        return (False, f"checkout on '{branch or 'detached HEAD'}', not main")
+    # Pinned hosts declare core.expected_branch; hardcoding "main" here would
+    # permanently refuse stale recovery on every intentionally pinned node.
+    expected = _resolve_expected_branch(repo_dir)
+    if branch != expected:
+        return (False, f"checkout on '{branch or 'detached HEAD'}', not {expected}")
     if dirty:
         return (False, "checkout has uncommitted changes")
-    return (True, "clean + on main")
+    return (True, f"clean + on {expected}")
 
 
 # Printed when an owner alert could not be delivered
@@ -3508,17 +3527,18 @@ def stale_restart_allowed(repo_dir, *, guard=None) -> "tuple[bool, str]":
     feature branch it silently ships unreviewed code (2026-07-29: four days of
     bridge restarts booted a branch 75 commits behind main).
 
-    Refuses only on a DETERMINED non-canonical checkout. An unreadable git
-    state is undetermined, and blocking recovery on that is the same
-    unmeasured-premise error this guard exists to prevent.
+    Allows a canonical checkout and a NONGIT install (a shipped bundle has no
+    branch to be wrong on, and the pre-guard stale path always restarted it).
+    Everything else refuses — including CHECKOUT_UNREADABLE: there .git exists,
+    so the checkout MAY be a feature branch, and a transient git failure must
+    not re-authorize exactly the restart this guard exists to prevent. The
+    refused bridge keeps running; the next pass retries with readable state.
     """
     guard = guard or _checkout_is_canonical
     ok, why = guard(repo_dir)
     if ok:
         return (True, "")
-    if str(why).startswith(CHECKOUT_UNREADABLE):
-        # Undetermined is not "wrong branch". Refusing here would block a
-        # legitimate recovery on a premise nothing established.
+    if str(why).startswith(CHECKOUT_NONGIT):
         return (True, why)
     return (False, why)
 

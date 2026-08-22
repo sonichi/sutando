@@ -44,13 +44,20 @@ def main() -> int:
     check(ok2 is True, "canonical checkout still permits the stale restart")
     check(why2 == "", "no reason is reported when the restart is permitted")
 
-    # Undetermined is not "wrong branch": refusing on an unreadable git state
-    # would block recovery on a premise nothing established.
+    # A git PROBE FAILURE refuses: .git exists, so the checkout may be a
+    # feature branch — a transient failure must not re-authorize the restart.
     ok_u, why_u = hc.stale_restart_allowed(
         REPO, guard=lambda _d: (False, f"{hc.CHECKOUT_UNREADABLE} (git exit 128)"))
-    check(ok_u is True, "an UNREADABLE git state permits the restart (undetermined != wrong)")
+    check(ok_u is False, "an UNREADABLE git state refuses (probe failure != bundle)")
     check(hc.CHECKOUT_UNREADABLE in why_u,
-          "and it still reports why the checkout could not be determined")
+          "and it reports why the checkout could not be determined")
+
+    # A NONGIT install (shipped bundle — no .git at all) keeps recovery: it has
+    # no branch to be wrong on, and the pre-guard stale path always restarted it.
+    ok_b, why_b = hc.stale_restart_allowed(
+        REPO, guard=lambda _d: (False, f"{hc.CHECKOUT_NONGIT} (no .git in /x)"))
+    check(ok_b is True, "a NONGIT install (bundle) still permits the stale restart")
+    check(hc.CHECKOUT_NONGIT in why_b, "and the bundle reason is carried")
 
     # ...but a DETERMINED wrong branch must still refuse, or the guard is inert.
     ok_d, _ = hc.stale_restart_allowed(
@@ -67,6 +74,52 @@ def main() -> int:
     hc.stale_restart_allowed(REPO, guard=lambda d: (sentinel.append(d), (True, ""))[1])
     check(sentinel == [REPO],
           "the guard is called with the repo dir it was handed, not a hardcoded path")
+
+    # REAL guard against REAL checkouts — the branch comparison must honor
+    # core.expected_branch, or pinned hosts never auto-apply stale updates.
+    import os
+    import subprocess
+    import tempfile
+    env_no_override = {k: v for k, v in os.environ.items() if k != "SUTANDO_EXPECTED_BRANCH"}
+    with tempfile.TemporaryDirectory() as td:
+        pinned = Path(td) / "pinned"
+        pinned.mkdir()
+        # gitignored per-clone in the real repo too — an ignored config file
+        # must not read as "uncommitted changes" and mask the branch verdict.
+        (pinned / ".gitignore").write_text("sutando.config.local.json\n")
+        for argv in (["git", "init", "-q"], ["git", "checkout", "-q", "-b", "pinned-branch"],
+                     ["git", "add", ".gitignore"],
+                     ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                      "commit", "-q", "--allow-empty", "-m", "seed"]):
+            subprocess.run(argv, cwd=pinned, check=True, capture_output=True)
+        from unittest import mock
+        with mock.patch.dict(os.environ, env_no_override, clear=True):
+            ok_wrong, why_wrong = hc._checkout_is_canonical(pinned)
+            check(ok_wrong is False and "not main" in why_wrong,
+                  "unconfigured: a pinned-branch checkout is non-canonical vs main")
+            (pinned / "sutando.config.local.json").write_text(
+                '{"core": {"expected_branch": "pinned-branch"}}')
+            # load_config memoizes per (process, repo_root); without a reset the
+            # second read returns the pre-config cache and the pin is invisible.
+            sc = sys.modules.get("sutando_config")
+            if sc is None:
+                sys.path.insert(0, str(REPO / "src"))
+                import sutando_config as sc
+            sc._CACHE = None
+            ok_pin, why_pin = hc._checkout_is_canonical(pinned)
+            check(ok_pin is True,
+                  f"core.expected_branch=pinned-branch makes the same checkout canonical ({why_pin})")
+            allowed_pin, _ = hc.stale_restart_allowed(pinned)
+            check(allowed_pin is True,
+                  "and the stale path permits the restart on the configured pin")
+        nongit = Path(td) / "bundle"
+        nongit.mkdir()
+        (nongit / "src").mkdir()
+        ok_ng, why_ng = hc._checkout_is_canonical(nongit)
+        check(ok_ng is False and why_ng.startswith(hc.CHECKOUT_NONGIT),
+              f"a dir with no .git reports {hc.CHECKOUT_NONGIT!r}, not unreadable ({why_ng})")
+        allowed_ng, _ = hc.stale_restart_allowed(nongit)
+        check(allowed_ng is True, "and the stale path permits bundle recovery")
 
     print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
     return 1 if failures else 0
