@@ -5221,11 +5221,16 @@ def _proactive_fence():
             from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
             # A switch must not hide Design A state: items/attempt history in
             # .items would read as vanished under C and resurrect on rollback.
-            legacy = [q for q in (root / ".items").glob("*") if q.is_file()] \
-                if (root / ".items").is_dir() else []
-            if legacy:
-                print(f"  [proactive] claim_backend=c refused: {len(legacy)} "
-                      f"unmigrated Design A item(s) in {root / '.items'} — "
+            items = root / ".items"
+            if items.is_dir():
+                entries = list(items.iterdir())  # ANY entry blocks, whatever its type
+            else:
+                # A FILE (or other non-dir) at .items is unrecognized A-side
+                # state, not proof of absence — same refusal, fail closed.
+                entries = [items] if items.exists() else []
+            if entries:
+                print(f"  [proactive] claim_backend=c refused: {len(entries)} "
+                      f"unmigrated Design A entr(y/ies) at {items} — "
                       "complete the A->C migration first; running on Design A",
                       flush=True)
             else:

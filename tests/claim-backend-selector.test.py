@@ -128,7 +128,7 @@ _spec.loader.exec_module(db)
 
 
 def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
-                legacy_items=0):
+                legacy_items=0, legacy_shape=None):
     """Build the fence the way the bridge does, and report what it chose."""
     saved_env = os.environ.get("SUTANDO_CLAIM_BACKEND")
     saved_results, saved_fence = db.RESULTS_DIR, db._PROACTIVE_FENCE
@@ -146,6 +146,13 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
             (r / _o.LOCKS_DIR).mkdir(parents=True)
             _o._fence_path(r).write_text("[]")
             _o._STRIPE_MODE.pop(_o._root_key(r), None)
+        if legacy_shape == "file":
+            r = Path(td) / ".outbox-discord-proactive"
+            r.mkdir(parents=True, exist_ok=True)
+            (r / ".items").write_text("not a dir")
+        elif legacy_shape == "subdir":
+            d = Path(td) / ".outbox-discord-proactive" / ".items" / "nested"
+            d.mkdir(parents=True)
         if legacy_items:
             d = Path(td) / ".outbox-discord-proactive" / ".items"
             d.mkdir(parents=True)
@@ -185,9 +192,18 @@ check(kind == "DesignCClaimBackend",
 kind, out = _fence_with("c", activate=True, legacy_items=4)
 check(kind == "DesignAClaimBackend",
       f"unmigrated A items -> selector stays on Design A (got {kind})")
-check("unmigrated Design A item" in out and "4" in out,
+check("unmigrated Design A" in out and "4" in out,
       "and the refusal names the count and the migration prerequisite")
 check("migration" in out, "and points at the migration as the fix")
+
+# Unexpected .items SHAPES also refuse (fail closed, not fail open):
+# a FILE at .items, and a directory containing only a subdirectory.
+kind, out = _fence_with("c", activate=True, legacy_shape="file")
+check(kind == "DesignAClaimBackend",
+      f"a FILE at .items refuses the switch (got {kind})")
+kind, out = _fence_with("c", activate=True, legacy_shape="subdir")
+check(kind == "DesignAClaimBackend",
+      f"a subdir inside .items refuses the switch (got {kind})")
 
 # The arm that matters: C is asked for, the root cannot serve it, and the
 # proactive leg must keep delivering rather than raise out of the fence.
