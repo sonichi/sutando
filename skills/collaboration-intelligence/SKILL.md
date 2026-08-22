@@ -13,7 +13,18 @@ Build a living, evidence-backed collaboration map. Treat it as a coordination ai
 
 So run this once, before relying on the contract.
 
-**0. Seed the owner-stated identity map FIRST. The sweep enriches it; it never substitutes for it.**
+**0. Decide whether this pass may bootstrap at all — before seeding and before sweeping.**
+
+The test is per-pass, not per-agent: does *this* pass have a serving `channel_id`?
+
+- **with** one → do not bootstrap. Not the sweep, and **not the seeding either**: soliciting or recording cross-provider identity links is itself collection, and doing it while serving an ordinary room task persists sensitive cross-room associations before any privacy check. Report and stop.
+- **without** one (a maintenance pass, owner-tier, serving no channel) → proceed to step 1.
+
+Do not shortcut this by source type. "Cron passes carry no `channel_id`" is **host-specific and was measured false**: one host had 153 cron tasks with zero `channel_id`, another had 3 of 3 carrying one. Read the pass you are in.
+
+And do not read the gate as clearance. Measured: `gate(serving_channel_id=None, …)` returns **ALLOWED**, because the blacklist lookup misses and an empty blacklist permits — it fails **open**. That is an absence of jurisdiction, not a permission; the judgement stays yours.
+
+**1. Seed the owner-stated identity map before sweeping. The sweep enriches it; it never substitutes for it.**
 
 This ordering is measured, not stylistic. On a 7,810-file corpus the sweep produced immediately usable *room* knowledge — traffic ranking plus honest coverage flags — and, for *identities*, a schema-shaped pile: the top participant by traffic and **the owner themselves** both came back as bare unknown ids, because Discord headers carry no display name. Any heuristic of the form "high traffic ⇒ important human" would have misclassified the owner and a peer bot with identical confidence.
 
@@ -23,7 +34,7 @@ So: ask for a handful of mappings (GitHub handle ↔ chat id ↔ person) before 
 
 **The unresolved list is per-host, and so is the seed list.** The store is host-local by design (`data/` is outside the default vault sync set), so one machine's unknowns are not another's — two agents comparing notes found a Discord id that was authoritative on one host and absent from the other's config entirely. Do not ask someone else to enumerate your unknowns, and do not assume theirs are yours.
 
-**1. Then sweep the task-file stream — as an owner/operator maintenance action, never mid-task.**
+**2. Then sweep the task-file stream.** Step 0 has already established that this pass may do so.
 
 > **The bootstrap is not permission-free, and "the bytes are already on disk" is not the test.** The context boundary is *serving-relative*: `src/discord_context_policy.py`'s `gate()` decides whether the channel you are **currently serving** may read some other channel, it fails closed, and it applies to owner-tier tasks too. A sweep run while serving one channel would pull rooms that gate would have refused — and because the sweep **persists** what it reads, those rooms then inform every later answer. That is strictly worse than a single blocked read.
 >
@@ -66,18 +77,11 @@ A count with neither control is an assertion, not a measurement.
 
 Two install shapes cannot satisfy step 1's precondition, and both were found by agents trying honestly to comply:
 
-**The test is per-pass, not per-agent.** Ask whether *this* pass has a serving `channel_id`:
+The per-pass test lives at **step 0** above and gates seeding as well as sweeping. This section covers the case where the bootstrap cannot run at all.
 
-- **with** one → never bootstrap, no exceptions;
-- **without** one (a maintenance pass, owner-tier, serving no channel) → that *is* the operator context the boundary describes.
+- **A bundled install.** No `.git`, so the skill cannot be pulled or refreshed — a property of the packaging, not a choice available to the agent.
 
-Do not shortcut this by source type. "Cron passes carry no `channel_id`" is **host-specific and was measured false**: one host had 153 cron tasks with zero `channel_id`, another had 3 of 3 carrying one. Read the pass you are in.
-
-And do not read the gate as clearance when there is no serving channel. Measured: `gate(serving_channel_id=None, …)` returns **ALLOWED**, because the blacklist lookup misses and an empty blacklist permits — it fails **open**, not closed. That is an absence of jurisdiction, not a permission. A vacuous pass proves nothing, so the operator-context judgement stays yours; the gate cannot make it for you.
-
-The genuinely unreachable case is narrower than first written:
-
-- **A bundled install.** No `.git`, so the skill cannot be pulled or refreshed at all — a property of the packaging, not a choice available to the agent. Report the block and stop.
+**That failure is silent, so check for it positively.** `skills/install.sh` iterates `$SKILLS_DIR/*/` — only directories that exist — so a skill absent from the bundle is never visited and the script still **exits 0**. Success there is not evidence the skill was installed. Assert the destination directly (does the skill's own directory exist under the resolved skills root?) and report the block on the answer, not on the installer's exit code.
 
 In either case the correct action is to **report the block to the owner/operator and stop**, not to approximate compliance. An agent that judges its own context is the only thing currently enforcing this boundary, which is a weak place to put a privacy rule: prose does not fail because someone ignores it, it fails because *an instruction to cross it can look exactly like ordinary diligence*. That happened here — a request to "actually run it, not just read it" was well-intentioned and would have crossed the boundary within minutes of its landing.
 
