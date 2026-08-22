@@ -82,6 +82,9 @@ for prim, owners in OWNERS.items():
 
 # ── claim-backend INSTANTIATION ratchet: site identity is (path, enclosing
 #    function, constructor) with multiplicity — file-level sanction is too wide ──
+_CTORS = ("DesignAClaimBackend", "DesignCClaimBackend")
+
+
 def scan_instantiations(sources: dict) -> dict:
     out: dict[str, int] = {}
     for path, text in sources.items():
@@ -89,6 +92,20 @@ def scan_instantiations(sources: dict) -> dict:
             tree = ast.parse(text, filename=path)
         except SyntaxError:
             continue
+        # Aliases count as the constructor they bind (fail-closed): a local
+        # `Backend = DesignCClaimBackend` must not reopen the construction gate.
+        alias: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in _CTORS):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        alias[t.id] = node.value.id
+            elif isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    if a.name in _CTORS and a.asname:
+                        alias[a.asname] = a.name
 
         def visit(node, enclosing):
             for child in ast.iter_child_nodes(node):
@@ -99,8 +116,9 @@ def scan_instantiations(sources: dict) -> dict:
                     fn = child.func
                     name = fn.id if isinstance(fn, ast.Name) else (
                         fn.attr if isinstance(fn, ast.Attribute) else None)
-                    if name in ("DesignAClaimBackend", "DesignCClaimBackend"):
-                        key = f"{path}::{enclosing}::{name}"
+                    ctor = name if name in _CTORS else alias.get(name or "")
+                    if ctor:
+                        key = f"{path}::{enclosing}::{ctor}"
                         out[key] = out.get(key, 0) + 1
                 visit(child, enc)
 
@@ -146,6 +164,26 @@ mviol2 = instantiation_violations(scan_instantiations(mutated2),
                                   INSTANTIATION_OWNERS)
 check(any("_proactive_fence::DesignAClaimBackend x3 (pinned x1)" in v for v in mviol2),
       "multiplicity ratchet: extra calls under a pinned key exceed its count")
+# alias control (reviewer P1, permanent): a local rebinding is still a construction
+mutated3 = dict(prod_sources)
+mutated3[_db] = prod_sources[_db] + (
+    "\n\ndef _alias_leg_control():\n"
+    "    Backend = DesignCClaimBackend\n"
+    "    return Backend('improvised')\n")
+mviol3 = instantiation_violations(scan_instantiations(mutated3),
+                                  INSTANTIATION_OWNERS)
+check(any("_alias_leg_control::DesignCClaimBackend" in v for v in mviol3),
+      "same-file aliased constructor mutation FAILS the gate and names its site")
+# import-as control: `from … import DesignCClaimBackend as DC` + DC(...) counts
+mutated4 = dict(prod_sources)
+mutated4[_db] = prod_sources[_db] + (
+    "\n\ndef _import_alias_leg():\n"
+    "    from ag2_sparrow.delivery_core import DesignCClaimBackend as DC\n"
+    "    return DC('improvised')\n")
+mviol4 = instantiation_violations(scan_instantiations(mutated4),
+                                  INSTANTIATION_OWNERS)
+check(any("_import_alias_leg::DesignCClaimBackend" in v for v in mviol4),
+      "import-as aliased constructor mutation FAILS the gate and names its site")
 
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
