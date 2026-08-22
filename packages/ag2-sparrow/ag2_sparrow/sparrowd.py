@@ -84,7 +84,7 @@ class Supervisor:
 
     def __init__(self, specs: List[WorkerSpec], *,
                  backoff_initial_s: float = 1.0, backoff_max_s: float = 60.0,
-                 sleep: Callable[[float], None] = time.sleep,
+                 sleep: Optional[Callable[[float], None]] = None,
                  clock: Callable[[], float] = time.monotonic):
         self._workers = {s.name: _WorkerState(spec=s) for s in specs}
         self._backoff_initial = backoff_initial_s
@@ -94,6 +94,15 @@ class Supervisor:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._threads: List[threading.Thread] = []
+
+    def _pause(self, seconds: float) -> None:
+        """Backoff wait: stop-interruptible by default; an injected sleep
+        (tests) is honored but stop is still checked around it."""
+        if self._sleep is not None:
+            if not self._stop.is_set():
+                self._sleep(seconds)
+            return
+        self._stop.wait(seconds)
 
     def start(self) -> None:
         for name in self._workers:
@@ -114,16 +123,19 @@ class Supervisor:
         ws = self._workers[name]
         backoff = self._backoff_initial
         while not self._stop.is_set():
+            spawn_err = None
             with self._lock:
                 try:
                     self._spawn(ws)
                 except OSError as e:
                     ws.state = "backoff"
                     ws.last_exit = None
-                    _log(f"worker {name}: spawn failed ({e}) — backoff {backoff:.1f}s")
-                    self._sleep(backoff)
-                    backoff = min(backoff * 2, self._backoff_max)
-                    continue
+                    spawn_err = e
+            if spawn_err is not None:
+                _log(f"worker {name}: spawn failed ({spawn_err}) — backoff {backoff:.1f}s")
+                self._pause(backoff)
+                backoff = min(backoff * 2, self._backoff_max)
+                continue
             rc = ws.proc.wait()
             with self._lock:
                 ws.last_exit = rc
@@ -137,7 +149,7 @@ class Supervisor:
                 ws.state = "backoff"
             _log(f"worker {name}: exited rc={rc} — restart in {backoff:.1f}s "
                  f"(restart #{ws.restarts})")
-            self._sleep(backoff)
+            self._pause(backoff)
             backoff = min(backoff * 2, self._backoff_max)
         with self._lock:
             ws.state = "stopped"
@@ -202,30 +214,45 @@ class ControlServer:
                 conn, _ = self._srv.accept()
             except OSError:
                 return
-            with conn:
-                try:
-                    line = conn.makefile("r").readline()
-                    req = json.loads(line) if line.strip() else {}
-                except (ValueError, OSError):
-                    req = {}
-                op = req.get("op")
-                if op == "status":
-                    resp = {"ok": True, **self._sup.status()}
-                elif op == "health":
-                    st = self._sup.status()["workers"]
-                    healthy = all(w["state"] in ("running", "pending")
-                                  for w in st.values()) if st else True
-                    resp = {"ok": True, "healthy": healthy}
-                elif op == "stop":
-                    resp = {"ok": True, "stopping": True}
-                else:
-                    resp = {"ok": False, "error": f"unknown op {op!r}"}
-                try:
-                    conn.sendall((json.dumps(resp) + "\n").encode())
-                except OSError:
-                    pass
-                if op == "stop":
-                    self._on_stop()
+            # Per-connection thread: a half-open or slow client must never
+            # starve the accept loop (availability of stop/status IS the point).
+            threading.Thread(target=self._handle, args=(conn,),
+                             name="control-conn", daemon=True).start()
+
+    _MAX_REQUEST = 4096
+
+    def _handle(self, conn) -> None:
+        with conn:
+            try:
+                conn.settimeout(2.0)
+                buf = b""
+                while b"\n" not in buf and len(buf) <= self._MAX_REQUEST:
+                    chunk = conn.recv(1024)
+                    if not chunk:
+                        break
+                    buf += chunk
+                line = buf.split(b"\n", 1)[0][: self._MAX_REQUEST]
+                req = json.loads(line) if line.strip() else {}
+            except (ValueError, OSError):
+                req = {}
+            op = req.get("op")
+            if op == "status":
+                resp = {"ok": True, **self._sup.status()}
+            elif op == "health":
+                st = self._sup.status()["workers"]
+                healthy = all(w["state"] in ("running", "pending")
+                              for w in st.values()) if st else True
+                resp = {"ok": True, "healthy": healthy}
+            elif op == "stop":
+                resp = {"ok": True, "stopping": True}
+            else:
+                resp = {"ok": False, "error": f"unknown op {op!r}"}
+            try:
+                conn.sendall((json.dumps(resp) + "\n").encode())
+            except OSError:
+                pass
+            if op == "stop":
+                self._on_stop()
 
     def close(self) -> None:
         if self._srv is not None:
