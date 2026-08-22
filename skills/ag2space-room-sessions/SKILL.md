@@ -26,13 +26,21 @@ a whole turn), ensures the pane exists — respawning with `claude --resume
 survives process death — writes a sanitized **spool prompt** (the trusted task
 view; never the raw task file), injects one line pointing at it into the live
 pane, detaches a per-task monitor, acks the room, and returns immediately. The
-watcher is never occupied by a running turn.
+watcher is never occupied by a running turn. A session id is recorded only
+after the pane proves itself with output — recording earlier would poison every
+later `--resume` with a session that may never have existed; a startup failure
+raises with the dying pane's last screen as the diagnostic.
 
-**Publication ownership flips versus the old inline design:** the standing
-session itself writes the result to `results/<task-id>.txt` (the spool prompt
-names the exact path — which necessarily embeds the task id). The monitor is
-the backstop publisher on failure, never a competing one: it only writes after
-the pane is dead or was just killed.
+**The monitor is the sole publisher of the shared result path.** The session
+writes only its own private out-file
+(`state/ag2space-room-sessions/spool/<task-id>.out.txt`); the monitor waits for
+that output to be non-empty and stable (an ordinary write is not atomic and
+must never be published mid-way), then publishes it atomically via the
+no-clobber `_publish_once`. The session never touches
+`results/<task-id>.txt`, so a session/monitor write race is structurally
+impossible. On every terminal path the monitor checks the out-file first — a
+turn that finished right before its pane died still delivers its real result,
+not a failure.
 
 **Why standing over per-message spawn:** a mid-turn message (including a
 cancel or redirect) enters the live conversation natively instead of queueing
@@ -41,20 +49,27 @@ turn serialization is the session's own input queue, not a turn-length flock.
 
 ## The monitor (per injected turn)
 
-A detached watchdog per task:
+A detached watchdog per task, holding publication ownership until a terminal
+state — a delivered result or an honest failure, never abandonment:
 
 - **Heartbeats** every `SUTANDO_TIER_HEARTBEAT_INTERVAL` (120s default) to the
   room while the turn runs, dispatched off-thread so a slow notifier can never
   delay the checks below.
 - **Stall** = pane content frozen for `SUTANDO_TIER_STALL_TIMEOUT` (180s) with
-  no result — a live provider at least animates its spinner. The pane is killed
-  first, then an honest failure result is published ("resend to continue — the
-  conversation itself is preserved"); the next message respawns via `--resume`.
-- **Safety ceiling** `SUTANDO_TIER_HARD_TIMEOUT` (3600s) bounds the *watchdog*,
-  not the work: a still-active turn is left running with a room notice, and its
-  result still lands whenever it finishes. Long work is never discarded.
-- A pane that **dies** without a result gets the honest failure body after a
-  short grace period.
+  no output — a live provider at least animates its spinner. The pane is killed
+  FIRST (fencing: nothing can keep writing the out-file during the verdict),
+  then the out-file is checked once more — a just-finished turn delivers its
+  real result; otherwise the honest failure body is published ("resend to
+  continue — the conversation itself is preserved") and the next message
+  respawns via `--resume`.
+- **A failing liveness probe is unknown, never a dead verdict** — a transient
+  tmux socket error degrades into stall handling rather than an instant
+  failure, so a probe blip cannot fail a turn that is still running.
+- **Safety ceiling** `SUTANDO_TIER_HARD_TIMEOUT` (3600s) changes the message,
+  never the ownership: the room gets a one-time notice and supervision
+  continues until the terminal state. Long work is never discarded or orphaned.
+- A pane that **dies** without output gets the honest failure body after a
+  short grace period (with the same finished-out-file check first).
 
 Explicit non-goal: a runaway turn that keeps producing output forever is only
 bounded by the room noticing its heartbeats — kill it manually with

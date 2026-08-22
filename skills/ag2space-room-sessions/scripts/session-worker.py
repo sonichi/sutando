@@ -340,11 +340,22 @@ def _pane_name(runtime: str, room_key: str) -> str:
     return f"room-{runtime}-{room_key[:12]}"
 
 
-def _pane_alive(workspace: Path, name: str) -> bool:
+def _pane_alive(workspace: Path, name: str) -> Optional[bool]:
+    """True/False = tmux answered. None = the probe itself failed (socket error or
+    timeout) — callers must treat None as unknown, never as a confirmed exit."""
     try:
-        return _tmux(workspace, "has-session", "-t", f"={name}").returncode == 0
+        done = _tmux(workspace, "has-session", "-t", f"={name}")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return done.returncode == 0
+
+
+def _pane_dead(workspace: Path, name: str) -> bool:
+    try:
+        done = _tmux(workspace, "display-message", "-p", "-t", f"={name}:", "#{pane_dead}")
     except (OSError, subprocess.TimeoutExpired):
         return False
+    return done.returncode == 0 and done.stdout.strip() == "1"
 
 
 def _pane_content(workspace: Path, name: str) -> str:
@@ -369,48 +380,87 @@ def _standing_launch_command(session_id: str, resume: bool) -> list[str]:
     return command
 
 
+def _startup_failure(workspace: Path, name: str, reason: str) -> RuntimeError:
+    # Post-mortem before cleanup: remain-on-exit kept the dying pane, so its last
+    # screen is the actual diagnostic (auth error, traceback, bad flag...).
+    tail = "\n".join(line for line in _pane_content(workspace, name).splitlines() if line.strip())[-500:]
+    _tmux(workspace, "kill-session", "-t", f"={name}")
+    return RuntimeError(f"standing session {reason} during startup"
+                        + (f"; last pane output:\n{tail}" if tail else ""))
+
+
 def _ensure_standing_session(workspace: Path, runtime: str, room_key: str, repo: Path) -> str:
-    """Ensure the room's standing provider pane exists and answered with output;
-    a respawn after crash/reboot resumes the recorded provider session id."""
+    """Ensure the room's standing provider pane exists and proved itself with
+    output; a respawn after crash/reboot resumes the recorded provider session id."""
     name = _pane_name(runtime, room_key)
-    if _pane_alive(workspace, name):
+    if _pane_alive(workspace, name) is True:
         return name
     session_id, created = _session_id(workspace, runtime, room_key)
     done = _tmux(workspace, "new-session", "-d", "-s", name, "-c", str(_working_dir(repo)),
                  *_standing_launch_command(session_id, resume=not created))
     if done.returncode != 0:
         raise RuntimeError(f"tmux new-session failed: {done.stderr.strip()}")
-    if created:
-        _record_session(workspace, runtime, room_key, session_id)
+    # Keep a dying startup pane around for post-mortem capture (turned off again
+    # once startup is confirmed, so a later natural exit still cleans up).
+    _tmux(workspace, "set-option", "-w", "-t", f"={name}:", "remain-on-exit", "on")
     deadline = time.monotonic() + _timeout("SUTANDO_ROOM_SPAWN_WAIT", None)
     while time.monotonic() < deadline:
+        if _pane_dead(workspace, name) or _pane_alive(workspace, name) is False:
+            raise _startup_failure(workspace, name, "exited")
         if _pane_content(workspace, name).strip():
+            # Record only after the pane proves itself: an earlier record poisons
+            # every later --resume with a session that may never have existed.
+            if created:
+                _record_session(workspace, runtime, room_key, session_id)
+            _tmux(workspace, "set-option", "-w", "-t", f"={name}:", "remain-on-exit", "off")
             return name
-        if not _pane_alive(workspace, name):
-            raise RuntimeError("standing session exited during startup")
         time.sleep(0.1)
-    raise RuntimeError("standing session produced no output during startup")
+    raise _startup_failure(workspace, name, "produced no output")
 
 
 def _spool_dir(workspace: Path) -> Path:
     return workspace / "state" / "ag2space-room-sessions" / "spool"
 
 
-def _write_spool_prompt(workspace: Path, task_file: Path, results_dir: Path) -> Path:
-    # Publication ownership flips here versus the inline path: the standing
-    # session writes the result itself, so the view must name the result path.
+def _out_path(workspace: Path, task_id: str) -> Path:
+    return _spool_dir(workspace) / f"{task_id}.out.txt"
+
+
+def _write_spool_prompt(workspace: Path, task_file: Path) -> Path:
+    # The session writes only its PRIVATE output file; the trusted monitor is the
+    # sole publisher of the shared results path (validated + atomic, no clobber).
     task_id = task_file.stem
     prompt = (
         "Handle the owner task below in this persistent AG2 Space room session. Follow "
         "AGENTS.md for repository and safety policy, and keep this room's conversation "
-        "context across tasks. Do not read the original task file and do not touch any "
-        "other tasks/results tracking file. When done, write the exact result body - "
-        f"nothing else - to {results_dir / (task_id + '.txt')} in a single write.\n\n"
+        "context across tasks. Do not read the original task file and do not create or "
+        "modify any tasks/results tracking file; the trusted monitor owns delivery. "
+        "When done, write the exact result body - nothing else - to "
+        f"{_out_path(workspace, task_id)} in a single write.\n\n"
         f"Trusted task view:\n{_task_view(task_file)}\n"
     )
     path = _spool_dir(workspace) / f"{task_id}.prompt.txt"
     _atomic_text(path, prompt)
     return path
+
+
+def _stable_output(path: Path, delay: float = 0.5) -> Optional[str]:
+    """The provider's private out-file, but only once it is non-empty and stops
+    changing — an ordinary write is not atomic and must never be published mid-way."""
+    try:
+        first = path.read_bytes()
+    except OSError:
+        return None
+    if not first.strip():
+        return None
+    time.sleep(delay)
+    try:
+        second = path.read_bytes()
+    except OSError:
+        return None
+    if first != second:
+        return None
+    return second.decode("utf-8", "replace")
 
 
 def _inject(workspace: Path, name: str, line: str) -> None:
@@ -429,6 +479,16 @@ def _fail(task_file: Path, result: Path, reason: str) -> None:
     _notify(task_file, f"Hit a problem: {reason}. Resend to continue.")
 
 
+def _settle(task_file: Path, result: Path, out: Path, reason: str) -> None:
+    # Terminal disposition: a finished private out-file beats the failure verdict
+    # (the turn may have completed right before the pane died or was killed).
+    body = _stable_output(out)
+    if body is not None:
+        _publish_once(result, body)
+        return
+    _fail(task_file, result, reason)
+
+
 def monitor(
     runtime: str,
     workspace: Path,
@@ -437,8 +497,9 @@ def monitor(
     hard_timeout: Optional[float] = None,
     stall_timeout: Optional[float] = None,
 ) -> None:
-    """Watchdog for one injected turn, in a detached process: heartbeats while it
-    runs, stall detection on frozen pane content, honest failure publishing."""
+    """Sole publisher of this task's shared result, in a detached process: delivers
+    the session's validated private output, heartbeats, stall/exit supervision.
+    Never abandons ownership before a terminal state - result or failure."""
     room_key = resolve_room_key(task_file)
     if room_key is None:
         return
@@ -451,37 +512,47 @@ def monitor(
         interval = 0.0
     started = last_change = time.monotonic()
     next_heartbeat = started + interval if interval > 0 else None
+    ceiling_notified = False
     fingerprint = ""
     result = results_dir / task_file.name
+    out = _out_path(workspace, task_file.stem)
     while True:
         if read_ready_result(result) is not None:
             return
-        now = time.monotonic()
-        if not _pane_alive(workspace, name):
-            time.sleep(2)  # grace: a final result write may still be landing
-            if read_ready_result(result) is None:
-                _fail(task_file, result, "the room's standing session exited before finishing")
+        body = _stable_output(out)
+        if body is not None:
+            _publish_once(result, body)
             return
-        content = _pane_content(workspace, name)
-        if content != fingerprint:
+        now = time.monotonic()
+        alive = _pane_alive(workspace, name)
+        if alive is False:
+            time.sleep(2)  # grace: a final out-file write may still be landing
+            _settle(task_file, result, out, "the room's standing session exited before finishing")
+            return
+        # alive None = probe failure, NOT a confirmed exit: fall through so it
+        # degrades into stall handling (content unreadable -> clock keeps running).
+        content = _pane_content(workspace, name) if alive else ""
+        if content and content != fingerprint:
             fingerprint = content
             last_change = now
         if now - last_change >= stall:
-            # A frozen pane is a hung process (a live provider at least animates its
-            # spinner). Kill BEFORE publishing so the session can't write after us.
+            # Fence first: kill the pane BEFORE the terminal verdict so nothing can
+            # keep writing the out-file while we decide result-vs-failure.
             _tmux(workspace, "kill-session", "-t", f"={name}")
-            if read_ready_result(result) is None:
-                _fail(task_file, result,
-                      f"the room's standing session froze for {stall:g}s and was stopped; "
-                      "the next message resumes the conversation")
+            _settle(task_file, result, out,
+                    f"the room's standing session froze for {stall:g}s and was stopped; "
+                    "the next message resumes the conversation")
             return
-        if now - started >= hard:
-            # Safety ceiling bounds the WATCHDOG, not the work: a still-active turn
-            # is left running and its result still lands whenever it finishes.
-            _notify(task_file,
-                    f"This turn passed the {hard:g}s safety ceiling and is still running - "
-                    "the result will follow whenever it completes.")
-            return
+        if not ceiling_notified and now - started >= hard:
+            # The ceiling changes the message, never the ownership: supervision
+            # continues to a terminal state, the work is never abandoned or killed.
+            ceiling_notified = True
+            threading.Thread(
+                target=_notify,
+                args=(task_file, f"This turn passed the {hard:g}s safety ceiling and is "
+                                 "still running - the result will follow when it completes."),
+                daemon=True,
+            ).start()
         if next_heartbeat is not None and now >= next_heartbeat:
             while now >= next_heartbeat:
                 next_heartbeat += interval
@@ -656,7 +727,7 @@ def handle(
             if _completed_result_exists(results_dir, task_file.name):
                 return 0
             name = _ensure_standing_session(workspace, runtime, room_key, repo)
-            spool = _write_spool_prompt(workspace, task_file, results_dir)
+            spool = _write_spool_prompt(workspace, task_file)
             _inject(workspace, name, f'Read the file "{spool}" and do exactly what it says.')
         _spawn_monitor(runtime, workspace, task_file, results_dir, repo,
                        hard_timeout, stall_timeout)

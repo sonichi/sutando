@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import redirect_stderr
@@ -28,10 +29,11 @@ SPEC.loader.exec_module(worker)
 FAILURES: list[str] = []
 
 
-def check(condition: bool, message: str) -> None:
+def check(condition: bool, message: str) -> bool:
     print(("  ok  " if condition else "  FAIL ") + message)
     if not condition:
         FAILURES.append(message)
+    return condition
 
 
 def executable(path: Path, body: str) -> Path:
@@ -143,9 +145,12 @@ def test_session_state_reuses_room_not_message() -> None:
             check(False, "invalid provider session id is refused")
 
 
-STANDING_STUB = """#!/usr/bin/env python3
-import json, os, pathlib, re, sys, time
-with pathlib.Path(os.environ['ARG_LOG']).open('a') as out:
+def standing_stub(log_path: Path) -> str:
+    # The log path is EMBEDDED, not read from env: pane env propagation is the
+    # most version-sensitive tmux behavior, and the stub must not depend on it.
+    return f"""#!/usr/bin/env python3
+import json, pathlib, re, sys
+with pathlib.Path({str(log_path)!r}).open('a') as out:
     out.write(json.dumps(sys.argv[1:]) + '\\n')
 print('READY', flush=True)
 for line in sys.stdin:
@@ -154,8 +159,6 @@ for line in sys.stdin:
         continue
     prompt = pathlib.Path(m.group(1)).read_text()
     dest = re.search(r'to (.+?) in a single write', prompt).group(1)
-    if os.environ.get('MODE') == 'hang':
-        time.sleep(600)
     pathlib.Path(dest).write_text('standing room result\\n')
     print('DONE', flush=True)
 """
@@ -180,10 +183,9 @@ def test_claude_standing_session_e2e() -> None:
         (workspace / "results").mkdir(parents=True)
         log = root / "claude.jsonl"
         log.touch()
-        executable(root / "claude", STANDING_STUB)
+        executable(root / "claude", standing_stub(log))
         env = {
             "PATH": f"{root}:{os.environ['PATH']}",
-            "ARG_LOG": str(log),
             "SUTANDO_ROOM_TMUX_DIR": str(root / "tmux"),
             "SUTANDO_ROOM_SPAWN_WAIT": "15",
         }
@@ -191,15 +193,16 @@ def test_claude_standing_session_e2e() -> None:
         second = task(workspace, "task-claude-two")
         third = task(workspace, "task-claude-three")
         try:
-            with patch.dict(os.environ, env), \
-                 patch.object(worker, "_spawn_monitor"), patch.object(worker, "_notify"):
+            # The real detached monitor runs: the shared result appearing proves the
+            # whole pipeline (inject -> private out-file -> validated publication).
+            with patch.dict(os.environ, env), patch.object(worker, "_notify"):
                 check(worker.handle("claude", workspace, first, workspace / "results", REPO) == 0,
                       "standing session spawns for the room's first message")
                 result_one = workspace / "results" / first.name
-                check(wait_for(lambda: result_one.exists()),
-                      "standing session writes the first result itself")
-                check(result_one.read_text() == "standing room result\n",
-                      "standing session publishes the exact result body")
+                if check(wait_for(lambda: result_one.exists()),
+                         "monitor publishes the session's first result"):
+                    check(result_one.read_text() == "standing room result\n",
+                          "published body is the session's exact private output")
 
                 check(worker.handle("claude", workspace, second, workspace / "results", REPO) == 0,
                       "second message is claimed without a new spawn")
@@ -207,7 +210,8 @@ def test_claude_standing_session_e2e() -> None:
                       "reused pane serves the second message")
                 spawns = [json.loads(line) for line in log.read_text().splitlines()]
                 check(len(spawns) == 1, "one pane serves consecutive same-room messages")
-                check("--session-id" in spawns[0], "first spawn proposes a new provider session id")
+                check(spawns and "--session-id" in spawns[0],
+                      "first spawn proposes a new provider session id")
 
                 room_key = worker.resolve_room_key(first)
                 assert room_key
@@ -217,12 +221,14 @@ def test_claude_standing_session_e2e() -> None:
                 check(wait_for(lambda: (workspace / "results" / third.name).exists()),
                       "respawned pane serves the message")
                 spawns = [json.loads(line) for line in log.read_text().splitlines()]
-                created = spawns[0][spawns[0].index("--session-id") + 1]
-                check("--resume" in spawns[1] and spawns[1][spawns[1].index("--resume") + 1] == created,
-                      "respawn resumes the recorded provider session id")
-                state = json.loads(worker._state_path(workspace).read_text(encoding="utf-8"))
-                check(state["sessions"]["claude"][room_key]["session_id"] == created,
-                      "standing session id is persisted for resume")
+                if check(len(spawns) == 2 and "--session-id" in spawns[0] and "--resume" in spawns[1],
+                         "respawn uses resume after create"):
+                    created = spawns[0][spawns[0].index("--session-id") + 1]
+                    check(spawns[1][spawns[1].index("--resume") + 1] == created,
+                          "respawn resumes the recorded provider session id")
+                    state = json.loads(worker._state_path(workspace).read_text(encoding="utf-8"))
+                    check(state["sessions"]["claude"][room_key]["session_id"] == created,
+                          "standing session id is persisted for resume")
 
                 spool = worker._spool_dir(workspace) / f"{first.stem}.prompt.txt"
                 body = spool.read_text(encoding="utf-8")
@@ -234,8 +240,10 @@ def test_claude_standing_session_e2e() -> None:
                       "spool prompt preserves the trusted addressed-to target")
                 check(f"Process and write the result to results/{first.stem}.txt" not in body,
                       "spool prompt omits the original numbered publication directive")
-                check(str(workspace / "results" / first.name) in body,
-                      "spool prompt names the result path the session must write")
+                check(str(worker._out_path(workspace, first.stem)) in body,
+                      "spool prompt names only the private out-file contract")
+                check(str(workspace / "results" / first.name) not in body,
+                      "spool prompt never names the shared results path")
                 check(str(first) not in body, "spool prompt never names the original task path")
         finally:
             with patch.dict(os.environ, env):
@@ -257,13 +265,38 @@ def test_monitor_watchdog_policies() -> None:
         check(not tmux.called and not notify.called,
               "monitor exits untouched when the result is already ready")
 
+        finished = task(workspace, "task-finished", room_id="!finished:a")
+        worker._atomic_text(worker._out_path(workspace, finished.stem), "real session output\n")
+        with patch.dict(os.environ, timeouts), \
+             patch.object(worker, "_notify") as notify, patch.object(worker, "_tmux") as tmux, \
+             patch.object(worker.time, "sleep"):
+            worker.monitor("claude", workspace, finished, results)
+        check((results / finished.name).read_text() == "real session output\n",
+              "monitor is the publisher of the session's private output")
+        check(not tmux.called and not notify.called,
+              "a finished out-file needs no kill and no failure notice")
+
         dead = task(workspace, "task-dead", room_id="!dead:a")
         with patch.dict(os.environ, timeouts), \
              patch.object(worker, "_pane_alive", return_value=False), \
              patch.object(worker, "_notify"), patch.object(worker.time, "sleep"):
             worker.monitor("claude", workspace, dead, results)
         check("exited before finishing" in (results / dead.name).read_text(),
-              "a dead pane without a result publishes the honest failure body")
+              "a dead pane without output publishes the honest failure body")
+
+        died_late = task(workspace, "task-died-late", room_id="!died-late:a")
+        out_late = worker._out_path(workspace, died_late.stem)
+
+        def write_then_report_dead(ws, n):
+            worker._atomic_text(out_late, "finished just in time\n")
+            return False
+
+        with patch.dict(os.environ, timeouts), \
+             patch.object(worker, "_pane_alive", side_effect=write_then_report_dead), \
+             patch.object(worker, "_notify"), patch.object(worker.time, "sleep"):
+            worker.monitor("claude", workspace, died_late, results)
+        check((results / died_late.name).read_text() == "finished just in time\n",
+              "a finished out-file beats the failure verdict when the pane dies")
 
         frozen = task(workspace, "task-frozen", room_id="!frozen:a")
         events: list[str] = []
@@ -272,26 +305,44 @@ def test_monitor_watchdog_policies() -> None:
              patch.object(worker, "_pane_content", return_value="frozen screen"), \
              patch.object(worker, "_notify"), patch.object(worker.time, "sleep"), \
              patch.object(worker, "_tmux",
-                          side_effect=lambda ws, *a: events.append(a[0])) as tmux, \
-             patch.object(worker, "_fail",
-                          side_effect=lambda *a: events.append("fail")):
+                          side_effect=lambda ws, *a: events.append(a[0])), \
+             patch.object(worker, "_settle",
+                          side_effect=lambda *a: events.append("settle")):
             worker.monitor("claude", workspace, frozen, results)
-        check(events == ["kill-session", "fail"],
-              "a frozen pane is killed BEFORE the failure result is published")
+        check(events == ["kill-session", "settle"],
+              "a frozen pane is fenced (killed) BEFORE the terminal verdict")
+
+        flaky = task(workspace, "task-flaky", room_id="!flaky:a")
+        with patch.dict(os.environ, timeouts), \
+             patch.object(worker, "_pane_alive", return_value=None), \
+             patch.object(worker, "_notify"), patch.object(worker.time, "sleep"), \
+             patch.object(worker, "_tmux"):
+            worker.monitor("claude", workspace, flaky, results)
+        check("froze" in (results / flaky.name).read_text(),
+              "a failing liveness probe degrades to stall handling, never a dead verdict")
 
         busy = task(workspace, "task-busy", room_id="!busy:a")
+        out_busy = worker._out_path(workspace, busy.stem)
         ceiling = {**timeouts, "SUTANDO_TIER_HARD_TIMEOUT": "0.3",
                    "SUTANDO_TIER_STALL_TIMEOUT": "5"}
-        with patch.dict(os.environ, ceiling), \
-             patch.object(worker, "_pane_alive", return_value=True), \
-             patch.object(worker, "_pane_content", side_effect=lambda ws, n: f"tick {time.monotonic()}"), \
-             patch.object(worker, "_notify") as notify, patch.object(worker.time, "sleep"), \
-             patch.object(worker, "_tmux") as tmux:
-            worker.monitor("claude", workspace, busy, results)
-        check(not tmux.called and not (results / busy.name).exists(),
-              "an active turn past the safety ceiling is never killed or failed")
-        check(notify.called and "safety ceiling" in notify.call_args.args[1],
-              "the safety ceiling detaches the watchdog with a room notice")
+        finish_timer = threading.Timer(0.6, lambda: worker._atomic_text(out_busy, "slow but done\n"))
+        finish_timer.start()
+        try:
+            with patch.dict(os.environ, ceiling), \
+                 patch.object(worker, "_pane_alive", return_value=True), \
+                 patch.object(worker, "_pane_content",
+                              side_effect=lambda ws, n: f"tick {time.monotonic()}"), \
+                 patch.object(worker, "_notify") as notify, patch.object(worker.time, "sleep"), \
+                 patch.object(worker, "_tmux") as tmux:
+                worker.monitor("claude", workspace, busy, results)
+        finally:
+            finish_timer.cancel()
+        check(not tmux.called, "an active turn past the safety ceiling is never killed")
+        check((results / busy.name).read_text() == "slow but done\n",
+              "supervision continues past the ceiling until the result is delivered")
+        check(wait_for(lambda: notify.called, 2)
+              and "safety ceiling" in notify.call_args.args[1],
+              "the safety ceiling posts a notice without abandoning ownership")
 
 
 def test_claude_handle_dispatch_without_tmux() -> None:
@@ -314,8 +365,11 @@ def test_claude_handle_dispatch_without_tmux() -> None:
         spool = worker._spool_dir(workspace) / f"{started.stem}.prompt.txt"
         check(spool.is_file() and str(spool) in inject.call_args.args[2],
               "injection points the pane at the spool prompt")
-        check(str(results / started.name) in spool.read_text(encoding="utf-8"),
-              "the spool prompt carries the result-path contract")
+        spool_text = spool.read_text(encoding="utf-8")
+        check(str(worker._out_path(workspace, started.stem)) in spool_text,
+              "the spool prompt carries the private out-file contract")
+        check(str(results / started.name) not in spool_text,
+              "the session is never pointed at the shared results path")
 
         broken = task(workspace, "task-broken", room_id="!broken:a")
         with patch.object(worker, "_ensure_standing_session",
@@ -323,6 +377,29 @@ def test_claude_handle_dispatch_without_tmux() -> None:
              patch.object(worker, "_notify"):
             code = worker.handle("claude", workspace, broken, results, REPO)
         check(code == 1, "a spawn failure falls back to the watcher path")
+
+
+def test_startup_failure_never_poisons_the_session_id() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        workspace = Path(name)
+        doomed = task(workspace, "task-doomed")
+        room_key = worker.resolve_room_key(doomed)
+        assert room_key
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with patch.dict(os.environ, {"SUTANDO_ROOM_SPAWN_WAIT": "5"}), \
+             patch.object(worker, "_tmux", return_value=ok), \
+             patch.object(worker, "_pane_alive", return_value=None), \
+             patch.object(worker, "_pane_dead", return_value=True), \
+             patch.object(worker, "_pane_content", return_value="claude: auth error"):
+            try:
+                worker._ensure_standing_session(workspace, "claude", room_key, REPO)
+            except RuntimeError as exc:
+                check("auth error" in str(exc),
+                      "startup failure carries the dying pane's screen for diagnosis")
+            else:
+                check(False, "startup failure carries the dying pane's screen for diagnosis")
+        _, created = worker._session_id(workspace, "claude", room_key)
+        check(created, "a failed startup never records the session id (no poisoned resume)")
 
 
 def test_codex_create_resume_and_result_ownership() -> None:
@@ -590,6 +667,7 @@ def main() -> int:
     test_claude_standing_session_e2e()
     test_monitor_watchdog_policies()
     test_claude_handle_dispatch_without_tmux()
+    test_startup_failure_never_poisons_the_session_id()
     test_codex_create_resume_and_result_ownership()
     test_codex_event_and_state_edges()
     test_runtime_edges_and_adapter_wiring()
