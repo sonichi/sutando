@@ -214,30 +214,40 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    Its presence is not evidence of anything; close+reopen is what actually clears this case.
 
    **One ABSENT PR never gets that comment at all — which is worth knowing, but is not a fix.**
-   The workflow triggers on `pull_request_target: [synchronize]`, which fires on a head-SHA change.
-   A PR whose head has never moved since it was opened has produced no such event, so the automation
-   has never run on it and its absence from the comment log means nothing about the PR. Measured on
-   #3253: one commit, zero force-pushes, and `headRefOid` identical to that sole commit.
+   The workflow triggers on `pull_request_target: [synchronize]`, which fires when the PR's head
+   changes. A PR whose head has been set exactly once — at open — has produced no such event, so the
+   automation has never run on it and its absence from the comment log says nothing about the PR.
+
+   Establish that from the **timeline**, which records head-changing events, not from the commit
+   list, which only shows the history the branch has *now*:
 
    ```bash
-   gh pr view <N> --json headRefOid,commits \
-     --jq '"head=" + .headRefOid + " sole-commit-is-head=" + (.headRefOid == .commits[0].oid | tostring)'
-   # true with commits==1  ->  the head has never changed, so no synchronize has ever fired
+   gh api repos/<owner>/<repo>/issues/<N>/timeline --paginate \
+     --jq '[.[].event] | {committed: map(select(. == "committed")) | length,
+                          force_pushed: map(select(. == "head_ref_force_pushed")) | length}'
+   # {"committed":1,"force_pushed":0}  ->  the head was set once; no synchronize has fired
    ```
 
-   Prove it from the **static head**, not from timestamps: `/commits/<sha>` returns `author.date` and
-   `committer.date`, and **neither is a push time** — on #3253 they differ by seven minutes. GitHub
-   does not expose push time there, so a date comparison cannot witness a `synchronize`.
+   **Read it as a one-way test.** `committed == 1` with no force-pushes is sufficient for "the head
+   never moved", because a single commit can only have arrived once. The converse does not hold: a PR
+   opened with several commits shows `committed > 1` from that one push, so a higher count does not
+   prove the head moved afterwards.
+
+   Do **not** try to establish this from `headRefOid == commits[0].oid`: a branch can be force-pushed
+   any number of times and still end at a one-commit history, and the commit list keeps no record of
+   the heads it replaced. For the same reason, do not use `/commits/<sha>` dates — it returns
+   `author.date` and `committer.date`, and **neither is a push time** (on #3253 they differ by seven
+   minutes). Both describe the present; the claim is about the past.
 
    **Do not conclude "so just push it".** The workflow's only effect is posting that comment, and the
-   paragraph above measures the comment as inert for ABSENT. A push would buy the same inert comment,
-   plus a fresh SHA that starts with no status of its own and a full CI rerun. Whether the comment
-   would help *this* PR is an open question with no evidence either way; **close+reopen remains the
-   documented remedy.** The useful content here is that the absence of a recheck comment on such a PR
-   is structural and tells you nothing — not that a push resolves it.
+   paragraph above measures the comment as inert for ABSENT across 33 pushes on three PRs. A push
+   would buy the same inert comment, plus a fresh SHA that starts with no status of its own and a
+   full CI rerun. Whether the comment would help *this* PR is an open question with no evidence either
+   way; **close+reopen remains the documented remedy.** The useful content here is that the absence of
+   a recheck comment on such a PR is structural and tells you nothing — not that a push resolves it.
 
-   The sub-case is about head-never-moved, not about forks: #3253 was also the only fork among the
-   four, which is a correlation at n=1 and not the cause.
+   The sub-case is about the head never having moved, not about forks: #3253 was also the only fork
+   among the four, which is a correlation at n=1 and not the cause.
 
    **Give it a minute or two before concluding it failed.** The status is posted asynchronously: on one PR it was still `total=0` immediately after reopening and `license/cla=success` on the next check. Re-running the command above is the way to tell; an immediate zero means nothing yet.
 
