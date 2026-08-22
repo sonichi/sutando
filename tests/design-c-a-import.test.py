@@ -223,6 +223,14 @@ with tempfile.TemporaryDirectory() as td:
     check(json.loads((root / FALLBACK_COUNTER).read_text())["count"] == 2,
           "and a miss does not bump the counter")
 
+    # a counter that parses to a non-dict (torn/truncated write shape) must
+    # not crash the read path; the next hit rebuilds it from zero
+    (root / FALLBACK_COUNTER).write_text("null")
+    rec = dual_read(root, "hist-1")
+    check(rec is not None
+          and json.loads((root / FALLBACK_COUNTER).read_text())["count"] == 1,
+          "non-dict counter is tolerated: hit still serves and recounts from 0")
+
     after = {d: sorted(x.name for x in (root / d).iterdir())
              for d in ("ready", "inflight", "undelivered")}
     check(after == before,
@@ -237,6 +245,19 @@ with tempfile.TemporaryDirectory() as td:
         json.dumps({"item_id": "somebody-else"}))
     check(dual_read(root, "alias") is None,
           "body/item_id mismatch is refused (no serving mislabeled records)")
+
+with tempfile.TemporaryDirectory() as td:
+    # First consult (even a miss) initializes the counter at 0, so an absent
+    # file can only mean "dual_read never ran here" — the gate warns on that.
+    root = Path(td) / "fresh"
+    outbox._write_item(root, "only", {"item_id": "only", "status": "DELIVERED"})
+    import_a_state(root)
+    check(not (root / FALLBACK_COUNTER).exists(),
+          "import alone writes no counter (dual_read owns the marker)")
+    check(dual_read(root, "never-existed") is None, "first consult misses")
+    ctr0 = json.loads((root / FALLBACK_COUNTER).read_text())
+    check(ctr0["count"] == 0 and "initialized_ts" in ctr0,
+          "and initializes the counter at a MEASURED zero (liveness marker)")
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td) / "nofall"

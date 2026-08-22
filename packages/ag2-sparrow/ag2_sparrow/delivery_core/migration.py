@@ -247,10 +247,12 @@ FALLBACK_COUNTER = "a-fallback-hits.json"
 def dual_read(root: Path, item_id: str) -> "dict | None":
     """C-miss fallback during the migration window: read-only lookup of the
     PRESERVED A record under .items-migrated/. Returns the parsed record or
-    None. Every hit bumps the per-root fallback counter — A's deletion gate
-    is that counter staying unchanged across a full release, so a hit is a
-    FINDING (an id the importer should have covered), not a silent rescue.
-    Never writes to either store; never resurrects the item."""
+    None. The first consult on a root initializes the counter at count 0 (a
+    liveness marker: the release gate treats an ABSENT counter as "dual_read
+    never ran here", not as a clean zero), and every hit bumps it — A's
+    deletion gate is that counter staying at a measured zero across a full
+    release, so a hit is a FINDING (an id the importer should have covered),
+    not a silent rescue. Never writes to either item store."""
     import json as _json
     import time as _time
 
@@ -260,6 +262,21 @@ def dual_read(root: Path, item_id: str) -> "dict | None":
     migrated_dir = root / ".items-migrated"
     if migrated_dir.is_symlink() or not migrated_dir.is_dir():
         return None
+    counter = root / FALLBACK_COUNTER
+    try:
+        prior = _json.loads(counter.read_text(encoding="utf-8"))
+        count = int(prior.get("count", 0)) if isinstance(prior, dict) else 0
+    except FileNotFoundError:
+        # Liveness marker: count 0 turns "file absent" from an assumed-benign
+        # state into "dual_read never ran here", which the release gate warns on.
+        count = 0
+        tmp = counter.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps({"count": 0,
+                                    "initialized_ts": _time.time()}),
+                       encoding="utf-8")
+        os.replace(tmp, counter)
+    except (OSError, ValueError):
+        count = 0
     p = migrated_dir / f"{_a_safe_key(item_id)}.json"
     if p.is_symlink() or not p.is_file():
         return None
@@ -269,12 +286,6 @@ def dual_read(root: Path, item_id: str) -> "dict | None":
         return None
     if not isinstance(rec, dict) or rec.get("item_id") != item_id:
         return None
-    counter = root / FALLBACK_COUNTER
-    try:
-        prior = _json.loads(counter.read_text(encoding="utf-8"))
-        count = int(prior.get("count", 0))
-    except (OSError, ValueError):
-        count = 0
     tmp = counter.with_suffix(".json.tmp")
     tmp.write_text(_json.dumps({"count": count + 1,
                                 "last_hit_ts": _time.time(),
