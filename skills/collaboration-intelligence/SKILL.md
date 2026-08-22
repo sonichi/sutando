@@ -21,6 +21,8 @@ Worse for derivation: a known cross-provider identity — one person holding a G
 
 So: ask for a handful of mappings (GitHub handle ↔ chat id ↔ person) before sweeping. It is the highest-value minute available, and it is the part the sweep structurally cannot do for you.
 
+**The unresolved list is per-host, and so is the seed list.** The store is host-local by design (`data/` is outside the default vault sync set), so one machine's unknowns are not another's — two agents comparing notes found a Discord id that was authoritative on one host and absent from the other's config entirely. Do not ask someone else to enumerate your unknowns, and do not assume theirs are yours.
+
 **1. Then sweep the task-file stream — as an owner/operator maintenance action, never mid-task.**
 
 > **The bootstrap is not permission-free, and "the bytes are already on disk" is not the test.** The context boundary is *serving-relative*: `src/discord_context_policy.py`'s `gate()` decides whether the channel you are **currently serving** may read some other channel, it fails closed, and it applies to owner-tier tasks too. A sweep run while serving one channel would pull rooms that gate would have refused — and because the sweep **persists** what it reads, those rooms then inform every later answer. That is strictly worse than a single blocked read.
@@ -50,6 +52,15 @@ Record the result per [references/schema.md](references/schema.md), including `s
 **3. (Already done at step 0 — kept here only as a pointer.)** See **Seed before you sweep** above; the ordering matters and the sweep does not substitute for it.
 
 **4. Then let the scheduled work maintain it.** Only once the map holds something does the contract's load-first path mean anything.
+
+**Validate the sweep against itself before trusting its counts.** A parsing sweep does not fail with an error; it returns a plausible number. One real attempt reported a tidy count of unresolved identities that was pure artifact — a fixed-size read had cut header lines mid-value, so a single identity appeared three times truncated to different lengths. A second attempt broke the opposite way and under-counted. Both looked normal.
+
+So run two controls on your own output, and treat the sweep as unusable until both hold:
+
+- **negative** — a known-bad artifact must be ABSENT (no truncated or prefix-duplicated identifiers).
+- **positive** — a known-present, high-frequency participant (the owner, typically) must appear with a plausible magnitude. A parser that silently drops most records still returns a small, tidy, wrong set.
+
+A count with neither control is an assertion, not a measurement.
 
 **When the bootstrap is unreachable — say so and route it, do not quietly skip or quietly run it.**
 
