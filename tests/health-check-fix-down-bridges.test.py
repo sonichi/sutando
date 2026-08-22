@@ -835,7 +835,7 @@ def case_s_checkout_is_canonical() -> list[str]:
         ok, why = hc._checkout_is_canonical(inner)
         if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):
             fails.append(f"s) no .git + no manifest should be UNREADABLE, got ({ok},{why})")
-        for bad in ('{bad', '{}'):
+        for bad in ('{bad', '{}', '"x"', 'true', '42', '[1]'):
             (inner.parent / "ENGINE_MANIFEST.json").write_text(bad)
             ok, why = hc._checkout_is_canonical(inner)
             if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):

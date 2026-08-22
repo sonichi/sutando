@@ -3352,9 +3352,12 @@ def _valid_engine_manifest(manifest) -> bool:
     if not manifest.is_file():
         return False
     try:
-        sha = (json.loads(manifest.read_text()) or {}).get("sha")
+        parsed = json.loads(manifest.read_text())
     except (OSError, ValueError):
         return False
+    if not isinstance(parsed, dict):
+        return False  # valid JSON scalar/list is still not a manifest
+    sha = parsed.get("sha")
     return isinstance(sha, str) and bool(sha.strip())
 
 
