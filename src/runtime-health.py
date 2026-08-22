@@ -344,6 +344,15 @@ def _write_station_cache(path, data):
         pass
 
 
+def _write_json_atomic(path, obj):
+    """`open(path, "w")` truncates before it writes, so a reader polling in that
+    window sees an empty or partial file. Swap a fully-written temp file in."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
+
 def _cache_ts(x):
     """A cache timestamp as a FINITE number, or None if missing/malformed. The
     cache is a mutable workspace state file — it can be corrupted, synced, or
@@ -629,16 +638,14 @@ def main():
     try:
         state_dir = os.path.join(ws, "state")
         os.makedirs(state_dir, exist_ok=True)
-        with open(os.path.join(state_dir, "runtime-health.json"), "w") as f:
-            json.dump(result, f, indent=2)
+        _write_json_atomic(os.path.join(state_dir, "runtime-health.json"), result)
         # The authoritative verdict (design: docs/design-core-health-verdict.md):
         # same facts as runtime-health.json plus the persistence count the gate
         # needs. Additive — consumers migrate to this file one PR at a time.
         verdict = dict(result)
         verdict["ts"] = int(time.time())
         verdict["confirm"] = _confirm_count(state_dir, result["health"], result["severity"])
-        with open(os.path.join(state_dir, "core-verdict.json"), "w") as f:
-            json.dump(verdict, f, indent=2)
+        _write_json_atomic(os.path.join(state_dir, "core-verdict.json"), verdict)
     except OSError:
         pass
     print(json.dumps(result, indent=2))
