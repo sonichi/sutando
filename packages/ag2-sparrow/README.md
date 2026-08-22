@@ -143,15 +143,19 @@ defang is applied on all three sinks regardless.
 | `BEE_EVENTS_PATH` | SSE path on the proxy (default `/v1/stream`) |
 | `BEE_EVENT_TYPES` | comma-list of SSE types to forward (default `todo-created,todo-updated`; the per-utterance stream would flood the queue) |
 | `BEE_API_BASE` / `BEE_API_TOKEN` | cloud-direct mode (vault-preferred token) |
+| `BEE_CA_FILE` | CA bundle for cloud-direct TLS — Bee's API certificate chains to a private CA, so the system trust store alone is [insufficient](https://docs.bee.computer/docs/proxy#direct-api-no-proxy); unset keeps default trust (proxy mode needs none) |
 | `BEE_BROKER_URL` / `BEE_BROKER_TOKEN` | broker sink target + bearer (agent record needs `"ingest": true`) |
 | `BEE_AGENT_ID` | relay agent whose queue receives Bee tasks |
 | `BEE_CURSOR_FILE` | resume-cursor path (required headless; defaults under the local workspace) |
 | `BEE_INBOX_FILE` | inbox sink's OWN sqlite (never share the gateway channel's inbox — its `MAX(cursor)` is that channel's resume anchor) |
-| `BEE_SINK` | `broker` (default) \| `local` \| `inbox` |
+| `BEE_SINK` | `local` (default) \| `broker` \| `inbox` |
 
-Resume: the last delivered SSE event id persists and replays as
-`Last-Event-ID` on reconnect; a failed delivery halts the stream rather than
-skipping ahead, and enqueue is idempotent by task id.
+Resume: when the stream sends SSE event ids, the last delivered one persists
+and replays as `Last-Event-ID` on reconnect — a best-effort hint only. The
+live Bee stream sends no `id:` field and Bee documents
+[realtime](https://docs.bee.computer/docs/realtime) as at-most-once, so
+delivery guarantees rest elsewhere: enqueue is idempotent by stable task id,
+and a failed delivery halts the stream rather than skipping ahead.
 
 ## Directories & single source
 

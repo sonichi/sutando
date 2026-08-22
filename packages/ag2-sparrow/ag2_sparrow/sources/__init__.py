@@ -1,4 +1,4 @@
-"""sources/ — watcher SOURCE registry (the sources/ split, owner ask 2026-08-07).
+"""sources/ — watcher SOURCE registry.
 
 One module per client-side integration; each contributes SUBSCRIBE specifics
 (stream_request/source_configured, CONFIG_KEYS/DEFAULTS/VAULT_KEYS) and a

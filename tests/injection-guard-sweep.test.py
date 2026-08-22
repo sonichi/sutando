@@ -60,8 +60,8 @@ for _f in (
         f"{_f} must call confine_user_content() on user-supplied task body",
     )
 
-# discord-bridge: enriched task body must be re-confined after Discord-state prefetch
-# (fetched channel messages are not run through confine before being prepended;
+# discord-bridge: the enriched task body must be re-confined after the
+# Discord-state prefetch (fetched channel messages arrive unconfined).
 _db = _src("src/discord-bridge.py")
 _check(
     "discord-bridge: confine_user_content(enriched) after prefetch",
@@ -315,10 +315,11 @@ _check(
 
 # ---------------------------------------------------------------------------
 # Exhaustive scan: every Python file that embeds an interpolated task: field
+# (f"task: {) must be in the known-guarded set — a trip-wire for new writers.
 
 _GUARDED_PY_WRITERS = {
-    # The centralized write side (serialize_task_last). Its guard is
-    # structural, not ZWSP-defang: header values reject newlines outright and
+    # The centralized write side (serialize_task_last): a structural guard —
+    # header values reject newlines; the body serializes after the task: line.
     "src/local_task_protocol.py",
     # Byte-identical vendored copy of the line above; same structural guard.
     "packages/ag2-sparrow/ag2_sparrow/local_task_protocol.py",
@@ -330,10 +331,10 @@ _GUARDED_PY_WRITERS = {
     "src/agent-api.py",
     "src/cron-runner.py",
     # Bee wearable lane: event_to_task confines the third-party device text
-    # (utterance/todo body) before it enters the task body; the local-sink
+    # and channel id before either enters the line-based task file.
     "packages/ag2-sparrow/ag2_sparrow/bee_watcher.py",
     # Sparrow gateway bridge: guarded by a DIFFERENT documented mechanism —
-    # every interpolated value passes _one_line() (newline-strip; header
+    # every interpolated value passes _one_line() (newline-strip).
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",
 }
 

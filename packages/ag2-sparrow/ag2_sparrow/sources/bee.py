@@ -16,14 +16,15 @@ from pathlib import Path
 SOURCE = "bee"
 
 # Config vocabulary the runner resolves (CLI > env > DEFAULTS) for this source.
+# The same keys are declared in skills/bee-actions/manifest.json for discovery.
 CONFIG_KEYS = (
     "BEE_PROXY_URL", "BEE_EVENTS_PATH", "BEE_EVENT_TYPES",
     "BEE_BROKER_URL", "BEE_BROKER_TOKEN", "BEE_AGENT_ID",
     "BEE_SINK", "BEE_API_BASE", "BEE_API_TOKEN",
+    "BEE_CURSOR_FILE", "BEE_INBOX_FILE", "BEE_CA_FILE",
 )
 VAULT_KEYS = ("BEE_BROKER_TOKEN", "BEE_API_TOKEN")
 
-# Package-owned defaults (was a skill manifest before the ag2-sparrow move).
 DEFAULTS = {
     "BEE_EVENTS_PATH": "/v1/stream",
     "BEE_EVENT_TYPES": "todo-created,todo-updated",  # conservative; utterances flood
@@ -55,7 +56,17 @@ except Exception:  # pragma: no cover - only when src/ is absent
         return "\n".join(out)
 
 
-_SAFE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,48}")
+# One id alphabet for every Bee-controlled value that becomes file/header
+# structure: task ids validate against it, other ids are confined to it.
+_SAFE_ID_CHARS = "A-Za-z0-9._-"
+_SAFE_ID_RE = re.compile(rf"[{_SAFE_ID_CHARS}]{{1,48}}")
+_UNSAFE_ID_CHAR_RE = re.compile(rf"[^{_SAFE_ID_CHARS}]")
+
+
+def _confine_id(raw: object, limit: int = 120) -> str:
+    """Confine a provider-controlled identifier to the safe id alphabet —
+    it lands on single-line `channel_id:`/`room_id` structure downstream."""
+    return _UNSAFE_ID_CHAR_RE.sub("-", str(raw)[:limit]) or "unknown"
 
 
 def _safe_task_id(raw: str) -> str:
@@ -80,6 +91,16 @@ def stream_request(cfg: dict) -> "tuple[str, dict]":
     return base.rstrip("/") + cfg["BEE_EVENTS_PATH"], headers
 
 
+def ssl_context(cfg: dict):
+    """Direct-cloud TLS: Bee's API sits behind a private CA the system trust
+    store lacks (per Bee's docs) — BEE_CA_FILE supplies it; unset = default."""
+    ca = (cfg.get("BEE_CA_FILE") or "").strip()
+    if not ca:
+        return None
+    import ssl
+    return ssl.create_default_context(cafile=ca)
+
+
 def source_configured(cfg: dict) -> bool:
     """True when either subscribe mode (proxy or cloud bearer) is configured."""
     return bool(cfg.get("BEE_PROXY_URL")
@@ -89,13 +110,10 @@ def source_configured(cfg: dict) -> bool:
 def event_to_task(etype: str, event_id: str, data: dict) -> dict:
     """NORMALIZE half: one SSE event into the relay task shape.
 
-    Field mapping pinned against a live authenticated stream (fixtures:
-    first real capture): utterance events nest text under `utterance.text`
-    with the stable id at `utterance.id`; the conversation key is
-    `conversation_uuid` (not conversation_id); and the stream sends NO SSE
-    `id:` field, so the stable entity id inside the payload is the dedupe
-    key. Unknown shapes still fall back to compact JSON — visible to the
-    core rather than dropped."""
+    Live-stream shape: text nests under `utterance.text`/`todo.text` with
+    the stable id at `.id`; the conversation key is `conversation_uuid`;
+    no SSE `id:` field is sent, so the payload's stable entity id is the
+    dedupe key. Unknown shapes fall back to compact JSON, never dropped."""
     utt = data.get("utterance") if isinstance(data.get("utterance"), dict) else {}
     todo = data.get("todo") if isinstance(data.get("todo"), dict) else {}
     text = ""
@@ -110,9 +128,8 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
 
     # Device-controlled id becomes a header line: strict allowlist, so an
     # embedded newline can never forge one.
-    conv_raw = str(data.get("conversation_uuid") or data.get("conversation_id")
-                   or data.get("id") or event_id)[:120]
-    conv = re.sub(r"[^A-Za-z0-9._:@-]", "-", conv_raw) or "unknown"
+    conv = _confine_id(data.get("conversation_uuid") or data.get("conversation_id")
+                       or data.get("id") or event_id)
     stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
     # Tier belongs to the SOURCE, not the sink: an omitted access_tier is
     # read as owner downstream, so every sink must carry it explicitly.

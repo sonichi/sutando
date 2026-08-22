@@ -5,17 +5,17 @@ Subscribes to Bee's SSE stream (local authenticated proxy, or cloud-direct
 when BEE_API_BASE+BEE_API_TOKEN are set), normalizes selected events into the
 relay task shape (`source: bee`), and delivers via the configured sink
 (broker /v1/ingest | local task files | durable EventInbox). Config
-reference: the package README, "Bee wearable source". The last delivered SSE
-id persists and replays as Last-Event-ID on reconnect — restarts never
-re-forward history; a failed delivery halts the stream (no skip-ahead)."""
+reference: the package README, "Bee wearable source". When the stream sends
+SSE ids the last delivered one replays as Last-Event-ID on reconnect — a
+best-effort hint only (the live Bee stream sends none, and Bee documents
+realtime as at-most-once); dedupe rests on stable payload task ids, and a
+failed delivery halts the stream (no skip-ahead)."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -53,33 +53,47 @@ def _config(cli: argparse.Namespace) -> dict:
     return cfg
 
 
-def _cursor_path() -> Path:
-    # BEE_CURSOR_FILE overrides the resume-cursor path (required headless —
-    # no workspace to resolve); unset resolves under the local workspace.
-    _explicit = os.environ.get("BEE_CURSOR_FILE", "").strip()
-    if _explicit:
-        return Path(_explicit)
+def _cursor_path(cfg: dict) -> Path:
+    # BEE_CURSOR_FILE (CLI > env > manifest) overrides the resume-cursor path
+    # (required headless — no state dir); unset resolves under the state dir.
+    explicit = (cfg.get("BEE_CURSOR_FILE") or "").strip()
+    if explicit:
+        return Path(explicit)
     from ag2_sparrow import _dirs
     return _dirs.state_dir() / "bee-watcher-cursor.json"
 
 
-def _read_cursor() -> str:
+def _read_cursor(cfg: dict) -> str:
     try:
-        return json.loads(_cursor_path().read_text()).get("last_event_id", "")
+        return json.loads(_cursor_path(cfg).read_text()).get("last_event_id", "")
     except (OSError, ValueError):
         return ""
 
 
-def _write_cursor(event_id: str) -> None:
-    p = _cursor_path()
+def _write_cursor(cfg: dict, event_id: str) -> None:
+    p = _cursor_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(f".json.{os.getpid()}.tmp")
     tmp.write_text(json.dumps({"last_event_id": event_id, "ts": int(time.time())}))
     os.replace(tmp, p)
 
 
+def _ledger_path(tasks_dir: Path, task_id: str) -> Path:
+    return tasks_dir / ".bee-delivered" / task_id
+
+
+def _mark_delivered(ledger: Path) -> None:
+    # Exclusive create (proactive_recovery's EEXIST idiom): the ledger entry
+    # is the durable delivery record the core's claim rename never touches.
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.close(os.open(ledger, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        pass
+
+
 def _write_local_task(task: dict) -> bool:
-    """LOCAL sink: persist the event as a task file (atomic tmp+rename).
+    """LOCAL sink: persist the event as a task file, exactly once.
 
     access_tier ambient, never owner — device-captured speech is an
     observation, not a command; privileged actions must surface, not
@@ -88,22 +102,45 @@ def _write_local_task(task: dict) -> bool:
     import datetime
     tasks_dir = _dirs.task_dir()
     tasks_dir.mkdir(parents=True, exist_ok=True)
+    # The ledger decides redelivery: artifact scans race the core's claim
+    # rename (live -> claimed-core-N), the ledger entry outlives it.
+    ledger = _ledger_path(tasks_dir, task["id"])
+    if ledger.exists():
+        return True
+    # Ledger-less artifact (pre-ledger delivery, or crash between publish
+    # and ledger write): any lifecycle copy means delivered — backfill.
+    from ag2_sparrow.task_archive import find_task_file
+    from ag2_sparrow.local_task_protocol import find_archived_task
+    if (find_task_file(tasks_dir, task["id"]) is not None
+            or find_archived_task(tasks_dir, task["id"]) is not None):
+        _mark_delivered(ledger)
+        return True
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [f"id: {task['id']}", f"timestamp: {ts}", f"task: {task['task']}",
              "source: bee", "interaction_type: message",
              f"channel_id: {task['channel_id']}", f"user_id: {task['user_id']}",
              "room_name: Bee", "priority: low", "access_tier: ambient"]
     dest = tasks_dir / f"{task['id']}.txt"
-    # Dedup on the task artifact (the delivery record) across its lifecycle:
-    # find_task_file = live + claimed-core-N; find_archived_task = archives.
-    from ag2_sparrow.task_archive import find_task_file
-    from ag2_sparrow.local_task_protocol import find_archived_task
-    if (find_task_file(tasks_dir, task["id"]) is not None
-            or find_archived_task(tasks_dir, task["id"]) is not None):
-        return True                     # already delivered — idempotent
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
-    os.replace(tmp, dest)
+    try:
+        # link, not replace: exclusive publish — a concurrent live copy wins.
+        os.link(tmp, dest)
+    except FileExistsError:
+        pass
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    _mark_delivered(ledger)
+    # Re-verify: if a claim raced the scan above, the claimed copy is already
+    # executing — retract the fresh duplicate (no-op if the claim took ours).
+    if sorted(tasks_dir.glob(f"{task['id']}.claimed-core-*.txt")):
+        try:
+            dest.unlink()
+        except FileNotFoundError:
+            pass
     return True
 
 
@@ -115,11 +152,11 @@ class _InboxSink:
     channel's MAX(cursor) resume anchor. insert() committing IS delivery;
     drain failures retry on later drains and never halt the stream."""
 
-    def __init__(self, types: set):
+    def __init__(self, types: set, cfg: dict):
         from ag2_sparrow import _dirs
         from ag2_sparrow.event_inbox import EventInbox
         from ag2_sparrow.event_consumer import EventConsumer, TaskifyHandler
-        path = os.environ.get("BEE_INBOX_FILE", "").strip() \
+        path = (cfg.get("BEE_INBOX_FILE") or "").strip() \
             or str(_dirs.state_dir() / "bee-events.db")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._inbox = EventInbox(path)
@@ -187,25 +224,27 @@ def _sse_frames(resp):
 
 def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
     wanted = {t.strip() for t in cfg["BEE_EVENT_TYPES"].split(",") if t.strip()}
-    _sink = (_InboxSink({f"bee.{t}" for t in wanted})
+    _sink = (_InboxSink({f"bee.{t}" for t in wanted}, cfg)
              if cfg.get("BEE_SINK") == "inbox" else None)
     url, base_headers = _source.stream_request(cfg)
+    ctx = _source.ssl_context(cfg)
     backoff, forwarded = 1, 0
     while True:
         headers = dict(base_headers)
-        cursor = _read_cursor()
+        cursor = _read_cursor(cfg)
         if cursor:
             headers["Last-Event-ID"] = cursor
         try:
             with urllib.request.urlopen(
-                    urllib.request.Request(url, headers=headers), timeout=300) as resp:
+                    urllib.request.Request(url, headers=headers),
+                    timeout=300, context=ctx) as resp:
                 backoff = 1
                 for etype, eid, data_raw in _sse_frames(resp):
                     if wanted and etype not in wanted:
                         # A filtered frame is consumed: advance the cursor so a
                         # long filtered run cannot stall Last-Event-ID replay.
                         if eid:
-                            _write_cursor(eid)
+                            _write_cursor(cfg, eid)
                         continue
                     try:
                         data = json.loads(data_raw)
@@ -228,8 +267,10 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
                         break
                     forwarded += 1
                     _log(f"forwarded {task['id']} ({etype}) → {cfg['BEE_AGENT_ID']}")
+                    # Best-effort resume hint only — the live Bee stream sends
+                    # no id: frames; dedupe rests on stable payload task ids.
                     if eid:
-                        _write_cursor(eid)
+                        _write_cursor(cfg, eid)
                     if max_events and forwarded >= max_events:
                         return 0
         except (urllib.error.URLError, OSError) as e:
@@ -242,10 +283,11 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    for key in ("bee_proxy_url", "bee_events_path", "bee_event_types",
-                "bee_broker_url", "bee_broker_token", "bee_agent_id",
-                "bee_sink", "bee_api_base", "bee_api_token"):
-        ap.add_argument(f"--{key.replace('_', '-')}", dest=key)
+    # Every declared config key gets a flag — the source's vocabulary IS the
+    # CLI surface, so a new key cannot silently miss the CLI leg.
+    for key in _source.CONFIG_KEYS:
+        flag = key.lower()
+        ap.add_argument(f"--{flag.replace('_', '-')}", dest=flag)
     ap.add_argument("--once", action="store_true",
                     help="process one stream connection, then exit (tests)")
     ap.add_argument("--max-events", type=int, default=0)
