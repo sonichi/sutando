@@ -58,9 +58,8 @@ _REPO = resolve_workspace()
 SEND_ALLOWED_ROOTS: tuple[str, ...] = (
     str(_REPO / "results"),
     str(_REPO / "notes"),
-    # Notes canonical home (private dir) — once saved by save_note,
-    # paths reference the private location. Both old and new paths
-    # allowed during the transition; resolver picks whichever exists.
+    # Notes canonical home: save_note writes to the private location, so both
+    # spellings stay allowed during the transition (resolver picks what exists).
     str(shared_personal_path("notes", _REPO)),
     str(_REPO / "docs"),
     # Rendered episode bundles. This tree can be a symlink out to the sync
@@ -70,10 +69,8 @@ SEND_ALLOWED_ROOTS: tuple[str, ...] = (
     str(Path.home() / "Documents" / "sutando-launch-assets"),
 )
 
-# Prefix forms — files whose realpath starts with any of these strings
-# are deliverable. Covers temp-file artifacts the agent generates
-# (`/tmp/sutando-recording-*.mov`, `/tmp/echo-screenshot-*.png`, etc.)
-# without needing to enumerate every filename.
+# Prefix forms: a file whose REALPATH starts with one of these is deliverable,
+# so agent temp artifacts need no per-filename enumeration.
 SEND_ALLOWED_PREFIXES: tuple[str, ...] = (
     "/tmp/sutando-",
     "/private/tmp/sutando-",

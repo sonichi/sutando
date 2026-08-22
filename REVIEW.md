@@ -301,6 +301,13 @@ checks:
       - '/usr/fake'
       - '/tmp/'
       - 'example.com'
+      # The send-allowlist's OWN policy data, not a host path a helper could
+      # resolve: is_path_sendable compares realpaths, and macOS resolves /tmp
+      # to /private/tmp, so both spellings must be listed or the prefix never
+      # matches. Token-specific on purpose — a bare '/private/tmp/' allow would
+      # also hide unrelated real findings.
+      - '/private/tmp/sutando-'
+      - '/private/tmp/echo-'
     # Tokens allowed ONLY when the SAME added line also carries a companion path
     # for the SAME binary — i.e. the portable candidate-list shape, never a naked
     # literal. Encoded as 'TOKEN_PREFIX :: COMPANION_PREFIX'.
