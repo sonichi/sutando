@@ -102,8 +102,8 @@ def import_a_state(root: Path) -> dict:
 
     Mapping (ruling's table): READY/QUEUED unclaimed -> C ready/; PARKED ->
     C undelivered/ with A's reason; DELIVERED -> a C terminal record carrying
-    A's persisted receipt (imported=True, no incarnation — there is no live
-    claim to bind); any CLAIMED non-terminal item -> C undelivered/ as
+    A's persisted receipt (imported=True, with a 2-part pseudo-incarnation —
+    there is no live claim to bind); any CLAIMED non-terminal item -> C undelivered/ as
     import-outcome-unknown (reconcile territory: the claim's fate is exactly
     as unknowable as a mid-delivery crash). Attempt counts carry over.
 
@@ -123,6 +123,21 @@ def import_a_state(root: Path) -> dict:
     migrated_dir = root / ".items-migrated"
     report = {"ready": 0, "parked": 0, "delivered": 0, "unknown": 0,
               "skipped": 0, "verified": False, "fenced": False}
+    # Import is defined ONLY for epoch A. Already-C is an explicit no-op;
+    # any other or unreadable epoch is another protocol's state — fail closed.
+    try:
+        epoch = read_epoch(root)
+    except (OSError, ValueError):
+        report["unmigratable"] = "epoch fence unreadable"
+        return report
+    if epoch == "C":
+        report["noop"] = "root is already C"
+        report["verified"] = True
+        report["fenced"] = True
+        return report
+    if epoch != "A":
+        report["unmigratable"] = f"epoch {epoch!r} is not A"
+        return report
     if items_dir.is_symlink():
         # A symlink-to-directory passes is_dir(): migrating THROUGH it would
         # fence this root against state that lives somewhere else. Fail closed.
@@ -157,12 +172,25 @@ def import_a_state(root: Path) -> dict:
     else:
         resume_rename_done = False
     c = DesignCClaimBackend(root, activate=True)
+    from ag2_sparrow.outbox import _safe_key as _a_key
     for f in sorted(items_dir.glob("*.json")):
+        # Every A record must be a real local regular file whose name binds
+        # to its body's item_id — a symlink or renamed record is not imported.
+        if f.is_symlink() or not f.is_file():
+            key = _safe_key(f.stem)
+            marker = c._d("undelivered") / f"{key}{SEP}import-invalid-file{SEP}import"
+            if not marker.exists():
+                marker.write_bytes(b"")
+                report["unknown"] += 1
+            else:
+                report["skipped"] += 1
+            continue
         try:
             rec = _json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             rec = None
-        if not isinstance(rec, dict) or not rec.get("item_id"):
+        if (not isinstance(rec, dict) or "item_id" not in rec
+                or not isinstance(rec["item_id"], str)):
             key = _safe_key(f.stem)
             marker = c._d("undelivered") / f"{key}{SEP}import-unreadable{SEP}import"
             if marker.exists():
@@ -170,6 +198,15 @@ def import_a_state(root: Path) -> dict:
             else:
                 marker.write_bytes(f.read_bytes() if f.exists() else b"")
                 report["unknown"] += 1
+            continue
+        if f.stem != _a_key(rec["item_id"]):
+            key = _safe_key(f.stem)
+            marker = c._d("undelivered") / f"{key}{SEP}import-name-mismatch{SEP}import"
+            if not marker.exists():
+                marker.write_bytes(f.read_bytes())
+                report["unknown"] += 1
+            else:
+                report["skipped"] += 1
             continue
         item_id = rec["item_id"]
         key = _safe_key(item_id)
@@ -212,7 +249,7 @@ def import_a_state(root: Path) -> dict:
             }, f"a-import{SEP}{key}")
             report["delivered"] += 1
         elif status == "PARKED":
-            reason = str(rec.get("reason") or "parked")[:40].replace(SEP, "-")
+            reason = _safe_component(str(rec.get("reason") or "parked")[:40])
             marker = c._d("undelivered") / f"{key}{SEP}{reason}{SEP}import"
             if marker.exists():
                 report["skipped"] += 1
@@ -241,13 +278,28 @@ def import_a_state(root: Path) -> dict:
             k = _safe_key(rec.get("item_id", f.stem))
         except (OSError, ValueError):
             k = _safe_key(f.stem)
+        from .backend_c import TOKEN_PARTS
+
+        def _valid_marker(e):
+            parts = e.name.split(SEP)
+            return parts[0] == k and len(parts) == 3
+        # Tokens count as C ownership ONLY in the full claim grammar — a
+        # prefix-matching junk name must fail verification, not satisfy it.
+        raw_tokens = c._tokens(k)
+        valid_tokens = [t for t in raw_tokens
+                        if len(t.name.split(SEP)) == TOKEN_PARTS]
         present = ((c._d("ready") / k).exists()
                    or c._terminal_path(k).exists()
-                   or any(e.name.startswith(f"{k}{SEP}")
+                   or any(_valid_marker(e)
                           for e in c._d("undelivered").iterdir())
-                   or any(e.name.startswith(f"{k}{SEP}")
+                   or any(_valid_marker(e)
                           for e in c._d("archive").iterdir())
-                   or c._tokens(k))
+                   or valid_tokens)
+        if raw_tokens and not valid_tokens:
+            report.setdefault("malformed_tokens", []).extend(
+                t.name for t in raw_tokens[:3])
+            missing.append(k)
+            continue
         if not present:
             missing.append(k)
     if missing:
@@ -345,7 +397,17 @@ def dual_read(root: Path, item_id: str) -> "dict | None":
                 return
             tmp = counter.with_suffix(f".{os.getpid()}.{_time.time_ns()}.tmp")
             tmp.write_text(_json.dumps(payload), encoding="utf-8")
+            fd = os.open(tmp, os.O_RDONLY)
+            try:
+                os.fsync(fd)                 # data durable before it is named
+            finally:
+                os.close(fd)
             os.replace(tmp, counter)
+            dfd = os.open(counter.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)                # the rename itself is durable
+            finally:
+                os.close(dfd)
 
     # Liveness marker: count 0 turns "file absent" from an assumed-benign
     # state into "dual_read never ran here", which the release gate warns on.

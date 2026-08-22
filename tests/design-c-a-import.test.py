@@ -427,5 +427,101 @@ with tempfile.TemporaryDirectory() as td:
         check(isinstance(after, int) and not isinstance(after, bool) and after >= 1,
               f"malformed counter ({label}): repaired to valid int ({after})")
 
+
+# ── reviewer r2 permanent controls (kewei) ────────────────────────────────────
+
+# 1) epoch gate: B and garbage fail closed; already-C is an explicit no-op
+with tempfile.TemporaryDirectory() as td:
+    for label, ep in (("B", "B"), ("garbage", "garbage")):
+        root = Path(td) / f"r-{label}"
+        a = DesignAClaimBackend(root)
+        a.publish("x-1", b"body")
+        (root / "protocol-epoch").write_text(ep)
+        rep = import_a_state(root)
+        check("unmigratable" in rep and not rep["fenced"] and not rep["verified"],
+              f"epoch {label!r}: import refuses, nothing fenced ({rep})")
+        check(read_epoch(root) == ep, f"epoch {label!r} is left untouched")
+    root = Path(td) / "r-c"
+    root.mkdir(); (root / "protocol-epoch").write_text("C")
+    rep = import_a_state(root)
+    check(rep.get("noop") and rep["verified"] and rep["fenced"],
+          "already-C root: explicit no-op, no state touched")
+
+# 2) malformed token must FAIL verification, never satisfy membership
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "r-tok"
+    a = DesignAClaimBackend(root)
+    a.publish("real-1", b"payload")
+    from ag2_sparrow.delivery_core.backend_c import INFLIGHT
+    from ag2_sparrow.delivery_core.backend_c import _safe_key as _ck
+    k = _ck("real-1")
+    infl = root / INFLIGHT
+    infl.mkdir(parents=True, exist_ok=True)
+    (infl / f"{k}~junk").write_text("")      # 2 parts, not TOKEN_PARTS
+    rep = import_a_state(root)
+    check(not rep["fenced"],
+          f"malformed token: fence is NOT written ({rep})")
+    check("malformed_tokens" in rep or "missing" in rep,
+          "malformed token: named in the report, not silently absorbed")
+
+# 3) per-record symlink is quarantined, never followed
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "r-sym"
+    a = DesignAClaimBackend(root)
+    a.publish("good-1", b"fine")
+    outside = Path(td) / "outside.json"
+    outside.write_text('{"item_id": "evil-1", "status": "QUEUED", "payload": "x"}')
+    (root / ".items" / "evil.json").symlink_to(outside)
+    rep = import_a_state(root)
+    check(rep["unknown"] >= 1, f"symlinked record is quarantined ({rep})")
+
+# 3b) filename<->item_id binding: a renamed record does not import as-is
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "r-bind"
+    a = DesignAClaimBackend(root)
+    a.publish("orig-1", b"fine")
+    items = root / ".items"
+    recs = sorted(items.glob("*.json"))
+    recs[0].rename(items / "someothername.json")
+    rep = import_a_state(root)
+    check(rep["unknown"] >= 1 and not any(
+        (root / "ready").glob("*")) if (root / "ready").exists() else rep["unknown"] >= 1,
+        f"name-mismatched record is quarantined, not imported ({rep})")
+
+# 4) contract-valid A values migrate: empty-string id + slash reason
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "r-legal"
+    a = DesignAClaimBackend(root)
+    a.publish("", b"empty-id body")
+    a.publish("held-1", b"held")
+    a.park("held-1", "operator/hold")
+    rep = import_a_state(root)
+    check(rep["verified"] and rep["fenced"],
+          f"empty id + slash reason both import and verify ({rep})")
+    check(rep["ready"] >= 1, "empty-string item id landed in ready")
+    check(rep["parked"] >= 1, "operator/hold parked marker written (encoded)")
+
+# 5) counter durability: fsync(temp) precedes replace; dir fsync after
+import os
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "r-fsync"
+    a = DesignAClaimBackend(root)
+    a.publish("f-1", b"x")
+    import_a_state(root)
+    calls = []
+    _real_fsync, _real_replace = os.fsync, os.replace
+    os.fsync = lambda fd: (calls.append("fsync"), _real_fsync(fd))[1]
+    os.replace = lambda a_, b_: (calls.append("replace"), _real_replace(a_, b_))[1]
+    try:
+        dual_read(root, "f-1")               # counter hit -> RMW
+    finally:
+        os.fsync, os.replace = _real_fsync, _real_replace
+    check("fsync" in calls and "replace" in calls,
+          f"counter RMW calls both fsync and replace ({calls})")
+    if "replace" in calls:
+        ri = calls.index("replace")
+        check("fsync" in calls[:ri] and "fsync" in calls[ri+1:],
+              f"ordering: fsync(temp) BEFORE replace, dir fsync AFTER ({calls})")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
