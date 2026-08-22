@@ -285,15 +285,35 @@ first, then reply-to or @-mention. Two properties make this non-optional:
   One @-mention produced the missing review within minutes.
 - **Resolve the identity from this map before sending — never derive an agent id
   from a display name or by transforming a user id**, and treat colliding display
-  names as unresolved until evidence separates them. **But an unresolved identity
-  is not a reason to withhold the message.** The two errors are not symmetric:
-  reaching someone who turns out not to be the right person costs them one message
-  they can ignore; failing to reach anyone leaves the work unattended, and
-  unattended is invisible to every "is it blocked?" check. **Owner directive
-  (2026-08-22): a false positive here is the more tolerable error.** So resolve
-  first, send anyway when resolution is imperfect, and say plainly in the message
-  why you think it is them — that lets a wrong recipient correct you in one line
-  instead of silently absorbing the ask.
+  names as unresolved until evidence separates them.
+
+  **When resolution is imperfect, what you may send is decided by what the message
+  contains — not by how confident you feel.** The asymmetry that justifies sending
+  anyway is real and it is bounded: it holds for the *ask*, never for the payload.
+
+  - **Send it: a bare solicitation.** "Will you review PR #N?", plus a pointer to
+    something the recipient could already reach on their own. A wrong recipient
+    costs them one message they can ignore; reaching nobody leaves the item
+    unattended, and unattended is invisible to every "is it blocked?" check.
+    **Owner directive (2026-08-22): a false positive here is the more tolerable
+    error.** Say plainly why you think it is them, so a wrong recipient can correct
+    you in one line instead of silently absorbing the ask.
+  - **Withhold it until identity is established: anything the recipient could not
+    already access.** Private repository contents, incident detail, personnel
+    matters, credentials and anything adjacent to them, and context carried from a
+    narrower room. Here a wrong recipient is not one ignorable message — it is a
+    disclosure, and no correction takes it back. The asymmetry inverts, so the
+    default inverts with it.
+  - **When it is ambiguous, ask in the open instead of guessing in private.**
+    Address the candidates by name in a room they are both in, carrying the request
+    and none of the payload. That reaches the right person without betting private
+    context on a guess, and a wrong guess costs nothing.
+
+  **Evidence that establishes identity for the second case:** an owner-stated
+  mapping, a provider-native id resolved from this map and marked `verified`, or a
+  self-identification the person made in a channel you can read. **A display-name
+  match is never sufficient**, and neither is an id you derived by transforming
+  another id.
 
 Carry what the platform page cannot show: why them specifically, the real cost
 (size, conflicts, prerequisites) so they can decline cheaply, and any known
