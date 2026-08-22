@@ -333,6 +333,81 @@ with tempfile.TemporaryDirectory() as td:
     check(not (be.root / "ready" / ke).exists(),
           'empty item_id: NOT re-armed for redelivery')
 
+    # ── ROUND-4 CONTROLS (keweichen) ───────────────────────────────────
+    # 1. Strict M-D recovery barriers the archive dir BEFORE the claim dies.
+    b20 = fresh(td, "strict-md", durability="strict")
+    b20.publish("item-20", b"p")
+    tok20 = b20.claim("item-20", "w0")
+    k20 = _safe_key("item-20")
+    (b20.root / "archive" / f"{k20}.json").write_text(json.dumps(
+        {"schema": 1, "item_id": "item-20", "outcome": "confirmed",
+         "receipt": {"provider": "P", "destination": "D"},
+         "completed_ns": time.time_ns(), "worker": "w0", "attempts": 0,
+         "incarnation": tok20.incarnation}))
+    barriers = []
+    orig_barrier = b20._strict_dir_barrier
+    b20._strict_dir_barrier = lambda: barriers.append(
+        (b20.root / "inflight" / tok20.incarnation).exists()) or orig_barrier()
+    rep20 = b20.recover()
+    b20._strict_dir_barrier = orig_barrier
+    check(k20 in rep20.retired, "strict M-D: claim retired")
+    check(len(barriers) >= 1 and barriers[0] is True,
+          "strict M-D: archive dir barrier fires BEFORE the claim unlink")
+
+    # 2a. An empty receipt {} never authorizes retirement nor reads as proof.
+    b21 = fresh(td, "empty-receipt")
+    b21.publish("item-21", b"p")
+    tok21 = b21.claim("item-21", "w0")
+    k21 = _safe_key("item-21")
+    (b21.root / "archive" / f"{k21}.json").write_text(json.dumps(
+        {"schema": 1, "item_id": "item-21", "outcome": "confirmed",
+         "receipt": {}, "completed_ns": time.time_ns(), "worker": "w0",
+         "attempts": 0, "incarnation": tok21.incarnation}))
+    rep21 = b21.recover()
+    check(k21 not in rep21.retired
+          and (b21.root / "inflight" / tok21.incarnation).exists(),
+          "empty receipt: live claim survives (not writer-produced)")
+    check(b21.terminal_record("item-21") is None,
+          "empty receipt: never returned as terminal proof")
+
+    # 2b. A malformed record beside a valid one: reads return the valid one
+    #     and never raise on unsortable metadata.
+    b22 = fresh(td, "malformed-read")
+    b22.publish("item-22", b"p")
+    b22.complete(b22.claim("item-22", "w0"), DeliveryOutcome.CONFIRMED,
+                 provider="P", destination="D")
+    k22 = _safe_key("item-22")
+    (b22.root / "archive" / f"{k22}{SEP}999.json").write_text(json.dumps(
+        {"schema": 1, "item_id": "item-22", "outcome": "confirmed",
+         "receipt": {"provider": "P", "destination": "D"},
+         "completed_ns": "newest", "worker": "w0", "attempts": 0,
+         "incarnation": "bogus"}))
+    try:
+        rec22 = b22.terminal_record("item-22")
+        raised = False
+    except TypeError:
+        rec22, raised = None, True
+    check(not raised, "malformed completed_ns: read does not raise")
+    check(rec22 is not None and rec22["receipt"]["provider"] == "P",
+          "malformed record beside valid: the VALID one is returned")
+
+    # 3. A token whose item_id does not bind to the incarnation key is
+    #    refused before any mutation.
+    b23 = fresh(td, "unbound-token")
+    b23.publish("item-23", b"p")
+    tok23 = b23.claim("item-23", "w0")
+    from ag2_sparrow.delivery_core.contract import ClaimToken
+    forged = ClaimToken(item_id="different-item", worker="w0",
+                        incarnation=tok23.incarnation)
+    ok23 = b23.complete(forged, DeliveryOutcome.CONFIRMED,
+                        provider="P", destination="D")
+    check(ok23 is False, "unbound token: complete() refuses")
+    check((b23.root / "inflight" / tok23.incarnation).exists(),
+          "unbound token: claim intact, nothing archived")
+    check(b23.terminal_record("different-item") is None
+          and b23.terminal_record("item-23") is None,
+          "unbound token: no unfindable receipt was written")
+
     # ── durability=lax skips fsync but keeps the protocol shape ────────
     b7 = fresh(td, "lax", durability="lax")
     b7.publish("item-7", b"p")
