@@ -80,29 +80,72 @@ for prim, owners in OWNERS.items():
     check(not missing,
           f"{prim}: every pinned owner still defines it (gone: {sorted(missing)})")
 
-# ── claim-backend INSTANTIATION is injected, never improvised (ratchet) ────
-# Discord's proactive leg is pinned migration debt, not precedent.
-inst_sites: set[str] = set()
-for f in scan_files:
-    try:
-        tree = ast.parse(f.read_text(), filename=str(f))
-    except SyntaxError:
-        continue
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            fn = node.func
-            name = fn.id if isinstance(fn, ast.Name) else (
-                fn.attr if isinstance(fn, ast.Attribute) else None)
-            if name in ("DesignAClaimBackend", "DesignCClaimBackend"):
-                inst_sites.add(rel(f))
+# ── claim-backend INSTANTIATION ratchet: site identity is (path, enclosing
+#    function, constructor) with multiplicity — file-level sanction is too wide ──
+def scan_instantiations(sources: dict) -> dict:
+    out: dict[str, int] = {}
+    for path, text in sources.items():
+        try:
+            tree = ast.parse(text, filename=path)
+        except SyntaxError:
+            continue
 
+        def visit(node, enclosing):
+            for child in ast.iter_child_nodes(node):
+                enc = enclosing
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    enc = child.name
+                if isinstance(child, ast.Call):
+                    fn = child.func
+                    name = fn.id if isinstance(fn, ast.Name) else (
+                        fn.attr if isinstance(fn, ast.Attribute) else None)
+                    if name in ("DesignAClaimBackend", "DesignCClaimBackend"):
+                        key = f"{path}::{enclosing}::{name}"
+                        out[key] = out.get(key, 0) + 1
+                visit(child, enc)
+
+        visit(tree, "<module>")
+    return out
+
+
+def instantiation_violations(found: dict, owners: dict) -> list[str]:
+    bad = [f"{k} x{n}" for k, n in sorted(found.items()) if k not in owners]
+    bad += [f"{k} x{n} (pinned x{owners[k]})" for k, n in sorted(found.items())
+            if k in owners and n > owners[k]]
+    return bad
+
+
+prod_sources = {rel(f): f.read_text() for f in scan_files}
 INSTANTIATION_OWNERS = {
-    "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",  # _delivery_core()
-    "src/discord-bridge.py",  # proactive-leg migration debt, ratcheted
+    "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py::_delivery_core::DesignAClaimBackend": 1,
+    # Discord's proactive leg is pinned migration debt, not precedent.
+    "src/discord-bridge.py::_proactive_fence::DesignAClaimBackend": 1,
 }
-extra_inst = inst_sites - INSTANTIATION_OWNERS
-check(not extra_inst,
-      f"claim backends instantiated only at sanctioned sites (new: {sorted(extra_inst)})")
+viol = instantiation_violations(scan_instantiations(prod_sources),
+                                INSTANTIATION_OWNERS)
+check(not viol,
+      f"claim backends instantiated only at pinned (file,function) sites: {viol}")
+
+# ── CONTROL (kewei P1): a SECOND leg inside an already-sanctioned file must
+#    fail and name the site — file-level sanction cannot absorb it ──────────
+_db = "src/discord-bridge.py"
+mutated = dict(prod_sources)
+mutated[_db] = prod_sources[_db] + (
+    "\n\ndef _second_leg_control():\n"
+    "    return DesignCClaimBackend('improvised')\n")
+mviol = instantiation_violations(scan_instantiations(mutated),
+                                 INSTANTIATION_OWNERS)
+check(any("_second_leg_control::DesignCClaimBackend" in v for v in mviol),
+      "same-file second-leg mutation FAILS the gate and names its site")
+# multiplicity control: a SECOND call in the SAME sanctioned function trips x-count
+mutated2 = dict(prod_sources)
+mutated2[_db] = prod_sources[_db] + (
+    "\n\ndef _proactive_fence():\n"
+    "    DesignAClaimBackend('one'); DesignAClaimBackend('two')\n")
+mviol2 = instantiation_violations(scan_instantiations(mutated2),
+                                  INSTANTIATION_OWNERS)
+check(any("_proactive_fence::DesignAClaimBackend x3 (pinned x1)" in v for v in mviol2),
+      "multiplicity ratchet: extra calls under a pinned key exceed its count")
 
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
