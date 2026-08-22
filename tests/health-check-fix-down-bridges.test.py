@@ -835,10 +835,15 @@ def case_s_checkout_is_canonical() -> list[str]:
         ok, why = hc._checkout_is_canonical(inner)
         if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):
             fails.append(f"s) no .git + no manifest should be UNREADABLE, got ({ok},{why})")
+        for bad in ('{bad', '{}'):
+            (inner.parent / "ENGINE_MANIFEST.json").write_text(bad)
+            ok, why = hc._checkout_is_canonical(inner)
+            if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):
+                fails.append(f"s) manifest {bad!r} should be UNREADABLE, got ({ok},{why})")
         (inner.parent / "ENGINE_MANIFEST.json").write_text('{"sha": "x"}')
         ok, why = hc._checkout_is_canonical(inner)
         if ok or not why.startswith(hc.CHECKOUT_NONGIT):
-            fails.append(f"s) manifest bundle should report {hc.CHECKOUT_NONGIT!r}, got ({ok},{why})")
+            fails.append(f"s) valid manifest bundle should report {hc.CHECKOUT_NONGIT!r}, got ({ok},{why})")
         broken = Path(td) / "broken"
         broken.mkdir()
         (broken / ".git").symlink_to(Path(td) / "gone")

@@ -3345,6 +3345,19 @@ CHECKOUT_UNREADABLE = "git state unreadable"
 CHECKOUT_NONGIT = "non-git install"
 
 
+def _valid_engine_manifest(manifest) -> bool:
+    """The same three criteria check_engine_revision_drift applies: a regular
+    file, readable JSON object, non-empty sha. Existence alone is not provenance."""
+    manifest = Path(manifest)
+    if not manifest.is_file():
+        return False
+    try:
+        sha = (json.loads(manifest.read_text()) or {}).get("sha")
+    except (OSError, ValueError):
+        return False
+    return isinstance(sha, str) and bool(sha.strip())
+
+
 def _checkout_is_canonical(repo_dir) -> tuple:
     """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?"""
     # Decided BEFORE any git call, and the bundle exception needs POSITIVE
@@ -3354,9 +3367,9 @@ def _checkout_is_canonical(repo_dir) -> tuple:
         if os.path.lexists(git_meta):
             # A name that resolves nowhere is damaged metadata, not a bundle.
             return (False, f"{CHECKOUT_UNREADABLE} (.git is a broken link)")
-        if (Path(repo_dir).parent / "ENGINE_MANIFEST.json").exists():
+        if _valid_engine_manifest(Path(repo_dir).parent / "ENGINE_MANIFEST.json"):
             return (False, f"{CHECKOUT_NONGIT} (bundled engine manifest present)")
-        return (False, f"{CHECKOUT_UNREADABLE} (no .git and no engine manifest)")
+        return (False, f"{CHECKOUT_UNREADABLE} (no .git and no valid engine manifest)")
     try:
         # Route through git_argv, never a bare "git": a bare-string PATH lookup resolves to
         # the /usr/bin/git SHIM on a macOS host without the Xcode command line tools, which

@@ -129,6 +129,20 @@ def main() -> int:
               f"no .git AND no manifest is UNREADABLE, not a bundle ({why_bare})")
         allowed_bare, _ = hc.stale_restart_allowed(bare)
         check(allowed_bare is False, "and the stale path refuses it (fail-closed)")
+        # Existence is not provenance: dir / corrupt JSON / sha-less all refuse.
+        (engine / "ENGINE_MANIFEST.json").mkdir()
+        ok_d, why_d = hc._checkout_is_canonical(bare)
+        check(ok_d is False and why_d.startswith(hc.CHECKOUT_UNREADABLE),
+              f"a DIRECTORY at the manifest path is not provenance ({why_d})")
+        check(hc.stale_restart_allowed(bare)[0] is False,
+              "and the stale path refuses the directory-manifest checkout")
+        (engine / "ENGINE_MANIFEST.json").rmdir()
+        (engine / "ENGINE_MANIFEST.json").write_text('{bad')
+        check(hc.stale_restart_allowed(bare)[0] is False,
+              "corrupt-JSON manifest refuses")
+        (engine / "ENGINE_MANIFEST.json").write_text('{}')
+        check(hc.stale_restart_allowed(bare)[0] is False,
+              "sha-less manifest refuses")
         (engine / "ENGINE_MANIFEST.json").write_text('{"sha": "abc"}')
         ok_ng, why_ng = hc._checkout_is_canonical(bare)
         check(ok_ng is False and why_ng.startswith(hc.CHECKOUT_NONGIT),
