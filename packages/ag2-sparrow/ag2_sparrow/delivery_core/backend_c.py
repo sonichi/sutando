@@ -399,7 +399,8 @@ class DesignCClaimBackend:
                 # Only the exact legacy grammar (regular file, incarnation+
                 # SEP+nanos) is rename-atomic evidence; prefix-shares are not.
                 suffix = f.name[len(incarnation):]
-                if f.is_file() and suffix.startswith(SEP)                         and suffix[len(SEP):].isdigit():
+                # is_file() follows symlinks; a symlink is never rename-atomic.
+                if not f.is_symlink() and f.is_file() and suffix.startswith(SEP)                         and suffix[len(SEP):].isdigit():
                     return True
                 continue
             if not (f.name.startswith(f"{key}") and f.suffix == ".json"):
