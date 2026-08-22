@@ -37,6 +37,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+# Imported before the stub replaces sys.modules: it hands back the real gate.
+from proactive_routing import redirect_target_is_foreign as _real_redirect_target_is_foreign  # noqa: E402
+
 FAILURES: list[str] = []
 
 
@@ -100,6 +103,8 @@ def _run_one_pass(results: Path, send):
     routing.should_claim_proactive = lambda *_a, **_k: True
     routing.should_claim_proactive_file = lambda *_a, **_k: True
     routing.proactive_destination = lambda *_a, **_k: None
+    # Stubbed routing claims every file; redirect_target_is_foreign stays REAL.
+    routing.redirect_target_is_foreign = _real_redirect_target_is_foreign
     sys.modules["proactive_routing"] = routing
 
     class _DM:
