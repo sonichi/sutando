@@ -225,7 +225,9 @@ For a material update, return only what changed:
 
 ## Runtimes
 
-Runtime-neutral. **Claude Code and Codex** — the two runtimes Sutando supports —
-load this skill from the SKILL.md front-matter above; the `name` + `description`
-drive implicit invocation. Nothing in the body assumes a specific host, so
-behavior is identical across them.
+Nothing in the body assumes a specific host — but *reachability* is not runtime-neutral, and the two supported runtimes differ today:
+
+- **Claude Code — installed.** `skills/install.sh` links every repo directory containing a `SKILL.md` into the Claude skills directory (`sutando-config.sh claude-home-path skills`), so this skill is discovered there and its `name` + `description` drive implicit invocation.
+- **Codex — NOT installed by anything in this repo.** No installer places repo skills into a Codex-discovered skill root; the Codex launcher sets `CODEX_HOME` and otherwise invokes individual skill *scripts* by absolute path, which is direct execution, not skill discovery. Under Codex this file is reachable only if a human or a procedure reads it explicitly.
+
+That gap predates this skill and applies to every repo skill, so closing it is adapter-edge installer work, not a change to make here. Until it is closed, do not assume a Codex-runtime agent has this skill loaded — put the invocation in a procedure that runtime already executes, exactly as **Firing without being asked** above requires for the same underlying reason.
