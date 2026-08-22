@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The build_log snapshot must never clobber an independently-written per-host
-# copy — ownership is decided by recorded provenance, never by mtime.
+# The build_log snapshot must not clobber a per-host copy it can DETECT — ownership
+# is provenance, never mtime. An already-open descriptor is not detectable.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 fails=0
@@ -94,10 +94,8 @@ rm -f "$WORKSPACE_DIR/hosts/testhost/build_log.md" \
       "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 _snapshot_per_host_config
 printf 'root advanced\n' > "$WORKSPACE_DIR/build_log.md"
-# Inject a concurrent per-host append EXACTLY ONCE, right after the ownership
-# hash of the destination — the check->replace window the reviewer exercised.
-# Wrapping shasum lets the append land after _cur is computed but before the
-# copy, identically for the fixed and the pre-fix function.
+# Injects once, right after the ownership hash. This covers only the check->replace
+# window; an fd opened BEFORE the snapshot and written after is out of its reach.
 rm -f "$SB/.injected"
 shasum() {
     local _o; _o="$(command shasum "$@")"

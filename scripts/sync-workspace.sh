@@ -843,12 +843,8 @@ _snapshot_per_host_config() {
         cp -p "$_ch" "$_host_dir/channels/$_svc/access.json" 2>/dev/null || true
     done
 
-    # One-writer contract: the per-host copy is OURS only while it still holds
-    # exactly what this snapshot last wrote (provenance, never mtime). The
-    # replace is atomic (temp + rename) and gated on a re-hash of the dest
-    # taken after staging: a writer that grew the file since the ownership
-    # check flips that gate and we refuse, so a concurrent live write can
-    # never be erased by the copy.
+    # Ownership is provenance, never mtime. The re-hash before the swap refuses a
+    # writer that CHANGED the file; a writer holding an open fd is undetectable.
     if [ -f "$WORKSPACE_DIR/build_log.md" ]; then
         local _src="$WORKSPACE_DIR/build_log.md"
         local _dst="$_host_dir/build_log.md" _sig="$_host_dir/.build_log.snapshot-sha"
@@ -856,16 +852,12 @@ _snapshot_per_host_config() {
         [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
         [ -f "$_sig" ] && _rec="$(cat "$_sig" 2>/dev/null)"
         if [ -f "$_dst" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
-            # Equal content is always safe to (re-)own: repair a missing OR
-            # stale provenance sha so an interrupted publish self-heals, and
-            # skip the copy — there is nothing to propagate.
+            # Equal content is safe to re-own: repair a missing or stale sha so an
+            # interrupted publish self-heals. Nothing to propagate.
             [ "$_cur" != "$_rec" ] && printf '%s\n' "$_cur" > "$_sig" 2>/dev/null || true
         elif [ ! -f "$_dst" ] || { [ -n "$_rec" ] && [ "$_cur" = "$_rec" ]; }; then
-            # Absent, or ours (still hashes to the recorded sha) -> refresh.
-            # Stage to a temp on the same dir, then swap ONLY if the dest still
-            # matches what we hashed above; else a live writer touched it and we
-            # refuse. The sha is taken from the staged temp, never a post-swap
-            # re-read of the dest.
+            # Ours or absent -> stage beside the dest, swap only if the dest still
+            # matches. The recorded sha comes from the temp, never a post-swap read.
             local _tmp
             _tmp="$(mktemp "${_dst}.snap.XXXXXX" 2>/dev/null)" || _tmp=""
             if [ -n "$_tmp" ] && cp -p "$_src" "$_tmp" 2>/dev/null; then
