@@ -223,7 +223,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    subject and a dropped redirect cannot satisfy it:
 
    ```python
-   MARK  = f"step7-{ts}"                     # UNIQUE PER WRITE — ts is already in scope
+   MARK  = f"step7-{uuid.uuid4().hex[:12]}"  # UNIQUE BY CONSTRUCTION, not by circumstance
    entry = f"### {ts} — ...  [{MARK}]\n..."  # interpolated into what is WRITTEN
    p.write_text(p.read_text() + entry)
    assert p.read_text().count(MARK) == 1     # reads the FILE, never the terminal
@@ -235,6 +235,13 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    the pass with it. With `ts` in the marker, `== 1` means *this entry landed exactly once*; with a
    constant it means *this log has been written to exactly once ever*, which is a different claim
    and almost always false.
+
+   **Do not reach for a timestamp here.** `f"step7-{ts}"` is unique only by *circumstance* — it
+   holds while the clock is fine-grained enough and the writes are far enough apart, and collides
+   the moment two appends land in the same tick. At minute granularity that is an ordinary loop
+   pass. A random marker has no such premise. And confirm the check can still FAIL: re-append the
+   same marker deliberately and watch `count` reach 2, or you have a probe that passes by
+   construction, which certifies nothing.
 
    `== 1`, not `> 0` — a 300 KB log may already contain the phrase somewhere else. And check that
    the probe can produce a positive at all: a marker matching nothing scores 0 by construction and
