@@ -321,10 +321,15 @@ _l.run = lambda specs, sd: (_calls.append((specs, sd)), 0)[1]
 check(_l.main() == 0 and _calls and str(_calls[0][1]).endswith("state/sparrowd"),
       "main() wires worker_specs into run with the workspace state dir")
 
-# adapter edge: the package shell names no concrete worker or gateway
+# adapter edge: forbidden set derives from the adapter's specs so the
+# guard grows with the worker list; static tokens have no spec-side source.
 pkg = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "sparrowd.py").read_text()
-for tok in ("remote-gateway-bridge", "remote_gateway_bridge", "chat.ag2.space",
-            "discord", "telegram"):
+_forbidden = {"chat.ag2.space", "discord", "telegram"}
+for _s in _specs:
+    _forbidden.add(_s.name)
+    _forbidden.add(_s.name.replace("-", "_"))
+    _forbidden.add(Path(_s.argv[1]).name)
+for tok in sorted(_forbidden):
     check(tok not in pkg, f"package shell never names {tok!r} (specs injected)")
 
 # ...and the launcher (the adapter) is where the concrete worker lives

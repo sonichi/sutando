@@ -171,7 +171,7 @@ class Supervisor:
         for p in procs:
             try:
                 p.send_signal(signal.SIGTERM)
-            except OSError:
+            except OSError:  # pragma: no cover - worker died between poll and signal
                 pass
         deadline = self._clock() + grace_s
         for p in procs:
@@ -258,7 +258,7 @@ class ControlServer:
         if self._srv is not None:
             try:
                 self._srv.close()
-            except OSError:
+            except OSError:  # pragma: no cover - already-closed socket on double close
                 pass
         try:
             self._path.unlink()
