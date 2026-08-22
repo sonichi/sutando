@@ -1,6 +1,6 @@
 ---
 name: collaboration-intelligence
-description: Maintain and use a cross-channel collaboration map of rooms, people, agents, agent owners, relationships, expertise, feature ownership, purpose, roster, priority/VIP handling, and recent context. Trigger when an incoming task or message includes room/channel/sender/member metadata; the user asks who is in a room, what it is for, who owns or knows a component, where to ask, whom to contact or cc, or what recent context matters; you must coordinate, delegate, hand off, or escalate work to a person or agent; a participant is unfamiliar, ambiguous, or explicitly designated VIP/priority; identities must be reconciled across AG2 Space/Matrix, Discord, Telegram, Slack, WhatsApp, email, GitHub, or another bridge; or a roster needs incremental refresh or sweep. Do not trigger for generic communication-platform questions or drafting that does not depend on room, identity, relationship, or collaboration context.
+description: Maintain and use a cross-channel collaboration map of rooms, people, agents, agent owners, relationships, expertise, feature ownership, purpose, roster, priority/VIP handling, and recent context. Trigger when an incoming task or message includes room/channel/sender/member metadata; the user asks who is in a room, what it is for, who owns or knows a component, where to ask, whom to contact or cc, or what recent context matters; you must coordinate, delegate, hand off, or escalate work to a person or agent — including when the task is phrased as an action you already know how to perform ("find a reviewer", "chase reviewers", "找reviewer", "ask someone to look at this", "who should I assign"), since naming it as a familiar action is how this trigger gets missed; a merge or approval gate reports a PR queued on nobody, short of the approvals its branch rule requires, or carrying an approval that is stale against the current head; a participant is unfamiliar, ambiguous, or explicitly designated VIP/priority; identities must be reconciled across AG2 Space/Matrix, Discord, Telegram, Slack, WhatsApp, email, GitHub, or another bridge; or a roster needs incremental refresh or sweep. Do not trigger for generic communication-platform questions or drafting that does not depend on room, identity, relationship, or collaboration context.
 ---
 
 # Collaboration Intelligence
@@ -17,6 +17,24 @@ When triggered implicitly:
 4. Keep routine bookkeeping silent. Surface only unknown identities, conflicts, stale facts, scope risks, or collaboration recommendations that affect the task.
 
 Do not scan every connected service merely because the skill triggered. Expand to another room or provider only when the current task requires it.
+
+## Firing without being asked
+
+A skill description is matched against how you *framed* the task, and that is exactly what fails. Measured: this description already said "you must coordinate, delegate, hand off, or escalate work to a person or agent" when an agent went to recruit PR reviewers — the case it literally names — and it did not fire, because the agent had named the task "chase reviewers" (an action it already knew how to perform) rather than "choose collaborators" (a decision needing a map). Adding trigger phrases does not fix that; a re-framed task evades any phrase list.
+
+So do not rely on description matching alone. **Hook invocation to observable state, which does not depend on how anything was framed.** Each of these is a computed fact some routine already produces:
+
+| Observable state | Why it is a collaboration-intent signal |
+|---|---|
+| A merge gate reports a PR queued on nobody, or on nobody who can act | "Assigned to no one" is indistinguishable from "waiting on review" in every UI. Only the gate can tell them apart. |
+| Approvals present but fewer than the branch rule requires | The gap is arithmetic, not intuition — who closes it is the map's question. |
+| An approval exists but is stale against the current head | The tick is real and describes a head nobody reviewed; someone specific must be re-asked. |
+| An identity appears that no stable ID in the map resolves | Resolve before addressing, never after. |
+| A request is about to go out addressed to nobody | Publishing is fine unaddressed; asking is not. |
+
+The rule to carry: **when a routine you are already running computes one of these, invoke this skill from that routine** — as a step, not as a hope that the description matches. A step executes regardless of framing; a description does not. Bound it to once per (subject, state-change) so a standing gap does not re-fire on every pass.
+
+The same measurement makes the weaker path explicit, and it is worth stating plainly rather than implying the trigger is solved: on the night this was written, the gate had *already printed* the queued-on-nobody verdict before the agent acted, and the agent still did not invoke the skill. A signal nothing is obliged to read changes nothing.
 
 ## Operating contract
 
