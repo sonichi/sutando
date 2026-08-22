@@ -92,24 +92,41 @@ def scan_instantiations(sources: dict) -> dict:
             tree = ast.parse(text, filename=path)
         except SyntaxError:
             continue
-        # Aliases count as the constructor they bind (fail-closed): a local
-        # `Backend = DesignCClaimBackend` must not reopen the construction gate.
+        # Aliases count as the constructor they bind, resolved TRANSITIVELY
+        # to a fixed point over Assign+AnnAssign (fail-closed rebinding).
         alias: dict[str, str] = {}
+        pending: list = []
         for node in ast.walk(tree):
+            tgt = rhs = None
             if isinstance(node, ast.Assign):
-                # Name RHS (Backend = DesignCClaimBackend) and qualified
-                # Attribute RHS (Backend = dc.DesignCClaimBackend) both bind.
                 rhs = node.value
-                ctor = (rhs.id if isinstance(rhs, ast.Name) else
-                        rhs.attr if isinstance(rhs, ast.Attribute) else None)
-                if ctor in _CTORS:
-                    for t in node.targets:
-                        if isinstance(t, ast.Name):
-                            alias[t.id] = ctor
+                tgts = [t for t in node.targets if isinstance(t, ast.Name)]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                rhs = node.value
+                tgts = [node.target] if isinstance(node.target, ast.Name) else []
             elif isinstance(node, ast.ImportFrom):
                 for a in node.names:
                     if a.name in _CTORS and a.asname:
                         alias[a.asname] = a.name
+                continue
+            else:
+                continue
+            name = (rhs.id if isinstance(rhs, ast.Name) else
+                    rhs.attr if isinstance(rhs, ast.Attribute) else None)
+            if name is None:
+                continue
+            for t in tgts:
+                if name in _CTORS:
+                    alias[t.id] = name
+                else:
+                    pending.append((t.id, name))
+        changed = True
+        while changed:
+            changed = False
+            for tgt_id, src_name in pending:
+                if src_name in alias and tgt_id not in alias:
+                    alias[tgt_id] = alias[src_name]
+                    changed = True
 
         def visit(node, enclosing):
             for child in ast.iter_child_nodes(node):
@@ -199,6 +216,28 @@ mviol5 = instantiation_violations(scan_instantiations(mutated5),
                                   INSTANTIATION_OWNERS)
 check(any("_qualified_rebind_leg::DesignCClaimBackend" in v for v in mviol5),
       "qualified-attribute rebinding mutation FAILS the gate and names its site")
+# chained + annotated aliases (reviewer P1 r4): both permanent controls
+mutated6 = dict(prod_sources)
+mutated6[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core.backend_c as _dc2\n"
+    "Backend = _dc2.DesignCClaimBackend\n"
+    "Selected = Backend\n"
+    "def _chained_alias_leg():\n"
+    "    return Selected('improvised')\n")
+mviol6 = instantiation_violations(scan_instantiations(mutated6),
+                                  INSTANTIATION_OWNERS)
+check(any("_chained_alias_leg::DesignCClaimBackend" in v for v in mviol6),
+      "chained alias mutation FAILS the gate and names its site")
+mutated7 = dict(prod_sources)
+mutated7[_db] = prod_sources[_db] + (
+    "\n\nimport ag2_sparrow.delivery_core.backend_c as _dc3\n"
+    "BackendT: type = _dc3.DesignCClaimBackend\n"
+    "def _annotated_alias_leg():\n"
+    "    return BackendT('improvised')\n")
+mviol7 = instantiation_violations(scan_instantiations(mutated7),
+                                  INSTANTIATION_OWNERS)
+check(any("_annotated_alias_leg::DesignCClaimBackend" in v for v in mviol7),
+      "annotated alias mutation FAILS the gate and names its site")
 
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
