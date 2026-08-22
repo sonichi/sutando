@@ -127,5 +127,21 @@ _snapshot_per_host_config
 check "root-live refresh works once provenance self-healed" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root moved after self-heal" ]'
 
+echo "9. a FAILED atomic replace must clean up and say so (hosts/*/ is a carried vault path)"
+printf 'root advanced\n' > "$WORKSPACE_DIR/build_log.md"
+printf 'ours\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+shasum -a 256 "$WORKSPACE_DIR/hosts/testhost/build_log.md" | cut -d" " -f1 \
+    > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+_sig_before="$(cat "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")"
+mv() { return 1; }   # the swap fails (full disk, EXDEV, immutable dest, ...)
+_out9="$(_snapshot_per_host_config 2>&1)"
+unset -f mv
+check "no orphan temp is left behind for the vault to carry" \
+      '[ -z "$(ls "$WORKSPACE_DIR/hosts/testhost"/build_log.md.snap.* 2>/dev/null)" ]'
+check "the failed replace is logged, not swallowed" \
+      'printf %s "$_out9" | grep -qi "replace"'
+check "provenance is not stamped for a swap that did not happen" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")" = "$_sig_before" ]'
+
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

@@ -873,8 +873,14 @@ _snapshot_per_host_config() {
                 _new="$(shasum -a 256 "$_tmp" 2>/dev/null | cut -d' ' -f1)"
                 [ -f "$_dst" ] && _now="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
                 if [ "$_now" = "$_cur" ]; then
-                    mv -f "$_tmp" "$_dst" 2>/dev/null \
-                        && printf '%s\n' "$_new" > "$_sig" 2>/dev/null || true
+                    if mv -f "$_tmp" "$_dst" 2>/dev/null; then
+                        printf '%s\n' "$_new" > "$_sig" 2>/dev/null || true
+                    else
+                        # hosts/*/ is a carried vault path: a temp left here is
+                        # committed and pushed again on every subsequent sync.
+                        rm -f "$_tmp" 2>/dev/null || true
+                        log "snapshot: atomic replace of hosts/$(_host)/build_log.md failed; temp removed, per-host copy and provenance left unchanged"
+                    fi
                 else
                     rm -f "$_tmp" 2>/dev/null || true
                     log "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
