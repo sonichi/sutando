@@ -206,6 +206,31 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
 
    **If it is absent, close and reopen the PR.** Reopening fires `pull_request.reopened`, which CLA-Assistant does act on. Reviews are not dismissed — reopening is not a push — but it *does* re-trigger the full CI run, so expect a few minutes of pending checks afterward.
 
+   **Do not wait on the auto-recheck comment: for ABSENT it is inert.**
+   `.github/workflows/cla-recheck-on-push.yml` posts `@cla-assistant check` on every push to an open
+   PR, so you will often find that comment already sitting there and conclude a recheck was tried.
+   Measured 2026-08-22 across the three ABSENT PRs that had one — #2778, #3070, #3249 — the comment
+   posted **+19s, +10s and +12s** after each push and the status was **still absent days later**.
+   Its presence is not evidence of anything; close+reopen is what actually clears this case.
+
+   **One ABSENT PR never gets that comment at all, and it needs a smaller fix.** The workflow triggers
+   on `pull_request_target: [synchronize]` — a push to an *already-open* PR. A branch pushed **before**
+   its PR was opened, and never touched since, produces no `synchronize` event, so the automation has
+   nothing to fire on and the PR is structurally outside it. Measured on #3253: head committed
+   `00:10:18Z`, PR opened `00:11:51Z` — the head predates its own PR by 93 seconds, one commit, no
+   pushes after. Tell it apart with:
+
+   ```bash
+   gh pr view <N> --json createdAt,headRefOid --jq '.createdAt + " opened / head " + .headRefOid'
+   gh api repos/<owner>/<repo>/commits/<head> --jq '.commit.committer.date + " head pushed"'
+   # head pushed BEFORE opened  ->  no synchronize has ever fired for this head
+   ```
+
+   For that shape **any push to the branch** fires the workflow and clears it — a smaller instrument
+   than close+reopen, which also re-runs all of CI. Note the sub-case is about push-vs-open ordering,
+   not about forks: #3253 was also the only fork among the four, which is a correlation at n=1 and
+   not the cause.
+
    **Give it a minute or two before concluding it failed.** The status is posted asynchronously: on one PR it was still `total=0` immediately after reopening and `license/cla=success` on the next check. Re-running the command above is the way to tell; an immediate zero means nothing yet.
 
    **If the status is PRESENT and `pending`, that is a third case with its own cause.** `state=pending` with the description *"Contributor License Agreement is not signed yet."* means CLA-Assistant ran and is waiting on a signature — so close+reopen does nothing, and the `--reset-author` fix above only applies if the identity is your own. Ask GitHub which commit identities it cannot vouch for:
