@@ -110,5 +110,38 @@ with tempfile.TemporaryDirectory() as td:
     check(r["status"] == "ok" and "legacy_sends=1" in r["detail"],
           "matching sha: ok, and the legacy counter is surfaced")
 
+# ── coverage of the remaining verdicts and fallback arms ───────────────────
+check(m._git_head("/nonexistent-dir-xyz") is None,
+      "loader _git_head fails closed (None) outside a git repo")
+with tempfile.TemporaryDirectory() as td:
+    p2 = Path(td) / "gateway-status.json"
+    p2.write_text(json.dumps({"runtime": {"build_sha": "a" * 40,
+                                          "entrypoint": "somewhere/else.py",
+                                          "engine": "E", "core_confirmed": 0,
+                                          "legacy_sends": 0}}))
+    r = hc.check_runtime_identity(path=p2, head_sha="a" * 40)
+    check(r["status"] == "warn" and "non-canonical entrypoint" in r["detail"],
+          "non-canonical entrypoint: warn names the path")
+    # head_sha=None: probe derives HEAD via git itself (real repo) — the
+    # sidecar sha IS that head here, so the verdict must be ok, not drift.
+    real_head = subprocess.check_output(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
+    p2.write_text(json.dumps({"runtime": {"build_sha": real_head,
+                                          "entrypoint": "x/src/remote-gateway-bridge.py",
+                                          "engine": "E", "core_confirmed": 0,
+                                          "legacy_sends": 0}}))
+    r = hc.check_runtime_identity(path=p2)
+    check(r["status"] == "ok", "head_sha=None: probe derives HEAD via git and matches")
+    # git-unavailable arm: REPO_DIR pointed at a non-repo -> except -> sha
+    # comparison skipped -> ok (fail-open on the CHECKOUT side, by design)
+    saved_repo = hc.REPO_DIR
+    try:
+        hc.REPO_DIR = Path(td)
+        r = hc.check_runtime_identity(path=p2)
+        check(r["status"] == "ok",
+              "checkout HEAD unreadable: probe skips the sha comparison, no false drift")
+    finally:
+        hc.REPO_DIR = saved_repo
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
