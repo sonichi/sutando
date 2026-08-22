@@ -3,9 +3,9 @@
 and the shared contextNotFrom policy.
 
 The gate semantics (Susan 2026-06-17) and the CLI contract are unchanged; the
-policy now lives in `discord_context_policy.py` (single implementation, shared
+policy now lives in `policy/context/discord.py` (single implementation, shared
 with discord-read.py's --serving mode) and the message rendering in
-`discord_reader.py`. The rendering upgrade is deliberate: this reader's private
+`channels/discord/reader.py`. The rendering upgrade is deliberate: this reader's private
 copy printed `m.get("content")` only, so a forwarded message rendered BLANK —
 the shared renderer labels forwards and reply context like the main reader.
 
@@ -23,10 +23,10 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from util_paths import claude_home_path
-from discord_http import request_json
-import discord_context_policy as _policy
-import discord_reader as _reader
-from discord_reader import _redact  # noqa: F401  — shared policy, re-exported
+from channels.discord.http import request_json
+import policy.context.discord as _policy
+import channels.discord.reader as _reader
+from channels.discord.reader import _redact  # noqa: F401  — shared policy, re-exported
 
 ACCESS_FILE = _policy.ACCESS_FILE
 ENV_FILE = claude_home_path("channels", "discord", ".env")

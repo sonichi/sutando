@@ -163,9 +163,9 @@ class ReaderRedaction(unittest.TestCase):
         Post-extraction the imports live ONCE in discord_reader; the CLI must
         resolve the IDENTICAL function object (stronger than a source-string
         match, which stays green when the call is disabled — REVIEW.md L13)."""
-        shared = sys.modules["discord_reader"]
+        shared = sys.modules["channels.discord.reader"]
         self.assertIs(dr._redact, shared._redact)
-        src = (REPO / "src" / "discord_reader.py").read_text()
+        src = (REPO / "src" / "channels" / "discord" / "reader.py").read_text()
         self.assertIn("from chat_secret_filter import filter_chat_secrets", src)
         self.assertIn("from vault_intercept import redact_vault_commands", src)
 
@@ -219,7 +219,7 @@ class SiblingReaderRedaction(unittest.TestCase):
         """Both readers and the bridge must resolve the SAME policy, from the
         same modules. Post-extraction: identity against the shared module —
         the import-source pin lives on discord_reader.py (one canonical file)."""
-        self.assertIs(self.rdc._redact, sys.modules["discord_reader"]._redact)
+        self.assertIs(self.rdc._redact, sys.modules["channels.discord.reader"]._redact)
 
 
 if __name__ == "__main__":

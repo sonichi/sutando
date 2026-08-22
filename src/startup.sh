@@ -195,13 +195,9 @@ core_runtime="$(resolve_startup_core_runtime)"
 # successful `claude-sutando --migrate`. Mirrors src/agent/claude/cli/start-cli.sh
 # (Sutando.app's tmux-wrapped CLI launcher) — same machine-spawn pattern.
 #
-# Defense in depth (matches start-cli):
-#   - Helper missing → silent fallback (legacy install).
-#   - Helper present + config valid → export.
-#   - Helper present + config invalid → refuse to start (don't scatter state).
-if [ -x "$REPO/scripts/sutando-config.sh" ]; then
-  _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
-  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+# Resolve-or-refuse is shared with start-cli; only the credential seeding is ours.
+source "$REPO/src/claude_config_dir.sh"
+if _ccd="$(resolve_claude_config_dir "$REPO" startup)"; then
     mkdir -p "$_ccd"
     # NOTE: the claude core-agent launcher + the `claude-sutando` config-dir
     # onboarding alias now live under src/agent/claude/ (start-cli.sh /
@@ -299,13 +295,12 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
     fi
     fi
     export CLAUDE_CONFIG_DIR="$_ccd"
-  else
-    echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
-    cat "$_ccd_err" >&2
-    rm -f "$_ccd_err"
-    exit 1
-  fi
-  rm -f "$_ccd_err"
+else
+  _ccd_rc=$?
+  # 2 = caller already scoped the config dir; nothing to seed, and the services
+  # below still reach the intended credential store.
+  [ "$_ccd_rc" = "2" ] || exit 1
+  echo "  ~ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 fi
 
 # Boot gate (#2396): verify the SELECTED core can boot authenticated BEFORE any
@@ -604,13 +599,27 @@ else
 fi
 
 # Check Accessibility (needed for context drop shortcut)
-if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
-  echo "  ⚠ Accessibility not granted"
-  echo "    → System Settings → Privacy & Security → Accessibility"
-  echo "    → Add Terminal.app or Shortcuts.app"
-else
-  echo "  ✓ Accessibility"
+# $REPO is overridable, so fall back to alongside this script: an unguarded
+# source under `set -e` aborts the whole run.
+__probe="$REPO/src/accessibility_probe.sh"
+[ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
+# 125 = could not check. NOT 0: a missing probe would otherwise print
+# "✓ Accessibility", asserting a grant on a run where nothing was probed.
+acc_rc=125
+if [ -f "$__probe" ]; then
+  # `|| rc=$?` keeps this exempt from `set -e`; a bare non-zero call aborts.
+  source "$__probe"
+  acc_rc=0; accessibility_probe || acc_rc=$?
 fi
+case $acc_rc in
+  0)   echo "  ✓ Accessibility" ;;
+  125) echo "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked" ;;
+  124) echo "  ⚠ Accessibility UNKNOWN — probe timed out after ${ACCESSIBILITY_PROBE_TIMEOUT_S}s"
+       echo "    This session cannot answer the prompt (headless/SSH); the grant may be fine." ;;
+  *)   echo "  ⚠ Accessibility not granted"
+       echo "    → System Settings → Privacy & Security → Accessibility"
+       echo "    → Add Terminal.app or Shortcuts.app" ;;
+esac
 echo ""
 
 # Install Claude Code skills (runs every startup, idempotent)

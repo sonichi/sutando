@@ -120,6 +120,35 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
+   **⚠ A WARN IS A POINTER INTO THE RECORD, NOT NEW INFORMATION. Grep the PQ before investigating one.** Health-check warns are chronic by construction: they re-fire every pass until an owner decision lands, so the ones that survive are precisely the ones already investigated and parked. The warn text looks new every time and carries no memory of having been read — that mismatch is the whole trap.
+
+   **Grep the SUBJECT, not the probe name.** A warn is named for its *detector*
+   (`memory-sync`, `daily-cron-punctuality`); a question is filed under the *subject of the decision*
+   (`unfiled-findings-backlog`, `example-digest`). Nothing keeps those vocabularies aligned, so the
+   name you already know is the one least likely to hit. Measured across five live warns: the probe
+   name hit **2 of 5**, an entity name taken from the warn TEXT hit **5 of 5** — and on `memory-sync`,
+   the case this rule was written for, the probe name returns **0** while the write-up sits under
+   `unfiled-findings-backlog`.
+
+   ```bash
+   # token = an entity from the warn TEXT (a path, filename, host, command), not the probe name
+   H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"
+   grep -in "<subject-token>" "$H/pending-questions.md" "$H/current-track.md" | head
+   ```
+
+   **Grep BOTH parking files.** Warns get parked wherever the pass that triaged them was writing —
+   a second core measured two of its own parked analyses in `current-track.md` (a health-warning
+   triage heading, a cron-cause note), where a PQ-only grep misses them by construction.
+
+   **A zero means "try another token", not "nothing is filed."** Two or three tokens from the warn
+   text, then — before concluding absence — enumerate the headings instead of querying:
+   `grep -n '^## ' "$H"/*.md`. Reading ~25 headings takes seconds and cannot miss due to token
+   choice, which is exactly how a self-chosen token fails: the suspicion generates the tokens, and
+   the answer sits under a heading the suspicion never touches. Then investigate. One call each, before any investigation costing more than a couple of tool
+   calls. It either returns nothing or hands you your own prior write-up — with the measurements, the mechanism, and usually the proposed fix already in it. When it hits: **extend it with what is genuinely new, or say plainly that nothing is new.** Re-filing a weaker duplicate is the failure mode, and surfacing one to the owner as a discovery makes them read the same thing twice.
+
+   This lives in the loop file rather than only in a memory because a memory loads when RECALLED while this file loads EVERY PASS. The rule already existed, stated sharply, and still failed repeatedly — placement was the defect, not precision.
+
 3.5. **Apply the self-development policy gate.** Run:
 
    ```bash
@@ -168,6 +197,69 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
+   **⚠ THEN ASSERT THE WRITE LANDED — three misses in one session, 2026-08-22.** The append
+   reports success in every cheap way and still does not happen:
+
+   ```
+   printf '...' "$(date -u ...)"          # redirect dropped: renders to TERMINAL, reads as success
+   cat >> "$W/build_log.md" <<'EOF' ...   # landed
+   echo logged                            # proves the ECHO ran, never that the APPEND did
+   ```
+
+   Measured the same day: a `printf` whose `>> build_log.md` was omitted printed the entry to
+   stdout and looked identical to a successful write; a whole diagnosis was reported to the owner
+   and never written (`grep -c` returned **0** a pass later); and two completed owner tasks were
+   left with no result file at all. In every case the terminal showed the text.
+
+   **So close the write by reading it back, exactly as step 8 already does for the questions
+   reader** — same shape, different file. **But do NOT re-type the phrase to search for.** A probe
+   typed a second time from memory drifts from the text it is checking, and then fails the same way
+   the write fails. Measured on a peer node the same day: an audit of seven appends reported
+   **1 MISSING** because the probe used wording from the *commit message* while the entry said
+   something else. False MISSING is the dangerous polarity — it invites redoing work already done,
+   and a check that cries wolf gets demoted to the category that never fires.
+
+   **Define the marker ONCE and assert on the same variable**, so the probe cannot drift from its
+   subject and a dropped redirect cannot satisfy it:
+
+   ```python
+   MARK  = f"step7-{uuid.uuid4().hex[:12]}"  # UNIQUE BY CONSTRUCTION, not by circumstance
+   entry = f"### {ts} — ...  [{MARK}]\n..."  # interpolated into what is WRITTEN
+   with open(path, "a") as f:                # O_APPEND — NEVER read_text() + write_text()
+       f.write(entry); f.flush(); os.fsync(f.fileno())
+   assert path.read_text().count(MARK) == 1  # reads the FILE, never the terminal
+   ```
+
+   **⚠ NEVER close this write with `p.write_text(p.read_text() + entry)`.** `build_log.md` is
+   shared, synced, multi-writer state and is append-only by contract. A read-modify-replace lets any
+   append landing between the read and the write be **silently erased** — and the erasing writer's
+   own `count(MARK) == 1` still passes, because its marker is present in the file it just truncated.
+   That is the worst failure this section can have: the step that exists to certify a write becomes
+   the step that destroys another host's. Measured: two writers both reading `base\n` leave final
+   content `base\nB\n`, with A gone and B's assertion green. Use `O_APPEND` (atomic per write) or a
+   shared lock — never whole-file concatenate-and-replace.
+
+   **The marker must be unique per write, and `== 1` is why.** A literal constant passes on pass 1
+   and then fails forever: the marker survives in the log, so pass 2 finds it twice and a *correct*
+   append fails its own assertion — inside a loop step, where `assert` raises and takes the rest of
+   the pass with it. With `ts` in the marker, `== 1` means *this entry landed exactly once*; with a
+   constant it means *this log has been written to exactly once ever*, which is a different claim
+   and almost always false.
+
+   **Do not reach for a timestamp here.** `f"step7-{ts}"` is unique only by *circumstance* — it
+   holds while the clock is fine-grained enough and the writes are far enough apart, and collides
+   the moment two appends land in the same tick. At minute granularity that is an ordinary loop
+   pass. A random marker has no such premise. And confirm the check can still FAIL: re-append the
+   same marker deliberately and watch `count` reach 2, or you have a probe that passes by
+   construction, which certifies nothing.
+
+   `== 1`, not `> 0` — a 300 KB log may already contain the phrase somewhere else. And check that
+   the probe can produce a positive at all: a marker matching nothing scores 0 by construction and
+   cannot fail, which is a control that certifies nothing.
+
+   `echo logged` / `echo closed` is not this check. It asserts the *last* command in the chain
+   ran, which is true even when the append was the one that silently went elsewhere.
+
    **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or `pending-questions.md`? Typical relay-worthy events:
    - A PR opened, merged, or got a meaningful review reply
    - A pending question resolved (owner picked an option)
@@ -185,6 +277,40 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 8. **If blocked, ask.** Write the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; create the `hosts/<hostname>/` dir if absent) — send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
    **⚠ INSERT ABOVE THE `# Resolved` DIVIDER, NEVER `>>` AT EOF (2026-08-02, twice in one session).** Every reader — `check-pending-questions.py`, morning-briefing, agent-api, friction-detector, dashboard — counts only the text ABOVE the file's top-level `# Resolved` line; everything below it is the audit trail. `cat >> "$PQ"` appends at EOF, which on this host is **500 lines below the divider**, so the question lands in the archive and is never counted.
+
+   **⚠⚠ AND PLACE IT BY IMPORTANCE, AT THE TOP — "above the divider" is NOT enough (2026-08-20).**
+   The instruction above is correct and load-bearing, but for an append-style writer "above the
+   divider" means the **last position of the active region** — so the documented cure for
+   archive-invisibility prescribes the exact position that causes **prefix-invisibility**. The
+   notifiers render fixed-depth prefixes, not the whole list:
+
+   ```
+   check-pending-questions.py:258  notify_macos       titles[:3]
+   check-pending-questions.py:327  notify_discord_dm  questions[:5]
+   check-pending-questions.py:310  notify_voice       unsliced
+   ```
+
+   With 36 open items, anything at index ≥ 5 renders on **voice only** — and voice is usually not
+   connected. Measured 2026-08-20: the Google-Drive-mirroring-the-live-repo question, filed that
+   day and the highest-stakes item on the list, sat at **position 35 of 36** and reached no surface
+   the owner reads, while `len(q)` honestly reported 36 the whole time. Sutando-rui hit the same
+   thing independently: a PR needing ~30 seconds of owner time sat at position 12 for days, blocked
+   not on review or code but on a rendering slice.
+
+   **So: a fixed-depth prefix over an append-ordered list makes POSITION a priority signal whether
+   or not anyone intended one, and appending asserts the lowest one by construction.** Decide
+   placement deliberately at write time. If the new question outranks what is already at the top,
+   put it at the top; if it does not, you have just decided it can wait — say so to yourself, not
+   by accident.
+
+   **Assert the right invariant for the edit you actually made** — the count discriminates
+   differently per operation, and the wrong choice passes while the entry is gone:
+
+   | edit | assert |
+   |---|---|
+   | new question | count went **up**, and the title matches (see below) |
+   | reorder / promote | count **unchanged**, and the entry is now inside the rendered prefix |
+   | fold two into one | count went **down by exactly the number folded**, AND the folded id appears in the survivor, AND no standalone entry for it remains — a fold that *lost* an entry shows the same count |
 
    I filed two questions this way on 2026-08-02 (the ep007 spine pick, and an ag2space room-join request) and **both were invisible**: the reader stayed at 22 while the file grew. Moving them above the divider took it to 24. **This is the exact defect PR #2521 fixes in `auth-preflight-gate.sh`** — which I reviewed, fixed an ABA race in, and pushed the same afternoon I committed the bug by hand, twice.
 

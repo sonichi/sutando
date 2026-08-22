@@ -169,7 +169,7 @@ def main(argv):
         sys.exit(0)
     sys.path.insert(0, os.path.join(repo, "src"))
     from workspace_default import resolve_workspace
-    from send_allowlist import is_path_sendable, SEND_ALLOWED_ROOTS, SEND_ALLOWED_PREFIXES
+    from policy.egress.attachment import is_path_sendable, SEND_ALLOWED_ROOTS, SEND_ALLOWED_PREFIXES
     from result_markers import parse_markers
 
     workspace = resolve_workspace()

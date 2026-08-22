@@ -2299,6 +2299,19 @@ def check_memory_index_integrity() -> "dict | None":
                 f"({MEMORY_INDEX_LOAD_BYTES:,} B) / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
+    def _corpus_note() -> str:
+        """Name the corpus measured: "compact it now" is destructive advice about
+        one specific file, and SUTANDO_MEMORY_DIR can point this at another."""
+        try:
+            default = Path(_default_memory_dir())
+        except Exception:  # pragma: no cover - defensive; never break the check
+            return f" [corpus: {MEMORY_DIR}]"
+        if default.resolve() != MEMORY_DIR.resolve():
+            return (f" [corpus: {MEMORY_DIR} — set by SUTANDO_MEMORY_DIR, NOT the "
+                    f"workspace default {default}; if sessions load the default, "
+                    f"this verdict is about a corpus they never read]")
+        return f" [corpus: {MEMORY_DIR}]"
+
     def _hub_note() -> str:
         return (f"; {len(hub_only)} reachable via a sibling hub index "
                 f"({', '.join(sorted(index_names - {'MEMORY.md'}))}) — by design, not loaded"
@@ -2307,7 +2320,7 @@ def check_memory_index_integrity() -> "dict | None":
     if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
                 "detail": (f"all memory files reachable from the loaded MEMORY.md index"
-                           f"{_hub_note()} ({_size_note()})")}
+                           f"{_hub_note()} ({_size_note()}){_corpus_note()}")}
     parts = []
     if beyond_cut:
         parts.append(
@@ -2344,7 +2357,7 @@ def check_memory_index_integrity() -> "dict | None":
     # that still loaded fine once frontmatter/comments were excluded.)
     return {"name": "memory-index",
             "status": "fail" if beyond_cut else "warn",
-            "detail": "; ".join(parts)}
+            "detail": "; ".join(parts) + _corpus_note()}
 
 
 def check_memory_sync() -> dict:
@@ -2415,6 +2428,53 @@ def _age_phrase(age_s) -> str:
     """None means the writer gave no usable timestamp — say so rather than
     printing a number a reader cannot tell apart from a real age."""
     return "age unknown" if age_s is None else f"{age_s}s ago"
+
+
+def _norm_remote(u: str) -> str:
+    """FETCH_HEAD drops a trailing `.git` that `remote get-url` keeps."""
+    u = u.strip().rstrip("/")
+    return u[:-4] if u.endswith(".git") else u
+
+
+def _last_fetch_age_s(repo, git_bin: str, expected: str) -> "int | None":
+    """Seconds since this checkout last fetched `expected` from a remote, or None.
+
+    Scoped to `origin/<expected>`, the exact comparison target: FETCH_HEAD's mtime is
+    the last fetch of ANYTHING, so a PR ref — or `main` from a second remote — would
+    otherwise date a stale origin/main.
+    """
+    try:
+        out = subprocess.run([git_bin, "-C", str(repo), "rev-parse", "--git-common-dir"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        common = Path(out.stdout.strip())
+        if not common.is_absolute():
+            common = Path(repo) / common
+        fetch_head = common / "FETCH_HEAD"
+        st = fetch_head.stat()
+        url = subprocess.run([git_bin, "-C", str(repo), "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10)
+        if url.returncode != 0:
+            return None
+        # `remote get-url` keeps a trailing `.git` that FETCH_HEAD drops, so an exact
+        # compare never matches on a real clone; normalise both ends before comparing.
+        want = _norm_remote(url.stdout)
+        marker = f"branch '{expected}' of "
+        for line in fetch_head.read_text(errors="replace").splitlines():
+            i = line.find(marker)
+            if i >= 0 and _norm_remote(line[i + len(marker):]) == want:
+                return max(int(time.time() - st.st_mtime), 0)
+        return None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def _fetch_age_phrase(age_s) -> str:
+    """A currency claim with no fetch behind it is worth naming, not omitting."""
+    if age_s is None:
+        return "no fetch of that branch recorded"
+    return f"a fetch {age_s // 3600}h{age_s % 3600 // 60}m ago"
 
 
 def check_onboarding_status() -> "dict | None":
@@ -2949,7 +3009,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # census costs ten 5s-timeout pgreps to say so. None is unanswerable, so it probes.
     if behind == 0:
         return {"name": name, "status": "ok",
-                "detail": f"live checkout on {expected!r}"}
+                "detail": f"live checkout on {expected!r} "
+                          f"({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin, expected))})"}
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     # LIVE processes only: `src/` moves several times a day, so the running set
     # is what keeps this from becoming the alert fatigue the threshold prevents.
@@ -2996,7 +3057,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           f"{refresh} + restart the affected service. {tail}"}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
-                      + (f", {behind} commits behind" if behind else "")}
+                      + (f", {behind} commits behind" if behind else "")
+                      + f" ({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin, expected))})"}
 
 
 def check_engine_revision_drift(repo_dir: "Path | None" = None,
@@ -6418,12 +6480,18 @@ def check_proactive_quarantine() -> dict:
 
 
 def _ps_snapshot() -> "str | None":
-    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once."""
+    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once.
+
+    None means UNAVAILABLE, and that includes a `ps` that returned normally with
+    a nonzero exit: its empty stdout would otherwise read as a successful scan
+    that found nothing, which is the absence callers must not assert.
+    """
     try:
-        return subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5).stdout
+        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                              capture_output=True, text=True, timeout=5)
     except Exception:  # noqa: BLE001
         return None
+    return done.stdout if done.returncode == 0 else None
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
@@ -6606,17 +6674,27 @@ def check_task_watcher() -> dict:
     """
     name = "task-watcher"
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
-    if not _any_core_alive():
-        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
-    trees = _watcher_trees()
+    # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
+    # so take the snapshot here: None is unavailable, "" is genuinely empty.
+    ps_out = _ps_snapshot()
+    if ps_out is None:
+        return {"name": name, "status": "warn",
+                "detail": "cannot enumerate processes (ps unavailable) — watcher liveness is "
+                          "UNKNOWN, not clear; a dead or duplicate watcher would be invisible"}
+    # "Not expected" is a claim about THIS host, so it needs the local heartbeat
+    # and must not be made before enumerating: visible watchers outrank it.
+    trees = _watcher_trees(ps_out)
     roots = sorted(trees)
+    if not roots and _fresh_local_core_record() is None:
+        return {"name": name, "status": "ok",
+                "detail": "no local core running and no watcher processes — watcher not expected"}
     if not pid_file.exists():
         if roots:
             # Sentinel gone but watchers alive: they are draining tasks/ but
             # nothing supervises them, and each new start adds another (observed
             # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
             # duplicate processing, not a stalled queue).
-            ps_out = _ps_snapshot()
+
             # A KNOWN parent that is not init: its spawning session still owns it.
             # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
@@ -6807,6 +6885,56 @@ def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
                 os.close(fd)
             except Exception:
                 pass
+
+
+def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
+    """A dual_read hit means C could not resolve an id the importer should have
+    covered — a finding, and the gate that blocks Design A's deletion."""
+    from datetime import datetime
+    name = "a-fallback-hits"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    hits = []
+    migrated = 0
+    for root in sorted(results.glob(".outbox*")):
+        counter = root / "a-fallback-hits.json"
+        if (root / ".items-migrated").is_dir():
+            migrated += 1
+            if not counter.is_file():
+                # Absence of evidence, not evidence of absence: a gate must not
+                # pass on an instrument that never ran (dual_read inits count 0).
+                hits.append(f"{root.name}: migrated but no counter — dual_read "
+                            "never ran here (instrument absent, not a measured zero)")
+                continue
+        if not counter.is_file():
+            continue
+        try:
+            rec = json.loads(counter.read_text(encoding="utf-8"))
+            if not isinstance(rec, dict):
+                raise ValueError("counter is not a JSON object")
+            count = int(rec.get("count", 0))
+        except (OSError, ValueError, TypeError):
+            hits.append(f"{root.name}: counter unreadable")
+            continue
+        if count > 0:
+            # fromtimestamp raises on domain garbage (inf/nan/1e30) that
+            # isinstance passes; a probe on the gate path must never raise.
+            try:
+                when_s = datetime.fromtimestamp(
+                    rec.get("last_hit_ts")).strftime("%m-%d %H:%M")
+            except (TypeError, ValueError, OSError, OverflowError):
+                when_s = "?"
+            hits.append(f"{root.name}: {count} hit(s), last {rec.get('last_item', '?')} at {when_s}")
+    if hits:
+        return {"name": name, "status": "warn",
+                "detail": "A-fallback (dual_read) HIT — importer coverage gap or "
+                          "phantom id; A deletion stays gated until a full release "
+                          "records zero new hits: " + "; ".join(hits)}
+    if migrated:
+        return {"name": name, "status": "ok",
+                "detail": f"no fallback hits — {migrated} migrated root(s), "
+                          "each with a live counter (measured zero)"}
+    return {"name": name, "status": "ok",
+            "detail": "no migrated outbox roots — dual-read window not active"}
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
@@ -9043,6 +9171,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
+    checks.append(check_a_fallback_hits())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
