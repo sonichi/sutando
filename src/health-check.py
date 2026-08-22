@@ -5646,10 +5646,7 @@ def check_runtime_identity(path: "Path | None" = None,
                           f"HEAD is {head_sha[:8]} — restart to converge; "
                           + " ".join(bits)}
     expected = (REPO_DIR / "src" / "remote-gateway-bridge.py").resolve()
-    try:
-        actual = Path(ep).resolve()
-    except OSError:
-        actual = Path(ep)
+    actual = Path(ep).resolve()
     if actual != expected:
         return {"name": name, "status": "warn",
                 "detail": f"non-canonical entrypoint {ep} (expected {expected}); "

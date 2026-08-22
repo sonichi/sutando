@@ -108,6 +108,13 @@ with tempfile.TemporaryDirectory() as td:
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
     check(r["status"] == "warn" and "malformed" in r["detail"],
           "empty runtime block: warn malformed (required keys enforced)")
+    for label, block in (("non-dict runtime", "a string"),
+                         ("no entrypoint", {"build_sha": "a" * 40}),
+                         ("no engine", {"build_sha": "a" * 40,
+                                        "entrypoint": CANON})):
+        p.write_text(json.dumps({"runtime": block}))
+        r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+        check(r["status"] == "warn", f"{label}: warn malformed")
     bad = dict(GOOD, legacy_sends=-2)
     p.write_text(json.dumps({"runtime": bad}))
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
