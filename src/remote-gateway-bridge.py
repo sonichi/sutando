@@ -88,9 +88,10 @@ _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bri
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
 def _git_head(repo):
     import subprocess
+    from git_binary import git_argv  # resolver: never the bare CLT stub
     try:
         return subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            git_argv("-C", str(repo), "rev-parse", "HEAD"),
             text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
     except Exception:
         return None

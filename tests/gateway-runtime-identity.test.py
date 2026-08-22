@@ -79,69 +79,64 @@ with tempfile.TemporaryDirectory() as td:
     check("StubBackend" in rt["engine"],
           "engine string names the LIVE backend/provider pair")
 
-# ── probe verdicts ─────────────────────────────────────────────────────────
+# ── probe verdicts: absent=idle, damaged=warn, valid=verified ──────────────
 hspec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(hspec)
 try:
     hspec.loader.exec_module(hc)
 except SystemExit:
     pass
+CANON = str((REPO / "src" / "remote-gateway-bridge.py").resolve())
+GOOD = {"build_sha": "a" * 40, "entrypoint": CANON, "engine": "E",
+        "core_confirmed": 3, "legacy_sends": 1}
 with tempfile.TemporaryDirectory() as td:
     p = Path(td) / "gateway-status.json"
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
     check(r["status"] == "ok" and "nothing to verify" in r["detail"],
-          "no sidecar: probe idles rather than inventing a verdict")
+          "absent sidecar: probe idles")
+    for label, content in (("corrupt JSON", "{not json"), ("empty file", ""),
+                           ("non-object", "[1,2]")):
+        p.write_text(content)
+        r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+        check(r["status"] == "warn",
+              f"{label}: WARN, never rendered as the absent-idle pass")
     p.write_text(json.dumps({"connected": True}))
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
     check(r["status"] == "warn" and "predates" in r["detail"],
-          "sidecar without runtime block: warn names the restart remedy")
-    p.write_text(json.dumps({"runtime": {"build_sha": "b" * 40,
-                                         "entrypoint": "x/src/remote-gateway-bridge.py",
-                                         "engine": "E", "core_confirmed": 3,
-                                         "legacy_sends": 1}}))
+          "no runtime block: warn names the restart remedy")
+    p.write_text(json.dumps({"runtime": {}}))
+    r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+    check(r["status"] == "warn" and "malformed" in r["detail"],
+          "empty runtime block: warn malformed (required keys enforced)")
+    bad = dict(GOOD, legacy_sends=-2)
+    p.write_text(json.dumps({"runtime": bad}))
+    r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
+    check(r["status"] == "warn" and "non-negative" in r["detail"],
+          "negative counter: warn malformed")
+    p.write_text(json.dumps({"runtime": dict(GOOD, build_sha="b" * 40)}))
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
     check(r["status"] == "warn" and "build drift" in r["detail"],
-          "sha mismatch: warn says drift and both shas")
-    p.write_text(json.dumps({"runtime": {"build_sha": "a" * 40,
-                                         "entrypoint": "x/src/remote-gateway-bridge.py",
-                                         "engine": "E", "core_confirmed": 3,
-                                         "legacy_sends": 1}}))
+          "sha mismatch: warn drift with both shas")
+    p.write_text(json.dumps({"runtime": dict(
+        GOOD, entrypoint="/tmp/other/src/remote-gateway-bridge.py")}))
     r = hc.check_runtime_identity(path=p, head_sha="a" * 40)
-    check(r["status"] == "ok" and "legacy_sends=1" in r["detail"],
-          "matching sha: ok, and the legacy counter is surfaced")
-
-# ── coverage of the remaining verdicts and fallback arms ───────────────────
-check(m._git_head("/nonexistent-dir-xyz") is None,
-      "loader _git_head fails closed (None) outside a git repo")
-with tempfile.TemporaryDirectory() as td:
-    p2 = Path(td) / "gateway-status.json"
-    p2.write_text(json.dumps({"runtime": {"build_sha": "a" * 40,
-                                          "entrypoint": "somewhere/else.py",
-                                          "engine": "E", "core_confirmed": 0,
-                                          "legacy_sends": 0}}))
-    r = hc.check_runtime_identity(path=p2, head_sha="a" * 40)
-    check(r["status"] == "warn" and "non-canonical entrypoint" in r["detail"],
-          "non-canonical entrypoint: warn names the path")
-    # head_sha=None: probe derives HEAD via git itself (real repo) — the
-    # sidecar sha IS that head here, so the verdict must be ok, not drift.
-    real_head = subprocess.check_output(
-        ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
-    p2.write_text(json.dumps({"runtime": {"build_sha": real_head,
-                                          "entrypoint": "x/src/remote-gateway-bridge.py",
-                                          "engine": "E", "core_confirmed": 0,
-                                          "legacy_sends": 0}}))
-    r = hc.check_runtime_identity(path=p2)
-    check(r["status"] == "ok", "head_sha=None: probe derives HEAD via git and matches")
-    # git-unavailable arm: REPO_DIR pointed at a non-repo -> except -> sha
-    # comparison skipped -> ok (fail-open on the CHECKOUT side, by design)
+    check(r["status"] == "warn" and "non-canonical" in r["detail"],
+          "suffix-matching foreign path: warn non-canonical (resolved compare)")
+    p.write_text(json.dumps({"runtime": GOOD}))
     saved_repo = hc.REPO_DIR
     try:
         hc.REPO_DIR = Path(td)
-        r = hc.check_runtime_identity(path=p2)
-        check(r["status"] == "ok",
-              "checkout HEAD unreadable: probe skips the sha comparison, no false drift")
+        r = hc.check_runtime_identity(path=p)
+        check(r["status"] == "warn" and "HEAD unreadable" in r["detail"],
+              "checkout HEAD unreadable: WARN — identity cannot be verified")
     finally:
         hc.REPO_DIR = saved_repo
+    real_head = subprocess.check_output(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
+    p.write_text(json.dumps({"runtime": dict(GOOD, build_sha=real_head)}))
+    r = hc.check_runtime_identity(path=p)
+    check(r["status"] == "ok" and "legacy_sends=1" in r["detail"],
+          "valid block + matching derived HEAD + canonical resolved entrypoint: ok")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

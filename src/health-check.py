@@ -5586,42 +5586,76 @@ def check_runtime_identity(path: "Path | None" = None,
     """#3279 verification layer 3: the RUNNING gateway process self-reports
     build SHA / entry point / delivery engine into its status sidecar; this
     probe compares that against the checkout so 'the code on disk' and 'the
-    code in memory' can no longer silently diverge. Absent block = the
-    process predates the self-report (info, not proof of drift)."""
+    code in memory' can no longer silently diverge. Absent sidecar = idle;
+    an UNREADABLE or MALFORMED one warns — the probe's own input being
+    damaged must never render as a clean pass."""
     name = "runtime-identity"
     p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
-    try:
-        rt = json.loads(Path(p).read_text()).get("runtime")
-    except (OSError, ValueError, AttributeError, TypeError):
+    p = Path(p)
+    if not p.exists():
         return {"name": name, "status": "ok",
                 "detail": "no gateway sidecar — nothing to verify (probe idle)"}
-    if not isinstance(rt, dict):
+    try:
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"name": name, "status": "warn",
+                "detail": "gateway sidecar exists but is unreadable/unparseable "
+                          "— layer-3 verification is blind; inspect the file"}
+    if not isinstance(doc, dict):
+        return {"name": name, "status": "warn",
+                "detail": "gateway sidecar is not a JSON object — malformed"}
+    rt = doc.get("runtime")
+    if rt is None:
         return {"name": name, "status": "warn",
                 "detail": "running bridge predates the runtime self-report — "
                           "restart onto current code to enable layer-3 checks"}
-    if head_sha is None:
-        try:
-            head_sha = subprocess.check_output(
-                ["git", "-C", str(REPO_DIR), "rev-parse", "HEAD"],
-                text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
-        except Exception:
-            head_sha = None
+    def _bad(reason):
+        return {"name": name, "status": "warn",
+                "detail": f"runtime self-report malformed: {reason}"}
+    if not isinstance(rt, dict):
+        return _bad("runtime block is not an object")
+    sha = rt.get("build_sha")
+    ep = rt.get("entrypoint")
+    if not (isinstance(sha, str) and len(sha) >= 8):
+        return _bad("build_sha missing or not a sha string")
+    if not (isinstance(ep, str) and ep):
+        return _bad("entrypoint missing")
+    if not isinstance(rt.get("engine"), str):
+        return _bad("engine missing")
+    for k in ("core_confirmed", "legacy_sends"):
+        v = rt.get(k)
+        if not (isinstance(v, int) and not isinstance(v, bool) and v >= 0):
+            return _bad(f"{k} is not a non-negative int")
     bits = [f"engine={rt.get('engine')}",
             f"core_confirmed={rt.get('core_confirmed')}",
             f"legacy_sends={rt.get('legacy_sends')}"]
-    sha = rt.get("build_sha")
-    if head_sha and sha and sha != head_sha:
+    if head_sha is None:
+        try:
+            head_sha = subprocess.check_output(
+                git_argv("-C", str(REPO_DIR), "rev-parse", "HEAD"),
+                text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        except Exception:
+            head_sha = None
+    if not head_sha:
         return {"name": name, "status": "warn",
-                "detail": f"build drift: process runs {str(sha)[:8]}, checkout "
+                "detail": "checkout HEAD unreadable — cannot verify build "
+                          "identity; " + " ".join(bits)}
+    if sha != head_sha:
+        return {"name": name, "status": "warn",
+                "detail": f"build drift: process runs {sha[:8]}, checkout "
                           f"HEAD is {head_sha[:8]} — restart to converge; "
                           + " ".join(bits)}
-    ep = rt.get("entrypoint") or ""
-    if ep and not ep.endswith("src/remote-gateway-bridge.py"):
+    expected = (REPO_DIR / "src" / "remote-gateway-bridge.py").resolve()
+    try:
+        actual = Path(ep).resolve()
+    except OSError:
+        actual = Path(ep)
+    if actual != expected:
         return {"name": name, "status": "warn",
-                "detail": f"non-canonical entrypoint {ep}; " + " ".join(bits)}
+                "detail": f"non-canonical entrypoint {ep} (expected {expected}); "
+                          + " ".join(bits)}
     return {"name": name, "status": "ok",
-            "detail": (f"sha={str(sha)[:8] if sha else 'unreported'} "
-                       f"entrypoint=canonical " + " ".join(bits))}
+            "detail": (f"sha={sha[:8]} entrypoint=canonical " + " ".join(bits))}
 
 
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
