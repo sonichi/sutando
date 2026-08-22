@@ -349,6 +349,16 @@
       "status": "draft",
       "canonical_for": "the v1 seven-link delivery chain, identity rules, provider capability declarations, and named v1 gaps",
       "last_verified": "2026-08-18"
+    },
+    "docs/delivery-protocol.md": {
+      "title": "The file delivery protocol as a formal state machine",
+      "audience": [
+        "contributors",
+        "maintainers"
+      ],
+      "status": "active",
+      "canonical_for": "delivery_core file-protocol transitions, fencing, crash matrix, support boundary, GC status",
+      "last_verified": "2026-08-22"
     }
   }
 }
