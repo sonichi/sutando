@@ -36,7 +36,7 @@ So: ask for a handful of mappings (GitHub handle ↔ chat id ↔ person) before 
 
 **2. Then sweep the task-file stream.** Step 0 has already established that this pass may do so.
 
-> **The bootstrap is not permission-free, and "the bytes are already on disk" is not the test.** The context boundary is *serving-relative*: `src/discord_context_policy.py`'s `gate()` decides whether the channel you are **currently serving** may read some other channel, it fails closed, and it applies to owner-tier tasks too. A sweep run while serving one channel would pull rooms that gate would have refused — and because the sweep **persists** what it reads, those rooms then inform every later answer. That is strictly worse than a single blocked read.
+> **The bootstrap is not permission-free, and "the bytes are already on disk" is not the test.** The context boundary is *serving-relative*: `src/discord_context_policy.py`'s `gate()` decides whether the channel you are **currently serving** may read some other channel, and it applies to owner-tier tasks too. Its fail-closed behaviour is **conditional**: it refuses an unresolvable guild only when the serving channel has a `contextNotFrom` blacklist at all — with no blacklist it returns ALLOWED before reaching that check (see the measured note above). So the boundary constrains a sweep only where someone configured it; elsewhere the judgement is yours. A sweep run while serving one channel would pull rooms that gate would have refused — and because the sweep **persists** what it reads, those rooms then inform every later answer. That is strictly worse than a single blocked read.
 >
 > So: run the bootstrap from an explicit owner/operator maintenance context, not as a side effect of handling a task. If you cannot establish that context, either filter every archived observation through the same serving-channel policy, or do not sweep. Record `access_scope` on each observation so a later answer cannot quietly widen it.
 
@@ -72,8 +72,6 @@ So run two controls on your own output, and treat the sweep as unusable until bo
 A count with neither control is an assertion, not a measurement.
 
 **When the bootstrap is unreachable — say so and route it, do not quietly skip or quietly run it.**
-
-Two install shapes cannot satisfy step 1's precondition, and both were found by agents trying honestly to comply:
 
 The per-pass test lives at **step 0** above and gates seeding as well as sweeping. This section covers the case where the bootstrap cannot run at all.
 
