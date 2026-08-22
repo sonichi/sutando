@@ -13,14 +13,29 @@ Build a living, evidence-backed collaboration map. Treat it as a coordination ai
 
 So run this once, before relying on the contract.
 
-**1. Sweep what you already have.** The task-file stream is an observation source readable with no new permissions and no network: every task header carries `channel_id`, `room_name`, `room_members`, `room_member_count`, `user_id`. Sweeping `tasks/` plus `tasks/archive/` yields, on day one:
+**1. Sweep the task-file stream — as an owner/operator maintenance action, never mid-task.**
 
-- **rooms**, ranked by traffic, with provider-native ids and names
+> **The bootstrap is not permission-free, and "the bytes are already on disk" is not the test.** The context boundary is *serving-relative*: `src/discord_context_policy.py`'s `gate()` decides whether the channel you are **currently serving** may read some other channel, it fails closed, and it applies to owner-tier tasks too. A sweep run while serving one channel would pull rooms that gate would have refused — and because the sweep **persists** what it reads, those rooms then inform every later answer. That is strictly worse than a single blocked read.
+>
+> So: run the bootstrap from an explicit owner/operator maintenance context, not as a side effect of handling a task. If you cannot establish that context, either filter every archived observation through the same serving-channel policy, or do not sweep. Record `access_scope` on each observation so a later answer cannot quietly widen it.
+
+**Header fields are source-specific — check, do not assume.** Writers differ, and the richest one is not representative:
+
+| source | provides | consequence |
+|---|---|---|
+| AG2 Space / Matrix | `channel_id`, `room_name`, `room_members`, `room_member_count`, `user_id` | rooms, names and rosters available |
+| Discord | `channel_id`, `channel_name`, `guild_name`, `user_id` | **no roster, no member count** — membership is `unknown`, not empty |
+| Slack | `channel_id`, `user_id` | id and speaker only; name and roster `unknown` |
+
+Treat a field the source never emits as **`unknown`**, never as absent-therefore-zero — a room with no roster field is not a room with no members. Set `coverage: unknown` for those sources and `coverage: partial` only where a roster was truncated (`+N more`), which is recordable **at sweep time** and unrecoverable afterwards.
+
+What the sweep yields, on the sources that carry it:
+
+- **rooms**, ranked by traffic, with provider-native ids and whatever name the source gave
 - **participants**, ranked by messages, classified `human` / `agent` / `service`
-- **coverage flags** — a header showing `+N more` means the roster was truncated, so that room is `coverage: partial` and must be recorded as such *at sweep time*; a truncated list looks complete afterwards
 - **unknowns worth resolving immediately** — rooms with real traffic but no name and no members observed
 
-Record the result per [references/schema.md](references/schema.md), including `store_freshness` per source. Do not enumerate rooms, inboxes or accounts you were not already given: this sweep observes traffic already received, which is what makes it permission-free.
+Record the result per [references/schema.md](references/schema.md), including `store_freshness` per source. Do not enumerate rooms, inboxes or accounts you were not already given.
 
 **2. Expect it to surface defects, and record them rather than smoothing them.** Run against a real corpus it immediately produced unnamed high-traffic rooms, hundreds of truncated rosters, and a service account misfiled as human by a two-way agent/human split. Each is a real map entry — an unknown to resolve, a partial-coverage flag, a classification gap — not noise to filter out.
 
