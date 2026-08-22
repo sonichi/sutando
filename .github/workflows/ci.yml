@@ -145,6 +145,9 @@ jobs:
       - name: Lint skill manifests
         run: |
           timeout -k 5 120 python3 scripts/lint-skill.test.py
+          timeout -k 5 120 python3 skills/inboxroom/inbox-command.test.py
+          timeout -k 5 120 python3 skills/piperoom/piperoom-command.test.py
+          timeout -k 5 120 python3 skills/typed-room-behavior/behavior-loop.test.py
           timeout -k 5 120 python3 scripts/lint-skill.py --all --strict
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
