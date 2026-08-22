@@ -147,8 +147,10 @@ for line in sys.stdin:
     if not m:
         continue
     prompt = pathlib.Path(m.group(1)).read_text()
-    dest = re.search(r'to (.+?) in a single write', prompt).group(1)
-    pathlib.Path(dest).write_text('standing room result\\n')
+    dest = re.search(r'to (.+?)\\.tmp and then rename', prompt).group(1)
+    tmp = pathlib.Path(dest + '.tmp')
+    tmp.write_text('standing room result\\n')
+    tmp.rename(dest)
     print('DONE', flush=True)
 """
 
@@ -220,6 +222,8 @@ def test_claude_standing_session_e2e() -> None:
                           "standing session id is persisted for resume")
 
                 spool = worker._spool_dir(workspace) / f"{first.stem}.prompt.txt"
+                if not check(spool.is_file(), "spool prompt exists for the first message"):
+                    return
                 body = spool.read_text(encoding="utf-8")
                 check("answer this" in body and "SKILL INSTRUCTIONS" in body,
                       "spool prompt carries task content and trusted execution policy")
@@ -365,6 +369,17 @@ def test_claude_handle_dispatch_without_tmux() -> None:
             code = worker.handle("claude", workspace, broken, results, REPO)
         check(code == 1, "a spawn failure falls back to the watcher path")
 
+        crashed = task(workspace, "task-crashed-retry", room_id="!crashed:a")
+        worker._atomic_text(worker._out_path(workspace, crashed.stem), "recovered body\n")
+        with patch.object(worker, "_ensure_standing_session") as ensure, \
+             patch.object(worker, "_inject") as inject, \
+             patch.object(worker, "_spawn_monitor"), patch.object(worker, "_notify"):
+            code = worker.handle("claude", workspace, crashed, results, REPO)
+        check(code == 0 and not ensure.called and not inject.called,
+              "a retry with finished-but-unpublished output never re-injects")
+        check((results / crashed.name).read_text() == "recovered body\n",
+              "the crashed attempt's finished output is published, not re-run")
+
 
 def test_startup_failure_never_poisons_the_session_id() -> None:
     with tempfile.TemporaryDirectory() as name:
@@ -373,11 +388,11 @@ def test_startup_failure_never_poisons_the_session_id() -> None:
         room_key = worker.resolve_room_key(doomed)
         assert room_key
         ok = subprocess.CompletedProcess([], 0, "", "")
+        dying = f"claude: auth error\n{worker.EXIT_SENTINEL} code=1"
         with patch.dict(os.environ, {"SUTANDO_ROOM_SPAWN_WAIT": "5"}), \
              patch.object(worker, "_tmux", return_value=ok), \
-             patch.object(worker, "_pane_alive", return_value=None), \
-             patch.object(worker, "_pane_dead", return_value=True), \
-             patch.object(worker, "_pane_content", return_value="claude: auth error"):
+             patch.object(worker, "_pane_alive", return_value=False), \
+             patch.object(worker, "_pane_content", return_value=dying):
             try:
                 worker._ensure_standing_session(workspace, "claude", room_key, REPO)
             except RuntimeError as exc:

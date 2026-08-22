@@ -28,19 +28,26 @@ view; never the raw task file), injects one line pointing at it into the live
 pane, detaches a per-task monitor, acks the room, and returns immediately. The
 watcher is never occupied by a running turn. A session id is recorded only
 after the pane proves itself with output — recording earlier would poison every
-later `--resume` with a session that may never have existed; a startup failure
-raises with the dying pane's last screen as the diagnostic.
+later `--resume` with a session that may never have existed. The provider runs
+under a small `sh` wrapper that prints an exit sentinel and lingers briefly
+when the command dies, so a startup failure always raises with the dying
+pane's actual screen (auth error, traceback, bad flag) as the diagnostic — on
+every tmux version, with no remain-on-exit race.
 
 **The monitor is the sole publisher of the shared result path.** The session
 writes only its own private out-file
-(`state/ag2space-room-sessions/spool/<task-id>.out.txt`); the monitor waits for
-that output to be non-empty and stable (an ordinary write is not atomic and
-must never be published mid-way), then publishes it atomically via the
-no-clobber `_publish_once`. The session never touches
-`results/<task-id>.txt`, so a session/monitor write race is structurally
-impossible. On every terminal path the monitor checks the out-file first — a
-turn that finished right before its pane died still delivers its real result,
-not a failure.
+(`state/ag2space-room-sessions/spool/<task-id>.out.txt`) — and by the spool
+contract it writes `<out>.tmp` first and atomically **renames** it into place
+as its final action: the out-file's existence IS the completion signal
+(elapsed-time stability is not durable evidence of a finished write). The
+monitor publishes it via the no-clobber `_publish_once`. The session never
+touches `results/<task-id>.txt`, so a session/monitor write race is
+structurally impossible. On every terminal path the monitor checks the
+out-file first — a turn that finished right before its pane died still
+delivers its real result, not a failure. And `handle()` checks it under the
+room lock before injecting: a retry after a crashed monitor publishes the
+finished output directly instead of re-running the turn, so stale output can
+never race a fresh injection.
 
 **Why standing over per-message spawn:** a mid-turn message (including a
 cancel or redirect) enters the live conversation natively instead of queueing

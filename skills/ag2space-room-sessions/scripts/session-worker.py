@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -261,14 +262,6 @@ def _pane_alive(workspace: Path, name: str) -> Optional[bool]:
     return done.returncode == 0
 
 
-def _pane_dead(workspace: Path, name: str) -> bool:
-    try:
-        done = _tmux(workspace, "display-message", "-p", "-t", f"={name}:", "#{pane_dead}")
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return done.returncode == 0 and done.stdout.strip() == "1"
-
-
 def _pane_content(workspace: Path, name: str) -> str:
     try:
         # "=name:" = exact-match session, its active pane — pane-targeting verbs
@@ -338,10 +331,18 @@ def _discover_codex_session(since: float, expect_cwd: Path) -> Optional[str]:
     return max(candidates)[1]
 
 
-def _startup_failure(workspace: Path, name: str, reason: str) -> RuntimeError:
-    # Post-mortem before cleanup: remain-on-exit kept the dying pane, so its last
-    # screen is the actual diagnostic (auth error, traceback, bad flag...).
-    tail = "\n".join(line for line in _pane_content(workspace, name).splitlines() if line.strip())[-500:]
+EXIT_SENTINEL = "__SUTANDO_PANE_EXIT__"
+
+
+def _wrapped_launch(command: list[str]) -> str:
+    # On provider exit the pane prints a sentinel and lingers instead of vanishing:
+    # the dying screen is capturable by construction, on every tmux version.
+    return (f"{shlex.join(command)}; ec=$?; "
+            f"printf '\\n{EXIT_SENTINEL} code=%d\\n' \"$ec\"; sleep 30")
+
+
+def _startup_failure(workspace: Path, name: str, reason: str, content: str = "") -> RuntimeError:
+    tail = "\n".join(line for line in content.splitlines() if line.strip())[-500:]
     _tmux(workspace, "kill-session", "-t", f"={name}")
     return RuntimeError(f"standing session {reason} during startup"
                         + (f"; last pane output:\n{tail}" if tail else ""))
@@ -359,18 +360,17 @@ def _ensure_standing_session(workspace: Path, runtime: str, room_key: str, repo:
         return name
     session_id, created = _session_id(workspace, runtime, room_key)
     done = _tmux(workspace, "new-session", "-d", "-s", name, "-c", str(_working_dir(repo)),
-                 *_standing_launch_command(runtime, session_id, resume=not created))
+                 _wrapped_launch(_standing_launch_command(runtime, session_id, resume=not created)))
     if done.returncode != 0:
         raise RuntimeError(f"tmux new-session failed: {done.stderr.strip()}")
-    # Keep a dying startup pane around for post-mortem capture (turned off again
-    # once startup is confirmed, so a later natural exit still cleans up).
-    _tmux(workspace, "set-option", "-w", "-t", f"={name}:", "remain-on-exit", "on")
     trust_answered = False
     deadline = time.monotonic() + _timeout("SUTANDO_ROOM_SPAWN_WAIT", None)
     while time.monotonic() < deadline:
-        if _pane_dead(workspace, name) or _pane_alive(workspace, name) is False:
-            raise _startup_failure(workspace, name, "exited")
         content = _pane_content(workspace, name)
+        if EXIT_SENTINEL in content:
+            raise _startup_failure(workspace, name, "exited", content)
+        if _pane_alive(workspace, name) is False:
+            raise _startup_failure(workspace, name, "exited", content)
         if not trust_answered and "Do you trust the contents of this directory" in content:
             # Codex's first-use-in-a-directory dialog; Enter selects "Yes,
             # continue" (verified live on 0.149.0). Answered at most once.
@@ -387,10 +387,10 @@ def _ensure_standing_session(workspace: Path, runtime: str, room_key: str, repo:
                 # Codex's self-chosen id is discovered by the monitor from the
                 # rollout file the FIRST TURN creates; the marker bounds the scan.
                 _atomic_text(_spawn_marker(workspace, name), f"{time.time():.3f}\n")
-            _tmux(workspace, "set-option", "-w", "-t", f"={name}:", "remain-on-exit", "off")
             return name
         time.sleep(0.1)
-    raise _startup_failure(workspace, name, "produced no output")
+    raise _startup_failure(workspace, name, "produced no output",
+                           _pane_content(workspace, name))
 
 
 def _spool_dir(workspace: Path) -> Path:
@@ -405,13 +405,15 @@ def _write_spool_prompt(workspace: Path, task_file: Path) -> Path:
     # The session writes only its PRIVATE output file; the trusted monitor is the
     # sole publisher of the shared results path (validated + atomic, no clobber).
     task_id = task_file.stem
+    out = _out_path(workspace, task_id)
     prompt = (
         "Handle the owner task below in this persistent AG2 Space room session. Follow "
         "AGENTS.md for repository and safety policy, and keep this room's conversation "
         "context across tasks. Do not read the original task file and do not create or "
         "modify any tasks/results tracking file; the trusted monitor owns delivery. "
-        "When done, write the exact result body - nothing else - to "
-        f"{_out_path(workspace, task_id)} in a single write.\n\n"
+        f"When done, write the exact result body - nothing else - to {out}.tmp "
+        f"and then rename that file to {out} as your final action. The rename is the "
+        "completion signal: never write the final path directly.\n\n"
         f"Trusted task view:\n{_task_view(task_file)}\n"
     )
     path = _spool_dir(workspace) / f"{task_id}.prompt.txt"
@@ -419,23 +421,14 @@ def _write_spool_prompt(workspace: Path, task_file: Path) -> Path:
     return path
 
 
-def _stable_output(path: Path, delay: float = 0.5) -> Optional[str]:
-    """The provider's private out-file, but only once it is non-empty and stops
-    changing — an ordinary write is not atomic and must never be published mid-way."""
+def _finished_output(path: Path) -> Optional[str]:
+    """The provider's private out-file. Its EXISTENCE is the completion signal —
+    the spool contract has the provider write elsewhere and atomically rename."""
     try:
-        first = path.read_bytes()
+        body = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    if not first.strip():
-        return None
-    time.sleep(delay)
-    try:
-        second = path.read_bytes()
-    except OSError:
-        return None
-    if first != second:
-        return None
-    return second.decode("utf-8", "replace")
+    return body if body.strip() else None
 
 
 def _inject(workspace: Path, name: str, line: str) -> None:
@@ -460,7 +453,7 @@ def _fail(task_file: Path, result: Path, reason: str) -> None:
 def _settle(task_file: Path, result: Path, out: Path, reason: str) -> None:
     # Terminal disposition: a finished private out-file beats the failure verdict
     # (the turn may have completed right before the pane died or was killed).
-    body = _stable_output(out)
+    body = _finished_output(out)
     if body is not None:
         _publish_once(result, body)
         return
@@ -510,19 +503,21 @@ def monitor(
                 marker.unlink(missing_ok=True)
         if read_ready_result(result) is not None:
             return
-        body = _stable_output(out)
+        body = _finished_output(out)
         if body is not None:
             _publish_once(result, body)
             return
         now = time.monotonic()
         alive = _pane_alive(workspace, name)
-        if alive is False:
-            time.sleep(2)  # grace: a final out-file write may still be landing
-            _settle(task_file, result, out, "the room's standing session exited before finishing")
-            return
         # alive None = probe failure, NOT a confirmed exit: fall through so it
         # degrades into stall handling (content unreadable -> clock keeps running).
         content = _pane_content(workspace, name) if alive else ""
+        if alive is False or EXIT_SENTINEL in content:
+            # Confirmed exit: session gone, or the wrapper's sentinel is on screen.
+            time.sleep(2)  # grace: a final out-file rename may still be landing
+            _tmux(workspace, "kill-session", "-t", f"={name}")
+            _settle(task_file, result, out, "the room's standing session exited before finishing")
+            return
         if content and content != fingerprint:
             fingerprint = content
             last_change = now
@@ -621,6 +616,12 @@ def handle(
         # provider turn - the standing session serializes its own turns natively.
         with _locked(lock):
             if _completed_result_exists(results_dir, task_file.name):
+                return 0
+            leftover = _finished_output(_out_path(workspace, task_file.stem))
+            if leftover is not None:
+                # Finished-but-unpublished output from a crashed prior attempt:
+                # publish it — never race stale output against a fresh injection.
+                _publish_once(results_dir / task_file.name, leftover)
                 return 0
             name = _ensure_standing_session(workspace, runtime, room_key, repo)
             spool = _write_spool_prompt(workspace, task_file)
