@@ -50,7 +50,7 @@ def check(cond, label):
 
 
 sys.path.insert(0, str(REPO / "src"))
-from discord_rest_client import DiscordRestClient  # noqa: E402
+from channels.discord.client import DiscordRestClient  # noqa: E402
 
 
 def capture(message, **kw):

@@ -26,6 +26,11 @@ identities:
     display_name: string | null
     bridge_origin: string | null
     verified: false
+    activity:                       # WHERE this identity is live, not merely that it exists
+      last_seen_at: timestamp | null
+      rooms: [room-id]              # where it was actually observed
+      relative: primary | secondary | dormant | unknown
+      exclusive: true | false | unknown   # true = this person is reachable ONLY here
 owner_links:
   - owner_entity_id: stable-local-id
     relation: owner | operator | manager | sponsor | unknown
@@ -63,6 +68,7 @@ provider: string
 provider_room_id: stable-provider-native-room-or-channel-id
 provider_container_id: workspace-guild-server-community-id | null
 name: string | null
+topic: string | null              # the room's SELF-DECLARED purpose, read from provider state
 kind: dm | group_dm | channel | room | issue | pr | email_thread | other
 bridge_origin: string | null
 visibility: private | internal | public | unknown
@@ -152,9 +158,28 @@ store_freshness:
     coverage: full | partial | unknown      # partial when the provider truncated
     coverage_note: string | null            # e.g. "roster capped at 10 members"
     last_error_at: timestamp | null         # a failed sweep must not look like a quiet one
+    unknown_kind: unreachable_here | unsupported_by_provider | null
 ```
 
-**Report freshness with every miss.** When a lookup returns nothing, the answer is "not in the map; this source last swept at `<t>`, coverage `<c>`", never a bare "not found". A miss against a stale or partial source is a *reason to go look*, not a fact about the world — and the caller cannot make that distinction unless you hand it over.
+**`unknown_kind` answers the only question a miss actually raises: is it worth asking
+again?** Without it, a provider that structurally cannot enumerate members and one that
+merely lacks a token on this host return the same empty result, and the skill gives both
+the same advice — go look. For the structural case that sends the caller into a wall that
+produces no error, just another empty result indistinguishable from "not asked yet".
+
+- `unsupported_by_provider` — retrying is pointless anywhere. The gap is in the provider.
+- `unreachable_here` — retrying is pointless *on this host*, and may succeed on another
+  or after configuration. **It is host-local, so it must not be synced across hosts as a
+  fact**; one machine's "cannot reach" is another's ordinary success. Only
+  `unsupported_by_provider` is safely shareable.
+
+Record it per source at sweep time, not per lookup — it is a property of the source's
+capability, not of any one sweep, and re-deriving it per lookup means deriving it
+unverified every time.
+
+**Report freshness with every miss.** When a lookup returns nothing, the answer is "not in the map; this source last swept at `<t>`, coverage `<c>`", never a bare "not found". A miss against a stale or partial source is usually a *reason to go look*, not a fact about the world — and the caller cannot make that distinction unless you hand it over.
+
+The exception is `unknown_kind: unsupported_by_provider`, where going to look is the wall described above: report the miss as a property of the source, and do not advise a retry that cannot succeed. Hand over `unknown_kind` alongside `last_swept_at` and `coverage` so the caller can tell the two apart.
 
 `coverage: partial` is not a lesser `full`. A provider that caps a roster returns a complete-looking list, so partial coverage must be recorded at write time by comparing what was returned against the count the provider reported — it cannot be recovered afterwards by inspecting the stored data, which looks consistent either way.
 
@@ -220,6 +245,10 @@ quick_lookup:
 - Never use display-name equality alone. Two people can render the same name on one homeserver, so a display-name join does not merely lose precision — it returns *a* stable ID with full confidence, and the wrong one is indistinguishable from the right one downstream.
 - **An owner-stated mapping outranks any derived one.** Record it as an evidenced fact with `source: owner_stated` and the time it was stated, and do not let a later derivation silently supersede it. A derivation that disagrees with an owner statement is a conflict to surface, not a correction to apply.
 - Keep aliases after a verified rename; do not treat a rename as a new entity.
+- `name` and `topic` are mutable aliases, never keys. **`topic` is the room's self-declared
+  purpose (provider state); `purpose` is what the map inferred from traffic.** Store both, and
+  treat a divergence between them as a signal in its own right — usually a room whose real use
+  drifted while nobody updated the topic. Do not silently overwrite either with the other.
 - Supersede time-varying facts rather than deleting them silently.
 - Decay inferred operational facts when not reconfirmed: room context quickly, active responsibility moderately, identity and explicit ownership slowly.
 - Deduplicate alerts by `alert_key`; update `last_seen_at` instead of repeatedly notifying.

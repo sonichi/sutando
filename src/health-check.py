@@ -2299,6 +2299,19 @@ def check_memory_index_integrity() -> "dict | None":
                 f"({MEMORY_INDEX_LOAD_BYTES:,} B) / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
+    def _corpus_note() -> str:
+        """Name the corpus measured: "compact it now" is destructive advice about
+        one specific file, and SUTANDO_MEMORY_DIR can point this at another."""
+        try:
+            default = Path(_default_memory_dir())
+        except Exception:  # pragma: no cover - defensive; never break the check
+            return f" [corpus: {MEMORY_DIR}]"
+        if default.resolve() != MEMORY_DIR.resolve():
+            return (f" [corpus: {MEMORY_DIR} — set by SUTANDO_MEMORY_DIR, NOT the "
+                    f"workspace default {default}; if sessions load the default, "
+                    f"this verdict is about a corpus they never read]")
+        return f" [corpus: {MEMORY_DIR}]"
+
     def _hub_note() -> str:
         return (f"; {len(hub_only)} reachable via a sibling hub index "
                 f"({', '.join(sorted(index_names - {'MEMORY.md'}))}) — by design, not loaded"
@@ -2307,7 +2320,7 @@ def check_memory_index_integrity() -> "dict | None":
     if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
                 "detail": (f"all memory files reachable from the loaded MEMORY.md index"
-                           f"{_hub_note()} ({_size_note()})")}
+                           f"{_hub_note()} ({_size_note()}){_corpus_note()}")}
     parts = []
     if beyond_cut:
         parts.append(
@@ -2344,7 +2357,7 @@ def check_memory_index_integrity() -> "dict | None":
     # that still loaded fine once frontmatter/comments were excluded.)
     return {"name": "memory-index",
             "status": "fail" if beyond_cut else "warn",
-            "detail": "; ".join(parts)}
+            "detail": "; ".join(parts) + _corpus_note()}
 
 
 def check_memory_sync() -> dict:
@@ -6467,12 +6480,18 @@ def check_proactive_quarantine() -> dict:
 
 
 def _ps_snapshot() -> "str | None":
-    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once."""
+    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once.
+
+    None means UNAVAILABLE, and that includes a `ps` that returned normally with
+    a nonzero exit: its empty stdout would otherwise read as a successful scan
+    that found nothing, which is the absence callers must not assert.
+    """
     try:
-        return subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5).stdout
+        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                              capture_output=True, text=True, timeout=5)
     except Exception:  # noqa: BLE001
         return None
+    return done.stdout if done.returncode == 0 else None
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
@@ -6655,17 +6674,27 @@ def check_task_watcher() -> dict:
     """
     name = "task-watcher"
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
-    if not _any_core_alive():
-        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
-    trees = _watcher_trees()
+    # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
+    # so take the snapshot here: None is unavailable, "" is genuinely empty.
+    ps_out = _ps_snapshot()
+    if ps_out is None:
+        return {"name": name, "status": "warn",
+                "detail": "cannot enumerate processes (ps unavailable) — watcher liveness is "
+                          "UNKNOWN, not clear; a dead or duplicate watcher would be invisible"}
+    # "Not expected" is a claim about THIS host, so it needs the local heartbeat
+    # and must not be made before enumerating: visible watchers outrank it.
+    trees = _watcher_trees(ps_out)
     roots = sorted(trees)
+    if not roots and _fresh_local_core_record() is None:
+        return {"name": name, "status": "ok",
+                "detail": "no local core running and no watcher processes — watcher not expected"}
     if not pid_file.exists():
         if roots:
             # Sentinel gone but watchers alive: they are draining tasks/ but
             # nothing supervises them, and each new start adds another (observed
             # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
             # duplicate processing, not a stalled queue).
-            ps_out = _ps_snapshot()
+
             # A KNOWN parent that is not init: its spawning session still owns it.
             # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
