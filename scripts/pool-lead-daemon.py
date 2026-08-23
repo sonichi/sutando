@@ -92,6 +92,7 @@ def main() -> int:
     status = PoolStatusWriter(tasks, state, followers, alive)
     notifier = PoolNotifier(tasks, state, _send_notice)
     ledger = ScaleLedger(state)
+    last_prune = 0.0
     beat = cores / f"{LEAD_LABEL}.alive"
     running = {"on": True}
 
@@ -114,6 +115,13 @@ def main() -> int:
             print(f"reclaimed {name}", flush=True)
         for name, disposition in lead.reclaim_claimed():
             print(f"reclaimed-claim {name} -> {disposition}", flush=True)
+        for name in lead.reclaim_stuck_assignments():
+            print(f"reclaimed-stuck {name}", flush=True)
+        if time.time() - last_prune > 3600:
+            n = lead.prune_done_flags()
+            if n:
+                print(f"pruned {n} stale done-flag(s)", flush=True)
+            last_prune = time.time()
         for stem in notifier.check_stalls():
             print(f"notified-stall {stem}", flush=True)
         # Autoscale, scale-UP only: shrinking can strand a core's live claims,

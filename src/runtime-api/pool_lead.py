@@ -28,6 +28,8 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 # handler until the channel has been idle this long, then rebalance.
 AFFINITY_IDLE_S = 30 * 60
 AFFINITY_BUSY_MAX = 3  # outstanding assigned+claimed before affinity yields
+ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
+DONE_FLAG_RETENTION_S = 7 * 86400
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
 # assigned/claimed states explicitly rather than banning dots
@@ -196,6 +198,85 @@ class PoolLead:
                 continue
             reclaimed.append(f.name)
         return reclaimed
+
+    # ── liveness hygiene ────────────────────────────────────────────────────
+    def _assign_ledger_path(self) -> Path:
+        return self.state_dir / "pool" / "assignments.json"
+
+    def _load_assign_ledger(self) -> dict:
+        try:
+            d = json.loads(self._assign_ledger_path().read_text())
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_assign_ledger(self, ledger: dict) -> None:
+        p = self._assign_ledger_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp2")
+            tmp.write_text(json.dumps(ledger))
+            os.replace(tmp, p)
+        except OSError:
+            pass  # hygiene is best-effort; assignment correctness never depends on it
+
+    def reclaim_stuck_assignments(self, max_age_s: int = ASSIGN_STUCK_S) -> "list[str]":
+        """Repool assignments a LIVE follower has not claimed in time. A hung
+        session's wrapper keeps its heartbeat fresh, so reclaim_dead never
+        fires — unclaimed age is the only signal. No claim = no work started,
+        so repooling cannot double-fire a side effect."""
+        pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.assigned-(.+)\.txt$")
+        ledger = self._load_assign_ledger()
+        out = []
+        live = set()
+        try:
+            entries = list(self.tasks_dir.iterdir())
+        except OSError:
+            return out
+        for f in entries:
+            m = pat.match(f.name)
+            if not m:
+                continue
+            live.add(f.name)
+            ts = ledger.get(f.name)
+            if ts is None:
+                ledger[f.name] = self.now()  # adopt pre-ledger assignments
+                continue
+            if self.now() - float(ts) < max_age_s or not self.alive_fn(m.group(2)):
+                continue  # young, or dead (reclaim_dead owns that path)
+            try:
+                os.rename(f, f.with_name(m.group(1) + ".txt"))
+            except OSError:
+                continue
+            ledger.pop(f.name, None)
+            live.discard(f.name)
+            out.append(f.name)
+        self._save_assign_ledger({k: v for k, v in ledger.items() if k in live})
+        return out
+
+    def prune_done_flags(self, retention_s: int = DONE_FLAG_RETENTION_S) -> int:
+        """Drop done-flags past retention whose task no longer exists in
+        tasks/ in any state — bounds the dirs and retires stale flags that
+        could shadow a reused task id."""
+        cores = self.state_dir / "cores"
+        removed = 0
+        try:
+            dirs = [d / "done" for d in cores.iterdir() if (d / "done").is_dir()]
+        except OSError:
+            return 0
+        for d in dirs:
+            for flag in d.glob("task-*.flag"):
+                try:
+                    if self.now() - flag.stat().st_mtime < retention_s:
+                        continue
+                    stem = flag.name[:-len(".flag")]
+                    if any(self.tasks_dir.glob(f"{stem}*.txt")):
+                        continue
+                    flag.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
 
     def _done_flag_exists(self, task_name: str) -> bool:
         cores = self.state_dir / "cores"

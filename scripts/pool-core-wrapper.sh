@@ -21,8 +21,18 @@ PANE_PID="$("$POOL_TMUX_BIN" list-panes -t "$SESSION" -F '#{pane_pid}' | head -1
   "core-${SUTANDO_CORE_ID}" "$POOL_WORKSPACE" "$PANE_PID" &
 BEAT=$!
 
+# Sweep nudge: the in-session cron expires after 7 days and the watcher can
+# miss events; this keystroke is the durable backstop (same pattern as the
+# app's checkWatcher). A duplicate sweep is a no-op (acquire returns None).
+NUDGE_S="${SUTANDO_POOL_SWEEP_NUDGE_S:-1800}"
+LAST_NUDGE=$(date +%s)
 while "$POOL_TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; do
   sleep "${SUTANDO_POOL_SESSION_POLL:-30}"
+  NOW=$(date +%s)
+  if [ $((NOW - LAST_NUDGE)) -ge "$NUDGE_S" ]; then
+    "$POOL_TMUX_BIN" send-keys -t "$SESSION" "/proactive-loop-pool pass" Enter 2>/dev/null
+    LAST_NUDGE=$NOW
+  fi
 done
 kill "$BEAT" 2>/dev/null
 exit 0
