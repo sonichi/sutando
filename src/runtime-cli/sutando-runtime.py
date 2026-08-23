@@ -64,7 +64,7 @@ def _wss_url() -> str | None:
     return os.environ.get("SUTANDO_SCP_WSS_URL") or None
 
 
-def _rpc_wss(method: str, params: dict, timeout: float) -> dict:
+def _rpc_wss(method: str, params: dict, timeout: float) -> dict:  # pragma: no cover — LAN-WSS transport; needs aiohttp + a remote Server (S1 slice)
     import asyncio  # noqa: PLC0415
     import aiohttp  # noqa: PLC0415
     url = os.environ["SUTANDO_SCP_WSS_URL"]
@@ -118,7 +118,7 @@ def _jarg(v):
     return json.loads(v) if v else None
 
 
-def _raw_tmux() -> int:
+def _raw_tmux() -> int:  # pragma: no cover — live tmux firehose; needs an interactive tmux session
     # RAW = read-only view via tmux's own attach — the firehose stays on
     # the tmux socket, never through the daemon push path. Ctrl-b d detaches.
     import subprocess
@@ -131,7 +131,7 @@ def _raw_tmux() -> int:
                             "-t", session, "-r"])
 
 
-def _watch_wss(activity: bool = False) -> int:
+def _watch_wss(activity: bool = False) -> int:  # pragma: no cover — LAN-WSS transport; needs aiohttp + a remote Server (S1 slice)
     # PUSH mode over LAN-WSS: subscribe + stream from a remote Server;
     # read-only (submit stays edge-refused).
 
@@ -304,7 +304,7 @@ async def _chat_line(reader, writer, _send, level=0, agent_id=None) -> None:
     await asyncio.gather(pump_stdin(), pump_socket())
 
 
-async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
+async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:  # pragma: no cover — tty-only fixed UI; _chat_line is the tested twin
     # Fixed-bottom compose box: output scrolls ABOVE a pinned input line so
     # typing is never clobbered. Scroll-region + raw-mode buffer, no deps.
     import termios

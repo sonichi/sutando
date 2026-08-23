@@ -288,6 +288,48 @@ check("recovery relinks a pending approval to its card", a_rid in d._ha_of, str(
 check("recovery relinks a pending elicitation to its card", e_rid in d._ha_of, str(d._ha_of))
 check("recovered approval is still pending", store.get(a_rid)["status"] == "pending")
 
+print("── approval.respond (device-plane; transport gates access) ──")
+d, store, ha, _ = fresh(actor="responder")
+raises("respond requires requestId",
+       lambda: run(d.handle("approval.respond", {})), code=-32602, substr="requestId")
+raises("respond requires a valid decision",
+       lambda: run(d.handle("approval.respond", {"requestId": "r", "decision": "maybe"})),
+       code=-32602, substr="decision")
+raises("respond on unknown request",
+       lambda: run(d.handle("approval.respond",
+                            {"requestId": "nope", "decision": "approve"})),
+       code=-32602, substr="unknown")
+ra = run(d.handle("approval.request", {"action": "x.y"}))
+rr = run(d.handle("approval.respond",
+                  {"requestId": ra["requestId"], "decision": "approve"}))
+check("respond approves and reports the transition",
+      rr["status"] == "approved", str(rr))
+check("approved is durable", store.get(ra["requestId"])["status"] == "approved")
+rr2 = run(d.handle("approval.respond",
+                   {"requestId": ra["requestId"], "decision": "reject"}))
+check("second respond reports alreadyTerminal, never flips the row",
+      rr2.get("alreadyTerminal") and store.get(ra["requestId"])["status"] == "approved",
+      str(rr2))
+re_ = run(d.handle("elicitation.request",
+                   {"question": "q?", "type": "single_select",
+                    "options": ["a", "b"]}))
+raises("respond refuses a non-approval request type",
+       lambda: run(d.handle("approval.respond",
+                            {"requestId": re_["requestId"], "decision": "approve"})),
+       code=-32602, substr="approval")
+rd = run(d.handle("approval.request", {"action": "z.z"}))
+rrd = run(d.handle("approval.respond",
+                   {"requestId": rd["requestId"], "decision": "reject"}))
+check("respond reject denies", rrd["status"] == "denied", str(rrd))
+
+print("── schedule / task param edges ──")
+raises("schedule.list without a schedules surface",
+       lambda: run(d.handle("schedule.list", {})), code=-32601, substr="schedule")
+raises("task.* without a task pipeline is a clean -32601",
+       lambda: run(d.handle("task.status", {})), code=-32601, substr="task pipeline")
+raises("request.get without requestId",
+       lambda: run(d.handle("request.get", {})), code=-32602, substr="requestId")
+
 print()
 if FAILS:
     print(f"FAIL — {len(FAILS)}: {FAILS}")

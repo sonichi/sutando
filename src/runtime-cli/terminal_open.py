@@ -59,7 +59,7 @@ def build_open_plan(agent_id: str, terminal: str, window: bool = False) -> dict:
     return {"method": "manual", "command": command}
 
 
-def open_instance(agent_id: str, window: bool = False) -> dict:
+def open_instance(agent_id: str, window: bool = False) -> dict:  # pragma: no cover — spawns a real terminal tab; build_open_plan/applescript_for are the tested pure core
     plan = build_open_plan(agent_id, detect_terminal(), window=window)
     if plan["method"] == "applescript":
         subprocess.run(["osascript", "-e", plan["script"]], check=False)

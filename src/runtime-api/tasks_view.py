@@ -189,7 +189,11 @@ class TasksView:
              or find_archived_task(self.tasks_dir, task_id))
         if p is None:
             return None
-        th = parse_task_headers_lenient(p.read_text())
+        try:
+            raw = p.read_text()
+        except OSError:
+            return None  # unreadable degrades to absent, same as every read here
+        th = parse_task_headers_lenient(raw)
         out = {"taskId": task_id, "task": th.body,
                "state": self.status(task_id)["state"]}
         for k in ("source", "timestamp", "priority", "access_tier",

@@ -38,6 +38,12 @@ REPO = Path(__file__).resolve().parent.parent
 SERVER = REPO / "src" / "runtime-api" / "server.py"
 CLI = REPO / "src" / "runtime-cli" / "sutando-runtime.py"
 
+# Under the coverage gate, subprocesses must self-instrument or their
+# execution (daemon + CLI) counts as zero — same pattern as voice-lock.
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+
 FAILS: list = []
 
 
@@ -48,7 +54,7 @@ def check(cond, msg):
 
 
 def cli(*args, expect_rc=0, timeout=30):
-    p = subprocess.run([sys.executable, str(CLI), *args],
+    p = subprocess.run([*PYBASE, str(CLI), *args],
                        capture_output=True, text=True, timeout=timeout,
                        env=ENV)
     if p.returncode != expect_rc:
@@ -71,7 +77,7 @@ def wait_socket(path, timeout=10):
 
 
 def start_daemon():
-    proc = subprocess.Popen([sys.executable, str(SERVER)], env=ENV,
+    proc = subprocess.Popen([*PYBASE, str(SERVER)], env=ENV,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True)
     if not wait_socket(ENV["SUTANDO_RUNTIME_SOCKET"]):
@@ -208,7 +214,7 @@ def main() -> int:
         check(w3b["status"] == "resolved" and w3b["result"]["answer"],
               "multi_select resolves with the chosen options")
         # 3c. free_text is a clean v0 rejection (dead path would strand forever)
-        p3c = subprocess.run([sys.executable, str(CLI), "elicitation", "request",
+        p3c = subprocess.run([*PYBASE, str(CLI), "elicitation", "request",
                               "--question", "Say anything", "--type", "free_text"],
                              capture_output=True, text=True, env=ENV)
         check(p3c.returncode == 1 and "not supported in v0" in p3c.stderr,
@@ -234,7 +240,7 @@ def main() -> int:
               and GW["posts"][-1]["room_id"] == "!room:example.org",
               "capability.execute delivers via gateway, verified by event_id")
         # one-time consumption: the same approval cannot authorize a second send
-        p4 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        p4 = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                              "--action", "message.send",
                              "--resource", '{"roomId":"!room:example.org"}',
                              "--input", '{"body":"hello"}',
@@ -244,7 +250,7 @@ def main() -> int:
               "an approval authorizes exactly ONE execution (consumed)")
         # UNGATED governed action → refused BEFORE any gateway contact
         posts_before = len(GW["posts"])
-        p4u = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        p4u = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                               "--action", "message.send",
                               "--resource", '{"roomId":"!room:example.org"}',
                               "--input", '{"body":"sneaky"}'],
@@ -319,7 +325,7 @@ def main() -> int:
         store.resolve(actbi["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", rbi["requestId"], "--timeout", "10")
         posts_bi = len(GW["posts"])
-        pbi = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        pbi = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                               "--action", "message.send",
                               "--resource", '{"roomId":"!room:example.org"}',
                               "--input", '{"body":"SUBSTITUTED-UNSHOWN-BODY"}',
@@ -343,7 +349,7 @@ def main() -> int:
         actb = pending_action_for(rb["requestId"], store)
         store.resolve(actb["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", rb["requestId"], "--timeout", "10")
-        pb = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        pb = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                              "--action", "message.send",
                              "--resource", '{"roomId":"!room:example.org"}',
                              "--input", '{"body":"cross"}',
@@ -357,7 +363,7 @@ def main() -> int:
         actb2 = pending_action_for(rb2["requestId"], store)
         store.resolve(actb2["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", rb2["requestId"], "--timeout", "10")
-        pb2 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        pb2 = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                               "--action", "message.send",
                               "--resource", '{"roomId":"!room:example.org"}',
                               "--input", '{"body":"cross2"}',
@@ -367,7 +373,7 @@ def main() -> int:
               "approval bound to another resource cannot authorize this send")
 
         # idempotency-key REUSE with a different fingerprint → rejected
-        pk = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+        pk = subprocess.run([*PYBASE, str(CLI), "capability", "execute",
                              "--action", "message.send",
                              "--resource", '{"roomId":"!room:example.org"}',
                              "--input", '{"body":"DIFFERENT"}',
@@ -424,7 +430,7 @@ def main() -> int:
               "unknown capability action fails cleanly")
 
         # 5. unknown id → error
-        p = subprocess.run([sys.executable, str(CLI), "request", "get", "nope-1"],
+        p = subprocess.run([*PYBASE, str(CLI), "request", "get", "nope-1"],
                            capture_output=True, text=True, env=ENV)
         check(p.returncode == 1 and "unknown requestId" in p.stderr,
               "unknown requestId is a clean protocol error")
@@ -629,7 +635,7 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
               and rt18.get("session") == "e2e-core",
               "manifest records the tmux attach coords (socket + session)")
         at18 = subprocess.run(
-            [sys.executable, str(CLI), "instance", "attach",
+            [*PYBASE, str(CLI), "instance", "attach",
              "@test-agent:example.org", "--print"],
             capture_output=True, text=True, env=ENV)
         check(at18.stdout.strip() ==

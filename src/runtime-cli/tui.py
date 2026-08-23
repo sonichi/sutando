@@ -139,7 +139,7 @@ _KEYS = ("[l] list/refresh  [s] start <id>  [c] connect <id>  "
          "[h] requests <id>  [q] quit")
 
 
-def main(argv=None) -> int:
+def main(argv=None) -> int:  # pragma: no cover — interactive key loop; instance_view/render_view are the tested pure core
     print("sutando tui — dumb reference client (Registry -> Manifest -> "
           "Launcher -> Protocol)\n")
     while True:
