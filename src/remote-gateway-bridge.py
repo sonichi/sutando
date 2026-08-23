@@ -43,8 +43,9 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from proactive_routing import (BRIDGE_CHANNELS, proactive_destination,  # noqa: E402
-                               should_claim_proactive)
+from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
+                               proactive_destination, should_claim_proactive)
+from delivery.readiness import read_ready_result  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 
@@ -192,6 +193,13 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
     dest = proactive_destination(path.name)
     if dest is not None:
         return dest == _CHANNEL
+    # The BODY's redirect outranks activity (same rule as the bridge
+    # gates) — a Matrix-targeted body is claimed here despite foreign activity.
+    body = read_ready_result(path)
+    if body:
+        kind = body_target_channel(body)
+        if kind is not None:
+            return kind == _CHANNEL
     state = WS / "state" / "last-owner-activity.json"
     if should_claim_proactive(state, _CHANNEL):
         return True

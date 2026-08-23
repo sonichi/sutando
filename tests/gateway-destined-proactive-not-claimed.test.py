@@ -132,6 +132,51 @@ finally:
     proc.kill()
     out = proc.stdout.read().decode(errors="replace")[-1500:]
 
+# ── Phase 2: activity routes to DISCORD; only the BODY names a channel —
+# matrix-targeted must be claimed promptly, discord-targeted never. ──
+tmp2 = tempfile.mkdtemp(prefix="destined-gate2-")
+rdir2 = Path(tmp2) / "results"
+rdir2.mkdir(parents=True)
+sdir2 = Path(tmp2) / "state"
+sdir2.mkdir(parents=True)
+(sdir2 / "last-owner-activity.json").write_text(json.dumps(
+    {"ts": int(time.time()), "channel": "discord", "summary": "t"}))
+(rdir2 / "proactive-200.txt").write_text(
+    "[channel: !legacy:ag2.space]\nmatrix targeted body")
+(rdir2 / "proactive-201.txt").write_text(
+    "[channel: 123456789012345678]\ndiscord targeted body")
+env2 = dict(env)
+env2["SUTANDO_WORKSPACE"] = tmp2
+proc2 = subprocess.Popen(
+    [sys.executable, str(REPO / "src" / "remote-gateway-bridge.py")],
+    cwd=str(REPO), env=env2,
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+try:
+    deadline = time.monotonic() + 25
+    matrix_delivered = False
+    while time.monotonic() < deadline:
+        with LOCK:
+            bodies = [p.get("body", "") for p in STATE["room_posts"]]
+        if any("matrix targeted body" in b for b in bodies):
+            matrix_delivered = True
+            break
+        if proc2.poll() is not None:
+            break
+    check(matrix_delivered,
+          "reverse direction: matrix-targeted BODY is claimed despite "
+          "discord activity (well inside the 180s grace)")
+    time.sleep(4)
+    with LOCK:
+        bodies = [p.get("body", "") for p in STATE["room_posts"]]
+    check(not any("discord targeted body" in b for b in bodies),
+          "discord-targeted body never reaches the gateway room")
+    check((rdir2 / "proactive-201.txt").exists(),
+          "discord-targeted file remains on disk for its own bridge")
+finally:
+    proc2.kill()
+    out2 = proc2.stdout.read().decode(errors="replace")[-1500:]
+    out = out + "\n--- phase2 ---\n" + out2
+
 if failures:
     print("--- bridge output tail ---")
     print(out)
