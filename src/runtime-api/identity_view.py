@@ -98,6 +98,10 @@ class IdentityView:
                 continue
             row = {k: rec[k] for k in ("device_id", "label", "device_type")
                    if rec.get(k) not in (None, "", "None")}
+            # a credential-backed pairing record (hashed token, owner-minted)
+            # is a formal enrollment; anything else is just configuration
+            row["status"] = ("enrolled" if rec.get("token_sha256")
+                             else "configured_unverified")
             if details and rec.get("granted_methods"):
                 row["granted_methods"] = rec["granted_methods"]
             if rec.get("last_seen_at") not in (None, "None"):
@@ -190,12 +194,17 @@ class IdentityView:
         if policy_invalid:
             ent["status"] = "policy_invalid"
         elif link:
-            # a verified EntranceLink record is the ONLY path to "active"
-            ent["status"] = "active"
+            # introspection proves credential->subject; ONLY an explicit
+            # owner authorization on the link makes the Stand binding active
+            authorized = bool(link.get("authorized_by"))
+            ent["status"] = "active" if authorized else "verified_unlinked"
             ent["identity"] = link.get("provider_subject")
             if link.get("display"):
                 ent["display"] = link["display"]
             ent["verification"] = link.get("verification")
+            ent["stand_binding"] = ("authorized" if authorized else "absent")
+            if authorized:
+                ent["authorized_by"] = link["authorized_by"]
             if details and link.get("credential"):
                 ent["credential"] = link["credential"]
         elif evidence:

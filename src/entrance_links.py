@@ -96,6 +96,21 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
     return link
 
 
+def authorize_link(state_dir: str | Path, provider: str,
+                   authorized_by: str) -> dict:
+    """Explicit owner authorization: the act that turns a verified link into
+    an active Stand binding. Never called automatically."""
+    links = load_links(state_dir)
+    for lk in links:
+        if lk.get("provider") == provider and lk.get("status") == "active":
+            lk["authorized_by"] = authorized_by
+            lk["authorized_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+            _save_links(state_dir, links)
+            return lk
+    raise ValueError(f"no active-eligible {provider} link to authorize")
+
+
 def verify_discord(state_dir: str | Path, token: str) -> dict:
     req = urllib.request.Request(
         "https://discord.com/api/v10/users/@me",

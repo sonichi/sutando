@@ -612,9 +612,15 @@ def _fmt_subject(provider: str, subject: str) -> str:
     return f"{provider}:user:{subject}"
 
 
+_PROFILE_LABELS = {"ag2space": "ag2space [production]",
+                   "dev-ag2space": "ag2space [dev]"}
+
+
 def _print_entrance_rows(ents: list, width: int) -> None:
+    width = max(width, len("ag2space [production]")) + 2
     for e in ents:
-        print(f"  {e.get('provider','').ljust(width)}{e.get('status','')}")
+        label = _PROFILE_LABELS.get(e.get("provider", ""), e.get("provider", ""))
+        print(f"  {label.ljust(width)}{e.get('status','')}")
         ident = e.get("identity") or {}
         if ident:
             sub = ident.get("id", "")
@@ -632,7 +638,9 @@ def _print_entrance_rows(ents: list, width: int) -> None:
         if cred.get("fingerprint"):
             print(f"    {'fingerprint'.ljust(width)}{cred['fingerprint']}")
         ev = e.get("evidence") or {}
-        for key, label in (("subject_evidence", "identity"),
+        subj_label = ("identity" if e.get("status") == "active"
+                      else "subject evidence")
+        for key, label in (("subject_evidence", subj_label),
                            ("owner_id", "owner id"),
                            ("credential_present", "credential"),
                            ("policy_present", "policy")):
@@ -641,6 +649,8 @@ def _print_entrance_rows(ents: list, width: int) -> None:
                 if key == "owner_id":
                     val = _fmt_subject(e.get("provider", ""), val)
                 print(f"    {label.ljust(width)}{val}")
+        if e.get("stand_binding"):
+            print(f"    {'Stand binding'.ljust(width)}{e['stand_binding']}")
         st = e.get("storage") or {}
         if st.get("directory"):
             print(f"    {'storage'.ljust(width)}{st['directory']}")
@@ -729,7 +739,8 @@ def _print_stand_card(card: dict, section: "str | None") -> int:
         if devs:
             for d in devs:
                 row = f"  {d.get('label', d.get('device_id', '')).ljust(width)}"
-                row += (d.get("device_type") or "").ljust(10)
+                row += (d.get("device_type") or "unknown").ljust(10)
+                row += d.get("status", "")
                 print(row.rstrip())
         else:
             print("  No enrolled devices")

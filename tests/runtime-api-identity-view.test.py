@@ -318,17 +318,32 @@ class TestEntranceLinks(unittest.TestCase):
             {"method": "discord_token_introspection", "verified_at": "t"},
             "sha256:abcd")
 
-    def test_active_link_upgrades_entrance(self):
+    def test_verified_link_without_authorization_is_unlinked(self):
         (self.state / "auth" / "ag2space.json").write_text(
             json.dumps({"agent_id": "@stand:ag2.space"}))
         link = self._link()
         self.assertEqual(link["stand_id"], "@stand:ag2.space")
         out = _mk(self.state, self.channels).entrances()
         e = out["channels"][0]
-        self.assertEqual(e["status"], "active")
+        # introspection alone proves credential->subject, NOT authorization
+        self.assertEqual(e["status"], "verified_unlinked")
+        self.assertEqual(e["stand_binding"], "absent")
         self.assertEqual(e["identity"], {"type": "bot_user", "id": "123"})
         self.assertEqual(e["verification"]["method"],
                          "discord_token_introspection")
+
+    def test_owner_authorization_activates_the_binding(self):
+        self._link()
+        self.el.authorize_link(self.state, "discord", "@owner:x")
+        out = _mk(self.state, self.channels).entrances()
+        e = out["channels"][0]
+        self.assertEqual(e["status"], "active")
+        self.assertEqual(e["stand_binding"], "authorized")
+        self.assertEqual(e["authorized_by"], "@owner:x")
+
+    def test_authorize_without_link_is_loud(self):
+        with self.assertRaises(ValueError):
+            self.el.authorize_link(self.state, "discord", "@owner:x")
 
     def test_no_link_stays_unverified(self):
         out = _mk(self.state, self.channels).entrances()
