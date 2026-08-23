@@ -72,7 +72,9 @@ def census(workspace: Path | None = None, days: float = 7.0) -> dict:
             try:
                 text = p.read_text(encoding="utf-8")
                 mtime = p.stat().st_mtime
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # A torn read mid-character raises UnicodeDecodeError, which is a
+                # ValueError and escapes bare OSError — skip, same as a vanish.
                 continue
             if _task_epoch(p.name, text, mtime) < cutoff:
                 continue

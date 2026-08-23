@@ -132,6 +132,25 @@ def test_active_task_rows_survives_torn_bodies():
             check(False, f"_active_task_rows RAISED {type(e).__name__}")
 
 
+def test_task_envelope_census_survives_a_torn_body():
+    """Census rglobs task-*.txt while a bridge writes them; `except OSError`
+    alone does not cover the decode error."""
+    census = _load("task_envelope_census", REPO / "src" / "task_envelope_census.py")
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        (ws / "tasks").mkdir(parents=True)
+        (ws / "tasks" / "task-good.txt").write_text(
+            "id: task-good\nsource: chat\ntask: hello\n")
+        (ws / "tasks" / "task-torn.txt").write_bytes(
+            torn("id: task-torn\nsource: chat\ntask: " + BODY))
+        try:
+            out = census.census(workspace=ws, days=3650.0)
+            check(out.get("scanned", 0) >= 1,
+                  f"census scans the clean task and skips the torn one (scanned={out.get('scanned')})")
+        except UnicodeDecodeError as e:
+            check(False, f"task-envelope census RAISED {type(e).__name__}")
+
+
 def test_daily_insight_analysis_survives_a_torn_body():
     """The 50-freshest scan over results/ must count, not crash."""
     insight = _load("daily_insight", REPO / "src" / "daily-insight.py")
@@ -156,5 +175,6 @@ test_archive_poll_degrades_to_pending()
 test_daily_insight_analysis_survives_a_torn_body()
 test_display_fields_narrow_guard_covers_decode_error()
 test_active_task_rows_survives_torn_bodies()
+test_task_envelope_census_survives_a_torn_body()
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
