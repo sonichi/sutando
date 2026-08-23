@@ -258,6 +258,33 @@ def test_body_leg_fallbacks_and_precedence():
     _with_state({"ts": 9999999999, "channel": "ag2space"}, fn)
 
 
+def test_delivery_guard_shares_the_claim_gates_precedence():
+    """proactive_body_guard: filename outranks the body's redirect, so the
+    delivery-time re-check can never reverse the claim decision (kewei P1)."""
+    from proactive_routing import proactive_body_guard
+    disc = "[channel: 1535008729106485288]\nx"
+    room = "[channel: !r:ag2.space]\nx"
+    # destined file: the body's foreign redirect is overridden, both modes
+    assert proactive_body_guard("p.to-telegram.txt", disc, "telegram") is True
+    assert proactive_body_guard("p.to-slack.txt", disc, "slack") is True
+    assert proactive_body_guard("p.to-discord.txt", room, "discord",
+                                strict=True) is True
+    # a foreign filename blocks delivery even when the body matches
+    assert proactive_body_guard("p.to-discord.txt",
+                                "[channel: C0123ABCD]\nx", "slack") is False
+    # undestined: pre-existing body rules apply unchanged
+    assert proactive_body_guard("p.txt", disc, "telegram") is False
+    assert proactive_body_guard("p.txt", "[channel: garbage]\nx",
+                                "telegram") is True
+    assert proactive_body_guard("p.txt", "no marker", "telegram") is True
+    # strict (default destination): unrecognised is foreign, own id is not
+    assert proactive_body_guard("p.txt", "[channel: garbage]\nx", "discord",
+                                strict=True) is False
+    assert proactive_body_guard("p.txt", disc, "discord", strict=True) is True
+    assert proactive_body_guard("p.txt", "no marker", "discord",
+                                strict=True) is True
+
+
 def main():
     test_discord_active_routes_to_discord()
     test_telegram_active_routes_to_telegram()
@@ -273,6 +300,7 @@ def main():
     test_bridge_channels_set_is_documented()
     test_body_leg_discord_claims_its_own_target()
     test_body_leg_fallbacks_and_precedence()
+    test_delivery_guard_shares_the_claim_gates_precedence()
     print("All proactive-routing tests passed.")
 
 

@@ -1047,6 +1047,9 @@ def _engine_desc() -> str:
         return "DeliveryCore(unbuilt)"
     return (f"DeliveryCore({type(c.backend).__name__}"
             f"->{type(c.provider).__name__})")
+# Host-injected "the FILENAME destines this file here" (name -> bool): filename
+# outranks a foreign body redirect. None (standalone default): no override.
+PROACTIVE_DESTINED_HERE: Callable[[str], bool] | None = None
 # Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
 # event_id: trust the bare ok as delivered (at-least-once beats never).
 _PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
@@ -2636,14 +2639,15 @@ _PROACTIVE_MAX_BODY_B = 48 * 1024
 
 # Destination FORMAT validation is this bridge's own job ("the bridge
 # validates the id format for its platform when applying" — result_markers).
-# Ids AND aliases: every other bridge declines '#alias:server' as Matrix-owned,
-# so a '!'-only rule here strands alias-directed bodies with no claimant.
-_MATRIX_ROOM_RE = re.compile(r"^[!#][^\s:]+:[^\s:]+(?::\d+)?$")
+# Room IDS only — no alias resolution exists (room-ID-only contract); server
+# names may carry a port or a bracketed IPv6 host.
+_MATRIX_ROOM_RE = re.compile(
+    r"^![^\s:]+:(?:\[[0-9A-Fa-f:.]+\]|[^\s:\[\]]+)(?::\d+)?$")
 
 
 def _proactive_route(body: str) -> "tuple[str, str | None, str]":
-    """('send', room_or_None, stripped-body) | ('foreign', None, '') |
-    ('drop', None, '').
+    """('send', room_or_None, stripped-body) | ('foreign', None, stripped-body)
+    | ('drop', None, '').
 
     Marker grammar comes SOLELY from parse_markers() (no private parser —
     CLAUDE.md result-marker contract); this function only applies the actions
@@ -2652,13 +2656,12 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
       * [dm-only]      → parse_markers already suppressed any redirect, so the
                          body falls through to the default (owner) room
       * [channel: !r:s]→ 'send' to that room, marker stripped
-      * [channel: #a:s]→ 'send' — Matrix-owned. DELIVERY CONTRACT: the
-                         gateway forwards the alias verbatim; resolution to a
-                         room id is the BROKER's job (server-side contract).
-                         Until the broker ships it, alias sends come back
-                         refused and park bounded in undelivered/ — the
-                         failure log names this contract so the operator
-                         knows what is missing, not just that it failed.
+      * [channel: #a:s]→ 'foreign' — NOT executable here: the backend sends
+                         the value verbatim as Matrix {roomId} with no alias
+                         resolution (room-ID-only contract), so claiming an
+                         alias would retry-and-park a nudge that can never
+                         land. The stripped body still rides the tuple for a
+                         host whose filename rule overrides the foreign call.
       * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
                          blocker: claiming it here would leak the raw body)
       * attach markers → stripped by the parser; uploads are unsupported on
@@ -2672,7 +2675,7 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
         dest = redirect.value
         if _MATRIX_ROOM_RE.match(dest):
             return ("send", dest, parsed.body)
-        return ("foreign", None, "")
+        return ("foreign", None, parsed.body)
     return ("send", None, parsed.body)
 
 
@@ -2755,14 +2758,15 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
             pass
 
 
-def _alias_contract_note(dest: "str | None") -> str:
-    """A failed '#alias' send is missing a CONTRACT, not just connectivity —
-    say so, or the park reads as an ordinary network fault."""
-    if dest and dest.startswith("#"):
-        return (" [alias target: delivery requires broker-side alias "
-                "resolution — not yet provided by this gateway; the body "
-                "stays recoverable in undelivered/]")
-    return ""
+def _destined_here(name: str) -> bool:
+    """True iff the host's filename rule destines this file to this bridge.
+    Fail-closed: no injection, or a raising one, means no override."""
+    if PROACTIVE_DESTINED_HERE is None:
+        return False
+    try:
+        return bool(PROACTIVE_DESTINED_HERE(name))
+    except Exception:
+        return False
 
 
 def _resolve_send_failure(claim, original, exc) -> str:
@@ -2808,7 +2812,11 @@ def _post_proactive() -> None:
         except (OSError, UnicodeDecodeError):
             continue  # racing consumer, or a writer mid-flight
         if route == "foreign":
-            continue
+            if not _destined_here(f.name):
+                continue
+            # filename outranks the body's foreign redirect (shared
+            # precedence): deliver here, to the default room
+            route, peek_room = "send", None
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
         if route == "send" and peek_room is None and not PROACTIVE_ROOM:
@@ -2843,6 +2851,9 @@ def _post_proactive() -> None:
                      f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
                      f"owner nudge stranded under live pid until restart")
             continue
+        if route == "foreign" and _destined_here(f.name):
+            # same filename-over-body precedence as the pre-claim peek
+            route, room_override = "send", None
         if route == "foreign" or (
                 route == "send" and room_override is None and not PROACTIVE_ROOM):
             # Hand back rather than eat: a foreign target seen only post-claim,
@@ -2903,8 +2914,7 @@ def _post_proactive() -> None:
                     claim, f, _UnconfirmedDelivery("no event_id in response"))
                 _log(f"proactive send for {f.name} got no delivery signal "
                      f"(response {str(resp)[:120]!r}) — {outcome}; check "
-                     "REMOTE_PROACTIVE_ROOM and the agent's room membership"
-                     + _alias_contract_note(dest_room))
+                     "REMOTE_PROACTIVE_ROOM and the agent's room membership")
                 continue
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -2914,8 +2924,7 @@ def _post_proactive() -> None:
                     pass
                 raise
             outcome = _resolve_send_failure(claim, f, e)
-            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}"
-                 + _alias_contract_note(dest_room))
+            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
             continue
         except (urllib.error.URLError, TimeoutError) as e:
             outcome = _resolve_send_failure(claim, f, e)

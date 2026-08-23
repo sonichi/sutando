@@ -1066,7 +1066,7 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import (body_claimable_by,
+        from proactive_routing import (proactive_body_guard,
                                        should_claim_proactive_file)
         try:
             if not presenter_mode_active(REPO):
@@ -1089,13 +1089,13 @@ def main():  # pragma: no cover
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
                             and f.suffix == ".txt" and _tg_claims(f.name):
-                        # Peek before claiming: a body addressed to another bridge
-                        # is delivered by that bridge, not sent here as literal text.
+                        # Peek before claiming: a body addressed to another bridge is
+                        # delivered there — unless the FILENAME destines it here.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if not body_claimable_by(peek, "telegram"):
+                        if not proactive_body_guard(f.name, peek, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.

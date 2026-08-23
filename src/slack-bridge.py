@@ -64,7 +64,7 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+from proactive_routing import fallback_claims_name, proactive_body_guard  # noqa: E402
 
 
 def _slack_claims_name(name: str) -> bool:
@@ -1621,16 +1621,16 @@ def result_watcher():
                         _record_skip_audit(delivery_id, "deduped")
                         f.unlink(missing_ok=True)
                         continue
-                    # Peek before claiming: a body addressed to another bridge
-                    # is delivered by that bridge, not dumped here as literal text.
+                    # Explicit filename destination outranks the race.
+                    if not _slack_claims_name(f.name):
+                        continue
+                    # Peek before claiming: a body addressed to another bridge is
+                    # delivered there — unless the FILENAME destines it here.
                     try:
                         peek = f.read_text(errors="ignore").lstrip()
                     except OSError:
                         continue
-                    if not body_claimable_by(peek, "slack"):
-                        continue
-                    # Explicit filename destination outranks the race.
-                    if not _slack_claims_name(f.name):
+                    if not proactive_body_guard(f.name, peek, "slack"):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

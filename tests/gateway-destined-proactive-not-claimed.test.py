@@ -67,10 +67,21 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(ln) if ln else b"{}"
         if self.path.startswith("/v1/room"):
             try:
-                with LOCK:
-                    STATE["room_posts"].append(json.loads(raw))
+                payload = json.loads(raw)
             except ValueError:
-                pass
+                payload = {}
+            with LOCK:
+                STATE["room_posts"].append(payload)
+            # Production grammar, not an accept-all oracle: the backend does NO
+            # alias resolution, so a non-`!` target must fail here (kewei P1).
+            room = str(payload.get("room_id") or "")
+            if not room.startswith("!"):
+                self._json({"ok": False, "error": f"unknown room {room!r}"})
+                return
+            with LOCK:
+                n = len(STATE["room_posts"])
+            self._json({"ok": True, "event_id": f"$evt{n}"})
+            return
         self._json({"ok": True})
 
 
@@ -91,10 +102,14 @@ sdir.mkdir(parents=True)
 (rdir / "proactive-000.txt").write_bytes(b"\x80\x81 truncated multibyte")
 (rdir / "proactive-100.txt").write_text("undestined control body")
 (rdir / "proactive-101.to-discord.txt").write_text("discord destined body")
-# alias-directed body: the classifier and the executable-target rule must
-# AGREE it is ours (the '#' no-claim deadlock kewei reproduced)
+# alias-directed body: room-ID-only contract — the backend cannot resolve an
+# alias, so the gateway must call it foreign and never claim it
 (rdir / "proactive-102.txt").write_text(
     "[channel: #alias-probe:example.org]\nalias directed body")
+# filename/body CONFLICT: .to-ag2space outranks the discord body redirect —
+# the file is delivered HERE to the default room, not stranded (kewei P1)
+(rdir / "proactive-103.to-ag2space.txt").write_text(
+    "[channel: 123456789012345678]\nconflict destined body")
 
 env = dict(os.environ)
 env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": tmp,
@@ -126,24 +141,48 @@ try:
     check(delivered_control,
           "positive control: undestined proactive IS delivered to /v1/room")
 
-    # Give the drain several more cycles to (wrongly) take the destined file.
+    # Conflict file rides the SAME drain: filename outranks the discord body
+    # redirect → default room, marker stripped. Poll; instant reads race it.
+    conflict = None
+    conflict_deadline = time.monotonic() + 20
+    while time.monotonic() < conflict_deadline:
+        with LOCK:
+            conflict = next((p for p in STATE["room_posts"]
+                             if "conflict destined body" in p.get("body", "")),
+                            None)
+        if conflict or proc.poll() is not None:
+            break
+        time.sleep(0.3)
+    check(bool(conflict),
+          ".to-ag2space + discord-body conflict is delivered HERE (filename "
+          "outranks the body's foreign redirect)")
+    check(bool(conflict) and conflict.get("room_id") == "!mock:example.org",
+          "conflict delivery goes to the DEFAULT room")
+    check(bool(conflict) and "[channel:" not in conflict.get("body", ""),
+          "conflict delivery body carries no leftover marker")
+    # Give the drain several more cycles to (wrongly) take the other files.
     time.sleep(4)
     with LOCK:
         bodies = [p.get("body", "") for p in STATE["room_posts"]]
     check(not any("discord destined body" in b for b in bodies),
           "destined .to-discord body never reaches the gateway's room")
-    check(any("alias directed body" in b for b in bodies),
-          "alias-directed body IS delivered by the gateway (no strand)")
-    # consumption (claim -> deliver -> archive) is asynchronous: poll, don't
-    # snapshot — the instant form raced the drain on slower CI runners
-    consumed = False
+    check(not any("alias directed body" in b for b in bodies),
+          "alias-directed body is NEVER posted: room-ID-only — the backend "
+          "cannot resolve an alias, so claiming it would retry-and-park")
+    check((rdir / "proactive-102.txt").exists(),
+          "alias-directed file is left on disk, never claimed by the gateway")
+    # Delivery proof is the CONFIRMED archive, not mere disappearance — a
+    # file parked in undelivered/ also vanishes from results/ (false oracle).
+    archived = False
     deadline2 = time.monotonic() + 20
     while time.monotonic() < deadline2:
-        if not (rdir / "proactive-102.txt").exists():
-            consumed = True
+        if list((rdir / "archive").glob("proactive-100-*.txt")):
+            archived = True
             break
         time.sleep(0.5)
-    check(consumed, "alias-directed file is consumed after delivery")
+    check(archived, "undestined control is ARCHIVED after confirmed delivery")
+    check(not list((rdir / "undelivered").glob("proactive-100*")),
+          "and it was not parked in undelivered/")
     check((rdir / "proactive-101.to-discord.txt").exists(),
           "destined file remains on disk under its original name")
     check((rdir / "proactive-000.txt").exists(),
@@ -167,6 +206,8 @@ sdir2.mkdir(parents=True)
     "[channel: 123456789012345678]\ndiscord targeted body")
 (rdir2 / "proactive-202.txt").write_text(
     "[channel: !ported:example.org:8448]\nported room body")
+(rdir2 / "proactive-203.txt").write_text(
+    "[channel: !v6:[2001:db8::1]:8448]\nipv6 room body")
 env2 = dict(env)
 env2["SUTANDO_WORKSPACE"] = tmp2
 proc2 = subprocess.Popen(
@@ -201,6 +242,20 @@ try:
     check(bool(ported), "ported room id delivered through the loader path")
     check(ported and ported.get("room_id") == "!ported:example.org:8448",
           "ported delivery addressed to the port-qualified room verbatim")
+    v6_deadline = time.monotonic() + 25
+    v6 = None
+    while time.monotonic() < v6_deadline:
+        with LOCK:
+            v6 = next((p for p in STATE["room_posts"]
+                       if "ipv6 room body" in p.get("body", "")), None)
+        if v6 or proc2.poll() is not None:
+            break
+        time.sleep(0.3)
+    # bracketed-IPv6 server names are valid Matrix room ids: the loader path
+    # must carry the WHOLE address, not truncate at the first `]` (kewei P1)
+    check(bool(v6), "bracketed-IPv6 room id delivered through the loader path")
+    check(v6 and v6.get("room_id") == "!v6:[2001:db8::1]:8448",
+          "IPv6 delivery addressed to the bracketed room verbatim")
     time.sleep(4)
     with LOCK:
         bodies = [p.get("body", "") for p in STATE["room_posts"]]

@@ -224,9 +224,13 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
-# Executable-target rule = the SHARED classifier's Matrix rule (ids + aliases);
-# a private '!'-only copy stranded alias-directed bodies (alias deadlock).
+# Executable-target rule = the SHARED classifier's Matrix rule (room ids only;
+# ports and bracketed IPv6 hosts included) — one grammar, one owner.
 _MATRIX_ROOM_RE = MATRIX_TARGET_RE
+# Filename destination outranks the body's foreign redirect (shared precedence
+# — same rule the claim gate applies first).
+def PROACTIVE_DESTINED_HERE(name):
+    return proactive_destination(name) == _CHANNEL
 
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it

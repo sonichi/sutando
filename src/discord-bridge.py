@@ -5541,7 +5541,8 @@ async def poll_proactive():
             # state/last-owner-activity.json; default discord on missing
             # state).
             from proactive_routing import (  # noqa: E402
-                redirect_target_is_foreign, should_claim_proactive_file)
+                proactive_body_guard, redirect_target_is_foreign,
+                should_claim_proactive_file)
             for f in RESULTS_DIR.iterdir():
                 # Per-FILE decision: an explicit .to-<channel> destination
                 # outranks activity routing (see proactive_routing).
@@ -5581,8 +5582,14 @@ async def poll_proactive():
                         continue
                     _early_redirect = next(
                         (a for a in _pp.actions if a.kind == "redirect"), None)
-                    if _early_redirect is not None and redirect_target_is_foreign(
-                            _early_redirect.value, "discord"):
+                    _foreign_redirect = (
+                        _early_redirect is not None and redirect_target_is_foreign(
+                            _early_redirect.value, "discord"))
+                    # Shared guard, claim-gate precedence: .to-discord FILENAME
+                    # outranks the body (`f` is the claim — restore .txt name).
+                    if _foreign_redirect and not proactive_body_guard(
+                            f.with_suffix(".txt").name, text, "discord",
+                            strict=True):
                         print(f"  [proactive] {f.name} targets "
                               f"{str(_early_redirect.value).strip()!r} — not a Discord "
                               f"channel id; releasing for its own bridge", flush=True)
@@ -5661,7 +5668,10 @@ async def poll_proactive():
                         #     operator needs to detect the misroute (per
                         #     the 2026-05-26 catch — silently stripping
                         #     would have hidden the bug).
-                        _redirect_proactive = next((a for a in _pp.actions if a.kind == "redirect"), None)
+                        # Filename-destined override: a foreign address is not
+                        # resolvable on Discord — deliver to the owner DM instead.
+                        _redirect_proactive = None if _foreign_redirect else next(
+                            (a for a in _pp.actions if a.kind == "redirect"), None)
                         if _redirect_proactive:
                             _target_id = int(_redirect_proactive.value)
                             _redirect_text = clean_text  # already stripped by parse_markers

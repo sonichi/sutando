@@ -57,9 +57,9 @@ def source_checks() -> None:
     for name, channel in (("slack-bridge.py", "slack"),
                           ("telegram-bridge.py", "telegram")):
         src = (REPO / "src" / name).read_text(encoding="utf-8")
-        check(f'body_claimable_by(peek, "{channel}")' in src,
+        check(f'proactive_body_guard(f.name, peek, "{channel}")' in src,
               f"5) {name} delegates its peek to proactive_routing")
-        check("from proactive_routing import" in src and "body_claimable_by" in src,
+        check("from proactive_routing import" in src and "proactive_body_guard" in src,
               f"5) {name} imports it")
         check(not private.search(src),
               f"5) no private Discord-only body grammar survives in {name}")
@@ -81,7 +81,12 @@ def main() -> int:
         ("1530802402603700415", "discord"),
         ("1022910063620390932", "discord"),
         (ROOM, "ag2space"),
-        ("#general:ag2.space", "ag2space"),
+        # room-ID-only contract: an alias is NOT executable (the backend does
+        # no alias resolution), so it stays unrecognised like any other value
+        ("#general:ag2.space", None),
+        (f"{ROOM}:8448", "ag2space"),
+        ("!v6:[2001:db8::1]", "ag2space"),
+        ("!v6:[2001:db8::1]:8448", "ag2space"),
         ("C0123ABCD", "slack"),
         ("G01ABCDEF", "slack"),
         ("D01ABCDEF", "slack"),

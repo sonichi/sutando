@@ -171,12 +171,13 @@ def fallback_claims_name(name, this_channel: str) -> bool:
 # The [channel:] BODY marker names a channel but IMPLIES a bridge, and that
 # implication is what each adapter re-derived — two of them Discord-only.
 
-# Discord snowflake / Matrix room-or-alias / Slack channel id. Anchored whole:
-# a substring match would classify `#room:server` off its leading character.
-# ONE owner of "what is a Matrix target": ids AND aliases AND the optional
-# explicit server port ('!r:example.org:8448') — the gateway sink binds this.
-MATRIX_TARGET_RE = re.compile(r"[!#][^\s:]+:[^\s:]+(?::\d+)?\Z")
+# ONE owner of "executable Matrix target": room IDS only — no alias resolution
+# exists (room-ID-only contract); server may be name[:port] or [IPv6][:port].
+MATRIX_TARGET_RE = re.compile(
+    r"![^\s:]+:(?:\[[0-9A-Fa-f:.]+\]|[^\s:\[\]]+)(?::\d+)?\Z")
 
+# Discord snowflake / Matrix room id / Slack channel id. Anchored whole: a
+# substring match would classify `!room:server` off its leading character.
 _TARGET_KINDS = (
     ("discord", re.compile(r"\d{17,20}\Z")),
     ("ag2space", MATRIX_TARGET_RE),
@@ -225,6 +226,31 @@ def body_claimable_by(body, this_channel: str) -> bool:
     stray marker line, and it is a separate judgement from this one.
     """
     kind = body_target_channel(body)
+    return kind is None or kind == this_channel
+
+
+def proactive_body_guard(name, body, this_channel: str,
+                         strict: bool = False) -> bool:
+    """Delivery-time re-check with the claim gate's OWN precedence: an explicit
+    .to-<channel> filename outranks the body's redirect. Reversing that here is
+    what stranded a destined file whose body named another bridge — the claim
+    honoured the filename, then the body guard refused delivery.
+
+    strict is the default destination's rule (see redirect_target_is_foreign):
+    a redirect target not positively this bridge's address blocks delivery.
+    """
+    dest = proactive_destination(name)
+    if dest is not None:
+        return dest == this_channel
+    from result_markers import parse_markers  # noqa: PLC0415 — see module note
+    redirect = next(
+        (a for a in parse_markers(str(body or "")).actions
+         if a.kind == "redirect"), None)
+    if redirect is None:
+        return True
+    kind = target_channel_kind(redirect.value)
+    if strict:
+        return kind == this_channel
     return kind is None or kind == this_channel
 
 

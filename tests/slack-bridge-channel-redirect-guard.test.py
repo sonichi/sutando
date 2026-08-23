@@ -77,7 +77,7 @@ class TestSlackBridgeChannelRedirectGuard(unittest.TestCase):
         behaviour pins what the literal was for.
         """
         self.assertIn(
-            'body_claimable_by(peek, "slack")', SRC,
+            'proactive_body_guard(f.name, peek, "slack")', SRC,
             "the peek must delegate to proactive_routing, not spell its own grammar")
         self.assertNotRegex(
             SRC, r"\\d\{17,20\}",
