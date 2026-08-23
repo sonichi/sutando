@@ -671,10 +671,33 @@ def poll_progress(pending_replies: dict) -> None:
             pending_task_tiers.pop(tid, None)
 
 
+def log_group_reach(get_me):
+    """Report at boot whether Telegram will deliver group messages to this bot.
+
+    Privacy mode filters group updates SERVER-SIDE, so a dropped message reaches
+    no log and leaves nothing to find afterwards — the state is only knowable by
+    asking, and only worth asking once per boot.
+    """
+    try:
+        me = (get_me() or {}).get("result") or {}
+    except Exception as e:  # noqa: BLE001 — a diagnostic must never take the bridge down
+        return f"[Telegram] group-reach: getMe failed ({e}) — group delivery state unknown"
+    if not me:
+        return "[Telegram] group-reach: getMe returned no result — group delivery state unknown"
+    if me.get("can_read_all_group_messages"):
+        return "[Telegram] group-reach: privacy mode OFF — all group messages are delivered"
+    return (
+        "[Telegram] group-reach: privacy mode ON — in groups only commands, replies to "
+        f"this bot, and genuine @{me.get('username') or 'bot'} mention entities are "
+        "delivered; anything else is dropped by Telegram before it reaches this bridge"
+    )
+
+
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
     print("Telegram bridge started. Polling for messages...", flush=True)
+    print(log_group_reach(lambda: api("getMe")), flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
