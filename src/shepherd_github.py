@@ -149,6 +149,14 @@ _REQUIRED_KEYS = ("task_id", "provider", "repo", "number", "actor_scheme",
                   "failure_conditions")
 
 
+def _identity(rec: dict) -> tuple:
+    """Everything a stale write could clobber. `note` is free text whose change
+    is benign, so it is excluded; every other field is identity-bearing."""
+    return (rec["repo"], rec["number"], rec["actor_scheme"], rec["actor_value"],
+            tuple(rec["waiting_for"]), tuple(rec["success_conditions"]),
+            tuple(rec["failure_conditions"]), rec["state"])
+
+
 def _validate_record(rec: dict, task_id: str) -> dict:
     """Fail closed on a record that cannot be a real contract. An unvalidated
     load lets a hand-edited or truncated file drive a live objective."""
@@ -222,6 +230,7 @@ def resume(task_id: str) -> tuple[str, str]:
         return rec["state"], f"already terminal ({rec['state']}); not re-observed"
 
     scope = scope_from_saved(rec)
+    snapshot = _identity(rec)
     event = observe(rec["repo"], rec["number"])  # network: NO lock held
 
     # Another pass may have terminated the objective while we were on the wire;
@@ -233,6 +242,12 @@ def resume(task_id: str) -> tuple[str, str]:
         prior = cur["state"]
         if is_terminal(prior):
             return prior, f"terminated concurrently ({prior}); observation discarded"
+        # The state guard alone is not enough: a concurrent pass can rebind the
+        # subject, actor or conditions, and writing back `scope` would revert it.
+        if _identity(cur) != snapshot:
+            return prior, (f"contract changed during observation "
+                           f"(now {cur['repo']}#{cur['number']}, state {prior}); "
+                           f"observation discarded")
 
         decision, why = admit(event, scope)
         if decision != "accepted":

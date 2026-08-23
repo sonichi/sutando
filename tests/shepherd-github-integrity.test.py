@@ -277,6 +277,52 @@ finally:
 check("a terminal record short-circuits", st17, "succeeded")
 check("...without a network call", "not re-observed" in why17, True)
 
+# --- 10. a concurrent NON-TERMINAL rebind must not be reverted ----------------
+# The terminal guard catches one kind of concurrent mutation; a rebind is the other.
+g.save("task-integrity-18", scope_for("org/old", 1), "waiting", "seed")
+_real4 = g.observe
+
+
+def _rebind_then_observe(repo, number):
+    g.save("task-integrity-18", scope_for("org/new", 2), "blocked", "rebound")
+    return g.ObservedEvent(event_type="github.pull_request.updated",
+                           subject=g.subject_for(repo, number),
+                           actor=Actor(g.ACTOR_SCHEME, "someone@example.com"))
+
+
+g.observe = _rebind_then_observe
+try:
+    st18, why18 = g.resume("task-integrity-18")
+finally:
+    g.observe = _real4
+rec18 = g.load("task-integrity-18")
+check("a concurrent rebind survives resume (repo)", rec18["repo"], "org/new")
+check("a concurrent rebind survives resume (number)", rec18["number"], 2)
+check("resume reports the concurrent state", st18, "blocked")
+check("...and says the observation was discarded", "discarded" in why18, True)
+
+# a concurrent actor change is the same class of clobber
+g.save("task-integrity-19", scope_for("org/a", 3, Actor(g.ACTOR_SCHEME, "first@x.z")),
+       "waiting", "seed")
+_real5 = g.observe
+
+
+def _reactor_then_observe(repo, number):
+    g.save("task-integrity-19", scope_for("org/a", 3, Actor(g.ACTOR_SCHEME, "second@x.z")),
+           "waiting", "new actor")
+    return g.ObservedEvent(event_type="github.pull_request.updated",
+                           subject=g.subject_for(repo, number),
+                           actor=Actor(g.ACTOR_SCHEME, "first@x.z"))
+
+
+g.observe = _reactor_then_observe
+try:
+    g.resume("task-integrity-19")
+finally:
+    g.observe = _real5
+check("a concurrent actor rebind is not reverted",
+      g.load("task-integrity-19")["actor_value"], "second@x.z")
+
 print(f"integrity: {len(failures)} failure(s)")
 for f in failures:
     print("  FAIL", f)
