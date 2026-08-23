@@ -98,3 +98,56 @@ test('turn.interrupted clears a fabricated turn so the NEXT turn is not swallowe
 	f.transport.onAudioOutput!('audio-again');
 	assert.ok(f.audio.includes('audio-again'), 'audio suppression must lift at the turn boundary');
 });
+
+// ── Bodhi ORDER regression: flush precedes publish ──────────────────────────
+// bodhi-realtime-agent/dist/index.js finalizes the transcript 2-4 lines BEFORE
+// it publishes the turn event (flush :3019 -> publish :3021; :3106 -> :3110;
+// :3177 -> :3179). The fake below models that TRANSCRIPT BUFFER, not just a
+// list of forwarded strings: text forwarded after flush() belongs to the NEXT
+// turn, which is the whole defect. A fake without the buffer stays green under
+// the bug — the first version of this test did exactly that.
+
+function makeTranscriptHost(withHook: boolean) {
+	const pending: string[] = [];          // forwarded, not yet finalized
+	const finalized: string[] = [];        // one entry per completed turn
+	const handlers: Record<string, Array<() => void>> = {};
+	const transport = {
+		onAudioOutput: (_b64: string) => {},
+		onOutputTranscription: (t: string) => { pending.push(t); },
+	};
+	let preFlush: (() => void) | null = null;
+	const wired = wireSanitizerToTransport({
+		transport,
+		subscribe: (ev, h) => { (handlers[ev] ||= []).push(h); },
+		beforeTranscriptFlush: withHook ? (reset) => { preFlush = reset; } : undefined,
+	});
+	const flush = () => { finalized.push(pending.join('')); pending.length = 0; };
+	// bodhi's real order: flush(), THEN publish turn.end.
+	const finalizeTurn = () => {
+		preFlush?.();
+		flush();
+		(handlers['turn.end'] || []).forEach((h) => h());
+	};
+	return { transport, finalized, pending, wired, finalizeTurn };
+}
+
+test('a prefix-shaped turn is finalized into ITS OWN transcript entry', () => {
+	const h = makeTranscriptHost(true);
+	assert.equal(h.wired, true);
+	h.transport.onOutputTranscription!('System');   // ambiguous prefix — held
+	h.finalizeTurn();
+	h.transport.onOutputTranscription!('Hello');    // a separate, later turn
+	h.finalizeTurn();
+	assert.deepEqual(h.finalized, ['System', 'Hello']);
+});
+
+test('CONTROL: without the pre-flush hook the same turns corrupt each other', () => {
+	const h = makeTranscriptHost(false);   // subscriber-only == the pre-fix wiring
+	h.transport.onOutputTranscription!('System');
+	h.finalizeTurn();
+	h.transport.onOutputTranscription!('Hello');
+	h.finalizeTurn();
+	// This is the measured defect, asserted so the fix above cannot silently regress:
+	// turn 1 finalizes EMPTY and turn 2 carries "SystemHello".
+	assert.deepEqual(h.finalized, ['', 'SystemHello']);
+});

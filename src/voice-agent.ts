@@ -1434,6 +1434,14 @@ async function main() {
 		wireSanitizerToTransport({
 			transport: (session as any).transport,
 			subscribe: (ev, fn) => session.eventBus.subscribe(ev as any, fn),
+			beforeTranscriptFlush: (reset) => {
+				// bodhi flushes the transcript 2-4 lines BEFORE publishing turn.end
+				// (dist/index.js:3019/3106/3177), so a subscriber runs too late.
+				const tm = (session as any).transcriptManager;
+				if (!tm || typeof tm.flush !== 'function') return;
+				const origFlush = tm.flush.bind(tm);
+				tm.flush = () => { try { reset(); } catch {} origFlush(); };
+			},
 			onBlocked: (buffered) =>
 				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
 			log: (m) => console.log(`${ts()} ${m}`),

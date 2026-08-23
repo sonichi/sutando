@@ -91,6 +91,9 @@ export interface SanitizableTransport {
 export interface SanitizerWiring {
 	transport: SanitizableTransport | null | undefined;
 	subscribe: (event: string, handler: () => void) => void;
+	/** Run `reset` immediately BEFORE the host finalizes its transcript. The
+	 * host publishes turn.end AFTER flushing, so a subscriber alone is late. */
+	beforeTranscriptFlush?: (reset: () => void) => void;
 	onBlocked?: (buffered: string) => void;
 	log?: (message: string) => void;
 }
@@ -115,6 +118,9 @@ export function wireSanitizerToTransport(deps: SanitizerWiring): boolean {
 	});
 	transport.onOutputTranscription = (text: string) => sanitizer.handleChunk(text);
 	const resetTurn = () => sanitizer.resetTurn();
+	// resetTurn forwards still-held clean text, so it must run before the host
+	// flushes. Idempotent, so the event subscriptions remain a safe backstop.
+	deps.beforeTranscriptFlush?.(resetTurn);
 	deps.subscribe('turn.end', resetTurn);
 	deps.subscribe('turn.interrupted', resetTurn);
 	deps.log?.('[OutputSanitizer] wired into transport.onOutputTranscription (per-turn buffered)');
