@@ -11,9 +11,10 @@ sends (a bounced mention notifies no one).
 Usage:
   notify_reviewers.py --reviewers rui,kewei --message "re-review #3303" [--send]
 
-Without --send it prints the exact room_ops commands (plan mode). Exit 0 =
-all resolved; 2 = unknown reviewer; 3 = entry unusable (no stand/room);
-4 = allowlist known-false (route through the owner instead).
+Without --send it prints the exact room_ops commands (plan mode). A refused
+entry never starves the batch: resolvable reviewers are still notified and
+the worst refusal becomes the exit — 0 all resolved; 2 unknown reviewer;
+3 entry unusable (no stand/room); 4 allowlist known-false (route via owner).
 
 Roster: <workspace>/data/collaboration-intelligence/reviewer-stands.json
   {"rui": {"human": "@rui:ag2.space", "stand": "@sutando-rui:ag2.space",
@@ -54,28 +55,34 @@ def load_roster() -> dict:
     return data
 
 
-def resolve(names: "list[str]", roster: dict) -> "list[dict]":
-    out = []
+def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
+    """(targets, refusal_rc): one bad entry must never starve the rest of the
+    batch — resolvable reviewers are still notified, the worst refusal code
+    is carried to the exit so the caller sees somebody was skipped."""
+    out, worst = [], 0
     for name in names:
         entry = roster.get(name)
         if entry is None:
             print(f"UNKNOWN reviewer '{name}' — not in {roster_path()}; "
                   "add them from the map, do not guess", file=sys.stderr)
-            raise SystemExit(2)
+            worst = max(worst, 2)
+            continue
         stand, room = entry.get("stand"), entry.get("room")
         if not stand or not room:
             # a human id alone cannot be a target: person-mentions trigger no Stand
             print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
                   f"(human-only = not Stand addressing)", file=sys.stderr)
-            raise SystemExit(3)
+            worst = max(worst, 3)
+            continue
         if entry.get("allowlisted") is False:
             print(f"OFF-ALLOWLIST '{name}': {stand} bounced a mention before —"
                   " route through the owner instead of re-sending",
                   file=sys.stderr)
-            raise SystemExit(4)
+            worst = max(worst, 4)
+            continue
         out.append({"name": name, "stand": stand, "room": room,
                     "human": entry.get("human")})
-    return out
+    return out, worst
 
 
 def command_for(target: dict, message: str) -> "list[str]":
@@ -94,7 +101,7 @@ def main() -> int:
     ap.add_argument("--send", action="store_true")
     a = ap.parse_args()
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
-    targets = resolve(names, load_roster())
+    targets, refusal_rc = resolve(names, load_roster())
     failures = 0
     for t in targets:
         argv = command_for(t, a.message)
@@ -113,7 +120,9 @@ def main() -> int:
               + ("" if ok else f" STDERR={p.stderr[:120]}"))
         if not ok:
             failures += 1
-    return 1 if failures else 0
+    if failures:
+        return 1
+    return refusal_rc
 
 
 if __name__ == "__main__":

@@ -67,6 +67,15 @@ class NotifyReviewers(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("never guess", p.stderr)
 
+    def test_one_bad_entry_never_starves_the_batch(self):
+        roster = dict(GOOD)
+        roster["mini"] = {"stand": "@mini:x", "room": "!r:x",
+                          "allowlisted": False}
+        p = run(roster, "--reviewers", "rui,mini", "--message", "m")
+        self.assertEqual(p.returncode, 4)          # refusal still visible
+        self.assertIn("mention @sutando-rui:x", p.stdout)  # rui still planned
+        self.assertIn("OFF-ALLOWLIST 'mini'", p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
