@@ -313,7 +313,8 @@ class WiringTest(unittest.TestCase):
                              "cleanup resolves the bare name, not the claimed file")
         # and every delivery path must go THROUGH it rather than open-coding
         self.assertGreaterEqual(
-            len(re.findall(r"^\s+_archive_delivered_pair\(result_file, task_id\)$",
+            len(re.findall(
+                r"^\s+_archive_delivered_pair\(result_file, task_id, _receipt_body\)$",
                            self.src, re.M)), 2,
             "both delivery paths must call the shared helper")
         self.assertNotIn("_gone = archive_file", self.src,

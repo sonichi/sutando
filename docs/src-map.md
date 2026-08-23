@@ -96,7 +96,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
 - **`orphan_result_routes.py`** — Routes for results whose task a bridge never saw.
 - **`osascript-setup-hint.ts`** — Extract the user-actionable sentence from an osascript failure.
-- **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
+- **`outbox.py`** — Sparrow Outbox: durable claims and terminal receipts for outbound items.
 - **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.

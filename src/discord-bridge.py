@@ -138,6 +138,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from orphan_result_routes import orphan_result_routes  # noqa: E402
+import outbox  # noqa: E402
 
 
 # Round-robin position for the orphan-route scan, so a large unroutable
@@ -505,21 +506,22 @@ def archive_file(src: "Path", kind: str, task_id: str) -> bool:
         log=lambda m: print(m, flush=True))
 
 
-def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
-    """Archive a delivered task's result + task file, then retire its sentinel.
-
-    One owner for a policy both delivery paths need: the sentinel may only be
-    cleared once the result has actually left the live queue, because a
-    surviving result re-enters the poll loop and the sentinel is the only thing
-    standing between it and a second send.
-    """
+def _archive_delivered_pair(result_file: "Path", task_id: str,
+                            result_body=None) -> bool:
+    """Archive a delivered result + task, then retire its legacy sentinel only
+    after the result leaves the live queue and its shared receipt is durable."""
     gone = archive_file(result_file, "results", task_id)
     # find_task_file, not a reconstructed bare name: a claimed task is
     # `<id>.claimed-core-N.txt` and would strand forever.
     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
     archive_file(task_file, "tasks", task_id)
     if gone:
-        _clear_delivered(task_id)
+        durable = (_has_durable_terminal_receipt(task_id)
+                   if result_body is None
+                   else _has_durable_terminal_receipt(task_id, result_body))
+        if durable:
+            _clear_delivered(task_id)
+    return gone
 
 
 def _anchor_from_task_file(task_id: str):
@@ -4483,41 +4485,107 @@ async def _catchup_missed_dms():
             print(f"  [dm-catchup] channel {channel_id_str} failed: {e}", flush=True)
 
 
-# Delivery-idempotency sentinels. Pre-fix: if the bridge crashed
-# BETWEEN `channel.send(reply_text)` returning success and the
-# subsequent `archive_file(result_file, ...)` call, on restart the
-# result file still exists in `results/` and would be re-sent —
-# producing a duplicate. With these sentinels:
-#
-#   1. Right BEFORE the per-task send block, `_is_delivered(task_id)`
-#      checks the sentinel. If present → skip send, run archive,
-#      clear sentinel.
-#   2. Right AFTER channel.send succeeds, `_mark_delivered(task_id)`
-#      touches the sentinel.
-#   3. After archive completes, `_clear_delivered(task_id)` removes
-#      the sentinel (bounded dir growth).
-#
-# The crash-between-send-and-sentinel window remains a narrow
-# double-send vector (Discord nonce-based dedup would close that
-# tighter; deferred to follow-up).
-#
-# Scope of THIS PR: poll_results main-path only. Channel-redirect,
-# proactive, and dm-fallback paths are scoped follow-ups.
+# Existing sentinels are ambiguous during migration; new sends dual-write them
+# across the send-to-archive crash window. Shared receipts persist afterward.
 DELIVERED_DIR = REPO / "state" / "discord-delivered"
+_AMBIGUOUS_RECEIPT_NOTICE_LIMIT = 1024
+_ambiguous_receipt_notices: set = set()
+_ambiguous_receipt_notice_overflow = False
 
 
 def _delivered_sentinel_path(task_id: str) -> Path:
     return DELIVERED_DIR / f"{task_id}.sentinel"
 
 
-def _mark_delivered(task_id: str) -> None:
-    """Touch the delivery sentinel for `task_id`. Called immediately
-    after a successful `channel.send`."""
+def _result_receipt_root() -> Path:
+    return RESULTS_DIR / ".outbox-discord-task-results"
+
+
+def _has_durable_terminal_receipt(task_id: str,
+                                  result_body=None) -> bool:
+    try:
+        receipt = outbox.read_terminal_receipt(_result_receipt_root(), task_id)
+        state = receipt.state
+        if result_body is not None:
+            state = outbox.terminal_receipt_content_state(
+                receipt, outbox.terminal_content_digest(result_body))
+        return state is outbox.TerminalReceiptState.TERMINAL
+    except Exception:
+        return False
+
+
+def _note_ambiguous_receipt(task_id: str) -> None:
+    global _ambiguous_receipt_notice_overflow
+    if task_id in _ambiguous_receipt_notices:
+        return
+    if len(_ambiguous_receipt_notices) >= _AMBIGUOUS_RECEIPT_NOTICE_LIMIT:
+        if not _ambiguous_receipt_notice_overflow:
+            print("  [delivered] additional ambiguous receipt notices suppressed",
+                  flush=True)
+            _ambiguous_receipt_notice_overflow = True
+        return
+    _ambiguous_receipt_notices.add(task_id)
+    print(f"  [delivered] holding {task_id}: terminal outcome needs reconciliation",
+          flush=True)
+
+
+def _terminal_receipt_state(task_id: str, result_body=None):
+    """Return shared receipt state; legacy-only evidence stays ambiguous."""
+    try:
+        receipt = outbox.read_terminal_receipt(_result_receipt_root(), task_id)
+    except Exception as exc:
+        print(f"  [delivered] receipt read failed for {task_id}: {exc}", flush=True)
+        _note_ambiguous_receipt(task_id)
+        return outbox.TerminalReceiptState.UNKNOWN
+    receipt_state = receipt.state
+    if result_body is not None:
+        receipt_state = outbox.terminal_receipt_content_state(
+            receipt, outbox.terminal_content_digest(result_body))
+    if receipt_state is outbox.TerminalReceiptState.UNKNOWN:
+        _note_ambiguous_receipt(task_id)
+        return receipt_state
+    if receipt_state is outbox.TerminalReceiptState.TERMINAL:
+        _ambiguous_receipt_notices.discard(task_id)
+        return receipt_state
+    try:
+        _delivered_sentinel_path(task_id).lstat()
+    except FileNotFoundError:
+        _ambiguous_receipt_notices.discard(task_id)
+        return receipt_state
+    except OSError:
+        _note_ambiguous_receipt(task_id)
+        return outbox.TerminalReceiptState.UNKNOWN
+    _note_ambiguous_receipt(task_id)
+    return outbox.TerminalReceiptState.UNKNOWN
+
+
+def _record_terminal_receipt(task_id: str, disposition,
+                             result_body: str = "") -> bool:
+    content_digest = outbox.terminal_content_digest(result_body)
+    try:
+        receipt = outbox.record_terminal_receipt(
+            _result_receipt_root(), task_id, disposition,
+            content_digest=content_digest)
+        return (receipt.state is outbox.TerminalReceiptState.TERMINAL
+                and receipt.content_digest == content_digest)
+    except Exception as exc:
+        print(f"  [delivered] receipt write failed for {task_id}: {exc}", flush=True)
+        return False
+
+
+def _mark_legacy_delivered(task_id: str) -> None:
     try:
         DELIVERED_DIR.mkdir(parents=True, exist_ok=True)
         _delivered_sentinel_path(task_id).touch()
-    except Exception as e:
-        print(f"  [delivered] sentinel write failed for {task_id}: {e}", flush=True)
+    except Exception as exc:
+        print(f"  [delivered] sentinel write failed for {task_id}: {exc}", flush=True)
+
+
+def _mark_delivered(task_id: str, result_body: str = "") -> None:
+    """Persist terminal delivery immediately after successful provider I/O."""
+    _record_terminal_receipt(
+        task_id, outbox.TerminalDisposition.DELIVERED, result_body)
+    _mark_legacy_delivered(task_id)
     # §7 audit ledger (Result Router S5): one line per delivered result, so
     # "did the user see this?" is answerable without grepping bridge logs. This
     # is the single post-successful-send choke point in the Discord result path.
@@ -4525,18 +4593,20 @@ def _mark_delivered(task_id: str) -> None:
     result_audit.record(task_id, "delivered", "discord")
 
 
-def _record_skip_audit(task_id: str, skip_value: str) -> None:
+def _record_skip_audit(task_id: str, skip_value: str,
+                       result_body: str = "") -> None:
     """Record §7 audit disposition for a skip-marked result (no_send / deduped)."""
     _disp = "deduped" if skip_value == "deduped" else "no_send"
+    terminal = (outbox.TerminalDisposition.DEDUPED if _disp == "deduped"
+                else outbox.TerminalDisposition.NO_SEND)
+    if not _record_terminal_receipt(task_id, terminal, result_body):
+        _mark_legacy_delivered(task_id)
     result_audit.record(task_id, _disp, "discord")
 
 
 def _is_delivered(task_id: str) -> bool:
-    """True iff the sentinel for `task_id` exists."""
-    try:
-        return _delivered_sentinel_path(task_id).exists()
-    except Exception:
-        return False
+    """True when the task is terminal or its receipt cannot be read safely."""
+    return _terminal_receipt_state(task_id) is not outbox.TerminalReceiptState.ABSENT
 
 
 def _clear_delivered(task_id: str) -> None:
@@ -4708,6 +4778,21 @@ async def poll_results():
             cursor=_orphan_route_cursor,
         )
         for task_id, channel_id_str in _adopted.items():
+            if (_terminal_receipt_state(task_id)
+                    is outbox.TerminalReceiptState.UNKNOWN):
+                continue
+            result_file = RESULTS_DIR / f"{task_id}.txt"
+            reply_text = read_ready_result(result_file)
+            if reply_text is None:
+                continue
+            _receipt_state = _terminal_receipt_state(task_id, reply_text)
+            if _receipt_state is outbox.TerminalReceiptState.TERMINAL:
+                if _archive_delivered_pair(result_file, task_id, reply_text):
+                    result_audit.record(task_id, "deduped", "discord")
+                    print(f"  Skipped recreated terminal result: {task_id}", flush=True)
+                continue
+            if _receipt_state is outbox.TerminalReceiptState.UNKNOWN:
+                continue
             _recovered_replies.setdefault(task_id, channel_id_str)
 
         # Merge recovered replies into pending_replies (resolve channel objects)
@@ -4724,9 +4809,25 @@ async def poll_results():
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 import re
+                if (_terminal_receipt_state(task_id)
+                        is outbox.TerminalReceiptState.UNKNOWN):
+                    continue
                 reply_text = read_ready_result(result_file)
                 if reply_text is None:
                     await _note_empty_result(task_id, result_file)
+                    continue
+                _receipt_body = reply_text
+                _receipt_state = _terminal_receipt_state(task_id, _receipt_body)
+                if _receipt_state is outbox.TerminalReceiptState.TERMINAL:
+                    pending_replies.pop(task_id, None)
+                    pending_reply_anchors.pop(task_id, None)
+                    pending_task_tiers.pop(task_id, None)
+                    save_pending_replies()
+                    if _archive_delivered_pair(result_file, task_id, _receipt_body):
+                        result_audit.record(task_id, "deduped", "discord")
+                        print(f"  Skipped terminal result: {task_id}", flush=True)
+                    continue
+                if _receipt_state is outbox.TerminalReceiptState.UNKNOWN:
                     continue
                 _empty_result_polls.pop(task_id, None)
                 channel = pending_replies.pop(task_id)
@@ -4833,25 +4934,12 @@ async def poll_results():
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     # §7 audit: skip-marked results are resolved deliveries, not
                     # silent voids — one line per resolved result per spec.
-                    _record_skip_audit(task_id, _skip.value)
-                    archive_file(result_file, "results", task_id)
-                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
+                    _record_skip_audit(task_id, _skip.value, _receipt_body)
+                    _archive_delivered_pair(result_file, task_id, _receipt_body)
                     continue
                 # Strip all protocol markers from working text (channel, file,
                 # etc.) so downstream handling operates on clean content.
                 reply_text = _parsed.body
-
-                # Idempotency check: if the previous run already sent
-                # this reply (sentinel present) but crashed BEFORE the
-                # archive completed, skip the send + archive normally.
-                # Avoids the double-delivery vector when the bridge
-                # restarts between channel.send() returning and
-                # archive_file() finishing. See DELIVERED_DIR docstring.
-                if _is_delivered(task_id):
-                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
-                    _archive_delivered_pair(result_file, task_id)
-                    continue
 
                 try:
                     # Extract optional [reply: <message_id>] directive — the
@@ -5023,13 +5111,9 @@ async def poll_results():
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
 
-                    # Mark delivered BEFORE the archive runs. If we
-                    # crash between channel.send returning and archive,
-                    # on restart the sentinel + result-file combo
-                    # triggers the skip-block above (archive + clear,
-                    # no re-send). Without this, the result file
-                    # would re-send on restart producing a duplicate.
-                    _mark_delivered(task_id)
+                    # Persist success before archival; a restart can then
+                    # retire the live result without another provider call.
+                    _mark_delivered(task_id, _receipt_body)
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                     # Observability: one delivered-reply event.
                     _emit_channel(
@@ -5045,7 +5129,7 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
-                _archive_delivered_pair(result_file, task_id)
+                _archive_delivered_pair(result_file, task_id, _receipt_body)
             else:
                 # CONSECUTIVE means consecutive: an absent file breaks the run, or a
                 # writer that retries accumulates counts across separate appearances.
