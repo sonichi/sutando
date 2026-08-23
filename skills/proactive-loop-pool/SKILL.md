@@ -10,6 +10,8 @@ Variant of `/proactive-loop` that's safe to run in N parallel claude sessions sh
 
 This skill exists for the multi-core pool installed by `bash scripts/install-core-pool.sh N`. Each launchd-managed core session in the pool invokes `/proactive-loop-pool` instead of `/proactive-loop`.
 
+**This file is the Claude entry.** The claim → finish protocol below is runtime-neutral; the entry is not. The Codex counterpart is [`CODEX.md`](CODEX.md) — one entry per runtime, sharing this protocol.
+
 **Single-core users**: keep using `/proactive-loop`. This skill is only useful when N > 1 sessions exist; in single-core mode it adds claim overhead with no benefit.
 
 **Usage**: `/proactive-loop-pool [interval]`
