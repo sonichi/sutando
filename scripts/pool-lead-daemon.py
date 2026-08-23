@@ -84,6 +84,8 @@ def main() -> int:
             print(f"assigned {name} -> {inst}", flush=True)
         for name in lead.reclaim_dead():
             print(f"reclaimed {name}", flush=True)
+        for name, disposition in lead.reclaim_claimed():
+            print(f"reclaimed-claim {name} -> {disposition}", flush=True)
         time.sleep(a.interval)
     try:
         beat.unlink()  # followers degrade NOW, not after the stale window

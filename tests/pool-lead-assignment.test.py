@@ -6,6 +6,7 @@ Run: python3 tests/pool-lead-assignment.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 import unittest
@@ -114,6 +115,59 @@ class PoolLeadTests(unittest.TestCase):
         (self.tasks / "task-old.assigned-core-a.txt").write_text("x")
         self.assertEqual(self.lead.sweep(), [])
         self.assertEqual(self._names(), ["task-old.assigned-core-a.txt"])
+
+
+
+
+class ReclaimClaimedTest(unittest.TestCase):
+    """Crash-mid-claim recovery: done-flag discriminates delivered vs repooled."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.tasks = self.tmp / "tasks"
+        self.state = self.tmp / "state"
+        self.tasks.mkdir()
+        (self.state / "cores").mkdir(parents=True)
+        self.lead = PoolLead(
+            self.tasks, self.state,
+            followers_fn=lambda: ["core-1"],
+            alive_fn=lambda inst: inst == "core-1",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _claimed(self, tid, inst):
+        f = self.tasks / f"task-{tid}.claimed-{inst}.txt"
+        f.write_text(f"id: task-{tid}\n")
+        return f
+
+    def test_dead_claimer_without_done_flag_repools(self):
+        self._claimed("x1", "core-9")
+        out = self.lead.reclaim_claimed()
+        self.assertEqual(out, [("task-x1.claimed-core-9.txt", "repooled")])
+        self.assertTrue((self.tasks / "task-x1.txt").exists())
+
+    def test_dead_claimer_with_done_flag_restores_for_delivery_only(self):
+        self._claimed("x2", "core-9")
+        done = self.state / "cores" / "core-9" / "done"
+        done.mkdir(parents=True)
+        (done / "task-x2.flag").write_text("")  # producer convention: stem + .flag
+        out = self.lead.reclaim_claimed()
+        self.assertEqual(out, [("task-x2.claimed-core-9.txt", "delivered")])
+        self.assertTrue((self.tasks / "task-x2.txt").exists())
+        self.assertEqual(self.lead.sweep(), [])  # never reassigned
+
+    def test_live_claimer_untouched(self):
+        f = self._claimed("x3", "core-1")
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        self.assertTrue(f.exists())
+
+    def test_repooled_task_is_reassignable(self):
+        self._claimed("x4", "core-9")
+        self.lead.reclaim_claimed()
+        assigned = self.lead.sweep()
+        self.assertEqual(assigned, [("task-x4.txt", "core-1")])
 
 
 if __name__ == "__main__":

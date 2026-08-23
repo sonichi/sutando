@@ -116,6 +116,8 @@ class PoolLead:
         affinity = self._load_affinity()
         out = []
         for f in sort_tasks_by_priority(pending):
+            if self._done_flag_exists(f.name):
+                continue  # processed by a since-dead claimer; bridge owns it now
             channel = _read_channel(f)
             inst = self._pick(channel, followers, affinity)
             target = f.with_name(
@@ -159,3 +161,38 @@ class PoolLead:
                 continue
             reclaimed.append(f.name)
         return reclaimed
+
+    def _done_flag_exists(self, task_name: str) -> bool:
+        cores = self.state_dir / "cores"
+        try:
+            dirs = [d for d in cores.iterdir() if d.is_dir()]
+        except OSError:
+            return False
+        stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
+        return any((d / "done" / f"{stem}.flag").exists() for d in dirs)
+
+    def reclaim_claimed(self) -> "list[tuple[str, str]]":
+        """Recover claimed files whose claimer died. The claimer's
+        done-flag discriminates crash-before vs crash-after processing:
+        flag present -> the result was written; restore the canonical name
+        so bridges can deliver (sweep's done-flag skip prevents
+        reassignment). Flag absent -> no side effects ran; restore to the
+        pool for normal reassignment."""
+        out = []
+        pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
+        try:
+            entries = list(self.tasks_dir.iterdir())
+        except OSError:
+            return out
+        for f in entries:
+            m = pat.match(f.name)
+            if not m or self.alive_fn(m.group(2)):
+                continue
+            canonical = m.group(1) + ".txt"
+            try:
+                os.rename(f, f.with_name(canonical))
+            except OSError:
+                continue
+            done = self._done_flag_exists(canonical)
+            out.append((f.name, "delivered" if done else "repooled"))
+        return out
