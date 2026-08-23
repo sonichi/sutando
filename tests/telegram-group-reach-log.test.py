@@ -5,11 +5,22 @@ Privacy mode drops group messages server-side, so the failure produces no log
 line and no error — it is only visible if the bridge asks getMe and says so.
 """
 import importlib.util
+import os
 import pathlib
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# The bridge resolves channel config at MODULE level, so isolation must happen
+# BEFORE exec_module or the import reads the developer's real ~/.claude allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-tg-group-reach-")
+_cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": []}')
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
+
 spec = importlib.util.spec_from_file_location("telegram_bridge", ROOT / "src" / "telegram-bridge.py")
 tb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tb)
