@@ -21,17 +21,19 @@ case "$CHANNEL" in
 esac
 
 # Interpreter: resolved ONCE, before anything invokes it. Honor an explicit
-# override, else the PATH-resolved python3 -- but only after the module probe
-# accepts it. An unvalidated `command -v python3` can be the Xcode Command Line
-# Tools stub, which prompts an install dialog when executed, so the token gate
-# below must never be the thing that discovers that.
-# The launchd plist sets PATH to "__BREW_BIN__:/usr/bin:...", where __BREW_BIN__
-# is the dir the installer resolved via its own `command -v python3` -- so a bare
-# `python3` here is the interpreter the installer validated, with no clone-,
-# arch-, or user-specific candidate list baked into this committed file.
+# override, else the safe-interpreter-contract candidate -- but only after the
+# module probe accepts it. A bare `command -v python3` can be the Xcode Command
+# Line Tools stub, which prompts an install dialog when executed, so the token
+# gate below must never be the thing that discovers that. scripts/python-binary.sh
+# (already used by src/startup.sh and start-cli.sh) resolves the same way this
+# wrapper needs to: it rejects the /usr/bin stub via `xcode-select -p` unless the
+# developer tools are actually installed, so its candidate is safe to run here.
 PYTHON="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
-if [ -z "$PYTHON" ] && command -v python3 >/dev/null 2>&1; then
-  python3 -c "import $MODULE" >/dev/null 2>&1 && PYTHON=python3
+if [ -z "$PYTHON" ] && [ -r "$REPO/scripts/python-binary.sh" ]; then
+  # shellcheck source=../../scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  _candidate="$(resolve_python "$REPO")"
+  [ -n "$_candidate" ] && "$_candidate" -c "import $MODULE" >/dev/null 2>&1 && PYTHON="$_candidate"
 fi
 
 # The bridge resolves env -> .env -> vault, so an .env-only gate here is NARROWER

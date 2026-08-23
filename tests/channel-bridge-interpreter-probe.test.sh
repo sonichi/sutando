@@ -123,5 +123,31 @@ else
   say ok "probe rejected PATH python3 and the gate never invoked it"
 fi
 
+echo "6. REGRESSION: the real macOS CLT-stub location must never be invoked (probe OR gate) when developer tools are absent"
+# Unlike the shadow-python3 cases above (an arbitrary PATH entry standing in for
+# "PATH has a python3"), this drives resolve_python() through its ACTUAL
+# stub-rejection rule: python3 resolved at the real /usr/bin, with only
+# `xcode-select` faked to report "not installed". That is the shape qingyun-wu's
+# review flagged as still unhandled -- a `command -v python3` probe accepts
+# /usr/bin/python3 unconditionally, which on a clean Mac IS the CLT stub, and
+# merely running it (even just for the module import probe) raises the install
+# dialog before it can fail.
+if [ -x /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ]; then
+  fakexcode="$TMP/fakexcode"; mkdir -p "$fakexcode"
+  printf '#!/bin/sh\nexit 2\n' > "$fakexcode/xcode-select"; chmod +x "$fakexcode/xcode-select"
+  : > "$TMP/argv.log"
+  TELEGRAM_BOT_TOKEN=x OSTYPE=darwin24 PATH="$fakexcode:/usr/bin:/bin" \
+    _bound 20 "$TMP/out6" bash "$WRAPPER" telegram; rc6=$?
+  if [ -s "$TMP/argv.log" ]; then
+    say FAIL "something was logged to the shadow-python argv log during case 6 (should be untouched)"
+  elif grep -q 'no usable Python interpreter' "$TMP/out6" && [ "$rc6" = 1 ]; then
+    say ok "resolve_python() refused the real /usr/bin/python3 with no CLT; wrapper never invoked it for probe or gate"
+  else
+    say FAIL "expected exit 1 + 'no usable Python interpreter' with a faked no-CLT signal, got rc=$rc6: $(tail -1 "$TMP/out6")"
+  fi
+else
+  say ok "SKIP: no real /usr/bin/python3 on this platform — case 6 is macOS-only"
+fi
+
 [ "$fails" = 0 ] && echo "ALL PASSED" || echo "FAILED: $fails"
 exit "$fails"
