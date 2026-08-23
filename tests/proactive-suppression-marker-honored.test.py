@@ -80,43 +80,41 @@ def main() -> int:
             func,
         )
 
-    # Guard 3: the skip branch discards the file via the fence's terminal-drop
-    # path (never sent, never parked to undelivered/ on a later failure) —
-    # not confirm()/release() directly, which would either skip the print/log
-    # or leave attempts()-inflating state behind.
-    if ".drop(" not in func:
+    # Guard 3: the skip branch itself must call .drop(...), checked in the
+    # post-skip-check window (not "anywhere in func" — a later, unrelated drop() exists).
+    skip_idx = func.find("kind == \"skip\"")
+    if skip_idx == -1:
+        skip_idx = func.find("kind=='skip'")
+    skip_tail = func[skip_idx:skip_idx + 400] if skip_idx != -1 else ""
+    if ".drop(" not in skip_tail:
         fail(
             "poll_proactive's skip-marker branch doesn't call "
             "_proactive_fence().drop(...) — a suppressed file must be "
             "cleanly discarded (unlinked, never DM-attempted), not left to "
             "reach the send/fail path",
-            func,
+            skip_tail or func,
         )
 
-    # Guard 4: ordering — the skip check must appear BEFORE the first DM send
-    # call in the function, or a suppressed body could still be attempted on
-    # some earlier branch.
-    skip_idx = func.find("kind == \"skip\"")
-    if skip_idx == -1:
-        skip_idx = func.find("kind=='skip'")
-    send_idx = func.find(".send(")
+    # Guard 4: ordering — the skip check must precede the first send call.
+    # Checks both .send( and deliver_text( — the latter is the real text-DM path.
+    send_candidates = [i for i in (func.find(".send("), func.find("deliver_text(")) if i != -1]
+    send_idx = min(send_candidates) if send_candidates else -1
     if skip_idx != -1 and send_idx != -1 and skip_idx > send_idx:
         fail(
-            "the skip-marker check appears AFTER the first .send( call in "
-            "poll_proactive — a suppressed body could still be sent before "
-            "the check runs",
+            "the skip-marker check appears AFTER the first send call "
+            "(.send(/deliver_text() in poll_proactive — a suppressed body "
+            "could still be sent before the check runs",
             func,
         )
 
     # Guard 5: the skip branch `continue`s past the rest of the loop body
     # (does not fall through to redirect/DM resolution).
     if skip_idx != -1:
-        tail = func[skip_idx:skip_idx + 400]
-        if "continue" not in tail:
+        if "continue" not in skip_tail:
             fail(
                 "the skip-marker branch doesn't `continue` shortly after — "
                 "it may fall through into redirect/DM-send logic anyway",
-                tail,
+                skip_tail,
             )
 
     if _FAILURES:
