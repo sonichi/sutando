@@ -478,6 +478,69 @@ with tempfile.TemporaryDirectory() as td:
     check(not txt.exists() and claim.exists(),
           "erroring backend: the rename DID happen (control discriminates)")
 
+# kewei r-latest P1: the fence must GATE selection and never raise into startup.
+from ag2_sparrow.delivery_core.migration import (  # noqa: E402
+    EPOCH_FILE, classify_epoch, c_selection_allowed, write_fence)
+
+
+def _root(content=None, kind="file"):
+    d = Path(tempfile.mkdtemp(prefix="epoch-"))
+    p_ = d / EPOCH_FILE
+    if kind == "file" and content is not None:
+        p_.write_bytes(content)
+    elif kind == "dir":
+        p_.mkdir()
+    elif kind == "dangling":
+        p_.symlink_to(d / "does-not-exist")
+    return d
+
+
+# (label, root, expected state, C allowed on a CLEAN root)
+_EPOCH_CASES = [
+    ("A",            _root(b"A"),              "ok",         False),
+    ("C",            _root(b"C"),              "ok",         True),
+    ("unknown",      _root(b"garbage"),        "unknown",    False),
+    ("missing",      _root(None),              "missing",    True),
+    ("dangling",     _root(kind="dangling"),   "unreadable", False),
+    ("invalid-utf8", _root(b"\xff"),           "unreadable", False),
+    ("dir",          _root(kind="dir"),        "unreadable", False),
+]
+for _label, _r, _want_state, _want_c in _EPOCH_CASES:
+    _st, _ = classify_epoch(_r)
+    check(_st == _want_state,
+          f"epoch {_label}: classify_epoch -> {_st!r}, want {_want_state!r}")
+    check(c_selection_allowed(_r, True)[0] is _want_c,
+          f"epoch {_label}: C-on-clean-root should be {_want_c}")
+    # A dirty root may NEVER bootstrap C, whatever the fence says about absence
+    if _want_state == "missing":
+        check(c_selection_allowed(_r, False)[0] is False,
+              f"epoch {_label}: C must be refused when the root holds A entries")
+
+# The row kewei measured: write_fence(root, "A") then C was selected anyway.
+_fenced_a = _root(None)
+write_fence(_fenced_a, "A")
+check(c_selection_allowed(_fenced_a, True)[0] is False,
+      "written_epoch=A must REFUSE C (the migration owner still says A)")
+
+# Crash before the final fence: C state present, fence still A -> refuse.
+_crashed = _root(b"A")
+(_crashed / "ready").mkdir()
+check(c_selection_allowed(_crashed, True)[0] is False,
+      "crash-before-final-fence: A fence with C namespaces must refuse C")
+
+# kewei r-latest P2: a Protocol class attribute is a REQUIRED structural member.
+
+from ag2_sparrow.delivery_core.contract import ClaimBackend  # noqa: E402
+from ag2_sparrow.delivery_core.migration import TransitionRefusalBackend  # noqa: E402
+
+_required = set(getattr(ClaimBackend, "__protocol_attrs__", set()))
+for _name, _cls in (("DesignAClaimBackend", DesignAClaimBackend),
+                    ("DesignCClaimBackend", DesignCClaimBackend),
+                    ("TransitionRefusalBackend", TransitionRefusalBackend)):
+    _missing = sorted(a for a in _required if not hasattr(_cls, a))
+    check(not _missing, f"{_name} must satisfy ClaimBackend; missing={_missing}")
+
+
 if fails:
     print(f"\n{len(fails)} FAILURE(S)")
     raise SystemExit(1)

@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .contract import DeliveryOutcome
+from .contract import BackendCapabilities, CleanupReport, DeliveryOutcome
 
 EPOCH_FILE = "protocol-epoch"
 DEFAULT_EPOCH = "A"
@@ -31,6 +31,48 @@ def read_epoch(root: Path) -> str:
         return (Path(root) / EPOCH_FILE).read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return DEFAULT_EPOCH
+
+
+EPOCH_OK = "ok"
+EPOCH_MISSING = "missing"
+EPOCH_UNREADABLE = "unreadable"
+EPOCH_UNKNOWN = "unknown"
+SUPPORTED_EPOCHS = ("A", "C")
+
+
+def classify_epoch(root: Path) -> "tuple[str, str]":
+    """(state, value) for the protocol fence. NEVER raises: selection runs
+    before any result poller, and invalid UTF-8 is a ValueError not an OSError."""
+    p = Path(root) / EPOCH_FILE
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # lexists distinguishes "no fence" from a DANGLING link, which is
+        # anomalous state someone created — never a clean-root bootstrap.
+        if os.path.lexists(p):
+            return (EPOCH_UNREADABLE, "")
+        return (EPOCH_MISSING, DEFAULT_EPOCH)
+    except (OSError, ValueError):
+        return (EPOCH_UNREADABLE, "")
+    value = raw.strip()
+    if value in SUPPORTED_EPOCHS:
+        return (EPOCH_OK, value)
+    return (EPOCH_UNKNOWN, value)
+
+
+def c_selection_allowed(root: Path, root_is_clean: bool) -> "tuple[bool, str]":
+    """(allow C, reason). Fail closed: only an explicit C fence, or a clean
+    root bootstrapping one, may start C. Unknown/unreadable defers to A."""
+    state, value = classify_epoch(root)
+    if state == EPOCH_OK and value == "C":
+        return (True, "epoch=C")
+    if state == EPOCH_OK:
+        return (False, f"epoch={value} is authoritative")
+    if state == EPOCH_MISSING:
+        if root_is_clean:
+            return (True, "clean-root bootstrap (no fence, no A entries)")
+        return (False, "no fence and the root holds A entries")
+    return (False, f"epoch {state}")
 
 
 def write_fence(root: Path, epoch: str) -> None:
@@ -104,13 +146,12 @@ def c_live_state(root: Path) -> "list[str]":
     Read-only; an unreadable namespace is REPORTED as state (fail closed)."""
     root = Path(root)
     found = []
-    try:
-        if read_epoch(root) == "C":
-            found.append("epoch=C")
-    except OSError:
-        # A directory or unreadable blob at protocol-epoch is ambiguous C-side
-        # state, not proof of absence — classify, never raise into startup.
-        found.append("epoch(unreadable)")
+    _state, _value = classify_epoch(root)
+    if _state == EPOCH_OK and _value == "C":
+        found.append("epoch=C")
+    elif _state in (EPOCH_UNREADABLE, EPOCH_UNKNOWN):
+        # Ambiguous C-side state is not proof of absence — fail closed.
+        found.append(f"epoch({_state})")
     for name in ("ready", "inflight", "undelivered", "attempts"):
         d = root / name
         try:
@@ -135,6 +176,15 @@ class TransitionRefusalBackend:
 
     def __init__(self, reason: str):
         self.reason = reason
+
+    capabilities = BackendCapabilities(supports_force_release=False)
+
+    def cleanup(self):
+        return CleanupReport(0, f"refusal backend: {self.reason}")
+
+    def force_release(self, item_id):
+        raise NotImplementedError(
+            "TransitionRefusalBackend refuses claims; nothing to force-release")
 
     def publish(self, item_id, payload):
         return False                       # record kept where it already is

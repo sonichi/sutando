@@ -5261,11 +5261,18 @@ def _proactive_fence():
             entries = [items]  # unreadable A-side state: fail closed
         if resolve_claim_backend() == "c":
             from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
+            from ag2_sparrow.delivery_core.migration import c_selection_allowed
+            # The fence, not just config, decides: C must not drain a root the
+            # migration owner still says A owns, and must defer on bad state.
+            _c_ok, _c_why = c_selection_allowed(root, not entries)
             if entries:
                 print(f"  [proactive] claim_backend=c refused: {len(entries)} "
                       f"unmigrated Design A entr(y/ies) at {items} — "
                       "complete the A->C migration first; running on Design A",
                       flush=True)
+            elif not _c_ok:
+                print(f"  [proactive] claim_backend=c refused: {_c_why} — "
+                      "running on Design A this cycle", flush=True)
             else:
                 try:
                     backend = DesignCClaimBackend(root)
