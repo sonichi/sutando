@@ -142,7 +142,7 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
         "slack": ("`app.client.chat_postMessage` called directly from bridge "
                   "code at multiple sites (the direct outbound Slice 5 "
                   "strangles)",
-                  [(SLACK, r"app.client.chat_postMessage")]),
+                  [(SLACK, r"app\.client\.chat_postMessage\(")]),
     }),
     ("private retry / receipt", {
         "discord": ("in-memory attempt counter on the marker leg; the "
