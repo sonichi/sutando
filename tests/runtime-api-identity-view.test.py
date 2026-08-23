@@ -507,6 +507,43 @@ class TestAuthorityBoundaries(unittest.TestCase):
             self.el.revoke_link(self.state, "discord", "@o:x")
         self.assertEqual(self.el.load_links(self.state)[0]["status"], "active")
 
+    def test_reenrollment_during_lock_wait_uses_fresh_identity(self):
+        # TOCTOU control: identity is snapshotted INSIDE the transaction — a
+        # mutation that waited out a re-enrollment must act as the NEW Stand
+        import fcntl
+        import threading
+        self._enroll()
+        self._verify()
+        lock_path = self.el.links_path(self.state).with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = open(lock_path, "w")
+        fcntl.flock(holder, fcntl.LOCK_EX)  # external holder blocks mutators
+        result = {}
+
+        def mutate():
+            try:
+                self.el.authorize_link(self.state, "discord", "@o:x")
+                result["outcome"] = "authorized"
+            except ValueError as e:
+                result["outcome"] = f"refused: {e}"
+
+        t = threading.Thread(target=mutate)
+        t.start()
+        import time
+        time.sleep(0.3)  # mutator is now blocked on the ledger lock
+        # re-enroll as a DIFFERENT Stand while the mutator waits
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": "@stand-b:x"}))
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+        t.join(timeout=10)
+        # fresh snapshot = Stand B; the discord row belongs to the ORIGINAL
+        # stand, so the mutation must refuse — stale-A authority never commits
+        self.assertTrue(result.get("outcome", "").startswith("refused"),
+                        result.get("outcome"))
+        row = self.el.load_links(self.state)[0]
+        self.assertNotIn("authorized_by", row)
+
     def test_concurrent_mutations_lose_nothing(self):
         # production mutators from N threads; the ledger lock must serialize
         # the whole load->mutate->save transaction (kewei's lost-update repro)

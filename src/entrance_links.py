@@ -114,8 +114,10 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
                 display: "dict | None" = None) -> dict:
     # UNIQUE(provider, canonical subject): an active link for the provider is
     # replaced only by the SAME subject; a different subject must be explicit.
-    stand_id = require_resolved_identity(state_dir)
     with _ledger_lock(state_dir):
+        # identity snapshot INSIDE the transaction: a re-enrollment during
+        # the lock wait must not let a mutation commit under stale authority
+        stand_id = require_resolved_identity(state_dir)
         return _upsert_link_locked(state_dir, stand_id, provider,
                                    provider_subject, verification,
                                    credential_fingerprint, display)
@@ -162,8 +164,8 @@ def authorize_link(state_dir: str | Path, provider: str,
                    confirmation_ref: "str | None" = None) -> dict:
     """Explicit owner authorization: the act that turns a verified link into
     an active Stand binding. Never called automatically."""
-    stand_id = require_resolved_identity(state_dir)
     with _ledger_lock(state_dir):
+        stand_id = require_resolved_identity(state_dir)
         return _authorize_link_locked(state_dir, stand_id, provider,
                                       authorized_by, confirmation_ref)
 
@@ -196,8 +198,8 @@ def _authorize_link_locked(state_dir, stand_id, provider, authorized_by,
 def revoke_link(state_dir: str | Path, provider: str, revoked_by: str,
                 reason: "str | None" = None) -> dict:
     """Revocation is layered: kills THIS binding only, never the Stand."""
-    stand_id = require_resolved_identity(state_dir)
     with _ledger_lock(state_dir):
+        stand_id = require_resolved_identity(state_dir)
         return _revoke_link_locked(state_dir, stand_id, provider,
                                    revoked_by, reason)
 
