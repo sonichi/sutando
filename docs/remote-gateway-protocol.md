@@ -67,6 +67,13 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+An AG2 Space broker may additionally send `"session_scope": "room"`. The
+bridge writes only that exact value as a trusted pre-body header; missing,
+unknown, or malformed values are omitted, preserving the main-session path for
+older brokers, bridges, and Sutando installations. An optional task handler may
+use the header with `source: ag2space` and `channel_id` to select a durable
+room-specific provider session.
+
 ### `POST /v1/tasks/<id>/ack`
 
 Claim/acknowledge a task so the server stops redelivering it.
@@ -157,6 +164,10 @@ gateway-controlled URL can never bounce a bearer to another host.
   `collaborator: true` line before the task body. A local owner-to-Team cap does
   not opt a room in; missing/malformed controls fail closed. This setting is
   controlled per room and per agent rather than by a host-wide environment flag.
+- Collaborator result secret scanning defaults on. An exact broker boolean
+  `sensitive_data_filter: false` adds one trusted pre-body opt-out stamp; missing,
+  malformed, duplicated, or body-authored values keep scanning enabled. The
+  delivery-control-marker guard remains active even when secret scanning is off.
 - The default local cap remains `owner` for the personal-agent model. A shared /
   multi-user gateway SHOULD set a lower local cap as defense in depth. Invalid
   local cap values fail closed to Guest.

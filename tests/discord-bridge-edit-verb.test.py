@@ -48,38 +48,37 @@ def check(cond: bool, msg: str) -> None:
         FAILS += 1
 
 
-class _Resp:
-    def __init__(self, payload):
-        self._p = json.dumps(payload).encode()
-
-    def read(self):
-        return self._p
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+from channels.discord.client import DiscordRestClient  # noqa: E402
 
 
-def _patch_urlopen(calls, payload=None):
-    import urllib.request
+def _bind_transport(calls, script=None, default=(200, {"id": "9999"})):
+    """Bind a scripted transport through the PRODUCTION DiscordRestClient, so
+    these cases exercise the real chokepoint rather than a copied recipe.
+    `script` steps are (status, body) tuples or Exceptions; when exhausted the
+    `default` step repeats."""
+    steps = list(script or [])
 
-    def fake(req, timeout=None):
+    def transport(req, timeout):
         calls.append({"url": req.full_url, "method": req.get_method(),
                       "body": json.loads(req.data.decode()) if req.data else None})
-        return _Resp(payload if payload is not None else {"id": "9999"})
+        step = steps.pop(0) if steps else default
+        if isinstance(step, Exception):
+            raise step
+        return step
 
-    urllib.request.urlopen = fake
+    _mod._rest_client = lambda timeout=10: DiscordRestClient(
+        "test-stub-token", transport=transport)
 
 
 def main() -> int:
-    import urllib.request
-    real = urllib.request.urlopen
+    real = _mod._rest_client
+    check(isinstance(real(), DiscordRestClient),
+          "_rest_client() builds the shared client (default timeout=10)")
+    check(real()._timeout == 10, "_rest_client() keeps the pre-client 10s bound")
     try:
         # 1. edit issues a PATCH at the message-scoped URL
         calls = []
-        _patch_urlopen(calls)
+        _bind_transport(calls)
         _mod._edit_via_rest("111", "222", "corrected body")
         check(len(calls) == 1, f"edit issues exactly one request (got {len(calls)})")
         check(calls and calls[0]["method"] == "PATCH",
@@ -92,7 +91,7 @@ def main() -> int:
         # 2. THE LOAD-BEARING CASE: a body the chunker would split is refused,
         #    and refused BEFORE any network call — not truncated.
         calls = []
-        _patch_urlopen(calls)
+        _bind_transport(calls)
         try:
             _mod._edit_via_rest("111", "222", "x" * 5000)
             refused = False
@@ -103,7 +102,7 @@ def main() -> int:
 
         # 3. empty body refused — an edit to nothing silently blanks a message
         calls = []
-        _patch_urlopen(calls)
+        _bind_transport(calls)
         try:
             _mod._edit_via_rest("111", "222", "   ")
             blanked = True
@@ -113,7 +112,7 @@ def main() -> int:
 
         # 4. send returns the id an edit needs — the gap that made this necessary
         calls = []
-        _patch_urlopen(calls, payload={"id": "4242"})
+        _bind_transport(calls, default=(200, {"id": "4242"}))
         import io
         from contextlib import redirect_stdout
         buf = io.StringIO()
@@ -124,10 +123,8 @@ def main() -> int:
 
         # 4b. The refusals above short-circuit before the request, so the
         #     failing-request path is otherwise never exercised.
-        def fake_raise(req, timeout=None):
-            raise RuntimeError("403 Forbidden")
-
-        urllib.request.urlopen = fake_raise
+        calls = []
+        _bind_transport(calls, default=RuntimeError("403 Forbidden"))
         buf = io.StringIO()
         rc = None
         try:
@@ -142,16 +139,7 @@ def main() -> int:
         # 5. A COMMITTED send whose response body is unreadable is still a send.
         #    Reporting it as a failure invites the retry that duplicates it.
         calls = []
-
-        class _BadBody(_Resp):
-            def read(self):
-                return b"<html>gateway</html>"
-
-        def fake_bad(req, timeout=None):
-            calls.append(req.full_url)
-            return _BadBody({})
-
-        urllib.request.urlopen = fake_bad
+        _bind_transport(calls, default=(200, "<html>gateway</html>"))
         buf = io.StringIO()
         rc = None
         try:
@@ -164,19 +152,10 @@ def main() -> int:
         check("Send failed" not in out, "...and is not reported as a send failure")
         check("unavailable" in out, f"...but the id is reported unavailable (got {out!r})")
 
-        # 5b. urlopen succeeds, then read() raises: the message is committed,
-        #     so reporting a send failure here invites a duplicate retry.
+        # 5b. Body dies mid-read after a 2xx -> (status, None) per
+        #     _default_transport (gate test pins that); still committed here.
         calls = []
-
-        class _RaisingRead:
-            def read(self):
-                raise ConnectionResetError("peer reset mid-body")
-
-        def fake_read_raises(req, timeout=None):
-            calls.append(req.full_url)
-            return _RaisingRead()
-
-        urllib.request.urlopen = fake_read_raises
+        _bind_transport(calls, default=(200, None))
         buf = io.StringIO()
         rc = None
         try:
@@ -192,16 +171,8 @@ def main() -> int:
         # 6. A later-chunk failure must not swallow the EARLIER chunk's id —
         #    that chunk is delivered and would otherwise be unrevisable.
         calls = []
-        state = {"n": 0}
-
-        def fake_second_fails(req, timeout=None):
-            state["n"] += 1
-            calls.append(req.full_url)
-            if state["n"] == 1:
-                return _Resp({"id": "7001"})
-            raise RuntimeError("boom on chunk 2")
-
-        urllib.request.urlopen = fake_second_fails
+        _bind_transport(calls, script=[(200, {"id": "7001"})],
+                        default=RuntimeError("boom on chunk 2"))
         buf = io.StringIO()
         rc = None
         try:
@@ -210,12 +181,12 @@ def main() -> int:
         except SystemExit as e:
             rc = e.code
         out = buf.getvalue()
-        check(state["n"] >= 2, f"the body really did chunk (requests={state['n']})")
+        check(len(calls) >= 2, f"the body really did chunk (requests={len(calls)})")
         check("message_id 7001" in out,
               f"chunk 1's id is printed BEFORE chunk 2 fails (got {out!r})")
         check(rc == 1, f"and the overall send still fails (exit {rc})")
     finally:
-        urllib.request.urlopen = real
+        _mod._rest_client = real
 
     print(f"\n{'PASS' if FAILS == 0 else str(FAILS) + ' FAILURE(S)'}")
     return 1 if FAILS else 0
