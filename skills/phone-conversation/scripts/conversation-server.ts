@@ -209,7 +209,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'chat_id|thread_ts|reply_to_event|reply_to_me|reply_to_sender|addressed_to|callSid|caller|from|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card)\\s*:',
+	'attachments|platform_card|instance_id)\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
