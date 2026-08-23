@@ -53,8 +53,23 @@ class FinishTests(unittest.TestCase):
         self.assertTrue(
             (self.state / "cores" / "me" / "done" / "task-a1.flag").exists())
         self.assertFalse(claimed.exists())
-        self.assertTrue((self.tasks / "archive" / claimed.name).exists())
+        # canonical archive name — result consumers resolve by task-<id>.txt;
+        # a claimed-suffix name dead-letters the reply as no-task (incident)
+        self.assertTrue((self.tasks / "archive" / "task-a1.txt").exists())
+        self.assertFalse((self.tasks / "archive" / claimed.name).exists())
         self.assertEqual(list(self.results.glob(".task-*")), [])  # no tmp left
+
+    def test_archive_never_clobbers_existing_record(self):
+        archive = self.tasks / "archive"
+        archive.mkdir()
+        (archive / "task-a1.txt").write_text("earlier archived record\n")
+        claimed = self._claim("a1")
+        self._finish(claimed, "task: a1\nAnswer.\n")
+        self.assertEqual((archive / "task-a1.txt").read_text(),
+                         "earlier archived record\n")
+        self.assertEqual((archive / "task-a1.txt.1").read_text(),
+                         "id: task-a1\ntask: do the thing\n")
+        self.assertFalse(claimed.exists())
 
     def test_incident_repro_body_of_a_against_claim_of_b_refused(self):
         # Two concurrent claims; A's composed body handed B's path must
@@ -105,18 +120,25 @@ class FinishTests(unittest.TestCase):
         flag = self.state / "cores" / "me" / "done" / "task-a1.flag"
         calls = []
         real_replace = pf.os.replace
+        real_move = pf._move_without_clobbering
 
-        def spy(src, dst):
+        def spy_replace(src, dst):
             calls.append((str(dst), flag.exists()))
             return real_replace(src, dst)
 
-        pf.os.replace = spy
+        def spy_move(src, dst):
+            calls.append((str(dst), flag.exists()))
+            return real_move(src, dst)
+
+        pf.os.replace = spy_replace
+        pf._move_without_clobbering = spy_move
         try:
             self._finish(self._claim("a1"), "task: a1\nbody\n")
         finally:
             pf.os.replace = real_replace
+            pf._move_without_clobbering = real_move
         self.assertTrue(flag.exists())
-        # replace #1 = result (flag NOT yet written), #2 = archive (flag is)
+        # move #1 = result (flag NOT yet written), #2 = archive (flag is)
         self.assertIn("results/task-a1.txt", calls[0][0])
         self.assertFalse(calls[0][1])
         self.assertIn("archive", calls[1][0])

@@ -20,6 +20,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from task_priority import sort_tasks_by_priority  # noqa: E402
+from task_archive import _move_without_clobbering  # noqa: E402
 
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
 
@@ -123,7 +124,9 @@ def finish_task(tasks_dir, results_dir, state_dir, instance: str,
 
     archive = Path(tasks_dir) / "archive"
     archive.mkdir(parents=True, exist_ok=True)
-    os.replace(claimed, archive / claimed.name)
+    # Canonical name: result consumers resolve destinations by task-<id>.txt,
+    # so a claimed-suffix archive name dead-letters the reply as no-task.
+    _move_without_clobbering(claimed, archive / f"task-{task_id}.txt")
     return result
 
 

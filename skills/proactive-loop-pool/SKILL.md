@@ -75,7 +75,7 @@ task: <id>
 EOF
 ```
 
-The `task: <id>` first line is a pairing check: the helper refuses (exit 2, zero writes) if it doesn't match the claimed file's id — this is what prevents a session holding two claims from writing each reply into the other task's result file. The helper strips that line before writing, so users never see it, then writes `results/task-<id>.txt` atomically, touches your done-flag, and archives the claimed file — in that order. Never hand-write the result/flag/archive steps yourself.
+The `task: <id>` first line is a pairing check: the helper refuses (exit 2, zero writes) if it doesn't match the claimed file's id — this is what prevents a session holding two claims from writing each reply into the other task's result file. The helper strips that line before writing, so users never see it, then writes `results/task-<id>.txt` atomically, touches your done-flag, and archives the claimed file under its canonical name (`tasks/archive/task-<id>.txt` — result consumers resolve by that name; a claimed-suffix archive name dead-letters the reply) — in that order. Never hand-write the result/flag/archive steps yourself.
 
 **Initial sweep on session start**: the watcher's initial sweep emits TASK_FILE events for any pre-existing files. Run the claim step on each; expect to win some and lose others depending on which sibling session got there first.
 
