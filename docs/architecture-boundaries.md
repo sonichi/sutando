@@ -113,6 +113,10 @@ semantics, but it must not name, locate, or import a concrete skill. This keeps
 the dependency direction adapter → helper while preserving the rule that core
 does not depend on installed skills.
 
+Injected optional task handlers use exit 75 only after execution has become
+outcome-unknown and no durable settlement sink is writable. The watcher owns
+the claim transition to `held`; held claims survive restart and never fall back.
+
 ### Shared adapter policy
 
 Provider-neutral workspace-state policy must have one dependency-light core

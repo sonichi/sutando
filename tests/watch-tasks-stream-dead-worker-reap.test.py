@@ -72,6 +72,7 @@ class Harness:
         self.handler.write_text(
             '#!/bin/sh\nfor a in "$@"; do [ "$a" = "--probe" ] && exit 4; done\nexec sleep 100000\n')
         self.handler.chmod(0o755)
+        self.runtime = ""
         self.proc: subprocess.Popen | None = None
 
     @classmethod
@@ -83,7 +84,7 @@ class Harness:
         h.feed.write_text("")
         (tmp / "bin" / "fswatch").write_text(f"#!/bin/sh\nexec tail -n +1 -f {h.feed}\n")
         (tmp / "bin" / "fswatch").chmod(0o755)
-        h.handler, h.proc = tmp / "handler.sh", None
+        h.handler, h.runtime, h.proc = tmp / "handler.sh", "", None
         return h
 
     def task(self, name: str) -> Path:
@@ -97,6 +98,7 @@ class Harness:
         env["TMPDIR"] = str(self.tmp)
         env["SUTANDO_RESULTS_DIR"] = str(self.ws / "results")
         env["SUTANDO_TASK_EVENT_HANDLER"] = str(self.handler)
+        env["SUTANDO_CORE_RUNTIME"] = self.runtime
         # The watched dir is $1, NOT an env var — passing it as one would fall
         # through to the resolver and watch the REAL workspace.
         self.proc = subprocess.Popen(
@@ -318,6 +320,72 @@ def scenario_answer_landing_during_the_reap_stays_deliverable() -> None:
         h.stop()
 
 
+def scenario_outcome_unknown_claim_survives_restart() -> None:
+    """Exit 75 preserves the claim when neither settlement sink was writable."""
+    h = Harness()
+    calls = h.tmp / "outcome-unknown-calls"
+    worker = REPO / "skills" / "ag2space-room-sessions" / "scripts" / "session-worker.py"
+    h.handler.write_text(
+        f'''#!/usr/bin/env python3
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("held_worker", {str(worker)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def provider(*args, **kwargs):
+    with Path({str(calls)!r}).open("a") as handle:
+        handle.write("call\\n")
+    raise module.OutcomeUnknownError(module.OUTCOME_UNKNOWN_BODY)
+
+def unavailable(*args, **kwargs):
+    raise OSError("settlement unavailable")
+
+module._run_claude = provider
+module._atomic_text = unavailable
+module._publish_once = unavailable
+raise SystemExit(module.main())
+'''
+    )
+    h.handler.chmod(0o755)
+    h.runtime = "claude"
+    task = h.ws / "tasks" / "task-outcome-unknown.txt"
+    task.write_text(
+        "id: task-outcome-unknown\n"
+        "session_scope: room\n"
+        "source: ag2space\n"
+        "channel_id: !outcome-unknown:ag2.space\n"
+        "access_tier: owner\n"
+        "task: exercise unsettled outcome\n"
+    )
+    claim = h.ws / "state" / "task-event-handler-claims" / "task-outcome-unknown.txt"
+    fallback = h.ws / "state" / "task-event-handler-fallbacks" / "task-outcome-unknown.txt"
+    h.start()
+    try:
+        held = wait_for(
+            lambda: claim.is_file() and claim.read_text().splitlines()[-1:] == ["held"]
+        )
+        check("outcome-unknown handler exit durably marks the claim held", held)
+        check("outcome-unknown handler runs the provider path once",
+              calls.read_text().splitlines() == ["call"])
+        check("held outcome never creates a live-core fallback receipt", not fallback.exists())
+        h.stop(graceful=True)
+
+        restarted = Harness.attach(h.ws, h.tmp)
+        restarted.runtime = "claude"
+        restarted.start()
+        try:
+            time.sleep(1.0)
+            check("held claim survives watcher restart", claim.is_file())
+            check("restart does not re-run an outcome-unknown provider",
+                  calls.read_text().splitlines() == ["call"])
+        finally:
+            restarted.stop()
+    finally:
+        h.stop()
+
+
 
 
 
@@ -328,6 +396,7 @@ def main() -> int:
     scenario_whitespace_archived_result_is_not_delivered()
     scenario_unready_destination_is_left_untouched_and_unsettled()
     scenario_answer_landing_during_the_reap_stays_deliverable()
+    scenario_outcome_unknown_claim_survives_restart()
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1

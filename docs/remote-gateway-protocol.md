@@ -76,7 +76,9 @@ provider session per room. Messages in the same room resume that session;
 different rooms use different sessions. Team and Guest tasks keep their
 established guarded paths. A provider timeout after launch is terminal because
 its side effects are outcome-unknown; the skill suppresses automatic fallback
-replay and checkpoints a reported session handle when available.
+replay and checkpoints a reported session handle when available. If both
+settlement sinks fail, the watcher retains a durable held claim across restart;
+it never releases the task to the unrestricted live-core fallback.
 
 ### `POST /v1/tasks/<id>/ack`
 

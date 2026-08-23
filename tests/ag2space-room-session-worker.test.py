@@ -516,10 +516,23 @@ def test_direct_failure_and_cli_edges() -> None:
         check(not worker._outcome_path(workspace, outcome_name).exists(),
               "published outcome receipt is removed")
 
-        with patch.object(worker, "_atomic_text", side_effect=OSError("state unavailable")):
-            worker._record_outcome_unknown(workspace, results, "task-state-error.txt", "unknown")
-        check(not (results / "task-state-error.txt").exists(),
-              "outcome recording fails closed when durable state is unavailable")
+        with patch.object(worker, "_atomic_text", side_effect=OSError("state unavailable")), \
+             patch.object(worker, "_publish_once", side_effect=OSError("results unavailable")):
+            recorded = worker._record_outcome_unknown(
+                workspace, results, "task-state-error.txt", "unknown"
+            )
+        check(not recorded and not (results / "task-state-error.txt").exists(),
+              "outcome recording reports failure without a durable settlement sink")
+
+        retrying = task(workspace, "task-settlement-retry", room_id="!settlement-retry:a")
+        with patch.object(worker, "_run_claude", side_effect=worker.OutcomeUnknownError(
+                 worker.OUTCOME_UNKNOWN_BODY
+             )) as provider, \
+             patch.object(worker, "_record_outcome_unknown", return_value=False) as record:
+            code = worker.handle("claude", workspace, retrying, results, REPO)
+        check(code == worker.OUTCOME_UNSETTLED and provider.call_count == 1
+              and record.call_count == 1,
+              "handler requests durable claim retention without re-running the provider")
 
         published = results / "publish-once.txt"
         worker._publish_once(published, "first\n")

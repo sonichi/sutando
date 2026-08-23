@@ -24,6 +24,7 @@ from typing import Optional
 
 
 UNHANDLED = 3
+OUTCOME_UNSETTLED = 75
 SCHEMA_VERSION = 1
 OUTCOME_UNKNOWN_BODY = (
     "The room-session provider timed out after execution started. Its outcome is unknown, "
@@ -157,14 +158,21 @@ def _settle_outcome_unknown(workspace: Path, results_dir: Path, filename: str) -
     return True
 
 
-def _record_outcome_unknown(workspace: Path, results_dir: Path, filename: str, body: str) -> None:
+def _record_outcome_unknown(workspace: Path, results_dir: Path, filename: str, body: str) -> bool:
     receipt = _outcome_path(workspace, filename)
+    payload = f"{body}\n"
     try:
-        _atomic_text(receipt, f"{body}\n")
-        if _publish_once(results_dir / filename, f"{body}\n"):
-            receipt.unlink(missing_ok=True)
+        _atomic_text(receipt, payload)
     except OSError:
         pass
+    receipt_ready = read_ready_result(receipt) is not None
+    try:
+        if _publish_once(results_dir / filename, payload):
+            receipt.unlink(missing_ok=True)
+            return True
+    except OSError:
+        pass
+    return receipt_ready
 
 
 def _session_id(workspace: Path, runtime: str, room_key: str) -> tuple[str, bool]:
@@ -502,7 +510,14 @@ def handle(
                     )
                 )
             except OutcomeUnknownError as exc:
-                _record_outcome_unknown(workspace, results_dir, task_file.name, str(exc))
+                if not _record_outcome_unknown(
+                    workspace, results_dir, task_file.name, str(exc)
+                ):
+                    print(
+                        "AG2 Space room-session worker: settlement unavailable; preserving claim",
+                        file=sys.stderr,
+                    )
+                    return OUTCOME_UNSETTLED
                 print(f"AG2 Space room-session worker: {exc}", file=sys.stderr)
                 return 0
             if not body.strip():
