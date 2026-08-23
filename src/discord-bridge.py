@@ -3259,70 +3259,57 @@ async def _handle_discord_message(message, force=False):
         if isinstance(message.channel, discord.Thread):
             try:
                 access_data = json.loads(ACCESS_FILE.read_text())
-            except Exception:
-                # First-run/wipe: no access.json yet — degrade like
+            except FileNotFoundError:
+                # Genuinely absent (first-run/wipe) — degrade like
                 # load_allowed()/load_policy(), don't drop the seed.
                 access_data = {}
-            try:
-                access_groups = access_data.setdefault('groups', {})
-                thread_id_str = str(message.channel.id)
-                # Multi-bot-safe seed gate. In a fleet deployment (siblingBots
-                # declared), seed ONLY when THIS bot is the addressed one
-                # (direct @-mention or a sutando-role @) — otherwise every
-                # sibling bot seeds the same thread, posts its own 🌱 notice
-                # pinging its own owner (the seed storm), and then grabs every
-                # unaddressed follow-up (the 2026-07-02 #1823 pile-up). In a
-                # single-bot deployment (no siblingBots) seed on any first
-                # message, preserving the #1498 ep013 first-message-drop fix.
-                _seed_ok = (
-                    bot_mentioned or role_mentioned
-                    or not _has_sibling_bots(access_data, getattr(client.user, "id", None))
-                )
-                if thread_id_str not in access_groups and _seed_ok:
-                    parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
-                    parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
-                    if parent_cfg is True:
-                        thread_entry = {'requireMention': False}
-                    elif isinstance(parent_cfg, dict):
-                        inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
-                        thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
-                    else:
-                        thread_entry = {'requireMention': False, 'allowFrom': [str(message.author.id)]}
-                    access_groups[thread_id_str] = thread_entry
-                    # Atomic tmp+rename. Bare write_text truncates-then-writes,
-                    # exposing a window where a concurrent reader (every
-                    # message hits load_channel_config which re-reads
-                    # access.json) or a crash could see a partial file. Same
-                    # change also closes the lost-update race with the
-                    # `/discord:access` skill's read-modify-write.
-                    tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
-                    write_private_text(tmp_path, json.dumps(access_data, indent=2))
-                    os.replace(tmp_path, ACCESS_FILE)
-                    _backup_access_to_disk(access_data)  # pragma: no cover — thread-engage seed write glue; the backup fn is unit-tested. Durable backup on every valid access write
-                    # Refresh the gate for THIS message. require_mention was
-                    # computed by load_channel_config before the seed existed,
-                    # so without this the seeding message itself is still
-                    # dropped at the requireMention gate below unless it
-                    # happened to @-mention the bot — the ep013-class
-                    # first-message drop was only half-fixed by the 2026-06-06
-                    # ungate (thread seeded, triggering message lost). Widen
-                    # only: never flip an already-False gate back to True.
-                    require_mention = require_mention and bool(thread_entry.get('requireMention', True))
-                    print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
-                    # Owner-visibility ping (one-shot, first seed only): when a
-                    # non-owner seeds the thread, @-mention the owner inline so an
-                    # auto-opened thread can't silently accumulate sandboxed replies
-                    # the owner never sees (#1498 slip-risk).
-                    owner_ids = access_data.get('allowFrom', [])
-                    if _should_notify_owner_on_seed(message.author.id, owner_ids):
-                        try:
-                            parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
-                            await message.channel.send(
-                                _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
-                        except Exception as e:
-                            print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
             except Exception as e:
-                print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
+                # Corrupt/unreadable ≠ missing — don't fall through to {} (that
+                # would let the seed-write below clobber the file). Skip seeding.
+                print(f"  [thread-engage] WARNING: access.json unreadable ({e}); skipping seed, not overwriting", flush=True)
+                access_data = None
+            if access_data is not None:
+                try:
+                    access_groups = access_data.setdefault('groups', {})
+                    thread_id_str = str(message.channel.id)
+                    # Multi-bot fleets: seed only when THIS bot is addressed (avoids
+                    # the sibling seed-storm, #1823). Single-bot: seed on any first message.
+                    _seed_ok = (
+                        bot_mentioned or role_mentioned
+                        or not _has_sibling_bots(access_data, getattr(client.user, "id", None))
+                    )
+                    if thread_id_str not in access_groups and _seed_ok:
+                        parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
+                        parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
+                        if parent_cfg is True:
+                            thread_entry = {'requireMention': False}
+                        elif isinstance(parent_cfg, dict):
+                            inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
+                            thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
+                        else:
+                            thread_entry = {'requireMention': False, 'allowFrom': [str(message.author.id)]}
+                        access_groups[thread_id_str] = thread_entry
+                        # Atomic tmp+rename — avoids a truncated-file window for
+                        # concurrent readers/crashes and closes the `/discord:access` race.
+                        tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
+                        write_private_text(tmp_path, json.dumps(access_data, indent=2))
+                        os.replace(tmp_path, ACCESS_FILE)
+                        _backup_access_to_disk(access_data)  # pragma: no cover — glue; backup fn is unit-tested
+                        # Refresh the gate so the seeding message isn't dropped below; widen only.
+                        require_mention = require_mention and bool(thread_entry.get('requireMention', True))
+                        print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
+                        # Owner-visibility ping (first seed only): @-mention the owner so
+                        # a non-owner-opened thread can't silently accumulate unseen replies.
+                        owner_ids = access_data.get('allowFrom', [])
+                        if _should_notify_owner_on_seed(message.author.id, owner_ids):
+                            try:
+                                parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
+                                await message.channel.send(
+                                    _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
+                            except Exception as e:
+                                print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
+                except Exception as e:
+                    print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
 
         # Text/magic-word screen-push REMOVED (#1427, owner 2026-06-05). Screen
         # sharing in a voice session is owned entirely by the voice-invoked

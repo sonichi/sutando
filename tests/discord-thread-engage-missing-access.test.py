@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
 """Regression guard for the thread-engage seed block in src/discord-bridge.py
-silently dropping a thread's first-message seeding when access.json has
-genuinely never been created (fresh-install pairing window: no durable
-backup yet, no prior write).
+silently dropping a thread's first-message seeding when access.json is
+genuinely missing — and, separately, guarding against a PRESENT-BUT-CORRUPT
+access.json being treated the same way and clobbered by the seed write.
 
-Before this fix, `json.loads(ACCESS_FILE.read_text())` and the entire
-seed-write logic shared ONE try/except. A missing file raised
-FileNotFoundError, which the shared except caught and logged as
-"[thread-engage] failed to update access.json: ..." — but that also skipped
-the seed logic entirely, so the thread was never added to access.json's
-`groups`. Flagged in pending-questions.md (2026-08-10, "[thread-engage]
-crashes on missing access.json").
+History: the original fix (this file's v1) shared ONE try/except across the
+read and the seed-write, so a missing file raised FileNotFoundError, the
+shared except caught it and logged "[thread-engage] failed to update
+access.json: ...", and the seed logic never ran — the thread was never added
+to access.json's `groups`. Flagged in pending-questions.md (2026-08-10,
+"[thread-engage] crashes on missing access.json").
 
-The fix splits the read into its own try/except that degrades to a fresh
-`{}` doc on failure (mirroring the graceful-degradation pattern already used
-by load_allowed()/load_policy()/load_tier_map() elsewhere in this file),
-so the seed-write logic that follows still runs and creates access.json for
-the first time instead of silently doing nothing.
+v1's naive fix split the read into its own try/except but caught ALL
+exceptions (`except Exception`) and defaulted to `{}` — which conflated
+"genuinely absent" with "present but corrupt/unreadable". A transient read
+error or a corrupt-but-present file then fell through to the seed-write path,
+which replaces the live access.json with just `{"groups": {...}}`, silently
+erasing allowFrom/tierMap/dmPolicy/sibling-bot policy/every existing group.
+Caught in PR #3318 review (qingyun-wu, 2026-08-23): executing the exact
+shipped block against a present corrupt file de-authorized the owner.
+
+The current fix mirrors the absent-vs-corrupt contract read_access_for_seed()
+(:909-928) already uses: FileNotFoundError → seedable `{}` default;
+any other read failure → None, and the seed-write path is skipped entirely
+(guarded by `if access_data is not None:`) so a present corrupt file is left
+byte-for-byte untouched.
 
 Why structural + a narrow executable slice, not a full behavioral test of
 on_message: on_message is a single giant handler wired to live discord.py
 objects (discord.Thread, client.user, message.channel.*) — mocking it fully
 outweighs the fix (same tradeoff proactive-suppression-marker-honored.test.py
 already documents for poll_proactive). Instead this test extracts the EXACT
-shipped read+fallback lines and executes them standalone against a genuinely
-missing file — real production code, real assertion, no discord.py needed —
-plus structural checks that the fallback precedes and does not swallow the
-seed-write logic.
+shipped read+fallback lines and executes them standalone against both a
+genuinely missing file and a genuinely corrupt one — real production code,
+real assertions, no discord.py needed — plus structural checks that the
+fallback precedes and gates the seed-write logic.
 
 Run: python3 tests/discord-thread-engage-missing-access.test.py
 Exit: 0 on pass, 1 on fail.
@@ -57,7 +65,7 @@ _READ_START = (
     "            try:\n"
     "                access_data = json.loads(ACCESS_FILE.read_text())"
 )
-_SEED_TRY_MARKER = "\n            try:\n                access_groups"
+_SEED_GUARD_MARKER = "\n            if access_data is not None:"
 
 
 def _extract_thread_engage_block(source: str) -> str:
@@ -72,12 +80,12 @@ def _extract_thread_engage_block(source: str) -> str:
 
 
 def _extract_read_fallback(block: str) -> str:
-    """The ACCESS_FILE-read + fallback sub-block only — two try/except
-    statements, no discord.py references, directly executable."""
+    """The ACCESS_FILE-read + absent-vs-corrupt fallback sub-block only —
+    two `except` clauses, no discord.py references, directly executable."""
     start = block.find(_READ_START)
     if start == -1:
         return ""
-    end = block.find(_SEED_TRY_MARKER, start)
+    end = block.find(_SEED_GUARD_MARKER, start)
     if end == -1:
         return ""
     return block[start:end]
@@ -92,28 +100,42 @@ class TestThreadEngageMissingAccessFile(unittest.TestCase):
         )
         self.fallback = _extract_read_fallback(self.block)
 
-    def test_read_has_its_own_except_ahead_of_seed_logic(self):
-        """The ACCESS_FILE read is wrapped in ITS OWN try/except (not merged
-        with the seed-logic try) so a missing/corrupt file degrades instead
-        of skipping seeding entirely."""
+    def test_read_has_its_own_except_clauses_ahead_of_seed_logic(self):
+        """The ACCESS_FILE read is wrapped in its OWN try/except (not merged
+        with the seed-logic try), and distinguishes FileNotFoundError
+        (genuinely absent) from any other read failure (present-but-corrupt)
+        — mirroring read_access_for_seed()'s absent-vs-corrupt contract."""
         self.assertTrue(
             self.fallback,
             "the read (json.loads(ACCESS_FILE.read_text())) is not isolated "
-            "in its own try/except ahead of the seed-logic try — a read "
-            "failure will skip seeding entirely instead of degrading to {}",
+            "in its own try/except ahead of the seed-guard — a read failure "
+            "won't be distinguished from a missing file",
+        )
+        self.assertIn(
+            "except FileNotFoundError",
+            self.fallback,
+            "a genuinely missing file must be caught specifically, not lumped "
+            "in with every other read failure",
         )
         self.assertIn(
             "access_data = {}",
             self.fallback,
-            "read failure must default access_data to a fresh {} doc",
+            "a genuinely missing file must default access_data to a fresh {} doc",
+        )
+        self.assertIn(
+            "access_data = None",
+            self.fallback,
+            "a present-but-unreadable file must NOT default to {} (that would "
+            "let the seed-write below erase it) — it must set access_data to "
+            "None so the seed-write guard skips it",
         )
 
-    def test_read_fallback_executes_and_degrades_to_empty_doc(self):
+    def test_read_fallback_degrades_missing_file_to_empty_doc(self):
         """Execute the EXACT extracted read+fallback lines from the shipped
         file against a genuinely-missing ACCESS_FILE and confirm access_data
         comes out as {} (seedable) rather than being left unset."""
         self.assertTrue(self.fallback, "fallback slice missing — see prior test")
-        tmp = Path(tempfile.mkdtemp(prefix="dc-thread-engage-")) / "access.json"
+        tmp = Path(tempfile.mkdtemp(prefix="dc-thread-engage-missing-")) / "access.json"
         self.assertFalse(tmp.exists(), "precondition: file genuinely missing")
         ns = {"json": json, "ACCESS_FILE": tmp}
         exec(compile(textwrap.dedent(self.fallback), str(BRIDGE), "exec"), ns)
@@ -124,18 +146,44 @@ class TestThreadEngageMissingAccessFile(unittest.TestCase):
             "or leave the name unset",
         )
 
-    def test_seed_logic_runs_after_the_fallback_not_inside_it(self):
-        """access_groups = access_data.setdefault(...) must be reachable
-        AFTER the read try/except, not nested inside the branch that only
-        logs and returns without seeding."""
-        idx_fallback = self.block.find("except Exception:\n                # First-run")
+    def test_read_fallback_leaves_corrupt_file_untouched(self):
+        """Write-path regression (qingyun-wu, PR #3318 review): execute the
+        EXACT extracted read+fallback lines against a PRESENT but corrupt
+        access.json and confirm (a) access_data comes out None, so the
+        seed-write guard below skips the write entirely, and (b) the file's
+        bytes on disk are byte-for-byte unchanged — a transient read error
+        must never erase allowFrom/tierMap/dmPolicy/existing groups."""
+        self.assertTrue(self.fallback, "fallback slice missing — see prior test")
+        tmp = Path(tempfile.mkdtemp(prefix="dc-thread-engage-corrupt-")) / "access.json"
+        corrupt_bytes = '{"allowFrom":["owner"'  # truncated/invalid JSON
+        tmp.write_text(corrupt_bytes)
+        ns = {"json": json, "ACCESS_FILE": tmp}
+        exec(compile(textwrap.dedent(self.fallback), str(BRIDGE), "exec"), ns)
+        self.assertIsNone(
+            ns.get("access_data"),
+            "a present-but-corrupt access.json must set access_data to None "
+            "(not {}) so the seed-write guard skips the write",
+        )
+        self.assertEqual(
+            tmp.read_text(),
+            corrupt_bytes,
+            "the read fallback itself must never write to ACCESS_FILE — bytes "
+            "on disk must be untouched after a corrupt read",
+        )
+
+    def test_seed_logic_gated_on_access_data_not_none(self):
+        """access_groups = access_data.setdefault(...) must be reachable only
+        inside `if access_data is not None:` — i.e. AFTER and GATED BY the
+        read fallback, so a corrupt-file None never reaches the seed-write."""
+        idx_guard = self.block.find(_SEED_GUARD_MARKER.strip())
         idx_seed = self.block.find("access_groups = access_data.setdefault")
-        self.assertNotEqual(idx_fallback, -1, "expected fallback except not found")
+        self.assertNotEqual(idx_guard, -1, "expected seed guard `if access_data is not None:` not found")
         self.assertNotEqual(idx_seed, -1, "expected seed-logic line not found")
         self.assertLess(
-            idx_fallback,
+            idx_guard,
             idx_seed,
-            "seed logic must run AFTER the read fallback, not be skipped by it",
+            "seed logic must be gated by `if access_data is not None:`, not "
+            "reachable unconditionally after the read fallback",
         )
 
 
