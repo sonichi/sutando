@@ -118,6 +118,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
+from access_store import mutate_access_file, read_access_for_transaction  # noqa: E402  — single locked writer for access.json (#3318)
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
@@ -866,69 +867,34 @@ def ensure_tier_map_seeded() -> bool:
     needed but could NOT be persisted/read. On False the caller MUST fail
     closed — never grant owner off an empty/unconfirmed map (#2161 CR:
     a transient read/write error must not silently escalate every
-    allowlisted sender to owner)."""
+    allowlisted sender to owner).
+
+    Routed through access_store.mutate_access_file (#3318) — the single
+    locked owner every access.json writer shares, so this can't lost-update
+    against a concurrent thread-engage seed or pairing-code write."""
+    def _mutator(data):
+        allow = data.get("allowFrom") or []
+        # Test key PRESENCE, not truthiness — an explicitly-empty tierMap ({})
+        # is a deliberate "nobody is owner" state, not an unseeded file.
+        if "tierMap" in data:
+            return None, True
+        if not allow:
+            return None, True  # nothing to grandfather — an empty map is legitimate here
+        data["tierMap"] = {uid: "owner" for uid in allow}
+        return data, len(allow)
+
     try:
-        data = json.loads(ACCESS_FILE.read_text())
-    except Exception as e:
-        print(f"  [tier-map] WARNING: access.json unreadable ({e}); allowlisted senders resolve read-only (team) until the tierMap can be read", flush=True)
-        return False
-    allow = data.get("allowFrom") or []
-    # Test key PRESENCE, not truthiness. An explicitly-empty tierMap ({}) is a
-    # deliberate "nobody is owner via tierMap" state — treating it as falsy
-    # here would re-seed every allowFrom member as owner, escalating read-only
-    # users (#2161 CR: {"allowFrom":["U"],"tierMap":{}} must NOT become
-    # {"U":"owner"}). Only a genuinely ABSENT key (never-seeded legacy file)
-    # triggers first-run grandfathering below. A present-but-empty map returns
-    # here, so the allowlisted user is missing from the map and resolves team.
-    if "tierMap" in data:
-        return True
-    if not allow:
-        return True  # nothing to grandfather — an empty map is legitimate here
-    data["tierMap"] = {uid: "owner" for uid in allow}
-    # Atomic write: a bare ACCESS_FILE.write_text() truncates the live
-    # access-control file BEFORE writing, so a disk-full / interrupt / partial
-    # write can destroy allowFrom — and with fail-closed tier resolution that
-    # locks legitimate owners out against a corrupt file, at bridge startup.
-    # Write a sibling temp BORN 0600 (write_private_text), then os.replace() (mirrors the
-    # pairing path + the #2222 owner-activity fix). The pid+uuid suffix avoids
-    # colliding with a concurrent pairing-path .tmp; on any failure the original
-    # access.json bytes are left intact and the orphan temp is removed.
-    tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        write_private_text(tmp, json.dumps(data, indent=2) + "\n")
-        os.replace(tmp, ACCESS_FILE)
-        _backup_access_to_disk(data)  # durable backup on every valid access write
-        print(f"  [tier-map] grandfathered {len(allow)} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
-        return True
+        seeded = mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
     except OSError as e:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
         print(f"  [tier-map] WARNING: failed to persist grandfather tierMap ({e}); allowlisted senders resolve read-only (team) until seeded", flush=True)
         return False
-
-def read_access_for_seed(path):
-    """Read access.json for a path that is about to WRITE it back (pairing seed).
-
-    Returns:
-      - the parsed dict when the file is present and valid;
-      - a fresh default dict when the file is genuinely ABSENT (first-run
-        onboarding — seeding a default is correct);
-      - None when the file EXISTS but is unreadable/corrupt — the caller MUST
-        NOT overwrite it. Writing an empty-allowFrom default over a
-        present-but-unparseable access.json turns a transient read glitch into
-        a PERMANENT config wipe: the owner is dropped from allowFrom, so every
-        sender gets a pairing prompt and codes leak into channels. Observed
-        2026-07-21 (the owner was silently de-authorized mid-session). The safe
-        move on corruption is to leave the file untouched and bail.
-    """
-    try:
-        return json.loads(path.read_text())
-    except FileNotFoundError:
-        return {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
-    except Exception:
-        return None
+    if seeded is None:
+        print(f"  [tier-map] WARNING: access.json unreadable; allowlisted senders resolve read-only (team) until the tierMap can be read", flush=True)
+        return False
+    if seeded is True:
+        return True
+    print(f"  [tier-map] grandfathered {seeded} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
+    return True
 
 def load_channel_config(channel_id):
     """Load channel config. Returns (requireMention, allowFrom set) or None if not configured."""
@@ -3257,59 +3223,56 @@ async def _handle_discord_message(message, force=False):
         # in pending-questions.md (2026-05-17 entry + 2026-05-25 + 2026-06-02
         # updates).
         if isinstance(message.channel, discord.Thread):
+            def _thread_seed_mutator(access_data):
+                access_groups = access_data.setdefault('groups', {})
+                thread_id_str = str(message.channel.id)
+                # Multi-bot fleets: seed only when THIS bot is addressed (avoids
+                # the sibling seed-storm, #1823). Single-bot: seed on any first message.
+                _seed_ok = (
+                    bot_mentioned or role_mentioned
+                    or not _has_sibling_bots(access_data, getattr(client.user, "id", None))
+                )
+                if thread_id_str not in access_groups and _seed_ok:
+                    parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
+                    parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
+                    if parent_cfg is True:
+                        thread_entry = {'requireMention': False}
+                    elif isinstance(parent_cfg, dict):
+                        inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
+                        thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
+                    else:
+                        thread_entry = {'requireMention': False, 'allowFrom': [str(message.author.id)]}
+                    access_groups[thread_id_str] = thread_entry
+                    return access_data, (thread_id_str, parent_id_str, thread_entry, access_data.get('allowFrom', []))
+                return None, None
+
+            # Same locked owner as ensure_tier_map_seeded/pairing — avoids lost
+            # updates. Absent or corrupt access.json both no-op here, untouched.
             try:
-                access_data = json.loads(ACCESS_FILE.read_text())
-            except FileNotFoundError:
-                # Genuinely absent (first-run/wipe) — degrade like
-                # load_allowed()/load_policy(), don't drop the seed.
-                access_data = {}
+                seed_result = mutate_access_file(ACCESS_FILE, _thread_seed_mutator, backup=_backup_access_to_disk)
             except Exception as e:
-                # Corrupt/unreadable ≠ missing — don't fall through to {} (that
-                # would let the seed-write below clobber the file). Skip seeding.
-                print(f"  [thread-engage] WARNING: access.json unreadable ({e}); skipping seed, not overwriting", flush=True)
-                access_data = None
-            if access_data is not None:  # pragma: no cover — seed-write needs a full discord.py Thread mock; read/fallback above is unit-tested
-                try:
-                    access_groups = access_data.setdefault('groups', {})
-                    thread_id_str = str(message.channel.id)
-                    # Multi-bot fleets: seed only when THIS bot is addressed (avoids
-                    # the sibling seed-storm, #1823). Single-bot: seed on any first message.
-                    _seed_ok = (
-                        bot_mentioned or role_mentioned
-                        or not _has_sibling_bots(access_data, getattr(client.user, "id", None))
-                    )
-                    if thread_id_str not in access_groups and _seed_ok:
-                        parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
-                        parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
-                        if parent_cfg is True:
-                            thread_entry = {'requireMention': False}
-                        elif isinstance(parent_cfg, dict):
-                            inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
-                            thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
-                        else:
-                            thread_entry = {'requireMention': False, 'allowFrom': [str(message.author.id)]}
-                        access_groups[thread_id_str] = thread_entry
-                        # Atomic tmp+rename — avoids a truncated-file window for
-                        # concurrent readers/crashes and closes the `/discord:access` race.
-                        tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
-                        write_private_text(tmp_path, json.dumps(access_data, indent=2))
-                        os.replace(tmp_path, ACCESS_FILE)
-                        _backup_access_to_disk(access_data)  # pragma: no cover — glue; backup fn is unit-tested
-                        # Refresh the gate so the seeding message isn't dropped below; widen only.
-                        require_mention = require_mention and bool(thread_entry.get('requireMention', True))
-                        print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
-                        # Owner-visibility ping (first seed only): @-mention the owner so
-                        # a non-owner-opened thread can't silently accumulate unseen replies.
-                        owner_ids = access_data.get('allowFrom', [])
-                        if _should_notify_owner_on_seed(message.author.id, owner_ids):
-                            try:
-                                parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
-                                await message.channel.send(
-                                    _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
-                            except Exception as e:
-                                print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
-                except Exception as e:
-                    print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
+                seed_result = None
+                print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
+            else:
+                if seed_result is None and read_access_for_transaction(ACCESS_FILE) is None:
+                    # Corrupt/unreadable ≠ missing — access_store already left the file
+                    # untouched; this re-read is diagnostic-only (best-effort, unlocked).
+                    print("  [thread-engage] WARNING: access.json unreadable; skipping seed, not overwriting", flush=True)
+
+            if seed_result is not None:  # pragma: no cover — needs a full discord.py Thread mock; mutator is unit-tested directly against access_store
+                thread_id_str, parent_id_str, thread_entry, owner_ids = seed_result
+                # Refresh the gate so the seeding message isn't dropped below; widen only.
+                require_mention = require_mention and bool(thread_entry.get('requireMention', True))
+                print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
+                # First-seed owner-visibility ping — outside the lock deliberately,
+                # since we never hold it across a network await.
+                if _should_notify_owner_on_seed(message.author.id, owner_ids):
+                    try:
+                        parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
+                        await message.channel.send(
+                            _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
+                    except Exception as e:
+                        print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
 
         # Text/magic-word screen-push REMOVED (#1427, owner 2026-06-05). Screen
         # sharing in a voice session is owned entirely by the voice-invoked
@@ -3456,52 +3419,40 @@ async def _handle_discord_message(message, force=False):
     if policy == "pairing" and sender_id not in allowed and not channel_authorized:
         # Generate pairing code — user must approve via /discord:access pair <code>
         import random, string
-        # Async gateway wiring is structurally pinned below; the pure helper's
-        # valid/absent/corrupt behavior is executed against real files.
-        access = read_access_for_seed(ACCESS_FILE)  # pragma: no cover
-        if access is None:  # pragma: no cover
-            # access.json EXISTS but is corrupt/unreadable. Do NOT overwrite it
-            # with an empty-allowFrom default — that permanently wipes the real
-            # config (owner dropped from allowFrom → pairing prompts + code leak
-            # to channels; observed 2026-07-21). Bail loudly; leave the file for
-            # recovery. A restart auto-restores from the durable state/auth/
-            # backup (_restore_access_from_disk in on_ready); the legacy
-            # channels/discord/access.json.bak-* files remain a manual fallback.
+
+        def _pairing_mutator(access):
+            code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+            pending = access.get("pending", {})
+            # Clean expired codes
+            now_ms = int(time.time() * 1000)
+            pending = {k: v for k, v in pending.items() if v.get("expiresAt", 0) > now_ms}
+            pending[code] = {
+                "senderId": sender_id,
+                "chatId": str(message.channel.id),
+                "createdAt": now_ms,
+                "expiresAt": now_ms + 3600000,  # 1 hour
+            }
+            access["pending"] = pending
+            return access, code
+
+        # Same locked owner as ensure_tier_map_seeded/thread-engage — avoids a
+        # lost-update race; corrupt/unreadable file leaves `code` None, untouched.
+        try:
+            code = mutate_access_file(ACCESS_FILE, _pairing_mutator, backup=_backup_access_to_disk)
+        except Exception as e:
+            code = None
+            print(f"  [pairing] failed to update access.json: {e}", flush=True)
+
+        if code is None:
             print(
-                f"  [pairing] access.json present but unreadable — NOT overwriting "
-                f"(would wipe allowFrom). Skipping pairing for @{username} ({sender_id}). "
+                f"  [pairing] access.json unreadable or write failed — NOT overwriting "
+                f"(would risk wiping allowFrom). Skipping pairing for @{username} ({sender_id}). "
                 f"Restart to auto-restore from the durable state/auth/discord-access-backup.json "
                 f"(or manually restore a channels/discord/access.json.bak-* backup).",
                 flush=True,
             )
             return
-        code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-        pending = access.get("pending", {})
-        # Clean expired codes
-        now_ms = int(time.time() * 1000)
-        pending = {k: v for k, v in pending.items() if v.get("expiresAt", 0) > now_ms}
-        pending[code] = {
-            "senderId": sender_id,
-            "chatId": str(message.channel.id),
-            "createdAt": now_ms,
-            "expiresAt": now_ms + 3600000,  # 1 hour
-        }
-        access["pending"] = pending
-        # Atomic tmp+rename. A bare write_text truncates-then-writes, exposing a
-        # window where a concurrent reader (every message hits load_channel_config,
-        # which re-reads access.json) sees a partial/empty file → json parse fail.
-        # THIS truncate-in-place write was the TRIGGER of the 2026-07-21 corrupt
-        # read: before the no-clobber guard above, that failed read fell to the
-        # bare-except default and permanently wiped allowFrom → pairing-code leak
-        # into DMs and #dev. The no-clobber guard stops the amplification; writing
-        # atomically here closes the window that produced the corrupt read at all
-        # (and the lost-update race with the `/discord:access` read-modify-write).
-        # Same pattern the thread-engage seed already uses. chmod the tmp before
-        # replace so the final file is never briefly 0644 (it holds owner IDs).
-        tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')  # pragma: no cover — async pairing branch; atomicity asserted structurally
-        write_private_text(tmp_path, json.dumps(access, indent=2))  # pragma: no cover
-        os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
-        _backup_access_to_disk(access)  # pragma: no cover — durable backup on every valid access write (#2358)
+
         route = await _deliver_pairing_prompt(message.channel, code, username, sender_id, allowed)
         print(f"  Pairing requested: @{username} ({sender_id}) code delivered via {route}")
         return

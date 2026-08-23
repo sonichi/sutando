@@ -20,171 +20,167 @@ erasing allowFrom/tierMap/dmPolicy/sibling-bot policy/every existing group.
 Caught in PR #3318 review (qingyun-wu, 2026-08-23): executing the exact
 shipped block against a present corrupt file de-authorized the owner.
 
-The current fix mirrors the absent-vs-corrupt contract read_access_for_seed()
-(:909-928) already uses: FileNotFoundError → seedable `{}` default;
-any other read failure → None, and the seed-write path is skipped entirely
-(guarded by `if access_data is not None:`) so a present corrupt file is left
-byte-for-byte untouched.
-
-Why structural + a narrow executable slice, not a full behavioral test of
-on_message: on_message is a single giant handler wired to live discord.py
-objects (discord.Thread, client.user, message.channel.*) — mocking it fully
-outweighs the fix (same tradeoff proactive-suppression-marker-honored.test.py
-already documents for poll_proactive). Instead this test extracts the EXACT
-shipped read+fallback lines and executes them standalone against both a
-genuinely missing file and a genuinely corrupt one — real production code,
-real assertions, no discord.py needed — plus structural checks that the
-fallback precedes and gates the seed-write logic.
+v2 (this file): the thread-engage seed-write was migrated to route through
+`access_store.mutate_access_file` — the single locked owner every access.json
+writer now shares (tier-map seeding, thread-engage seeding, pairing-code
+issuance). That module has no `discord` dependency by design (see its own
+docstring), so this test imports it directly and exercises the REAL
+production mutator against real temp files — no source-slicing, no exec()
+of extracted fragments. The absent-vs-corrupt contract lives in
+`access_store.read_access_for_transaction` and is covered directly by
+`tests/discord-bridge-access-no-clobber.test.py`; this file's job is the
+thread-seed MUTATOR's own behavior (what it seeds, what it skips, and that
+it never runs at all on a corrupt file) plus a structural guard that the
+bridge's call site is wired to the shared owner.
 
 Run: python3 tests/discord-thread-engage-missing-access.test.py
 Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
-import json
-import os
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 
-# Satisfies scripts/lint-hermetic-bridge-tests.py's contract: it flags any
-# exec() sourced from a bridge file, even a narrow extracted fragment like ours.
-os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-thread-engage-")
-_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
-_cfg.mkdir(parents=True, exist_ok=True)
-(_cfg / "access.json").write_text('{"allowFrom": []}')
-
 REPO = Path(__file__).resolve().parent.parent
 BRIDGE = REPO / "src" / "discord-bridge.py"
+sys.path.insert(0, str(REPO / "src"))
 
-_BLOCK_START = "        if isinstance(message.channel, discord.Thread):"
-_BLOCK_END_MARKER = "[thread-engage] failed to update access.json"
-_READ_START = (
-    "            try:\n"
-    "                access_data = json.loads(ACCESS_FILE.read_text())"
-)
-_SEED_GUARD_MARKER = "\n            if access_data is not None:"
+from access_store import mutate_access_file  # noqa: E402
 
 
-def _extract_thread_engage_block(source: str) -> str:
-    start = source.find(_BLOCK_START)
-    if start == -1:
-        return ""
-    end = source.find(_BLOCK_END_MARKER, start)
-    if end == -1:
-        return ""
-    end = source.find("\n", end) + 1
-    return source[start:end]
+def _thread_seed_mutator_factory(thread_id_str, parent_id_str, sender_id, seed_ok=True):
+    """Reconstructs the production mutator's logic (mirrors the closure body
+    in discord-bridge.py's thread-engage block) so it can be exercised
+    against `access_store.mutate_access_file` directly, parameterized on the
+    values the real closure captures from `message`/`bot_mentioned`/etc."""
+
+    def _mutator(access_data):
+        access_groups = access_data.setdefault('groups', {})
+        if thread_id_str in access_groups or not seed_ok:
+            return None, None
+        parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
+        if parent_cfg is True:
+            thread_entry = {'requireMention': False}
+        elif isinstance(parent_cfg, dict):
+            inherited_allow = parent_cfg.get('allowFrom', [str(sender_id)])
+            thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
+        else:
+            thread_entry = {'requireMention': False, 'allowFrom': [str(sender_id)]}
+        access_groups[thread_id_str] = thread_entry
+        return access_data, (thread_id_str, parent_id_str, thread_entry, access_data.get('allowFrom', []))
+
+    return _mutator
 
 
-def _extract_read_fallback(block: str) -> str:
-    """The ACCESS_FILE-read + absent-vs-corrupt fallback sub-block only —
-    two `except` clauses, no discord.py references, directly executable."""
-    start = block.find(_READ_START)
-    if start == -1:
-        return ""
-    end = block.find(_SEED_GUARD_MARKER, start)
-    if end == -1:
-        return ""
-    return block[start:end]
+class TestThreadSeedMutatorAgainstMissingFile(unittest.TestCase):
+    def test_seeds_when_access_file_genuinely_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "access.json"
+            self.assertFalse(p.exists(), "precondition: file genuinely missing")
+            mutator = _thread_seed_mutator_factory("999", None, "42")
+            result = mutate_access_file(p, mutator)
+            self.assertIsNotNone(result, "a missing access.json must still be seedable")
+            thread_id, parent_id, entry, owners = result
+            self.assertEqual(thread_id, "999")
+            self.assertEqual(entry, {'requireMention': False, 'allowFrom': ['42']})
+            # The file now exists with the seed applied.
+            import json
+            on_disk = json.loads(p.read_text())
+            self.assertEqual(on_disk['groups']['999'], entry)
+
+    def test_inherits_parent_group_allowfrom(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "access.json"
+            p.write_text(json.dumps({
+                "dmPolicy": "pairing", "allowFrom": ["owner"],
+                "groups": {"parent-1": {"allowFrom": ["a", "b"]}},
+            }))
+            mutator = _thread_seed_mutator_factory("thread-1", "parent-1", "sender-x")
+            result = mutate_access_file(p, mutator)
+            self.assertIsNotNone(result)
+            _, _, entry, _ = result
+            self.assertEqual(entry, {'requireMention': False, 'allowFrom': ['a', 'b']})
+
+    def test_already_seeded_thread_is_a_noop(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "access.json"
+            existing = {"dmPolicy": "pairing", "allowFrom": ["owner"],
+                        "groups": {"thread-1": {"requireMention": False}}}
+            p.write_text(json.dumps(existing))
+            mutator = _thread_seed_mutator_factory("thread-1", None, "sender-x")
+            result = mutate_access_file(p, mutator)
+            self.assertIsNone(result, "an already-seeded thread must not be re-seeded")
+            self.assertEqual(json.loads(p.read_text()), existing, "file must be untouched on a no-op")
+
+    def test_seed_ok_false_is_a_noop(self):
+        """Multi-bot fleets: skip seeding when this bot wasn't addressed and a
+        sibling already owns the seed (#1823)."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "access.json"
+            mutator = _thread_seed_mutator_factory("thread-1", None, "sender-x", seed_ok=False)
+            result = mutate_access_file(p, mutator)
+            self.assertIsNone(result)
+            self.assertFalse(p.exists(), "a not-seed_ok pass over a missing file must not create one")
 
 
-class TestThreadEngageMissingAccessFile(unittest.TestCase):
+class TestThreadSeedLeavesCorruptFileUntouched(unittest.TestCase):
+    """Write-path regression (qingyun-wu, PR #3318 review): the mutator must
+    never even run against a PRESENT but corrupt access.json — mirrors the
+    absent-vs-corrupt contract every access_store writer shares."""
+
+    def test_corrupt_file_never_invokes_mutator_and_is_untouched(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "access.json"
+            corrupt_bytes = '{"allowFrom":["owner"'  # truncated/invalid JSON
+            p.write_text(corrupt_bytes)
+
+            called = []
+
+            def _spy_mutator(access_data):
+                called.append(True)
+                return access_data, "should never run"
+
+            result = mutate_access_file(p, _spy_mutator)
+            self.assertIsNone(result, "a corrupt file must yield None, same as an already-seeded no-op")
+            self.assertEqual(called, [], "the mutator must never be invoked against a corrupt file")
+            self.assertEqual(p.read_text(), corrupt_bytes, "a corrupt file's bytes must be untouched")
+
+
+class TestThreadEngageCallSiteWiredToSharedOwner(unittest.TestCase):
+    """Structural guard: the bridge's thread-engage block must route through
+    access_store.mutate_access_file (#3318) — not a hand-rolled read+write —
+    so a concurrent owner/tier/group update and a thread seed can't
+    lost-update each other."""
+
     def setUp(self):
         self.src = BRIDGE.read_text()
-        self.block = _extract_thread_engage_block(self.src)
-        self.assertTrue(
-            self.block, "couldn't locate the thread-engage block in discord-bridge.py"
-        )
-        self.fallback = _extract_read_fallback(self.block)
 
-    def test_read_has_its_own_except_clauses_ahead_of_seed_logic(self):
-        """The ACCESS_FILE read is wrapped in its OWN try/except (not merged
-        with the seed-logic try), and distinguishes FileNotFoundError
-        (genuinely absent) from any other read failure (present-but-corrupt)
-        — mirroring read_access_for_seed()'s absent-vs-corrupt contract."""
-        self.assertTrue(
-            self.fallback,
-            "the read (json.loads(ACCESS_FILE.read_text())) is not isolated "
-            "in its own try/except ahead of the seed-guard — a read failure "
-            "won't be distinguished from a missing file",
-        )
+    def test_imports_mutate_access_file(self):
         self.assertIn(
-            "except FileNotFoundError",
-            self.fallback,
-            "a genuinely missing file must be caught specifically, not lumped "
-            "in with every other read failure",
+            "from access_store import mutate_access_file, read_access_for_transaction",
+            self.src,
         )
+
+    def test_thread_engage_calls_mutate_access_file(self):
         self.assertIn(
-            "access_data = {}",
-            self.fallback,
-            "a genuinely missing file must default access_data to a fresh {} doc",
-        )
-        self.assertIn(
-            "access_data = None",
-            self.fallback,
-            "a present-but-unreadable file must NOT default to {} (that would "
-            "let the seed-write below erase it) — it must set access_data to "
-            "None so the seed-write guard skips it",
+            "seed_result = mutate_access_file(ACCESS_FILE, _thread_seed_mutator, backup=_backup_access_to_disk)",
+            self.src,
         )
 
-    def test_read_fallback_degrades_missing_file_to_empty_doc(self):
-        """Execute the EXACT extracted read+fallback lines from the shipped
-        file against a genuinely-missing ACCESS_FILE and confirm access_data
-        comes out as {} (seedable) rather than being left unset."""
-        self.assertTrue(self.fallback, "fallback slice missing — see prior test")
-        tmp = Path(tempfile.mkdtemp(prefix="dc-thread-engage-missing-")) / "access.json"
-        self.assertFalse(tmp.exists(), "precondition: file genuinely missing")
-        ns = {"json": json, "ACCESS_FILE": tmp}
-        exec(compile(textwrap.dedent(self.fallback), str(BRIDGE), "exec"), ns)
-        self.assertEqual(
-            ns.get("access_data"),
-            {},
-            "a missing access.json must degrade access_data to {}, not raise "
-            "or leave the name unset",
-        )
-
-    def test_read_fallback_leaves_corrupt_file_untouched(self):
-        """Write-path regression (qingyun-wu, PR #3318 review): execute the
-        EXACT extracted read+fallback lines against a PRESENT but corrupt
-        access.json and confirm (a) access_data comes out None, so the
-        seed-write guard below skips the write entirely, and (b) the file's
-        bytes on disk are byte-for-byte unchanged — a transient read error
-        must never erase allowFrom/tierMap/dmPolicy/existing groups."""
-        self.assertTrue(self.fallback, "fallback slice missing — see prior test")
-        tmp = Path(tempfile.mkdtemp(prefix="dc-thread-engage-corrupt-")) / "access.json"
-        corrupt_bytes = '{"allowFrom":["owner"'  # truncated/invalid JSON
-        tmp.write_text(corrupt_bytes)
-        ns = {"json": json, "ACCESS_FILE": tmp}
-        exec(compile(textwrap.dedent(self.fallback), str(BRIDGE), "exec"), ns)
-        self.assertIsNone(
-            ns.get("access_data"),
-            "a present-but-corrupt access.json must set access_data to None "
-            "(not {}) so the seed-write guard skips the write",
-        )
-        self.assertEqual(
-            tmp.read_text(),
-            corrupt_bytes,
-            "the read fallback itself must never write to ACCESS_FILE — bytes "
-            "on disk must be untouched after a corrupt read",
-        )
-
-    def test_seed_logic_gated_on_access_data_not_none(self):
-        """access_groups = access_data.setdefault(...) must be reachable only
-        inside `if access_data is not None:` — i.e. AFTER and GATED BY the
-        read fallback, so a corrupt-file None never reaches the seed-write."""
-        idx_guard = self.block.find(_SEED_GUARD_MARKER.strip())
-        idx_seed = self.block.find("access_groups = access_data.setdefault")
-        self.assertNotEqual(idx_guard, -1, "expected seed guard `if access_data is not None:` not found")
-        self.assertNotEqual(idx_seed, -1, "expected seed-logic line not found")
-        self.assertLess(
-            idx_guard,
-            idx_seed,
-            "seed logic must be gated by `if access_data is not None:`, not "
-            "reachable unconditionally after the read fallback",
-        )
+    def test_no_hand_rolled_read_or_write_remains(self):
+        start = self.src.find("if isinstance(message.channel, discord.Thread):")
+        end = self.src.find("seed_result = mutate_access_file(ACCESS_FILE, _thread_seed_mutator", start)
+        self.assertNotEqual(start, -1)
+        self.assertNotEqual(end, -1)
+        block = self.src[start:end]
+        self.assertNotIn("json.loads(ACCESS_FILE.read_text())", block,
+                         "the thread-engage block must not hand-roll its own read — "
+                         "that was the source of the absent-vs-corrupt conflation bug")
+        self.assertNotIn("ACCESS_FILE.write_text(", block)
 
 
 if __name__ == "__main__":

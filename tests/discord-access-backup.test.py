@@ -348,11 +348,13 @@ class TestWiredIntoBridge(unittest.TestCase):
         )
 
     def test_backup_called_at_write_sites(self):
-        # Every atomic access.json write-back should mirror a durable backup.
+        # Every atomic write-back mirrors a durable backup, passed BY REFERENCE
+        # (backup=_backup_access_to_disk) to the shared mutator, not called direct.
+        self.assertIn("def _backup_access_to_disk(", self.src, "missing helper def")
         self.assertGreaterEqual(
-            self.src.count("_backup_access_to_disk("), 4,
-            "expected _backup_access_to_disk wired at the tier-map seed, thread-engage, "
-            "and pairing write sites (+ the helper def)")
+            self.src.count("backup=_backup_access_to_disk"), 3,
+            "expected _backup_access_to_disk wired by reference at the "
+            "tier-map seed, thread-engage, and pairing write sites")
 
 
 if __name__ == "__main__":
