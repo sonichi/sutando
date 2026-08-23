@@ -49,6 +49,13 @@ def is_delivered(results_dir: Path, task_id: str,
     return False
 
 
+def is_parked(results_dir: Path, task_id: str) -> bool:
+    """PARKED is terminal for the bridge: the disposition is already durable
+    in the outbox, so the caller archives the result pair instead of looping."""
+    root = result_backend(results_dir).root
+    return outbox.item_status(root, task_id) == "PARKED"
+
+
 def claim_for_send(results_dir: Path, task_id: str) -> Optional[ClaimToken]:
     """Publish (one-slot, idempotent) then claim. None = someone else holds
     it or it just completed — the caller skips this pass, never re-sends."""

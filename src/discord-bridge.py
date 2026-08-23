@@ -4853,9 +4853,15 @@ async def poll_results():
                     print(f"  Skipped (already delivered per outbox/sentinel): {task_id}", flush=True)
                     _archive_delivered_pair(result_file, task_id)
                     continue
+                if _drd.is_parked(RESULTS_DIR, task_id):
+                    # terminal park recorded but a crash preceded the archive:
+                    # finish the archive now so the pair cannot loop forever
+                    print(f"  Parked (terminal) — archiving: {task_id}", flush=True)
+                    _archive_delivered_pair(result_file, task_id)
+                    continue
                 _send_tok = _drd.claim_for_send(RESULTS_DIR, task_id)
                 if _send_tok is None:
-                    # parked, or another incarnation holds the claim right now
+                    # another incarnation holds the claim right now
                     continue
 
                 try:

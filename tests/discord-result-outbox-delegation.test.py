@@ -125,6 +125,20 @@ with tempfile.TemporaryDirectory() as td:
 
 # ── wiring: the bridge delegates at its choke points ───────────────────────
 src = (REPO / "src" / "discord-bridge.py").read_text()
+with tempfile.TemporaryDirectory() as td:
+    rd = Path(td) / "results"
+    rd.mkdir()
+    # crash window: parked (terminal) but the archive never ran. On restart
+    # the caller must be able to detect PARKED and archive — not loop.
+    tok = drd.claim_for_send(rd, "task-P")
+    drd.failed_terminal(rd, tok)
+    check(drd.is_parked(rd, "task-P"), "parked item: is_parked True")
+    check(drd.claim_for_send(rd, "task-P") is None,
+          "parked item: claim_for_send still refuses")
+    check(not drd.is_delivered(rd, "task-P"),
+          "parked is not conflated with delivered")
+    check(not drd.is_parked(rd, "task-F"), "fresh item: is_parked False")
+
 tree = ast.parse(src)
 # Attribute ACCESSES, not just direct-call funcs: the failure path calls
 # through a conditional expression ((_drd.a if x else _drd.b)(...)).
@@ -133,8 +147,12 @@ for node in ast.walk(tree):
     if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
             and node.value.id == "_drd"):
         calls.add(node.attr)
-for fn in ("is_delivered", "claim_for_send", "confirm", "unknown", "failed_terminal"):
+for fn in ("is_delivered", "is_parked", "claim_for_send", "confirm", "unknown", "failed_terminal"):
     check(fn in calls, f"bridge calls _drd.{fn}() (delegation wired)")
+import re as _re
+m = _re.search(r"is_parked\(RESULTS_DIR, task_id\):\n(.*?)continue", src, _re.S)
+check(bool(m) and "_archive_delivered_pair" in m.group(1),
+      "bridge archives the pair inside the is_parked branch")
 mark_calls = [n for n in ast.walk(tree)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
               and n.func.id == "_mark_delivered"]
