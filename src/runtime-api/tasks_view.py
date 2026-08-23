@@ -81,7 +81,8 @@ class TasksView:
         # fail-open so a stamping error costs the stamp, never the submit.
         try:
             import sys as _sys
-            _src = str(Path(__file__).resolve().parent.parent)
+            # CODE-tree (src/) for imports — not workspace resolution
+            _src = str(Path(__file__).resolve().parents[1])
             if _src not in _sys.path:
                 _sys.path.insert(0, _src)
             from task_envelope import stamp_text
