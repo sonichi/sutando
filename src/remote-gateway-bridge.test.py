@@ -736,11 +736,14 @@ def main() -> int:
           and "sk-live" not in (_posted[0].get("body") or ""),
           "team deduped with out-of-grammar extra is withheld, not re-posted")
     import team_result_guard as _guard
-    check(_guard.suppression_stub_for_tier("[deduped: task-abc_123]", "team")
-          == "[deduped: task-abc_123]",
-          "in-grammar deduped body reconstructs the exact marker line")
-    check(_guard.suppression_stub_for_tier("[future-marker]", "team") is None,
-          "unknown skip marker yields no stub (guard path, not [no-send])")
+    # suppression_stub_for_tier was replaced by is_suppression_only: the guard
+    # classifies and journals, it no longer reconstructs a stub to close with.
+    check(_guard.is_suppression_only("[deduped: task-abc_123]"),
+          "in-grammar deduped body classifies as suppression-only")
+    check(not _guard.is_suppression_only("[future-marker]"),
+          "unknown marker is not suppression (guard path, not [no-send])")
+    check(not hasattr(_guard, "suppression_stub_for_tier"),
+          "the retired stub API is gone from the module")
 
     # DeliveryCore wiring, proven by side effects only the seam produces:
     # outbox attempt accounting + UNKNOWN resolved by the idempotent re-send.
