@@ -122,9 +122,8 @@ class ClaimTaskTests(unittest.TestCase):
         self.assertEqual(b.name, "task-b.claimed-core-2.txt")
 
     def test_validation_rejects_path_traversal(self):
-        # A hostile task_id with `/` or `..` must NOT be allowed to escape
-        # the tasks/ dir. Regression guard for the CodeQL py/path-injection
-        # class; same sanitizer shape as the bridges' file-attach allowlist.
+        # hostile task_id with / or .. must not escape tasks/
+        # (py/path-injection class; same shape as the attach allowlist)
         for bad in ["../etc", "a/b", "..", ".", "", ".dotfile"]:
             with self.assertRaises(ValueError, msg=f"should reject {bad!r}"):
                 claim(bad, "1", workspace=self.ws)
@@ -138,9 +137,7 @@ class ClaimTaskTests(unittest.TestCase):
         self.assertIsNotNone(result)
 
 
-# ---------------------------------------------------------------------------
 # Channel-affinity tests (#884)
-# ---------------------------------------------------------------------------
 
 from claim_task import claim_with_affinity, ALIVE_THRESHOLD_SEC  # noqa: E402
 

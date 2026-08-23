@@ -73,9 +73,9 @@ class PoolLeadTests(unittest.TestCase):
         self.clock[0] += AFFINITY_IDLE_S + 1
         self._task("task-c2.txt", channel="C123")
         second = dict(self.lead.sweep())["task-c2.txt"]
-        self.assertIn(second, self.alive)  # re-picked by load, not pinned
-        # not asserting inequality: rebalance may legitimately re-pick the
-        # same core when it is least-loaded; the STICKINESS must be gone
+        self.assertIn(second, self.alive)
+        # no inequality assert: a rebalance may re-pick the same core by
+        # load; only the stickiness must be gone
         row = self.lead._load_affinity()["C123"]
         self.assertEqual(row["ts"], self.clock[0])
 

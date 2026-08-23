@@ -95,16 +95,13 @@ def claim(task_id: str, core_id: str, workspace: Path | None = None) -> Path | N
     except FileNotFoundError:
         return None
     except OSError:
-        # Could be EXDEV (cross-device) or permission; treat as lost-race
-        # and surface the underlying error to stderr for diagnosis without
-        # raising — the caller's contract is "won or lost", not "won or threw".
+        # EXDEV/permission = lost-race; the contract is "won or lost",
+        # never "threw"
         return None
 
 
-# ---------------------------------------------------------------------------
-# Channel-affinity layer (#884). Adds sticky-handler semantics on top of the
-# plain `claim()` primitive. Only invoked when caller passes channel_id.
-# ---------------------------------------------------------------------------
+# Channel-affinity layer (#884): sticky-handler semantics over plain
+# claim(); only invoked when the caller passes channel_id.
 
 DEFAULT_IDLE_THRESHOLD_SEC = 30 * 60   # 30 min — chat-pattern cohesion
 ALIVE_THRESHOLD_SEC = 90               # 3 missed 30s heartbeats = dead
