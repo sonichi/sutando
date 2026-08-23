@@ -119,6 +119,7 @@ PORT = 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -180,13 +181,15 @@ def _task_display_fields_for_id(task_id: str) -> tuple[str, str]:
         return "", ""
     try:
         return _task_display_fields(task_file.read_text())
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Same pair readiness.py catches: a partial write mid-character raises
+        # UnicodeDecodeError, which is a ValueError and escapes bare OSError.
         return "", ""
 
 
 def _remember_done_result_file(result_file: Path) -> None:
     task_id = result_file.stem
-    result_content = result_file.read_text().strip()
+    result_content = read_ready_result(result_file) or ""
     task_line, source_line = _task_display_fields_for_id(task_id)
     display_text = task_line or (result_content.split('\n')[0][:80] if result_content else task_id)
 
@@ -347,7 +350,8 @@ def _active_task_rows() -> list[dict]:
         reverse=True,
     )[:10]:
         task_id = task_file.stem
-        content = task_file.read_text()
+        # Freshest-first over a dir a bridge is writing: never decode strictly.
+        content = task_file.read_text(errors="replace")
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
@@ -363,13 +367,13 @@ def _active_task_rows() -> list[dict]:
                 break
         if result_file.exists():
             status = "done"
-            result_text = result_file.read_text().strip()
+            result_text = read_ready_result(result_file) or ""
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
         elif archived_file is not None:
             status = "done"
-            result_text = archived_file.read_text().strip()
+            result_text = read_ready_result(archived_file) or ""
         else:
             status = "working"
             result_text = ""
@@ -400,7 +404,7 @@ def _active_task_rows() -> list[dict]:
         result_file = RESULT_DIR / f"{task_id}.txt"
         if result_file.exists():
             task_data["status"] = "done"
-            task_data["result"] = result_file.read_text().strip()
+            task_data["result"] = read_ready_result(result_file) or ""
         elif not task_file.exists() and _time.time() - task_data.get("time", 0) > 300:
             stale_ids.append(task_id)
     for task_id in stale_ids:
@@ -603,8 +607,12 @@ def delegation_archive_result(data: dict):
 def get_task_result(task_id: str):
     """Check if a task result exists."""
     result_file = _safe_path(RESULT_DIR, task_id)
-    if result_file and result_file.exists():
-        return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
+    if result_file:
+        # Readiness, not existence: a body read mid-write decodes fatally, and
+        # "not ready yet" is the pending answer two branches down.
+        body = read_ready_result(result_file)
+        if body is not None:
+            return {"task_id": _safe_id(task_id), "status": "completed", "result": body}
     # Check archive — task-bridge archives results within seconds of delivery,
     # so direct /result polls often arrive after the file has been moved.
     safe_id = _safe_id(task_id)
@@ -612,8 +620,9 @@ def get_task_result(task_id: str):
         filename = f"{safe_id}.txt"
         for month_dir in sorted((RESULT_DIR / "archive").glob("*/"), reverse=True):
             candidate = month_dir / filename
-            if candidate.exists():
-                return {"task_id": safe_id, "status": "completed", "result": candidate.read_text()}
+            body = read_ready_result(candidate)
+            if body is not None:
+                return {"task_id": safe_id, "status": "completed", "result": body}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}

@@ -101,7 +101,8 @@ def analyze_task_patterns():
     task_files = sorted(RESULTS_DIR.glob("task-*.txt"), key=lambda f: f.stat().st_mtime, reverse=True)
     sources = Counter()
     for f in task_files[:50]:
-        content = f.read_text()
+        # Freshest-first over a dir the core is writing: never decode strictly.
+        content = f.read_text(errors="replace")
         if "discord" in content.lower():
             sources["Discord"] += 1
         elif "telegram" in content.lower():
