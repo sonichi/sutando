@@ -43,8 +43,9 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
-                               proactive_destination, should_claim_proactive)
+from proactive_routing import (BRIDGE_CHANNELS, MATRIX_TARGET_RE,  # noqa: E402
+                               body_target_channel, proactive_destination,
+                               should_claim_proactive)
 from delivery.readiness import read_ready_result  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
@@ -223,6 +224,10 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
+# Executable-target rule = the SHARED classifier's Matrix rule (ids + aliases);
+# a private '!'-only copy stranded alias-directed bodies (alias deadlock).
+_MATRIX_ROOM_RE = MATRIX_TARGET_RE
+
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

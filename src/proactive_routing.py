@@ -173,9 +173,13 @@ def fallback_claims_name(name, this_channel: str) -> bool:
 
 # Discord snowflake / Matrix room-or-alias / Slack channel id. Anchored whole:
 # a substring match would classify `#room:server` off its leading character.
+# ONE owner of "what is a Matrix target" (ids AND aliases) — the gateway
+# sink binds this object, so classifier and sender cannot disagree.
+MATRIX_TARGET_RE = re.compile(r"[!#][^\s:]+:[^\s:]+\Z")
+
 _TARGET_KINDS = (
     ("discord", re.compile(r"\d{17,20}\Z")),
-    ("ag2space", re.compile(r"[!#][^\s:]+:[^\s:]+\Z")),
+    ("ag2space", MATRIX_TARGET_RE),
     ("slack", re.compile(r"[CDG][A-Z0-9]{6,}\Z")),
 )
 

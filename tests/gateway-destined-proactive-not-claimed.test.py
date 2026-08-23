@@ -91,6 +91,10 @@ sdir.mkdir(parents=True)
 (rdir / "proactive-000.txt").write_bytes(b"\x80\x81 truncated multibyte")
 (rdir / "proactive-100.txt").write_text("undestined control body")
 (rdir / "proactive-101.to-discord.txt").write_text("discord destined body")
+# alias-directed body: the classifier and the executable-target rule must
+# AGREE it is ours (the '#' no-claim deadlock kewei reproduced)
+(rdir / "proactive-102.txt").write_text(
+    "[channel: #alias-probe:example.org]\nalias directed body")
 
 env = dict(os.environ)
 env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": tmp,
@@ -128,6 +132,10 @@ try:
         bodies = [p.get("body", "") for p in STATE["room_posts"]]
     check(not any("discord destined body" in b for b in bodies),
           "destined .to-discord body never reaches the gateway's room")
+    check(any("alias directed body" in b for b in bodies),
+          "alias-directed body IS delivered by the gateway (no strand)")
+    check(not (rdir / "proactive-102.txt").exists(),
+          "alias-directed file is consumed after delivery")
     check((rdir / "proactive-101.to-discord.txt").exists(),
           "destined file remains on disk under its original name")
     check((rdir / "proactive-000.txt").exists(),
