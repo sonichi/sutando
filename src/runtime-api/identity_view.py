@@ -115,8 +115,14 @@ class IdentityView:
         # Reverse index over EntranceLink records. Ambiguity is a loud,
         # structured error — never auto-pick between Stands.
         sid = subject.rsplit(":", 1)[-1].strip()
+        links, store_corrupt = self._links_store()
+        if store_corrupt:
+            # fail loud: "unresolved because unreadable" is a different claim
+            # from "no such binding" and callers must not conflate them
+            return {"resolved": False, "store_corrupt": True,
+                    "provider": provider, "subject": subject}
         hits = []
-        for lk in self._all_links():
+        for lk in links:
             if lk.get("provider") != provider or lk.get("status") != "active":
                 continue
             subj = lk.get("provider_subject") or {}
@@ -142,13 +148,20 @@ class IdentityView:
                          "status": lk.get("status"),
                          "verification": lk.get("verification")}}
 
-    def _all_links(self) -> list:
+    def _links_store(self) -> "tuple[list, bool]":
+        # (links, corrupt): an absent store is empty, but a present-yet-
+        # unparseable one must surface as corruption, never as "no links".
+        path = self.state_dir / "auth" / "entrance-links.json"
+        if not path.is_file():
+            return [], False
         try:
-            data = json.loads(
-                (self.state_dir / "auth" / "entrance-links.json").read_text())
-            return data if isinstance(data, list) else []
+            data = json.loads(path.read_text())
         except (OSError, ValueError):
-            return []
+            return [], True
+        return (data, False) if isinstance(data, list) else ([], True)
+
+    def _all_links(self) -> list:
+        return self._links_store()[0]
 
     # ── sutando.entrances ───────────────────────────────────────────────────
     def entrances(self, details: bool = False) -> dict:
@@ -164,7 +177,10 @@ class IdentityView:
 
     def _entrance(self, d: Path, details: bool = False) -> dict:
         ent: dict = {"provider": d.name}
-        link = self._active_link(d.name)
+        links, store_corrupt = self._links_store()
+        link = next((lk for lk in links
+                     if lk.get("provider") == d.name
+                     and lk.get("status") == "active"), None)
         evidence: dict = {}
         env = d / ".env"
         if env.is_file():
@@ -183,7 +199,12 @@ class IdentityView:
             enrolled = self._enrolled()
             if enrolled.get("agent_id"):
                 evidence["subject_evidence"] = enrolled["agent_id"]
-        if policy_invalid:
+        if store_corrupt:
+            # a broken links store must not read as "no binding" — that would
+            # silently demote an authorized channel to configured_unverified
+            ent["status"] = "policy_invalid"
+            ent["policy_error"] = "entrance-links store unreadable"
+        elif policy_invalid:
             ent["status"] = "policy_invalid"
         elif link:
             # introspection proves credential->subject; ONLY an explicit

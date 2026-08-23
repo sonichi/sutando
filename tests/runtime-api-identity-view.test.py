@@ -462,6 +462,32 @@ class TestAuthorityBoundaries(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 fn()
 
+    def test_corrupt_store_surfaces_policy_invalid_never_no_links(self):
+        # a present-but-unreadable store must never read as "no binding"
+        self._enroll()
+        self._verify()
+        store = self.state / "auth" / "entrance-links.json"
+        store.write_text("{not json")
+        (self.channels / "discord").mkdir(parents=True, exist_ok=True)
+        v = _mk(self.state, self.channels)
+        ents = {e["provider"]: e for e in v.entrances()["channels"]}
+        self.assertEqual(ents["discord"]["status"], "policy_invalid")
+        self.assertIn("unreadable", ents["discord"]["policy_error"])
+        r = v.resolve("discord", "123")
+        self.assertFalse(r["resolved"])
+        self.assertTrue(r.get("store_corrupt"))
+        # mutations refuse rather than rebuilding the store empty
+        for fn in (lambda: self._verify(),
+                   lambda: self.el.authorize_link(self.state, "discord", "@o:x"),
+                   lambda: self.el.revoke_link(self.state, "discord", "@o:x")):
+            with self.assertRaises(ValueError):
+                fn()
+        self.assertEqual(store.read_text(), "{not json")  # untouched
+        # non-list shape is corruption too, not an empty store
+        store.write_text('{"links": []}')
+        with self.assertRaises(ValueError):
+            self.el.revoke_link(self.state, "discord", "@o:x")
+
     def test_cross_stand_authorization_refused(self):
         self._enroll()
         self._verify()

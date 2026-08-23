@@ -33,6 +33,25 @@ def load_links(state_dir: str | Path) -> list:
         return []
 
 
+def _load_links_for_mutation(state_dir: str | Path) -> list:
+    # A mutation over a corrupt store would rebuild it empty, silently
+    # destroying every prior binding record — refuse instead.
+    path = links_path(state_dir)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except ValueError as e:
+        raise ValueError(
+            f"entrance-links store unreadable ({e}) — refusing to mutate; "
+            "repair or move the file first") from e
+    if not isinstance(data, list):
+        raise ValueError(
+            "entrance-links store is not a list — refusing to mutate; "
+            "repair or move the file first")
+    return data
+
+
 def active_link(state_dir: str | Path, provider: str) -> "dict | None":
     for link in load_links(state_dir):
         if link.get("provider") == provider and link.get("status") == "active":
@@ -78,7 +97,7 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
     # UNIQUE(provider, canonical subject): an active link for the provider is
     # replaced only by the SAME subject; a different subject must be explicit.
     stand_id = require_resolved_identity(state_dir)
-    links = load_links(state_dir)
+    links = _load_links_for_mutation(state_dir)
     existing = [l for l in links
                 if l.get("provider") == provider and l.get("status") == "active"]
     for l in existing:
@@ -112,7 +131,7 @@ def authorize_link(state_dir: str | Path, provider: str,
     """Explicit owner authorization: the act that turns a verified link into
     an active Stand binding. Never called automatically."""
     stand_id = require_resolved_identity(state_dir)
-    links = load_links(state_dir)
+    links = _load_links_for_mutation(state_dir)
     for lk in links:
         if lk.get("provider") != provider or lk.get("status") != "active":
             continue
@@ -139,7 +158,7 @@ def revoke_link(state_dir: str | Path, provider: str, revoked_by: str,
                 reason: "str | None" = None) -> dict:
     """Revocation is layered: kills THIS binding only, never the Stand."""
     require_resolved_identity(state_dir)
-    links = load_links(state_dir)
+    links = _load_links_for_mutation(state_dir)
     for lk in links:
         if lk.get("provider") == provider and lk.get("status") == "active":
             now = datetime.now(timezone.utc).isoformat(timespec="seconds")
