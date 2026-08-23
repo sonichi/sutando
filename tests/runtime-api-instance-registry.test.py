@@ -127,6 +127,29 @@ class InstanceRegistryTests(unittest.TestCase):
         self.assertEqual(out["state"], "started")
         self.assertEqual(reg.read_desired_state("a1")["desired_state"], "running")
 
+    def test_start_exports_manifest_instance_id_not_agent_id(self):
+        # divergent ids: the manifest's instance_id must win (identity-drift fix)
+        sock = Path(self.tmp.name) / "run" / "rt.sock"
+        launcher = self._touch_launcher()
+        reg.write_manifest("agent-A", endpoint=str(sock), instance="inst-B",
+                           launcher={"type": "process", "executable": str(launcher),
+                                     "args": [], "working_directory": self.tmp.name})
+        captured = {}
+        import subprocess as _sp
+        orig = _sp.Popen
+        def spy(*a, **kw):
+            captured.update(kw.get("env") or {})
+            return orig(*a, **kw)
+        _sp.Popen = spy
+        try:
+            reg.start_instance("agent-A", wait_s=1,
+                               _ready=lambda m: {"attachable": False, "stage": "x"})
+        except Exception:
+            pass
+        finally:
+            _sp.Popen = orig
+        self.assertEqual(captured.get("SUTANDO_INSTANCE_ID"), "inst-B")
+
     def test_start_idempotent_when_already_attachable(self):
         sock = Path(self.tmp.name) / "run" / "rt.sock"
         reg.write_manifest("a1", endpoint=str(sock),

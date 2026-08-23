@@ -255,3 +255,37 @@ class DispatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TraversalGuardTests(unittest.TestCase):
+    """Client task ids are confined to the task namespace (P1 fix)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        (root / "tasks").mkdir(); (root / "results").mkdir()
+        (root / "state").mkdir()
+        (root / "state" / "secret.txt").write_text("SENTINEL")
+        self.view = TasksView(root / "tasks", root / "results", "@me:x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_get_result_traversal_reads_as_absent(self):
+        # the exact reported repro: ../state/secret must NOT read the sibling
+        out = self.view.get_result("../state/secret")
+        blob = str(out)
+        self.assertNotIn("SENTINEL", blob)
+
+    def test_hostile_ids_absent_on_every_entry_point(self):
+        for tid in ("../state/secret", "task-a/../../b", "/etc/passwd",
+                    "task-a/../b", "", None, "task-a\x00b"):
+            self.assertNotIn("SENTINEL", str(self.view.get_result(tid)))
+            self.assertEqual(self.view.status(tid)["state"], "not_found")
+            self.assertIsNone(self.view.details(tid))
+            self.assertFalse(self.view.cancel(tid).get("ok"))
+
+    def test_legit_ids_still_resolve(self):
+        (Path(self.tmp.name) / "results" / "task-rtapi-abc12.txt").write_text("hi")
+        out = self.view.get_result("task-rtapi-abc12")
+        self.assertIn("hi", str(out))

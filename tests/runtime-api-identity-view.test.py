@@ -8,6 +8,8 @@ access.json files. Ownership is never inferred from an allowlist entry.
 Run: python3 tests/runtime-api-identity-view.test.py
 Exit: 0 on pass, 1 on fail.
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import os

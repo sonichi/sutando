@@ -272,7 +272,8 @@ def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> di
         if _ready(m).get("attachable"):
             return {"ok": True, "state": "already_running", "endpoint": endpoint}
 
-        env = {**os.environ, "SUTANDO_INSTANCE_ID": agent_id}
+        env = {**os.environ,
+               "SUTANDO_INSTANCE_ID": m.get("instance_id") or agent_id}
         rt = m.get("runtime") or {}
         for var, val in (("SUTANDO_RUNTIME_SOCKET", endpoint),
                          ("SUTANDO_TMUX_SOCKET", rt.get("tmux_socket")),

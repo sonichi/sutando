@@ -46,6 +46,18 @@ _WAITING_STATE = {"elicitation": "waiting_for_input",
                   "human_action": "waiting_for_human_action"}
 
 
+_SAFE_TASK_ID = __import__("re").compile(r"\Atask-[A-Za-z0-9._-]+\Z")
+
+
+def _checked_task_id(task_id) -> "str | None":
+    """Confine client-supplied ids to the task namespace: no separators, no
+    traversal — a hostile id must read as absent, never as a path."""
+    tid = str(task_id or "")
+    if ".." in tid or not _SAFE_TASK_ID.fullmatch(tid):
+        return None
+    return tid
+
+
 class TasksView:
     def __init__(self, tasks_dir: str | Path, results_dir: str | Path,
                  actor_id: str, hitl_lookup=None, instance: str | None = None):
@@ -97,6 +109,8 @@ class TasksView:
 
     # ── task.status ─────────────────────────────────────────────────────────
     def status(self, task_id: str) -> dict:
+        if _checked_task_id(task_id) is None:
+            return {"state": "not_found"}
         result = self._result_path(task_id)
         if result is not None:
             return {"taskId": task_id, "state": "done"}
@@ -169,6 +183,8 @@ class TasksView:
 
     # ── task.details ────────────────────────────────────────────────────────
     def details(self, task_id: str) -> dict | None:
+        if _checked_task_id(task_id) is None:
+            return None
         p = (find_task_file(self.tasks_dir, task_id)
              or find_archived_task(self.tasks_dir, task_id))
         if p is None:
@@ -217,6 +233,8 @@ class TasksView:
         """Cancellation is a SIGNAL through the same pipeline (the documented
         CANCEL_INSTRUCTION mechanism) — the consumer decides whether the task
         is still cancellable; this never deletes files out from under it."""
+        if _checked_task_id(task_id) is None:
+            return {"ok": False, "error": "unknown task id"}
         st = self.status(task_id)["state"]
         if st == "unknown":
             raise ValueError(f"unknown task: {task_id}")
@@ -246,6 +264,8 @@ class TasksView:
                 "requests": [_WAITING_STATE[t] for t in types]}
 
     def _result_path(self, task_id: str) -> Path | None:
+        if _checked_task_id(task_id) is None:
+            return None
         for p in (self.results_dir / f"{task_id}.txt",
                   self.results_dir / "archive" / f"{task_id}.txt"):
             if p.is_file():
