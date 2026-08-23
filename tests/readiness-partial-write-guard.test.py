@@ -98,8 +98,7 @@ def test_archive_poll_degrades_to_pending():
         except UnicodeDecodeError as e:
             check(False, f"/result archive leg RAISED {type(e).__name__}")
 
-        # positive control for the archive leg: a COMPLETE archived body must
-        # still complete. Without this the torn case alone leaves the success
+        # Positive control: without it the torn case alone leaves the success
         # return unexercised, and "always pending" would pass.
         (arch / "task-2.txt").write_text(BODY)
         r = api.get_task_result("task-2")
