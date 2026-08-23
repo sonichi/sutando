@@ -149,7 +149,9 @@ def should_claim_proactive_file(name, state_file_path: Path,
     if body_reader is not None:
         try:
             body = body_reader()
-        except OSError:
+        # readiness.read_ready_result's tuple: unreadable includes a partial
+        # write mid-character, not only a missing or permission-denied file
+        except (OSError, UnicodeDecodeError):
             body = None
         if body:
             kind = body_target_channel(body)

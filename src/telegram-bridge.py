@@ -1084,7 +1084,7 @@ def main():  # pragma: no cover
                     # discord's DM fallback stays the after-grace catch-all.
                     return should_claim_proactive_file(
                         name, OWNER_ACTIVITY_FILE, "telegram",
-                        body_reader=lambda _n=name: (RESULTS_DIR / _n).read_text())
+                        body_reader=lambda _n=name: read_ready_result(RESULTS_DIR / _n))
 
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
