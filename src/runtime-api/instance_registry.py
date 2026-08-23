@@ -29,6 +29,8 @@ _SAFE_ID = re.compile(r"[^A-Za-z0-9._@:-]+")
 
 
 def registry_dir() -> Path:
+    # DELIBERATELY outside the workspace: discovery must work BEFORE any
+    # workspace is known — each manifest names its own. Don't "fix" this back.
     env = os.environ.get("SUTANDO_INSTANCE_REGISTRY")
     if env:
         return Path(env)
