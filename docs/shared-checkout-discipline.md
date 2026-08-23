@@ -74,6 +74,33 @@ startup, a resolved TypeScript module graph, a skill manifest folded into a tool
 table. Editing the file does not change what such a process runs; restarting it
 does.
 
+### The inverse: the tree is a pending deploy
+
+The three rules above cover reading the tree and writing it, and the corollary
+covers a process that no longer matches its file. There is a fourth direction
+with no read, no write, and no stale process involved: **changing the tree
+changes what the next restart will load.**
+
+A checkout parked on a non-default ref is a pending deploy of that ref for every
+supervised service that can restart itself. Nothing needs to go wrong for the
+hazard to exist — a `KeepAlive=true` service that crashes during the window comes
+back on whatever the tree holds, and no one issued a deploy.
+
+This repo already ships a detector for it. `health-check.py` warns when the live
+checkout is off the default branch, citing a host that spent four days serving a
+PR branch from a checkout nobody remembered parking there:
+
+```
+live checkout is on branch 'feat/...', expected 'main' — bridges/core
+auto-restart onto this checkout, so a leftover PR-branch checkout ships
+stale/unreviewed code
+```
+
+So: park the shared checkout on a non-default ref only for as long as you are
+watching it, and treat the warn as a deploy notice rather than branch-hygiene
+nagging. Author PRs in worktrees, which have no supervised service pointed at
+them.
+
 ## Evidence
 
 All three incidents occurred on 2026-08-23 in one checkout shared by concurrent
