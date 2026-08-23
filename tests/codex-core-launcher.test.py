@@ -6,6 +6,7 @@ import shutil
 import signal
 import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -170,6 +171,7 @@ exit 0
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
             str(self.root / "src/agent/codex/cli/task-notifier.sh"),
             str(self.root / "src/watch-tasks-stream.sh"),
+            str(self.root / "scripts/python-binary.sh"),
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,
                                   check=True, text=False).stdout.decode().split()
@@ -192,6 +194,7 @@ exit 0
             "SCHEDULER_LOG": str(Path(self.tmp.name) / "scheduler.log"),
             "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
             "SUTANDO_HOST_LABEL": "test-host",
+            "SUTANDO_PY": sys.executable,
         })
         env.update(env_extra or {})
         result = subprocess.run(
@@ -217,6 +220,7 @@ exit 0
             "HEARTBEAT_LOG": str(Path(self.tmp.name) / "heartbeat.log"),
             "HEARTBEAT_PID": str(Path(self.tmp.name) / "heartbeat.pid"),
             "SUTANDO_HOST_LABEL": "test-host",
+            "SUTANDO_PY": sys.executable,
         })
         env.update(env_extra or {})
         master, slave = pty.openpty()
@@ -276,6 +280,7 @@ exit 0
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertIn("task-notifier-supervisor.sh", calls)
         self.assertIn("SUTANDO_NOTIFIER_VERSION=", calls)
+        self.assertIn(f"-e SUTANDO_PY={sys.executable}", calls)
         self.assertIn("CODEX_HOME=", calls)
         self.assertIn("-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0", calls)
         self.assertIn("has-session -t =sutando-core", calls)
@@ -687,6 +692,36 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text() if self.log.exists() else ""
         self.assertNotIn("send-keys", calls)
+
+    def test_notifier_uses_resolved_python_when_bare_python_cannot_run(self):
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        (workspace / "results").mkdir(exist_ok=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (workspace / "results" / "task-done.txt").write_text("already complete\n")
+        bare_python_called = Path(self.tmp.name) / "bare-python-called"
+        self._write_exe("python3", f'''#!/bin/bash
+touch "{bare_python_called}"
+exit 127
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            SUTANDO_PY=sys.executable,
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(
+            ["/bin/bash", str(script), "--event", "task-done.txt"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(bare_python_called.exists())
+        self.assertNotIn("send-keys", self.log.read_text() if self.log.exists() else "")
 
     def test_notifier_ready_result_ignores_stale_fallback_cleanup_failure(self):
         workspace = self.root / "workspace"

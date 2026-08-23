@@ -3,6 +3,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+. "$REPO/scripts/python-binary.sh"
+PY="$(require_python "$REPO" "run the Codex task notifier")" || exit 1
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
@@ -80,7 +82,7 @@ prepare_workstream_context() {
   [ -f "$WORKSTREAM_CONTEXT_SCRIPT" ] || return 0
   candidate="$(mktemp "${TMPDIR:-/tmp}/sutando-workstream-context.XXXXXX")" || return 0
   chmod 600 "$candidate" 2>/dev/null || true
-  if python3 "$WORKSTREAM_CONTEXT_SCRIPT" context "$filename" > "$candidate" 2>/dev/null; then
+  if "$PY" "$WORKSTREAM_CONTEXT_SCRIPT" context "$filename" > "$candidate" 2>/dev/null; then
     if [ -s "$candidate" ]; then
       workstream_context_file="$candidate"
     else
@@ -95,7 +97,7 @@ prepare_workstream_context() {
 has_result() {
   local filename="$1" task_id
   task_id="${filename%.txt}"
-  if ! python3 - "$REPO/src" "$RESULTS_DIR" "$task_id" <<'PY' 2>/dev/null
+  if ! "$PY" - "$REPO/src" "$RESULTS_DIR" "$task_id" <<'PY' 2>/dev/null
 import pathlib, sys
 sys.path.insert(0, sys.argv[1])
 from local_task_protocol import find_result
@@ -177,7 +179,7 @@ next_pending_task() {
     printf '%s\n' "$candidate"
     return 0
   done < <(
-    python3 - "$REPO/src" "$TASKS_DIR" <<'PY'
+    "$PY" - "$REPO/src" "$TASKS_DIR" <<'PY'
 import sys
 from pathlib import Path
 
@@ -258,7 +260,7 @@ fi
 
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
-python3 -c \
+"$PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!

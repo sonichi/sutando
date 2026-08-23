@@ -4,6 +4,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
+. "$REPO/scripts/python-binary.sh"
+PY="$(require_python "$REPO" "start the Codex core")" || exit 1
+export SUTANDO_PY="$PY"
 
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
@@ -89,6 +92,7 @@ if [ -x "$ROOM_SESSION_HANDLER" ]; then
 fi
 
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
+CORE_ENV_ARGS+=(-e "SUTANDO_PY=$PY")
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
 [ -n "${CODEX_HOME:-}" ] && CORE_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
 # tmux's server environment can predate the product-mode override, so forward
@@ -124,6 +128,7 @@ ensure_task_notifier() {
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
+    "$REPO/scripts/python-binary.sh"
   )
   [ -f "$ROOM_SESSION_HANDLER" ] && version_files+=("$ROOM_SESSION_HANDLER")
   expected_version="$(
@@ -143,6 +148,7 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_PY=$PY")
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
@@ -168,7 +174,7 @@ ensure_core_monitor() {
   if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" >/dev/null 2>&1; then
     return 0
   fi
-  python3 "$REPO/src/core-input-watch.py" \
+  "$PY" "$REPO/src/core-input-watch.py" \
     --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
     >/tmp/core-input-watch.log 2>&1 &
 }
@@ -185,7 +191,7 @@ ensure_core_monitor() {
 # a heartbeat from a different checkout/bundle, and stays hermetic under test).
 ensure_core_heartbeat() {
   pgrep -f "$REPO/src/core_heartbeat.py" >/dev/null 2>&1 && return 0
-  python3 "$REPO/src/core_heartbeat.py" >/tmp/core-heartbeat.log 2>&1 &
+  "$PY" "$REPO/src/core_heartbeat.py" >/tmp/core-heartbeat.log 2>&1 &
 }
 
 ensure_durable_schedules() {
@@ -195,7 +201,7 @@ ensure_durable_schedules() {
   # while every custom schedule silently stops.
   [ "$(uname -s)" = "Darwin" ] || return 0
   local preflight result service
-  preflight="$(python3 "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py" --check)" || {
+  preflight="$("$PY" "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py" --check)" || {
     echo "  ⚠ durable schedule preflight failed" >&2
     return 0
   }
@@ -212,7 +218,7 @@ ensure_durable_schedules() {
           return 0
         fi
       fi
-      result="$(python3 "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py")" || {
+      result="$("$PY" "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py")" || {
         echo "  ⚠ durable schedule reconciliation failed" >&2
         return 0
       }
@@ -231,8 +237,8 @@ ensure_codex_scheduler() {
     host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 0
   fi
   scheduler="${SUTANDO_CODEX_SCHEDULER_SCRIPT:-$REPO/skills/schedule-crons/scripts/codex-scheduler.py}"
-  if ! python3 "$scheduler" install --workspace "$ws" --host-label "$host" >/dev/null; then
-    echo "  ⚠ Could not reconcile the durable Codex scheduler; run: python3 $scheduler install" >&2
+  if ! "$PY" "$scheduler" install --workspace "$ws" --host-label "$host" >/dev/null; then
+    echo "  ⚠ Could not reconcile the durable Codex scheduler; run: $PY $scheduler install" >&2
   fi
 }
 
