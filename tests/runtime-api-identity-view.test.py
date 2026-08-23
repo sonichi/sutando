@@ -386,7 +386,7 @@ class TestResolve(unittest.TestCase):
     def test_forward_hit_and_subject_prefix_forms(self):
         self._write_links([{
             "link_id": "link_x", "provider": "discord", "status": "active",
-            "stand_id": "@stand:ag2.space",
+            "stand_id": "@stand:ag2.space", "authorized_by": "@o:x",
             "provider_subject": {"type": "bot_user", "id": "123"},
             "display": {"name": "sutando-bot"},
             "verification": {"method": "discord_token_introspection",
@@ -411,10 +411,10 @@ class TestResolve(unittest.TestCase):
     def test_multi_stand_conflict_is_loud_never_autopicked(self):
         self._write_links([
             {"link_id": "a", "provider": "discord", "status": "active",
-             "stand_id": "@s1:x",
+             "stand_id": "@s1:x", "authorized_by": "@o:x",
              "provider_subject": {"type": "bot_user", "id": "123"}},
             {"link_id": "b", "provider": "discord", "status": "active",
-             "stand_id": "@s2:x",
+             "stand_id": "@s2:x", "authorized_by": "@o:x",
              "provider_subject": {"type": "bot_user", "id": "123"}}])
         out = _mk(self.state).resolve("discord", "123")
         self.assertFalse(out["resolved"])
@@ -463,6 +463,19 @@ class TestAuthorityBoundaries(unittest.TestCase):
                    lambda: self.el.revoke_link(self.state, "discord", "@o:x")):
             with self.assertRaises(PermissionError):
                 fn()
+
+    def test_resolve_requires_authorization_not_just_verification(self):
+        # the verifier's exact control: provider-verified but owner-unlinked
+        # must NOT resolve as an authorized Stand binding
+        self._enroll()
+        self._verify()
+        v = _mk(self.state, self.channels)
+        r = v.resolve("discord", "123")
+        self.assertFalse(r["resolved"])
+        self.assertTrue(r.get("verified_unlinked"))
+        self.el.authorize_link(self.state, "discord", "@o:x")
+        r2 = v.resolve("discord", "123")
+        self.assertTrue(r2["resolved"])
 
     def test_corrupt_store_surfaces_policy_invalid_never_no_links(self):
         # a present-but-unreadable store must never read as "no binding"

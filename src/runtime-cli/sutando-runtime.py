@@ -941,7 +941,8 @@ def main(argv=None) -> int:
                 return _print_stand_card(result, args.sub)
             if args.cmd == "stand" and args.sub == "resolve"                     and not result.get("resolved"):
                 print(json.dumps(result, ensure_ascii=False, indent=1))
-                return 1
+                # same exit contract as human mode: conflict is 3, not 1
+                return 3 if result.get("conflict") else 1
         elif args.group == "runtime":
             result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)
         elif args.group == "human-action":

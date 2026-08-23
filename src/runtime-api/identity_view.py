@@ -88,6 +88,8 @@ class IdentityView:
         return card
 
     def _devices(self, details: bool = False) -> list:
+        # Paired-peer registry — deliberately parallel to state/auth/
+        # device.json (THIS host's own install identity); never merged.
         out = []
         ddir = self.state_dir / "auth" / "devices"
         if not ddir.is_dir():
@@ -121,16 +123,25 @@ class IdentityView:
             # from "no such binding" and callers must not conflate them
             return {"resolved": False, "store_corrupt": True,
                     "provider": provider, "subject": subject}
-        hits = []
+        hits, unauthorized = [], 0
         for lk in links:
             if lk.get("provider") != provider or lk.get("status") != "active":
                 continue
             subj = lk.get("provider_subject") or {}
-            if str(subj.get("id", "")) == sid:
+            if str(subj.get("id", "")) != sid:
+                continue
+            # resolve() is an AUTHORITY read: provider verification alone
+            # never answers "this subject IS this Stand" — authorization does
+            if lk.get("authorized_by"):
                 hits.append(lk)
+            else:
+                unauthorized += 1
         stands = sorted({lk.get("stand_id", "") for lk in hits})
         if not hits:
-            return {"resolved": False, "provider": provider, "subject": subject}
+            out = {"resolved": False, "provider": provider, "subject": subject}
+            if unauthorized:
+                out["verified_unlinked"] = True
+            return out
         if len(stands) > 1:
             return {"resolved": False, "conflict": True,
                     "provider": provider, "subject": subject,
@@ -262,6 +273,8 @@ class IdentityView:
     # ── internals ───────────────────────────────────────────────────────────
     def _stand_record(self) -> dict:
         try:
+            # AUTHORITY record (owner-confirmed OwnerBinding) — deliberately
+            # parallel to hosts/<h>/stand-identity.json (persona); never merged.
             rec = json.loads((self.state_dir / "auth" / "stand.json").read_text())
             return rec if isinstance(rec, dict) else {}
         except (OSError, ValueError):
