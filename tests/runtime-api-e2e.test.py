@@ -149,8 +149,6 @@ ENV = {**os.environ,
        "SUTANDO_INSTANCE_REGISTRY": str(Path(TMP) / "instances"),
        "SUTANDO_TMUX_SOCKET": "/tmp/e2e-tmux.sock",
        "SUTANDO_TMUX_SESSION": "e2e-core",
-       "SUTANDO_LAUNCHER_EXECUTABLE": str(REPO / "bin" / "sutando"),
-       "SUTANDO_LAUNCHER_ARGS": '["serve"]',
        "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
        "REMOTE_TASK_TOKEN": "test-bearer"}
 

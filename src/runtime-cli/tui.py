@@ -170,6 +170,13 @@ def main(argv=None) -> int:  # pragma: no cover — interactive key loop; instan
             if v is None:
                 print(f"  no such instance: {rest[0]}\n")
                 continue
+            if cmd in ("a", "o", "t", "h") and v.get("identityVerified") is not True:
+                # the socket answered as a DIFFERENT instance (or never
+                # answered): routing work/attach there leaks to the wrong core
+                print("  refusing: socket identity is not verified as "
+                      f"{rest[0]} (identityVerified="
+                      f"{v.get('identityVerified')})\n")
+                continue
             try:
                 if cmd == "s":
                     print(" ", instance_registry.start_instance(rest[0]), "\n")

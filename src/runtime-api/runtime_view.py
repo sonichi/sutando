@@ -40,7 +40,9 @@ class RuntimeView:
         age = beat.get("beatAgeS")
         if age is None:
             return {"state": "offline"}
-        if age >= ALIVE_MAX_AGE_S:
+        if age >= ALIVE_MAX_AGE_S or age < 0:
+            # negative = future-dated mtime (clock skew / tampering): a dead
+            # core must not render attachable on a clock artifact
             return {"state": "offline", "beatAgeS": age}
         out = {"state": "degraded" if age >= DEGRADED_BEAT_AGE_S else "online",
                "beatAgeS": age}

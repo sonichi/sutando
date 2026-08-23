@@ -275,7 +275,11 @@ def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> di
             return {"ok": True, "state": "already_running", "endpoint": endpoint}
 
         env = {**os.environ,
-               "SUTANDO_INSTANCE_ID": m.get("instance_id") or agent_id}
+               "SUTANDO_INSTANCE_ID": m.get("instance_id") or agent_id,
+               # the child must serve the TARGET identity — the caller's
+               # ambient SUTANDO_AGENT_ID takes precedence in server.py
+               "SUTANDO_AGENT_ID":
+                   (m.get("identity") or {}).get("agent_id") or agent_id}
         rt = m.get("runtime") or {}
         for var, val in (("SUTANDO_RUNTIME_SOCKET", endpoint),
                          ("SUTANDO_TMUX_SOCKET", rt.get("tmux_socket")),

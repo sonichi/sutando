@@ -186,13 +186,15 @@ class RuntimeServer:
             # Launcher starts the WHOLE instance; SUTANDO_LAUNCHER_EXECUTABLE
             # /_ARGS override (tests inject one). Structured argv, no shell.
             repo = _HERE.parent.parent
+            # default must RESTORE THIS DAEMON: startup.sh never reaches
+            # server.py, so a manifest recording it cannot bring us back
             launcher_exe = (os.environ.get("SUTANDO_LAUNCHER_EXECUTABLE")
-                            or str(repo / "src" / "startup.sh"))
+                            or str(repo / "bin" / "sutando"))
             try:
                 launcher_args = json.loads(
-                    os.environ.get("SUTANDO_LAUNCHER_ARGS") or "[]")
+                    os.environ.get("SUTANDO_LAUNCHER_ARGS") or '["serve"]')
             except ValueError:
-                launcher_args = []
+                launcher_args = ["serve"]
             launcher = {"type": "process", "executable": launcher_exe,
                         "args": launcher_args,
                         "working_directory": str(repo)}

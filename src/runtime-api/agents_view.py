@@ -60,7 +60,7 @@ class AgentsView:
             payload = {}
         out = {
             "agentId": f.stem,
-            "alive": age < ALIVE_MAX_AGE_S,
+            "alive": 0 <= age < ALIVE_MAX_AGE_S,
             "beatAgeS": round(age, 1),
         }
         for k in ("host", "pid", "status", "socket", "locality", "started_at"):

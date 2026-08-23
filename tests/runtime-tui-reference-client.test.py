@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -69,6 +70,7 @@ class TuiReferenceClientTests(unittest.TestCase):
             state.mkdir(parents=True)
             sock = run / "rt.sock"
             env = {**os.environ,
+                   "SUTANDO_RUN_DIR": str(run),  # hermetic: never the host's live instance.lock
                    "SUTANDO_RUNTIME_SOCKET": str(sock),
                    "SUTANDO_RUNTIME_DB": str(Path(tmp) / "rt.sqlite"),
                    "SUTANDO_HA_DIR": str(Path(tmp) / "ha"),
@@ -89,8 +91,15 @@ class TuiReferenceClientTests(unittest.TestCase):
                 # discover through the registry the daemon wrote at boot
                 os.environ["SUTANDO_INSTANCE_REGISTRY"] = str(Path(tmp) / "instances")
                 import instance_registry
-                mans = [m for m in instance_registry.list_instances()
-                        if m.get("identity", {}).get("agent_id") == "@tui-agent:example.org"]
+                # boot registration lands just after the socket — poll briefly
+                mans = []
+                deadline = time.time() + 10
+                while not mans and time.time() < deadline:
+                    mans = [m for m in instance_registry.list_instances()
+                            if m.get("identity", {}).get("agent_id")
+                            == "@tui-agent:example.org"]
+                    if not mans:
+                        time.sleep(0.1)
                 self.assertEqual(len(mans), 1)
                 v = tui.instance_view(mans[0])
                 self.assertEqual(v["server"], "running")
@@ -187,6 +196,44 @@ class TuiBranchTests(unittest.TestCase):
             finally:
                 os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
 
+
+
+
+class TuiActionIdentityGate(unittest.TestCase):
+    """The ACTION path (not just the rendered flag): a socket that answered as
+    a different instance must never receive task/request/attach/open work."""
+
+    def _drive(self, verified, keys):
+        import tui as t
+        view = {"agentId": "@x:1", "server": "running", "core": "running",
+                "health": "healthy", "endpoint": "/tmp/x.sock",
+                "identityVerified": verified, "_manifest": {}}
+        calls = []
+        feed = iter(keys + ["q"])
+        with mock.patch.object(t, "_views", lambda: [view]), \
+             mock.patch.object(t, "_rpc_at",
+                               lambda ep, m, p: calls.append((ep, m, p)) or {}), \
+             mock.patch.object(t.instance_registry, "attach",
+                               lambda a: calls.append(("attach", a)) or
+                               {"ok": False, "error": "nope"}), \
+             mock.patch("builtins.input", lambda *_a: next(feed)):
+            t.main([])
+        return calls
+
+    def test_mismatched_identity_blocks_all_four_actions(self):
+        calls = self._drive(False, ["t @x:1 private-payload", "h @x:1",
+                                    "a @x:1", "o @x:1"])
+        self.assertEqual(calls, [], "work reached a socket that answered "
+                                    "as a DIFFERENT instance")
+
+    def test_unknown_identity_blocks_too(self):
+        calls = self._drive(None, ["t @x:1 private-payload"])
+        self.assertEqual(calls, [])
+
+    def test_verified_identity_still_submits(self):
+        calls = self._drive(True, ["t @x:1 hello"])
+        self.assertIn(("/tmp/x.sock", "task.submit", {"task": "hello"}),
+                      calls)
 
 
 if __name__ == "__main__":

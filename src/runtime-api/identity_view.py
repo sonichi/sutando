@@ -56,7 +56,7 @@ class IdentityView:
             out["status"] = "unknown"
         beat = self._own_beat()
         if "beatAgeS" in beat:
-            out["alive"] = beat["beatAgeS"] < ALIVE_MAX_AGE_S
+            out["alive"] = 0 <= beat["beatAgeS"] < ALIVE_MAX_AGE_S
             out["beatAgeS"] = beat["beatAgeS"]
         return out
 
