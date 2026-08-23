@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh [--with-app]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job).
+# Usage: bash src/startup.sh [--with-app] [--pool N]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job); --pool N installs the N-core pool + lead.
 
 set -e
 
@@ -8,10 +8,25 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --with-app is opt-in and parsed here so an unknown flag cannot silently do
 # nothing: every other argument is still ignored exactly as before.
+# --pool N installs/updates the multi-core follower pool AND ensures the lead
+# daemon is running — the installer alone starts only followers, which would
+# run leaderless. --pool 1 shrinks back to a single follower.
 WITH_APP=0
+POOL_N=""
+_prev=""
 for _arg in "$@"; do
-    case "$_arg" in --with-app) WITH_APP=1 ;; esac
+    case "$_prev" in --pool) POOL_N="$_arg" ;; esac
+    case "$_arg" in
+        --with-app) WITH_APP=1 ;;
+        --pool=*) POOL_N="${_arg#--pool=}" ;;
+    esac
+    _prev="$_arg"
 done
+if [ -n "$POOL_N" ]; then
+    case "$POOL_N" in
+        ''|*[!0-9]*) echo "✗ --pool needs a positive integer; got '$POOL_N'" >&2; exit 2 ;;
+    esac
+fi
 
 # Resolve python3 ONCE, refusing Apple's Xcode-CLT stub. On a Mac without the
 # developer tools `/usr/bin/python3` exists but raises a modal install dialog
@@ -1311,6 +1326,14 @@ if [ "$WITH_APP" -eq 1 ]; then
     else
         echo "  ✗ menu-bar app setup failed (exit $?) — the core is unaffected and still starting." >&2
     fi
+fi
+
+# --pool N|auto installs/resizes the follower set first; the lead is ensured
+# below for any host that has followers, with or without the flag.
+if [ -n "$POOL_N" ]; then
+    echo "Setting up multi-core pool (N=$POOL_N)..." >&2
+    bash "$REPO/scripts/install-core-pool.sh" "$POOL_N" \
+        || echo "  ✗ pool install failed (exit $?) — continuing with whatever is installed" >&2
 fi
 
 # Pool lead — runs whenever pool followers are installed: without it they

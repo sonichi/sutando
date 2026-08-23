@@ -30,9 +30,27 @@ sys.path.insert(0, str(_HERE.parent / "src" / "runtime-api"))
 from pool_follower import LEAD_STALE_S
 from pool_lead import PoolLead
 from pool_metrics import PoolMetrics
+from pool_notify import PoolNotifier
+from pool_scale import ScaleLedger, decide as scale_decide, observe as scale_observe
 from pool_status import PoolStatusWriter
 
 LEAD_LABEL = "pool-lead"
+
+# The daemon is the composition root: it binds the notify transport (a skill
+# script) so the policy module stays free of any concrete skill path.
+_NOTIFY_SCRIPT = _HERE.parent / "skills" / "task-progress" / "scripts" / "notify.py"
+
+
+def _send_notice(source: str, channel: str, message: str) -> bool:
+    chan_flag = "--chat-id" if source == "telegram" else "--channel-id"
+    try:
+        r = subprocess.run(
+            [sys.executable, str(_NOTIFY_SCRIPT), "--source", source,
+             chan_flag, channel, "--message", message],
+            capture_output=True, timeout=30)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def _workspace() -> Path:
@@ -47,6 +65,10 @@ def main() -> int:
     ap.add_argument("--interval", type=float, default=2.0)
     ap.add_argument("--prefix", default="core-",
                     help="instance-id prefix that marks pool followers")
+    ap.add_argument("--pool-max", type=int,
+                    default=int(os.environ.get("SUTANDO_POOL_MAX", "3")),
+                    help="autoscale cap; 0 disables scale-up (owner rule: "
+                         "grow when every core is saturated and work queues)")
     a = ap.parse_args()
     ws = _workspace()
     tasks, state = ws / "tasks", ws / "state"
@@ -68,6 +90,8 @@ def main() -> int:
     lead = PoolLead(tasks, state, followers, alive,
                     metrics=PoolMetrics(state))
     status = PoolStatusWriter(tasks, state, followers, alive)
+    notifier = PoolNotifier(tasks, state, _send_notice)
+    ledger = ScaleLedger(state)
     beat = cores / f"{LEAD_LABEL}.alive"
     running = {"on": True}
 
@@ -84,10 +108,37 @@ def main() -> int:
             {"role": "pool-lead", "pid": os.getpid(), "ts": time.time()}))
         for name, inst in lead.sweep():
             print(f"assigned {name} -> {inst}", flush=True)
+            if notifier.on_assigned(name, inst):
+                print(f"notified-handoff {name}", flush=True)
         for name in lead.reclaim_dead():
             print(f"reclaimed {name}", flush=True)
         for name, disposition in lead.reclaim_claimed():
             print(f"reclaimed-claim {name} -> {disposition}", flush=True)
+        for stem in notifier.check_stalls():
+            print(f"notified-stall {stem}", flush=True)
+        # Autoscale, scale-UP only: shrinking can strand a core's live claims,
+        # so it stays a manual operation (--pool N) for now.
+        if a.pool_max > 0:
+            live = followers()
+            pending, in_flight = scale_observe(tasks, live)
+            led = ledger.load()
+            if pending or any(in_flight.values()):
+                ledger.record(busy=True)
+            new_n = scale_decide(pending, in_flight, len(live),
+                                 min_n=1, max_n=a.pool_max,
+                                 last_change_ts=led["last_change_ts"],
+                                 last_busy_ts=led["last_busy_ts"],
+                                 now=time.time())
+            if new_n is not None and new_n > len(live):
+                r = subprocess.run(
+                    ["bash", str(_HERE / "install-core-pool.sh"), str(new_n)],
+                    capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    ledger.record(changed=True)
+                    print(f"scaled-up pool {len(live)} -> {new_n}", flush=True)
+                else:
+                    print(f"scale-up failed rc={r.returncode}: "
+                          f"{(r.stderr or '').strip()[:200]}", flush=True)
         status.maybe_write()
         time.sleep(a.interval)
     try:
