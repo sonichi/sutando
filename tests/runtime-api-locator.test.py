@@ -99,6 +99,22 @@ class LocatorAgreement(unittest.TestCase):
         return (self.daemon_socket(env), self.cli_socket(env),
                 self.shell_socket(env))
 
+    def all_three_rc(self, env):
+        """Exit statuses, not values — the negative controls need the failure
+        mode, which the value-returning helpers assert away."""
+        probe = {**env, "SUTANDO_RUNTIME_DB": str(self.base / "probe.sqlite")}
+        return (
+            _run([sys.executable, "-c",
+                  f"import sys; sys.path.insert(0, {str(SERVER.parent)!r});"
+                  " import server;"
+                  " print(server.build_runtime_server().socket_path)"], probe),
+            _run([sys.executable, "-c",
+                  "import importlib.util as u;"
+                  f" s=u.spec_from_file_location('rtcli', {str(CLI)!r});"
+                  " m=u.module_from_spec(s); s.loader.exec_module(m);"
+                  " print(m._socket_path())"], env),
+            _run(["bash", str(CONFIG_SH), "runtime-socket"], env))
+
     def test_unenrolled_daemon_cli_and_shell_agree(self):
         got = self.all_three(self.env())
         self.assertEqual(len(set(got)), 1, f"resolvers disagree: {got}")
@@ -139,6 +155,38 @@ class LocatorAgreement(unittest.TestCase):
                 sock = rundir.socket_path("default", agent=agent)
                 lock = rundir.lock_path("default", agent=agent)
                 self.assertEqual(Path(sock).parent, lock.parent)
+
+    # ── negative agreement: they must also FAIL together ────────────────────
+    def assert_all_reject(self, env, why):
+        rcs = self.all_three_rc(env)
+        names = ("daemon", "cli", "shell")
+        for name, r in zip(names, rcs):
+            self.assertNotEqual(
+                r.returncode, 0,
+                f"{name} reported success on {why}: {r.stdout.strip()!r}")
+            self.assertEqual(r.stdout.strip(), "",
+                             f"{name} printed a socket path on {why}")
+
+    def test_over_long_identity_is_rejected_by_all_three(self):
+        """A resolver that fails must not be papered over: a synthesized flat
+        endpoint is a plausible WRONG answer, which is worse than none."""
+        self.assert_all_reject(self.env(SUTANDO_AGENT_ID="@" + "a" * 200),
+                               "an over-long agent id")
+
+    def test_unusable_run_dir_is_rejected_by_all_three(self):
+        root = self.base
+        while len(str(root).encode()) < rundir.SUN_PATH_MAX - 10:
+            root = root / "padpadpad"
+        root.mkdir(parents=True, exist_ok=True)
+        self.assert_all_reject(self.env(SUTANDO_RUN_DIR=str(root)),
+                               "a run dir with no AF_UNIX budget")
+
+    def test_positive_control_the_same_probes_succeed_on_valid_config(self):
+        """Without this, `assert_all_reject` could be passing because the
+        probes are broken rather than because the guard fires."""
+        for r in self.all_three_rc(self.env()):
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(r.stdout.strip())
 
     # ── the live control ───────────────────────────────────────────────────
     def _boot(self, env):

@@ -499,15 +499,12 @@ print(_host_label(), end='')
     # scoped, so this EXECS rundir.py rather than mirroring it: a shell copy of
     # the chain published the pre-actor flat socket while the daemon listened on
     # the scoped one, and no client could reach a fresh daemon (review P1).
+    # No fallback on failure: a synthesized flat endpoint is a plausible WRONG
+    # answer, and rc=0 beside it is worse than no answer at all.
     if [ -n "${SUTANDO_RUNTIME_SOCKET:-}" ]; then
       printf '%s' "$SUTANDO_RUNTIME_SOCKET"
     else
-      _sock="$(py "$REPO_ROOT/src/runtime-api/rundir.py" --socket 2>/dev/null || true)"
-      if [ -n "$_sock" ]; then
-        printf '%s' "$_sock"
-      else
-        printf '%s/sutando-runtime.sock' "$(bash "$0" run-dir)"
-      fi
+      py "$REPO_ROOT/src/runtime-api/rundir.py" --socket
     fi
     ;;
 
