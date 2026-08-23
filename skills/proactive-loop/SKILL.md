@@ -111,7 +111,17 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 ## The numbered loop
 
-1. **Check for tasks.** Look in `tasks/` for voice / Discord / Telegram / phone tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`.
+1. **Check for tasks.** Look in `tasks/` for voice / Discord / Telegram / phone tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, then complete it via the completion step below.
+   - **Completion step (required):** the helper is the ONLY sanctioned way to write a result. Compose every result body starting with the line `task: <id>` (the id from the task file's name — `tasks/task-<id>.txt`), then:
+
+     ```bash
+     python3 src/result_write.py write task-<id>.txt <<'EOF'
+     task: <id>
+     <result body>
+     EOF
+     ```
+
+     The `task: <id>` first line is a pairing check: the helper refuses (exit 2, zero writes) if it names a different task — this is what prevents a session holding two tasks at once from writing each reply into the other task's result file, which sends both to the wrong user. The helper strips that line before writing, so users never see it, then writes `results/task-<id>.txt` atomically. Never hand-write that file. Marker-only bodies (`[deduped: …]`, `[no-send]`) go through the helper too — echo line first, marker on the next line.
    - **Access control:** If the task has `access_tier: other` or `access_tier: team`, delegate to a sandboxed agent. Do NOT process non-owner tasks with your full capabilities. Write the sandboxed output to results.
    - Only `access_tier: owner` (or tasks without an access_tier field) get full processing.
    - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result. The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
