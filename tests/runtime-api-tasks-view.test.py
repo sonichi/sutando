@@ -253,8 +253,6 @@ class DispatchTests(unittest.TestCase):
             asyncio.run(d.handle("task.status", {"taskId": "t"}))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TraversalGuardTests(unittest.TestCase):
@@ -289,3 +287,7 @@ class TraversalGuardTests(unittest.TestCase):
         (Path(self.tmp.name) / "results" / "task-rtapi-abc12.txt").write_text("hi")
         out = self.view.get_result("task-rtapi-abc12")
         self.assertIn("hi", str(out))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
