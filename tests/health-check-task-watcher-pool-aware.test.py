@@ -75,6 +75,22 @@ class LiveCoreInstances(unittest.TestCase):
             self.assertFalse(self.hc._live_core_instances(ws))
 
 
+class UnreadableHeartbeatIsSkipped(unittest.TestCase):
+    def test_dangling_alive_symlink_is_not_counted_and_does_not_raise(self):
+        """glob() yields the entry, stat() raises — the probe must skip it.
+
+        A core removing its .alive between the glob and the stat is the live
+        race; a dangling symlink reproduces it deterministically.
+        """
+        hc = _load()
+        td = tempfile.mkdtemp()
+        cores = Path(td) / "state" / "cores"
+        cores.mkdir(parents=True)
+        (cores / "core-1.alive").write_text("{}")
+        (cores / "core-broken.alive").symlink_to(cores / "does-not-exist")
+        self.assertEqual(hc._live_core_instances(Path(td)), {"core-1"})
+
+
 class ProbeVerdictIsPoolAware(unittest.TestCase):
     """Drives the REAL check_task_watcher(), not the helper.
 
