@@ -5693,12 +5693,7 @@ def _daily_completion_minutes(state: Path, job: str, limit: int = 7) -> list:
             continue
         when = None
         try:
-            # 3.9's fromisoformat rejects a `Z` suffix; and an aware stamp must be
-            # localised or its minute-of-day is UTC while cron times and mtime are local.
-            body = f.read_text(errors="ignore").strip()[:32].replace("Z", "+00:00")
-            when = datetime.fromisoformat(body)
-            if when.tzinfo is not None:
-                when = when.astimezone().replace(tzinfo=None)
+            when = datetime.fromisoformat(f.read_text(errors="ignore").strip()[:26])
         except (OSError, ValueError):
             when = None
         if when is None:

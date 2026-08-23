@@ -71,10 +71,24 @@ def build(finish=(6, 59), days=5, include_today=True):
     return ws
 
 
+# The probe reads the wall clock, and `due` is combined with TODAY's date, so
+# for the first hour after local midnight no miss can be reported at all.
+class _FixedNow(datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        d = datetime.date.today()
+        return cls(d.year, d.month, d.day, 12, 0, 0)
+
+
 def run(ws):
     hc.WORKSPACE_DIR = ws
     hc._host_label = lambda: "H"
-    return hc.check_daily_cron_punctuality()
+    real = datetime.datetime
+    datetime.datetime = _FixedNow
+    try:
+        return hc.check_daily_cron_punctuality()
+    finally:
+        datetime.datetime = real
 
 
 # ── the lane enters the scored population at all ─────────────────────────────
