@@ -96,6 +96,24 @@ class TestTokenResolution(unittest.TestCase):
                 got = self.mod._token("telegram", "TELEGRAM_BOT_TOKEN")
         self.assertEqual(got, "tg-vault-only")
 
+    def test_load_resolver_returns_none_when_import_fails(self):
+        """The degraded path itself, not just its result.
+
+        The sibling test patches `_resolve_channel_token` to None, which
+        exercises `_token`'s fallback but never `_load_resolver`. This drives
+        the import failure so the `except` branch is actually executed.
+        """
+        import builtins
+        real_import = builtins.__import__
+
+        def boom(name, *a, **kw):
+            if name == "channel_token":
+                raise ImportError("simulated: src/ not importable")
+            return real_import(name, *a, **kw)
+
+        with patch.object(builtins, "__import__", boom):
+            self.assertIsNone(self.mod._load_resolver())
+
     def test_env_still_wins_over_vault(self):
         """An exported value must keep winning, so working hosts are unaffected."""
         import channel_token
