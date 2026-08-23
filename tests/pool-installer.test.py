@@ -54,7 +54,8 @@ class PoolInstallerHarness(unittest.TestCase):
         shutil.copy(REPO / "src" / "launchd" / "com.sutando.pool-lead.plist",
                     repo / "src" / "launchd" / "com.sutando.pool-lead.plist")
         for w in ("pool-core-wrapper.sh", "pool-follower-beat.sh",
-                  "pool-lead-wrapper.sh", "pool-lead-daemon.py"):
+                  "pool-lead-wrapper.sh", "pool-lead-daemon.py",
+                  "kick-pool.sh"):
             shutil.copy(REPO / "scripts" / w, repo / "scripts" / w)
         _write_exec(repo / "scripts" / "sutando-config.sh",
                     STUB_CONFIG.format(config_dir_body=config_dir_body))
