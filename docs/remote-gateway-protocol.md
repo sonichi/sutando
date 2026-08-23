@@ -74,7 +74,9 @@ older brokers and bridges. The `ag2space-room-sessions` skill uses the header
 with `source: ag2space`, owner tier, and `channel_id` to select one durable
 provider session per room. Messages in the same room resume that session;
 different rooms use different sessions. Team and Guest tasks keep their
-established guarded paths.
+established guarded paths. A provider timeout after launch is terminal because
+its side effects are outcome-unknown; the skill suppresses automatic fallback
+replay and checkpoints a reported session handle when available.
 
 ### `POST /v1/tasks/<id>/ack`
 

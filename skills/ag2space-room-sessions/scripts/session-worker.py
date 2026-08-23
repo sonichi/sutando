@@ -25,6 +25,10 @@ from typing import Optional
 
 UNHANDLED = 3
 SCHEMA_VERSION = 1
+OUTCOME_UNKNOWN_BODY = (
+    "The room-session provider timed out after execution started. Its outcome is unknown, "
+    "so Sutando did not retry automatically."
+)
 SESSION_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -43,6 +47,17 @@ if str(REPO_ROOT / "src") not in sys.path:
 from local_task_protocol import find_result, parse_task_headers_trusted
 from result_ready import read_ready_result
 from team_result_guard import resolve_access_tier
+
+
+class ProviderTimeout(TimeoutError):
+    def __init__(self, message: str, stdout: str, stderr: str):
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class OutcomeUnknownError(RuntimeError):
+    pass
 
 
 def _read_json(path: Path) -> dict:
@@ -125,6 +140,31 @@ def resolve_room_key(task_file: Path) -> Optional[str]:
 
 def _state_path(workspace: Path) -> Path:
     return workspace / "state" / "ag2space-room-sessions.json"
+
+
+def _outcome_path(workspace: Path, filename: str) -> Path:
+    key = hashlib.sha256(filename.encode("utf-8")).hexdigest()
+    return workspace / "state" / "ag2space-room-session-outcomes" / f"{key}.txt"
+
+
+def _settle_outcome_unknown(workspace: Path, results_dir: Path, filename: str) -> bool:
+    receipt = _outcome_path(workspace, filename)
+    body = read_ready_result(receipt)
+    if body is None:
+        return False
+    if _publish_once(results_dir / filename, body):
+        receipt.unlink(missing_ok=True)
+    return True
+
+
+def _record_outcome_unknown(workspace: Path, results_dir: Path, filename: str, body: str) -> None:
+    receipt = _outcome_path(workspace, filename)
+    try:
+        _atomic_text(receipt, f"{body}\n")
+        if _publish_once(results_dir / filename, f"{body}\n"):
+            receipt.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _session_id(workspace: Path, runtime: str, room_key: str) -> tuple[str, bool]:
@@ -212,13 +252,21 @@ def _run_bounded(
         os.set_blocking(fd, False)
         selector.register(fd, selectors.EVENT_READ, name)
     started = last_progress = time.monotonic()
+
+    def timeout(message: str) -> ProviderTimeout:
+        return ProviderTimeout(
+            message,
+            b"".join(output["stdout"]).decode("utf-8", "replace"),
+            b"".join(output["stderr"]).decode("utf-8", "replace"),
+        )
+
     try:
         while selector.get_map():
             now = time.monotonic()
             if now - started >= hard_timeout:
-                raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
+                raise timeout(f"provider exceeded hard timeout ({hard_timeout:g}s)")
             if now - last_progress >= stall_timeout:
-                raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
+                raise timeout(f"provider made no progress for {stall_timeout:g}s")
             for key, _ in selector.select(timeout=min(0.2, stall_timeout)):
                 try:
                     chunk = os.read(key.fd, 65536)
@@ -232,9 +280,9 @@ def _run_bounded(
         while process.poll() is None:
             now = time.monotonic()
             if now - started >= hard_timeout:
-                raise TimeoutError(f"provider exceeded hard timeout ({hard_timeout:g}s)")
+                raise timeout(f"provider exceeded hard timeout ({hard_timeout:g}s)")
             if now - last_progress >= stall_timeout:
-                raise TimeoutError(f"provider made no progress for {stall_timeout:g}s")
+                raise timeout(f"provider made no progress for {stall_timeout:g}s")
             time.sleep(min(0.05, stall_timeout))
         return (
             int(process.returncode or 0),
@@ -323,12 +371,20 @@ def _run_claude(
     stall_timeout: Optional[float] = None,
 ) -> str:
     session_id, created = _session_id(workspace, "claude", room_key)
-    return_code, stdout, stderr = _run_bounded(
-        _claude_command(session_id, not created, prompt),
-        _working_dir(repo),
-        hard_timeout,
-        stall_timeout,
-    )
+    try:
+        return_code, stdout, stderr = _run_bounded(
+            _claude_command(session_id, not created, prompt),
+            _working_dir(repo),
+            hard_timeout,
+            stall_timeout,
+        )
+    except ProviderTimeout as exc:
+        if created:
+            try:
+                _record_session(workspace, "claude", room_key, session_id)
+            except (OSError, TypeError, ValueError):
+                pass
+        raise OutcomeUnknownError(OUTCOME_UNKNOWN_BODY) from exc
     if return_code:
         raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
     if created:
@@ -354,25 +410,25 @@ def _run_codex(
     os.close(fd)
     output_file = Path(name)
     try:
-        return_code, stdout, stderr = _run_bounded(
-            _codex_command(session_id or None, prompt, output_file, repo),
-            _working_dir(repo),
-            hard_timeout,
-            stall_timeout,
-        )
+        try:
+            return_code, stdout, stderr = _run_bounded(
+                _codex_command(session_id or None, prompt, output_file, repo),
+                _working_dir(repo),
+                hard_timeout,
+                stall_timeout,
+            )
+        except ProviderTimeout as exc:
+            if not session_id:
+                discovered = _codex_session_id(exc.stdout)
+                if discovered:
+                    try:
+                        _record_session(workspace, "codex", room_key, discovered)
+                    except (OSError, TypeError, ValueError):
+                        pass
+            raise OutcomeUnknownError(OUTCOME_UNKNOWN_BODY) from exc
         if return_code:
             raise RuntimeError(stderr.strip() or f"codex exited {return_code}")
-        discovered = ""
-        if not session_id:
-            for line in stdout.splitlines():
-                try:
-                    event = json.loads(line)
-                except (TypeError, ValueError):
-                    continue
-                if event.get("type") == "thread.started":
-                    candidate = str(event.get("thread_id") or "")
-                    if SESSION_ID.fullmatch(candidate):
-                        discovered = candidate
+        discovered = _codex_session_id(stdout) if not session_id else ""
         if not session_id and not discovered:
             raise RuntimeError("codex did not report a valid thread.started session id")
         if discovered:
@@ -380,6 +436,19 @@ def _run_codex(
         return output_file.read_text(encoding="utf-8")
     finally:
         output_file.unlink(missing_ok=True)
+
+
+def _codex_session_id(stdout: str) -> str:
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if event.get("type") == "thread.started":
+            candidate = str(event.get("thread_id") or "")
+            if SESSION_ID.fullmatch(candidate):
+                return candidate
+    return ""
 
 
 def probe(runtime: str, workspace: Path, task_file: Path) -> int:
@@ -411,16 +480,31 @@ def handle(
     assert room_key is not None
     if _completed_result_exists(results_dir, task_file.name):
         return 0
+    if _settle_outcome_unknown(workspace, results_dir, task_file.name):
+        return 0
     lock = workspace / "state" / "ag2space-room-session-locks" / f"{runtime}-{room_key}.lock"
     try:
         with _locked(lock):
             if _completed_result_exists(results_dir, task_file.name):
                 return 0
-            body = (
-                _run_claude(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
-                if runtime == "claude"
-                else _run_codex(workspace, room_key, _prompt(task_file), repo, hard_timeout, stall_timeout)
-            )
+            if _settle_outcome_unknown(workspace, results_dir, task_file.name):
+                return 0
+            try:
+                body = (
+                    _run_claude(
+                        workspace, room_key, _prompt(task_file), repo,
+                        hard_timeout, stall_timeout,
+                    )
+                    if runtime == "claude"
+                    else _run_codex(
+                        workspace, room_key, _prompt(task_file), repo,
+                        hard_timeout, stall_timeout,
+                    )
+                )
+            except OutcomeUnknownError as exc:
+                _record_outcome_unknown(workspace, results_dir, task_file.name, str(exc))
+                print(f"AG2 Space room-session worker: {exc}", file=sys.stderr)
+                return 0
             if not body.strip():
                 raise RuntimeError(f"{runtime} returned an empty result")
             if not _publish_once(results_dir / task_file.name, body):

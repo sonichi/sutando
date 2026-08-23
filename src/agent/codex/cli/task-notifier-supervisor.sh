@@ -3,6 +3,8 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+. "$REPO/scripts/python-binary.sh"
+PY="$(require_python "$REPO" "run the Codex task notifier supervisor")" || exit 1
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 RESTART_DELAY="${SUTANDO_NOTIFIER_RESTART_DELAY:-1}"
@@ -26,7 +28,7 @@ while tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; do
   # ends so no orphan child survives. Run the notifier in a separate process
   # group; otherwise that cleanup signal also kills this supervisor and tmux
   # removes the entire watcher session—the production failure fixed here.
-  python3 -c \
+  "$PY" -c \
     'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1]])' \
     "$NOTIFIER" &
   child_pid=$!

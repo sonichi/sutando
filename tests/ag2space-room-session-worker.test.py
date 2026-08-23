@@ -385,6 +385,90 @@ def test_runtime_edges_and_adapter_wiring() -> None:
     check("ag2space-room-sessions" not in watcher, "generic watcher does not name concrete skill")
 
 
+def test_timeout_outcome_unknown_is_terminal_and_checkpointed() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        workspace = root / "workspace"
+        results = workspace / "results"
+        results.mkdir(parents=True)
+        side_effect = root / "claude-side-effect"
+        calls = root / "claude-calls"
+        executable(root / "claude", """#!/bin/sh
+touch "$SIDE_EFFECT"
+printf 'call\n' >> "$CALLS"
+sleep 2
+""")
+        room_task = task(workspace, "task-timeout-claude", room_id="!timeout-claude:a")
+        env = {
+            "PATH": f"{root}:{os.environ['PATH']}",
+            "SIDE_EFFECT": str(side_effect),
+            "CALLS": str(calls),
+        }
+        with patch.dict(os.environ, env):
+            code = worker.handle(
+                "claude", workspace, room_task, results, REPO,
+                hard_timeout=0.5, stall_timeout=2,
+            )
+        room_key = worker.resolve_room_key(room_task)
+        state = json.loads(worker._state_path(workspace).read_text(encoding="utf-8"))
+        body = worker.read_ready_result(results / room_task.name)
+        check(code == 0 and side_effect.exists(),
+              "timeout after a Claude side effect is terminal, not fallback")
+        check(body == worker.OUTCOME_UNKNOWN_BODY,
+              "outcome-unknown timeout publishes a terminal explanation")
+        check(bool(room_key) and state["sessions"]["claude"].get(room_key),
+              "new Claude session is checkpointed before timeout settles")
+        before = calls.read_text().splitlines()
+        with patch.dict(os.environ, env):
+            repeated = worker.handle(
+                "claude", workspace, room_task, results, REPO,
+                hard_timeout=0.5, stall_timeout=2,
+            )
+        check(repeated == 0 and calls.read_text().splitlines() == before,
+              "settled outcome-unknown task is never executed again")
+
+        codex_side_effect = root / "codex-side-effect"
+        codex_calls = root / "codex-calls"
+        thread_id = str(uuid.uuid4())
+        executable(root / "codex", f"""#!/usr/bin/env python3
+import json, os, pathlib, time
+pathlib.Path(os.environ['CODEX_SIDE_EFFECT']).touch()
+with pathlib.Path(os.environ['CODEX_CALLS']).open('a') as handle:
+    handle.write('call\\n')
+print(json.dumps({{'type': 'thread.started', 'thread_id': '{thread_id}'}}), flush=True)
+time.sleep(2)
+""")
+        codex_task = task(workspace, "task-timeout-codex", room_id="!timeout-codex:a")
+        codex_env = {
+            "PATH": f"{root}:{os.environ['PATH']}",
+            "CODEX_SIDE_EFFECT": str(codex_side_effect),
+            "CODEX_CALLS": str(codex_calls),
+        }
+        with patch.dict(os.environ, codex_env):
+            codex_code = worker.handle(
+                "codex", workspace, codex_task, results, REPO,
+                hard_timeout=0.5, stall_timeout=2,
+            )
+        codex_key = worker.resolve_room_key(codex_task)
+        state = json.loads(worker._state_path(workspace).read_text(encoding="utf-8"))
+        check(codex_code == 0 and codex_side_effect.exists(),
+              "timeout after a Codex side effect is terminal, not fallback")
+        check(bool(codex_key) and state["sessions"]["codex"][codex_key]["session_id"] == thread_id,
+              "partial Codex thread event is checkpointed on timeout")
+
+        blocked = task(workspace, "task-timeout-blocked", room_id="!timeout-blocked:a")
+        (results / blocked.name).write_text("  \n")
+        with patch.object(worker, "_run_claude", side_effect=worker.OutcomeUnknownError(
+            worker.OUTCOME_UNKNOWN_BODY
+        )):
+            blocked_code = worker.handle("claude", workspace, blocked, results, REPO)
+        receipt = worker._outcome_path(workspace, blocked.name)
+        with patch.object(worker, "_run_claude") as provider:
+            repeated_code = worker.handle("claude", workspace, blocked, results, REPO)
+        check(blocked_code == 0 and repeated_code == 0 and receipt.exists() and not provider.called,
+              "durable outcome receipt prevents replay behind an unready result placeholder")
+
+
 def test_cli_probe_and_empty_output() -> None:
     with tempfile.TemporaryDirectory() as name:
         root = Path(name)
@@ -442,6 +526,7 @@ def main() -> int:
     test_codex_create_resume_and_result_ownership()
     test_codex_event_and_state_edges()
     test_runtime_edges_and_adapter_wiring()
+    test_timeout_outcome_unknown_is_terminal_and_checkpointed()
     test_cli_probe_and_empty_output()
     test_direct_failure_and_cli_edges()
     print(f"\nResults: {len(FAILURES)} failed")

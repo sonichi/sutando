@@ -15,7 +15,9 @@ different rooms may run through the watcher's bounded parallel workers.
 Missing, malformed, or future scope values, non-AG2 sources, and Team or Guest
 tasks remain unhandled and follow their established paths. Provider failures
 also return the task to the live core so a transient CLI failure cannot strand
-an owner request.
+an owner request. A timeout after provider launch is outcome-unknown instead:
+the skill checkpoints a session handle when available, records durable replay
+suppression, and publishes a terminal explanation without re-running the task.
 
 Session IDs live in `<workspace>/state/ag2space-room-sessions.json`. Remove this
 skill or revert its adapter wiring to return every task to the legacy main

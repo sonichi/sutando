@@ -535,6 +535,43 @@ exit 23
             process.terminate()
             process.communicate(timeout=2)
 
+    def test_notifier_supervisor_uses_resolved_python_when_bare_python_cannot_run(self):
+        bare_python_called = Path(self.tmp.name) / "bare-python-called"
+        notifier_called = Path(self.tmp.name) / "notifier-called"
+        tmux_once = Path(self.tmp.name) / "tmux-once"
+        self._write_exe("python3", f'''#!/bin/bash
+touch "{bare_python_called}"
+exit 127
+''')
+        self._write_exe("tmux", '''#!/bin/bash
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then
+  [ -f "$TMUX_ONCE" ] && exit 1
+  touch "$TMUX_ONCE"
+  exit 0
+fi
+exit 1
+''')
+        notifier = self.bin / "notifier-under-test"
+        notifier.write_text(f'#!/bin/bash\ntouch "{notifier_called}"\n')
+        notifier.chmod(0o755)
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            SUTANDO_PY=sys.executable,
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_NOTIFIER_SCRIPT=str(notifier),
+            TMUX_ONCE=str(tmux_once),
+        )
+        supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
+        result = subprocess.run(
+            ["/bin/bash", str(supervisor)], env=env, capture_output=True, text=True, timeout=2
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(notifier_called.exists())
+        self.assertFalse(bare_python_called.exists())
+
     def test_notifier_supervisor_survives_child_process_group_cleanup(self):
         count = Path(self.tmp.name) / "notifier-count"
         self._write_exe("tmux", '''#!/bin/bash
