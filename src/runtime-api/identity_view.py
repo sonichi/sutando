@@ -60,6 +60,27 @@ class IdentityView:
             out["beatAgeS"] = beat["beatAgeS"]
         return out
 
+    # ── sutando.stand ───────────────────────────────────────────────────────
+    def stand(self) -> dict:
+        # Stand = the durable owner-governed subject; every field must come
+        # from an explicit record (enrolled identity, channel owner record).
+        out: dict = {}
+        enrolled = self._enrolled()
+        if enrolled.get("agent_id"):
+            out["stand_id"] = enrolled["agent_id"]
+        native = dict(self._channels_named("ag2space"))
+        acc = native.get("ag2space") or {}
+        if acc.get("tofuOwner"):
+            out["owner"] = {"person_id": acc["tofuOwner"],
+                            "verification": "explicit"}
+        out["actor"] = {"actor_id": self.actor_id}
+        inst: dict = {}
+        if self.host_label:
+            inst["host_label"] = self.host_label
+        if inst:
+            out["instance"] = inst
+        return out
+
     # ── sutando.owner ───────────────────────────────────────────────────────
     def owner(self) -> dict:
         owners: dict = {}
@@ -84,6 +105,18 @@ class IdentityView:
         return {"channels": channels}
 
     # ── internals ───────────────────────────────────────────────────────────
+    def _enrolled(self) -> dict:
+        try:
+            rec = json.loads((self.state_dir / "auth" / "ag2space.json").read_text())
+            return rec if isinstance(rec, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _channels_named(self, name: str):
+        for n, acc in self._channels():
+            if n == name:
+                yield n, acc
+
     def _channels(self):
         if self.channels_dir is None or not self.channels_dir.is_dir():
             return

@@ -606,6 +606,41 @@ def _chat(activity: bool = False, verbose: bool = False, full: bool = False) -> 
     return 0
 
 
+def _print_stand(result: dict, sub: "str | None") -> int:
+    """Human/scripting views of sutando.stand; absent fields stay absent."""
+    if sub == "id":
+        sid = result.get("stand_id")
+        if not sid:
+            print("no stand record", file=sys.stderr)
+            return 1
+        print(sid)
+        return 0
+    rows = []
+    if result.get("stand_id"):
+        rows.append(("Stand", result["stand_id"]))
+    owner = result.get("owner") or {}
+    if owner.get("person_id"):
+        rows.append(("Owner", owner["person_id"]))
+    actor = result.get("actor") or {}
+    if actor.get("actor_id"):
+        rows.append(("Actor", actor["actor_id"]))
+    inst = result.get("instance") or {}
+    for key, label in (("instance_id", "Instance"),
+                       ("installation_id", "Installation"),
+                       ("host_label", "Host")):
+        if inst.get(key):
+            rows.append((label, inst[key]))
+    if result.get("status"):
+        rows.append(("Status", result["status"]))
+    if not rows:
+        print("no stand record", file=sys.stderr)
+        return 1
+    width = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        print(f"{k.ljust(width + 2)}{v}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="sutando-runtime")
     sub = ap.add_subparsers(dest="group", required=True)
@@ -670,6 +705,9 @@ def main(argv=None) -> int:
     idn = sub.add_parser("sutando").add_subparsers(dest="cmd", required=True)
     for name in ("info", "status", "owner", "allowlist"):
         idn.add_parser(name)
+    std = idn.add_parser("stand")
+    std.add_argument("sub", nargs="?", choices=["id"])
+    std.add_argument("--json", action="store_true", dest="as_json")
 
     rt = sub.add_parser("runtime").add_subparsers(dest="cmd", required=True)
     for name in ("health", "details"):
@@ -841,6 +879,8 @@ def main(argv=None) -> int:
                                 timeout=15))
         elif args.group == "sutando":
             result = _rpc(f"sutando.{args.cmd}", {}, timeout=15)
+            if args.cmd == "stand" and not args.as_json:
+                return _print_stand(result, getattr(args, "sub", None))
         elif args.group == "runtime":
             result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)
         elif args.group == "human-action":

@@ -142,6 +142,66 @@ class DispatchTests(unittest.TestCase):
             asyncio.run(d.handle("sutando.info", {}))
 
 
+class TestStand(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        (self.state / "auth").mkdir(parents=True)
+        self.channels = Path(self.tmp.name) / "channels"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _enroll(self, agent_id="@stand:ag2.space"):
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": agent_id, "schema_version": "1"}))
+
+    def _native_channel(self, payload):
+        d = self.channels / "ag2space"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "access.json").write_text(json.dumps(payload))
+
+    def test_full_record(self):
+        self._enroll()
+        self._native_channel({"tofuOwner": "@owner:ag2.space",
+                              "tierMap": {"@x:ag2.space": "team"}})
+        out = _mk(self.state, self.channels, host_label="host-1").stand()
+        self.assertEqual(out["stand_id"], "@stand:ag2.space")
+        self.assertEqual(out["owner"],
+                         {"person_id": "@owner:ag2.space",
+                          "verification": "explicit"})
+        self.assertEqual(out["actor"], {"actor_id": "@me:example.org"})
+        self.assertEqual(out["instance"], {"host_label": "host-1"})
+
+    def test_absent_records_are_omitted_not_null(self):
+        # no enrolled record, no channels, no host label
+        out = _mk(self.state).stand()
+        self.assertNotIn("stand_id", out)
+        self.assertNotIn("owner", out)
+        self.assertNotIn("instance", out)
+        self.assertEqual(out["actor"], {"actor_id": "@me:example.org"})
+        self.assertNotIn(None, out.values())
+
+    def test_owner_not_inferred_from_tiermap_or_other_channels(self):
+        self._enroll()
+        # native channel has tierMap owner but NO tofuOwner -> omit
+        self._native_channel({"tierMap": {"@o:ag2.space": "owner"}})
+        d = self.channels / "slack"
+        d.mkdir(parents=True)
+        (d / "access.json").write_text(json.dumps({"tofuOwner": "U1"}))
+        out = _mk(self.state, self.channels).stand()
+        self.assertNotIn("owner", out)
+
+    def test_dispatch_routes_stand(self):
+        self._enroll()
+        d = RuntimeDispatcher(DispatchTests._No(),
+                              DispatchTests._No(), "@me:x",
+                              executors={},
+                              identity_view=IdentityView(self.state, "@me:x"))
+        out = asyncio.run(d.handle("sutando.stand", {}))
+        self.assertEqual(out["stand_id"], "@stand:ag2.space")
+
+
 class TestEnrolledActorFallback(unittest.TestCase):
     def test_enrolled_identity_beats_local_agent_fallback(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent

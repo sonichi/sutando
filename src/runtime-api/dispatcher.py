@@ -247,6 +247,7 @@ class RuntimeDispatcher:
                 raise ProtocolError(-32601,
                                     "identity surface is not configured on this daemon")
             fn = {"sutando.info": self.identity.info,
+                  "sutando.stand": self.identity.stand,
                   "sutando.status": self.identity.status,
                   "sutando.owner": self.identity.owner,
                   "sutando.allowlist": self.identity.allowlist}.get(method)
