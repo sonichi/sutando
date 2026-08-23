@@ -2636,7 +2636,9 @@ _PROACTIVE_MAX_BODY_B = 48 * 1024
 
 # Destination FORMAT validation is this bridge's own job ("the bridge
 # validates the id format for its platform when applying" — result_markers).
-_MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+# Ids AND aliases: every other bridge declines '#alias:server' as Matrix-owned,
+# so a '!'-only rule here strands alias-directed bodies with no claimant.
+_MATRIX_ROOM_RE = re.compile(r"^[!#][^\s:]+:\S+$")
 
 
 def _proactive_route(body: str) -> "tuple[str, str | None, str]":
