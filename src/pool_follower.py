@@ -26,6 +26,9 @@ LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
 _UNASSIGNED_RE = re.compile(
     r"^task-(?!.*\.(?:assigned|claimed)-)([A-Za-z0-9._~-]+)\.txt$")
 
+_CLAIMED_RE = re.compile(
+    r"^task-([A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
+
 
 def lead_alive(state_dir, lead_label: str, now_fn=time.time) -> bool:
     """False on a missing OR future-dated beat — clock skew must degrade,
@@ -81,3 +84,70 @@ def acquire_work(tasks_dir, state_dir, instance: str,
         except OSError:
             continue
     return None
+
+
+def finish_task(tasks_dir, results_dir, state_dir, instance: str,
+                claimed_path, body: str) -> Path:
+    """Complete a claimed task: result write, done-flag, archive — in that
+    order. The body's first line MUST echo `task: <id>` (stripped before
+    writing); a mismatch means the body was composed for another task, so
+    refuse with ValueError and write nothing."""
+    claimed = Path(claimed_path)
+    m = _CLAIMED_RE.match(claimed.name)
+    if m is None or m.group(2) != instance:
+        raise ValueError(
+            f"not a claim held by {instance!r}: {claimed.name}")
+    if not claimed.is_file():
+        raise ValueError(f"claimed file missing: {claimed}")
+    task_id = m.group(1)
+    if not body or not body.strip():
+        raise ValueError("empty result body")
+    first, _, rest = body.partition("\n")
+    if first.rstrip("\r") != f"task: {task_id}":
+        raise ValueError(
+            f"pairing echo mismatch: need 'task: {task_id}' "
+            f"as first line, got {first!r}")
+    if not rest.strip():
+        raise ValueError("result body is only the pairing echo line")
+
+    results = Path(results_dir)
+    result = results / f"task-{task_id}.txt"
+    tmp = results / f".task-{task_id}.txt.tmp-{instance}"
+    results.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(rest)
+    os.replace(tmp, result)
+
+    done = Path(state_dir) / "cores" / instance / "done"
+    done.mkdir(parents=True, exist_ok=True)
+    (done / f"task-{task_id}.flag").write_text("")
+
+    archive = Path(tasks_dir) / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    os.replace(claimed, archive / claimed.name)
+    return result
+
+
+def _finish_cli(argv: "list[str]") -> int:
+    if len(argv) != 2:
+        print("usage: pool_follower.py finish <claimed_path> <instance>",
+              file=sys.stderr)
+        return 2
+    claimed = Path(argv[0]).resolve()
+    workspace = claimed.parent.parent  # tasks/<claim> → workspace siblings
+    try:
+        result = finish_task(claimed.parent, workspace / "results",
+                             workspace / "state", argv[1], claimed,
+                             sys.stdin.read())
+    except ValueError as e:
+        print(f"finish refused: {e}", file=sys.stderr)
+        return 2
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "finish":
+        sys.exit(_finish_cli(sys.argv[2:]))
+    print("usage: pool_follower.py finish <claimed_path> <instance>",
+          file=sys.stderr)
+    sys.exit(2)

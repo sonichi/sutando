@@ -66,7 +66,16 @@ Use the renamed `task-<id>.claimed-core-<n>.txt` path for all subsequent reads +
 
 **Core attribution (required, owner request 2026-08-23):** end every user-facing result body with a final line naming your core, em-dash form: `— core-<n>`. Plain text only — never a bracketed form (`[core-N]` would trip ag2space's `team_result_guard`, which withholds bodies carrying bracketed control markers). Skip the signature only on `[deduped:]`/`[no-send]` bodies, which no user reads.
 
-**Completion step (required):** after writing the result and your done-flag, move the claimed file to `tasks/archive/` yourself. Bridges and archivers glob canonical `task-*.txt` names only — a claimed-suffix file left behind is invisible to them and lingers forever (and the lead must keep skipping it). The bridges look for results by task ID, so writing to `results/task-<id>.txt` (without the `claimed-core-<n>` suffix) still routes correctly.
+**Completion step (required):** compose every result body starting with the line `task: <id>` (the id from your claimed file's name), then complete via the helper — one command replaces the manual write/flag/archive trio:
+
+```bash
+python3 src/pool_follower.py finish tasks/task-<id>.claimed-core-<n>.txt core-<n> <<'EOF'
+task: <id>
+<result body>
+EOF
+```
+
+The `task: <id>` first line is a pairing check: the helper refuses (exit 2, zero writes) if it doesn't match the claimed file's id — this is what prevents a session holding two claims from writing each reply into the other task's result file. The helper strips that line before writing, so users never see it, then writes `results/task-<id>.txt` atomically, touches your done-flag, and archives the claimed file — in that order. Never hand-write the result/flag/archive steps yourself.
 
 **Initial sweep on session start**: the watcher's initial sweep emits TASK_FILE events for any pre-existing files. Run the claim step on each; expect to win some and lose others depending on which sibling session got there first.
 
