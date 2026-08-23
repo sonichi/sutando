@@ -678,7 +678,7 @@ function resetSessionGateState(): void {
 // resolver function.
 import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
 
-import { createOutputSanitizer } from './output_sanitizer.js';
+import { createOutputSanitizer, wireSanitizerToTransport } from './output_sanitizer.js';
 function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
@@ -1429,32 +1429,15 @@ async function main() {
 	// Native audio streams transcript and audio concurrently, so suppression reaches only
 	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
 	(() => {
-		const transport = (session as any).transport;
-		if (!transport) return;
-		// Only the BRACKETED `[Silence]` is a fabrication signature: a bare `Silence.` collides
-		// with natural speech ("Silence is golden") and suppressed legitimate output.
-		// `_suppressAudio` is OpenAIRealtimeTransport's field, not GeminiLiveTransport's, so the
-		// previous `'_suppressAudio' in transport` guard was always false here and never suppressed.
-		// Gate the transport's own audio callback instead — works on either transport.
-		let suppressAudio = false;
-		const origOnAudioOutput = transport.onAudioOutput?.bind(transport);
-		transport.onAudioOutput = (b64: string) => { if (suppressAudio) return; origOnAudioOutput?.(b64); };
-		const origOnOutputTranscription = transport.onOutputTranscription?.bind(transport);
-		// Deltas are per-turn FRAGMENTS, so output is HELD until the running buffer either
-		// matches a fabricated prefix (suppress) or diverges (flush the rest of the turn).
-		const sanitizer = createOutputSanitizer({
-			forward: (t) => origOnOutputTranscription?.(t),
-			setSuppressAudio: (on) => { suppressAudio = on; },
+		// Wiring lives in output_sanitizer.ts so it has a test seam: this adapter
+		// path had none, which is the standing review blocker on this PR.
+		wireSanitizerToTransport({
+			transport: (session as any).transport,
+			subscribe: (ev, fn) => session.eventBus.subscribe(ev as any, fn),
 			onBlocked: (buffered) =>
 				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
+			log: (m) => console.log(`${ts()} ${m}`),
 		});
-		transport.onOutputTranscription = (text: string) => sanitizer.handleChunk(text);
-		// Reset per-turn sanitizer state at turn boundaries. Flush any still-held CLEAN text so a
-		// short turn that ended mid-hold (e.g. the whole turn was just "Sure") isn't dropped.
-		const resetTurn = () => sanitizer.resetTurn();
-		session.eventBus.subscribe('turn.end', resetTurn);
-		session.eventBus.subscribe('turn.interrupted', resetTurn);
-		console.log(`${ts()} [OutputSanitizer] wired into transport.onOutputTranscription (per-turn buffered)`);
 	})();
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings

@@ -80,3 +80,43 @@ export function createOutputSanitizer(hooks: OutputSanitizerHooks): OutputSaniti
 
 	return { handleChunk, resetTurn };
 }
+
+/** The transport surface the wiring touches. Both fields are optional because
+ * GeminiLiveTransport and OpenAIRealtimeTransport expose different subsets. */
+export interface SanitizableTransport {
+	onAudioOutput?: (b64: string) => void;
+	onOutputTranscription?: (text: string) => void;
+}
+
+export interface SanitizerWiring {
+	transport: SanitizableTransport | null | undefined;
+	subscribe: (event: string, handler: () => void) => void;
+	onBlocked?: (buffered: string) => void;
+	log?: (message: string) => void;
+}
+
+/** Install the sanitizer between the transport and its consumers.
+ *
+ * Audio is gated by CLOSING OVER a local flag and wrapping the transport's own
+ * callback — never by probing a `_suppressAudio` field, which only one transport
+ * defines and which is absent at wiring time on the other.
+ */
+export function wireSanitizerToTransport(deps: SanitizerWiring): boolean {
+	const transport = deps.transport;
+	if (!transport) return false;
+	let suppressAudio = false;
+	const origOnAudioOutput = transport.onAudioOutput?.bind(transport);
+	transport.onAudioOutput = (b64: string) => { if (suppressAudio) return; origOnAudioOutput?.(b64); };
+	const origOnOutputTranscription = transport.onOutputTranscription?.bind(transport);
+	const sanitizer = createOutputSanitizer({
+		forward: (t) => origOnOutputTranscription?.(t),
+		setSuppressAudio: (on) => { suppressAudio = on; },
+		onBlocked: deps.onBlocked,
+	});
+	transport.onOutputTranscription = (text: string) => sanitizer.handleChunk(text);
+	const resetTurn = () => sanitizer.resetTurn();
+	deps.subscribe('turn.end', resetTurn);
+	deps.subscribe('turn.interrupted', resetTurn);
+	deps.log?.('[OutputSanitizer] wired into transport.onOutputTranscription (per-turn buffered)');
+	return true;
+}
