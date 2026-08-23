@@ -6,6 +6,7 @@ Run: python3 tests/census-d1-anchors.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
@@ -15,16 +16,20 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "census-d1.py"
 DOC = REPO / "docs" / "census" / "d1-identity-census.md"
 
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+
 
 class CensusAnchors(unittest.TestCase):
     def test_every_anchor_matches_the_tree(self):
-        p = subprocess.run([sys.executable, str(SCRIPT), "--verify"],
+        p = subprocess.run([*PYBASE, str(SCRIPT), "--verify"],
                            capture_output=True, text=True, timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
 
     def test_committed_doc_is_generated_not_hand_edited(self):
         committed = DOC.read_text()
-        p = subprocess.run([sys.executable, str(SCRIPT), "--write-doc"],
+        p = subprocess.run([*PYBASE, str(SCRIPT), "--write-doc"],
                            capture_output=True, text=True, timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         regenerated = DOC.read_text()
