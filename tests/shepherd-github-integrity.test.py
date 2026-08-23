@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""The durable record must not rebind its own subject, hold an impossible state,
+or lose a concurrent terminal write.
+
+Every case drives the PRODUCTION functions. A test that reimplements the write
+recipe proves the recipe, not the code that ships.
+"""
+
+import json
+import pathlib
+import sys
+import tempfile
+import threading
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+WORK = tempfile.mkdtemp(prefix="shepherd-integrity-")
+
+import shepherd_github as g  # noqa: E402
+from shepherd_contract import Actor, ResponsibilityScope  # noqa: E402
+
+g.state_dir = lambda: pathlib.Path(WORK) / "state" / "shepherd"
+
+failures = []
+
+
+def check(name, got, want):
+    if got != want:
+        failures.append(f"{name}: got {got!r}, want {want!r}")
+
+
+def raises(name, fn, exc=Exception):
+    try:
+        fn()
+    except exc:
+        return
+    except Exception as e:  # wrong type still counts as not-the-contract
+        failures.append(f"{name}: raised {type(e).__name__}, want {exc.__name__}")
+        return
+    failures.append(f"{name}: did NOT raise {exc.__name__}")
+
+
+def scope_for(repo, number, actor=None):
+    return ResponsibilityScope(
+        subjects=(g.subject_for(repo, number),),
+        actor=actor or Actor(g.ACTOR_SCHEME, "someone@example.com"),
+        watch_conditions=g.WATCH,
+        success_conditions=g.SUCCESS,
+        failure_conditions=g.FAILURE)
+
+
+# --- 1. the persisted subject may not disagree with the scope -----------------
+sc = scope_for("org/repo-a", 1)
+g.save("task-integrity-1", sc, "waiting", "seed")
+rec = g.load("task-integrity-1")
+check("subject.repo derived from scope", rec["repo"], "org/repo-a")
+check("subject.number derived from scope", rec["number"], 1)
+back = g.scope_from_saved(rec)
+check("round-trip subject is the same subject", back.subjects, sc.subjects)
+
+# --- 2. an impossible state may not be written or loaded ----------------------
+raises("save rejects a state outside SHEPHERD_STATES",
+       lambda: g.save("task-integrity-2", scope_for("org/repo-a", 2), "typo-state"),
+       ValueError)
+
+p = g._contract_path("task-integrity-3")
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps({"task_id": "task-integrity-3", "provider": "github",
+                         "repo": "org/repo-a", "number": 3,
+                         "actor_scheme": g.ACTOR_SCHEME, "actor_value": "x@y.z",
+                         "state": "typo-state", "note": "",
+                         "waiting_for": [], "success_conditions": [],
+                         "failure_conditions": []}))
+raises("load rejects a record carrying an invalid state",
+       lambda: g.load("task-integrity-3"), ValueError)
+
+p4 = g._contract_path("task-integrity-4")
+p4.write_text(json.dumps({"task_id": "task-integrity-4", "state": "waiting"}))
+raises("load rejects a record missing required keys",
+       lambda: g.load("task-integrity-4"), ValueError)
+
+# --- 3. two concurrent saves must both complete -------------------------------
+g.save("task-integrity-5", scope_for("org/repo-a", 5), "waiting", "seed")
+errs = []
+barrier = threading.Barrier(2)
+
+
+def racer(note):
+    def run():
+        try:
+            barrier.wait(timeout=5)
+            g.save("task-integrity-5", scope_for("org/repo-a", 5), "waiting", note)
+        except Exception as e:
+            errs.append(type(e).__name__)
+    return run
+
+
+ts = [threading.Thread(target=racer(f"n{i}")) for i in range(2)]
+[t.start() for t in ts]
+[t.join(10) for t in ts]
+check("concurrent save() raises nothing", errs, [])
+check("record still parses after the race",
+      g.load("task-integrity-5")["state"], "waiting")
+
+# --- 4. resume() must not reopen a terminal state written mid-observation -----
+g.save("task-integrity-6", scope_for("org/repo-a", 6), "waiting", "seed")
+released = threading.Event()
+
+_real_observe = g.observe
+
+
+def slow_observe(repo, number):
+    # A concurrent pass terminates the objective while this one is on the wire.
+    g.save("task-integrity-6", scope_for("org/repo-a", 6), "succeeded", "won the race")
+    released.set()
+    return g.ObservedEvent(
+        event_type="github.pull_request.updated",
+        subject=g.subject_for(repo, number),
+        actor=Actor(g.ACTOR_SCHEME, "someone@example.com"))
+
+
+g.observe = slow_observe
+try:
+    state, why = g.resume("task-integrity-6")
+finally:
+    g.observe = _real_observe
+
+check("resume returns the concurrent terminal state", state, "succeeded")
+check("durable record keeps the terminal state", g.load("task-integrity-6")["state"], "succeeded")
+
+# --- 5. hostile / malformed subjects and records ------------------------------
+from shepherd_contract import Subject  # noqa: E402
+
+two = ResponsibilityScope(
+    subjects=(g.subject_for("org/repo-a", 7), g.subject_for("org/repo-b", 8)),
+    actor=Actor(g.ACTOR_SCHEME, "a@b.c"), watch_conditions=g.WATCH,
+    success_conditions=g.SUCCESS, failure_conditions=g.FAILURE)
+raises("save rejects a scope with two pull_request subjects",
+       lambda: g.save("task-integrity-7", two, "waiting"), ValueError)
+
+malformed = ResponsibilityScope(
+    subjects=(Subject(g.PROVIDER, "pull_request", "no-hash-here"),),
+    actor=Actor(g.ACTOR_SCHEME, "a@b.c"), watch_conditions=g.WATCH,
+    success_conditions=g.SUCCESS, failure_conditions=g.FAILURE)
+raises("save rejects a subject id with no #number",
+       lambda: g.save("task-integrity-8", malformed, "waiting"), ValueError)
+
+
+def _write_raw(task_id, obj):
+    q = g._contract_path(task_id)
+    q.parent.mkdir(parents=True, exist_ok=True)
+    q.write_text(json.dumps(obj))
+
+
+base = {"task_id": "x", "provider": "github", "repo": "o/r", "number": 1,
+        "actor_scheme": g.ACTOR_SCHEME, "actor_value": "a@b.c",
+        "state": "waiting", "note": "", "waiting_for": [],
+        "success_conditions": [], "failure_conditions": []}
+
+_write_raw("task-integrity-9", [1, 2, 3])
+raises("load rejects a non-object record", lambda: g.load("task-integrity-9"), ValueError)
+
+_write_raw("task-integrity-10", {**base, "provider": "gitlab"})
+raises("load rejects another provider's record",
+       lambda: g.load("task-integrity-10"), ValueError)
+
+_write_raw("task-integrity-11", {**base, "number": "1"})
+raises("load rejects a non-integer number",
+       lambda: g.load("task-integrity-11"), ValueError)
+
+check("load of an absent contract is None", g.load("task-integrity-99"), None)
+
+# --- 6. the three resume outcomes still work under the lock -------------------
+def _resume_with(task_id, event, seed="waiting"):
+    g.save(task_id, scope_for("org/repo-a", 12), seed, "seed")
+    real = g.observe
+    g.observe = lambda repo, number: event
+    try:
+        return g.resume(task_id)
+    finally:
+        g.observe = real
+
+
+ignored = g.ObservedEvent(
+    event_type="github.pull_request.merged",
+    subject=g.subject_for("other/repo", 99),
+    actor=Actor(g.ACTOR_SCHEME, "a@b.c"))
+st, why = _resume_with("task-integrity-12", ignored)
+check("an event about another subject does not move the state", st, "waiting")
+check("...and says it was ignored", "ignored" in why, True)
+
+merged_verified = g.ObservedEvent(
+    event_type="github.pull_request.merged",
+    subject=g.subject_for("org/repo-a", 12),
+    actor=Actor("matrix.mxid", "@someone:example.org"))
+vscope = ResponsibilityScope(
+    subjects=(g.subject_for("org/repo-a", 12),),
+    actor=Actor("matrix.mxid", "@someone:example.org"),
+    watch_conditions=g.WATCH, success_conditions=g.SUCCESS,
+    failure_conditions=g.FAILURE)
+g.save("task-integrity-13", vscope, "waiting", "seed")
+_real = g.observe
+g.observe = lambda repo, number: merged_verified
+try:
+    st, why = g.resume("task-integrity-13")
+finally:
+    g.observe = _real
+check("a verified merged event terminates", st, "succeeded")
+check("and the terminal state is durable", g.load("task-integrity-13")["state"], "succeeded")
+
+merged_asserted = g.ObservedEvent(
+    event_type="github.pull_request.merged",
+    subject=g.subject_for("org/repo-a", 12),
+    actor=Actor(g.ACTOR_SCHEME, "someone@example.com"))
+st, why = _resume_with("task-integrity-14", merged_asserted, seed="blocked")
+check("an asserted actor cannot terminate", st, "blocked")
+check("...and the note names the proposal", "proposed=succeeded" in why, True)
+
+# --- 7. a failed write leaves no temp behind, and the error is not swallowed --
+g.save("task-integrity-15", scope_for("org/repo-a", 15), "waiting", "seed")
+_real_dump = json.dump
+
+
+def _boom(*a, **k):
+    raise RuntimeError("disk went away mid-write")
+
+
+json.dump = _boom
+try:
+    raises("a failed write re-raises", lambda: g.save(
+        "task-integrity-15", scope_for("org/repo-a", 15), "waiting"), RuntimeError)
+finally:
+    json.dump = _real_dump
+check("a failed write leaves no .tmp behind",
+      [q.name for q in g.state_dir().iterdir() if q.name.endswith(".tmp")], [])
+check("the previous record survives a failed write",
+      g.load("task-integrity-15")["note"], "seed")
+
+# --- 8. resume guards: absent contract, and one deleted mid-observation -------
+check("resume on an absent contract", g.resume("task-integrity-98")[0], "unknown")
+
+g.save("task-integrity-16", scope_for("org/repo-a", 16), "waiting", "seed")
+_real2 = g.observe
+
+
+def _delete_then_observe(repo, number):
+    g._contract_path("task-integrity-16").unlink()
+    return g.ObservedEvent(event_type="github.pull_request.updated",
+                           subject=g.subject_for(repo, number),
+                           actor=Actor(g.ACTOR_SCHEME, "someone@example.com"))
+
+
+g.observe = _delete_then_observe
+try:
+    st16, why16 = g.resume("task-integrity-16")
+finally:
+    g.observe = _real2
+check("a contract deleted mid-observation is not resurrected", st16, "unknown")
+check("...and says so", "disappeared" in why16, True)
+
+# --- 9. an already-terminal record is not re-observed at all ------------------
+g.save("task-integrity-17", scope_for("org/repo-a", 17), "succeeded", "done")
+_real3 = g.observe
+
+
+def _must_not_run(repo, number):
+    failures.append("terminal record was re-observed")
+    raise AssertionError
+
+
+g.observe = _must_not_run
+try:
+    st17, why17 = g.resume("task-integrity-17")
+finally:
+    g.observe = _real3
+check("a terminal record short-circuits", st17, "succeeded")
+check("...without a network call", "not re-observed" in why17, True)
+
+print(f"integrity: {len(failures)} failure(s)")
+for f in failures:
+    print("  FAIL", f)
+sys.exit(1 if failures else 0)

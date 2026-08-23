@@ -34,7 +34,7 @@ PEER = Actor(g.ACTOR_SCHEME, "qingyun@ag2.ai")
 scope = g.scope_for("o/r", 1, MINE)
 
 # state written by THIS process...
-path = g.save("task-dur-1", "o/r", 1, scope, "waiting", "initial")
+path = g.save("task-dur-1", scope, "waiting", "initial")
 check("contract file exists", path.is_file(), True)
 
 # ...is readable by a genuinely separate interpreter, given only the task id
@@ -58,9 +58,12 @@ check("rehydrated rejects peer actor", rehydrated.actor.matches(PEER), False)
 check("rehydrated keeps outcome conditions",
       rehydrated.success_conditions, scope.success_conditions)
 
-# the write is atomic: no .tmp is left where a reader would find a partial file
+# A .lock is not a partial file. Assert on temp files specifically, so a leaked
+# .tmp still fails while a new intentional artifact does not.
 check("no partial file left behind",
-      sorted(p.suffix for p in g.state_dir().iterdir()), [".json"])
+      sorted(p.name for p in g.state_dir().iterdir() if p.name.endswith(".tmp")), [])
+check("the durable record is present",
+      sorted(p.suffix for p in g.state_dir().iterdir() if p.suffix == ".json"), [".json"])
 
 check("unknown task id is unknown, not a crash", g.load("task-does-not-exist"), None)
 
@@ -76,7 +79,7 @@ def raises(fn):
 # a task_id becomes a filename, so an unvalidated one escapes the directory
 outside = pathlib.Path(WORK) / "escaped.json"
 check("traversal id refused on save",
-      raises(lambda: g.save("../../escaped", "o/r", 1, scope, "waiting")), True)
+      raises(lambda: g.save("../../escaped", scope, "waiting")), True)
 check("traversal id refused on load", raises(lambda: g.load("../../escaped")), True)
 check("no file written outside the state dir", outside.exists(), False)
 check("absolute path id refused", raises(lambda: g.load("/etc/passwd")), True)
@@ -89,20 +92,20 @@ g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
     "github.pull_request.updated", g.subject_for(repo, num), MINE)
 
 for prior in ("failed", "succeeded", "cancelled"):
-    g.save("task-dur-2", "o/r", 1, scope, prior)
+    g.save("task-dur-2", scope, prior)
     state, why = g.resume("task-dur-2")
     check(f"terminal {prior} stays {prior}", state, prior)
     check(f"terminal {prior} not re-observed", "not re-observed" in why, True)
 
 for prior in ("blocked", "needs_human", "waiting"):
-    g.save("task-dur-2", "o/r", 1, scope, prior)
+    g.save("task-dur-2", scope, prior)
     state, _ = g.resume("task-dur-2")
     check(f"progress preserves {prior}", state, prior)
 
 # an asserted actor's merge is surfaced but does not close the objective
 g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
     "github.pull_request.merged", g.subject_for(repo, num), MINE)
-g.save("task-dur-2", "o/r", 1, scope, "waiting")
+g.save("task-dur-2", scope, "waiting")
 state, why = g.resume("task-dur-2")
 check("asserted merge does not terminate", state, "waiting")
 check("but it is reported as proposed", "proposed=succeeded" in why, True)
@@ -177,7 +180,7 @@ check("resume on an unknown task id is 'unknown', not a crash",
 # an event that is not admitted preserves state and says why
 g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
     "github.pull_request.updated", g.subject_for(repo, num), PEER)
-g.save("task-dur-3", "o/r", 1, scope, "waiting")
+g.save("task-dur-3", scope, "waiting")
 _st, _why = g.resume("task-dur-3")
 check("unadmitted event preserves state", _st, "waiting")
 check("unadmitted event reports the decision", "ignored" in _why, True)
@@ -185,7 +188,7 @@ check("unadmitted event reports the decision", "ignored" in _why, True)
 # a VERIFIED actor's outcome does terminate, exercising the terminal branch
 VERIFIED = Actor("matrix.mxid", "@qingyun-air.agent:ag2.space")
 vscope = g.scope_for("o/r", 2, VERIFIED)
-g.save("task-dur-4", "o/r", 2, vscope, "waiting")
+g.save("task-dur-4", vscope, "waiting")
 g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
     "github.pull_request.merged", g.subject_for(repo, num), VERIFIED)
 check("verified merge terminates the objective", g.resume("task-dur-4")[0], "succeeded")

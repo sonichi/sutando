@@ -12,14 +12,18 @@ the workspace is the durable per-user location and survives app updates.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 from local_task_protocol import valid_task_id
 from shepherd_contract import (
+    SHEPHERD_STATES,
     Actor,
     ObservedEvent,
     ResponsibilityScope,
@@ -98,14 +102,76 @@ def _contract_path(task_id: str) -> Path:
 
 def _atomic_write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    # A per-record temp name would be shared by two concurrent writers, and the
+    # loser's os.replace() then fails on a file the winner already moved.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
-def save(task_id: str, repo: str, number: int, scope: ResponsibilityScope,
-         state: str, note: str = "") -> Path:
-    """Persist the waiting contract. Atomic: a reader never sees a half-write."""
+@contextlib.contextmanager
+def _record_lock(task_id: str):
+    """Serialize the read-modify-write of one record. Held across the rewrite
+    only -- never across a network call."""
+    p = _contract_path(task_id).with_suffix(".lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _subject_parts(scope: ResponsibilityScope) -> tuple[str, int]:
+    """The persisted subject is DERIVED from the scope. Carrying repo/number as
+    separate arguments gives one fact two sources, and the record can then be
+    reloaded as a different pull request than the one it was accepted for."""
+    subs = [s for s in scope.subjects
+            if s.provider == PROVIDER and s.kind == "pull_request"]
+    if len(subs) != 1:
+        raise ValueError(f"expected exactly 1 {PROVIDER} pull_request subject, got {len(subs)}")
+    repo, sep, number = subs[0].resource_id.rpartition("#")
+    if not sep or not repo.strip() or not number.isdigit():
+        raise ValueError(f"malformed subject resource_id: {subs[0].resource_id!r}")
+    return repo, int(number)
+
+
+_REQUIRED_KEYS = ("task_id", "provider", "repo", "number", "actor_scheme",
+                  "actor_value", "state", "waiting_for", "success_conditions",
+                  "failure_conditions")
+
+
+def _validate_record(rec: dict, task_id: str) -> dict:
+    """Fail closed on a record that cannot be a real contract. An unvalidated
+    load lets a hand-edited or truncated file drive a live objective."""
+    if not isinstance(rec, dict):
+        raise ValueError(f"contract for {task_id} is not an object")
+    missing = [k for k in _REQUIRED_KEYS if k not in rec]
+    if missing:
+        raise ValueError(f"contract for {task_id} is missing {missing}")
+    if rec["state"] not in SHEPHERD_STATES:
+        raise ValueError(f"contract for {task_id} carries invalid state {rec['state']!r}")
+    if rec["provider"] != PROVIDER:
+        raise ValueError(f"contract for {task_id} is not a {PROVIDER} record")
+    if not isinstance(rec["number"], int):
+        raise ValueError(f"contract for {task_id} has non-integer number")
+    return rec
+
+
+def _write_record(task_id: str, scope: ResponsibilityScope, state: str,
+                  note: str = "") -> Path:
+    """Caller holds the record lock."""
+    if state not in SHEPHERD_STATES:
+        raise ValueError(f"refusing to persist state {state!r}; not in SHEPHERD_STATES")
+    repo, number = _subject_parts(scope)
     p = _contract_path(task_id)
     _atomic_write(p, {
         "task_id": task_id, "provider": PROVIDER, "repo": repo, "number": number,
@@ -118,9 +184,18 @@ def save(task_id: str, repo: str, number: int, scope: ResponsibilityScope,
     return p
 
 
+def save(task_id: str, scope: ResponsibilityScope, state: str,
+         note: str = "") -> Path:
+    """Persist the waiting contract. Atomic: a reader never sees a half-write."""
+    with _record_lock(task_id):
+        return _write_record(task_id, scope, state, note)
+
+
 def load(task_id: str) -> Optional[dict]:
     p = _contract_path(task_id)
-    return json.loads(p.read_text()) if p.is_file() else None
+    if not p.is_file():
+        return None
+    return _validate_record(json.loads(p.read_text()), task_id)
 
 
 def scope_from_saved(rec: dict) -> ResponsibilityScope:
@@ -141,28 +216,38 @@ def resume(task_id: str) -> tuple[str, str]:
     rec = load(task_id)
     if rec is None:
         return "unknown", f"no persisted contract for {task_id}"
-    prior = rec["state"]
     # A terminal record is final: re-observing must never reopen it, and the
     # network call is pointless once the objective is closed.
-    if is_terminal(prior):
-        return prior, f"already terminal ({prior}); not re-observed"
+    if is_terminal(rec["state"]):
+        return rec["state"], f"already terminal ({rec['state']}); not re-observed"
 
     scope = scope_from_saved(rec)
-    event = observe(rec["repo"], rec["number"])
-    decision, why = admit(event, scope)
-    if decision != "accepted":
-        save(task_id, rec["repo"], rec["number"], scope, prior, why)
-        return prior, f"{event.event_type} {decision}: {why}"
+    event = observe(rec["repo"], rec["number"])  # network: NO lock held
 
-    terminal = terminal_state_for(event, scope)
-    if terminal:
-        save(task_id, rec["repo"], rec["number"], scope, terminal, why)
-        return terminal, f"{event.event_type} accepted -> {terminal}"
+    # Another pass may have terminated the objective while we were on the wire;
+    # persisting the pre-observation state would silently reopen it.
+    with _record_lock(task_id):
+        cur = load(task_id)
+        if cur is None:
+            return "unknown", f"contract for {task_id} disappeared mid-observation"
+        prior = cur["state"]
+        if is_terminal(prior):
+            return prior, f"terminated concurrently ({prior}); observation discarded"
 
-    # Progress is not a transition: keep whatever state the objective was in
-    # (blocked / needs_human / waiting) rather than flattening it to waiting.
-    proposed = proposed_terminal_state(event, scope)
-    note = (f"{event.event_type} accepted; outcome proposed={proposed} but actor "
-            f"scheme is asserted, not verified — not terminating") if proposed else why
-    save(task_id, rec["repo"], rec["number"], scope, prior, note)
-    return prior, note
+        decision, why = admit(event, scope)
+        if decision != "accepted":
+            _write_record(task_id, scope, prior, why)
+            return prior, f"{event.event_type} {decision}: {why}"
+
+        terminal = terminal_state_for(event, scope)
+        if terminal:
+            _write_record(task_id, scope, terminal, why)
+            return terminal, f"{event.event_type} accepted -> {terminal}"
+
+        # Progress is not a transition: keep whatever state the objective was in
+        # (blocked / needs_human / waiting) rather than flattening it to waiting.
+        proposed = proposed_terminal_state(event, scope)
+        note = (f"{event.event_type} accepted; outcome proposed={proposed} but actor "
+                f"scheme is asserted, not verified — not terminating") if proposed else why
+        _write_record(task_id, scope, prior, note)
+        return prior, note
