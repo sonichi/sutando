@@ -499,6 +499,28 @@ def test_direct_failure_and_cli_edges() -> None:
         check(worker.resolve_room_key(workspace / "tasks" / "absent.txt") is None,
               "room resolver fails closed on an unreadable task")
 
+        unreadable = task(workspace, "task-unreadable")
+        with patch.object(worker, "resolve_access_tier", return_value="owner"), \
+             patch.object(Path, "read_text", side_effect=OSError("unreadable")):
+            check(worker.resolve_room_key(unreadable) is None,
+                  "room resolver fails closed when task reading raises")
+
+        with patch.object(worker.json, "loads", side_effect=ValueError("bad manifest")):
+            check(worker._manifest_config("SUTANDO_TIER_HARD_TIMEOUT") == "",
+                  "malformed manifest yields no timeout default")
+
+        outcome_name = "task-outcome.txt"
+        worker._atomic_text(worker._outcome_path(workspace, outcome_name), "unknown\n")
+        check(worker._settle_outcome_unknown(workspace, results, outcome_name),
+              "durable outcome receipt publishes when the destination is available")
+        check(not worker._outcome_path(workspace, outcome_name).exists(),
+              "published outcome receipt is removed")
+
+        with patch.object(worker, "_atomic_text", side_effect=OSError("state unavailable")):
+            worker._record_outcome_unknown(workspace, results, "task-state-error.txt", "unknown")
+        check(not (results / "task-state-error.txt").exists(),
+              "outcome recording fails closed when durable state is unavailable")
+
         published = results / "publish-once.txt"
         worker._publish_once(published, "first\n")
         accepted = worker._publish_once(published, "second\n")
@@ -510,6 +532,13 @@ def test_direct_failure_and_cli_edges() -> None:
              patch.object(worker, "_run_codex") as provider:
             code = worker.handle("codex", workspace, raced, results, REPO)
         check(code == 0 and not provider.called, "locked completion check prevents a duplicate launch")
+
+        settled = task(workspace, "task-settled-outcome", room_id="!settled-outcome:a")
+        with patch.object(worker, "_settle_outcome_unknown", side_effect=[False, True]), \
+             patch.object(worker, "_run_codex") as provider:
+            code = worker.handle("codex", workspace, settled, results, REPO)
+        check(code == 0 and not provider.called,
+              "locked outcome receipt check prevents a duplicate launch")
 
         argv = ["session-worker", "--runtime", "codex", "--workspace", str(workspace),
                 "--task-file", str(raced), "--results-dir", str(results), "--repo", str(REPO)]
