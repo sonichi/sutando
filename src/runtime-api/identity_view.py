@@ -63,16 +63,26 @@ class IdentityView:
     # ── sutando.stand ───────────────────────────────────────────────────────
     def stand(self) -> dict:
         # Stand = the durable owner-governed subject; every field must come
-        # from an explicit record (enrolled identity, channel owner record).
+        # from an explicit record (enrolled identity, stand.json bindings).
         out: dict = {}
         enrolled = self._enrolled()
         if enrolled.get("agent_id"):
             out["stand_id"] = enrolled["agent_id"]
-        native = dict(self._channels_named("ag2space"))
-        acc = native.get("ag2space") or {}
-        if acc.get("tofuOwner"):
-            out["owner"] = {"person_id": acc["tofuOwner"],
-                            "verification": "explicit"}
+        # Top-level Owner only from an explicit OwnerBinding (stand.json);
+        # channel tofuOwner is entrance-scoped evidence, never promoted.
+        rec = self._stand_record()
+        owners = [o for o in (rec.get("owners") or [])
+                  if isinstance(o, dict) and o.get("person_id")]
+        if owners:
+            prim = owners[0]
+            owner_out = {"person_id": prim["person_id"]}
+            for k in ("display_name", "role"):
+                if prim.get(k):
+                    owner_out[k] = prim[k]
+            owner_out["verification"] = "explicit_owner_binding"
+            out["owner"] = owner_out
+        if rec.get("display_name"):
+            out["display_name"] = rec["display_name"]
         out["actor"] = {"actor_id": self.actor_id}
         inst: dict = {}
         if self.host_label:
@@ -105,17 +115,19 @@ class IdentityView:
         return {"channels": channels}
 
     # ── internals ───────────────────────────────────────────────────────────
+    def _stand_record(self) -> dict:
+        try:
+            rec = json.loads((self.state_dir / "auth" / "stand.json").read_text())
+            return rec if isinstance(rec, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
     def _enrolled(self) -> dict:
         try:
             rec = json.loads((self.state_dir / "auth" / "ag2space.json").read_text())
             return rec if isinstance(rec, dict) else {}
         except (OSError, ValueError):
             return {}
-
-    def _channels_named(self, name: str):
-        for n, acc in self._channels():
-            if n == name:
-                yield n, acc
 
     def _channels(self):
         if self.channels_dir is None or not self.channels_dir.is_dir():

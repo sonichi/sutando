@@ -165,11 +165,19 @@ class TestStand(unittest.TestCase):
         self._enroll()
         self._native_channel({"tofuOwner": "@owner:ag2.space",
                               "tierMap": {"@x:ag2.space": "team"}})
+        (self.state / "auth" / "stand.json").write_text(json.dumps(
+            {"display_name": "Sutando",
+             "owners": [{"person_id": "@owner:ag2.space",
+                         "display_name": "Owner Person",
+                         "role": "primary_owner"}]}))
         out = _mk(self.state, self.channels, host_label="host-1").stand()
         self.assertEqual(out["stand_id"], "@stand:ag2.space")
+        self.assertEqual(out["display_name"], "Sutando")
         self.assertEqual(out["owner"],
                          {"person_id": "@owner:ag2.space",
-                          "verification": "explicit"})
+                          "display_name": "Owner Person",
+                          "role": "primary_owner",
+                          "verification": "explicit_owner_binding"})
         self.assertEqual(out["actor"], {"actor_id": "@me:example.org"})
         self.assertEqual(out["instance"], {"host_label": "host-1"})
 
@@ -182,10 +190,12 @@ class TestStand(unittest.TestCase):
         self.assertEqual(out["actor"], {"actor_id": "@me:example.org"})
         self.assertNotIn(None, out.values())
 
-    def test_owner_not_inferred_from_tiermap_or_other_channels(self):
+    def test_owner_never_promoted_from_channel_evidence(self):
         self._enroll()
-        # native channel has tierMap owner but NO tofuOwner -> omit
-        self._native_channel({"tierMap": {"@o:ag2.space": "owner"}})
+        # tofuOwner anywhere is entrance-scoped evidence, not a Stand-level
+        # OwnerBinding — top-level owner must stay absent without stand.json
+        self._native_channel({"tofuOwner": "@o:ag2.space",
+                              "tierMap": {"@o:ag2.space": "owner"}})
         d = self.channels / "slack"
         d.mkdir(parents=True)
         (d / "access.json").write_text(json.dumps({"tofuOwner": "U1"}))

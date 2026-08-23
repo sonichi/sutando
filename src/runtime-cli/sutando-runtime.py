@@ -617,10 +617,16 @@ def _print_stand(result: dict, sub: "str | None") -> int:
         return 0
     rows = []
     if result.get("stand_id"):
-        rows.append(("Stand", result["stand_id"]))
+        label = result["stand_id"]
+        if result.get("display_name"):
+            label = f"{result['display_name']} ({label})"
+        rows.append(("Stand", label))
     owner = result.get("owner") or {}
     if owner.get("person_id"):
-        rows.append(("Owner", owner["person_id"]))
+        oid = owner["person_id"]
+        if owner.get("display_name"):
+            oid = f"{owner['display_name']} ({oid})"
+        rows.append(("Owner", oid))
     inst = result.get("instance") or {}
     for key, label in (("instance_id", "Instance"),
                        ("installation_id", "Installation"),
