@@ -149,7 +149,7 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
@@ -5329,7 +5329,7 @@ async def poll_proactive():
                     _pp = parse_markers(text)
                     # Honor suppression markers, same as poll_dm_fallback —
                     # else a skip-marked file still gets DM-attempted here.
-                    if any(a.kind == "skip" for a in _pp.actions):
+                    if has_skip_action(_pp.actions):
                         print(f"  [proactive] skipped (suppression marker): {f.name}", flush=True)
                         _proactive_fence().drop(f, "suppression marker (no-send/deduped/REPLIED)")
                         continue
@@ -5735,7 +5735,7 @@ async def poll_dm_fallback():
                 except OSError:
                     _peek = ""
                 _parsed_fb = parse_markers(_peek)
-                if any(a.kind == "skip" for a in _parsed_fb.actions):
+                if has_skip_action(_parsed_fb.actions):
                     print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
                     _task_id = f.stem
                     _task_file = find_task_file(TASKS_DIR, _task_id)
