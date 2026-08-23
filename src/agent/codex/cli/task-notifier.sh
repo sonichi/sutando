@@ -106,7 +106,8 @@ PY
   then
     return 1
   fi
-  rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
+  rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename" 2>/dev/null || true
+  return 0
 }
 
 core_pane_is_busy() {

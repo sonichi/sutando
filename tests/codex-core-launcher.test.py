@@ -688,6 +688,30 @@ exit 0
         calls = self.log.read_text() if self.log.exists() else ""
         self.assertNotIn("send-keys", calls)
 
+    def test_notifier_ready_result_ignores_stale_fallback_cleanup_failure(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        fallback = workspace / "state" / "task-event-handler-fallbacks" / "task-done.txt"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        fallback.mkdir(parents=True)
+        (tasks / "task-done.txt").write_text("task: done\n")
+        (results / "task-done.txt").write_text("already complete\n")
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("send-keys", self.log.read_text() if self.log.exists() else "")
+        self.assertTrue(fallback.is_dir())
+
     def test_notifier_does_not_replay_task_with_archived_result(self):
         workspace = self.root / "workspace"
         (workspace / "tasks").mkdir(exist_ok=True)
