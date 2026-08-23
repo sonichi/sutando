@@ -156,10 +156,8 @@ def _write_raw(task_id, obj):
 base = {"task_id": "x", "provider": "github", "repo": "o/r", "number": 1,
         "actor_scheme": g.ACTOR_SCHEME, "actor_value": "a@b.c",
         "state": "waiting", "note": "",
-        # A VALID record: every targeted test below mutates one field, so the
-        # fixture must not already violate a different rule — an empty
-        # collection would trip the arity check first and the test would pass
-        # on the wrong ValueError.
+        # Must itself be VALID: an empty collection here would trip the arity
+        # check first and every targeted test below would pass on the wrong error.
         "waiting_for": ["github.pull_request.updated"],
         "success_conditions": ["github.pull_request.merged"],
         "failure_conditions": ["github.pull_request.closed_unmerged"]}
@@ -376,8 +374,7 @@ raises("scope_from_saved rejects a scalar condition string",
        lambda: g.scope_from_saved({**base, "waiting_for": "abc.def"}), ValueError)
 
 # --- 15. arity: an empty collection satisfies every element check by vacuity --
-# A record that watches nothing, or whose only outcomes are both empty, loads
-# cleanly and can then never progress or complete.
+# Such a record loads cleanly and can then never progress or complete.
 _write_raw("task-integrity-26", {**base, "task_id": "task-integrity-26",
                                  "success_conditions": [], "failure_conditions": []})
 raises("load rejects a record with no reachable outcome",
