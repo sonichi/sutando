@@ -155,6 +155,22 @@ def revoke_link(state_dir: str | Path, provider: str, revoked_by: str,
     raise ValueError(f"no active {provider} link to revoke")
 
 
+def verify_slack(state_dir: str | Path, token: str) -> dict:
+    """auth.test introspection: token -> team + bot identity. The workspace
+    (team_id) is the AUTHORITY scope and lives inside the typed subject."""
+    from slack_sdk import WebClient  # noqa: PLC0415
+    auth = WebClient(token=token).auth_test()
+    subject = {"type": "workspace_bot", "authority": str(auth["team_id"]),
+               "id": str(auth["user_id"])}
+    display = {"name": str(auth.get("user") or "")} if auth.get("user") else None
+    verification = {
+        "method": "slack_auth_test",
+        "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    return upsert_link(state_dir, "slack", subject, verification,
+                       _fingerprint(token), display=display)
+
+
 def verify_discord(state_dir: str | Path, token: str) -> dict:
     req = urllib.request.Request(
         "https://discord.com/api/v10/users/@me",
