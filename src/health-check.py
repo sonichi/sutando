@@ -3066,18 +3066,11 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
     repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
     manifest = Path(manifest_path) if manifest_path is not None else repo.parent / "ENGINE_MANIFEST.json"
 
-    if not manifest.is_file():
-        # A plain source clone has no bundle manifest — nothing to compare.
-        return {"name": name, "status": "ok",
-                "detail": "no ENGINE_MANIFEST.json — not a bundled engine, skipping"}
-    try:
-        built = (json.loads(manifest.read_text()) or {}).get("sha")
-    except (OSError, ValueError) as e:
-        return {"name": name, "status": "ok",
-                "detail": f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]}) — skipping"}
-    if not isinstance(built, str) or not built.strip():
-        return {"name": name, "status": "ok",
-                "detail": "ENGINE_MANIFEST.json has no sha — skipping"}
+    built, why = engine_manifest_sha(manifest)
+    if built is None:
+        # Shared with the restart guard: a damaged manifest is "no provenance",
+        # never an exception that aborts the rest of the always-on pass.
+        return {"name": name, "status": "ok", "detail": f"{why} — skipping"}
     built = built.strip()
 
     # A resolver failure must degrade like resolve_git() -> None, never to bare
@@ -3345,20 +3338,32 @@ CHECKOUT_UNREADABLE = "git state unreadable"
 CHECKOUT_NONGIT = "non-git install"
 
 
-def _valid_engine_manifest(manifest) -> bool:
-    """The same three criteria check_engine_revision_drift applies: a regular
-    file, readable JSON object, non-empty sha. Existence alone is not provenance."""
+def engine_manifest_sha(manifest) -> tuple:
+    """The single owner of manifest parse + shape validation.
+
+    Returns (sha, reason). `sha` is None whenever the file cannot supply
+    provenance; `reason` is the caller-facing phrase for that case.
+    """
     manifest = Path(manifest)
     if not manifest.is_file():
-        return False
+        return None, "no ENGINE_MANIFEST.json — not a bundled engine"
     try:
         parsed = json.loads(manifest.read_text())
-    except (OSError, ValueError):
-        return False
+    except (OSError, ValueError) as e:
+        return None, f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]})"
     if not isinstance(parsed, dict):
-        return False  # valid JSON scalar/list is still not a manifest
+        # Valid JSON scalar/list is still not a manifest. Both callers must see
+        # this as "no provenance", never as an exception.
+        return None, f"ENGINE_MANIFEST.json is {type(parsed).__name__}, not an object"
     sha = parsed.get("sha")
-    return isinstance(sha, str) and bool(sha.strip())
+    if not isinstance(sha, str) or not sha.strip():
+        return None, "ENGINE_MANIFEST.json has no sha"
+    return sha, ""
+
+
+def _valid_engine_manifest(manifest) -> bool:
+    """Existence alone is not provenance — bind the shared parser."""
+    return engine_manifest_sha(manifest)[0] is not None
 
 
 def _checkout_is_canonical(repo_dir) -> tuple:
@@ -3366,11 +3371,20 @@ def _checkout_is_canonical(repo_dir) -> tuple:
     # Decided BEFORE any git call, and the bundle exception needs POSITIVE
     # provenance: the parent-dir manifest check_engine_revision_drift keys on.
     git_meta = Path(repo_dir) / ".git"
-    if not git_meta.exists():
-        if os.path.lexists(git_meta):
+    try:
+        # stat/access can raise (PermissionError on a locked-down checkout) before
+        # the git boundary below — fail closed here too, never propagate.
+        meta_exists = git_meta.exists()
+        meta_lexists = os.path.lexists(git_meta)
+        bundled = (not meta_exists) and _valid_engine_manifest(
+            Path(repo_dir).parent / "ENGINE_MANIFEST.json")
+    except OSError as e:
+        return (False, f"{CHECKOUT_UNREADABLE} ({e})")
+    if not meta_exists:
+        if meta_lexists:
             # A name that resolves nowhere is damaged metadata, not a bundle.
             return (False, f"{CHECKOUT_UNREADABLE} (.git is a broken link)")
-        if _valid_engine_manifest(Path(repo_dir).parent / "ENGINE_MANIFEST.json"):
+        if bundled:
             return (False, f"{CHECKOUT_NONGIT} (bundled engine manifest present)")
         return (False, f"{CHECKOUT_UNREADABLE} (no .git and no valid engine manifest)")
     try:
