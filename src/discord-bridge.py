@@ -119,6 +119,7 @@ from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
+from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
@@ -3839,9 +3840,19 @@ async def _handle_discord_message(message, force=False):
     if await _handle_restart_command(message, text, access_tier, username, str(REPO)):
         return
 
-    # Write as task
+    # Write as task. The id derives from the provider event (injective), so a
+    # replayed event maps to the same file — skipped, never a second task.
     ts = int(time.time() * 1000)
-    task_id = f"task-{ts}"
+    _inst = getattr(getattr(client, "user", None), "id", None)
+    if _inst and getattr(message, "id", None):
+        task_id = provider_task_id(f"dc{_inst}", str(message.id))
+        if already_admitted(task_id, TASKS_DIR, RESULTS_DIR,
+                            lambda tid: archive_path("tasks", tid).exists()):
+            print(f"  [ingress-dedup] replay of {task_id} — already admitted",
+                  flush=True)
+            return
+    else:  # pragma: no cover — client identity absent (startup edge): legacy mint
+        task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
 
     # Intercept vault commands before any disk write.
