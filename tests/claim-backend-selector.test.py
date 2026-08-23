@@ -435,29 +435,50 @@ with tempfile.TemporaryDirectory() as td:
 # That the adapter SURVIVES this refusal is asserted in section 3 by running it,
 # not by reading `except RuntimeError` out of the source.
 
-if fails:
-    print(f"\n{len(fails)} FAILURE(S)")
-    raise SystemExit(1)
-print("\nALL PASS — selection is policy, mapping is the adapter's, default is 'a'")
-
-# kewei P1: a refusing backend must DEFER — no rename, no send path returned.
-import tempfile as _tf
-from pathlib import Path as _P
+print("6. a refusing backend must DEFER — no rename, no send path returned")
 import importlib.util as _ilu
 _spec = _ilu.spec_from_file_location("pcf", REPO / "src" / "proactive_claim_fence.py")
 _pcf = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_pcf)
-with _tf.TemporaryDirectory() as _td:
-    _txt = _P(_td) / "proactive-refuse-check.txt"
-    _txt.write_text("body")
-    _fence = _pcf.ProactiveClaimFence.__new__(_pcf.ProactiveClaimFence)
-    from ag2_sparrow.delivery_core.migration import TransitionRefusalBackend as _RB
-    _fence._backend = _RB("A over live C state")
-    _fence._worker = "t"
-    _fence._tokens = {}
-    _claim = _fence.claim(_txt)
-    check(_claim is None, "refusing backend: claim() returns None (distinct skip)")
-    check(_txt.exists(), "refusing backend: the .txt stays queued (no rename)")
-    check(not _txt.with_suffix(".sending").exists(),
+from ag2_sparrow.delivery_core.migration import TransitionRefusalBackend
+
+
+def _fence_over(backend):
+    fence = _pcf.ProactiveClaimFence.__new__(_pcf.ProactiveClaimFence)
+    fence._backend = backend
+    fence._worker = "t"
+    fence._tokens = {}
+    return fence
+
+
+with tempfile.TemporaryDirectory() as td:
+    txt = Path(td) / "proactive-refuse-check.txt"
+    txt.write_text("body")
+    claim = _fence_over(TransitionRefusalBackend("A over live C state")).claim(txt)
+    check(claim is None, "refusing backend: claim() returns None (distinct skip)")
+    check(txt.exists(), "refusing backend: the .txt stays queued (no rename)")
+    check(not txt.with_suffix(".sending").exists(),
           "refusing backend: no .sending claim is created")
 
+# Negative control: an ERRORING (not refusing) backend renames and returns the
+# claim, so the checks above discriminate refusal rather than pass vacuously.
+
+
+class _ErroringBackend:
+    def publish(self, *a): raise RuntimeError("backend down")
+    def claim(self, *a): raise RuntimeError("backend down")
+
+
+with tempfile.TemporaryDirectory() as td:
+    txt = Path(td) / "proactive-degrade-check.txt"
+    txt.write_text("body")
+    claim = _fence_over(_ErroringBackend()).claim(txt)
+    check(claim == txt.with_suffix(".sending"),
+          "erroring backend: file-only degraded cycle still returns the claim")
+    check(not txt.exists() and claim.exists(),
+          "erroring backend: the rename DID happen (control discriminates)")
+
+if fails:
+    print(f"\n{len(fails)} FAILURE(S)")
+    raise SystemExit(1)
+print("\nALL PASS — selection is policy, mapping is the adapter's, default is 'a'")

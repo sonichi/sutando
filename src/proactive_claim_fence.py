@@ -26,9 +26,10 @@ class ProactiveClaimFence:
     """Claim/confirm/retry/park for one bridge's proactive files.
 
     Every transition pairs one file move with one backend record transition.
-    The fence never blocks delivery: a backend refusal degrades that cycle to
-    file-only claiming (logged), because losing durability for one item is
-    recoverable and losing the owner's message is not.
+    A backend *error* degrades that cycle to file-only claiming (logged),
+    because losing durability for one item is recoverable and losing the
+    owner's message is not. A backend that *refuses* claims defers delivery
+    outright: no rename, the body stays queued for a later cycle.
     """
 
     def __init__(self, backend, results_dir: Path, worker: str = "proactive"):
