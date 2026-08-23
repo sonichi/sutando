@@ -2784,8 +2784,10 @@ def _post_proactive() -> None:
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
         try:
             route, peek_room, _ = _proactive_route(f.read_text(encoding="utf-8"))
-        except OSError:
-            continue  # racing consumer already claimed it
+        # UnicodeDecodeError = partial write mid-character; skipping keeps the
+        # docstring's fail-open contract (one bad file never blocks the drain)
+        except (OSError, UnicodeDecodeError):
+            continue  # racing consumer, or a writer mid-flight
         if route == "foreign":
             continue
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
@@ -2810,7 +2812,9 @@ def _post_proactive() -> None:
         try:
             route, room_override, routed_body = _proactive_route(
                 claim.read_text(encoding="utf-8"))
-        except OSError as exc:
+        # same tuple as the peek: a decode error post-claim must take the
+        # restore path below, never strand the claim under a live pid
+        except (OSError, UnicodeDecodeError) as exc:
             # A TRANSIENT post-claim read failure must not strand the nudge: the
             # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
             try:

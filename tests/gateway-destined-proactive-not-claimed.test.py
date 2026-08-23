@@ -87,6 +87,8 @@ sdir.mkdir(parents=True)
 # for UNDESTINED files, so the positive control lands without the 180s grace.
 (sdir / "last-owner-activity.json").write_text(json.dumps(
     {"ts": int(time.time()), "channel": "ag2space", "summary": "t"}))
+# poison sorts FIRST: a partial write mid-character must not block the drain
+(rdir / "proactive-000.txt").write_bytes(b"\x80\x81 truncated multibyte")
 (rdir / "proactive-100.txt").write_text("undestined control body")
 (rdir / "proactive-101.to-discord.txt").write_text("discord destined body")
 
@@ -128,6 +130,8 @@ try:
           "destined .to-discord body never reaches the gateway's room")
     check((rdir / "proactive-101.to-discord.txt").exists(),
           "destined file remains on disk under its original name")
+    check((rdir / "proactive-000.txt").exists(),
+          "undecodable (mid-write) file is skipped, not consumed")
 finally:
     proc.kill()
     out = proc.stdout.read().decode(errors="replace")[-1500:]
