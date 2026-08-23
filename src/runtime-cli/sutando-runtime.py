@@ -632,7 +632,7 @@ def _print_entrance_rows(ents: list, width: int) -> None:
         if cred.get("fingerprint"):
             print(f"    {'fingerprint'.ljust(width)}{cred['fingerprint']}")
         ev = e.get("evidence") or {}
-        for key, label in (("subject_evidence", "subject"),
+        for key, label in (("subject_evidence", "identity"),
                            ("owner_id", "owner id"),
                            ("credential_present", "credential"),
                            ("policy_present", "policy")):
