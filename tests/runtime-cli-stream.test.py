@@ -142,7 +142,8 @@ def drive():
     got, ok = read_lines_until(
         w, lambda ln: "feed probe line" in ln, timeout=25)
     check(ok, "watch --activity streams the tool feed line")
-    w.send_signal(signal.SIGTERM)
+    # SIGINT, not SIGTERM: the watch loop's Ctrl-C path must close and exit 0
+    w.send_signal(signal.SIGINT)
     try:
         w.wait(timeout=10)
     except subprocess.TimeoutExpired:

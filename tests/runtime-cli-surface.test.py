@@ -186,6 +186,17 @@ def drive(daemon):
     p = run_cli("instance", "attach", "@ghost:example.org", "--print")
     check(p.returncode == 1 and p.stderr.strip(),
           "instance attach on a missing agent errors loudly")
+    # attach --print on a REAL manifest prints the argv instead of exec'ing
+    sys.path.insert(0, str(REPO / "src" / "runtime-api"))
+    os.environ["SUTANDO_INSTANCE_REGISTRY"] = ENV["SUTANDO_INSTANCE_REGISTRY"]
+    import instance_registry as _reg
+    _reg.write_manifest("@att:example.org",
+                        endpoint=str(Path(TMP) / "att.sock"),
+                        tmux_socket="/tmp/att-tmux.sock",
+                        session="att-core")
+    p = run_cli("instance", "attach", "@att:example.org", "--print")
+    check(p.returncode == 0 and "tmux" in p.stdout,
+          "attach --print emits the tmux argv for a real manifest")
 
     # ── capability read + approval request via the CLI ──
     p = run_cli("capability", "read", "--capability", "nope.cap",
