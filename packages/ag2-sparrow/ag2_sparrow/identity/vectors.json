@@ -3,6 +3,9 @@
   "vectors": [
     {"kind": "ingress_task_id", "args": ["inst7", "9f3ab2"], "expected": "task-inst7~9f3ab2"},
     {"kind": "ingress_task_id", "args": ["inst~7", "ev@nt:1"], "expected": "task-inst%7E7~ev%40nt%3A1"},
+    {"kind": "ingress_task_id", "args": ["i", "\u200b"], "expected": "task-i~%E2%80%8B"},
+    {"kind": "ingress_task_id", "args": ["i", " 0B"], "expected": "task-i~%200B"},
+    {"kind": "ingress_task_id", "args": ["\ud83d\udca5", "event"], "expected": "task-%F0%9F%92%A5~event"},
     {"kind": "delivery_id", "args": ["task-1712000000001", "discord-dm"], "expected": "d:task-1712000000001@discord-dm"},
     {"kind": "legacy_delivery_id", "args": ["task-1712000000001", "discord-dm"], "expected": "legacy:task-1712000000001@discord-dm"},
     {"kind": "legacy_delivery_id", "args": ["proactive-99.txt#171200000", "discord-proactive"], "expected": "legacy:proactive-99.txt%23171200000@discord-proactive"},

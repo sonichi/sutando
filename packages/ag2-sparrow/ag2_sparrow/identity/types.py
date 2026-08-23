@@ -2,16 +2,25 @@
 
 Semantics are frozen in docs/sparrow-delivery-identity.md (B slice 1); this
 module gives each identity a type so a task_id cannot silently flow where a
-delivery_id is required. Values are opaque strings under a shared grammar:
-printable ASCII, no whitespace, no path separators (ids become filenames and
-record keys), bounded length.
+delivery_id is required. Values are opaque strings under one shared grammar:
+printable ASCII (0x21-0x7E), no whitespace, no path separators (ids become
+filenames and record keys), bounded length — plus a per-kind namespace shape.
+The constructors in derive.py, the parsers in serialization.py, and these
+types all enforce the SAME grammar: a typed value that cannot be re-parsed
+cannot be constructed.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from typing import ClassVar, Optional
 
 _MAX_LEN = 200
-_FORBIDDEN = set('/\\\x00')
+
+# One component: safe chars or fixed-width %XX escapes (uppercase hex),
+# at least one unit — empty components are constructor-impossible.
+_COMPONENT = r"(?:[^%@#+~:/\\]|%[0-9A-F]{2})+"
+_DELIVERY_BASE = rf"(?:d|legacy):{_COMPONENT}@{_COMPONENT}(?:\+r[1-9][0-9]*)*"
 
 
 def _validate(value: str, kind: str) -> None:
@@ -20,7 +29,7 @@ def _validate(value: str, kind: str) -> None:
     if len(value) > _MAX_LEN:
         raise ValueError(f"{kind} exceeds {_MAX_LEN} chars")
     for ch in value:
-        if ch in _FORBIDDEN or not ch.isprintable() or ch.isspace():
+        if not 0x21 <= ord(ch) <= 0x7E or ch in "/\\":
             raise ValueError(f"{kind} contains forbidden character {ch!r}")
 
 
@@ -28,8 +37,14 @@ def _validate(value: str, kind: str) -> None:
 class _Identity:
     value: str
 
+    _PATTERN: ClassVar[Optional[re.Pattern]] = None
+
     def __post_init__(self) -> None:
-        _validate(self.value, type(self).__name__)
+        kind = type(self).__name__
+        _validate(self.value, kind)
+        pattern = type(self)._PATTERN
+        if pattern is not None and not pattern.fullmatch(self.value):
+            raise ValueError(f"{kind} grammar rejects {self.value!r}")
 
     def __str__(self) -> str:
         return self.value
@@ -38,20 +53,30 @@ class _Identity:
 class DeliveryId(_Identity):
     """One object crossing one boundary, once. Sparrow-owned."""
 
+    _PATTERN = re.compile(_DELIVERY_BASE)
+
 
 class TaskId(_Identity):
     """One logical unit of Sutando work. Sutando-owned; Sparrow never mints
     it for its own accounting."""
 
+    _PATTERN = re.compile(r"task-.+")
+
 
 class AttemptId(_Identity):
     """One physical try at one delivery. Ordered per delivery, never reused."""
+
+    _PATTERN = re.compile(rf"{_DELIVERY_BASE}#a[1-9][0-9]*")
 
 
 class IdempotencyKey(_Identity):
     """One external side-effect, deduplicated. Stable across re-sends."""
 
+    _PATTERN = re.compile(rf"e:{_COMPONENT}@{_COMPONENT}")
+
 
 class IncarnationId(_Identity):
     """One process lifetime. Attribution only: names who performed an
     attempt, never the work itself (ratchet R1)."""
+
+    _PATTERN = re.compile(rf"{_COMPONENT}:[0-9]+:[0-9]+")

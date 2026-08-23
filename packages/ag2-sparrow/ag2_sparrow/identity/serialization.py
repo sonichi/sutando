@@ -1,51 +1,42 @@
 """Parse/format round-trip and record embedding for the five identities.
 
-Formatting is str(); parsing validates the namespace grammar from derive.py
-so a foreign string cannot masquerade as a derived identity. Record embedding
-adds explicit fields to a JSON-style dict without touching existing keys —
-how slice 2 introduces the field into outbox-shaped records without breaking
-the vendored-twin rule.
+Formatting is str(); parsing delegates to the type constructors, which own
+the one canonical grammar (types.py) — so a foreign string cannot masquerade
+as a derived identity, and every value a constructor accepts re-parses.
+Record embedding adds explicit fields to a JSON-style dict without touching
+existing keys — how slice 2 introduces the field into outbox-shaped records
+without breaking the vendored-twin rule.
 """
 from __future__ import annotations
-
-import re
 
 from .types import (AttemptId, DeliveryId, IdempotencyKey, IncarnationId,
                     TaskId)
 
-_COMPONENT = r"[^%@#+~:\s/\\]*(?:%[0-9A-F]{2}[^%@#+~:\s/\\]*)*"
-_DELIVERY_BASE = rf"(?:d|legacy):{_COMPONENT}@{_COMPONENT}"
-_DELIVERY = re.compile(rf"^{_DELIVERY_BASE}(?:\+r[1-9][0-9]*)*$")
-_ATTEMPT = re.compile(rf"^{_DELIVERY_BASE}(?:\+r[1-9][0-9]*)*#a[1-9][0-9]*$")
-_IDEMPOTENCY = re.compile(rf"^e:{_COMPONENT}@{_COMPONENT}$")
-_TASK = re.compile(r"^task-\S+$")
-_INCARNATION = re.compile(rf"^{_COMPONENT}:[0-9]+:[0-9]+$")
 
-
-def _parse(pattern: re.Pattern, cls, value: str):
-    if not isinstance(value, str) or not pattern.match(value):
+def _parse(cls, value):
+    if not isinstance(value, str):
         raise ValueError(f"not a valid {cls.__name__}: {value!r}")
     return cls(value)
 
 
 def parse_delivery_id(value: str) -> DeliveryId:
-    return _parse(_DELIVERY, DeliveryId, value)
+    return _parse(DeliveryId, value)
 
 
 def parse_attempt_id(value: str) -> AttemptId:
-    return _parse(_ATTEMPT, AttemptId, value)
+    return _parse(AttemptId, value)
 
 
 def parse_idempotency_key(value: str) -> IdempotencyKey:
-    return _parse(_IDEMPOTENCY, IdempotencyKey, value)
+    return _parse(IdempotencyKey, value)
 
 
 def parse_task_id(value: str) -> TaskId:
-    return _parse(_TASK, TaskId, value)
+    return _parse(TaskId, value)
 
 
 def parse_incarnation_id(value: str) -> IncarnationId:
-    return _parse(_INCARNATION, IncarnationId, value)
+    return _parse(IncarnationId, value)
 
 
 _FIELDS = {
@@ -67,7 +58,7 @@ def to_record_fields(**identities) -> dict:
         if name not in _FIELDS:
             raise ValueError(f"unknown identity field {name!r}")
         want = _FIELDS[name][0]
-        if not isinstance(value, want):
+        if type(value) is not want:
             raise TypeError(f"{name} must be {want.__name__}, "
                             f"got {type(value).__name__}")
         out[name] = value.value
