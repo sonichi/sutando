@@ -24,6 +24,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
 - [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
+- [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
 
 ## Guides and examples
 
@@ -53,6 +54,8 @@ Machine-readable ownership and lifecycle metadata lives in
 
 - [Architecture boundaries](architecture-boundaries.md)
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
+- [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
+- [The file delivery protocol as a formal state machine](delivery-protocol.md)
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)

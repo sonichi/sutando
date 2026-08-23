@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Send WhatsApp messages, list chats, and search history via wacli (local CLI backed by a synced store at ~/.wacli). Use after the user has run wacli auth to pair the device.",
+  "description": "Send WhatsApp messages, list chats, and search history via wacli (local CLI backed by a synced store at ~/.wacli). Unpaired? Use the guided connect flow (scripts/guided_connect.py) from chat - no terminal needed.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

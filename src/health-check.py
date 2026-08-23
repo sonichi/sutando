@@ -2299,6 +2299,19 @@ def check_memory_index_integrity() -> "dict | None":
                 f"({MEMORY_INDEX_LOAD_BYTES:,} B) / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
+    def _corpus_note() -> str:
+        """Name the corpus measured: "compact it now" is destructive advice about
+        one specific file, and SUTANDO_MEMORY_DIR can point this at another."""
+        try:
+            default = Path(_default_memory_dir())
+        except Exception:  # pragma: no cover - defensive; never break the check
+            return f" [corpus: {MEMORY_DIR}]"
+        if default.resolve() != MEMORY_DIR.resolve():
+            return (f" [corpus: {MEMORY_DIR} — set by SUTANDO_MEMORY_DIR, NOT the "
+                    f"workspace default {default}; if sessions load the default, "
+                    f"this verdict is about a corpus they never read]")
+        return f" [corpus: {MEMORY_DIR}]"
+
     def _hub_note() -> str:
         return (f"; {len(hub_only)} reachable via a sibling hub index "
                 f"({', '.join(sorted(index_names - {'MEMORY.md'}))}) — by design, not loaded"
@@ -2307,7 +2320,7 @@ def check_memory_index_integrity() -> "dict | None":
     if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
                 "detail": (f"all memory files reachable from the loaded MEMORY.md index"
-                           f"{_hub_note()} ({_size_note()})")}
+                           f"{_hub_note()} ({_size_note()}){_corpus_note()}")}
     parts = []
     if beyond_cut:
         parts.append(
@@ -2344,7 +2357,7 @@ def check_memory_index_integrity() -> "dict | None":
     # that still loaded fine once frontmatter/comments were excluded.)
     return {"name": "memory-index",
             "status": "fail" if beyond_cut else "warn",
-            "detail": "; ".join(parts)}
+            "detail": "; ".join(parts) + _corpus_note()}
 
 
 def check_memory_sync() -> dict:
@@ -5663,6 +5676,41 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     return out[-limit:]
 
 
+def _daily_completion_minutes(state: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-finished) from `state/<job>-YYYY-MM-DD.sentinel`.
+
+    Jobs that publish nothing dated into results/ still record completion here.
+    Prefer the body's ISO stamp; mtime is a fallback because a later touch
+    moves it while the recorded finish time cannot drift.
+    """
+    from datetime import datetime
+    out = []
+    if not state.is_dir():
+        return out
+    for f in state.glob(f"{job}-20*.sentinel"):
+        m = re.match(rf"{re.escape(job)}-(\d{{4}}-\d{{2}}-\d{{2}})\.sentinel$", f.name)
+        if not m:
+            continue
+        when = None
+        try:
+            # 3.9's fromisoformat rejects a `Z` suffix; and an aware stamp must be
+            # localised or its minute-of-day is UTC while cron times and mtime are local.
+            body = f.read_text(errors="ignore").strip()[:32].replace("Z", "+00:00")
+            when = datetime.fromisoformat(body)
+            if when.tzinfo is not None:
+                when = when.astimezone().replace(tzinfo=None)
+        except (OSError, ValueError):
+            when = None
+        if when is None:
+            try:
+                when = datetime.fromtimestamp(f.stat().st_mtime)
+            except OSError:  # pragma: no cover - file vanished between glob and stat
+                continue
+        out.append((m.group(1), when.hour * 60 + when.minute))
+    out.sort()
+    return out[-limit:]
+
+
 def check_daily_cron_punctuality() -> dict:
     """Report a daily job whose output never arrives at its scheduled time."""
     from datetime import datetime, time as dtime
@@ -5687,7 +5735,8 @@ def check_daily_cron_punctuality() -> dict:
     now = datetime.now()
     jobs, malformed = [], []
     for e in entries:
-        if not isinstance(e, dict) or e.get("launchd") or e.get("execution") == "codex-task":
+        # codex-task entries complete in another runtime that writes no sentinel.
+        if not isinstance(e, dict) or e.get("execution") == "codex-task":
             continue
         f = str(e.get("cron") or "").split()
         if len(f) != 5 or not f[0].isdigit() or not f[1].isdigit():
@@ -5706,12 +5755,18 @@ def check_daily_cron_punctuality() -> dict:
         # and never sees its real fleet-growth-<date>.mp4 output.
         declared = str(e.get("artifact") or "").strip()
         stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
-        arts = _daily_artifact_minutes(ws / "results", stem)
+        launchd = bool(e.get("launchd"))
+        # The launchd lane publishes no dated results file; its completion
+        # sentinel is the only dated record that it finished.
+        arts = (_daily_completion_minutes(ws / "state", jname) if launchd
+                else _daily_artifact_minutes(ws / "results", stem))
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
-            "stem": stem, "stem_declared": bool(declared),
+            # `artifact` names a results file, so it cannot vouch for a sentinel:
+            # only an observed history makes a missing sentinel today actionable.
+            "stem": stem, "stem_declared": bool(declared) and not launchd,
             # Renders only when new input exists, so a quiet day produces nothing
             # and absence is evidence of nothing rather than of a miss.
             "conditional": bool(e.get("conditional")),
@@ -5722,7 +5777,7 @@ def check_daily_cron_punctuality() -> dict:
                           f"fix the crons.json entry; punctuality unchecked for "
                           f"{len(malformed)} job(s)"}
     if not jobs:
-        return {"name": name, "status": "ok", "detail": "no session-owned daily jobs — skipped"}
+        return {"name": name, "status": "ok", "detail": "no plain-daily jobs — skipped"}
     return _interpret_daily_punctuality(jobs)
 
 
@@ -6467,12 +6522,18 @@ def check_proactive_quarantine() -> dict:
 
 
 def _ps_snapshot() -> "str | None":
-    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once."""
+    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once.
+
+    None means UNAVAILABLE, and that includes a `ps` that returned normally with
+    a nonzero exit: its empty stdout would otherwise read as a successful scan
+    that found nothing, which is the absence callers must not assert.
+    """
     try:
-        return subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5).stdout
+        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                              capture_output=True, text=True, timeout=5)
     except Exception:  # noqa: BLE001
         return None
+    return done.stdout if done.returncode == 0 else None
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
@@ -6655,17 +6716,27 @@ def check_task_watcher() -> dict:
     """
     name = "task-watcher"
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
-    if not _any_core_alive():
-        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
-    trees = _watcher_trees()
+    # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
+    # so take the snapshot here: None is unavailable, "" is genuinely empty.
+    ps_out = _ps_snapshot()
+    if ps_out is None:
+        return {"name": name, "status": "warn",
+                "detail": "cannot enumerate processes (ps unavailable) — watcher liveness is "
+                          "UNKNOWN, not clear; a dead or duplicate watcher would be invisible"}
+    # "Not expected" is a claim about THIS host, so it needs the local heartbeat
+    # and must not be made before enumerating: visible watchers outrank it.
+    trees = _watcher_trees(ps_out)
     roots = sorted(trees)
+    if not roots and _fresh_local_core_record() is None:
+        return {"name": name, "status": "ok",
+                "detail": "no local core running and no watcher processes — watcher not expected"}
     if not pid_file.exists():
         if roots:
             # Sentinel gone but watchers alive: they are draining tasks/ but
             # nothing supervises them, and each new start adds another (observed
             # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
             # duplicate processing, not a stalled queue).
-            ps_out = _ps_snapshot()
+
             # A KNOWN parent that is not init: its spawning session still owns it.
             # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
@@ -6856,6 +6927,56 @@ def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
                 os.close(fd)
             except Exception:
                 pass
+
+
+def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
+    """A dual_read hit means C could not resolve an id the importer should have
+    covered — a finding, and the gate that blocks Design A's deletion."""
+    from datetime import datetime
+    name = "a-fallback-hits"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    hits = []
+    migrated = 0
+    for root in sorted(results.glob(".outbox*")):
+        counter = root / "a-fallback-hits.json"
+        if (root / ".items-migrated").is_dir():
+            migrated += 1
+            if not counter.is_file():
+                # Absence of evidence, not evidence of absence: a gate must not
+                # pass on an instrument that never ran (dual_read inits count 0).
+                hits.append(f"{root.name}: migrated but no counter — dual_read "
+                            "never ran here (instrument absent, not a measured zero)")
+                continue
+        if not counter.is_file():
+            continue
+        try:
+            rec = json.loads(counter.read_text(encoding="utf-8"))
+            if not isinstance(rec, dict):
+                raise ValueError("counter is not a JSON object")
+            count = int(rec.get("count", 0))
+        except (OSError, ValueError, TypeError):
+            hits.append(f"{root.name}: counter unreadable")
+            continue
+        if count > 0:
+            # fromtimestamp raises on domain garbage (inf/nan/1e30) that
+            # isinstance passes; a probe on the gate path must never raise.
+            try:
+                when_s = datetime.fromtimestamp(
+                    rec.get("last_hit_ts")).strftime("%m-%d %H:%M")
+            except (TypeError, ValueError, OSError, OverflowError):
+                when_s = "?"
+            hits.append(f"{root.name}: {count} hit(s), last {rec.get('last_item', '?')} at {when_s}")
+    if hits:
+        return {"name": name, "status": "warn",
+                "detail": "A-fallback (dual_read) HIT — importer coverage gap or "
+                          "phantom id; A deletion stays gated until a full release "
+                          "records zero new hits: " + "; ".join(hits)}
+    if migrated:
+        return {"name": name, "status": "ok",
+                "detail": f"no fallback hits — {migrated} migrated root(s), "
+                          "each with a live counter (measured zero)"}
+    return {"name": name, "status": "ok",
+            "detail": "no migrated outbox roots — dual-read window not active"}
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
@@ -9092,6 +9213,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
+    checks.append(check_a_fallback_hits())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())

@@ -21,11 +21,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path  # noqa: E402
-import discord_context_policy  # noqa: E402
+import policy.context.discord as discord_context_policy  # noqa: E402
+from channels.discord.http import request_json  # noqa: E402
+
 # Shared implementations, bound as module globals so tests patch them per-CLI.
-from discord_http import request_json  # noqa: E402
-import discord_reader as _reader  # noqa: E402
-from discord_reader import (  # noqa: E402,F401
+import channels.discord.reader as _reader  # noqa: E402
+from channels.discord.reader import (  # noqa: E402,F401
     CLIP, MAX_PAGES, REPLY_CLIP,
     _at_or_before_boundary, _redact, _render, _reply_context,
     _strictly_older_than_boundary,

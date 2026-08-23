@@ -125,3 +125,18 @@ The M1 milestone will ship a dedicated recovery skill (`bash scripts/sutando-mig
 - `CLAUDE.md` § Workspace contract — the project-wide contract this doc operationalizes
 - `docs/sutando-config.schema.json` — JSON Schema for the config file (editor autocomplete + validation)
 - `sutando.config.local.json.example` — annotated override sample at the repo root
+
+
+## Deprecated `$SUTANDO_WORKSPACE`, and the repo-root fallback anti-pattern
+
+Relocated from `CLAUDE.md` to keep the always-loaded file under its 40 KiB budget; the operative
+rule stays there, the history lives here.
+
+`$SUTANDO_WORKSPACE` is no longer honored for workspace resolution as of v0.8 / #1440. If it is set
+it is still *detected*, to fire a one-time deprecation warning and trigger one-time auto-migration
+via per-source sentinels (PR #1478) — but the resolver ignores its value.
+
+**Historic anti-pattern:** bridges fell back to the script's repo root via
+`Path(__file__).resolve().parent.parent`. That polluted `git status`, and when invoked from an
+app-bundled `src/` symlink it stranded owner DMs in a `bundle-tasks/` directory while the watcher
+polled `workspace-tasks/`. Use the helpers listed in `CLAUDE.md` instead of reinventing the fallback.

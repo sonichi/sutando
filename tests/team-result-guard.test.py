@@ -28,7 +28,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-import team_result_guard as guard  # noqa: E402
+import policy.egress.result as guard  # noqa: E402
 
 BRIDGE = REPO / "src" / "discord-bridge.py"
 
@@ -260,7 +260,7 @@ def structural() -> list:
     fails = []
     bridge = BRIDGE.read_text()
 
-    if "from team_result_guard import" not in bridge:
+    if "from policy.egress.result import" not in bridge:
         fails.append("discord-bridge must import the shared guard")
 
     # Ordering is the requirement: a scan that runs after the router has read a
