@@ -261,3 +261,21 @@ def redirect_target_is_foreign(target, this_channel: str) -> bool:
     into the default's delivery, or every malformed marker lands in one DM.
     """
     return target_channel_kind(target) != this_channel
+
+
+def body_redirect_executes(name, target, this_channel: str) -> bool:
+    """The SINK's leg of filename-over-body: may this file's `[channel:]`
+    redirect actually move the send?
+
+    The claim gate honouring the filename is only half the decision — a sink
+    that re-parses the body and re-routes anyway undoes it, and the file is
+    posted to another bridge's address, refused, released and retried forever.
+
+    A `.to-<channel>` filename fixes the BRIDGE, so a target that is not
+    positively this bridge's own address never executes. Within the destined
+    bridge a redirect is a ROOM selection and still executes. An undestined
+    name keeps each sink's existing behaviour unchanged.
+    """
+    if proactive_destination(name) is None:
+        return True
+    return not redirect_target_is_foreign(target, this_channel)

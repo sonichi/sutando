@@ -64,7 +64,8 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import fallback_claims_name, proactive_body_guard  # noqa: E402
+from proactive_routing import (  # noqa: E402
+    body_redirect_executes, fallback_claims_name, proactive_body_guard)
 
 
 def _slack_claims_name(name: str) -> bool:
@@ -1331,7 +1332,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> bool:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown", delivery_name: str | None = None) -> bool:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -1370,6 +1371,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     redirected = False
     for action in parsed.actions:
         if action.kind == "redirect":
+            # A `.to-slack` filename already fixed this bridge; re-routing on
+            # the body here would undo that decision at the last step.
+            if delivery_name is not None and not body_redirect_executes(
+                    delivery_name, action.value, "slack"):
+                break
             channel = action.value
             thread_ts = None
             redirected = True
@@ -1653,7 +1659,8 @@ def result_watcher():
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            if _send_reply(dm_channel, None, text, access_tier="owner"):
+                            if _send_reply(dm_channel, None, text, access_tier="owner",
+                                           delivery_name=delivery_id):
                                 mark_proactive_delivered(STATE_DIR, delivery_id)
                                 print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                                 claim.unlink(missing_ok=True)
