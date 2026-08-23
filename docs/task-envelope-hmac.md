@@ -59,21 +59,26 @@ UID and can read the key. Closing that gap is Phases 4–5 below, not a
 property of the HMAC itself.
 
 **Replay is a separate invariant.** Same key + same bytes = same MAC, so a
-byte-identical copy of a sealed file re-verifies. Practical dedupe exists
-(consumers check for an existing result before processing —
-`_completed_result_exists`), but that is incidental, not a security
-property. Execution uniqueness is Phase 3.
+byte-identical copy of a sealed file re-verifies — and there is **no general
+replay protection before Phase 3**. The live watcher
+(`src/watch-tasks-stream.sh`) dispatches every task file it observes without
+consulting `results/`. The one result-existence check that exists is the
+Stop-hook sweep in `src/check-pending-tasks.sh`, which skips a task whose
+result file is already present — a narrow re-prompt heuristic on that single
+path, not an execution-admission guard. Execution uniqueness is Phase 3.
 
 ## Mechanism
 
 - **Key**: 32 bytes as 64 hex chars at `<workspace>/state/auth/task-hmac.key`,
-  mode 0600, never leaving the host. The merged Python writer mints it via
-  temp file + `link()` first-writer-wins, which publishes only complete
-  bytes. The TS writer creates at the final path with `O_EXCL` — atomic
-  create but not atomic content publication, a window the corrupt-key guards
-  close by rejection. Both loaders reject a present-but-corrupt key loudly
-  (exactly 64 hex chars / 32 bytes) rather than operating with a truncated
-  key; shipped in #3058 (TS) and #3065 (Python), both merged 2026-08-18.
+  mode 0600, never leaving the host. Both writers mint it via temp file +
+  `link()` first-writer-wins, which publishes only complete bytes — a reader
+  can never observe a partially written key. Python does this in
+  `src/task_envelope.py`; TS does the same in `src/task_envelope.ts`
+  (complete bytes land in a `wx`-flagged temp file, `linkSync` publishes
+  atomically; a losing concurrent creator reads the winner's key). Both
+  loaders additionally reject a present-but-corrupt key loudly (exactly
+  64 hex chars / 32 bytes) rather than operating with a truncated key;
+  shipped in #3058 (TS) and #3065 (Python), both merged 2026-08-18.
 - **Stamping**: HMAC-SHA256 over the entire body (any previous stamp line
   stripped first), spliced into the **canonical slot** — line 1 directly
   after `id:`, or line 0 when there is no id header. Writers fail *open*: a
@@ -125,24 +130,46 @@ upgrade path is a versioned stamp with a key id
 (`envelope_hmac: v2:<key_id>:<mac>`, `key_id` → verification key), which can
 coexist with v1 during a migration window.
 
-## Current status — Phase 1 live
+## Current status — Phase 1 partial (telemetry live, writer coverage incomplete)
 
-**Stamping on main** (regenerated from current `main` call sites — the
-modules that import and call the stamper): remote gateway bridge,
-discord-bridge, telegram-bridge, slack-bridge, the workstream classifier,
-cron-runner, and the TS lineage (`task-bridge.ts`, `task-delegation.ts`).
-**Not yet stamping, no PR**: `agent-api` and `voice-agent` — these write
-task files directly today; their edges are unowned work, not covered
-elsewhere. Until each row
-lands, tasks from those writers are `unsigned`. Stamps are **telemetry
-only** today:
-`src/task_envelope_census.py` counts verified/unsigned so the unsigned
-population can be watched draining during the soak window. No consumer
-changes behavior on a verdict yet. (Phase 1 is complete when every writer edge
-stamps — **not** when the PR trail has no open rows. Those two came apart on
-2026-08-20: the trail is now fully merged while `agent-api` and `voice-agent`
-still write unstamped and have no PR. The census's unsigned count is the live
-measure of that gap.)
+**Inventory scope:** every production code path on current `main` that
+publishes a file into `tasks/` — creation or re-publication under a new id —
+enumerated from call sites, not from the PR trail. Consumers that only read,
+move, or archive task files are out of scope; nothing else is scoped out.
+
+**Stamping on main** (call the stamper at their writer edge): the remote
+gateway bridge (which also injects the stamper into the vendored
+`local_task_protocol` seam via `set_task_stamper`), discord-bridge,
+telegram-bridge, slack-bridge, cron-runner, the workstream classifier
+(`src/task_workstreams.py`), and the TS delegation lineage
+(`task-bridge.ts`, `task-delegation.ts`).
+
+**Not yet stamping — unsigned writer edges on current `main`, no PR:**
+
+| Writer edge | Site(s) | Notes |
+|---|---|---|
+| `src/agent-api.py` | `:1016`, `:1051`, `:1078`, `:1325`; answer-injection rewrite at `:1230` | writes `task_content` directly |
+| `src/github-webhook.py` | `:191` | external events, `access_tier: other` |
+| `src/web-client.ts` | `:4433` | owner-tier scan trigger from the web UI |
+| `skills/phone-conversation/scripts/conversation-server.ts` | `:421` | phone tasks, owner or other tier |
+| `src/inline-tools.ts` | `:710` | voice `CANCEL_INSTRUCTION` writer, owner tier — the voice-agent process's remaining unsigned edge (ordinary voice delegation stamps via `task-delegation.ts`) |
+| `src/health-check.py` | `emit_task_for_failures` → `local_task_protocol.write_task_file` | the seam stamps only in a process that injected a stamper; only the gateway bridge does, so health tasks are unsigned |
+| `src/dedup_recovery.py` | `:90` | re-publishes a requeued task under a new id; the new bytes are unsigned |
+| `src/Sutando/main.swift` | context-drop `writeTask` (~`:2020`) | desktop hotkey task; no Swift stamper implementation exists |
+
+Until each edge stamps (or is explicitly scoped out with a recorded
+rationale), tasks from those writers are `unsigned`. **Phase 1 is complete
+when every in-scope writer edge stamps** — not when the PR trail has no open
+rows, and not when telemetry is running. Telemetry went live first; writer
+coverage is the incomplete half, and the census's unsigned count is its live
+measure.
+
+Stamps are **telemetry only** today: `src/task_envelope_census.py` counts
+verified/unsigned so the unsigned population can be watched draining during
+the soak window. No consumer changes behavior on a verdict yet. Phase 2
+enforcement must not be enabled until this inventory reads clean — flipping
+fail-closed against an incomplete ledger would reject owner tasks arriving
+through the health, phone, web, and voice-cancel paths above.
 
 **Read that count with its window in mind.** The default invocation is
 `python3 src/task_envelope_census.py --days 7`, and it scans `tasks/` **and**
@@ -171,7 +198,7 @@ non-bypassable by the processes it constrains.**
 
 | Phase | What ships | Status |
 |---|---|---|
-| 1 | HMAC telemetry: all writers stamp; census counts verdicts | **Live, soaking** |
+| 1 | HMAC telemetry: every writer edge stamps; census counts verdicts | **Partial — telemetry live and soaking; writer coverage incomplete (see the unsigned-edge table above)** |
 | 2 | Privileged fail-closed on **authenticity only**: `verified` → eligible; `unsigned`/`invalid`/`unverifiable` → the fail-closed arms (no privileged processing / quarantine / fail closed). Enforces authenticity **relative to the current trusted-writer domain — it does not narrow that domain**: same-UID key readers can still mint `verified` until Phase 5 | After soak window, owner sign-off |
 | 3 | Explicit replay ledger: `task_id` → terminal disposition (completed / rejected / expired / cancelled); a re-appearing terminal id gets a first-class `REPLAYED`/`ALREADY_TERMINAL` verdict. The id names an **execution identity**, not a filename — rename, move, or re-serialization never resets uniqueness. The ledger guarantees **execution-admission uniqueness, not exactly-once external effects** — a crash between side effect and ledger write still needs idempotency keys / outcome observation / OUTCOME_UNKNOWN reconciliation, the delivery runtime's existing problem class | Planned (order with 4 swappable) |
 | 4 | `drop/` → trusted sealer → `ready/`: untrusted producers write `drop/` only; one sealer validates, binds identity, and constructs a **new sealed object** (never editing the drop file in place — untrusted inode ≠ trusted inode, so the producer can't mutate the object mid-seal), fsyncs if durability requires, then atomically renames into `ready/`. Directories encode lifecycle (`drop/` untrusted input, `ready/` authenticated, `archive/` completed history), inspectable with `ls` | Planned |
@@ -223,7 +250,9 @@ seal → `ready/` → privileged processing → replay ledger → side effects.
 
 Properties (phase in which each becomes true):
 
-- **P1** Mutation of sealed bytes is detectable. *(Phase 1 — live)*
+- **P1** Mutation of sealed bytes is detectable. *(Phase 1 — live for
+  stamped writer edges; unstamped edges emit `unsigned`, which carries no
+  mutation evidence)*
 - **P2** Privileged execution requires `verified`. *(Phase 2)*
 - **P3** A terminal execution identity cannot be admitted again. *(Phase 3)*
 - **P4** Only the sealer can promote untrusted input. *(Phase 4)*
