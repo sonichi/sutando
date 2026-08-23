@@ -4,7 +4,7 @@ transaction (design 1b; impl plan WS1 Step 3, amendments R3/S4/U1/Z1).
 
 Serialization is an advisory ``fcntl.flock(LOCK_EX)`` on a *guard* file held
 across each whole transaction; the JSON lock file
-(``<workspace>/.voice-agent.pid``) is owner *metadata* only. Every creator AND
+(``<workspace>/state/locks/voice-agent.pid``; root path pre-#2722) is owner *metadata* only. Every creator AND
 replacer of the lock must hold the guard for the whole
 stale-owner-resolution + acquisition sequence — delete-then-create without it
 is racy (two contenders can both validate the stale lock; one creates a fresh

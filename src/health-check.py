@@ -1314,8 +1314,8 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: `.backend-supervisor.lock.guard` is written by the desktop app, whose source
 #: is not in this repo (`backend-supervisor.lock.guard`: 0 hits here).
 #:
-#: `.voice-agent.pid` is deliberately NOT exempt: state/locks/ is a real
-#: destination that exists in-tree, so its warn names somewhere to go (#2722).
+#: `.voice-agent.pid` stays NOT exempt after the #2722 move: the writer now
+#: uses state/locks/, so a root copy is a pre-move straggler worth flagging.
 
 #: Migration sentinels are production-owned and DELIBERATELY retained at the
 #: workspace root — `workspace_default.py` writes `.notes-migrated`,

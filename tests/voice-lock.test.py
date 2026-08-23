@@ -137,7 +137,8 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="voice-lock-test-"))
     ws = tmp / "workspace"
     ws.mkdir()
-    pidfile = ws / ".voice-agent.pid"
+    pidfile = ws / "state" / "locks" / "voice-agent.pid"
+    pidfile.parent.mkdir(parents=True)
     guard = ws / ".voice-agent.lock.guard"
     entry = tmp / "src" / "voice-agent.ts"
     entry.parent.mkdir()
