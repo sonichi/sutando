@@ -21,6 +21,8 @@ PANE_PID="$("$POOL_TMUX_BIN" list-panes -t "$SESSION" -F '#{pane_pid}' | head -1
   "core-${SUTANDO_CORE_ID}" "$POOL_WORKSPACE" "$PANE_PID" &
 BEAT=$!
 
-while "$POOL_TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; do sleep 30; done
+while "$POOL_TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; do
+  sleep "${SUTANDO_POOL_SESSION_POLL:-30}"
+done
 kill "$BEAT" 2>/dev/null
 exit 0
