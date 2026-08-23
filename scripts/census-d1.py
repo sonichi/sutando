@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 
 DISCORD = "src/discord-bridge.py"
 AG2 = "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"
