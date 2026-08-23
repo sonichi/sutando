@@ -34,13 +34,6 @@ fi
 WORKSPACE="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
 # capture the installer's PATH: launchd strips env, and the sessions need brew bins
 POOL_PATH="${PATH}"
-# TCC: launchd cannot exec scripts under ~/Documents nor open log paths
-# there — stage the wrapper and logs outside (memory: feedback_pool_wrapper_tcc).
-STAGE_DIR="$HOME/.sutando/bin"
-LOG_DIR="$HOME/Library/Application Support/Sutando/logs"
-mkdir -p "$STAGE_DIR" "$LOG_DIR"
-cp "$REPO_DIR/scripts/pool-core-wrapper.sh" "$STAGE_DIR/pool-core-wrapper.sh"
-chmod +x "$STAGE_DIR/pool-core-wrapper.sh"
 WORKSPACE="${WORKSPACE/#\~/$HOME}"
 mkdir -p "$WORKSPACE/logs"
 mkdir -p "$WORKSPACE/state/cores"
@@ -49,6 +42,13 @@ mkdir -p "$WORKSPACE/state/cores"
 # `src/core_heartbeat.py` by absolute path. This script lives at
 # `<repo>/scripts/install-core-pool.sh`.
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# TCC: launchd cannot exec scripts under ~/Documents nor open log paths
+# there — stage the wrapper and logs outside (memory: feedback_pool_wrapper_tcc).
+STAGE_DIR="$HOME/.sutando/bin"
+LOG_DIR="$HOME/Library/Application Support/Sutando/logs"
+mkdir -p "$STAGE_DIR" "$LOG_DIR"
+cp "$REPO_DIR/scripts/pool-core-wrapper.sh" "$STAGE_DIR/pool-core-wrapper.sh"
+chmod +x "$STAGE_DIR/pool-core-wrapper.sh"
 
 # Resolve claude + python3 binaries. Caller's $PATH may not include the
 # install dirs on launchd-spawned processes, so capture absolute paths now.
