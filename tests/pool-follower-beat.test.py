@@ -123,5 +123,109 @@ class PoolFollowerBeatTest(unittest.TestCase):
                     wrapper.kill()
 
 
+class PoolWrapperRuntimeDispatchTest(unittest.TestCase):
+    """POOL_RUNTIME picks the launch form; an unknown one must not fall back."""
+
+    # Records the command string tmux was asked to run, then lets the session
+    # end so the wrapper exits without a live agent ever being started.
+    STUB_TMUX = (
+        '#!/bin/bash\n'
+        'D="$STUB_TMUX_DIR"\n'
+        'case "$1" in\n'
+        '  has-session) [ -f "$D/session-alive" ];;\n'
+        '  new-session)\n'
+        '    printf "%s" "${@: -1}" > "$D/launch-cmd"\n'
+        '    touch "$D/session-alive"\n'
+        '    ( sleep 1; rm -f "$D/session-alive" ) &\n'
+        '    echo $! > "$D/pane-pid";;\n'
+        '  list-panes) cat "$D/pane-pid";;\n'
+        '  *) exit 0;;\n'
+        'esac\n')
+
+    def run_wrapper(self, td: Path, **envextra):
+        stub_tmux = td / "stub-tmux"
+        stub_tmux.write_text(self.STUB_TMUX)
+        stub_tmux.chmod(0o755)
+        for name in ("stub-claude", "stub-codex"):
+            b = td / name
+            b.write_text("#!/bin/bash\nsleep 3\n")
+            b.chmod(0o755)
+        env = dict(
+            os.environ,
+            POOL_REPO_DIR=str(REPO),
+            POOL_TMUX_BIN=str(stub_tmux),
+            STUB_TMUX_DIR=str(td),
+            POOL_WORKSPACE=str(td),
+            SUTANDO_CORE_ID="4",
+            SUTANDO_POOL_BEAT_INTERVAL="1",
+            SUTANDO_POOL_SESSION_POLL="1")
+        env.pop("POOL_RUNTIME", None)
+        env.pop("POOL_RUNTIME_BIN", None)
+        env.update(envextra)
+        r = subprocess.run(["bash", str(WRAPPER)], env=env,
+                           capture_output=True, text=True, timeout=60)
+        cmd = td / "launch-cmd"
+        return r, (cmd.read_text() if cmd.exists() else None)
+
+    def test_codex_runtime_launches_the_codex_form(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            r, cmd = self.run_wrapper(
+                td, POOL_RUNTIME="codex",
+                POOL_RUNTIME_BIN=str(td / "stub-codex"),
+                POOL_RUNTIME_CONFIG_ENV="CODEX_HOME",
+                POOL_RUNTIME_CONFIG_DIR=str(td / "codex-home"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNotNone(cmd, "no session was launched")
+            self.assertIn(str(td / "stub-codex"), cmd)
+            self.assertNotIn("stub-claude", cmd)
+            for flag in ("--sandbox danger-full-access",
+                         "--ask-for-approval never", "--no-alt-screen"):
+                self.assertIn(flag, cmd, f"codex launch is missing {flag}")
+            self.assertNotIn("--dangerously-skip-permissions", cmd,
+                             "claude's flags must not reach codex")
+            self.assertNotIn("/proactive-loop-pool'", cmd,
+                             "codex has no slash-command surface")
+            self.assertIn("skills/proactive-loop-pool/CODEX.md", cmd,
+                          "the codex entry must point at CODEX.md")
+            self.assertIn("core-4", cmd, "the entry must name the core")
+            self.assertIn(f"CODEX_HOME='{td / 'codex-home'}'", cmd,
+                          "the resolved codex store must be forwarded")
+
+    def test_claude_is_the_default_and_an_old_plist_still_works(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            # No POOL_RUNTIME / POOL_RUNTIME_BIN: exactly a plist written before
+            # the runtime dimension existed.
+            r, cmd = self.run_wrapper(td, POOL_CLAUDE_BIN=str(td / "stub-claude"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(str(td / "stub-claude"), cmd)
+            self.assertIn("--dangerously-skip-permissions", cmd)
+            self.assertIn("-- '/proactive-loop-pool'", cmd)
+            self.assertNotIn("--sandbox", cmd)
+
+    def test_explicit_claude_runtime_launches_the_claude_form(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            r, cmd = self.run_wrapper(
+                td, POOL_RUNTIME="claude",
+                POOL_RUNTIME_BIN=str(td / "stub-claude"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("--dangerously-skip-permissions", cmd)
+            self.assertIn("-- '/proactive-loop-pool'", cmd)
+
+    def test_unsupported_runtime_exits_2_without_launching(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            r, cmd = self.run_wrapper(
+                td, POOL_RUNTIME="gemini",
+                POOL_RUNTIME_BIN=str(td / "stub-claude"))
+            self.assertEqual(r.returncode, 2,
+                             "an unknown runtime must fail loudly, like "
+                             "src/agent/start-cli.sh")
+            self.assertIsNone(cmd, "no session may start for an unknown runtime")
+            self.assertIn("unsupported core runtime", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

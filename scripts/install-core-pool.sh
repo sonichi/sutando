@@ -4,6 +4,12 @@
 #
 # Usage:
 #   bash scripts/install-core-pool.sh [N] [--force] [--check-only] [--lead-only]
+#                                     [--runtime=<claude|codex>]
+#                                     [--core-runtime=<N>:<claude|codex>]...
+#
+# --runtime sets every core's CLI runtime (default `claude`, or
+# $SUTANDO_POOL_RUNTIME); --core-runtime overrides a single core. Supported
+# names match src/agent/start-cli.sh's allowlist; anything else exits 2.
 #
 # --check-only runs every preflight (config dir, skill, binaries, staging) and
 # exits without touching launchd — the seam the preflight tests exercise.
@@ -29,11 +35,36 @@ N=""
 FORCE=0
 CHECK_ONLY=0
 LEAD_ONLY=0
+# Runtime allowlist, kept identical to src/agent/start-cli.sh's dispatch: an
+# unsupported name must fail loudly, never fall back to the default runtime.
+pool_runtime_supported() {
+  case "$1" in claude|codex) return 0 ;; *) return 1 ;; esac
+}
+POOL_RUNTIME_DEFAULT="${SUTANDO_POOL_RUNTIME:-claude}"
+CORE_RUNTIME_SPECS=""
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
     --check-only) CHECK_ONLY=1 ;;
     --lead-only) LEAD_ONLY=1 ;;
+    --runtime=*)
+      POOL_RUNTIME_DEFAULT="${arg#--runtime=}" ;;
+    --core-runtime=*)
+      _spec="${arg#--core-runtime=}"
+      case "$_spec" in
+        *:*) : ;;
+        *) echo "error: --core-runtime expects <N>:<runtime>; got '$_spec'" >&2; exit 2 ;;
+      esac
+      _spec_idx="${_spec%%:*}"
+      _spec_rt="${_spec#*:}"
+      case "$_spec_idx" in
+        ''|*[!0-9]*) echo "error: --core-runtime core index must be a positive integer; got '$_spec_idx'" >&2; exit 2 ;;
+      esac
+      pool_runtime_supported "$_spec_rt" || {
+        echo "error: unsupported core runtime '$_spec_rt' (supported: claude, codex)" >&2
+        exit 2
+      }
+      CORE_RUNTIME_SPECS="$CORE_RUNTIME_SPECS$_spec_idx=$_spec_rt"$'\n' ;;
     --*) echo "error: unknown option '$arg'" >&2; exit 2 ;;
     *)
       [ -z "$N" ] || { echo "error: more than one N given ('$N', '$arg')" >&2; exit 2; }
@@ -48,6 +79,36 @@ if [ "$N" -lt 1 ] || [ "$N" -gt 16 ]; then
   echo "error: N must be in [1, 16]; got $N" >&2
   exit 2
 fi
+
+pool_runtime_supported "$POOL_RUNTIME_DEFAULT" || {
+  echo "error: unsupported core runtime '$POOL_RUNTIME_DEFAULT' (supported: claude, codex)" >&2
+  exit 2
+}
+# Last spec for an index wins; an out-of-range index is a typo, not a no-op.
+core_runtime_for() {
+  local want="$1" line answer="$POOL_RUNTIME_DEFAULT"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in "$want="*) answer="${line#*=}" ;; esac
+  done <<< "$CORE_RUNTIME_SPECS"
+  printf '%s' "$answer"
+}
+while IFS= read -r _line; do
+  [ -n "$_line" ] || continue
+  _line_idx="${_line%%=*}"
+  if [ "$_line_idx" -lt 1 ] || [ "$_line_idx" -gt "$N" ]; then
+    echo "error: --core-runtime names core $_line_idx, outside the installed pool [1, $N]" >&2
+    exit 2
+  fi
+done <<< "$CORE_RUNTIME_SPECS"
+POOL_USES_CODEX=0
+POOL_USES_CLAUDE=0
+for _i in $(seq 1 "$N"); do
+  case "$(core_runtime_for "$_i")" in
+    codex) POOL_USES_CODEX=1 ;;
+    claude) POOL_USES_CLAUDE=1 ;;
+  esac
+done
 
 # Resolve repo root first: the preflight below and the staging block both
 # address repo files by absolute path. This script lives at
@@ -124,10 +185,37 @@ if [ -z "$TMUX_BIN" ]; then
   echo "error: 'tmux' not found on \$PATH (persistent-form followers run in tmux)" >&2
   exit 1
 fi
-if [ -z "$CLAUDE_BIN" ]; then
+if [ -z "$CLAUDE_BIN" ] && [ "$POOL_USES_CLAUDE" -eq 1 ]; then
   echo "error: 'claude' CLI not found on \$PATH" >&2
   exit 1
 fi
+CODEX_BIN=""
+CODEX_CONFIG_ENV=""
+CODEX_CONFIG_DIR=""
+if [ "$POOL_USES_CODEX" -eq 1 ]; then
+  CODEX_BIN="$(command -v codex || true)"
+  if [ -z "$CODEX_BIN" ]; then
+    echo "error: 'codex' CLI not found on \$PATH (a core was declared runtime=codex)" >&2
+    exit 1
+  fi
+  if [ ! -f "$REPO_DIR/skills/proactive-loop-pool/CODEX.md" ]; then
+    echo "error: missing $REPO_DIR/skills/proactive-loop-pool/CODEX.md (the Codex pool entry)" >&2
+    exit 1
+  fi
+  # Codex followers must share the operator's authenticated store, resolved the
+  # same way src/agent/codex/cli/start-cli.sh resolves it.
+  CODEX_CONFIG_ENV="$(bash "$REPO_DIR/scripts/sutando-config.sh" core-config-dir-env-name codex 2>/dev/null || true)"
+  CODEX_CONFIG_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" core-config-dir-value codex 2>/dev/null || true)"
+fi
+
+# Absolute binary per runtime — launchd hands the follower no usable PATH.
+runtime_bin_for() {
+  case "$1" in
+    claude) printf '%s' "$CLAUDE_BIN" ;;
+    codex) printf '%s' "$CODEX_BIN" ;;
+    *) echo "install-core-pool: unsupported core runtime: $1" >&2; return 2 ;;
+  esac
+}
 
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$LAUNCH_AGENTS"
@@ -220,6 +308,9 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   echo "preflight OK: CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR_EFFECTIVE"
   echo "preflight OK: skill=${SKILL_DIR_CANDIDATES[0]}"
   echo "preflight OK: workspace=$WORKSPACE"
+  for i in $(seq 1 "$N"); do
+    echo "preflight OK: core-$i runtime=$(core_runtime_for "$i") bin=$(runtime_bin_for "$(core_runtime_for "$i")")"
+  done
   exit 0
 fi
 
@@ -261,6 +352,16 @@ shopt -u nullglob
 # up changes to env / paths / command.
 for i in $(seq 1 "$N"); do
   PLIST="$LAUNCH_AGENTS/com.sutando.core-$i.plist"
+  # POOL_CLAUDE_BIN below is retained unchanged: a wrapper staged by an earlier
+  # install reads it and knows nothing about POOL_RUNTIME/POOL_RUNTIME_BIN.
+  CORE_RUNTIME="$(core_runtime_for "$i")"
+  CORE_RUNTIME_BIN="$(runtime_bin_for "$CORE_RUNTIME")"
+  RUNTIME_CONFIG_KEYS=""
+  if [ "$CORE_RUNTIME" = "codex" ] && [ -n "$CODEX_CONFIG_ENV" ] && [ -n "$CODEX_CONFIG_DIR" ]; then
+    RUNTIME_CONFIG_KEYS="    <key>POOL_RUNTIME_CONFIG_ENV</key><string>$CODEX_CONFIG_ENV</string>
+    <key>POOL_RUNTIME_CONFIG_DIR</key><string>$CODEX_CONFIG_DIR</string>
+"
+  fi
   cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -285,7 +386,9 @@ for i in $(seq 1 "$N"); do
     <key>POOL_WORKSPACE</key><string>$WORKSPACE</string>
     <key>CLAUDE_CONFIG_DIR</key><string>$CLAUDE_CONFIG_DIR_EFFECTIVE</string>
     <key>PATH</key><string>$POOL_PATH</string>
-  </dict>
+    <key>POOL_RUNTIME</key><string>$CORE_RUNTIME</string>
+    <key>POOL_RUNTIME_BIN</key><string>$CORE_RUNTIME_BIN</string>
+${RUNTIME_CONFIG_KEYS}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
@@ -302,7 +405,7 @@ PLIST_EOF
   # bootstrap alone leaves the job loaded-but-never-started (observed: a
   # scaled-up core sat dead until poked), and RunAtLoad does not close it.
   launchctl kickstart "$DOMAIN/com.sutando.core-$i" 2>/dev/null || true
-  echo "installed: com.sutando.core-$i (workspace=$WORKSPACE)"
+  echo "installed: com.sutando.core-$i (workspace=$WORKSPACE, runtime=$CORE_RUNTIME)"
 
   # Retired heartbeat sidecar: it ran `core_heartbeat.py`, which ignores
   # SUTANDO_CORE_ID (writes `<hostlabel>.alive`) and gates on a tmux pane a
