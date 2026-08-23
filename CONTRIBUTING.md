@@ -269,6 +269,10 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    The practical consequence is the same either way: the trigger comment is neither sufficient nor necessary, and the check below is what tells you where you actually stand. A manual trigger comment on `#2605` did not restore it; close+reopen did, and its two approvals survived. Four PRs were recovered this way across two authors.
 3. Address every substantive review-thread comment before merge: fixed in a subsequent commit, replied with rationale for declining, or explicitly deferred to a follow-up issue.
 4. **If the PR ended up large, split it post-hoc.** If during review it becomes clear the diff covers more than one concern (a fix + a refactor, two unrelated features, etc.), close this PR and re-open it as N smaller PRs rather than negotiating reviewer patience. Easier than rebasing later; easier to revert one piece at a time.
+5. **Solicit and NOTIFY reviewers — a GitHub review request is not a notification.** Use the collaboration-intelligence skill to resolve *whom* to ask and *where they read*: it maps each reviewer to the agent stand-in that acts on their behalf, so the ask reaches something that will act rather than a list nobody polls.
+   - **On open** — request on GitHub **and** address each reviewer in a channel they are in. Requesting on GitHub alone is filing, not asking.
+   - **On every update** — do it again. A push re-notifies no one, and this repo sets `dismiss_stale_reviews_on_push: false`, so a standing `CHANGES_REQUESTED` latch survives the fix and its author receives no signal to look again. A PR can sit blocked with the fix already pushed, waiting on a reviewer who has no way to know.
+   - Address the **stand-in**, not the human handle — mentioning a person is not addressing their agent, and only one of those gets acted on.
 
 ## Reviewing PRs
 
