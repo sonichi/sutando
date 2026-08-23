@@ -2197,6 +2197,15 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         _log(f"owner-activity write failed: {e}")
 
 
+def _task_pending_locally(tid: str) -> bool:
+    """True while the task still sits in tasks/ under ANY pool state. A pool
+    lead renames a task to .assigned-<core> before the follower renames it to
+    .claimed-<core>; both are custody handoffs, never completions."""
+    return ((TASKS_DIR / f"{tid}.txt").exists()
+            or any(TASKS_DIR.glob(f"{tid}.assigned-*"))
+            or any(TASKS_DIR.glob(f"{tid}.claimed-*")))
+
+
 def _write_task(task: dict) -> str | None:
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns the task id, or None if it has no id / already present."""
@@ -2213,7 +2222,7 @@ def _write_task(task: dict) -> str | None:
     task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived.
-    if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
+    if _task_pending_locally(tid):
         return tid
     # Relay redelivery of already-handled work: on reconnect the gateway replays
     # its unacked pool, including tasks this node long since processed (the
@@ -3106,8 +3115,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     instead of being raced. Returns the new suspects set for the next pass."""
     gone = {tid for tid in inflight
             if _valid_local_tid(tid)
-            and not (TASKS_DIR / f"{tid}.txt").exists()
-            and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
+            and not _task_pending_locally(tid)
             and not (RESULTS_DIR / f"{tid}.txt").exists()
             and not _task_archived_recently(tid)}
     confirmed = gone & suspects
