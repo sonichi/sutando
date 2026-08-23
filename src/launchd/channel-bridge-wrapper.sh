@@ -20,15 +20,28 @@ case "$CHANNEL" in
   telegram) TOKEN_VAR=TELEGRAM_BOT_TOKEN; TOKEN="${TELEGRAM_BOT_TOKEN:-}"; MODULE=urllib.request ;;
 esac
 
+# Interpreter: resolved ONCE, before anything invokes it. Honor an explicit
+# override, else the PATH-resolved python3 -- but only after the module probe
+# accepts it. An unvalidated `command -v python3` can be the Xcode Command Line
+# Tools stub, which prompts an install dialog when executed, so the token gate
+# below must never be the thing that discovers that.
+# The launchd plist sets PATH to "__BREW_BIN__:/usr/bin:...", where __BREW_BIN__
+# is the dir the installer resolved via its own `command -v python3` -- so a bare
+# `python3` here is the interpreter the installer validated, with no clone-,
+# arch-, or user-specific candidate list baked into this committed file.
+PYTHON="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
+if [ -z "$PYTHON" ] && command -v python3 >/dev/null 2>&1; then
+  python3 -c "import $MODULE" >/dev/null 2>&1 && PYTHON=python3
+fi
+
 # The bridge resolves env -> .env -> vault, so an .env-only gate here is NARROWER
 # than the thing it gates and parks a bridge whose token is merely in the vault.
-# Honor the SAME interpreter contract the bridge launch uses below, or a host
-# relying on the explicit override gets a runnable bridge and an unrunnable gate.
-_GATE_PY="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
-if [ -z "$_GATE_PY" ] && command -v python3 >/dev/null 2>&1; then _GATE_PY=python3; fi
-if [ -z "$TOKEN" ] && [ -n "$_GATE_PY" ]; then
+# Uses the SAME validated $PYTHON the child gets: a host relying on the explicit
+# override otherwise gets a runnable bridge and an unrunnable gate, and a host
+# whose PATH python3 is a stub must not have it invoked here at all.
+if [ -z "$TOKEN" ] && [ -n "$PYTHON" ]; then
   _tok_rc=0
-  "$_GATE_PY" "$REPO/src/channel_token.py" --has "$TOKEN_VAR" --env-file "$ENV_FILE" 2>/dev/null || _tok_rc=$?
+  "$PYTHON" "$REPO/src/channel_token.py" --has "$TOKEN_VAR" --env-file "$ENV_FILE" 2>/dev/null || _tok_rc=$?
   # 0 = usable, 3 = definitively absent, anything else = resolver unrunnable, so
   # fall through to the .env answer rather than taking the bridge down on a bug.
   [ "$_tok_rc" -eq 0 ] && TOKEN="vault"
@@ -44,15 +57,9 @@ if [ -z "$TOKEN" ]; then
   while :; do sleep 300; done
 fi
 
-# Interpreter: honor an explicit override, else the PATH-resolved python3. The
-# launchd plist sets PATH to "__BREW_BIN__:/usr/bin:...", where __BREW_BIN__ is
-# the dir the installer resolved via its own `command -v python3` — so a bare
-# `python3` here is the interpreter the installer validated, with no clone-,
-# arch-, or user-specific candidate list baked into this committed file.
-PYTHON="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
-if [ -z "$PYTHON" ] && command -v python3 >/dev/null 2>&1; then
-  python3 -c "import $MODULE" >/dev/null 2>&1 && PYTHON=python3
-fi
+# $PYTHON was resolved above, before the token gate could invoke anything. The
+# fatal check stays HERE, after the idle branch: a deconfigured channel with no
+# usable interpreter must still park quietly rather than exit 1 into a respawn.
 if [ -z "$PYTHON" ]; then
   echo "[$CHANNEL-bridge-wrapper] no usable Python interpreter" >&2
   exit 1
