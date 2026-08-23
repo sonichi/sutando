@@ -189,7 +189,10 @@ def _task_display_fields_for_id(task_id: str) -> tuple[str, str]:
 
 def _remember_done_result_file(result_file: Path) -> None:
     task_id = result_file.stem
-    result_content = read_ready_result(result_file) or ""
+    # Existence is not doneness: a body still being written is not a result.
+    result_content = read_ready_result(result_file)
+    if result_content is None:
+        return
     task_line, source_line = _task_display_fields_for_id(task_id)
     display_text = task_line or (result_content.split('\n')[0][:80] if result_content else task_id)
 
@@ -365,15 +368,20 @@ def _active_task_rows() -> list[dict]:
             if candidate.exists():
                 archived_file = candidate
                 break
-        if result_file.exists():
+        # Status and body must answer the SAME question; `done` from existence
+        # plus a body from readiness reports done-with-an-empty-result.
+        live_body = read_ready_result(result_file)
+        archived_body = (read_ready_result(archived_file)
+                         if archived_file is not None else None)
+        if live_body is not None:
             status = "done"
-            result_text = read_ready_result(result_file) or ""
+            result_text = live_body
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
-        elif archived_file is not None:
+        elif archived_body is not None:
             status = "done"
-            result_text = read_ready_result(archived_file) or ""
+            result_text = archived_body
         else:
             status = "working"
             result_text = ""
@@ -402,9 +410,10 @@ def _active_task_rows() -> list[dict]:
             continue
         task_file = TASK_DIR / f"{task_id}.txt"
         result_file = RESULT_DIR / f"{task_id}.txt"
-        if result_file.exists():
+        body = read_ready_result(result_file)
+        if body is not None:
             task_data["status"] = "done"
-            task_data["result"] = read_ready_result(result_file) or ""
+            task_data["result"] = body
         elif not task_file.exists() and _time.time() - task_data.get("time", 0) > 300:
             stale_ids.append(task_id)
     for task_id in stale_ids:

@@ -130,6 +130,14 @@ def test_active_task_rows_survives_torn_bodies():
                   f"_active_task_rows survives torn task AND result bodies ({len(rows)} row(s))")
         except UnicodeDecodeError as e:
             check(False, f"_active_task_rows RAISED {type(e).__name__}")
+        # Status and body must answer the SAME question. Existence-based `done`
+        # plus readiness-based body reports done-with-an-empty-result.
+        row = api.task_history.get("task-4", {})
+        check(row.get("status") != "done",
+              f"a torn result does not mark the row done (status={row.get('status')!r})")
+        g = (api.get_task_result("task-4") or {}).get("status")
+        check((row.get("status") == "done") == (g == "completed"),
+              f"rows and /result agree on the same file (row={row.get('status')!r} /result={g!r})")
 
 
 def test_task_envelope_census_survives_a_torn_body():
