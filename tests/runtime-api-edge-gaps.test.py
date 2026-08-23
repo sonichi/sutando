@@ -69,6 +69,52 @@ class TasksViewEdges(unittest.TestCase):
         self.assertTrue(out is None or "body" not in json.dumps(out))
 
 
+class TasksViewMoreEdges(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tasks = Path(self.tmp.name) / "tasks"
+        self.results = Path(self.tmp.name) / "results"
+        (self.tasks / "archive").mkdir(parents=True)
+        self.results.mkdir()
+        self.v = TasksView(self.tasks, self.results, "@edge:test")
+
+    def tearDown(self):
+        for d in (self.tasks, self.results):
+            for p in d.rglob("*"):
+                if p.is_file():
+                    p.chmod(0o644)
+        self.tmp.cleanup()
+
+    def test_archived_task_reads_done(self):
+        (self.tasks / "archive" / "task-old.txt").write_text("id: task-old\n")
+        self.assertEqual(self.v.status("task-old")["state"], "done")
+
+    def test_latest_result_unreadable_is_none(self):
+        f = self.results / "task-rtapi-new.txt"
+        f.write_text("body")
+        f.chmod(0o000)
+        self.assertIsNone(self.v.get_result())  # latest (no id) form
+
+    def test_list_results_skips_unreadable(self):
+        (self.results / "task-rtapi-a.txt").write_text("A")
+        bad = self.results / "task-rtapi-b.txt"
+        bad.write_text("B")
+        bad.chmod(0o000)
+        out = self.v.list_results()
+        ids = [r["taskId"] for r in out.get("results", out) or []]             if isinstance(out, (dict, list)) else []
+        flat = json.dumps(out)
+        self.assertIn("task-rtapi-a", flat)
+        self.assertNotIn('"B"', flat)
+
+    def test_list_keeps_entry_when_headers_unreadable(self):
+        f = self.tasks / "task-h.txt"
+        f.write_text("id: task-h\nsource: chat\ntask: hi\n")
+        f.chmod(0o000)
+        flat = json.dumps(self.v.list_tasks() if hasattr(self.v, "list_tasks")
+                          else self.v.list())
+        self.assertIn("task-h", flat)  # entry present, headers just absent
+
+
 class AgentsViewEdges(unittest.TestCase):
     def test_empty_agent_id_is_none(self):
         with tempfile.TemporaryDirectory() as td:
@@ -101,24 +147,30 @@ class SchedulesViewEdges(unittest.TestCase):
             self.assertEqual(byname["loose"]["kind"], "prompt")
             self.assertIn("sweep", byname["loose"]["description"])
 
-    def test_relative_formats_and_descriptions(self):
+    def test_relative_formats_owners_and_descriptions(self):
         from datetime import datetime
+        import dashboard_schedules as ds
         with tempfile.TemporaryDirectory() as td:
             crons = Path(td) / "crons.json"
             crons.write_text(json.dumps([
                 {"name": "hourly", "cron": "30 */3 * * *",
                  "description": "own words"},
-                {"name": "daily", "cron": "0 4 * * 1",
+                {"name": "daily", "cron": "0 4 * * 4",
                  "prompt": "p" * 130},
                 {"name": "sh", "cron": "0 4 * * *",
                  "shell_command": "echo hi"},
             ]))
-            rows = SchedulesView(crons).list_schedules()["schedules"]
+            now = datetime(2026, 1, 5, 0, 0)  # Monday: Thursday is 3d out
+            rows = ds.list_schedules(crons, now=now)
             byname = {r["name"]: r for r in rows}
             self.assertEqual(byname["hourly"]["description"], "own words")
             self.assertTrue(byname["daily"]["description"].endswith("…"))
+            self.assertIn("d", byname["daily"]["next_run"])   # day-scale rel
             self.assertEqual(byname["sh"]["kind"], "shell")
             self.assertTrue(all(r["next_run_ts"] for r in rows))
+        self.assertEqual(ds.schedule_owner({"execution": "codex-task"}), "codex")
+        self.assertEqual(ds.schedule_owner({"launchd": True}), "launchd")
+        self.assertEqual(ds.schedule_owner({"loop": "dynamic"}), "dynamic-loop")
 
 
 class RuntimeViewEdges(unittest.TestCase):

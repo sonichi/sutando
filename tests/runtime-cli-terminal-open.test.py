@@ -39,6 +39,18 @@ class DetectTerminal(unittest.TestCase):
         self.assertEqual(self._with({"WEZTERM_PANE": "1"}), "wezterm")
         self.assertEqual(self._with({"KITTY_WINDOW_ID": "1"}), "kitty")
 
+    def test_ghostty_detected(self):
+        self.assertEqual(self._with({"TERM_PROGRAM": "ghostty"}), "ghostty")
+
+    def test_wezterm_and_kitty_argv_when_binary_present(self):
+        with mock.patch.object(to.shutil, "which", lambda _b: "/usr/bin/fake"):
+            wz = to.build_open_plan("@a:x", "wezterm")
+            self.assertEqual(wz["method"], "exec")
+            self.assertIn("wezterm", wz["argv"][0])
+            kt = to.build_open_plan("@a:x", "kitty")
+            self.assertEqual(kt["method"], "exec")
+            self.assertIn("kitty", kt["argv"][0])
+
     def test_unknown_terminal_falls_back(self):
         out = self._with({"TERM_PROGRAM": "MysteryTerm"})
         self.assertIsInstance(out, str)

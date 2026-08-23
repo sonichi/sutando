@@ -230,6 +230,20 @@ class EdgeBranches(unittest.TestCase):
         finally:
             os.environ.pop("XDG_DATA_HOME", None)
 
+    def test_both_platform_branches_via_patch(self):
+        from unittest import mock
+        os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
+        # cover BOTH platform-exclusive lines regardless of the runner's OS
+        with mock.patch.object(reg.sys, "platform", "darwin"):
+            self.assertIn("Application Support", str(reg.registry_dir()))
+        with mock.patch.object(reg.sys, "platform", "linux"):
+            os.environ["XDG_DATA_HOME"] = self.tmp.name
+            try:
+                self.assertTrue(
+                    str(reg.registry_dir()).startswith(self.tmp.name))
+            finally:
+                os.environ.pop("XDG_DATA_HOME", None)
+
     def test_missing_registry_dir_lists_empty(self):
         self.assertEqual(reg.list_instances(), [])
 
@@ -242,6 +256,61 @@ class EdgeBranches(unittest.TestCase):
             {"identity": {"agent_id": "@a:x"},
              "endpoint": {"path": str(Path(self.tmp.name) / "no.sock")}})
         self.assertFalse(out["attachable"])
+
+    def _stub_daemon(self, info_agent, health_state):
+        import socket as _s
+        import threading
+        import uuid as _uuid
+        sock_path = str(Path(self.tmp.name) / f"stub-{_uuid.uuid4().hex[:6]}.sock")
+        srv = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
+        srv.bind(sock_path)
+        srv.listen(2)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    data = conn.recv(65536).decode()
+                    if not data.strip():
+                        continue
+                    req = json.loads(data.splitlines()[0])
+                    r = ({"agentId": info_agent}
+                         if req.get("method") == "sutando.info"
+                         else {"state": health_state})
+                    conn.sendall(json.dumps(
+                        {"jsonrpc": "2.0", "id": req["id"],
+                         "result": r}).encode() + b"\n")
+                finally:
+                    conn.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        return sock_path, srv
+
+    def test_attachable_identity_and_core_stages(self):
+        sock, srv = self._stub_daemon("@imposter:x", "online")
+        try:
+            out = reg.attachable({"identity": {"agent_id": "@real:x"},
+                                  "endpoint": {"path": sock}})
+            self.assertEqual(out["stage"], "identity")
+        finally:
+            srv.close()
+        sock, srv = self._stub_daemon("@real:x", "starting")
+        try:
+            out = reg.attachable({"identity": {"agent_id": "@real:x"},
+                                  "endpoint": {"path": sock}})
+            self.assertEqual(out["stage"], "core")
+        finally:
+            srv.close()
+        sock, srv = self._stub_daemon("@real:x", "online")
+        try:
+            out = reg.attachable({"identity": {"agent_id": "@real:x"},
+                                  "endpoint": {"path": sock}})
+            self.assertTrue(out["attachable"])
+        finally:
+            srv.close()
 
     def test_start_refuses_non_executable_launcher(self):
         plain = Path(self.tmp.name) / "not-exec.sh"

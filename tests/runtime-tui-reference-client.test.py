@@ -108,5 +108,86 @@ class TuiReferenceClientTests(unittest.TestCase):
                 os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
 
 
+
+
+class TuiBranchTests(unittest.TestCase):
+    """Error-shape branches of the pure probe/render core."""
+
+    def _serve_once(self, payload_fn):
+        import socket as _s
+        import tempfile as _tf
+        import threading
+        sock_path = _tf.mktemp(prefix="tuib", dir="/tmp")
+        srv = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
+        srv.bind(sock_path)
+        srv.listen(1)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                data = conn.recv(65536)
+                resp = payload_fn(data)
+                if resp is not None:
+                    conn.sendall(resp)
+                conn.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        return sock_path, srv
+
+    def test_rpc_error_response_raises(self):
+        sock, srv = self._serve_once(lambda d: json.dumps(
+            {"jsonrpc": "2.0", "id": "x",
+             "error": {"message": "boom"}}).encode() + b"\n")
+        try:
+            with self.assertRaises(RuntimeError):
+                tui._rpc_at(sock, "sutando.info", {})
+        finally:
+            srv.close()
+
+    def test_early_close_yields_empty_buffer_error(self):
+        sock, srv = self._serve_once(lambda d: None)  # close with no bytes
+        try:
+            with self.assertRaises((RuntimeError, ValueError)):
+                tui._rpc_at(sock, "sutando.info", {})
+        finally:
+            srv.close()
+
+    def test_identity_mismatch_marks_unverified(self):
+        def payload(d):
+            req = json.loads(d.decode().splitlines()[0])
+            m = req.get("method")
+            if m == "sutando.info":
+                r = {"agentId": "@someone-else:x"}
+            else:
+                r = {"state": "online"}
+            return (json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                                "result": r}).encode() + b"\n")
+        sock, srv = self._serve_once(payload)
+        try:
+            v = tui.instance_view({
+                "identity": {"agent_id": "@me:x"},
+                "endpoint": {"path": sock}})
+            self.assertFalse(v["identityVerified"])
+        finally:
+            srv.close()
+
+    def test_views_lists_registry_manifests(self):
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            os.environ["SUTANDO_INSTANCE_REGISTRY"] = td
+            try:
+                tui.instance_registry.write_manifest(
+                    "@vw:x", endpoint=str(Path(td) / "none.sock"))
+                rows = tui._views()
+                self.assertEqual(len(rows), 1)
+                self.assertIn("_manifest", rows[0])
+            finally:
+                os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
