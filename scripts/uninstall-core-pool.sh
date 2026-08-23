@@ -35,6 +35,9 @@ for plist in "$LAUNCH_AGENTS"/com.sutando.core-[0-9]*.plist; do
   label="${base%.plist}"
   launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
   rm -f "$plist"
+  # persistent-form follower session outlives the wrapper; end it too
+  idx="${label#com.sutando.core-}"
+  case "$idx" in *[!0-9]*) ;; *) tmux kill-session -t "core-$idx" 2>/dev/null || true;; esac
   echo "removed: $base"
   removed=$((removed + 1))
 done

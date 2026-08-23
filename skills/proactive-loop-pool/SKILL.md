@@ -25,12 +25,16 @@ Each pool session sets these via its launchd plist (see `scripts/install-core-po
 
 If `SUTANDO_CORE_ID` is unset, abort with a clear error: "proactive-loop-pool requires SUTANDO_CORE_ID — are you sure you meant to invoke this instead of /proactive-loop?"
 
-## Activation, scheduling, watcher
+## Activation (persistent follower form)
 
-Identical to `/proactive-loop` — `/schedule-crons` and the streaming task watcher start the same way. See `~/.claude/skills/proactive-loop/SKILL.md` for the full body, or follow these steps verbatim:
+Followers are long-lived interactive sessions inside tmux (`tmux attach -t core-N` to observe), started by the launchd wrapper. On activation:
 
-1. `/schedule-crons` to set up recurring crons.
-2. Start the streaming task watcher via the `Monitor` tool.
+1. **Do NOT run `/schedule-crons`.** The host cron set (morning briefing, digests, main loop) is owned by the main core / lead; a follower registering it would fire every host cron N times. Followers register exactly ONE session cron: `CronCreate` with `cron: "*/5 * * * *"` and `prompt: "/proactive-loop-pool pass"` — the periodic sweep that catches assignments the watcher missed.
+2. Start the streaming task watcher via the `Monitor` tool — `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. React ONLY to events for your own assignments (`task-*.assigned-core-<your id>.txt`) plus, in leaderless fallback, unassigned `task-*.txt` (acquire_work decides — see below). Ignore other instances' assigned/claimed events.
+3. Liveness is the wrapper's job (`pool-follower-beat.sh` writes `state/cores/core-N.alive` pid-bound to this session) — do not start `core_heartbeat.py` in-session.
+4. Do not write `core-status.json` — that file is the main core's owner-facing status; a follower overwriting it lies to the owner about what the main core is doing.
+
+When the arguments say `pass`, run one acquire-and-process sweep (steps below) and stop; otherwise this is session boot — do steps 1-2, run one sweep, then idle until watcher events or the cron fire.
 
 ## The claim step (what's different from /proactive-loop)
 

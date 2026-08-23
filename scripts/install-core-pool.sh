@@ -66,6 +66,11 @@ chmod +x "$STAGE_DIR/pool-core-wrapper.sh" "$STAGE_DIR/pool-follower-beat.sh"
 # Resolve claude + python3 binaries. Caller's $PATH may not include the
 # install dirs on launchd-spawned processes, so capture absolute paths now.
 CLAUDE_BIN="$(command -v claude || true)"
+TMUX_BIN="$(command -v tmux || true)"
+if [ -z "$TMUX_BIN" ]; then
+  echo "error: 'tmux' not found on \$PATH (persistent-form followers run in tmux)" >&2
+  exit 1
+fi
 if [ -z "$CLAUDE_BIN" ]; then
   echo "error: 'claude' CLI not found on \$PATH" >&2
   exit 1
@@ -178,6 +183,7 @@ for i in $(seq 1 "$N"); do
     <key>SUTANDO_CORE_POOL_SIZE</key><string>$N</string>
     <key>POOL_REPO_DIR</key><string>$REPO_DIR</string>
     <key>POOL_CLAUDE_BIN</key><string>$CLAUDE_BIN</string>
+    <key>POOL_TMUX_BIN</key><string>$TMUX_BIN</string>
     <key>POOL_WORKSPACE</key><string>$WORKSPACE</string>
     <key>CLAUDE_CONFIG_DIR</key><string>$CLAUDE_CONFIG_DIR_EFFECTIVE</string>
     <key>PATH</key><string>$POOL_PATH</string>
