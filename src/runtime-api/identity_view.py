@@ -81,7 +81,7 @@ class IdentityView:
         evidence = [{"provider": name, "subject": acc["tofuOwner"]}
                     for name, acc in self._channels() if acc.get("tofuOwner")]
         card = {"stand": stand, "owners": owners, "owner_evidence": evidence,
-                "entrances": self.entrances(details)["entrances"],
+                "channels": self.entrances(details)["channels"],
                 "devices": self._devices(details),
                 "instances": self._instances()}
         return card
@@ -164,7 +164,7 @@ class IdentityView:
                 if not d.is_dir():
                     continue
                 out.append(self._entrance(d, details))
-        return {"entrances": out}
+        return {"channels": out}
 
     def _entrance(self, d: Path, details: bool = False) -> dict:
         ent: dict = {"provider": d.name}
@@ -180,7 +180,7 @@ class IdentityView:
                 payload = json.loads(acc.read_text())
                 evidence["policy_present"] = True
                 if isinstance(payload, dict) and payload.get("tofuOwner"):
-                    evidence["owner_evidence"] = payload["tofuOwner"]
+                    evidence["owner_id"] = payload["tofuOwner"]
             except (OSError, ValueError):
                 policy_invalid = True
         if d.name == "ag2space":

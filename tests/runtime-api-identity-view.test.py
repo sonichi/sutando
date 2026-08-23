@@ -182,7 +182,7 @@ class TestStand(unittest.TestCase):
         self.assertEqual(out["owner_evidence"],
                          [{"provider": "ag2space",
                            "subject": "@owner:ag2.space"}])
-        self.assertIn("entrances", out)
+        self.assertIn("channels", out)
         self.assertEqual(out["devices"], [])
         self.assertEqual(out["instances"], [])
 
@@ -250,20 +250,20 @@ class TestEntrances(unittest.TestCase):
         self._mkchan("telegram")  # empty folder
         self._mkchan("broken", access="{not json")
         out = _mk(self.state, self.channels).entrances()
-        by = {e["provider"]: e for e in out["entrances"]}
+        by = {e["provider"]: e for e in out["channels"]}
         self.assertEqual(by["ag2space"]["status"], "configured_unverified")
         self.assertEqual(by["ag2space"]["evidence"]["subject_evidence"],
                          "@stand:ag2.space")
-        self.assertEqual(by["ag2space"]["evidence"]["owner_evidence"],
+        self.assertEqual(by["ag2space"]["evidence"]["owner_id"],
                          "@owner:ag2.space")
         self.assertEqual(by["discord"]["status"], "configured_unverified")
         # tierMap is not owner evidence at the entrance level either
-        self.assertNotIn("owner_evidence", by["discord"]["evidence"])
+        self.assertNotIn("owner_id", by["discord"]["evidence"])
         self.assertEqual(by["slack"]["status"], "configured_unverified")
         self.assertEqual(by["telegram"]["status"], "not_configured")
         self.assertEqual(by["broken"]["status"], "policy_invalid")
         # nothing may ever claim "active" without provider verification (I2)
-        self.assertNotIn("active", {e["status"] for e in out["entrances"]})
+        self.assertNotIn("active", {e["status"] for e in out["channels"]})
 
     def test_env_contents_never_leak(self):
         self._mkchan("discord", env="DISCORD_TOKEN=sekret-dc-9911",
@@ -287,8 +287,9 @@ class TestEntrances(unittest.TestCase):
                               "@me:x", executors={},
                               identity_view=IdentityView(self.state, "@me:x",
                                                          channels_dir=self.channels))
-        out = asyncio.run(d.handle("sutando.entrances", {}))
-        self.assertIn("entrances", out)
+        for method in ("sutando.channels", "sutando.entrances"):
+            out = asyncio.run(d.handle(method, {}))
+            self.assertIn("channels", out)
 
 
 class TestEntranceLinks(unittest.TestCase):
@@ -323,7 +324,7 @@ class TestEntranceLinks(unittest.TestCase):
         link = self._link()
         self.assertEqual(link["stand_id"], "@stand:ag2.space")
         out = _mk(self.state, self.channels).entrances()
-        e = out["entrances"][0]
+        e = out["channels"][0]
         self.assertEqual(e["status"], "active")
         self.assertEqual(e["identity"], {"type": "bot_user", "id": "123"})
         self.assertEqual(e["verification"]["method"],
@@ -331,7 +332,7 @@ class TestEntranceLinks(unittest.TestCase):
 
     def test_no_link_stays_unverified(self):
         out = _mk(self.state, self.channels).entrances()
-        self.assertEqual(out["entrances"][0]["status"],
+        self.assertEqual(out["channels"][0]["status"],
                          "configured_unverified")
 
     def test_unique_subject_conflict_is_loud(self):

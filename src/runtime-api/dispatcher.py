@@ -252,6 +252,7 @@ class RuntimeDispatcher:
                 return self.identity.resolve(str(params.get("provider") or ""),
                                              str(params.get("subject") or ""))
             fn = {"sutando.info": self.identity.info,
+                  "sutando.channels": self.identity.entrances,
                   "sutando.entrances": self.identity.entrances,
                   "sutando.status": self.identity.status,
                   "sutando.owner": self.identity.owner,

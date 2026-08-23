@@ -633,12 +633,12 @@ def _print_entrance_rows(ents: list, width: int) -> None:
             print(f"    {'fingerprint'.ljust(width)}{cred['fingerprint']}")
         ev = e.get("evidence") or {}
         for key, label in (("subject_evidence", "subject"),
-                           ("owner_evidence", "owner evidence"),
+                           ("owner_id", "owner id"),
                            ("credential_present", "credential"),
                            ("policy_present", "policy")):
             if key in ev:
                 val = ev[key] if isinstance(ev[key], str) else "present"
-                if key == "owner_evidence":
+                if key == "owner_id":
                     val = _fmt_subject(e.get("provider", ""), val)
                 print(f"    {label.ljust(width)}{val}")
         st = e.get("storage") or {}
@@ -715,9 +715,9 @@ def _print_stand_card(card: dict, section: "str | None") -> int:
                       f"{_fmt_subject(ev['provider'], ev['subject'])}"
                       f" via {ev['provider']}")
         print()
-    if show("entrances"):
-        ents = card.get("entrances") or []
-        print("Entrances")
+    if show("channels") or section == "entrances":
+        ents = card.get("channels") or []
+        print("Channels")
         if ents:
             _print_entrance_rows(ents, width)
         else:
@@ -811,8 +811,8 @@ def main(argv=None) -> int:
         idn.add_parser(name)
     std = idn.add_parser("stand")
     std.add_argument("sub", nargs="?",
-                     choices=["id", "owner", "entrances", "devices",
-                              "instances", "resolve"])
+                     choices=["id", "owner", "channels", "entrances",
+                              "devices", "instances", "resolve"])
     std.add_argument("extra", nargs="*")
     std.add_argument("--json", action="store_true", dest="as_json")
     std.add_argument("--details", action="store_true", dest="details")
