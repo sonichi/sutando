@@ -184,7 +184,7 @@ class TestStand(unittest.TestCase):
                            "subject": "@owner:ag2.space"}])
         self.assertIn("channels", out)
         self.assertEqual(out["devices"], [])
-        self.assertEqual(out["instances"], [])
+        self.assertNotIn("instances", out)
 
     def test_absent_records_are_omitted_not_null(self):
         # no enrolled record, no channels: empty sections, no invented values

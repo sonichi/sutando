@@ -745,14 +745,6 @@ def _print_stand_card(card: dict, section: "str | None") -> int:
         else:
             print("  No enrolled devices")
         print()
-    if show("instances"):
-        rows = card.get("instances") or []
-        print("Instances")
-        if rows:
-            for r in rows:
-                print(f"  {r.get('host_label','').ljust(28)}{r.get('status','')}")
-        else:
-            print("  none registered")
     return 0
 
 
@@ -823,7 +815,7 @@ def main(argv=None) -> int:
     std = idn.add_parser("stand")
     std.add_argument("sub", nargs="?",
                      choices=["id", "owner", "channels", "entrances",
-                              "devices", "instances", "resolve"])
+                              "devices", "resolve"])
     std.add_argument("extra", nargs="*")
     std.add_argument("--json", action="store_true", dest="as_json")
     std.add_argument("--details", action="store_true", dest="details")

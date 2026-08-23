@@ -19,7 +19,7 @@ import json
 import time
 from pathlib import Path
 
-from agents_view import ALIVE_MAX_AGE_S, AgentsView
+from agents_view import ALIVE_MAX_AGE_S
 
 
 class IdentityView:
@@ -80,10 +80,11 @@ class IdentityView:
                 owners.append(row)
         evidence = [{"provider": name, "subject": acc["tofuOwner"]}
                     for name, acc in self._channels() if acc.get("tofuOwner")]
+        # No instances: heartbeat rows are incarnation/runtime data, not
+        # identity; Installations return when a real record exists (S1+).
         card = {"stand": stand, "owners": owners, "owner_evidence": evidence,
                 "channels": self.entrances(details)["channels"],
-                "devices": self._devices(details),
-                "instances": self._instances()}
+                "devices": self._devices(details)}
         return card
 
     def _devices(self, details: bool = False) -> list:
@@ -106,15 +107,6 @@ class IdentityView:
                 row["granted_methods"] = rec["granted_methods"]
             if rec.get("last_seen_at") not in (None, "None"):
                 row["last_seen_at"] = rec["last_seen_at"]
-            out.append(row)
-        return out
-
-    def _instances(self) -> list:
-        rows = AgentsView(self.state_dir).list_agents().get("agents", [])
-        out = []
-        for r in rows:
-            row = {"host_label": r.get("host") or r.get("agentId"),
-                   "status": "alive" if r.get("alive") else "stale"}
             out.append(row)
         return out
 
