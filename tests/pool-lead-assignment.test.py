@@ -81,6 +81,7 @@ class PoolLeadTests(unittest.TestCase):
         self.assertEqual(row["ts"], self.clock[0])
 
     def test_least_loaded_gets_channelless_work(self):
+        self.alive["core-c"] = True  # a/b stay in the owner lane (c = routine)
         (self.tasks / "task-old.assigned-core-a.txt").write_text("x")
         self._task("task-new.txt")
         inst = dict(self.lead.sweep())["task-new.txt"]
@@ -207,7 +208,7 @@ class AffinityBusyYieldTest(unittest.TestCase):
         self.tasks.mkdir(); (self.state / "pool").mkdir(parents=True)
         self.lead = PoolLead(
             self.tasks, self.state,
-            followers_fn=lambda: ["core-1", "core-2"],
+            followers_fn=lambda: ["core-1", "core-2", "core-3"],
             alive_fn=lambda inst: True,
         )
         import json

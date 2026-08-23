@@ -35,6 +35,8 @@ _TASK_RE = re.compile(
     r"^task-(?!.*\.(?:assigned|claimed)-)[A-Za-z0-9._~-]+\.txt$")
 _CHANNEL_RE = re.compile(r"^(?:channel_id|chat_id):\s*(\S+)", re.M)
 _INST_RE = re.compile(r"^[A-Za-z0-9@:._-]{1,128}$")
+_LANE_RE = re.compile(
+    r"^(?P<key>access_tier|priority|interaction_type):\s*(?P<val>\S+)", re.M)
 
 
 def _read_channel(path: Path) -> "str | None":
@@ -44,6 +46,22 @@ def _read_channel(path: Path) -> "str | None":
         return None
     m = _CHANNEL_RE.search(head)
     return m.group(1) if m else None
+
+
+def _read_lane(path: Path) -> str:
+    """'routine' for non-owner senders and low-priority/self-driven work;
+    'owner' otherwise. Unreadable or unenumerated headers fail to 'owner' —
+    a malformed header must never shunt an owner message behind maintenance."""
+    try:
+        head = path.read_text(errors="replace")[:2048]
+    except OSError:
+        return "owner"
+    fields = dict(m.group("key", "val") for m in _LANE_RE.finditer(head))
+    tier = fields.get("access_tier")
+    if (tier is not None and tier != "owner") or fields.get("priority") == "low" \
+            or fields.get("interaction_type") == "self_reflective":
+        return "routine"
+    return "owner"
 
 
 class PoolLead:
@@ -94,17 +112,28 @@ class PoolLead:
             return 0
 
     def _pick(self, channel: "str | None", followers: "list[str]",
-              affinity: dict) -> str:
+              affinity: dict, lane: str = "owner") -> str:
+        # Soft lanes (owner 2026-08-23): the highest core is the routine lane;
+        # owner traffic stays off it except as saturated-pool overflow.
+        lane_core = (max(followers, key=lambda f: (len(str(f)), str(f)))
+                     if len(followers) > 1 else None)
+        if lane == "routine" and lane_core is not None:
+            return lane_core
+        primary = [f for f in followers if f != lane_core] or followers
         if channel:
             row = affinity.get(channel)
-            if (isinstance(row, dict) and row.get("instance") in followers
+            if (isinstance(row, dict) and row.get("instance") in primary
                     and self.now() - float(row.get("ts") or 0)
                     < AFFINITY_IDLE_S
                     # a backlogged handler serializes the whole channel;
                     # parallelism outranks continuity past this depth
                     and self._load(row["instance"]) < AFFINITY_BUSY_MAX):
                 return row["instance"]
-        return min(followers, key=lambda f: (self._load(f), str(f)))
+        pick = min(primary, key=lambda f: (self._load(f), str(f)))
+        if (lane_core is not None and self._load(pick) >= AFFINITY_BUSY_MAX
+                and self._load(lane_core) == 0):
+            return lane_core  # overflow: whole owner lane saturated, lane idle
+        return pick
 
     # ── the sweep ───────────────────────────────────────────────────────────
     def sweep(self) -> "list[tuple[str, str]]":
@@ -125,7 +154,7 @@ class PoolLead:
             if self._done_flag_exists(f.name) and self._result_evidence(f.name):
                 continue  # processed by a since-dead claimer; bridge owns it now
             channel = _read_channel(f)
-            inst = self._pick(channel, followers, affinity)
+            inst = self._pick(channel, followers, affinity, _read_lane(f))
             target = f.with_name(
                 f.name[:-len(".txt")] + f".assigned-{inst}.txt")
             try:

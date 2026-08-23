@@ -53,6 +53,7 @@ class ComposeTests(unittest.TestCase):
 
     def test_leads_load_counter_sees_follower_claims(self):
         # fallback-claimed work must weigh in the lead's next pick
+        self.alive["f3"] = True  # keep f1/f2 in the owner lane (f3 = routine)
         (self.tasks / "task-a.claimed-f1.txt").write_text("x")
         (self.tasks / "task-new.txt").write_text("task: t\n")
         inst = dict(self.lead.sweep())["task-new.txt"]
