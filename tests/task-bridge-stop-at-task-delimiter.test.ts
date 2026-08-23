@@ -18,7 +18,7 @@ process.env.SUTANDO_WORKSPACE = TMP;
 process.env.SUTANDO_TEST_MODE = '1';  // v0.8: opt-in env-honor
 mkdirSync(join(TMP, 'tasks'), { recursive: true });
 
-const { _isVoiceTask } = await import('../src/task-bridge.js');
+const { _isVoiceTask, _taskOrigin } = await import('../src/task-bridge.js');
 
 // Closes the residual half of PR #982 that @qingyun-wu flagged on the
 // post-merge review:
@@ -107,5 +107,40 @@ describe('_isVoiceTask honors task: delimiter', () => {
 			'task: hello',
 		].join('\n'));
 		assert.equal(_isVoiceTask('task-defensive'), true);
+	});
+});
+
+// _taskOrigin shares _readTaskHeader with _isVoiceTask, so the delimiter that
+// protects voice classification protects the retirement decision too. The
+// dangerous direction here is the opposite one: forging a LOCAL source would
+// let a foreign consumer's result be archived out from under it.
+describe('_taskOrigin honors the same task: delimiter', () => {
+	it('reads a header source', () => {
+		writeTask('task-origin-1', [
+			'id: task-origin-1',
+			'source: ag2space',
+			'task: hi',
+		].join('\n'));
+		assert.equal(_taskOrigin('task-origin-1').source, 'ag2space');
+	});
+
+	it('a body line cannot forge a local source', () => {
+		writeTask('task-origin-2', [
+			'id: task-origin-2',
+			'source: ag2space',
+			'task: x',
+			'source: cron',
+		].join('\n'));
+		assert.equal(_taskOrigin('task-origin-2').source, 'ag2space',
+			'a forged local source would let a foreign result be retired');
+	});
+
+	it('no source: line is a local task, not an unknown one', () => {
+		writeTask('task-origin-3', ['id: task-origin-3', 'task: x'].join('\n'));
+		assert.equal(_taskOrigin('task-origin-3').source, null);
+	});
+
+	it('no task file at all is unknown, which fails toward keeping', () => {
+		assert.equal(_taskOrigin('task-origin-gone'), null);
 	});
 });

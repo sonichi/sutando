@@ -74,6 +74,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
+import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -257,13 +259,120 @@ def main() -> int:
         check(r["status"] == "ok" and "behind" not in r["detail"],
               f"l) up-to-date -> clean ok, got {r}")
 
+    # l2) "0 behind" is a claim about the remote and this probe never fetches, so a
+    #     clean verdict is only as current as the last fetch. Say when that was.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        r = hc.check_live_checkout_branch(work)
+        check("fetch" in r["detail"],
+              f"l2) clean verdict names its fetch age, got {r['detail']}")
+
+    # l3) Backdating FETCH_HEAD alone must move the age: `refs/remotes/*` moves only
+    #     when the remote does, so a reading taken from it would call a quiet main stale.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        fh = common / "FETCH_HEAD"
+        _origin = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                                 capture_output=True, text=True).stdout.strip()
+        fh.write_text(f"deadbeef\t\tbranch 'main' of {_origin}\n")
+        old = time.time() - (26 * 3600 + 5 * 60)
+        os.utime(fh, (old, old))
+        r = hc.check_live_checkout_branch(work)
+        check("26h5m" in r["detail"],
+              f"l3) age tracks FETCH_HEAD mtime, got {r['detail']}")
+
+    # l4) With no fetch on record, say so. A fabricated "0h0m ago" reads as maximally
+    #     fresh — this disclosure's own failure mode, inverted.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        (common / "FETCH_HEAD").unlink(missing_ok=True)
+        r = hc.check_live_checkout_branch(work)
+        check("no fetch of that branch recorded" in r["detail"] and "h0m" not in r["detail"],
+              f"l4) absent FETCH_HEAD is named, not rendered as fresh, got {r['detail']}")
+
+    # l5) A fetch of an UNRELATED ref must not date origin/<expected>. FETCH_HEAD's
+    #     mtime is the last fetch of anything; only its content names the ref.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        (common / "FETCH_HEAD").write_text(
+            "deadbeef\t\t'refs/pull/2270/head' of https://example.invalid/r\n")
+        r = hc.check_live_checkout_branch(work)
+        check("no fetch of that branch recorded" in r["detail"],
+              f"l5) a PR-ref fetch must not read as freshly fetched, got {r['detail']}")
+
+    # l5b) `main` fetched from ANOTHER remote must not date origin/main. FETCH_HEAD
+    #      names the branch AND the URL; only the URL separates the two remotes.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        origin = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                                capture_output=True, text=True).stdout.strip()
+        (common / "FETCH_HEAD").write_text(
+            "deadbeef\t\tbranch 'main' of https://elsewhere.invalid/other-fork\n")
+        r = hc.check_live_checkout_branch(work)
+        check("no fetch of that branch recorded" in r["detail"],
+              f"l5b) another remote's main must not date origin/main, got {r['detail']}")
+        # ...and the origin record, written the same way, DOES date it. Without this the
+        # check above passes for a function that always returns None.
+        (common / "FETCH_HEAD").write_text(f"deadbeef\t\tbranch 'main' of {origin}\n")
+        r = hc.check_live_checkout_branch(work)
+        check("a fetch" in r["detail"],
+              f"l5b-control) origin's own record must date it, got {r['detail']}")
+
+    # l5c) `remote get-url` keeps a trailing `.git` that FETCH_HEAD drops. An exact
+    #      compare would never match a real clone and silently report nothing ever.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        origin = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                                capture_output=True, text=True).stdout.strip()
+        subprocess.run(["git", "-C", str(work), "remote", "set-url", "origin", origin + ".git"],
+                       capture_output=True, text=True)
+        (common / "FETCH_HEAD").write_text(f"deadbeef\t\tbranch 'main' of {origin}\n")
+        r = hc.check_live_checkout_branch(work)
+        check("a fetch" in r["detail"],
+              f"l5c) a .git suffix mismatch must still match, got {r['detail']}")
+
+    # l6) A failed `rev-parse --git-common-dir` degrades to None, never to a number.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        fake = Path(td) / "git-nocommon"
+        fake.write_text("#!/bin/sh\ncase \"$*\" in *--git-common-dir*) exit 3;; esac\nexec git \"$@\"\n")
+        fake.chmod(0o755)
+        age = hc._last_fetch_age_s(work, str(fake), "main")
+        check(age is None, f"l6) nonzero --git-common-dir must degrade to None, got {age}")
+        check(hc._fetch_age_phrase(age) == "no fetch of that branch recorded",
+              f"l6) and renders the named phrase, got {hc._fetch_age_phrase(age)}")
+
     # Behavioral staleness (added 2026-08-03). The count threshold above is
     # deliberately 10 and case k) pins that 1 behind stays ok — both correct for
     # alert fatigue. But a count cannot distinguish one commit that rewrites a
     # skill from nine that touch docs, and skills are the one case with no other
-    # detector: `src/` needs a restart, so the `*-stale` probes catch it by
-    # comparing a running process to its source; a skill has no process, since
-    # the agent re-reads the markdown from this checkout on every invocation.
+    # detector at all: the agent re-reads the markdown from this checkout on
+    # every invocation. (`src/` is NOT covered either -- see the w-block.)
     #
     # Observed on this node: exactly ONE commit behind, this probe reporting ok,
     # while the live `context-reconstruct` still instructed writing the shared
@@ -398,6 +507,159 @@ def main() -> int:
         r = hc.check_live_checkout_branch(work)
         check(r["status"] == "ok",
               f"v7) and must not warn on reversible history, got {r['status']} / {r['detail'][:100]}")
+
+    # src/ behind for a RUNNING service: the *-stale probes compare a process to
+    # the file ON DISK, which agree byte for byte while the checkout is behind.
+    def _with_live(paths):
+        """Pin the running-service set; the real one reads this host's pgrep."""
+        real = hc._running_service_sources
+        hc._running_service_sources = lambda: list(paths)
+        return real
+
+    # w1) THE GAP: one commit behind, changing a source whose service is live.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["src/example-service.py"])
+        real = _with_live(["src/example-service.py"])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "warn",
+              f"w1) 1 behind changing a running service's source -> warn, got {r['status']}")
+        check("touch src/example-service.py" in r["detail"],
+              f"w1) must name the commit so it is actionable, got {r['detail'][:150]}")
+        check("ON DISK" in r["detail"],
+              f"w1) must say WHY no stale probe caught it, got {r['detail'][:200]}")
+
+    # w2) The gate is the design: src/ moves several times a day, so warning on
+    #     every src/ commit re-creates the alert fatigue the threshold prevents.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["src/example-service.py"])
+        real = _with_live([])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "ok",
+              f"w2) same drift, service NOT running -> ok, got {r['status']} / {r['detail'][:90]}")
+
+    # w3) Running, but the drift is elsewhere -> ok. With w2: BOTH halves are
+    #     required, so neither alone can fire the warning.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["docs/whatever.md"])
+        real = _with_live(["src/example-service.py"])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "ok",
+              f"w3) live service but unrelated drift -> ok, got {r['status']} / {r['detail'][:90]}")
+
+    # w4) The gateway runs from a package, so a directory entry must cover the
+    #     files under it; a file-equality check would miss every one.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(
+            Path(td), ["packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"])
+        real = _with_live(["packages/ag2-sparrow/ag2_sparrow/"])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "warn",
+              f"w4) a directory entry covers files beneath it, got {r['status']}")
+
+    # w5) Both stale -> the skills message wins. One probe returns one warning,
+    #     and a nondeterministic choice would make the detail untestable.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md", "src/example-service.py"])
+        real = _with_live(["src/example-service.py"])
+        try:
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc._running_service_sources = real
+        check(r["status"] == "warn" and "skills/" in r["detail"],
+              f"w5) both stale -> skills message, got {r['detail'][:110]}")
+        check("2 commit(s) behind" in r["detail"],
+              f"w5) and the TOTAL is still 2, got {r['detail'][:130]}")
+
+    # w6) Measurement-failure branch: the running-service list is the gate, so a
+    #     pgrep failure returning everything would warn on every src/ commit.
+    real_run = hc.subprocess.run
+
+    def _boom_on_pgrep(argv, *a, **kw):
+        if argv and "pgrep" in str(argv[0]):
+            raise OSError("pgrep vanished")
+        return real_run(argv, *a, **kw)
+
+    hc.subprocess.run = _boom_on_pgrep
+    try:
+        got = hc._running_service_sources()
+    finally:
+        hc.subprocess.run = real_run
+    check(got == [], f"w6) a failed pgrep yields no live services, got {got}")
+
+    # w7) POSITIVE CONTROL for w6: a function that always returned [] would pass
+    #     w6. pgrep is stubbed so the control does not depend on the host.
+    real_run2, real_filter = hc.subprocess.run, hc._filter_pids_this_checkout
+    hc.subprocess.run = lambda argv, *a, **kw: (
+        types.SimpleNamespace(stdout="4242\n", returncode=0)
+        if argv and "pgrep" in str(argv[0]) else real_run2(argv, *a, **kw))
+    hc._filter_pids_this_checkout = lambda pids: pids
+    try:
+        got = hc._running_service_sources()
+    finally:
+        hc.subprocess.run, hc._filter_pids_this_checkout = real_run2, real_filter
+    check(got and "src/voice-agent.ts" in got,
+          f"w7) control: a pgrep HIT yields the source path, got {got[:3]}")
+
+    # w8) A hit from a DIFFERENT checkout is not evidence about this one --
+    #     unfiltered, two coexisting clones give a perpetual false "stale".
+    real_run3, real_filter3 = hc.subprocess.run, hc._filter_pids_this_checkout
+    hc.subprocess.run = lambda argv, *a, **kw: (
+        types.SimpleNamespace(stdout="4242\n", returncode=0)
+        if argv and "pgrep" in str(argv[0]) else real_run3(argv, *a, **kw))
+    hc._filter_pids_this_checkout = lambda pids: []
+    try:
+        got = hc._running_service_sources()
+    finally:
+        hc.subprocess.run, hc._filter_pids_this_checkout = real_run3, real_filter3
+    check(got == [], f"w8) a foreign-clone pid is filtered out, got {got[:3]}")
+
+    # w9) COST: an up-to-date checkout must not pay for the census at all. Ten
+    #     sequential pgreps at a 5s timeout is ~50s worst case on the common path.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), [])   # cloned, nothing added upstream
+        _git(work, "fetch", "-q", "origin")
+
+        def _must_not_run():
+            raise AssertionError("_running_service_sources called with behind == 0")
+
+        real = hc._running_service_sources
+        hc._running_service_sources = _must_not_run
+        try:
+            r = hc.check_live_checkout_branch(work)
+            reached = False
+        except AssertionError:
+            r, reached = None, True
+        finally:
+            hc._running_service_sources = real
+        check(not reached, "w9) the census is NOT invoked for an up-to-date checkout")
+        check(r and r["status"] == "ok", f"w9) and the verdict is still ok, got {r}")
+        check(r and "commits behind" not in r["detail"],
+              f"w9) detail unchanged from the pre-PR wording, got {r['detail'] if r else None!r}")
+
+    # w10) The short-circuit keys on `behind == 0`, NOT on falsiness — `None`
+    #      (shallow / no merge-base) is unanswerable and must still be probed.
+    with tempfile.TemporaryDirectory() as td:
+        repo = _mk_repo(Path(td))            # no origin -> _commits_behind returns None
+        called = []
+        real = hc._running_service_sources
+        hc._running_service_sources = lambda: called.append(1) or []
+        try:
+            hc.check_live_checkout_branch(repo)
+        finally:
+            hc._running_service_sources = real
+        check(called == [1], f"w10) behind is None still reaches the census, calls={len(called)}")
 
     # v7b) The TREE-DIFF call has its own failure branch, distinct from the log
     #      call's (v5). It runs FIRST and is the gate, so if it raises and the
@@ -611,8 +873,6 @@ def main() -> int:
     #    merged tree of both heads `resolve_git` was imported and used elsewhere
     #    while this probe still shelled the literal, so the cumulative state
     #    kept the CLT shim modal #2469 removes. Pin both directions.
-    import types
-
     real_mod = sys.modules.get("git_binary")
     try:
         # z1) resolver present and returning a path -> BOTH calls use that path

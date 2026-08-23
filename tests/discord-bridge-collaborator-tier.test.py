@@ -231,17 +231,30 @@ def structural() -> list:
         fails.append("access_tier line must still serialize {access_tier} verbatim (collaborators stay team)")
 
     # The team-collaborator rulebook exists and reasserts the owner-only boundary.
-    rb = re.search(r'"team-collaborator"\s*:\s*\(([\s\S]*?)\)\s*,\s*\n\s*"team"\s*:', src)
-    if not rb:
-        fails.append("tier_instructions must define a 'team-collaborator' key before the 'team' key")
-    else:
-        body = rb.group(1)
+    # RENDER the rulebook instead of regexing the source for a literal: the text
+    # moved to src/team_guardrail.py, and a source-shape assertion cannot see it.
+    if not re.search(r'"team-collaborator"\s*:\s*engage_rulebook\(', src):
+        fails.append("tier_instructions must map 'team-collaborator' to engage_rulebook(...)")
+    sys.path.insert(0, str(BRIDGE.parent))
+    try:
+        from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE
+        body = engage_rulebook("channel", DISCORD_PROVENANCE, "results/task-{id}.txt")
+    except Exception as exc:
+        fails.append(f"team-collaborator rulebook is not renderable: {exc}")
+        body = ""
+    if body:
         if "SUTANDO SYSTEM INSTRUCTIONS" not in body:
             fails.append("team-collaborator rulebook must carry the in-band SYSTEM INSTRUCTIONS fence")
         if "OWNER" not in body or "authority boundary" not in body:
             fails.append("team-collaborator rulebook must reassert the owner-only authority boundary")
         if not re.search(r"commit|push|merge|irreversible|system-mutating", body):
             fails.append("team-collaborator rulebook must enumerate the owner-only (no-mutation) constraint")
+        # The subagent is offered as a processing SHAPE, never as a wider grant:
+        # isolating the context must not read as relaxing the boundary above it.
+        if "SUBAGENT" not in body:
+            fails.append("team-collaborator rulebook must offer the subagent processing option")
+        elif not re.search(r"not widen", body):
+            fails.append("subagent option must state it does not widen collaborator authority")
 
     return fails
 

@@ -61,18 +61,30 @@ def resolve_prefix_tuples(text: str) -> dict:
     return out
 
 
+def _gates_in(block, prefixes_by_name) -> list:
+    found = [m.group(2) for m in
+             re.finditer(r'startswith\((["\'])([^"\']+)\1\)', block)]
+    for name, vals in prefixes_by_name.items():
+        if re.search(rf"startswith\(.*\b{re.escape(name)}\b", block) or \
+                re.search(rf"\bin\s+{re.escape(name)}\b", block):
+            found.extend(vals)
+    return found
+
+
 def gates_before(lines, claim_idx, prefixes_by_name) -> "list | None":
     """Prefix strings gating the nearest enclosing results-dir loop, or None."""
     for i in range(claim_idx, max(0, claim_idx - 80), -1):
         if re.search(r"for\s+\w+\s+in\s+.*(RESULTS_DIR|results_dir)", lines[i]):
-            block = "\n".join(lines[i:claim_idx + 1])
-            found = [m.group(2) for m in
-                     re.finditer(r'startswith\((["\'])([^"\']+)\1\)', block)]
-            for name, vals in prefixes_by_name.items():
-                if re.search(rf"startswith\(.*\b{re.escape(name)}\b", block) or \
-                        re.search(rf"\bin\s+{re.escape(name)}\b", block):
-                    found.extend(vals)
-            return found
+            return _gates_in("\n".join(lines[i:claim_idx + 1]), prefixes_by_name)
+    return None
+
+
+def func_body_gates(lines, claim_idx, prefixes_by_name) -> "list | None":
+    """Inline gate inside the enclosing function (a method claim site like the
+    5b fence, called via attribute so caller resolution cannot see it)."""
+    for i in range(claim_idx, max(0, claim_idx - 80), -1):
+        if re.match(r"\s*def\s+\w+", lines[i]):
+            return _gates_in("\n".join(lines[i:claim_idx + 1]), prefixes_by_name)
     return None
 
 
@@ -100,7 +112,46 @@ def real_claim_lines(text: str) -> list:
     return out
 
 
+def enclosing_func(text: str, lineno: int) -> "str | None":
+    """Innermost function containing `lineno`."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.lineno <= lineno <= getattr(node, "end_lineno", node.lineno):
+                if best is None or node.lineno > best[0]:
+                    best = (node.lineno, node.name)
+    return best[1] if best else None
+
+
+def call_sites(fname: str) -> list:
+    """(file, lineno, gates) for every call to `fname` across src/."""
+    out = []
+    for py in sorted(SRC.glob("*.py")):
+        text = py.read_text()
+        if fname not in text:
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        lines, prefixes = text.splitlines(), resolve_prefix_tuples(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and node.func.id == fname:
+                out.append((py.name, node.lineno,
+                            gates_before(lines, node.lineno - 1, prefixes)))
+    return out
+
+
+# A claim moved into a shared helper has no enclosing results-dir loop, so its
+# gate lives at the CALLERS. Follow one hop rather than treating it as ungated —
+# the invariant is "every claim is gated", not "every claim is gated inline".
 claim_sites = []
+delegating_callers = 0
 for py in sorted(SRC.glob("*.py")):
     text = py.read_text()
     if ".sending" not in text:
@@ -108,11 +159,27 @@ for py in sorted(SRC.glob("*.py")):
     lines = text.splitlines()
     prefixes = resolve_prefix_tuples(text)
     for lineno in real_claim_lines(text):
-        claim_sites.append((py.name, lineno, gates_before(lines, lineno - 1, prefixes)))
+        gates = gates_before(lines, lineno - 1, prefixes)
+        label = py.name
+        if gates is None:
+            fn = enclosing_func(text, lineno)
+            callers = [c for c in call_sites(fn) if c[0] != py.name] if fn else []
+            # EVERY caller must be gated; one ungated caller means an ungated claim.
+            if callers and all(c[2] for c in callers):
+                gates = [g for c in callers for g in c[2]]
+                label = f"{py.name} (via {len(callers)} caller(s) of {fn}())"
+                delegating_callers += len(callers)
+            elif not callers:
+                # Method claim sites are invoked via attribute calls, which the
+                # Name-based caller scan cannot see; their gate must be inline.
+                gates = func_body_gates(lines, lineno - 1, prefixes)
+        claim_sites.append((label, lineno, gates))
 
-# A zero-site run would make every assertion below vacuously true.
+# A zero-site run would make every assertion below vacuously true. Centralising
+# REMOVES inline sites by design, so count claim PATHS: inline + delegating.
 ok("found at least one claim-by-rename site to check",
-   len(claim_sites) >= 3, f"found {len(claim_sites)}")
+   len(claim_sites) + delegating_callers >= 3,
+   f"found {len(claim_sites)} inline site(s) + {delegating_callers} delegating caller(s)")
 
 for fname, lineno, gates in claim_sites:
     has_proactive_family = bool(gates) and any(

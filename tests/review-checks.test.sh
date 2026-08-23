@@ -10,12 +10,15 @@ RUNNER="$HERE/../scripts/review-checks.sh"
 GUIDE="$HERE/../REVIEW.md"
 
 pass=0; fail=0
-# check <name> <expect: flag|clean> <diff> [extra-args...]
+TMPD="$(mktemp -d -t review-checks-test.XXXXXX)"
+trap 'rm -rf "$TMPD"' EXIT
+# check <name> <expect: flag|clean|<numeric rc>> <diff> [extra-args...]
 check() {
     local name="$1" expect="$2" diff="$3"; shift 3
-    local out rc
+    local out rc want
+    case "$expect" in flag) want=1;; clean) want=0;; *) want="$expect";; esac
     out="$(printf '%s' "$diff" | bash "$RUNNER" "$@" 2>/dev/null)"; rc=$?
-    if { [ "$expect" = flag ] && [ "$rc" = 1 ]; } || { [ "$expect" = clean ] && [ "$rc" = 0 ]; }; then
+    if [ "$rc" = "$want" ]; then
         echo "ok   $name"; pass=$((pass+1))
     else
         echo "FAIL $name (rc=$rc, want=$expect)"; fail=$((fail+1))
@@ -28,6 +31,11 @@ check "# and // comment lines not flagged"            clean $'+++ b/c.js\n@@ -1,
 check "fixture paths (/usr/fake,/nonexistent,/tmp)"   clean $'+++ b/f.js\n@@ -1,0 +1,3 @@\n+a = "/usr/fake/p"\n+b = "/nonexistent/p"\n+c = "/tmp/scratch"'
 check "mixed forbidden+allowed line still flags real" flag  $'+++ b/m.js\n@@ -1,0 +1,1 @@\n+x = "/Users/alice/app"; y = "https://example.com";'
 check "real /Users/tmp/ not masked by /tmp/ allow"    flag  $'+++ b/t.js\n@@ -1,0 +1,1 @@\n+p = "/Users/tmp/keep"'
+# The send-allowlist tokens are exempt, but ONLY those two: a sibling path under
+# the same root must still flag, or the allow would blanket /private/tmp.
+check "allowed /private/tmp/sutando- token"           clean $'+++ b/a.py\n@@ -1,0 +1,1 @@\n+    "/private/tmp/sutando-",'
+check "allowed /private/tmp/echo- token"              clean $'+++ b/a.py\n@@ -1,0 +1,1 @@\n+    "/private/tmp/echo-",'
+check "other /private/tmp/ path still flagged"        flag  $'+++ b/a.py\n@@ -1,0 +1,1 @@\n+    p = "/private/tmp/unrelated-cache"'
 check "~/.claude flagged"                             flag  $'+++ b/g.sh\n@@ -1,0 +1,1 @@\n+cfg=~/.claude/settings.json'
 check "/home/ flagged"                                flag  $'+++ b/i.py\n@@ -1,0 +1,1 @@\n+p = "/home/bob/.config"'
 check "clean diff passes"                             clean $'+++ b/h.js\n@@ -1,0 +1,1 @@\n+const x = resolveWorkspace();'
@@ -153,7 +161,28 @@ check "code still flagged alongside skipped file"     flag  $'+++ b/docs/a.md\n@
 # --- guide resolution + fallback ---------------------------------------------
 check "explicit --guide is honored"                   flag  $'+++ b/z.ts\n@@ -1,0 +1,1 @@\n+const p="/opt/thing";' --guide "$GUIDE"
 check "missing guide falls back, still flags /Users/" flag  $'+++ b/z.ts\n@@ -1,0 +1,1 @@\n+const p="/Users/a/b";' --guide /does/not/exist
-check "empty diff exits 0 (nothing to check)"         clean $''
+# --- empty input is "nothing was SCANNED", not "nothing was FOUND" -----------
+# Exit 0 let a no-op read as a clean gate to callers that check only the status.
+check "empty stdin fails closed (rc=2, never a pass)"  2     $''
+check "whitespace-only stdin fails closed too"         2     $' \n\t\n'
+check "--allow-empty opts an empty input back into 0"  clean $'' --allow-empty
+# --diff is the CI call shape, so cover the empty FILE path too, not just stdin.
+: > "$TMPD/empty.diff"
+bash "$RUNNER" --diff "$TMPD/empty.diff" >/dev/null 2>&1; empty_file_rc=$?
+if [ "$empty_file_rc" = 2 ]; then
+    echo "ok   empty --diff file fails closed (rc=2)"; pass=$((pass+1))
+else
+    echo "FAIL empty --diff file rc=$empty_file_rc, want 2"; fail=$((fail+1))
+fi
+# The runner must not print its PASS line on any empty-input path.
+for _a in "" "--allow-empty"; do
+    _o="$(printf '' | bash "$RUNNER" $_a 2>/dev/null)"
+    if [ -z "$_o" ]; then
+        echo "ok   empty input prints no PASS line (args='$_a')"; pass=$((pass+1))
+    else
+        echo "FAIL empty input printed to stdout (args='$_a'): '$_o'"; fail=$((fail+1))
+    fi
+done
 
 # --- oversized input can't silently bypass the scan (#2281) -------------------
 # A diff far larger than the OS argv/env limit (~1MB on macOS) used to be handed

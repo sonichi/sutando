@@ -167,10 +167,9 @@ def test_rescue_probe_bounded_and_skips_wedged():
 # ── 2. discord-bridge _send_via_rest: urlopen bounded with timeout=10 ───────
 
 def test_send_via_rest_bounded():
-    code = _compile_segment(
-        DISCORD_SRC,
-        lambda n: isinstance(n, ast.FunctionDef) and n.name == "_send_via_rest",
-    )
+    # The bound lives in _rest_client (DiscordRestClient timeout=10); the
+    # client's _default_transport is what passes it to urlopen.
+    sys.path.insert(0, str(REPO / "src"))
     g = {
         "TOKEN": "test-token",
         "_chunk_for_discord": lambda m: [m],
@@ -178,16 +177,33 @@ def test_send_via_rest_bounded():
         "sys": sys,
         "print": lambda *a, **k: None,
     }
-    exec(code, g)
+    for name in ("_rest_client", "_send_via_rest"):
+        code = _compile_segment(
+            DISCORD_SRC,
+            lambda n, name=name: isinstance(n, ast.FunctionDef) and n.name == name,
+        )
+        exec(code, g)
     send = g["_send_via_rest"]
 
     seen: dict = {}
     real_urlopen = urllib.request.urlopen
 
+    class _OkResp:
+        status = 200
+
+        def read(self):
+            return b'{"id": "1"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
     def ok_urlopen(req, timeout=None):
         seen["timeout"] = timeout
         seen["url"] = req.full_url
-        return types.SimpleNamespace(read=lambda: b"{}")
+        return _OkResp()
 
     urllib.request.urlopen = ok_urlopen
     try:

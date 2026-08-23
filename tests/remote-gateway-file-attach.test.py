@@ -3,7 +3,7 @@
 
 Covers:
   1. `_post_ready_results` routes marker decisions through the unified
-     parser (parse_markers, #873): skip markers archive without POSTing.
+     parser: skip markers POST raw to close the lease, then archive.
   2. `[file:]` markers upload via POST /v1/rooms/{room}/media, the marker
      is stripped from the delivered body, and the room comes from the
      task→room sidecar map recorded at queue time.
@@ -72,14 +72,55 @@ class FileAttachTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _result(self, tid: str, body: str) -> None:
+        # Provenance is explicit: the drain guards non-owner output, so a
+        # fixture with no task file is a guarded one, not an owner one.
+        (self.mod.TASKS_DIR / f"{tid}.txt").write_text(
+            f"id: {tid}\naccess_tier: owner\ntask: fixture\n")
         (self.mod.RESULTS_DIR / f"{tid}.txt").write_text(body)
 
-    # 1 — unified-parser skip semantics
-    def test_skip_marker_archives_without_posting(self):
+    # Skip markers still POST to close the lease; the server suppresses their
+    # user-facing delivery.
+    def test_skip_marker_posts_raw_body_then_archives(self):
         self._result("t1", "[no-send] internal only")
         self.mod._post_ready_results({"t1"})
-        self.assertEqual(self.calls, [])
+        posts = [c for c in self.calls if c[0] == "POST" and c[1] == "/v1/results"]
+        self.assertEqual(len(posts), 1)
+        self.assertIn("[no-send]", (posts[0][2] or {}).get("body", ""),
+                      "raw marker preserved so the server suppresses delivery")
         self.assertTrue(list((self.mod.ARCHIVE_RESULTS_DIR).glob("t1-*.txt")))
+
+    # 1b — a skip-marker POST that fails must NOT archive: the open lease is
+    # only recoverable while the result file survives for the next drain.
+    def test_skip_marker_post_failure_keeps_the_result_for_retry(self):
+        import urllib.error
+        failures = [
+            urllib.error.HTTPError("http://gw.invalid", 502, "bad gateway", None, None),
+            urllib.error.URLError("connection refused"),
+            TimeoutError("read timed out"),
+        ]
+        for i, exc in enumerate(failures):
+            with self.subTest(failure=type(exc).__name__):
+                tid = f"tfail{i}"
+                self._result(tid, "[no-send] internal only")
+                inflight = {tid}
+                with patch.object(self.mod, "_req", side_effect=exc):
+                    self.mod._post_ready_results(inflight)
+                self.assertTrue((self.mod.RESULTS_DIR / f"{tid}.txt").exists(),
+                                "failed POST must keep the result for retry")
+                self.assertFalse(list((self.mod.ARCHIVE_RESULTS_DIR).glob(f"{tid}-*.txt")),
+                                 "failed POST must not archive")
+                self.assertIn(tid, inflight, "failed POST must stay in flight")
+
+    # 1c — an unreadable alias ledger defers rather than POSTing under a guessed id
+    def test_skip_marker_defers_when_alias_ledger_unreadable(self):
+        self._result("tledger", "[no-send] internal only")
+        inflight = {"tledger"}
+        with patch.object(self.mod, "_delivery_tid", return_value=None):
+            self.mod._post_ready_results(inflight)
+        self.assertEqual([c for c in self.calls if c[1] == "/v1/results"], [],
+                         "must not POST under a guessed delivery id")
+        self.assertTrue((self.mod.RESULTS_DIR / "tledger.txt").exists())
+        self.assertIn("tledger", inflight)
 
     # 2 — happy path: allowlisted file uploads, marker stripped, room from map
     def test_attach_uploads_and_strips_marker(self):
