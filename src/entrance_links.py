@@ -59,6 +59,24 @@ def active_link(state_dir: str | Path, provider: str) -> "dict | None":
     return None
 
 
+import contextlib
+import fcntl
+
+
+@contextlib.contextmanager
+def _ledger_lock(state_dir: str | Path):
+    # One writer contract for the whole load->validate->mutate->save
+    # transaction; flock is held on a sibling lock file, never the ledger.
+    path = links_path(state_dir).with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def _save_links(state_dir: str | Path, links: list) -> None:
     path = links_path(state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +114,17 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
                 display: "dict | None" = None) -> dict:
     # UNIQUE(provider, canonical subject): an active link for the provider is
     # replaced only by the SAME subject; a different subject must be explicit.
-    stand_id = require_resolved_identity(state_dir)
+    with _ledger_lock(state_dir):
+        # identity snapshot INSIDE the transaction: a re-enrollment during
+        # the lock wait must not let a mutation commit under stale authority
+        stand_id = require_resolved_identity(state_dir)
+        return _upsert_link_locked(state_dir, stand_id, provider,
+                                   provider_subject, verification,
+                                   credential_fingerprint, display)
+
+
+def _upsert_link_locked(state_dir, stand_id, provider, provider_subject,
+                        verification, credential_fingerprint, display):
     links = _load_links_for_mutation(state_dir)
     existing = [l for l in links
                 if l.get("provider") == provider and l.get("status") == "active"]
@@ -105,6 +133,12 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
             raise ValueError(
                 f"active {provider} link exists with a different subject "
                 f"({l.get('provider_subject')}) — revoke it explicitly first")
+        # re-verification must never transplant another Stand's binding (or
+        # inherit its authorization) — cross-Stand re-bind is an explicit act
+        if l.get("stand_id") and l["stand_id"] != stand_id:
+            raise ValueError(
+                f"active {provider} link belongs to Stand {l['stand_id']}, "
+                f"not {stand_id} — revoke it explicitly before re-verifying")
     link = existing[0] if existing else {
         "link_id": "link_" + secrets.token_hex(8),
         "provider": provider,
@@ -125,12 +159,89 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
     return link
 
 
+NONCES_FILE = "authorization-nonces.json"
+
+
+def _nonces_path(state_dir: str | Path) -> Path:
+    return Path(state_dir) / "auth" / NONCES_FILE
+
+
+def _load_nonces(state_dir: str | Path) -> list:
+    try:
+        data = json.loads(_nonces_path(state_dir).read_text())
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_nonces(state_dir: str | Path, recs: list) -> None:
+    path = _nonces_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent))
+    with os.fdopen(fd, "w") as f:
+        json.dump(recs, f, indent=1)
+    os.replace(tmp, path)
+
+
+def issue_authorization_nonce(state_dir: str | Path, provider: str,
+                              ttl_s: int = 600) -> str:
+    """Mint a single-use, expiring confirmation for authorizing PROVIDER.
+    Only the sha256 lands on disk; the caller relays 'nonce:<hex>' to the
+    owner surface that will echo it back into authorize_link."""
+    require_resolved_identity(state_dir)
+    nonce = secrets.token_hex(16)
+    now = datetime.now(timezone.utc).timestamp()
+    with _ledger_lock(state_dir):
+        recs = [r for r in _load_nonces(state_dir)
+                if r.get("expires_at", 0) > now]  # opportunistic GC
+        recs.append({"sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+                     "provider": provider, "issued_at": now,
+                     "expires_at": now + ttl_s, "used": False})
+        _save_nonces(state_dir, recs)
+    return f"nonce:{nonce}"
+
+
+def _consume_nonce(state_dir: str | Path, provider: str, ref: str) -> None:
+    """Validate + burn a nonce confirmation. Caller holds the ledger lock.
+    Single-use is what makes a replayed owner confirmation inert."""
+    digest = hashlib.sha256(ref.removeprefix("nonce:").encode()).hexdigest()
+    now = datetime.now(timezone.utc).timestamp()
+    recs = _load_nonces(state_dir)
+    for r in recs:
+        if r.get("sha256") != digest:
+            continue
+        if r.get("used"):
+            raise ValueError("confirmation already used — replay refused")
+        if r.get("provider") != provider:
+            raise ValueError(
+                f"confirmation was issued for {r.get('provider')!r}, "
+                f"not {provider!r} — refused")
+        if r.get("expires_at", 0) <= now:
+            raise ValueError("confirmation expired — re-issue and retry")
+        r["used"] = True
+        r["used_at"] = now
+        _save_nonces(state_dir, recs)
+        return
+    raise ValueError("unknown confirmation — refused")
+
+
 def authorize_link(state_dir: str | Path, provider: str,
                    authorized_by: str,
                    confirmation_ref: "str | None" = None) -> dict:
     """Explicit owner authorization: the act that turns a verified link into
     an active Stand binding. Never called automatically."""
-    stand_id = require_resolved_identity(state_dir)
+    with _ledger_lock(state_dir):
+        stand_id = require_resolved_identity(state_dir)
+        if confirmation_ref and confirmation_ref.startswith("nonce:"):
+            # nonce refs validate + burn under THIS lock; plain refs remain
+            # free-text provenance labels (no validation claim)
+            _consume_nonce(state_dir, provider, confirmation_ref)
+        return _authorize_link_locked(state_dir, stand_id, provider,
+                                      authorized_by, confirmation_ref)
+
+
+def _authorize_link_locked(state_dir, stand_id, provider, authorized_by,
+                           confirmation_ref):
     links = _load_links_for_mutation(state_dir)
     for lk in links:
         if lk.get("provider") != provider or lk.get("status") != "active":
@@ -157,10 +268,22 @@ def authorize_link(state_dir: str | Path, provider: str,
 def revoke_link(state_dir: str | Path, provider: str, revoked_by: str,
                 reason: "str | None" = None) -> dict:
     """Revocation is layered: kills THIS binding only, never the Stand."""
-    require_resolved_identity(state_dir)
+    with _ledger_lock(state_dir):
+        stand_id = require_resolved_identity(state_dir)
+        return _revoke_link_locked(state_dir, stand_id, provider,
+                                   revoked_by, reason)
+
+
+def _revoke_link_locked(state_dir, stand_id, provider, revoked_by, reason):
     links = _load_links_for_mutation(state_dir)
     for lk in links:
         if lk.get("provider") == provider and lk.get("status") == "active":
+            # revocation is bound to the ENROLLED Stand, same boundary as
+            # authorize — Stand A must never kill Stand B's binding
+            if lk.get("stand_id") and lk["stand_id"] != stand_id:
+                raise ValueError(
+                    f"link belongs to Stand {lk['stand_id']}, not {stand_id} "
+                    "— cross-Stand revocation refused")
             now = datetime.now(timezone.utc).isoformat(timespec="seconds")
             lk["status"] = "revoked"
             lk["revocation"] = {"revoked_by": revoked_by, "revoked_at": now,
@@ -172,22 +295,6 @@ def revoke_link(state_dir: str | Path, provider: str, revoked_by: str,
             _save_links(state_dir, links)
             return lk
     raise ValueError(f"no active {provider} link to revoke")
-
-
-def verify_slack(state_dir: str | Path, token: str) -> dict:
-    """auth.test introspection: token -> team + bot identity. The workspace
-    (team_id) is the AUTHORITY scope and lives inside the typed subject."""
-    from slack_sdk import WebClient  # noqa: PLC0415
-    auth = WebClient(token=token).auth_test()
-    subject = {"type": "workspace_bot", "authority": str(auth["team_id"]),
-               "id": str(auth["user_id"])}
-    display = {"name": str(auth.get("user") or "")} if auth.get("user") else None
-    verification = {
-        "method": "slack_auth_test",
-        "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    return upsert_link(state_dir, "slack", subject, verification,
-                       _fingerprint(token), display=display)
 
 
 def verify_discord(state_dir: str | Path, token: str) -> dict:
