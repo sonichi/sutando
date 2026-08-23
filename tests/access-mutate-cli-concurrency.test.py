@@ -40,6 +40,16 @@ sys.path.insert(0, str(REPO / "src"))
 from access_store import mutate_access_file  # noqa: E402
 
 
+def _cli_command(args):
+    """Wrap the CLI subprocess invocation under coverage when the caller
+    (coverage-gate.sh) asks for it, so the CLI's own lines aren't reported
+    as unexercised despite this test genuinely driving them."""
+    command = [sys.executable]
+    if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+        command += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+    return command + [str(CLI)] + [str(a) for a in args]
+
+
 def _slow_bridge_mutator(data):
     """Mirrors a real bridge writer's shape (e.g. thread-engage seeding) —
     holds the lock long enough to force the CLI subprocess to genuinely
@@ -72,7 +82,7 @@ class TestSkillCliAndBridgeWriterBothSurvive(unittest.TestCase):
 
             def _run_cli():
                 results["cli"] = subprocess.run(
-                    [sys.executable, str(CLI), "group-append", "thread-1", "newmember"],
+                    _cli_command(["group-append", "thread-1", "newmember"]),
                     capture_output=True, text=True, env=env, timeout=10,
                 )
 
