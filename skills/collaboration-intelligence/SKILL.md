@@ -211,14 +211,21 @@ excuses the other's absence. Step 3 escalates and is time-gated rather than gap-
    exactly one surface and a message anywhere else reaches nobody. **Hard-wiring this step to the
    shared room contradicts that contract and produces the defect this section exists to remove:** a
    durable request created while a reachable person stays unaware, with no immediate-awareness action
-   available until the horizon. If no addressed route is constructible at all, **record the
-   immediate-notification channel as unavailable** — that is satisfied, not pending, exactly as the
-   durable-request branch is. Step 3 remains the later escalation; it must never be used to delay
+   available until the horizon. If no addressed route is constructible at all, **the awareness
+   requirement is NOT satisfied** — hand the item to an owner or a reachable replacement and record
+   that handoff as the terminal outcome. This is deliberately **not** symmetric with the
+   durable-request branch: losing durable queue state can still leave the party aware, whereas
+   losing the awareness channel leaves nobody contacted. Re-evaluate host-local unreachability when
+   a route becomes available, and keep this case pinned through the horizon rather than letting it
+   lapse into satisfied. Step 3 remains the later escalation; it must never be used to delay
    first awareness.
 3. **Escalate to the person's own channel only after the recorded horizon.** Set `escalate_after`
    **when the ask is first made**, derived from the item's urgency and the team's conventions, and
    record it with the ask. Escalate only when the horizon has passed, **every constructible channel
-   is confirmed *delivered*** — a channel recorded unavailable counts as **satisfied, not pending** —
+   is confirmed *delivered*** — a **durable** channel recorded unavailable counts as **satisfied, not
+   pending**, while an unavailable **awareness** channel does not and instead triggers the handoff
+   above, since escalating to a personal channel is itself an addressed route and cannot be the
+   terminal step when no addressed route exists —
    and the state has still not changed. A fixed number of hours invented here would
    impose a uniform SLA on teams that do not share one; no horizon at all is "wait forever" wearing
    patience's clothes.
