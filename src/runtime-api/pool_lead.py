@@ -48,12 +48,14 @@ def _read_channel(path: Path) -> "str | None":
 
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
-                 now_fn=time.time, metrics=None):
+                 now_fn=time.time, metrics=None, results_dir=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
         production binder wires instance_registry + the .alive files."""
         self.tasks_dir = Path(tasks_dir)
         self.state_dir = Path(state_dir)
+        self.results_dir = (Path(results_dir) if results_dir
+                            else self.tasks_dir.parent / "results")
         self.followers_fn = followers_fn
         self.alive_fn = alive_fn
         self.now = now_fn
@@ -120,7 +122,7 @@ class PoolLead:
         affinity = self._load_affinity()
         out = []
         for f in sort_tasks_by_priority(pending):
-            if self._done_flag_exists(f.name):
+            if self._done_flag_exists(f.name) and self._result_evidence(f.name):
                 continue  # processed by a since-dead claimer; bridge owns it now
             channel = _read_channel(f)
             inst = self._pick(channel, followers, affinity)
@@ -175,13 +177,23 @@ class PoolLead:
         stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
         return any((d / "done" / f"{stem}.flag").exists() for d in dirs)
 
+    def _result_evidence(self, task_name: str) -> bool:
+        """A result was produced: live in results/, or already consumed by a
+        bridge (archive/ and undelivered/ are the two consumer dispositions)."""
+        stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
+        name = f"{stem}.txt"
+        return any(p.exists() for p in (
+            self.results_dir / name,
+            self.results_dir / "archive" / name,
+            self.results_dir / "undelivered" / name))
+
     def reclaim_claimed(self) -> "list[tuple[str, str]]":
-        """Recover claimed files whose claimer died. The claimer's
-        done-flag discriminates crash-before vs crash-after processing:
-        flag present -> the result was written; restore the canonical name
-        so bridges can deliver (sweep's done-flag skip prevents
-        reassignment). Flag absent -> no side effects ran; restore to the
-        pool for normal reassignment."""
+        """Recover claimed files whose claimer died. Delivered means the
+        claimer's done-flag AND result evidence both exist; then restore
+        the canonical name so bridges can deliver (sweep skips it). A
+        done-flag alone is a crash between flag and result write — no
+        user-visible effect happened, so repool for reassignment rather
+        than silently losing the task."""
         out = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
         try:
@@ -197,6 +209,7 @@ class PoolLead:
                 os.rename(f, f.with_name(canonical))
             except OSError:
                 continue
-            done = self._done_flag_exists(canonical)
+            done = (self._done_flag_exists(canonical)
+                    and self._result_evidence(canonical))
             out.append((f.name, "delivered" if done else "repooled"))
         return out

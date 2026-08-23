@@ -120,18 +120,22 @@ class PoolLeadTests(unittest.TestCase):
 
 
 class ReclaimClaimedTest(unittest.TestCase):
-    """Crash-mid-claim recovery: done-flag discriminates delivered vs repooled."""
+    """Crash-mid-claim recovery: delivered = done-flag AND result evidence;
+    a flag alone (crash between flag and result write) must repool."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.tasks = self.tmp / "tasks"
         self.state = self.tmp / "state"
+        self.results = self.tmp / "results"
         self.tasks.mkdir()
+        self.results.mkdir()
         (self.state / "cores").mkdir(parents=True)
         self.lead = PoolLead(
             self.tasks, self.state,
             followers_fn=lambda: ["core-1"],
             alive_fn=lambda inst: inst == "core-1",
+            results_dir=self.results,
         )
 
     def tearDown(self):
@@ -142,21 +146,42 @@ class ReclaimClaimedTest(unittest.TestCase):
         f.write_text(f"id: task-{tid}\n")
         return f
 
+    def _flag(self, tid, inst):
+        done = self.state / "cores" / inst / "done"
+        done.mkdir(parents=True, exist_ok=True)
+        (done / f"task-{tid}.flag").write_text("")
+
     def test_dead_claimer_without_done_flag_repools(self):
         self._claimed("x1", "core-9")
         out = self.lead.reclaim_claimed()
         self.assertEqual(out, [("task-x1.claimed-core-9.txt", "repooled")])
         self.assertTrue((self.tasks / "task-x1.txt").exists())
 
-    def test_dead_claimer_with_done_flag_restores_for_delivery_only(self):
+    def test_dead_claimer_with_flag_and_result_restores_for_delivery_only(self):
         self._claimed("x2", "core-9")
-        done = self.state / "cores" / "core-9" / "done"
-        done.mkdir(parents=True)
-        (done / "task-x2.flag").write_text("")  # producer convention: stem + .flag
+        self._flag("x2", "core-9")
+        (self.results / "task-x2.txt").write_text("the reply")
         out = self.lead.reclaim_claimed()
         self.assertEqual(out, [("task-x2.claimed-core-9.txt", "delivered")])
         self.assertTrue((self.tasks / "task-x2.txt").exists())
         self.assertEqual(self.lead.sweep(), [])  # never reassigned
+
+    def test_flag_without_result_repools_and_reassigns(self):
+        # the silent-loss edge: crash after flag, before result write
+        self._claimed("x5", "core-9")
+        self._flag("x5", "core-9")
+        out = self.lead.reclaim_claimed()
+        self.assertEqual(out, [("task-x5.claimed-core-9.txt", "repooled")])
+        self.assertEqual(self.lead.sweep(), [("task-x5.txt", "core-1")])
+
+    def test_bridge_archived_result_still_counts_as_delivered(self):
+        self._claimed("x6", "core-9")
+        self._flag("x6", "core-9")
+        (self.results / "archive").mkdir()
+        (self.results / "archive" / "task-x6.txt").write_text("consumed")
+        out = self.lead.reclaim_claimed()
+        self.assertEqual(out, [("task-x6.claimed-core-9.txt", "delivered")])
+        self.assertEqual(self.lead.sweep(), [])
 
     def test_live_claimer_untouched(self):
         f = self._claimed("x3", "core-1")
