@@ -34,6 +34,13 @@ fi
 WORKSPACE="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
 # capture the installer's PATH: launchd strips env, and the sessions need brew bins
 POOL_PATH="${PATH}"
+# TCC: launchd cannot exec scripts under ~/Documents nor open log paths
+# there — stage the wrapper and logs outside (memory: feedback_pool_wrapper_tcc).
+STAGE_DIR="$HOME/.sutando/bin"
+LOG_DIR="$HOME/Library/Application Support/Sutando/logs"
+mkdir -p "$STAGE_DIR" "$LOG_DIR"
+cp "$REPO_DIR/scripts/pool-core-wrapper.sh" "$STAGE_DIR/pool-core-wrapper.sh"
+chmod +x "$STAGE_DIR/pool-core-wrapper.sh"
 WORKSPACE="${WORKSPACE/#\~/$HOME}"
 mkdir -p "$WORKSPACE/logs"
 mkdir -p "$WORKSPACE/state/cores"
@@ -153,27 +160,26 @@ for i in $(seq 1 "$N"); do
   <string>com.sutando.core-$i</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$CLAUDE_BIN</string>
-    <string>--dangerously-skip-permissions</string>
-    <string>--add-dir</string><string>$WORKSPACE</string>
-    <string>--print</string>
-    <string>/proactive-loop-pool</string>
+    <string>$STAGE_DIR/pool-core-wrapper.sh</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>$REPO_DIR</string>
+  <string>$HOME</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>SUTANDO_CORE_ID</key><string>$i</string>
     <key>SUTANDO_CORE_POOL_SIZE</key><string>$N</string>
+    <key>POOL_REPO_DIR</key><string>$REPO_DIR</string>
+    <key>POOL_CLAUDE_BIN</key><string>$CLAUDE_BIN</string>
+    <key>POOL_WORKSPACE</key><string>$WORKSPACE</string>
     <key>PATH</key><string>$POOL_PATH</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key>
-  <string>$WORKSPACE/logs/core-$i.log</string>
+  <string>$LOG_DIR/core-$i.log</string>
   <key>StandardErrorPath</key>
-  <string>$WORKSPACE/logs/core-$i.err</string>
+  <string>$LOG_DIR/core-$i.err</string>
 </dict>
 </plist>
 PLIST_EOF
