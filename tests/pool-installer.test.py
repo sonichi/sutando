@@ -189,6 +189,28 @@ class LeadPlistTest(PoolInstallerHarness):
             self.assertIn(str(logs), r.stdout)
             self.assertNotIn(f"{ws}/logs/core-", r.stdout)
 
+    def test_follower_path_carries_the_npm_global_bin(self):
+        # A non-login installer run snapshotted a PATH without npm's global
+        # bin, so followers could not see globally-installed CLIs (codex).
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            resolved = td / "resolved-ccd"
+            repo = self.make_repo(td, config_dir_body=f"printf '%s' '{resolved}'")
+            env, home, ws = self.make_env(td)
+            prefix = td / "npmprefix"
+            (prefix / "bin").mkdir(parents=True)
+            _write_exec(Path(env["PATH"].split(":")[0]) / "npm",
+                        f'#!/bin/bash\n[ "$1" = "prefix" ] && printf "%s" "{prefix}"\n')
+            r = self.run_installer(repo, env, "1")
+            self.assertEqual(r.returncode, 0, f"{r.stdout}\n{r.stderr}")
+            data = plistlib.loads(
+                (home / "Library" / "LaunchAgents"
+                 / "com.sutando.core-1.plist").read_bytes())
+            self.assertIn(str(prefix / "bin"),
+                          data["EnvironmentVariables"]["PATH"].split(":"),
+                          "installer must resolve npm's global bin itself, "
+                          "not inherit it from the caller's shell")
+
     def test_followers_keep_their_supervised_shape(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)

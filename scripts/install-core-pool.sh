@@ -59,6 +59,19 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
 # capture the installer's PATH: launchd strips env, and the sessions need brew bins
 POOL_PATH="${PATH}"
+# npm's global bin is on PATH only for shells that sourced the user profile, so
+# an installer run from a non-login context silently produced followers that
+# could not see globally-installed CLIs (codex → exit 127 → sandbox unavailable).
+# Resolve it from npm itself rather than trusting the caller's environment.
+_npm_bin=""
+if command -v npm > /dev/null 2>&1; then
+  _npm_prefix="$(npm prefix -g 2>/dev/null || true)"
+  [ -n "$_npm_prefix" ] && [ -d "$_npm_prefix/bin" ] && _npm_bin="$_npm_prefix/bin"
+fi
+case ":$POOL_PATH:" in
+  *":$_npm_bin:"*) : ;;
+  *) [ -n "$_npm_bin" ] && POOL_PATH="$_npm_bin:$POOL_PATH" ;;
+esac
 # Followers must share the LIVE session's credential store, so resolve it the
 # way every other Sutando launcher does (startup.sh, start-cli.sh) instead of
 # guessing: an ad-hoc default silently selects a foreign credential store.
