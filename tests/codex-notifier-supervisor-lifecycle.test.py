@@ -90,6 +90,17 @@ class SupervisorLifecycleTest(unittest.TestCase):
         self.assertEqual(delays[:3], [1, 2, 4], "backoff must double from the base delay")
         self.assertTrue(all(d <= 4 for d in delays), f"backoff exceeded its cap: {delays}")
 
+    def test_fractional_restart_delay_still_restarts(self):
+        """The delay is documented as fractional and the launcher suite drives it
+        at 0.01. Bash arithmetic is integer-only, so doubling it with $(( )) kills
+        the supervisor after one spawn instead of backing off."""
+        r = self._run(alive_calls=6, exit_code=1,
+                      env_extra={"SUTANDO_NOTIFIER_RESTART_DELAY": "0.01",
+                                 "SUTANDO_NOTIFIER_RESTART_DELAY_MAX": "0.05"})
+        self.assertGreaterEqual(self.run_count(), 2,
+                                f"fractional delay must not stop the loop: {r.stderr}")
+        self.assertNotIn("syntax error", r.stderr)
+
     def test_configuration_fault_is_terminal(self):
         """Exit 2 is a usage fault; respawning re-runs the same broken call."""
         r = self._run(alive_calls=8, exit_code=2)
