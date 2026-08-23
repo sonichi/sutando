@@ -77,6 +77,8 @@ def approve(ha, disp, rid, decision="approved", answer=None):
 print("── dispatch table ──")
 d, store, ha, _ = fresh()
 raises("unknown method → -32601", lambda: run(d.handle("no.such", {})), code=-32601)
+raises("human_action.complete requires requestId",
+       lambda: run(d.handle("human_action.complete", {})), code=-32602)
 raises("approval.request requires action", lambda: run(d.handle("approval.request", {})),
        code=-32602, substr="action")
 raises("elicitation.request requires question",

@@ -207,5 +207,50 @@ class CapabilityRegistryEdges(unittest.TestCase):
             capreg._json_copy({"x": "y" * 4096}, "input", 128)
 
 
+
+class TasksViewArchiveAndRaces(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tasks = Path(self.tmp.name) / "tasks"
+        self.results = Path(self.tmp.name) / "results"
+        self.tasks.mkdir()
+        self.results.mkdir()
+        self.v = TasksView(self.tasks, self.results, "@edge:test")
+
+    def tearDown(self):
+        for f in self.results.glob("task-rtapi-*.txt"):
+            f.chmod(0o644)
+        self.tmp.cleanup()
+
+    def test_archived_task_reports_done(self):
+        (self.tasks / "archive").mkdir()
+        (self.tasks / "archive" / "task-old9.txt").write_text("id: task-old9\n")
+        self.assertEqual(self.v.status("task-old9")["state"], "done")
+
+    def test_latest_result_unreadable_is_none_not_crash(self):
+        f = self.results / "task-rtapi-locked.txt"
+        f.write_text("secret")
+        f.chmod(0o000)
+        self.assertIsNone(self.v.get_result())
+
+    def test_list_results_skips_unreadable_entry(self):
+        ok = self.results / "task-rtapi-okay.txt"
+        ok.write_text("fine")
+        locked = self.results / "task-rtapi-locked.txt"
+        locked.write_text("secret")
+        locked.chmod(0o000)
+        ids = [r["taskId"] for r in self.v.list_results()["results"]]
+        self.assertIn("task-rtapi-okay", ids)
+        self.assertNotIn("task-rtapi-locked", ids)
+
+
+class AgentsViewStatRace(unittest.TestCase):
+    def test_entry_on_vanished_file_reports_offline(self):
+        with tempfile.TemporaryDirectory() as td:
+            v = AgentsView(td)
+            out = v._entry(Path(td) / "ghost.alive")
+            self.assertEqual(out, {"agentId": "ghost", "alive": False})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

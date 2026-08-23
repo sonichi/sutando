@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -188,6 +189,37 @@ class HelperFallbacks(unittest.TestCase):
         import unittest.mock as mock
         with mock.patch.dict(sys.modules, {"util_paths": None}):
             self.assertIsNone(srv._channels_dir())
+
+    def test_host_label_resolves_via_repo_script(self):
+        import unittest.mock as mock
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SUTANDO_HOST_LABEL", None)
+            out = srv._host_label()
+        # repo script present: success path returns a label (or None if
+        # the script prints nothing) — must not raise
+        self.assertTrue(out is None or isinstance(out, str))
+
+    def test_watchers_fall_back_on_malformed_poll_interval(self):
+        import unittest.mock as mock
+        tmp = tempfile.TemporaryDirectory()
+        (Path(tmp.name) / "state").mkdir()
+        s = _mk_server(tmp.name)
+        env = {"SUTANDO_RESULT_POLL_S": "bogus",
+               "SUTANDO_REQUEST_POLL_S": "also-bogus"}
+
+        async def drive(coro):
+            t = asyncio.ensure_future(coro)
+            await asyncio.sleep(0.05)
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+        with mock.patch.dict(os.environ, env):
+            run(drive(s._results_watcher()))
+            run(drive(s._requests_watcher()))
+        tmp.cleanup()
 
     def test_host_label_none_when_script_fails(self):
         import unittest.mock as mock

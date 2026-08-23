@@ -165,5 +165,25 @@ class TestEnrolledActorFallback(unittest.TestCase):
             self.assertIsNone(srv._enrolled_agent_id(td2))
 
 
+
+class ChannelsIterationSkips(unittest.TestCase):
+    def test_dir_without_access_json_and_unreadable_one_are_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            channels = Path(td) / "channels"
+            state.mkdir()
+            (channels / "bare").mkdir(parents=True)          # no access.json
+            broken = channels / "broken"
+            broken.mkdir()
+            (broken / "access.json").write_text("{nope")      # unparseable
+            good = channels / "good"
+            good.mkdir()
+            (good / "access.json").write_text(
+                json.dumps({"tofuOwner": "u1", "allowFrom": ["u1"]}))
+            v = _mk(state, channels)
+            self.assertEqual(list(v.owner()["owners"].keys()), ["good"])
+            self.assertEqual(v.allowlist()["channels"], {"good": ["u1"]})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
