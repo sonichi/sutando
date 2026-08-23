@@ -64,6 +64,8 @@ The affinity machinery is **inside** `claim_task.py` — your only responsibilit
 
 Use the renamed `task-<id>.claimed-core-<n>.txt` path for all subsequent reads + result writes.
 
+**Core attribution (required, owner request 2026-08-23):** end every user-facing result body with a final line naming your core, em-dash form: `— core-<n>`. Plain text only — never a bracketed form (`[core-N]` would trip ag2space's `team_result_guard`, which withholds bodies carrying bracketed control markers). Skip the signature only on `[deduped:]`/`[no-send]` bodies, which no user reads.
+
 **Completion step (required):** after writing the result and your done-flag, move the claimed file to `tasks/archive/` yourself. Bridges and archivers glob canonical `task-*.txt` names only — a claimed-suffix file left behind is invisible to them and lingers forever (and the lead must keep skipping it). The bridges look for results by task ID, so writing to `results/task-<id>.txt` (without the `claimed-core-<n>` suffix) still routes correctly.
 
 **Initial sweep on session start**: the watcher's initial sweep emits TASK_FILE events for any pre-existing files. Run the claim step on each; expect to win some and lose others depending on which sibling session got there first.

@@ -30,6 +30,7 @@ sys.path.insert(0, str(_HERE.parent / "src" / "runtime-api"))
 from pool_follower import LEAD_STALE_S
 from pool_lead import PoolLead
 from pool_metrics import PoolMetrics
+from pool_status import PoolStatusWriter
 
 LEAD_LABEL = "pool-lead"
 
@@ -66,6 +67,7 @@ def main() -> int:
 
     lead = PoolLead(tasks, state, followers, alive,
                     metrics=PoolMetrics(state))
+    status = PoolStatusWriter(tasks, state, followers, alive)
     beat = cores / f"{LEAD_LABEL}.alive"
     running = {"on": True}
 
@@ -86,6 +88,7 @@ def main() -> int:
             print(f"reclaimed {name}", flush=True)
         for name, disposition in lead.reclaim_claimed():
             print(f"reclaimed-claim {name} -> {disposition}", flush=True)
+        status.maybe_write()
         time.sleep(a.interval)
     try:
         beat.unlink()  # followers degrade NOW, not after the stale window
