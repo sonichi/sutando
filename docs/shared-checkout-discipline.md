@@ -25,13 +25,31 @@ a real check, it passes, and running it reads as compliance. But what it
 establishes is where the tree *was*. On a variable another session can write,
 that answer expires the moment control leaves your process.
 
-Prefer operations that name their target over operations that act on ambient
-`HEAD`. Where the target cannot be named — `commit` — put the assertion in the
-same command as the write, so nothing can interleave between checking and acting:
+**The primary rule is exclusive mutation, not a better check.** No assertion fixes
+this, because there is no check-and-write pair a peer cannot interleave: `&&`
+sequences two processes, it does not lock the worktree. Every mutating session gets
+its own worktree or clone (or every writer participates in one ownership lock);
+sessions sharing the live tree are **read-only**.
+
+A reviewer demonstrated the residual hole in the check-then-act form by forcing one
+switch after the branch read returned `intended`:
+
+```text
+branch-check-returned=intended
+raced-commit-branch=other
+remote-intended-equals-wrong-branch=yes
+```
+
+`git push origin HEAD:"$INTENDED"` names the *destination* and leaves the **source**
+ambient, so when `HEAD` had moved the push fast-forwarded remote `intended` to
+another branch's commit — the unreviewed-code path this document exists to close.
+
+Inside an exclusive boundary, these remain useful as defense-in-depth — never as the
+control itself. Name both ends, so the source cannot be supplied by ambient `HEAD`:
 
 ```bash
 [ "$(git branch --show-current)" = "$INTENDED" ] && git commit -m "<message>"
-git push origin HEAD:"$INTENDED"    # names the destination; HEAD supplies only the commit
+git push origin "$INTENDED:$INTENDED"   # both ends named; no ambient HEAD
 ```
 
 ### 2. Cite the ref when a conclusion rests on file content
@@ -107,11 +125,26 @@ them.
 **The remedy is narrower than "never park the tree", and the corollary above is
 why.** The reason parking feels necessary is usually that a branch had to be
 deployed for a live witness, so restoring the checkout looks like it costs you the
-evidence. It does not. Because a running process binds its code at import,
-`git switch main` leaves the already-running services exactly as they were — same
-pids, same behaviour — and changes only what a *future* restart would load.
-Measured by a reviewer on their own host: after `git switch main`, both bridge pids
-were unchanged and still serving, and the probe returned to `ok`.
+evidence. It does not — but the guarantee is narrower than "same pid, same
+behaviour". `git switch main` preserves **already-imported module state**; it does
+not preserve anything the process re-reads from disk. Lazy imports, subprocesses and
+per-call file reads all change under a stable pid. In this repo the bridges resolve
+`skills/audio-transcribe/scripts/transcribe.py` per attachment and
+`src/optional_script.py` starts that on-disk script on every call, so a reviewer
+drove the production runner across a switch and got:
+
+```text
+parent-pid-before=30169
+first-call=pr-branch-behaviour
+parent-pid-after=30169
+second-call=main-behaviour
+```
+
+`src/health-check.py` says the same of skills — re-read from the checkout on every
+invocation. So restoring the tree does clear the parked-tree exposure, and it does
+keep already-imported state; it does **not** make the tree safe to change under a
+live witness. For a witness that must stay stable, use CONTRIBUTING's
+detached-worktree service path rather than parking the shared checkout.
 
 That is the same fact as the corollary, read in the other direction. "A running
 process is not its file" is usually stated as a warning — you cannot infer the
