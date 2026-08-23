@@ -17,7 +17,8 @@ connect probe fails, 256 KB frame cap, per-request timeouts. The socket is
 same-user local RPC; any remote capability service must re-authorize fully.
 
 Run:  python3 src/runtime-api/server.py
-Env:  SUTANDO_RUNTIME_SOCKET  socket path (default <run dir>/sutando-runtime.sock)
+Env:  SUTANDO_RUNTIME_SOCKET  socket path (default resolved by rundir.py:
+                              <run dir>/<(agent, instance) key>/runtime.sock)
       SUTANDO_RUNTIME_DB      sqlite path (default <state>/runtime-state.sqlite)
       SUTANDO_HA_DIR          human-actions dir (default <state>/human-actions)
       SUTANDO_RUN_DIR         run dir (platform default via rundir.py)
@@ -49,7 +50,8 @@ from protocol import (MAX_LINE_BYTES, ELICITATION_TYPES, ProtocolError,  # noqa:
                       error_frame, notification_frame, parse_line, result_frame)
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
-from rundir import socket_path, instance_id, lock_path  # noqa: E402
+from rundir import (agent_id as _resolve_agent_id, instance_id,  # noqa: E402
+                    lock_path, runtime_state_dir, socket_path)
 
 from dispatcher import RuntimeDispatcher  # noqa: E402
 from agents_view import AgentsView  # noqa: E402
@@ -68,14 +70,9 @@ from capability_registry import (EphemeralCapabilityRegistry,  # noqa: E402
 
 
 def _state_dir() -> Path:
-    ws = os.environ.get("SUTANDO_RUNTIME_STATE")
-    if ws:
-        return Path(ws)
-    # Canonical workspace resolution (repo rule: use the helper, never a
-    # guessed relative fallback) — workspace_default lives in src/, one level up.
-    sys.path.insert(0, str(_HERE.parent))
-    from workspace_default import resolve_workspace  # noqa: PLC0415
-    return Path(resolve_workspace()) / "state"
+    # Same resolution the CLI's actor chain uses (rundir.py) — a second copy
+    # here would let daemon and client read different enrolled identities.
+    return runtime_state_dir()
 
 
 def _log(msg: str) -> None:
@@ -110,27 +107,12 @@ def _host_label() -> str | None:
         return None
 
 
-
-def _enrolled_agent_id(state_dir) -> "str | None":
-    if not state_dir:
-        return None
-    try:
-        rec = json.loads((Path(state_dir) / "auth" / "ag2space.json").read_text())
-        v = (rec.get("agent_id") or "").strip()
-        return v or None
-    except (OSError, ValueError):
-        return None
-
-
 def resolve_actor_id(state_dir) -> str:
-    """The daemon's own actor identity. Env first, then the enrolled identity
-    (same chain as the WSS leg), so info/agent-list rows join on the real
-    agent id, not a fallback."""
-    return (os.environ.get("SUTANDO_AGENT_ID")
-            or os.environ.get("AGENT_MXID")
-            or os.environ.get("AGENT_ID")
-            or _enrolled_agent_id(state_dir)
-            or "local-agent")
+    """The daemon's own actor identity — delegated to the shared chain in
+    rundir.py so the CLI and the shell descriptor resolve the SAME actor, and
+    therefore the same socket (review P1 regression)."""
+    return _resolve_agent_id(state_dir or None)
+
 
 class RuntimeServer:
     def __init__(self, socket_path: str, db_path: str, ha_dir: str,

@@ -752,14 +752,25 @@ class TestEnrolledActorFallback(unittest.TestCase):
             / "src" / "runtime-api" / "server.py")
         srv = ilu.module_from_spec(spec)
         spec.loader.exec_module(srv)
-        with tempfile.TemporaryDirectory() as td:
-            (Path(td) / "auth").mkdir()
-            (Path(td) / "auth" / "ag2space.json").write_text(
-                '{"agent_id": "@enrolled:ag2.space"}')
-            self.assertEqual(srv._enrolled_agent_id(td), "@enrolled:ag2.space")
-            self.assertIsNone(srv._enrolled_agent_id(None))
-        with tempfile.TemporaryDirectory() as td2:
-            self.assertIsNone(srv._enrolled_agent_id(td2))
+        # Asserted through the SHIPPED entry point: the enrolled lookup now
+        # lives in rundir.py, which is what the CLI and shell read too.
+        env = ("SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID")
+        saved = {k: os.environ.pop(k, None) for k in env}
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                (Path(td) / "auth").mkdir()
+                (Path(td) / "auth" / "ag2space.json").write_text(
+                    '{"agent_id": "@enrolled:ag2.space"}')
+                self.assertEqual(srv.resolve_actor_id(td), "@enrolled:ag2.space")
+            with tempfile.TemporaryDirectory() as td2:
+                self.assertEqual(srv.resolve_actor_id(td2), "local-agent")
+            os.environ["SUTANDO_AGENT_ID"] = "@env:ag2.space"
+            self.assertEqual(srv.resolve_actor_id(td), "@env:ag2.space")
+        finally:
+            for k in env:
+                os.environ.pop(k, None)
+                if saved.get(k) is not None:
+                    os.environ[k] = saved[k]
 
 
 

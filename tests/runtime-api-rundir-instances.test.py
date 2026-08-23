@@ -27,8 +27,11 @@ sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 
 import rundir  # noqa: E402
 
+# SUTANDO_RUNTIME_STATE is part of the identity env: the actor chain reads the
+# enrolled record there, so leaving it unset would read the real workspace.
 _IDENTITY_ENV = ("SUTANDO_RUNTIME_SOCKET", "SUTANDO_INSTANCE_ID",
-                 "SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID")
+                 "SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID",
+                 "SUTANDO_RUNTIME_STATE")
 
 
 class RundirInstanceTests(unittest.TestCase):
@@ -36,6 +39,7 @@ class RundirInstanceTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {k: os.environ.pop(k, None) for k in _IDENTITY_ENV}
         os.environ["SUTANDO_RUN_DIR"] = self.tmp.name
+        os.environ["SUTANDO_RUNTIME_STATE"] = str(Path(self.tmp.name) / "state")
 
     def tearDown(self):
         os.environ.pop("SUTANDO_RUN_DIR", None)
@@ -49,13 +53,14 @@ class RundirInstanceTests(unittest.TestCase):
         a = rundir.socket_path("qingyun-001")
         b = rundir.socket_path("research-001")
         self.assertNotEqual(a, b)
-        self.assertIn("/qingyun-001/", a)
+        self.assertIn("qingyun-001", Path(a).parent.name)
         self.assertNotEqual(rundir.lock_path("qingyun-001"),
                             rundir.lock_path("research-001"))
 
     def test_env_instance_id_scopes_the_default(self):
         os.environ["SUTANDO_INSTANCE_ID"] = "research-001"
-        self.assertIn("/research-001/", rundir.socket_path())
+        self.assertIn("research-001",
+                      Path(rundir.socket_path()).parent.name)
 
     def test_default_honors_preexisting_legacy_flat_socket(self):
         legacy = Path(self.tmp.name) / "sutando-runtime.sock"
@@ -87,9 +92,13 @@ class RundirInstanceTests(unittest.TestCase):
         self.assertNotEqual(rundir.instance_run_dir("default", agent="blue/red"),
                             rundir.instance_run_dir("default", agent="blue_red"))
 
-    def test_no_actor_declared_keeps_the_pre_actor_layout(self):
-        self.assertEqual(rundir.instance_run_dir("solo"),
-                         Path(self.tmp.name) / "solo")
+    def test_no_actor_declared_still_resolves_the_shared_default_actor(self):
+        """No declared actor is not "no actor": daemon, CLI and shell must all
+        land on DEFAULT_ACTOR, or a fresh daemon is unreachable from its own
+        CLI (review P1 regression)."""
+        self.assertEqual(
+            rundir.instance_run_dir("solo"),
+            Path(self.tmp.name) / rundir.instance_key(rundir.DEFAULT_ACTOR, "solo"))
 
 
 class LiveDoubleStartTests(unittest.TestCase):

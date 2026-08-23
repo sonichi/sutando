@@ -233,12 +233,14 @@ class HelperFallbacks(unittest.TestCase):
             self.assertIsNone(srv._host_label())
 
     def test_enrolled_agent_id_absent_and_corrupt(self):
-        self.assertIsNone(srv._enrolled_agent_id(None))
+        # The reader moved to rundir.py so daemon, CLI and shell share it.
+        import rundir  # noqa: PLC0415
+        self.assertIsNone(rundir.enrolled_agent_id(None))
         with tempfile.TemporaryDirectory() as td:
-            self.assertIsNone(srv._enrolled_agent_id(td))
+            self.assertIsNone(rundir.enrolled_agent_id(td))
             (Path(td) / "auth").mkdir()
             (Path(td) / "auth" / "ag2space.json").write_text("{broken")
-            self.assertIsNone(srv._enrolled_agent_id(td))
+            self.assertIsNone(rundir.enrolled_agent_id(td))
 
 
 class RequestsWatcherStoreFailures(unittest.TestCase):

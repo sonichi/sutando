@@ -205,6 +205,13 @@ class RuntimeDispatcher:
             return self._issue("human_action", method, params,
                                required=("action",))
         if method in ("human_action.complete", "human_action.decline"):
+            # Settling a human-only action is the same authority claim as
+            # approval.respond: the requester must never settle its own request.
+            if method not in self.granted_methods:
+                raise ProtocolError(
+                    -32601, f"{method} requires an authorized device grant — "
+                            "not callable on this transport (the human settles "
+                            "the action on its card)")
             return self._human_action_settle(method, params)
         if method == "approval.respond":
             # Fails closed: only a transport whose caller carries this grant

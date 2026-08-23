@@ -30,7 +30,8 @@ Issuing commands return immediately with {"requestId", "status": "pending"};
 exit 0 on a well-formed response (whatever the status), 1 on transport or
 protocol error — status interpretation belongs to the caller.
 
-Env: SUTANDO_RUNTIME_SOCKET (default <run dir>/sutando-runtime.sock).
+Env: SUTANDO_RUNTIME_SOCKET (default <run dir>/<(agent, instance) key>/runtime.sock,
+resolved by rundir.py — the same actor chain the daemon uses).
 """
 from __future__ import annotations
 
