@@ -14,6 +14,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 
 ## `src/`
 
+- **`access_store.py`** — Single writer contract for Discord access.json.
 - **`accessibility_probe.sh`** — Unbounded, this probe blocks forever on a session with nobody to answer the AppleScript prompt, and startup never reaches the services after it.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.

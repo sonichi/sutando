@@ -1,4 +1,4 @@
-"""Single writer contract for Discord access.json (PR #3318 review, qingyun-wu).
+"""Single writer contract for Discord access.json.
 
 Every writer of a channel's access.json — tier-map seeding, thread-engage
 seeding, pairing-code issuance, and (eventually) the `/discord:access` skill —
