@@ -1433,12 +1433,18 @@ async function main() {
 		if (!transport) return;
 		// Only the BRACKETED `[Silence]` is a fabrication signature: a bare `Silence.` collides
 		// with natural speech ("Silence is golden") and suppressed legitimate output.
+		// `_suppressAudio` is OpenAIRealtimeTransport's field, not GeminiLiveTransport's, so the
+		// previous `'_suppressAudio' in transport` guard was always false here and never suppressed.
+		// Gate the transport's own audio callback instead — works on either transport.
+		let suppressAudio = false;
+		const origOnAudioOutput = transport.onAudioOutput?.bind(transport);
+		transport.onAudioOutput = (b64: string) => { if (suppressAudio) return; origOnAudioOutput?.(b64); };
 		const origOnOutputTranscription = transport.onOutputTranscription?.bind(transport);
 		// Deltas are per-turn FRAGMENTS, so output is HELD until the running buffer either
 		// matches a fabricated prefix (suppress) or diverges (flush the rest of the turn).
 		const sanitizer = createOutputSanitizer({
 			forward: (t) => origOnOutputTranscription?.(t),
-			setSuppressAudio: (on) => { if ('_suppressAudio' in transport) transport._suppressAudio = on; },
+			setSuppressAudio: (on) => { suppressAudio = on; },
 			onBlocked: (buffered) =>
 				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
 		});
