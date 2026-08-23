@@ -62,7 +62,9 @@ For tasks with a `channel_id:` field in the body (`#884`):
 
 The affinity machinery is **inside** `claim_task.py` — your only responsibility is to pass `channel_id` when present. The script reads `state/cores/channel-<id>.handler` and `state/cores/core-<n>.alive` to decide whether you're allowed to claim.
 
-Use the renamed `task-<id>.claimed-core-<n>.txt` path for all subsequent reads + result writes. The bridges look for results by task ID, so writing to `results/task-<id>.txt` (without the `claimed-core-<n>` suffix) still routes correctly.
+Use the renamed `task-<id>.claimed-core-<n>.txt` path for all subsequent reads + result writes.
+
+**Completion step (required):** after writing the result and your done-flag, move the claimed file to `tasks/archive/` yourself. Bridges and archivers glob canonical `task-*.txt` names only — a claimed-suffix file left behind is invisible to them and lingers forever (and the lead must keep skipping it). The bridges look for results by task ID, so writing to `results/task-<id>.txt` (without the `claimed-core-<n>` suffix) still routes correctly.
 
 **Initial sweep on session start**: the watcher's initial sweep emits TASK_FILE events for any pre-existing files. Run the claim step on each; expect to win some and lose others depending on which sibling session got there first.
 
