@@ -14,12 +14,21 @@ Mac-only. Resolution order:
 
 The socket default lives here too so `SUTANDO_RUNTIME_SOCKET` is interpreted
 identically on both ends of the connection.
+
+Within the run dir, live resources are scoped by the SAME (agent_id,
+instance_id) tuple the instance registry keys on, using the shared encoding in
+`instance_key.py`. Scoping by instance alone meant two actors the registry
+listed as distinct fought over one socket and one lock.
 """
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
+
+# Importable by a bare file loader (tests, CLI) as well as by the daemon.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from instance_key import encode_part  # noqa: E402
 
 
 def run_dir() -> Path:
@@ -42,15 +51,34 @@ def instance_id() -> str:
     return os.environ.get("SUTANDO_INSTANCE_ID") or "default"
 
 
-def instance_run_dir(instance: str | None = None) -> Path:
-    return run_dir() / (instance or instance_id())
+def agent_id() -> str | None:
+    """The actor half of the runtime identity, from the same env chain the
+    daemon resolves. None means no actor is declared — the pre-actor layout."""
+    return (os.environ.get("SUTANDO_AGENT_ID")
+            or os.environ.get("AGENT_MXID")
+            or os.environ.get("AGENT_ID")
+            or None)
 
 
-def socket_path(instance: str | None = None) -> str:
-    """SUTANDO_RUNTIME_SOCKET overrides; otherwise instance-scoped
-    <run dir>/<instance>/runtime.sock so two instances can never collide.
-    The legacy flat <run dir>/sutando-runtime.sock is still honored for the
-    default instance when it already exists (pre-M2 daemons/clients)."""
+def instance_run_dir(instance: str | None = None,
+                     agent: str | None = None) -> Path:
+    """Run dir for one (agent_id, instance_id) tuple. Identity here is the
+    SAME tuple the instance registry keys on: scoping by instance alone let
+    two actors that the registry lists as distinct collide on socket + lock."""
+    inst = instance or instance_id()
+    who = agent or agent_id()
+    if not who:
+        return run_dir() / encode_part(inst, "instance_id")
+    return (run_dir() / encode_part(who, "agent_id")
+            / encode_part(inst, "instance_id"))
+
+
+def socket_path(instance: str | None = None,
+                agent: str | None = None) -> str:
+    """SUTANDO_RUNTIME_SOCKET overrides; otherwise identity-scoped
+    <run dir>/[<agent>/]<instance>/runtime.sock so two instances can never
+    collide. The legacy flat <run dir>/sutando-runtime.sock is still honored
+    for the default instance when it already exists (pre-M2 daemons/clients)."""
     env = os.environ.get("SUTANDO_RUNTIME_SOCKET")
     if env:
         return env
@@ -58,8 +86,9 @@ def socket_path(instance: str | None = None) -> str:
     legacy = run_dir() / "sutando-runtime.sock"
     if inst == "default" and legacy.exists():
         return str(legacy)
-    return str(instance_run_dir(inst) / "runtime.sock")
+    return str(instance_run_dir(inst, agent) / "runtime.sock")
 
 
-def lock_path(instance: str | None = None) -> Path:
-    return instance_run_dir(instance) / "instance.lock"
+def lock_path(instance: str | None = None,
+              agent: str | None = None) -> Path:
+    return instance_run_dir(instance, agent) / "instance.lock"

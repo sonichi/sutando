@@ -385,5 +385,78 @@ class EdgeBranches(unittest.TestCase):
         self.assertEqual(out.get("state"), "already_running")
 
 
+class CompositeKeyInjectivity(unittest.TestCase):
+    """Distinct (agent_id, instance_id) tuples must never share a durable
+    filename. Two ways that broke: the delimiter could occur inside a
+    component, and a lossy sanitizer mapped different components onto one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SUTANDO_INSTANCE_REGISTRY"] = self.tmp.name
+
+    def tearDown(self):
+        os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
+        self.tmp.cleanup()
+
+    def _register(self, agent, instance, endpoint):
+        return reg.write_manifest(agent, instance=instance, endpoint=endpoint)
+
+    @staticmethod
+    def _key_mod():
+        import instance_key
+        return instance_key
+
+    def test_delimiter_inside_a_component_does_not_collide(self):
+        delim = self._key_mod().DELIM
+        first = self._register("agent", f"work{delim}er", "/one.sock")
+        second = self._register(f"agent{delim}work", "er", "/two.sock")
+        self.assertNotEqual(first, second)
+        rows = reg.list_instances()
+        self.assertEqual(len(rows), 2, f"a tuple was overwritten: {rows}")
+        self.assertEqual(
+            {(r["identity"]["agent_id"], r["instance_id"]) for r in rows},
+            {("agent", f"work{delim}er"), (f"agent{delim}work", "er")})
+
+    def test_legacy_double_dash_pair_does_not_collide(self):
+        first = self._register("agent", "worker", "/one.sock")
+        second = self._register("agent--worker", "default", "/two.sock")
+        self.assertNotEqual(first, second)
+        rows = reg.list_instances()
+        self.assertEqual(len(rows), 2, f"a tuple was overwritten: {rows}")
+        endpoints = {r["endpoint"]["path"] for r in rows}
+        self.assertEqual(endpoints, {"/one.sock", "/two.sock"})
+
+    def test_sanitizer_collision_pair_survives_as_two_rows(self):
+        first = self._register("blue/red", "default", "/one.sock")
+        second = self._register("blue_red", "default", "/two.sock")
+        self.assertNotEqual(first, second)
+        self.assertEqual(len(reg.list_instances()), 2)
+
+    def test_key_is_reversible_for_every_shape(self):
+        km = self._key_mod()
+        for agent, inst in (("agent", "default"), ("agent", "worker"),
+                            (f"agent{km.DELIM}work", "er"),
+                            ("blue/red", "default"), ("blue_red", "x y"),
+                            ("@a-1:ag2.space", "100%"), ("a%2Bb", "c")):
+            with self.subTest(agent=agent, instance=inst):
+                self.assertEqual(km.decode_key(km.instance_key(agent, inst)),
+                                 (agent, inst))
+
+    def test_delimiter_cannot_occur_inside_an_encoded_component(self):
+        km = self._key_mod()
+        self.assertNotIn(km.DELIM, km.encode_part(f"a{km.DELIM}b"))
+
+    def test_unusable_identity_is_rejected_not_silently_rewritten(self):
+        km = self._key_mod()
+        for agent in ("", None, ".", "..", "x\x00y", "a" * 129):
+            with self.subTest(agent=agent):
+                with self.assertRaises(ValueError):
+                    km.instance_key(agent, "default")
+
+    def test_default_instance_keeps_the_bare_actor_filename(self):
+        p = self._register("@a-1:ag2.space", None, "/one.sock")
+        self.assertEqual(p.name, "@a-1:ag2.space.json")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

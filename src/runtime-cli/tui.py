@@ -33,29 +33,47 @@ sys.path.insert(0, str(_HERE.with_name("runtime-api")))
 import instance_registry  # noqa: E402
 
 
-def _rpc_at(sock_path: str, method: str, params: dict, timeout: float = 10.0) -> dict:
-    """One JSON-RPC call to a SPECIFIC instance socket (not the shared
-    default) — the client always addresses the instance it selected."""
+def _send(s: socket.socket, method: str, params: dict) -> dict:
     frame = json.dumps({"jsonrpc": "2.0", "id": f"tui-{uuid.uuid4().hex[:8]}",
                         "method": method, "params": params},
                        ensure_ascii=False) + "\n"
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect(sock_path)
-        s.sendall(frame.encode("utf-8"))
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-    finally:
-        s.close()
+    s.sendall(frame.encode("utf-8"))
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
     resp = json.loads(buf.decode("utf-8"))
     if "error" in resp:
         raise RuntimeError(resp["error"].get("message"))
     return resp["result"]
+
+
+def _rpc_at(sock_path: str, method: str, params: dict, timeout: float = 10.0,
+            expect: tuple | None = None) -> dict:
+    """One JSON-RPC call to a SPECIFIC instance socket (not the shared
+    default) — the client always addresses the instance it selected.
+
+    `expect` is an (agent_id, instance_id) tuple the answering peer must
+    match. It is checked over THIS connection, immediately before the call, so
+    the check and the action cannot straddle a socket replacement: an earlier
+    verification is a cache, and a cache is what routed private work to a
+    sibling runtime that rebound the path in between."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+        if expect is not None:
+            info = _send(s, "sutando.info", {})
+            got = (info.get("agentId"), info.get("instanceId") or "default")
+            if got != (expect[0], expect[1] or "default"):
+                raise RuntimeError(
+                    f"socket identity changed: expected {expect[0]}/"
+                    f"{expect[1]}, got {got[0]}/{got[1]} — refusing to route")
+        return _send(s, method, params)
+    finally:
+        s.close()
 
 
 def _socket_reachable(path: str, timeout: float = 1.0) -> bool:
@@ -184,6 +202,9 @@ def main(argv=None) -> int:  # pragma: no cover — interactive key loop; instan
                 print(f"  no such instance (or ambiguous agent id — use "
                       f"agentId/instanceId): {rest[0]}\n")
                 continue
+            # The view's flag is a fast reject only; routed calls re-verify on
+            # their own connection, so replacing the socket after this cannot win.
+            expect = (v["agentId"], v["instanceId"])
             if cmd in ("a", "o", "t", "h") and v.get("identityVerified") is not True:
                 # the socket answered as a DIFFERENT instance (or never
                 # answered): routing work/attach there leaks to the wrong core
@@ -214,14 +235,15 @@ def main(argv=None) -> int:  # pragma: no cover — interactive key loop; instan
                     if not ep or v["server"] != "running":
                         print("  instance not running — start it first\n")
                         continue
-                    out = _rpc_at(ep, "task.submit", {"task": " ".join(rest[1:])})
+                    out = _rpc_at(ep, "task.submit", {"task": " ".join(rest[1:])},
+                                  expect=expect)
                     print(" ", out, "\n")
                 elif cmd == "h":
                     ep = v.get("endpoint")
                     if not ep or v["server"] != "running":
                         print("  instance not running — start it first\n")
                         continue
-                    print(" ", _rpc_at(ep, "request.list", {}), "\n")
+                    print(" ", _rpc_at(ep, "request.list", {}, expect=expect), "\n")
             except (OSError, RuntimeError) as e:
                 print(f"  error: {e}\n")
         else:

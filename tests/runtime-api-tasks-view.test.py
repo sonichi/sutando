@@ -190,6 +190,26 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(self.view.get_result("task-rtapi-gateway")["result"],
                          "gateway result")
 
+    def test_longer_task_ids_gateway_archive_is_not_this_task(self):
+        """A longer id's epoch-suffixed archive shares this id's prefix.
+        Reading it would report another task's result, and done, for a task
+        that never delivered — and would suppress its cancellation."""
+        (self.results / "archive").mkdir(parents=True)
+        (self.results / "archive"
+         / "task-rtapi-target-longer-1785976425.txt").write_text("OTHER TASK")
+        self.assertIsNone(self.view.get_result("task-rtapi-target"))
+        self.assertNotEqual(self.view.status("task-rtapi-target")["state"], "done")
+
+    def test_genuine_gateway_suffix_still_resolves_beside_the_longer_id(self):
+        (self.results / "archive").mkdir(parents=True)
+        (self.results / "archive"
+         / "task-rtapi-target-longer-1785976425.txt").write_text("OTHER TASK")
+        (self.results / "archive"
+         / "task-rtapi-target-1785976425.txt").write_text("MINE")
+        self.assertEqual(self.view.get_result("task-rtapi-target")["result"],
+                         "MINE")
+        self.assertEqual(self.view.status("task-rtapi-target")["state"], "done")
+
     def test_details_roundtrip(self):
         tid = self.view.submit("inspect me", priority="low")["taskId"]
         d = self.view.details(tid)

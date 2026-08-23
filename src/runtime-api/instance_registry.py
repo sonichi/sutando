@@ -4,8 +4,9 @@ records, M1 of the manifest spec (taxonomy part 4/5): Agent existence ≠ agent
 process existence.
 
 One JSON per instance under a well-known per-user dir, keyed by the composite
-(agent_id, instance_id) — `<agent>.json` for the default instance (pre-M2
-name), `<agent>--<instance>.json` otherwise:
+(agent_id, instance_id) via the shared injective encoding in `instance_key.py`
+— `<agent>.json` for the default instance (pre-M2 name),
+`<agent>+<instance>.json` otherwise:
   darwin  ~/Library/Application Support/sutando/instances/
   linux   $XDG_DATA_HOME|~/.local/share/sutando/instances/
   any     $SUTANDO_INSTANCE_REGISTRY overrides
@@ -21,13 +22,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
 
+from instance_key import instance_key
+
 SCHEMA_VERSION = 1
-_SAFE_ID = re.compile(r"[^A-Za-z0-9._@:-]+")
 
 
 def registry_dir() -> Path:
@@ -46,13 +47,9 @@ def registry_dir() -> Path:
 
 def _key(agent_id: str, instance: str | None) -> str:
     """Composite durable key: actor identity says WHO executes; instance
-    identity says WHICH installation. Neither substitutes for the other."""
-    aid = _SAFE_ID.sub("_", str(agent_id or ""))
-    if not aid:
-        raise ValueError("agent_id is required")
-    inst = _SAFE_ID.sub("_", str(instance or "default"))
-    # the default instance keeps the bare-actor filename (pre-M2 registries)
-    return aid if inst == "default" else f"{aid}--{inst}"
+    identity says WHICH installation. Neither substitutes for the other, and
+    the encoding is injective so two tuples can never share a manifest."""
+    return instance_key(agent_id, instance)
 
 
 def _manifest_path(agent_id: str, instance: str | None = None) -> Path:

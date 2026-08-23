@@ -121,6 +121,17 @@ def _enrolled_agent_id(state_dir) -> "str | None":
     except (OSError, ValueError):
         return None
 
+
+def resolve_actor_id(state_dir) -> str:
+    """The daemon's own actor identity. Env first, then the enrolled identity
+    (same chain as the WSS leg), so info/agent-list rows join on the real
+    agent id, not a fallback."""
+    return (os.environ.get("SUTANDO_AGENT_ID")
+            or os.environ.get("AGENT_MXID")
+            or os.environ.get("AGENT_ID")
+            or _enrolled_agent_id(state_dir)
+            or "local-agent")
+
 class RuntimeServer:
     def __init__(self, socket_path: str, db_path: str, ha_dir: str,
                  state_dir: str | None = None,
@@ -139,13 +150,7 @@ class RuntimeServer:
         self._state_dir = state_dir
         # Actor identity is resolved DAEMON-SIDE, here, and handed to the
         # dispatcher explicitly — a client parameter can never override it.
-        # Env first, then the enrolled identity (same chain as the WSS leg),
-        # so info/agent-list rows join on the real agent id, not a fallback.
-        self.actor_id = (os.environ.get("SUTANDO_AGENT_ID")
-                         or os.environ.get("AGENT_MXID")
-                         or os.environ.get("AGENT_ID")
-                         or _enrolled_agent_id(state_dir)
-                         or "local-agent")
+        self.actor_id = resolve_actor_id(state_dir)
         # Request-domain orchestration (approvals, capabilities, idempotency,
         # durable transitions) lives in dispatcher.py; this class = transport.
         host_label = _host_label() if state_dir else None
@@ -447,7 +452,9 @@ class RuntimeServer:
         # Same-instance double start is illegal; flock held for the daemon's
         # life (per-open-file-description — keep the fd referenced on self).
         import fcntl
-        lp = lock_path()
+        # Identity-scoped: two actors sharing an instance_id are two instances,
+        # not a double start of one.
+        lp = lock_path(instance_id(), agent=self.actor_id)
         lp.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(lp.parent, 0o700)
         self._lock_fd = open(lp, "w")
@@ -455,8 +462,8 @@ class RuntimeServer:
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise SystemExit(
-                f"instance {instance_id()!r} already has an authoritative "
-                f"server (lock held: {lp}) — refusing double start")
+                f"instance {self.actor_id!r}/{instance_id()!r} already has an "
+                f"authoritative server (lock held: {lp}) — refusing double start")
         self._lock_fd.write(str(os.getpid()))
         self._lock_fd.flush()
         sp = Path(self.socket_path)
@@ -501,7 +508,8 @@ def build_runtime_server(provider_factories=(), *, state_dir=None,
     return RuntimeServer(
         # Canonical shared resolution (rundir.py) — daemon and CLI must agree
         # on the same default socket, on every platform (review blocker).
-        socket_path=runtime_socket or socket_path(),
+        socket_path=runtime_socket or socket_path(
+            agent=resolve_actor_id(state)),
         db_path=os.environ.get("SUTANDO_RUNTIME_DB")
         or str(state / "runtime-state.sqlite"),
         ha_dir=os.environ.get("SUTANDO_HA_DIR")
