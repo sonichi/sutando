@@ -97,9 +97,8 @@ def scan_instantiations(sources: dict) -> dict:
         except SyntaxError:
             continue
         recognized = set(_CTORS)
-        # local spelling -> the constructor it is actually BOUND to. A local
-        # name that equals the OTHER ctor must resolve by binding, or
-        # `DesignCClaimBackend as DesignAClaimBackend` reports A while building C.
+        # Local spelling -> the ctor it is BOUND to: a name equal to the OTHER
+        # ctor must resolve by binding, or C-as-A reports A while building C.
         bound = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
@@ -144,6 +143,9 @@ INSTANTIATION_OWNERS = {
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py::_delivery_core::DesignAClaimBackend": 1,
     # Discord's proactive leg is pinned migration debt, not precedent.
     "src/discord-bridge.py::_proactive_fence::DesignAClaimBackend": 1,
+    # The one outbox coordinator for the Discord result leg: return annotation
+    # plus the cached construction. A third reference here must fail the gate.
+    "src/discord_result_delivery.py::result_backend::DesignAClaimBackend": 2,
 }
 viol = instantiation_violations(scan_instantiations(prod_sources),
                                 INSTANTIATION_OWNERS)
@@ -364,9 +366,8 @@ def scan_backend_module_imports(sources: dict) -> list[str]:
                             out.append(f"{path} imports {mod}.{a.name}")
     return sorted(out)
 
-# kewei r7 P1a: a package sibling importing the facade RELATIVELY. node.module is
-# None for `from . import x`, so the unresolved value hid the facade entirely and
-# dynamic construction through it escaped both scanners.
+# node.module is None for `from . import x`, so the unresolved value hid the
+# facade entirely and construction through it escaped both scanners.
 _rel = "packages/ag2-sparrow/ag2_sparrow/relative_delivery_leg.py"
 mutated4r = dict(prod_sources)
 mutated4r[_rel] = ("from . import delivery_core as dc\n"
