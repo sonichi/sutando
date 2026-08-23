@@ -63,12 +63,16 @@ class Subject:
         )
 
 
-# Closed set: a scheme is strong only by being listed here. An unknown or
-# misspelled scheme is therefore weak, never strong by default.
-STRONG_ACTOR_SCHEMES = frozenset({
-    "git.commit_author_email",
-    "matrix.mxid",
-})
+# Discriminating: can tell two actors apart. Self-declared, so it can also be
+# SET by whoever writes the record -- attribution, never authorization.
+ASSERTED_ACTOR_SCHEMES = frozenset({"git.commit_author_email"})
+
+# Authenticated by the provider, so it may close an objective on its own.
+VERIFIED_ACTOR_SCHEMES = frozenset({"matrix.mxid"})
+
+# Closed by construction: an unknown or misspelled scheme is in neither set and
+# is therefore weak, never strong by default.
+STRONG_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | VERIFIED_ACTOR_SCHEMES
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,10 @@ class Actor:
     @property
     def is_discriminating(self) -> bool:
         return self.scheme in STRONG_ACTOR_SCHEMES
+
+    @property
+    def is_verified(self) -> bool:
+        return self.scheme in VERIFIED_ACTOR_SCHEMES
 
     def matches(self, other: "Actor") -> bool:
         return self.scheme == other.scheme and self.value == other.value
@@ -157,12 +165,9 @@ def _is_outcome(event: ObservedEvent, scope: ResponsibilityScope) -> bool:
     )
 
 
-def terminal_state_for(event: ObservedEvent, scope: ResponsibilityScope) -> Optional[str]:
-    """The shepherd state this event terminates the objective in, or None.
-
-    Only an ACCEPTED event may terminate: an unattributable outcome must not
-    close someone else's responsibility.
-    """
+def proposed_terminal_state(event: ObservedEvent,
+                            scope: ResponsibilityScope) -> Optional[str]:
+    """The terminal state this event WOULD imply if its actor were authenticated."""
     decision, _ = admit(event, scope)
     if decision != "accepted":
         return None
@@ -171,6 +176,17 @@ def terminal_state_for(event: ObservedEvent, scope: ResponsibilityScope) -> Opti
     if event.event_type in scope.failure_conditions:
         return "failed"
     return None
+
+
+def terminal_state_for(event: ObservedEvent, scope: ResponsibilityScope) -> Optional[str]:
+    """The state this event terminates the objective in, or None.
+
+    An asserted (self-declared) identity can attribute but cannot close: whoever
+    writes the record can set that field, so alone it is a claim, not evidence.
+    """
+    if not event.actor or not event.actor.is_verified:
+        return None
+    return proposed_terminal_state(event, scope)
 
 
 def is_terminal(state: str) -> bool:

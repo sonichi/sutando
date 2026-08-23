@@ -18,12 +18,15 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from local_task_protocol import valid_task_id
 from shepherd_contract import (
     Actor,
     ObservedEvent,
     ResponsibilityScope,
     Subject,
     admit,
+    is_terminal,
+    proposed_terminal_state,
     terminal_state_for,
 )
 from workspace_default import resolve_workspace
@@ -85,6 +88,14 @@ def scope_for(repo: str, number: int, actor: Actor) -> ResponsibilityScope:
         watch_conditions=WATCH, success_conditions=SUCCESS, failure_conditions=FAILURE)
 
 
+def _contract_path(task_id: str) -> Path:
+    """The only place a task_id becomes a path. Unvalidated ids escape the
+    directory (`../../x`), and the repository already owns the gate."""
+    if not valid_task_id(task_id):
+        raise ValueError(f"refusing to build a path from invalid task_id: {task_id!r}")
+    return state_dir() / f"{task_id}.json"
+
+
 def _atomic_write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -95,7 +106,7 @@ def _atomic_write(path: Path, payload: dict) -> None:
 def save(task_id: str, repo: str, number: int, scope: ResponsibilityScope,
          state: str, note: str = "") -> Path:
     """Persist the waiting contract. Atomic: a reader never sees a half-write."""
-    p = state_dir() / f"{task_id}.json"
+    p = _contract_path(task_id)
     _atomic_write(p, {
         "task_id": task_id, "provider": PROVIDER, "repo": repo, "number": number,
         "actor_scheme": scope.actor.scheme, "actor_value": scope.actor.value,
@@ -108,7 +119,7 @@ def save(task_id: str, repo: str, number: int, scope: ResponsibilityScope,
 
 
 def load(task_id: str) -> Optional[dict]:
-    p = state_dir() / f"{task_id}.json"
+    p = _contract_path(task_id)
     return json.loads(p.read_text()) if p.is_file() else None
 
 
@@ -130,13 +141,28 @@ def resume(task_id: str) -> tuple[str, str]:
     rec = load(task_id)
     if rec is None:
         return "unknown", f"no persisted contract for {task_id}"
+    prior = rec["state"]
+    # A terminal record is final: re-observing must never reopen it, and the
+    # network call is pointless once the objective is closed.
+    if is_terminal(prior):
+        return prior, f"already terminal ({prior}); not re-observed"
+
     scope = scope_from_saved(rec)
     event = observe(rec["repo"], rec["number"])
     decision, why = admit(event, scope)
     if decision != "accepted":
-        save(task_id, rec["repo"], rec["number"], scope, rec["state"], why)
-        return rec["state"], f"{event.event_type} {decision}: {why}"
+        save(task_id, rec["repo"], rec["number"], scope, prior, why)
+        return prior, f"{event.event_type} {decision}: {why}"
+
     terminal = terminal_state_for(event, scope)
-    new_state = terminal or "waiting"
-    save(task_id, rec["repo"], rec["number"], scope, new_state, why)
-    return new_state, f"{event.event_type} accepted"
+    if terminal:
+        save(task_id, rec["repo"], rec["number"], scope, terminal, why)
+        return terminal, f"{event.event_type} accepted -> {terminal}"
+
+    # Progress is not a transition: keep whatever state the objective was in
+    # (blocked / needs_human / waiting) rather than flattening it to waiting.
+    proposed = proposed_terminal_state(event, scope)
+    note = (f"{event.event_type} accepted; outcome proposed={proposed} but actor "
+            f"scheme is asserted, not verified — not terminating") if proposed else why
+    save(task_id, rec["repo"], rec["number"], scope, prior, note)
+    return prior, note

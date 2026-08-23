@@ -15,6 +15,7 @@ from shepherd_contract import (  # noqa: E402
     Subject,
     admit,
     is_terminal,
+    proposed_terminal_state,
     terminal_state_for,
 )
 
@@ -70,19 +71,35 @@ check("unwatched event type -> ignored",
       admit(ObservedEvent("github.issue_comment.created", PR, MINE), SCOPE)[0],
       "ignored")
 
-# terminal evidence
-check("my merge terminates succeeded",
+# a git author email is SELF-DECLARED commit metadata: whoever writes the commit
+# sets it, so it may attribute but must not close an objective on its own
+check("asserted scheme discriminates", MINE.is_discriminating, True)
+check("asserted scheme is NOT verified", MINE.is_verified, False)
+check("asserted actor cannot terminate",
       terminal_state_for(ObservedEvent("github.pull_request.merged", PR, MINE), SCOPE),
+      None)
+check("but the outcome is still surfaced as proposed",
+      proposed_terminal_state(ObservedEvent("github.pull_request.merged", PR, MINE), SCOPE),
       "succeeded")
 
-# someone else's merge must NOT close this objective
-check("peer merge does not terminate",
-      terminal_state_for(ObservedEvent("github.pull_request.merged", PR, PEER), SCOPE),
-      None)
-
-check("closed_unmerged terminates failed",
-      terminal_state_for(ObservedEvent("github.pull_request.closed_unmerged", PR, MINE), SCOPE),
+VERIFIED = Actor("matrix.mxid", "@qingyun-air.agent:ag2.space")
+VSCOPE = ResponsibilityScope(
+    subjects=(PR,), actor=VERIFIED,
+    watch_conditions=frozenset({"github.check_suite.completed"}),
+    success_conditions=frozenset({"github.pull_request.merged"}),
+    failure_conditions=frozenset({"github.pull_request.closed_unmerged"}))
+check("verified actor terminates succeeded",
+      terminal_state_for(ObservedEvent("github.pull_request.merged", PR, VERIFIED), VSCOPE),
+      "succeeded")
+check("verified actor terminates failed",
+      terminal_state_for(
+          ObservedEvent("github.pull_request.closed_unmerged", PR, VERIFIED), VSCOPE),
       "failed")
+
+# someone else's outcome must NOT close this objective, verified or not
+check("peer merge does not terminate",
+      proposed_terminal_state(ObservedEvent("github.pull_request.merged", PR, PEER), SCOPE),
+      None)
 
 # an accepted watched event that is neither success nor failure does not
 # terminate: progress is not an outcome
@@ -145,4 +162,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 22 assertions, control verified")
+print("PASS: 27 assertions, control verified")

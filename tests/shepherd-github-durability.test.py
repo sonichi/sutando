@@ -62,6 +62,47 @@ check("no partial file left behind",
 
 check("unknown task id is unknown, not a crash", g.load("task-does-not-exist"), None)
 
+
+def raises(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+# a task_id becomes a filename, so an unvalidated one escapes the directory
+outside = pathlib.Path(WORK) / "escaped.json"
+check("traversal id refused on save",
+      raises(lambda: g.save("../../escaped", "o/r", 1, scope, "waiting")), True)
+check("traversal id refused on load", raises(lambda: g.load("../../escaped")), True)
+check("no file written outside the state dir", outside.exists(), False)
+check("absolute path id refused", raises(lambda: g.load("/etc/passwd")), True)
+
+# resume() must be monotonic: re-observing may not reopen a closed objective,
+# and ordinary progress may not flatten blocked/needs_human into waiting
+g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
+    "github.pull_request.updated", g.subject_for(repo, num), MINE)
+
+for prior in ("failed", "succeeded", "cancelled"):
+    g.save("task-dur-2", "o/r", 1, scope, prior)
+    state, why = g.resume("task-dur-2")
+    check(f"terminal {prior} stays {prior}", state, prior)
+    check(f"terminal {prior} not re-observed", "not re-observed" in why, True)
+
+for prior in ("blocked", "needs_human", "waiting"):
+    g.save("task-dur-2", "o/r", 1, scope, prior)
+    state, _ = g.resume("task-dur-2")
+    check(f"progress preserves {prior}", state, prior)
+
+# an asserted actor's merge is surfaced but does not close the objective
+g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
+    "github.pull_request.merged", g.subject_for(repo, num), MINE)
+g.save("task-dur-2", "o/r", 1, scope, "waiting")
+state, why = g.resume("task-dur-2")
+check("asserted merge does not terminate", state, "waiting")
+check("but it is reported as proposed", "proposed=succeeded" in why, True)
+
 # negative control: the harness must be able to register a failure
 _n = len(failures)
 check("CONTROL (expected to fail)", 1, 2)
@@ -75,4 +116,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 8 assertions, control verified")
+print("PASS: 22 assertions, control verified")
