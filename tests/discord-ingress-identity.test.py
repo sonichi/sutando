@@ -72,9 +72,9 @@ class AlreadyAdmitted(unittest.TestCase):
 
 
 class BridgeWiring(unittest.TestCase):
-    """One wiring pin: the bridge's DM mint site delegates to the policy."""
+    """One wiring pin per bridge: the mint site delegates to the policy."""
 
-    def test_mint_site_uses_provider_task_id_with_replay_skip(self):
+    def test_discord_mint_site_uses_provider_task_id_with_replay_skip(self):
         src = (REPO / "src" / "discord-bridge.py").read_text()
         self.assertIn("from ingress_identity import provider_task_id", src)
         site = re.search(
@@ -84,6 +84,22 @@ class BridgeWiring(unittest.TestCase):
         self.assertIsNotNone(
             site, "discord-bridge DM ingress must derive the id from the "
                   "provider event and consult already_admitted before writing")
+
+    def test_slack_mint_site_uses_provider_task_id_with_replay_skip(self):
+        src = (REPO / "src" / "slack-bridge.py").read_text()
+        self.assertIn("from ingress_identity import provider_task_id", src)
+        site = re.search(
+            r"task_id = provider_task_id\(f\"sl\{event\.get\('team'\) or '0'\}\","
+            r"[\s\S]{0,400}?already_admitted\(task_id, TASKS_DIR, RESULTS_DIR",
+            src)
+        self.assertIsNotNone(
+            site, "slack-bridge ingress must derive the id from channel+ts "
+                  "and consult already_admitted before writing")
+
+    def test_slack_event_id_shape_needs_no_escaping(self):
+        tid = provider_task_id("slT08ABC", "D0B4N6DSY90-1787477641.984")
+        self.assertNotIn("%", tid)
+        self.assertRegex(tid, r"^task-[A-Za-z0-9._~-]+$")
 
 
 if __name__ == "__main__":
