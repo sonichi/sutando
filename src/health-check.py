@@ -6894,6 +6894,17 @@ def check_task_watcher() -> dict:
                 "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
     extras = sorted(r for r, members in trees.items() if str(pid) not in members)
     if extras:
+        # A pool runs one watcher per core, so N-1 of N are always "untracked":
+        # the sentinel is single-valued and whichever core stamped last holds it.
+        cores = _live_core_instances()
+        if len(cores) > 1:
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(trees)} watcher trees running, {len(extras)} not tracked by the "
+                              f"sentinel (root pids {', '.join(extras)}) — but {len(cores)} cores are "
+                              f"live ({', '.join(sorted(cores))}), and a pool runs one watcher per "
+                              f"core, so these are probably legitimate. DO NOT stop them on this "
+                              f"verdict alone: trace each root to its owning session first "
+                              f"(ps -o ppid= -p <pid>), and stop only a tree whose session is gone"}
         return {"name": name, "status": "warn",
                 "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
                           f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
@@ -9359,6 +9370,30 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
         except OSError:
             pass
     return False
+
+
+def _live_core_instances(workspace: Optional[Path] = None,
+                         max_age_s: float = 90.0) -> "set[str]":
+    """Names of cores with a fresh `state/cores/<name>.alive` heartbeat.
+
+    `_any_core_alive` short-circuits on the first hit, so it cannot answer "how
+    many". A pool runs one task watcher per core, which is the only thing that
+    distinguishes N legitimate watchers from N-1 duplicates.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return set()
+    now = time.time()
+    live = set()
+    for alive_file in cores_dir.glob("*.alive"):
+        try:
+            if heartbeat_is_fresh(alive_file.stat().st_mtime, now, max_age_s):
+                live.add(alive_file.stem)
+        except OSError:
+            pass
+    return live
 
 
 def _alerts_suppressed(check: dict) -> bool:
