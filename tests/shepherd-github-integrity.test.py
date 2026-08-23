@@ -394,6 +394,14 @@ _write_raw("task-integrity-28", {**base, "task_id": "task-integrity-28",
 check("a success-only contract still loads",
       g.load("task-integrity-28")["task_id"], "task-integrity-28")
 
+# --- 16. the public seam validates elements, not only container and arity -----
+raises("scope_from_saved rejects a mixed-type element",
+       lambda: g.scope_from_saved({**base, "success_conditions": ["ok", 7]}), ValueError)
+raises("scope_from_saved rejects a blank element",
+       lambda: g.scope_from_saved({**base, "failure_conditions": ["  "]}), ValueError)
+check("scope_from_saved still accepts a well-formed record",
+      sorted(g.scope_from_saved(base).success_conditions), sorted(base["success_conditions"]))
+
 print(f"integrity: {len(failures)} failure(s)")
 for f in failures:
     print("  FAIL", f)

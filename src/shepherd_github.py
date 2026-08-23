@@ -182,18 +182,14 @@ def _validate_record(rec: dict, task_id: str) -> dict:
     for key in _IDENTITY_KEYS:
         if not isinstance(rec[key], str) or not rec[key].strip():
             raise ValueError(f"contract for {task_id} has blank/non-string {key}")
+    at = f"contract for {task_id}"
     for key in _CONDITION_KEYS:
-        value = rec[key]
-        # A bare str is iterable, so frozenset() would explode it into characters.
-        if isinstance(value, str) or not isinstance(value, (list, tuple)):
-            raise ValueError(f"contract for {task_id}: {key} must be a list, "
-                             f"got {type(value).__name__}")
-        if any(not isinstance(x, str) or not x.strip() for x in value):
-            raise ValueError(f"contract for {task_id}: {key} must hold non-empty strings")
-    # Arity, not just element type: [] satisfies every element check by vacuity.
-    if not rec["waiting_for"]:
-        raise ValueError(f"contract for {task_id}: waiting_for must be non-empty — "
-                         f"a contract that observes nothing can never progress")
+        # A persisted record is JSON, so only a list is a legal container here;
+        # element and arity rules are shared with the public seam via _conditions.
+        if isinstance(rec[key], str) or not isinstance(rec[key], (list, tuple)):
+            raise ValueError(f"{at}: {key} must be a list, "
+                             f"got {type(rec[key]).__name__}")
+        _conditions(rec, key, required=(key == "waiting_for"), where=at)
     if not (rec["success_conditions"] or rec["failure_conditions"]):
         raise ValueError(f"contract for {task_id}: no reachable outcome — success and "
                          f"failure conditions are both empty")
@@ -234,15 +230,19 @@ def load(task_id: str) -> Optional[dict]:
     return _validate_record(json.loads(p.read_text()), task_id)
 
 
-def _conditions(rec: dict, key: str, *, required: bool = False) -> frozenset:
+def _conditions(rec: dict, key: str, *, required: bool = False,
+                where: str = "") -> frozenset:
     """One place defines what a condition collection is. A bare str is iterable,
     so frozenset() would silently reconstruct it as a set of characters."""
+    at = f"{where}: " if where else ""
     value = rec[key]
     if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
-        raise ValueError(f"{key} must be a collection of strings, "
+        raise ValueError(f"{at}{key} must be a collection of strings, "
                          f"got {type(value).__name__}")
+    if any(not isinstance(x, str) or not x.strip() for x in value):
+        raise ValueError(f"{at}{key} must hold non-empty strings")
     if required and not value:
-        raise ValueError(f"{key} must be non-empty")
+        raise ValueError(f"{at}{key} must be non-empty")
     return frozenset(value)
 
 
