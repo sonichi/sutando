@@ -322,11 +322,13 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:  # p
     pend = bytearray()
     done = loop.create_future()
     orow = [2]  # next output row; transcript fills TOP-down (like Claude Code)
-    lvl = [int(level)]  # 0 quiet · 1 steps · 2 per-tool; toggled by /quiet /activity /verbose
-    compose_h = [0]  # current compose-box height (rows); 0 forces the first layout
-    esc = bytearray()   # in-progress ANSI escape sequence (arrow keys, paste markers)
-    pasting = [False]   # inside a bracketed paste (\033[200~ … \033[201~)
-    paste_run = [-1.0]  # monotonic ts of the last unmarked multi-line paste burst
+    lvl = [int(level)]  # 0 quiet · 1 steps · 2 per-tool (/quiet /activity /verbose)
+
+    compose_h = [0]  # current compose-box height; 0 forces the first layout
+    esc = bytearray()  # in-progress ANSI escape sequence (arrows, paste marks)
+
+    pasting = [False]  # inside a bracketed paste (\033[200~ … \033[201~)
+    paste_run = [-1.0]  # monotonic ts of the last unmarked multi-line burst
 
     def dims():
         s = shutil.get_terminal_size((80, 24))
@@ -644,9 +646,16 @@ def _print_resolve(result: dict) -> int:
             print(f"  {c.get('stand_id','?')} — {ver}", file=sys.stderr)
         print("manual resolution required", file=sys.stderr)
         return 3
+    if result.get("store_corrupt"):
+        # unreadable is a different claim from absent — never collapse them
+        print("entrance-links store unreadable — resolution unavailable "
+              "(repair state/auth/entrance-links.json)", file=sys.stderr)
+        return 4
     if not result.get("resolved"):
-        print(f"not linked: {result.get('provider')} "
-              f"{result.get('subject')}", file=sys.stderr)
+        msg = f"not linked: {result.get('provider')} {result.get('subject')}"
+        if result.get("verified_unlinked"):
+            msg += " (provider-verified, awaiting owner authorization)"
+        print(msg, file=sys.stderr)
         return 1
     lk = result.get("link") or {}
     width = 12
@@ -941,7 +950,9 @@ def main(argv=None) -> int:
                 return _print_stand_card(result, args.sub)
             if args.cmd == "stand" and args.sub == "resolve"                     and not result.get("resolved"):
                 print(json.dumps(result, ensure_ascii=False, indent=1))
-                # same exit contract as human mode: conflict is 3, not 1
+                # same exit contract as human mode: conflict 3, corrupt 4
+                if result.get("store_corrupt"):
+                    return 4
                 return 3 if result.get("conflict") else 1
         elif args.group == "runtime":
             result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)

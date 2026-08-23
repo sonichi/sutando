@@ -59,6 +59,24 @@ def active_link(state_dir: str | Path, provider: str) -> "dict | None":
     return None
 
 
+import contextlib
+import fcntl
+
+
+@contextlib.contextmanager
+def _ledger_lock(state_dir: str | Path):
+    # One writer contract for the whole load->validate->mutate->save
+    # transaction; flock is held on a sibling lock file, never the ledger.
+    path = links_path(state_dir).with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def _save_links(state_dir: str | Path, links: list) -> None:
     path = links_path(state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +115,14 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
     # UNIQUE(provider, canonical subject): an active link for the provider is
     # replaced only by the SAME subject; a different subject must be explicit.
     stand_id = require_resolved_identity(state_dir)
+    with _ledger_lock(state_dir):
+        return _upsert_link_locked(state_dir, stand_id, provider,
+                                   provider_subject, verification,
+                                   credential_fingerprint, display)
+
+
+def _upsert_link_locked(state_dir, stand_id, provider, provider_subject,
+                        verification, credential_fingerprint, display):
     links = _load_links_for_mutation(state_dir)
     existing = [l for l in links
                 if l.get("provider") == provider and l.get("status") == "active"]
@@ -105,6 +131,12 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
             raise ValueError(
                 f"active {provider} link exists with a different subject "
                 f"({l.get('provider_subject')}) — revoke it explicitly first")
+        # re-verification must never transplant another Stand's binding (or
+        # inherit its authorization) — cross-Stand re-bind is an explicit act
+        if l.get("stand_id") and l["stand_id"] != stand_id:
+            raise ValueError(
+                f"active {provider} link belongs to Stand {l['stand_id']}, "
+                f"not {stand_id} — revoke it explicitly before re-verifying")
     link = existing[0] if existing else {
         "link_id": "link_" + secrets.token_hex(8),
         "provider": provider,
@@ -131,6 +163,13 @@ def authorize_link(state_dir: str | Path, provider: str,
     """Explicit owner authorization: the act that turns a verified link into
     an active Stand binding. Never called automatically."""
     stand_id = require_resolved_identity(state_dir)
+    with _ledger_lock(state_dir):
+        return _authorize_link_locked(state_dir, stand_id, provider,
+                                      authorized_by, confirmation_ref)
+
+
+def _authorize_link_locked(state_dir, stand_id, provider, authorized_by,
+                           confirmation_ref):
     links = _load_links_for_mutation(state_dir)
     for lk in links:
         if lk.get("provider") != provider or lk.get("status") != "active":
@@ -157,10 +196,22 @@ def authorize_link(state_dir: str | Path, provider: str,
 def revoke_link(state_dir: str | Path, provider: str, revoked_by: str,
                 reason: "str | None" = None) -> dict:
     """Revocation is layered: kills THIS binding only, never the Stand."""
-    require_resolved_identity(state_dir)
+    stand_id = require_resolved_identity(state_dir)
+    with _ledger_lock(state_dir):
+        return _revoke_link_locked(state_dir, stand_id, provider,
+                                   revoked_by, reason)
+
+
+def _revoke_link_locked(state_dir, stand_id, provider, revoked_by, reason):
     links = _load_links_for_mutation(state_dir)
     for lk in links:
         if lk.get("provider") == provider and lk.get("status") == "active":
+            # revocation is bound to the ENROLLED Stand, same boundary as
+            # authorize — Stand A must never kill Stand B's binding
+            if lk.get("stand_id") and lk["stand_id"] != stand_id:
+                raise ValueError(
+                    f"link belongs to Stand {lk['stand_id']}, not {stand_id} "
+                    "— cross-Stand revocation refused")
             now = datetime.now(timezone.utc).isoformat(timespec="seconds")
             lk["status"] = "revoked"
             lk["revocation"] = {"revoked_by": revoked_by, "revoked_at": now,

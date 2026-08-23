@@ -22,9 +22,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 
-from identity_view import IdentityView  # noqa: E402
-from dispatcher import RuntimeDispatcher  # noqa: E402
-from protocol import ProtocolError  # noqa: E402
+# flake8: noqa: E402 — imports follow the sys.path bootstrap above
+from identity_view import IdentityView
+from dispatcher import RuntimeDispatcher
+from protocol import ProtocolError
 
 
 def _mk(state: Path, channels: Path | None = None, **kw) -> IdentityView:
@@ -476,6 +477,77 @@ class TestAuthorityBoundaries(unittest.TestCase):
         self.el.authorize_link(self.state, "discord", "@o:x")
         r2 = v.resolve("discord", "123")
         self.assertTrue(r2["resolved"])
+
+    def test_reverify_never_transplants_another_stands_authorization(self):
+        # kewei's control: Stand B's authorized row must not become Stand A's
+        self._enroll()
+        self._verify()
+        self.el.authorize_link(self.state, "discord", "@owner-b:x")
+        links = self.el.load_links(self.state)
+        links[0]["stand_id"] = "@stand-b:x"
+        (self.state / "auth" / "entrance-links.json").write_text(
+            json.dumps(links))
+        with self.assertRaises(ValueError):
+            self._verify()  # enrolled Stand differs from the row's
+        row = self.el.load_links(self.state)[0]
+        self.assertEqual(row["stand_id"], "@stand-b:x")
+        self.assertEqual(row["authorized_by"], "@owner-b:x")
+        r = _mk(self.state, self.channels).resolve("discord", "123")
+        self.assertNotEqual(r.get("stand_id"), self.el._enrolled_stand_id(
+            self.state))
+
+    def test_cross_stand_revocation_refused(self):
+        self._enroll()
+        self._verify()
+        links = self.el.load_links(self.state)
+        links[0]["stand_id"] = "@stand-b:x"
+        (self.state / "auth" / "entrance-links.json").write_text(
+            json.dumps(links))
+        with self.assertRaises(ValueError):
+            self.el.revoke_link(self.state, "discord", "@o:x")
+        self.assertEqual(self.el.load_links(self.state)[0]["status"], "active")
+
+    def test_concurrent_mutations_lose_nothing(self):
+        # production mutators from N threads; the ledger lock must serialize
+        # the whole load->mutate->save transaction (kewei's lost-update repro)
+        import threading
+        self._enroll()
+        provs = [f"prov{i}" for i in range(8)]
+        errs = []
+
+        def verify(pv):
+            try:
+                self.el.upsert_link(
+                    self.state, pv, {"type": "bot_user", "id": pv},
+                    {"method": "m", "verified_at": "t"}, "sha256:ab")
+            except Exception as e:  # noqa: BLE001
+                errs.append(e)
+
+        threads = [threading.Thread(target=verify, args=(pv,)) for pv in provs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errs, [])
+        links = self.el.load_links(self.state)
+        self.assertEqual(sorted(l["provider"] for l in links), sorted(provs))
+        auth_errs = []
+
+        def authz(pv):
+            try:
+                self.el.authorize_link(self.state, pv, "@o:x")
+            except Exception as e:  # noqa: BLE001
+                auth_errs.append(e)
+
+        threads = [threading.Thread(target=authz, args=(pv,)) for pv in provs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(auth_errs, [])
+        authorized = [l["provider"] for l in self.el.load_links(self.state)
+                      if l.get("authorized_by")]
+        self.assertEqual(sorted(authorized), sorted(provs))  # zero lost updates
 
     def test_corrupt_store_surfaces_policy_invalid_never_no_links(self):
         # a present-but-unreadable store must never read as "no binding"
