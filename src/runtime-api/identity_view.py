@@ -105,6 +105,7 @@ class IdentityView:
 
     def _entrance(self, d: Path) -> dict:
         ent: dict = {"provider": d.name}
+        link = self._active_link(d.name)
         evidence: dict = {}
         env = d / ".env"
         if env.is_file():
@@ -125,6 +126,11 @@ class IdentityView:
                 evidence["subject_evidence"] = enrolled["agent_id"]
         if policy_invalid:
             ent["status"] = "policy_invalid"
+        elif link:
+            # a verified EntranceLink record is the ONLY path to "active"
+            ent["status"] = "active"
+            ent["identity"] = link.get("provider_subject")
+            ent["verification"] = link.get("verification")
         elif evidence:
             ent["status"] = "configured_unverified"
         else:
@@ -132,6 +138,17 @@ class IdentityView:
         if evidence:
             ent["evidence"] = evidence
         return ent
+
+    def _active_link(self, provider: str) -> "dict | None":
+        try:
+            data = json.loads(
+                (self.state_dir / "auth" / "entrance-links.json").read_text())
+        except (OSError, ValueError):
+            return None
+        for lk in data if isinstance(data, list) else []:
+            if lk.get("provider") == provider and lk.get("status") == "active":
+                return lk
+        return None
 
     # ── sutando.owner ───────────────────────────────────────────────────────
     def owner(self) -> dict:

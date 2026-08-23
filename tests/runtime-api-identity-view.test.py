@@ -286,6 +286,65 @@ class TestEntrances(unittest.TestCase):
         self.assertIn("entrances", out)
 
 
+class TestEntranceLinks(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        (self.state / "auth").mkdir(parents=True)
+        self.channels = Path(self.tmp.name) / "channels"
+        d = self.channels / "discord"
+        d.mkdir(parents=True)
+        (d / ".env").write_text("DISCORD_TOKEN=tok-sekret")
+        (d / "access.json").write_text("{}")
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "entrance_links",
+            Path(__file__).resolve().parent.parent / "src" / "entrance_links.py")
+        self.el = ilu.module_from_spec(spec)
+        spec.loader.exec_module(self.el)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _link(self, subject_id="123"):
+        return self.el.upsert_link(
+            self.state, "discord", {"type": "bot_user", "id": subject_id},
+            {"method": "discord_token_introspection", "verified_at": "t"},
+            "sha256:abcd")
+
+    def test_active_link_upgrades_entrance(self):
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": "@stand:ag2.space"}))
+        link = self._link()
+        self.assertEqual(link["stand_id"], "@stand:ag2.space")
+        out = _mk(self.state, self.channels).entrances()
+        e = out["entrances"][0]
+        self.assertEqual(e["status"], "active")
+        self.assertEqual(e["identity"], {"type": "bot_user", "id": "123"})
+        self.assertEqual(e["verification"]["method"],
+                         "discord_token_introspection")
+
+    def test_no_link_stays_unverified(self):
+        out = _mk(self.state, self.channels).entrances()
+        self.assertEqual(out["entrances"][0]["status"],
+                         "configured_unverified")
+
+    def test_unique_subject_conflict_is_loud(self):
+        self._link("123")
+        with self.assertRaises(ValueError):
+            self._link("456")
+        # same subject re-verifies in place (no duplicate rows)
+        self._link("123")
+        self.assertEqual(len(self.el.load_links(self.state)), 1)
+
+    def test_no_credential_material_in_records_or_view(self):
+        self._link()
+        blob = self.el.links_path(self.state).read_text()
+        dumped = json.dumps(_mk(self.state, self.channels).entrances())
+        for hay in (blob, dumped):
+            self.assertNotIn("tok-sekret", hay)
+
+
 class TestEnrolledActorFallback(unittest.TestCase):
     def test_enrolled_identity_beats_local_agent_fallback(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent

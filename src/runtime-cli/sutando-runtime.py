@@ -615,6 +615,14 @@ def _print_entrances(result: dict) -> int:
     width = max(width, len("owner evidence")) + 2
     for e in ents:
         print(f"{e.get('provider','').ljust(width)}{e.get('status','')}")
+        ident = e.get("identity") or {}
+        if ident:
+            sub = ":".join(str(v) for k, v in sorted(ident.items()))
+            print(f"  {'identity'.ljust(width)}{sub}")
+        ver = e.get("verification") or {}
+        if ver.get("method"):
+            print(f"  {'verified by'.ljust(width)}{ver['method']}"
+                  + (f" ({ver['verified_at']})" if ver.get("verified_at") else ""))
         ev = e.get("evidence") or {}
         for key, label in (("subject_evidence", "subject"),
                            ("owner_evidence", "owner evidence"),
