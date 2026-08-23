@@ -108,3 +108,57 @@ and no consensus protocol enters the system. launchd restarts the lead.
 | Old error text after a fix | `core-N.err` accumulates across runs | Append a `=== MARK ===` line, kickstart, read only post-mark lines |
 
 Debug recipe: reproduce outside launchd first (`cd $POOL_REPO_DIR && $POOL_CLAUDE_BIN --dangerously-skip-permissions --add-dir $POOL_WORKSPACE --print "Reply with exactly: BOOT-OK"`) — userland success + launchd failure isolates the plist env; userland failure isolates auth/skill/config.
+
+## Operations
+
+### Recovery does not use launchd timers
+
+Measured on this host during a deliberate kill drill: a killed follower with
+`KeepAlive: true` stayed dead indefinitely (`runs` frozen, `pended nondemand
+spawn = inefficient`, exit 0), and the watchdog's own `StartInterval: 180`
+never fired unaided over 7 minutes (`pended nondemand spawn = interval`).
+launchd defers *non-demand* spawns here; only `launchctl kickstart` — a demand
+spawn — reliably starts a job. Anything that relies on KeepAlive or a plist
+timer to bring a core back is decorative.
+
+So recovery is driven by the **lead**, the one process provably running (2s
+sweep). Every 60s it reconciles the installed `com.sutando.core-*` plists
+against live tmux sessions and kickstarts whichever core has no session.
+`scripts/kick-pool.sh` holds that logic and additionally un-wedges a session
+that is alive but idle at the REPL.
+
+Verify it is alive by its own output, never by log presence:
+
+    grep 'recovery:' <workspace>/logs/pool-lead.log | tail -3
+    # recovery: ok (3 session(s) healthy)      <- idle heartbeat, emitted every pass
+    # recovery: core-3: NO SESSION (dead) -> launchctl kickstart
+
+The idle heartbeat exists because a sweep that logs only when it acts is
+indistinguishable from a sweep that stopped running — the failure mode that
+hid a dead watchdog for three months.
+
+### Triaging a follower that stops working
+
+Classify before acting; the deciding question is *would a newly started
+process succeed?*
+
+| Symptom | Class | Action |
+|---|---|---|
+| `401`, credentials expired, auth errors | auth-state — per-process, not shared | Recycle that session (`launchctl kickstart -k gui/$(id -u)/com.sutando.core-N`). Retrying re-hits the same dead auth; a re-login elsewhere only affects *newly started* processes |
+| Timeouts, 5xx, network errors | transport | Back off and retry; do not touch the session |
+| Heartbeat fresh but assignments sit unclaimed | hung session | The lead's stuck-assignment reclaim repools it; `kick-pool.sh` un-wedges an idle REPL |
+| No tmux session | dead core | The lead's 60s reconcile kickstarts it (~55s observed end to end) |
+
+A follower's heartbeat is pid-bound, so it keeps beating while auth is dead —
+use assigned-but-unclaimed age as the signal, not the `.alive` file.
+
+### Scaling
+
+`bash src/startup.sh --pool N` (or `--pool auto`, which starts at 2 and lets
+the lead grow the pool) installs/resizes and ensures the lead is running.
+Scale-up is automatic under saturation up to `SUTANDO_POOL_MAX` (default 3);
+**scale-down stays manual** because booting out a core can strand its live
+claims. `SUTANDO_AFFINITY_BUSY_MAX` (default 3) sets how backlogged a channel's
+handler must be before affinity yields — lower favors latency, higher favors
+conversational continuity; `continuity_breaks` in the pool metrics measures
+what that choice costs.
