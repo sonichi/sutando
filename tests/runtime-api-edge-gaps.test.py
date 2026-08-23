@@ -144,6 +144,12 @@ class CapabilityRegistryEdges(unittest.TestCase):
         with self.assertRaises(ValueError):
             capreg._json_copy({"x": object()}, "input", 1024)
 
+    def test_nan_hits_the_encoder_guard_not_the_walker(self):
+        # NaN passes the shape walk; only dumps(allow_nan=False) rejects it —
+        # this is the encoder except-branch, distinct from the walker's
+        with self.assertRaises(ValueError):
+            capreg._json_copy({"x": float("nan")}, "input", 1024)
+
     def test_oversized_value_refuses_loudly(self):
         with self.assertRaises(ValueError):
             capreg._json_copy({"x": "y" * 4096}, "input", 128)

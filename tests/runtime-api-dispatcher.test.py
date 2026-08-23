@@ -330,6 +330,33 @@ raises("task.* without a task pipeline is a clean -32601",
 raises("request.get without requestId",
        lambda: run(d.handle("request.get", {})), code=-32602, substr="requestId")
 
+print("── configured-surface branches ──")
+sys.path.insert(0, str(REPO / "src"))
+from schedules_view import SchedulesView  # noqa: E402
+import json as _j
+import tempfile as _tf
+_sd = Path(_tf.mkdtemp(prefix="rt-disp-sched-"))
+(_sd / "crons.json").write_text(_j.dumps([{"name": "x", "cron": "*/5 * * * *",
+                                           "prompt": "p"}]))
+d.schedules = SchedulesView(_sd / "crons.json")
+rows = run(d.handle("schedule.list", {}))
+check("schedule.list serves configured rows through the dispatcher",
+      rows["schedules"] and rows["schedules"][0]["name"] == "x", str(rows))
+
+from tasks_view import TasksView  # noqa: E402
+_td = Path(_tf.mkdtemp(prefix="rt-disp-tasks-"))
+(_td / "tasks").mkdir(); (_td / "results").mkdir()
+d.tasks = TasksView(_td / "tasks", _td / "results", "@disp:test")
+raises("task.status with a pipeline but no taskId",
+       lambda: run(d.handle("task.status", {})), code=-32602, substr="taskId")
+raises("task.details unknown id",
+       lambda: run(d.handle("task.details", {"taskId": "task-none"})),
+       code=-32602, substr="unknown task")
+raises("task.submit empty text is a ValueError -> -32602",
+       lambda: run(d.handle("task.submit", {"task": "   "})), code=-32602)
+raises("request.wait without requestId",
+       lambda: run(d.handle("request.wait", {})), code=-32602, substr="requestId")
+
 print()
 if FAILS:
     print(f"FAIL — {len(FAILS)}: {FAILS}")

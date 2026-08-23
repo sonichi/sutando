@@ -207,7 +207,8 @@ def drive():
                     "--question", "after crash?", "--type", "single_select",
                     "--options", '["a","b"]', "--expires-in", "60"],
                    capture_output=True, text=True, timeout=30, env=ENV)
-    time.sleep(1.5)
+    # dwell past a few watcher polls: the no-subscriber idle branches run
+    time.sleep(2.5)
     p = subprocess.run([*PYBASE, str(CLI), "sutando", "info"],
                        capture_output=True, text=True, timeout=30, env=ENV)
     check(p.returncode == 0,

@@ -177,6 +177,30 @@ def drive(daemon):
         p = run_cli("human-action", "decline", rid, "--note", "n/a")
         check(p.returncode == 0, "human-action decline exits 0")
 
+    # ── instance group: list + start/attach on a missing agent ──
+    p = run_cli("instance", "list")
+    check(p.returncode == 0, "instance list exits 0")
+    p = run_cli("instance", "start", "@ghost:example.org")
+    check(p.returncode == 1 and not p.stdout.strip() == "",
+          "instance start on a missing agent errors with a body")
+    p = run_cli("instance", "attach", "@ghost:example.org", "--print")
+    check(p.returncode == 1 and p.stderr.strip(),
+          "instance attach on a missing agent errors loudly")
+
+    # ── capability read + approval request via the CLI ──
+    p = run_cli("capability", "read", "--capability", "nope.cap",
+                "--operation", "read")
+    check(p.returncode in (0, 1), "capability read answers on unknown cap")
+    p = run_cli("approval", "request", "--action", "cli.probe",
+                "--reason", "surface probe", "--expires-in", "60")
+    check(p.returncode == 0 and "requestId" in p.stdout,
+          "approval request exits 0 with a requestId")
+    rid2 = json.loads(p.stdout)["requestId"]
+    p = run_cli("request", "get", rid2)
+    check(p.returncode == 0, "request get on a live id exits 0")
+    p = run_cli("request", "cancel", rid2)
+    check(p.returncode == 0, "request cancel exits 0")
+
     # ── usage errors ──
     p = run_cli("task")
     check(p.returncode == 2, "bare group without subcommand is usage error")

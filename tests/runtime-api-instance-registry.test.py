@@ -206,5 +206,68 @@ class InstanceRegistryTests(unittest.TestCase):
         self.assertNotIn("/", p.name.replace(".json", ""))
 
 
+
+
+class EdgeBranches(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SUTANDO_INSTANCE_REGISTRY"] = str(
+            Path(self.tmp.name) / "reg")
+
+    def tearDown(self):
+        os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
+        self.tmp.cleanup()
+
+    def test_platform_default_dirs_without_env(self):
+        # both platform branches are pure path computation — call them
+        os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
+        got = reg.registry_dir()
+        self.assertIn("sutando", str(got))
+        os.environ["XDG_DATA_HOME"] = self.tmp.name
+        try:
+            if sys.platform != "darwin":
+                self.assertTrue(str(reg.registry_dir()).startswith(self.tmp.name))
+        finally:
+            os.environ.pop("XDG_DATA_HOME", None)
+
+    def test_missing_registry_dir_lists_empty(self):
+        self.assertEqual(reg.list_instances(), [])
+
+    def test_desired_state_missing_is_none(self):
+        self.assertIsNone(reg.read_desired_state("@nobody:x"))
+
+    def test_attachable_stages_fail_closed(self):
+        # dead endpoint -> server stage; each probe failure names its stage
+        out = reg.attachable(
+            {"identity": {"agent_id": "@a:x"},
+             "endpoint": {"path": str(Path(self.tmp.name) / "no.sock")}})
+        self.assertFalse(out["attachable"])
+
+    def test_start_refuses_non_executable_launcher(self):
+        plain = Path(self.tmp.name) / "not-exec.sh"
+        plain.write_text("#!/bin/sh\n")
+        reg.write_manifest("@ne:x", endpoint=str(Path(self.tmp.name) / "s.sock"),
+                           launcher={"type": "process", "executable": str(plain),
+                                     "args": [],
+                                     "working_directory": self.tmp.name})
+        out = reg.start_instance("@ne:x", wait_s=1,
+                                 _ready=lambda m: {"attachable": False})
+        self.assertFalse(out["ok"])
+        self.assertIn("not executable", out["error"])
+
+    def test_start_short_circuits_when_already_running(self):
+        launcher = Path(self.tmp.name) / "l.sh"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        reg.write_manifest("@run:x", endpoint=str(Path(self.tmp.name) / "s.sock"),
+                           launcher={"type": "process",
+                                     "executable": str(launcher), "args": [],
+                                     "working_directory": self.tmp.name})
+        out = reg.start_instance("@run:x", wait_s=1,
+                                 _ready=lambda m: {"attachable": True})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out.get("state"), "already_running")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
