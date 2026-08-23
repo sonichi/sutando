@@ -36,6 +36,8 @@ ENV = {**os.environ,
        "SUTANDO_AGENT_ID": "@sr-test:example.org",
        "SUTANDO_HOST_LABEL": "stand-resolve-host",
        "SUTANDO_INSTANCE_REGISTRY": str(Path(TMP) / "instances"),
+       # hermetic channels dir for the entrance rows on the stand card
+       "CLAUDE_CONFIG_DIR": str(Path(TMP) / "claude-home"),
        "REMOTE_TASK_URL": "", "REMOTE_TASK_TOKEN": "t"}
 
 FAILS: list = []
@@ -101,10 +103,15 @@ def drive():
     write_links([{"link_id": "l1", "provider": "discord", "status": "active",
                   "stand_id": "@sr-test:example.org",
                   "authorized_by": "@o:x",
-                  "provider_subject": {"type": "bot_user", "id": "42"}}])
+                  "provider_subject": {"type": "bot_user", "id": "42"},
+                  "display": {"name": "SutandoBot"},
+                  "verification": {"method": "discord_token_introspection",
+                                   "verified_at": "2026-08-23T00:00:00Z"}}])
     p = cli("sutando", "stand", "resolve", "discord", "42")
     check(p.returncode == 0 and "@sr-test:example.org" in p.stdout,
           "authorized hit exits 0")
+    check("SutandoBot" in p.stdout and "discord_token_introspection" in p.stdout,
+          "resolve human output renders display + verification")
 
     write_links([{"link_id": "l2", "provider": "discord", "status": "active",
                   "stand_id": "@sr-test:example.org",
@@ -136,6 +143,69 @@ def drive():
     p = cli("sutando", "stand", "resolve", "discord", "42", "--json")
     check(p.returncode == 4 and json.loads(p.stdout).get("store_corrupt"),
           "corrupt store exits 4 with JSON body")
+
+    p = cli("sutando", "stand", "resolve", "discord")
+    check(p.returncode == 2 and "usage" in p.stderr,
+          "resolve arity error exits 2 with usage")
+
+    # ---- stand card rendering (the `sutando stand` human surface) ----
+    write_links([{
+        "link_id": "l9", "provider": "discord", "status": "active",
+        "stand_id": "@sr-test:example.org", "authorized_by": "@own:x",
+        "provider_subject": {"type": "bot_user", "id": "42"},
+        "display": {"name": "SutandoBot"},
+        "verification": {"method": "discord_token_introspection",
+                         "verified_at": "2026-08-23T00:00:00Z"},
+        "credential": {"kind": "bot_token", "status": "verified",
+                       "fingerprint": "sha256:abcd"}}])
+
+    p = cli("sutando", "stand")  # before channel/device/stand records exist
+    check(p.returncode == 0 and "Owner   Not established" in p.stdout,
+          "card: owner reads Not established without a binding record")
+    check("none configured" in p.stdout, "card: empty channels are explicit")
+    check("No enrolled devices" in p.stdout, "card: empty devices are explicit")
+
+    dc = Path(ENV["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+    dc.mkdir(parents=True)
+    (dc / ".env").write_text("DISCORD_TOKEN=sk-hush")
+    (dc / "access.json").write_text(json.dumps({"tofuOwner": "777"}))
+    ag = Path(ENV["CLAUDE_CONFIG_DIR"]) / "channels" / "ag2space"
+    ag.mkdir(parents=True)
+    (ag / "access.json").write_text(json.dumps({"tofuOwner": "@own:x"}))
+
+    p = cli("sutando", "stand")
+    check(p.returncode == 0 and "SutandoBot   bot_user:42" in p.stdout,
+          "card: active entrance renders display + identity")
+    check("discord:user:777 via discord" in p.stdout
+          and "@own:x via ag2space" in p.stdout,
+          "card: owner evidence renders in both subject forms")
+    check("sk-hush" not in p.stdout, "card: credential material never leaks")
+
+    auth = Path(ENV["SUTANDO_RUNTIME_STATE"]) / "auth"
+    (auth / "stand.json").write_text(json.dumps({
+        "display_name": "SR Stand", "status": "active",
+        "owners": [{"person_id": "@own:x", "display_name": "Kew",
+                    "role": "owner"}]}))
+    devs = auth / "devices"
+    devs.mkdir()
+    (devs / "d1.json").write_text(json.dumps({
+        "device_id": "d1", "label": "phone", "device_type": "mobile",
+        "token_sha256": "aa"}))
+
+    p = cli("sutando", "stand")
+    check(p.returncode == 0 and "SR Stand" in p.stdout, "card: display name")
+    check("Owner   Kew (@own:x)   owner" in p.stdout, "card: owner row")
+    check("phone" in p.stdout and "enrolled" in p.stdout, "card: device row")
+
+    p = cli("sutando", "stand", "id")
+    check(p.returncode == 0 and p.stdout.strip() == "@sr-test:example.org",
+          "stand id prints the bare id")
+
+    p = cli("sutando", "stand", "entrances", "--details")
+    check(p.returncode == 0 and "sha256:abcd" in p.stdout
+          and "discord_token_introspection" in p.stdout,
+          "entrances --details: fingerprint + verification method")
+    check(str(dc) in p.stdout, "entrances --details: storage directory")
 
 
 if __name__ == "__main__":

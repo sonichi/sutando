@@ -285,6 +285,43 @@ class TestEntrances(unittest.TestCase):
         self.assertNotIn("stale-backup", dumped)
         self.assertIn("current", dumped)
 
+    def test_active_link_renders_display_credential_storage(self):
+        self._mkchan("discord", env="DISCORD_TOKEN=x",
+                     access=json.dumps({"tofuOwner": "u1"}))
+        (self.channels / "README.md").write_text("not a channel dir")
+        (self.state / "auth" / "entrance-links.json").write_text(json.dumps([
+            {"provider": "discord", "status": "active",
+             "authorized_by": "@own:x",
+             "provider_subject": {"type": "bot_user", "id": "42"},
+             "display": {"name": "SutandoBot"},
+             "verification": {"method": "discord_token_introspection"},
+             "credential": {"fingerprint": "sha256:ab"}}]))
+        out = _mk(self.state, self.channels).entrances(details=True)
+        self.assertEqual(len(out["channels"]), 1)  # stray file skipped
+        ent = out["channels"][0]
+        self.assertEqual(ent["status"], "active")
+        self.assertEqual(ent["display"], {"name": "SutandoBot"})
+        self.assertEqual(ent["credential"], {"fingerprint": "sha256:ab"})
+        self.assertEqual(ent["storage"]["type"], "channel_directory")
+
+    def test_devices_render_from_pairing_records(self):
+        ddir = self.state / "auth" / "devices"
+        ddir.mkdir(parents=True)
+        (ddir / "d1.json").write_text(json.dumps(
+            {"device_id": "d1", "label": "phone", "device_type": "mobile",
+             "token_sha256": "aa", "granted_methods": ["task.submit"],
+             "last_seen_at": "2026-08-23T00:00:00Z"}))
+        (ddir / "d2.json").write_text(json.dumps({"device_id": "d2"}))
+        (ddir / "bad.json").write_text("{nope")
+        devs = _mk(self.state).stand_card(details=True)["devices"]
+        by = {d["device_id"]: d for d in devs}
+        self.assertEqual(set(by), {"d1", "d2"})  # corrupt record skipped
+        self.assertEqual(by["d1"]["status"], "enrolled")
+        self.assertEqual(by["d1"]["granted_methods"], ["task.submit"])
+        self.assertEqual(by["d1"]["last_seen_at"], "2026-08-23T00:00:00Z")
+        self.assertEqual(by["d2"]["status"], "configured_unverified")
+        self.assertNotIn("last_seen_at", by["d2"])
+
     def test_dispatch_routes_entrances(self):
         d = RuntimeDispatcher(DispatchTests._No(), DispatchTests._No(),
                               "@me:x", executors={},
@@ -395,9 +432,29 @@ class TestEntranceLinks(unittest.TestCase):
         self.assertNotIn("tok-sekret", json.dumps(link))
 
     def test_discord_client_seam_is_the_census_chokepoint(self):
-        client = self.el._discord_client("tok")
+        # strip src so the seam's own path bootstrap is the exercised path
+        src = str((Path(__file__).resolve().parent.parent / "src").resolve())
+        saved = list(sys.path)
+        sys.path[:] = [p for p in sys.path if p != src]
+        try:
+            client = self.el._discord_client("tok")
+        finally:
+            sys.path[:] = saved
         self.assertEqual(type(client).__name__, "DiscordRestClient")
         self.assertTrue(callable(client.get_json))
+
+    def test_load_links_absent_store_is_empty(self):
+        self.assertEqual(self.el.load_links(self.state / "nope"), [])
+
+    def test_active_link_lookup(self):
+        self.assertIsNone(self.el.active_link(self.state, "discord"))
+        made = self._link()
+        got = self.el.active_link(self.state, "discord")
+        self.assertEqual(got["link_id"], made["link_id"])
+
+    def test_revoke_without_active_link_is_loud(self):
+        with self.assertRaises(ValueError):
+            self.el.revoke_link(self.state, "discord", "@o:x", "cleanup")
 
 
 class TestResolve(unittest.TestCase):
@@ -420,7 +477,11 @@ class TestResolve(unittest.TestCase):
             "provider_subject": {"type": "bot_user", "id": "123"},
             "display": {"name": "sutando-bot"},
             "verification": {"method": "discord_token_introspection",
-                             "verified_at": "t"}}])
+                             "verified_at": "t"}},
+            # same-provider distractor: subject mismatch must be skipped
+            {"link_id": "link_y", "provider": "discord", "status": "active",
+             "stand_id": "@other:ag2.space", "authorized_by": "@o:x",
+             "provider_subject": {"type": "bot_user", "id": "999"}}])
         v = _mk(self.state)
         for subject in ("123", "bot:123", "bot_user:123"):
             out = v.resolve("discord", subject)

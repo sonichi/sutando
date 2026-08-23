@@ -171,9 +171,6 @@ class IdentityView:
             return [], True
         return (data, False) if isinstance(data, list) else ([], True)
 
-    def _all_links(self) -> list:
-        return self._links_store()[0]
-
     # ── sutando.entrances ───────────────────────────────────────────────────
     def entrances(self, details: bool = False) -> dict:
         # I1 evidence projection: folder facts only, no provider calls and
@@ -240,12 +237,6 @@ class IdentityView:
         if details:
             ent["storage"] = {"type": "channel_directory", "directory": str(d)}
         return ent
-
-    def _active_link(self, provider: str) -> "dict | None":
-        for lk in self._all_links():
-            if lk.get("provider") == provider and lk.get("status") == "active":
-                return lk
-        return None
 
     # ── sutando.owner ───────────────────────────────────────────────────────
     def owner(self) -> dict:
