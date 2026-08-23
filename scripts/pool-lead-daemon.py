@@ -140,9 +140,15 @@ def main() -> int:
             print(f"notified-stall {stem}", flush=True)
         if time.time() - last_recovery > RECOVERY_EVERY_S:
             out = _run_recovery()
-            for line in out.splitlines():
-                if "NO SESSION" in line or "kickstart" in line or "staged" in line:
-                    print(f"recovery: {line}", flush=True)
+            acted = [ln for ln in out.splitlines()
+                     if "NO SESSION" in ln or "kickstart" in ln or "staged" in ln]
+            for line in acted:
+                print(f"recovery: {line}", flush=True)
+            # Always emit, even when idle: a sweep that is silent while healthy
+            # is indistinguishable from a sweep that stopped running.
+            if not acted:
+                live = sum(1 for ln in out.splitlines() if ln.startswith("core-"))
+                print(f"recovery: ok ({live} session(s) healthy)", flush=True)
             last_recovery = time.time()
         # Autoscale, scale-UP only: shrinking can strand a core's live claims,
         # so it stays a manual operation (--pool N) for now.
