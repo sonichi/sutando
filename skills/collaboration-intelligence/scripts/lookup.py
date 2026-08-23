@@ -35,11 +35,15 @@ def match(rows, needle, ents=()):
     by_ident = {e.get("entity_id") for e in ents
                 for i in (e.get("identities") or [])
                 if n in str(i.get("provider_id", "")).lower()}
-    return [r for r in rows
-            if n in str(r.get("entity_id", "")).lower()
-            or n in str(r.get("one_line", "")).lower()
-            or n in str(r.get("agent_mxid", "")).lower()
-            or r.get("entity_id") in by_ident]
+    # Identity matches OUTRANK role text and never mix with it: role text names
+    # other people and repos, so a hit there is about the subject, not the person.
+    strong = [r for r in rows
+              if n in str(r.get("entity_id", "")).lower()
+              or n in str(r.get("agent_mxid", "")).lower()
+              or r.get("entity_id") in by_ident]
+    if strong:
+        return strong
+    return [r for r in rows if n in str(r.get("one_line", "")).lower()]
 
 def ids_for(ents, entity_id):
     for e in ents:
