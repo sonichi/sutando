@@ -65,6 +65,32 @@ try:
 except ValueError:
     check("empty id is refused", True)
 
+# ── a missing gate is refused too: it reduced to "", so a caller using a wrong
+# field name got a key that was add-sensitive but never moved when a blocker did
+for name, bad in (("empty gate", [["#1", ""]]),
+                  ("whitespace gate", [["#1", "   "]]),
+                  ("wrong field name", [{"id": "#1", "blocker": "owner"}])):
+    try:
+        ish.held_hash(bad)
+        check(f"{name} is refused", False, "no ValueError raised")
+    except ValueError:
+        check(f"{name} is refused", True)
+
+# the exact defect: two DIFFERENT gates must not collapse to one empty gate
+try:
+    k = ish.canonical_key([{"id": "#1", "blocker": "owner"},
+                           {"id": "#2", "blocker": "ci"}])
+    check("two different gates cannot both reduce to empty", False, f"keyed as {k!r}")
+except ValueError:
+    check("two different gates cannot both reduce to empty", True)
+
+# CONTROL: the well-formed spelling of that same pair still works, so the new
+# refusal is rejecting the wrong KEY NAME and not the shape
+ok = ish.canonical_key([{"id": "#1", "gated_on": "owner"},
+                        {"id": "#2", "gated_on": "ci"}])
+check("the correct field name still keys both entries",
+      ok == "#1:owner\n#2:ci", f"got {ok!r}")
+
 # ── state round trip: post once, then quiet, and --commit is what records ────
 ws = Path(tempfile.mkdtemp())
 state = ws / "state" / "idle-streak.json"

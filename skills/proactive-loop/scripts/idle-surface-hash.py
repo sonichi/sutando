@@ -56,7 +56,12 @@ def canonical_key(items) -> str:
         ident = _token(ident)
         if not ident:
             raise ValueError(f"held-list entry has no id: {it!r}")
-        out.append(f"{ident}:{_blocker(gate)}")
+        # A wrong/renamed gate key would otherwise reduce to "", leaving a key
+        # that is stable and add-sensitive but never moves when a blocker does.
+        blocker = _blocker(gate)
+        if not blocker:
+            raise ValueError(f"held-list entry has no gated_on: {it!r}")
+        out.append(f"{ident}:{blocker}")
     return "\n".join(sorted(set(out)))
 
 
