@@ -183,6 +183,26 @@ class TuiBranchTests(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_sibling_instance_same_agent_marks_unverified(self):
+        # same Stand, different installation: agentId matches but instanceId
+        # does not — must fail closed (the action gate then refuses work)
+        def payload(d):
+            req = json.loads(d.decode().splitlines()[0])
+            r = ({"agentId": "@me:x", "instanceId": "other-install"}
+                 if req.get("method") == "sutando.info" else {"state": "online"})
+            return (json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                                "result": r}).encode() + b"\n")
+        sock, srv = self._serve_once(payload)
+        try:
+            v = tui.instance_view({
+                "identity": {"agent_id": "@me:x"},
+                "instance_id": "mine",
+                "endpoint": {"path": sock}})
+            self.assertEqual(v["instanceId"], "mine")
+            self.assertFalse(v["identityVerified"])
+        finally:
+            srv.close()
+
     def test_views_lists_registry_manifests(self):
         import tempfile as _tf
         with _tf.TemporaryDirectory() as td:
@@ -205,8 +225,8 @@ class TuiActionIdentityGate(unittest.TestCase):
 
     def _drive(self, verified, keys):
         import tui as t
-        view = {"agentId": "@x:1", "server": "running", "core": "running",
-                "health": "healthy", "endpoint": "/tmp/x.sock",
+        view = {"agentId": "@x:1", "instanceId": "default", "server": "running",
+                "core": "running", "health": "healthy", "endpoint": "/tmp/x.sock",
                 "identityVerified": verified, "_manifest": {}}
         calls = []
         feed = iter(keys + ["q"])
@@ -214,7 +234,8 @@ class TuiActionIdentityGate(unittest.TestCase):
              mock.patch.object(t, "_rpc_at",
                                lambda ep, m, p: calls.append((ep, m, p)) or {}), \
              mock.patch.object(t.instance_registry, "attach",
-                               lambda a: calls.append(("attach", a)) or
+                               lambda a, instance=None:
+                               calls.append(("attach", a)) or
                                {"ok": False, "error": "nope"}), \
              mock.patch("builtins.input", lambda *_a: next(feed)):
             t.main([])

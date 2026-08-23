@@ -154,7 +154,8 @@ class RuntimeServer:
             agents_view=AgentsView(state_dir) if state_dir else None,
             identity_view=(IdentityView(state_dir, self.actor_id,
                                         channels_dir=_channels_dir(),
-                                        host_label=host_label)
+                                        host_label=host_label,
+                                        instance=instance_id())
                            if state_dir else None),
             tasks_view=(TasksView(Path(state_dir).parent / "tasks",
                                   Path(state_dir).parent / "results",
@@ -214,7 +215,7 @@ class RuntimeServer:
 
     def mark_stopped(self) -> None:
         try:
-            instance_registry.mark_stopped(self.actor_id)
+            instance_registry.mark_stopped(self.actor_id, instance_id())
         except Exception:  # noqa: BLE001
             pass
 

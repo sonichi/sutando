@@ -370,7 +370,7 @@ class TestEntranceLinks(unittest.TestCase):
         for hay in (blob, dumped):
             self.assertNotIn("tok-sekret", hay)
 
-    def test_verify_discord_reads_me_via_client_seam(self):
+    def test_verify_discord_lives_at_the_edge_and_shapes_display(self):
         calls = []
 
         class _Client:
@@ -378,12 +378,17 @@ class TestEntranceLinks(unittest.TestCase):
                 calls.append(path)
                 return {"id": 987, "global_name": "Sutando", "avatar": "abcd"}
 
-        orig = self.el._discord_client
-        self.el._discord_client = lambda token: _Client()
+        sys.path.insert(0, str(ROOT / "src"))
         try:
-            link = self.el.verify_discord(self.state, "tok-sekret")
+            import importlib
+            ev = importlib.import_module("channels.discord.entrance_verify")
+            link = ev.verify_discord(self.state, "tok-sekret",
+                                     client=_Client())
+            # default client is the census chokepoint, not hand-rolled REST
+            self.assertEqual(ev.DiscordRestClient.__module__,
+                             "channels.discord.client")
         finally:
-            self.el._discord_client = orig
+            sys.path.remove(str(ROOT / "src"))
         self.assertEqual(calls, ["/users/@me"])
         self.assertEqual(link["provider_subject"],
                          {"type": "bot_user", "id": "987"})
@@ -393,11 +398,6 @@ class TestEntranceLinks(unittest.TestCase):
         self.assertEqual(link["verification"]["method"],
                          "discord_token_introspection")
         self.assertNotIn("tok-sekret", json.dumps(link))
-
-    def test_discord_client_seam_is_the_census_chokepoint(self):
-        client = self.el._discord_client("tok")
-        self.assertEqual(type(client).__name__, "DiscordRestClient")
-        self.assertTrue(callable(client.get_json))
 
 
 class TestResolve(unittest.TestCase):
@@ -726,6 +726,52 @@ class ChannelsIterationSkips(unittest.TestCase):
             v = _mk(state, channels)
             self.assertEqual(list(v.owner()["owners"].keys()), ["good"])
             self.assertEqual(v.allowlist()["channels"], {"good": ["u1"]})
+
+
+class TestDiscordEntranceVerifyEdge(unittest.TestCase):
+    """The provider-I/O edge: verify_discord lives in channels/discord and
+    delegates the API read to DiscordRestClient; entrance_links itself makes
+    no provider call (the census pins the literal to the chokepoint)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        (self.state / "auth").mkdir(parents=True)
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": "@stand:ag2.space"}))
+        sys.path.insert(0, str(ROOT / "src"))
+        import importlib
+        self.ev = importlib.import_module("channels.discord.entrance_verify")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        sys.path.remove(str(ROOT / "src"))
+
+    def test_edge_delegates_to_client_and_records_domain_facts(self):
+        calls = []
+
+        class FakeClient:
+            def get_json(self, path):
+                calls.append(path)
+                return {"id": 987, "username": "bot", "avatar": "av"}
+
+        link = self.ev.verify_discord(self.state, "tok-sekret",
+                                      client=FakeClient())
+        self.assertEqual(calls, ["/users/@me"])
+        self.assertEqual(link["provider_subject"],
+                         {"type": "bot_user", "id": "987"})
+        self.assertEqual(link["verification"]["method"],
+                         "discord_token_introspection")
+        # only a fingerprint is recorded, never the credential
+        self.assertNotIn("tok-sekret", json.dumps(link))
+        self.assertTrue(link["credential"]["fingerprint"].startswith("sha256:"))
+
+    def test_domain_module_offers_no_provider_io(self):
+        import importlib
+        el = importlib.import_module("entrance_links")
+        self.assertFalse(hasattr(el, "verify_discord"))
+        src = (ROOT / "src" / "entrance_links.py").read_text()
+        self.assertNotIn("discord.com/api", src)
 
 
 if __name__ == "__main__":

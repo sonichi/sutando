@@ -118,10 +118,14 @@ class RuntimeDispatcher:
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
                  agents_view=None, identity_view=None, tasks_view=None,
                  runtime_view=None, schedules_view=None,
-                 capability_registry: Optional[EphemeralCapabilityRegistry] = None):
+                 capability_registry: Optional[EphemeralCapabilityRegistry] = None,
+                 granted_methods: frozenset = frozenset()):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
+        # Caller grants, resolved DAEMON-SIDE per transport (a paired device's
+        # granted_methods). The plain Unix socket grants nothing: default empty.
+        self.granted_methods = frozenset(granted_methods)
         self.executors = executors
         # Discovery/identity/task views — injected like executors so tests
         # compose tmp-dir views; None = those methods unavailable.
@@ -203,6 +207,12 @@ class RuntimeDispatcher:
         if method in ("human_action.complete", "human_action.decline"):
             return self._human_action_settle(method, params)
         if method == "approval.respond":
+            # Fails closed: only a transport whose caller carries this grant
+            # may resolve approvals — a requester must never approve itself.
+            if method not in self.granted_methods:
+                raise ProtocolError(
+                    -32601, "approval.respond requires an authorized device "
+                            "grant — not callable on this transport")
             return self._approval_respond(params)
         if method == "human_action.status":
             return self._get(params)
@@ -379,8 +389,8 @@ class RuntimeDispatcher:
         approved, reject → denied. Same CAS terminal-immutability as every other
         resolution path, so a late/duplicate respond — or a concurrent card
         answer — cannot overwrite a resolved request; the mirrored card is closed
-        so it does not dangle. Authorization to call this at all is enforced at
-        the transport edge (a device's granted_methods), off by default."""
+        so it does not dangle. Reachable only when the composed granted_methods
+        carries approval.respond (see handle()); off by default."""
         rid = params.get("requestId")
         if not rid:
             raise ProtocolError(-32602, "missing required param: requestId")

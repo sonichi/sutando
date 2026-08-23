@@ -240,6 +240,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`__init__.py`** — Discord channel: API mechanics + injected post-gate (bridge, client, http, reader, post_gate).
 - **`client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
 - **`delivery_provider.py`** — DiscordDeliveryProvider: binds the shared DiscordRestClient into the 3013 delivery-core seam — the first production provider behind it.
+- **`entrance_verify.py`** — Discord entrance verification — the provider-I/O edge of EntranceLink.
 - **`http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
 - **`post_gate.py`** — Production injection seam for the Discord post-gate.
 - **`reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
