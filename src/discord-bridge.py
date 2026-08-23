@@ -5548,7 +5548,8 @@ async def poll_proactive():
                 if f.name.startswith("proactive-") and f.suffix == ".txt" \
                         and should_claim_proactive_file(
                             f.name, STATE_DIR / "last-owner-activity.json",
-                            "discord"):
+                            "discord",
+                            body_reader=lambda _f=f: _f.read_text()):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram
