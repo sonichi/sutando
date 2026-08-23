@@ -1,14 +1,14 @@
 """Single writer contract for Discord access.json.
 
 Every writer of a channel's access.json — tier-map seeding, thread-engage
-seeding, pairing-code issuance, and (eventually) the `/discord:access` skill —
-must go through ``mutate_access_file`` so a concurrent owner/tier/group update
-and a thread seed can never lost-update each other, in-process or cross-process
-(the skill's freehand Read/Write-tool edit is a separate OS process with no
-other coordination available). No ``discord`` import here on purpose: bridge
-call sites need the AST/source-slicing workaround to keep tests free of a full
-discord.py mock; this module doesn't, so its own tests can just ``import``
-it.
+seeding, pairing-code issuance, and the `/discord:access` skill's `group
+append`/`group rm-allow` subcommands (via `scripts/access-mutate.py`) — must
+go through ``mutate_access_file`` so a concurrent owner/tier/group update and
+a thread seed (or a skill invocation, a separate OS process) can never
+lost-update each other. No ``discord`` import here on purpose: bridge call
+sites need the AST/source-slicing workaround to keep tests free of a full
+discord.py mock; this module doesn't, so its own tests — and the
+skill-callable CLI — can just ``import`` it.
 """
 from __future__ import annotations
 
@@ -18,6 +18,42 @@ import json
 import os
 import uuid
 from pathlib import Path
+
+import sys as _sys
+
+_SRC = Path(__file__).resolve().parent
+if str(_SRC) not in _sys.path:
+    _sys.path.insert(0, str(_SRC))
+
+from util_paths import claude_home_path, channel_access_path  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
+
+
+def discord_access_backup_file() -> Path:
+    """The durable on-disk backup path discord-bridge.py restores from.
+
+    Single source of truth for this path — see ``resolve_discord_access_file``,
+    which uses its existence to decide between the canonical and legacy live
+    file, and any writer (bridge or skill CLI) that needs to keep the backup
+    in sync with a live write.
+    """
+    return resolve_workspace() / "state" / "auth" / "discord-access-backup.json"
+
+
+def resolve_discord_access_file() -> Path:
+    """Resolve the live Discord access.json path — the exact rule
+    discord-bridge.py's own ``_resolve_access_file`` applies, extracted here
+    so any writer (the bridge, or a skill-callable CLI in a separate process)
+    resolves the identical file rather than duplicating the migration logic.
+
+    Before the first durable backup exists, preserve the transition-window
+    behavior: a missing canonical file may read/write the populated legacy
+    ``~/.claude`` file. Once the durable backup exists, a missing canonical
+    file is a wipe to restore — not a reason to resurrect legacy state.
+    """
+    if discord_access_backup_file().exists():
+        return claude_home_path("channels", "discord", "access.json")
+    return channel_access_path("discord")
 
 
 def read_access_for_transaction(path: Path):

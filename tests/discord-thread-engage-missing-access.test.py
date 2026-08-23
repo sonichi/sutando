@@ -54,7 +54,12 @@ def _thread_seed_mutator_factory(thread_id_str, parent_id_str, sender_id, seed_o
     """Reconstructs the production mutator's logic (mirrors the closure body
     in discord-bridge.py's thread-engage block) so it can be exercised
     against `access_store.mutate_access_file` directly, parameterized on the
-    values the real closure captures from `message`/`bot_mentioned`/etc."""
+    values the real closure captures from `message`/`bot_mentioned`/etc.
+
+    Mirrors the #3318 blocker-2 fix: the no-parent-config branch manufactures
+    a brand-new grant rather than propagating an existing one, so it only
+    seeds when the sender is already a global `allowFrom` member — anyone
+    else falls through to the normal allowlist/pairing gate, unseeded."""
 
     def _mutator(access_data):
         access_groups = access_data.setdefault('groups', {})
@@ -67,6 +72,8 @@ def _thread_seed_mutator_factory(thread_id_str, parent_id_str, sender_id, seed_o
             inherited_allow = parent_cfg.get('allowFrom', [str(sender_id)])
             thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
         else:
+            if str(sender_id) not in (access_data.get('allowFrom') or []):
+                return None, None
             thread_entry = {'requireMention': False, 'allowFrom': [str(sender_id)]}
         access_groups[thread_id_str] = thread_entry
         return access_data, (thread_id_str, parent_id_str, thread_entry, access_data.get('allowFrom', []))
@@ -75,20 +82,49 @@ def _thread_seed_mutator_factory(thread_id_str, parent_id_str, sender_id, seed_o
 
 
 class TestThreadSeedMutatorAgainstMissingFile(unittest.TestCase):
-    def test_seeds_when_access_file_genuinely_missing(self):
+    def test_missing_access_file_does_not_self_authorize_unrecognized_sender(self):
+        """#3318 blocker 2 (qingyun-wu): a genuinely missing access.json used to
+        turn the first unmentioned thread author into an authorized sender —
+        `read_access_for_transaction`'s safe default has an empty `allowFrom`,
+        so every sender looked equally "unrecognized" and got seeded anyway.
+        A missing access file must fail closed: no group entry, no file
+        created, sender falls through to the normal allowlist/pairing gate."""
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "access.json"
             self.assertFalse(p.exists(), "precondition: file genuinely missing")
             mutator = _thread_seed_mutator_factory("999", None, "42")
             result = mutate_access_file(p, mutator)
-            self.assertIsNotNone(result, "a missing access.json must still be seedable")
+            self.assertIsNone(result, "an unrecognized sender must not self-authorize via a missing access.json")
+            self.assertFalse(p.exists(), "a rejected seed attempt must not create access.json")
+
+    def test_missing_access_file_does_not_self_authorize_even_with_no_parent(self):
+        """Same as above, restated for the exact scenario the reviewer traced:
+        no parent config to inherit from, so the branch would otherwise
+        manufacture a brand-new grant out of nothing."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "access.json"
+            mutator = _thread_seed_mutator_factory("thread-fresh", "parent-unconfigured", "stranger-1")
+            result = mutate_access_file(p, mutator)
+            self.assertIsNone(result)
+            self.assertFalse(p.exists())
+
+    def test_recognized_sender_still_seeds_without_parent_config(self):
+        """The owner's own single-bot convenience (the reason this branch
+        exists — see "Ungated 2026-06-06" in discord-bridge.py) must survive:
+        a sender ALREADY in the top-level allowFrom still gets an
+        engager-only grant even with no parent config to inherit."""
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "access.json"
+            p.write_text(json.dumps({"dmPolicy": "pairing", "allowFrom": ["owner-1"], "groups": {}}))
+            mutator = _thread_seed_mutator_factory("thread-1", None, "owner-1")
+            result = mutate_access_file(p, mutator)
+            self.assertIsNotNone(result, "an already-recognized (allowFrom) sender must still be seedable")
             thread_id, parent_id, entry, owners = result
-            self.assertEqual(thread_id, "999")
-            self.assertEqual(entry, {'requireMention': False, 'allowFrom': ['42']})
-            # The file now exists with the seed applied.
-            import json
+            self.assertEqual(thread_id, "thread-1")
+            self.assertEqual(entry, {'requireMention': False, 'allowFrom': ['owner-1']})
             on_disk = json.loads(p.read_text())
-            self.assertEqual(on_disk['groups']['999'], entry)
+            self.assertEqual(on_disk['groups']['thread-1'], entry)
 
     def test_inherits_parent_group_allowfrom(self):
         import json
@@ -160,10 +196,9 @@ class TestThreadEngageCallSiteWiredToSharedOwner(unittest.TestCase):
         self.src = BRIDGE.read_text()
 
     def test_imports_mutate_access_file(self):
-        self.assertIn(
-            "from access_store import mutate_access_file, read_access_for_transaction",
-            self.src,
-        )
+        self.assertIn("from access_store import (", self.src)
+        self.assertIn("mutate_access_file,", self.src)
+        self.assertIn("read_access_for_transaction,", self.src)
 
     def test_thread_engage_calls_mutate_access_file(self):
         self.assertIn(

@@ -115,10 +115,9 @@ class TestPairingBranchUsesSharedOwner(unittest.TestCase):
         self.src = BRIDGE.read_text()
 
     def test_pairing_imports_mutate_access_file(self):
-        self.assertIn(
-            "from access_store import mutate_access_file, read_access_for_transaction",
-            self.src,
-        )
+        self.assertIn("from access_store import (", self.src)
+        self.assertIn("mutate_access_file,", self.src)
+        self.assertIn("read_access_for_transaction,", self.src)
 
     def test_pairing_uses_mutate_access_file(self):
         self.assertIn(

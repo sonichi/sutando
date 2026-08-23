@@ -119,8 +119,59 @@ def _build_pairing_harness():
     return _wrap_as_async_function(node, "_pairing_harness", PAIRING_PARAMS, None)
 
 
+def _wrap_nodes_as_async_function(nodes: list[ast.stmt], name: str, params: list[str], sentinel: str):
+    """Like `_wrap_as_async_function` but for a CONTIGUOUS RUN of sibling
+    statements (not a single `If`) — appends a sentinel return so a caller can
+    tell "one of the block's own `return`s fired" (early-drop) apart from
+    "execution fell through to the end of the slice" (would have continued in
+    the real function)."""
+    body = list(nodes) + [ast.Return(value=ast.Constant(value=sentinel))]
+    fn = ast.AsyncFunctionDef(
+        name=name,
+        args=ast.arguments(
+            posonlyargs=[], args=[ast.arg(arg=p) for p in params],
+            vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[],
+        ),
+        body=body, decorator_list=[], returns=None,
+    )
+    fn.lineno, fn.col_offset = nodes[0].lineno, 0
+    fn.end_lineno, fn.end_col_offset = nodes[-1].end_lineno, 0
+    module = ast.Module(body=[fn], type_ignores=[])
+    ast.fix_missing_locations(module)
+    ns: dict = {}
+    exec(compile(module, str(BRIDGE), "exec"), ns)
+    return ns[name]
+
+
+_GATE_SENTINEL = "__NOT_DROPPED__"
+
+
+def _build_thread_engage_to_gate_harness():
+    """Spans the thread-engage seed block through the `require_mention` gate
+    that follows it in `_handle_discord_message` — the real production
+    statements, in their original nested `if not is_dm:` block, sliced by
+    matching the same `If` node the two single-block harnesses above already
+    locate. Lets a test observe whether an unseeded, unmentioned message is
+    actually dropped (bare `return` → None) before it can ever reach the
+    downstream channel_authorized/pairing code (#3318 blocker 2)."""
+    outer = _find_if_matching(lambda t: t == "not is_dm")
+    start = next(
+        i for i, s in enumerate(outer.body)
+        if isinstance(s, ast.If) and ast.unparse(s.test) == "isinstance(message.channel, discord.Thread)"
+    )
+    end = next(
+        i for i, s in enumerate(outer.body)
+        if isinstance(s, ast.If) and ast.unparse(s.test).startswith("require_mention and")
+    )
+    nodes = outer.body[start:end + 1]
+    return _wrap_nodes_as_async_function(
+        nodes, "_thread_engage_to_gate_harness", THREAD_PARAMS + ["load_allowed"], _GATE_SENTINEL
+    )
+
+
 _THREAD_HARNESS = _build_thread_harness()
 _PAIRING_HARNESS = _build_pairing_harness()
+_THREAD_TO_GATE_HARNESS = _build_thread_engage_to_gate_harness()
 
 
 class _FakeThread(discord.Thread):
@@ -177,18 +228,40 @@ class ThreadEngageMutatorBody(unittest.TestCase):
         kwargs.update(overrides)
         return asyncio.run(_THREAD_HARNESS(**kwargs))
 
-    def test_fresh_thread_is_seeded_with_inherited_allowfrom_default(self):
+    def test_fresh_thread_unrecognized_sender_is_not_seeded(self):
+        """#3318 blocker 2 (qingyun-wu): a fresh thread with no parent config
+        must not manufacture a brand-new grant for an author who isn't already
+        a recognized (allowFrom) sender — that self-authorized an unpaired,
+        unmentioned stranger on their own first message. The message still
+        reaches the normal allowlist/pairing gate downstream, just unseeded."""
         self.access_file.write_text(json.dumps({"groups": {}, "allowFrom": ["1111"]}))
         author = _FakeAuthor(2222)
         channel = _FakeThread(9001, 8001)
         message = _FakeMessage(channel, author)
         result = self._run(message=message)
-        check("fresh-thread seed narrows require_mention to False", result is False)
+        check("unrecognized-sender fresh thread leaves require_mention untouched", result is True)
+        doc = json.loads(self.access_file.read_text())
+        check(
+            "unrecognized-sender fresh thread writes no groups entry",
+            doc.get("groups", {}).get("9001") is None,
+            str(doc),
+        )
+
+    def test_fresh_thread_recognized_sender_is_still_seeded(self):
+        """The owner's own single-bot convenience (the reason this branch
+        exists) must survive: a sender already in the top-level allowFrom
+        still gets an engager-only grant even with no parent config."""
+        self.access_file.write_text(json.dumps({"groups": {}, "allowFrom": ["2222"]}))
+        author = _FakeAuthor(2222)
+        channel = _FakeThread(9001, 8001)
+        message = _FakeMessage(channel, author)
+        result = self._run(message=message)
+        check("recognized-sender fresh thread seed narrows require_mention to False", result is False)
         doc = json.loads(self.access_file.read_text())
         entry = doc.get("groups", {}).get("9001")
-        check("fresh-thread seed writes a groups entry", entry is not None, str(doc))
+        check("recognized-sender fresh thread seed writes a groups entry", entry is not None, str(doc))
         check(
-            "fresh-thread entry defaults allowFrom to the author (no parent config)",
+            "recognized-sender fresh thread entry defaults allowFrom to the author (no parent config)",
             entry == {"requireMention": False, "allowFrom": ["2222"]},
             str(entry),
         )
@@ -231,6 +304,74 @@ class ThreadEngageMutatorBody(unittest.TestCase):
               buf.getvalue())
         check("corrupt-file path never rewrites the file",
               self.access_file.read_text() == "{not valid json")
+
+
+class ThreadEngageFailsClosedThroughGate(unittest.TestCase):
+    """End-to-end (#3318 blocker 2, qingyun-wu): drives the REAL production
+    statements from the thread-engage seed block through the require_mention
+    gate that immediately follows it, proving an unpaired, unmentioned
+    author's first message in a thread with NO access.json present is DROPPED
+    (bare `return`, before channel_authorized is ever computed) rather than
+    self-authorizing. A recognized sender is run as a control to prove the
+    harness isn't just unconditionally returning early."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="thread-engage-gate-cs-"))
+        self.access_file = self.tmpdir / "access.json"  # genuinely absent
+        self.client = type("C", (), {"user": type("U", (), {"id": 555})()})()
+
+    def _run(self, **overrides):
+        kwargs = dict(
+            client=self.client, bot_mentioned=False, role_mentioned=False,
+            require_mention=True, ACCESS_FILE=self.access_file,
+            mutate_access_file=real_mutate_access_file,
+            _backup_access_to_disk=lambda *_a, **_k: None,
+            read_access_for_transaction=real_read_access_for_transaction,
+            _has_sibling_bots=lambda *_a, **_k: False,
+            _should_notify_owner_on_seed=lambda *_a, **_k: False,
+            _format_seed_notice=lambda *_a, **_k: "unused",
+            discord=discord,
+            load_allowed=lambda: [],
+        )
+        kwargs.update(overrides)
+        return asyncio.run(_THREAD_TO_GATE_HARNESS(**kwargs))
+
+    def test_unpaired_unmentioned_author_dropped_when_access_file_missing(self):
+        self.assertFalse(self.access_file.exists(), "precondition: access.json genuinely missing")
+        author = _FakeAuthor(2222)
+        channel = _FakeThread(9101, 8101)
+        message = _FakeMessage(channel, author)
+        result = self._run(message=message)
+        check(
+            "unpaired unmentioned author is dropped at the require_mention gate "
+            "(never reaches channel_authorized/pairing)",
+            result is None,
+            f"got {result!r} instead of an early return",
+        )
+        check(
+            "the dropped message did not self-grant a seed (access.json still absent)",
+            not self.access_file.exists(),
+        )
+
+    def test_recognized_sender_falls_through_the_gate(self):
+        self.access_file.write_text(json.dumps(
+            {"dmPolicy": "pairing", "allowFrom": ["2222"], "groups": {}}
+        ))
+        author = _FakeAuthor(2222)
+        channel = _FakeThread(9102, 8102)
+        message = _FakeMessage(channel, author)
+        result = self._run(message=message)
+        check(
+            "a recognized sender's seeded thread falls through the gate (not dropped)",
+            result == _GATE_SENTINEL,
+            f"got {result!r}",
+        )
+        doc = json.loads(self.access_file.read_text())
+        check(
+            "the recognized sender's thread was actually seeded",
+            doc.get("groups", {}).get("9102") is not None,
+            str(doc),
+        )
 
 
 class PairingMutatorExceptionBranch(unittest.TestCase):

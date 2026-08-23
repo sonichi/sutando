@@ -117,8 +117,13 @@ if _PKG_ROOT not in sys.path:
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
-from access_store import mutate_access_file, read_access_for_transaction  # noqa: E402  — single locked writer for access.json (#3318)
+from util_paths import claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
+from access_store import (  # noqa: E402  — single locked writer for access.json (#3318)
+    mutate_access_file,
+    read_access_for_transaction,
+    resolve_discord_access_file,
+    discord_access_backup_file,
+)
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
@@ -707,28 +712,10 @@ seen_message_ids = set()  # Discord message IDs already processed
 # with the owner de-authorized. This backup lives under state/auth/ (per
 # CLAUDE.md, the cleanup-exempt per-host install-state dir) so a restart can
 # auto-restore the allowlist from disk instead of exposing an open pairing gate.
-ACCESS_BACKUP_FILE = STATE_DIR / "auth" / "discord-access-backup.json"
-
-
-def _resolve_access_file() -> Path:
-    """Resolve the live file without letting the migration fallback bypass a
-    durable restore.
-
-    Before the first durable backup exists, preserve the transition-window
-    behavior: a missing canonical file may read/write the populated legacy
-    ``~/.claude`` file. Once the durable backup exists, however, a missing
-    canonical file is a wipe to restore—not a reason to resurrect legacy
-    authorization state. Pin to the canonical path so ``on_ready`` can restore
-    it from ``state/auth`` before any access read.
-    """
-    if ACCESS_BACKUP_FILE.exists():
-        return claude_home_path("channels", "discord", "access.json")
-    return channel_access_path("discord")
-
-
-# Load access config after defining the durable path: its presence determines
-# whether a missing canonical file means migration fallback or wipe recovery.
-ACCESS_FILE = _resolve_access_file()
+# Path resolution is owned by access_store.py so a separate skill-callable
+# CLI process resolves the identical file instead of duplicating the rule.
+ACCESS_BACKUP_FILE = discord_access_backup_file()
+ACCESS_FILE = resolve_discord_access_file()
 
 
 def _is_valid_access_doc(data) -> bool:
@@ -3208,7 +3195,8 @@ async def _handle_discord_message(message, force=False):
         #  - parent_cfg is True (open shorthand) → leave thread open: emit
         #    {requireMention: False} with no allowFrom (no restriction). A
         #    thread under an open parent must not be MORE restrictive.
-        #  - missing parent_cfg → engager-only [author_id] (safe default).
+        #  - missing parent_cfg → engager-only [author_id], but only when the
+        #    sender is already a global allowFrom member (#3318 blocker 2).
         # Ungated 2026-06-06 (was `if bot_mentioned and ...`): the bot_mentioned
         # gate left a gap where any thread's FIRST message that did NOT mention
         # the bot was silently dropped (the thread never landed in access.json,
@@ -3241,6 +3229,10 @@ async def _handle_discord_message(message, force=False):
                         inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
                         thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
                     else:
+                        # No parent policy to inherit: seed only when the sender is
+                        # already a global allowFrom member (#3318 blocker 2).
+                        if str(message.author.id) not in (access_data.get('allowFrom') or []):
+                            return None, None
                         thread_entry = {'requireMention': False, 'allowFrom': [str(message.author.id)]}
                     access_groups[thread_id_str] = thread_entry
                     return access_data, (thread_id_str, parent_id_str, thread_entry, access_data.get('allowFrom', []))

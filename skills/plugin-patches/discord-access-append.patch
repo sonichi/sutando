@@ -1,6 +1,6 @@
 --- a/skills/access/SKILL.md
 +++ b/skills/access/SKILL.md
-@@ -106,6 +106,30 @@
+@@ -106,6 +106,36 @@
  
  1. Read, `delete groups[<channelId>]`, write.
  
@@ -10,23 +10,29 @@
 +existing members). Use this when adding a collaborator to an already-configured
 +channel — `group add` replaces the list, which would drop existing members.
 +
-+1. Read access.json. If `groups[<channelId>]` doesn't exist, tell the user
-+   to run `group add <channelId> --allow <senderId>` first; do not create.
-+2. For each sender ID arg, append to `groups[<channelId>].allowFrom` (dedupe).
-+3. Write back.
-+4. Confirm: which IDs were added (skipping any that were already present).
++Run, from the repo root:
++```
++python3 scripts/access-mutate.py group-append <channelId> <senderId> [<senderId> ...]
++```
++This goes through the same locked read-modify-write transaction every other
++access.json writer uses (`access_store.mutate_access_file`) — do NOT read
++access.json and write it back by hand; a freehand edit races the bridge's own
++writers (tier-map seeding, thread-engage seeding, pairing) and can silently
++drop one side's update. Report the printed JSON's `added`/`skipped` IDs to the
++user; a non-zero exit or an `"ok": false` result means the group didn't exist
++or access.json was unreadable — relay the `error` field, don't retry by hand.
 +
 +### `group rm-allow <channelId> <senderId>` (optional: extra IDs)
 +
 +Symmetric inverse of `group append`. Remove one or more sender IDs from an
 +existing group's `allowFrom` without touching the rest of the entry.
 +
-+1. Read access.json. If `groups[<channelId>]` doesn't exist, tell the user;
-+   nothing to do.
-+2. For each sender ID arg, filter `groups[<channelId>].allowFrom` to exclude
-+   it.
-+3. Write back.
-+4. Confirm: which IDs were removed (skipping any that weren't present).
++Run, from the repo root:
++```
++python3 scripts/access-mutate.py group-rm-allow <channelId> <senderId> [<senderId> ...]
++```
++Same locked transaction as `group append` above — do NOT hand-edit
++access.json. Report the printed JSON's `removed`/`skipped` IDs to the user.
 +
  ### `set <key> <value>`
  
