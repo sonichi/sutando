@@ -169,7 +169,8 @@ REPLY_CHAIN_MAX_DEPTH = 8
 # reached within this bound, an explicit truncation marker is emitted.
 REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
-import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
+import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink)
+import discord_result_delivery as _drd  # noqa: E402  (top-level so hooks carry no lazy import)
 import delivery.router as result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 
 #: Consecutive polls each result file has been present-but-empty. Bridge-owned
@@ -4848,9 +4849,19 @@ async def poll_results():
                 # Avoids the double-delivery vector when the bridge
                 # restarts between channel.send() returning and
                 # archive_file() finishing. See DELIVERED_DIR docstring.
-                if _is_delivered(task_id):
-                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
+                if _drd.is_delivered(RESULTS_DIR, task_id, DELIVERED_DIR):
+                    print(f"  Skipped (already delivered per outbox/sentinel): {task_id}", flush=True)
                     _archive_delivered_pair(result_file, task_id)
+                    continue
+                if _drd.is_parked(RESULTS_DIR, task_id):
+                    # terminal park recorded but a crash preceded the archive:
+                    # finish the archive now so the pair cannot loop forever
+                    print(f"  Parked (terminal) — archiving: {task_id}", flush=True)
+                    _archive_delivered_pair(result_file, task_id)
+                    continue
+                _send_tok = _drd.claim_for_send(RESULTS_DIR, task_id)
+                if _send_tok is None:
+                    # another incarnation holds the claim right now
                     continue
 
                 try:
@@ -5029,7 +5040,8 @@ async def poll_results():
                     # triggers the skip-block above (archive + clear,
                     # no re-send). Without this, the result file
                     # would re-send on restart producing a duplicate.
-                    _mark_delivered(task_id)
+                    _drd.confirm(RESULTS_DIR, _send_tok,
+                                 str(getattr(channel, "id", "")))
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                     # Observability: one delivered-reply event.
                     _emit_channel(
@@ -5042,6 +5054,10 @@ async def poll_results():
                         },
                     )
                 except Exception as e:
+                    _ambiguous = isinstance(e, (TimeoutError,)) or \
+                        "timeout" in str(e).lower()
+                    (_drd.unknown if _ambiguous else _drd.failed_terminal)(
+                        RESULTS_DIR, _send_tok)
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.

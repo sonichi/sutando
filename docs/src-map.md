@@ -63,6 +63,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`discord_proactive_send.py`** — Send-leg of proactive text delivery through the shared DeliveryProvider.
 - **`discord_reader.py`** — Alias of `channels.discord.reader` (phase-1a restructure); one transition window.
 - **`discord_rest_client.py`** — Alias of `channels.discord.client` (phase-1a restructure); one transition window.
+- **`discord_result_delivery.py`** — Discord result-delivery state, bound to the shared outbox (#3279 action 2).
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
