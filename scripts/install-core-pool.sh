@@ -91,7 +91,9 @@ mkdir -p "$WORKSPACE/state/cores"
 STAGE_DIR="$HOME/.sutando/bin"
 LOG_DIR="$HOME/Library/Application Support/Sutando/logs"
 mkdir -p "$STAGE_DIR" "$LOG_DIR"
-for w in pool-core-wrapper.sh pool-follower-beat.sh pool-lead-wrapper.sh; do
+# kick-pool is staged from the repo too, so the recovery watchdog cannot drift
+# away from the session naming the wrapper creates (an unversioned copy rotted).
+for w in pool-core-wrapper.sh pool-follower-beat.sh pool-lead-wrapper.sh kick-pool.sh; do
   cp "$REPO_DIR/scripts/$w" "$STAGE_DIR/$w"
   chmod +x "$STAGE_DIR/$w"
 done
