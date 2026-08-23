@@ -32,7 +32,10 @@ never becomes a second logical task.
   preserved rows); only a post-reconciliation RE-SEND mints a successor.
 - Today's shipped approximations, PER LEG (the equality is not universal):
   the gateway result leg publishes the broker task id as `item_id`
-  (`remote_gateway_bridge.py`, publish site) — there `item_id == task_id`,
+  (`remote_gateway_bridge.py`, publish site) — there `item_id == task_id`
+  **only on the unsuffixed (primary) gateway**; under `GATEWAY_INSTANCE=dev`
+  the local task id is `task-dev~task-COLLIDE` while the published `item_id`
+  stays `task-COLLIDE`, so the equality is per-instance, not per-leg —
   the conflation this document exists to end; the Discord proactive leg's
   `ProactiveClaimFence` constructs `item_id` as `filename#mtime_ns`
   (`src/proactive_claim_fence.py`) — a non-task identity shape already in
@@ -61,24 +64,48 @@ could double a side-effect.
 The dedup identity of one external side-effect (one Discord message, one
 gateway POST, one file write). Distinct from `delivery_id`: a
 post-reconciliation RE-SEND (the successor in R2's table) is a NEW delivery of
-the SAME side-effect — new `delivery_id`, SAME `idempotency_key`; an operator
-REQUEUE of a parked item resumes the old delivery and replaces neither.
+the SAME side-effect; an operator REQUEUE of a parked item resumes the old
+delivery and replaces neither.
+
+**Shipped key rule, which this document does NOT override:**
+`delivery_core/core.py` defines the key as `f"{item_id}#{resend_epoch}"`, and
+`resend_epoch` "changes only on a DELIBERATE operator re-send". A
+post-reconciliation re-send IS deliberate, so on the shipped path the successor
+**advances `resend_epoch` and therefore carries a NEW key** — it is not
+provider-deduplicated against its predecessor. Same-key succession would be a
+*change* to `docs/sparrow-v1-contract.md:24-28`, not a definition, and slice 2
+must not assume it until that contract is amended.
 Today's shipped approximations:
 `task_id`-keyed delivered-sentinels and the outbox DELIVERED terminal state.
 
 ### incarnation_id
 
 One process lifetime. Shipped today: Design C terminal records embed
-`worker/pid/start_usec`; the gateway's `_INST_SUFFIX` scopes per-instance
-state. Incarnations ATTRIBUTE work ("which process performed attempt N");
-they never NAME work (ratchet 1).
+`worker/pid/start_usec`. Incarnations ATTRIBUTE work ("which process performed
+attempt N"); they never NAME work (ratchet 1).
+
+### namespace (gateway / provider) — NOT incarnation material
+
+`_INST_SUFFIX` is a **configured, stable namespace**, not a process
+incarnation: `remote_gateway_bridge.py` derives it from the `GATEWAY_INSTANCE`
+environment value, so it survives restarts unchanged. It is *required* in
+logical identity because broker ids are unique only within one gateway — two
+gateways can both mint `task-COLLIDE`.
+
+Named-gateway mapping, as shipped: `_write_task()` serializes the namespaced
+local id (`task-<instance>~<broker-id>`); the result leg converts back to the
+bare broker id and publishes THAT as `item_id`. So a namespace-scoped upstream
+id must be preserved through the round trip, never stripped as "incarnation".
 
 ## The three ratchets (normative, effective immediately)
 
 **R1 — No logical identity from process material.** New code must not derive
 `delivery_id`, `task_id`, or `idempotency_key` from PID, worker name,
-`start_usec`, `_INST_SUFFIX`, or any other incarnation material. Incarnation
-material may appear in *attribution fields* of a record, never in its identity.
+`start_usec`, or any other incarnation material. Incarnation material may
+appear in *attribution fields* of a record, never in its identity.
+`_INST_SUFFIX` is explicitly NOT covered by this ratchet — see "namespace"
+above: it is configured and restart-stable, and stripping it collides two
+gateways' broker ids.
 (Why: a restart would re-mint identities, and exactly-once dies at the rename.)
 
 **R2 — delivery_id survives every resumption; only a successor mints anew.**
@@ -88,12 +115,16 @@ The operations are distinct, and each declares its identity semantics:
 |---|---|---|---|
 | pre-terminal retry / crash recovery | outbox claim recovery | preserved | preserved |
 | `PARKED` → operator requeue | `src/outbox.py` requeue (`PARKED → QUEUED`, same key) | preserved | preserved |
-| post-reconciliation re-send | successor after a final disposition | NEW, with lineage to predecessor | preserved (same side-effect) |
+| post-reconciliation re-send | successor after a final disposition | NEW, with lineage to predecessor | **NEW** (`resend_epoch` advances — shipped rule above) |
 
 `PARKED` is therefore a SUSPENDED disposition in this model, not a terminal
 one: requeue resumes the same delivery, matching the shipped same-key
-behavior. Final dispositions are `CONFIRMED` and terminal `NOT_DELIVERED`;
+behavior. Final dispositions are `CONFIRMED` and the **attempt-ceiling park**;
 only after one of those does a re-send create a successor delivery.
+There is no shipped "terminal `NOT_DELIVERED`": `core.py` retries a confirmed
+`NOT_DELIVERED` ("only a confirmed NOT_DELIVERED auto-retries"), so it is an
+*attempted* outcome that re-arms the item, and exhausting the ceiling is what
+produces `PARKED`.
 (`backend_a.py` labels `PARKED` terminal in its own state enum; that label is
 local to A's lifecycle and is superseded by this table for identity purposes.)
 
@@ -110,8 +141,10 @@ at read time is forbidden: it would make one legacy delivery look like many.
   field without breaking the twin-verbatim rule.
 - Design C terminal records: their embedded incarnation material is
   attribution and stays; nothing here renames their files.
-- Discord's task-keyed delivered-sentinels (`src/discord-bridge.py`,
-  `_delivered_sentinel_path` block) / gateway drops: current behavior unchanged;
+- Discord's task-keyed delivered-sentinels: **superseded on current main** —
+  `src/discord_result_delivery.py` makes outbox state authoritative and honors
+  `state/discord-delivered/` READ-ONLY for the migration window; the bridge
+  keeps `channel.send` mechanics only. Gateway drops: behavior unchanged;
   their implicit `delivery_id == task_id` equality is *documented debt*, legal
   under R3's mapping (`legacy: task_id @ boundary`) until slice 2.
 
