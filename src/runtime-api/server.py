@@ -43,6 +43,7 @@ from typing import Optional
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_HERE.parent))  # src/ — shared policy modules
 
 from protocol import (MAX_LINE_BYTES, ELICITATION_TYPES, ProtocolError,  # noqa: E402
                       error_frame, notification_frame, parse_line, result_frame)
@@ -52,6 +53,8 @@ from rundir import socket_path, instance_id, lock_path  # noqa: E402
 
 from dispatcher import RuntimeDispatcher  # noqa: E402
 from agents_view import AgentsView  # noqa: E402
+
+from delivery.readiness import read_ready_result  # noqa: E402
 from identity_view import IdentityView  # noqa: E402
 
 from tasks_view import TasksView  # noqa: E402
@@ -143,9 +146,8 @@ class RuntimeServer:
                          or os.environ.get("AGENT_ID")
                          or _enrolled_agent_id(state_dir)
                          or "local-agent")
-        # Request-domain orchestration (dispatch, approvals, governed
-        # capabilities, idempotency, durable transitions, recovery) lives in
-        # dispatcher.py. This class owns socket transport only.
+        # Request-domain orchestration (approvals, capabilities, idempotency,
+        # durable transitions) lives in dispatcher.py; this class = transport.
         host_label = _host_label() if state_dir else None
         self.dispatcher = RuntimeDispatcher(
             self.store, self.ha, self.actor_id,
@@ -418,11 +420,12 @@ class RuntimeServer:
         except OSError:
             return
         for f in reversed([f for f in files if f.name not in seen]):
-            seen.add(f.name)
-            try:
-                body = f.read_text()
-            except OSError:
+            # readiness: unreadable/mid-write/empty = not-yet — the name only
+            # enters `seen` after a ready read, so a transient race retries
+            body = read_ready_result(f)
+            if body is None:
                 continue
+            seen.add(f.name)
             frame = notification_frame("task.result", {
                 "taskId": f.name.removesuffix(".txt"),
                 "result": body, "ts": int(f.stat().st_mtime)})

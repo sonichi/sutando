@@ -272,8 +272,14 @@ class EmitNewResults(unittest.TestCase):
         joined = b"".join(live.frames).decode(errors="replace")
         self.assertIn("good body", joined)
         self.assertNotIn("hidden", joined)
-        self.assertIn("task-bad.txt", seen)  # skipped but not retried forever
+        # transient read failure must NOT consume the name — the result
+        # retries and is delivered once readable (kewei's control)
+        self.assertNotIn("task-bad.txt", seen)
         bad.chmod(0o644)
+        run(s._emit_new_results(_Tasks(), seen))
+        joined2 = b"".join(live.frames).decode(errors="replace")
+        self.assertIn("hidden", joined2)         # recovered on the next pass
+        self.assertIn("task-bad.txt", seen)
         tmp.cleanup()
 
 
