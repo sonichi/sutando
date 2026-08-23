@@ -170,5 +170,49 @@ class ReclaimClaimedTest(unittest.TestCase):
         self.assertEqual(assigned, [("task-x4.txt", "core-1")])
 
 
+
+
+class AffinityBusyYieldTest(unittest.TestCase):
+    """A backlogged affinity handler yields to the least-loaded follower."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.tasks = self.tmp / "tasks"
+        self.state = self.tmp / "state"
+        self.tasks.mkdir(); (self.state / "pool").mkdir(parents=True)
+        self.lead = PoolLead(
+            self.tasks, self.state,
+            followers_fn=lambda: ["core-1", "core-2"],
+            alive_fn=lambda inst: True,
+        )
+        import json
+        (self.state / "pool" / "affinity.json").write_text(
+            json.dumps({"chan-A": {"instance": "core-2", "ts": self.lead.now()}}))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _backlog(self, inst, n):
+        for i in range(n):
+            (self.tasks / f"task-b{i}.claimed-{inst}.txt").write_text("x")
+
+    def _new_task(self):
+        f = self.tasks / "task-fresh.txt"
+        f.write_text("id: task-fresh\nchannel_id: chan-A\n")
+        return f
+
+    def test_busy_handler_yields_to_idle_follower(self):
+        self._backlog("core-2", 3)  # at AFFINITY_BUSY_MAX
+        self._new_task()
+        out = dict(self.lead.sweep())
+        self.assertEqual(out.get("task-fresh.txt"), "core-1")
+
+    def test_handler_below_threshold_keeps_channel(self):
+        self._backlog("core-2", 2)  # under AFFINITY_BUSY_MAX
+        self._new_task()
+        out = dict(self.lead.sweep())
+        self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

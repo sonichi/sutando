@@ -27,6 +27,7 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 # Sticky-channel window (#884 semantics): tasks from a channel follow its
 # handler until the channel has been idle this long, then rebalance.
 AFFINITY_IDLE_S = 30 * 60
+AFFINITY_BUSY_MAX = 3  # outstanding assigned+claimed before affinity yields
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
 # assigned/claimed states explicitly rather than banning dots
@@ -96,7 +97,10 @@ class PoolLead:
             row = affinity.get(channel)
             if (isinstance(row, dict) and row.get("instance") in followers
                     and self.now() - float(row.get("ts") or 0)
-                    < AFFINITY_IDLE_S):
+                    < AFFINITY_IDLE_S
+                    # a backlogged handler serializes the whole channel;
+                    # parallelism outranks continuity past this depth
+                    and self._load(row["instance"]) < AFFINITY_BUSY_MAX):
                 return row["instance"]
         return min(followers, key=lambda f: (self._load(f), str(f)))
 
