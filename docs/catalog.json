@@ -236,6 +236,17 @@
    "canonical_for": "Claude Code hook event mapping and privacy contract",
    "last_verified": "2026-07-27"
   },
+  "docs/shared-checkout-discipline.md": {
+   "title": "Shared-checkout discipline",
+   "audience": [
+    "agents",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "pinning branch and ref state before reading or writing a checkout worked by concurrent sessions",
+   "last_verified": "2026-08-23"
+  },
   "docs/slack-bridge.md": {
    "title": "Slack bridge",
    "audience": [

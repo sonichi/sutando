@@ -39,6 +39,8 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Per-host workspace convention](workspace-hosts-convention.md)
 - [Per-host carried-path rules](workspace-per-host-paths.md)
 - [State-sync allowlist design](state-sync-allowlist.md)
+- [Shared-checkout discipline](shared-checkout-discipline.md) — pinning the ref
+  before reading or writing a concurrently-worked tree.
 - [Testing and coverage](testing-coverage.md)
 - [Voice-agent test framework](voice-agent-test-framework.md)
 
