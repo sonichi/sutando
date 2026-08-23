@@ -3345,9 +3345,11 @@ def engine_manifest_sha(manifest) -> tuple:
     provenance; `reason` is the caller-facing phrase for that case.
     """
     manifest = Path(manifest)
-    if not manifest.is_file():
-        return None, "no ENGINE_MANIFEST.json — not a bundled engine"
     try:
+        # is_file() re-raises non-ignorable stat errors (PermissionError), so it
+        # belongs INSIDE the boundary — every caller must see "no provenance".
+        if not manifest.is_file():
+            return None, "no ENGINE_MANIFEST.json — not a bundled engine"
         parsed = json.loads(manifest.read_text())
     except (OSError, ValueError) as e:
         return None, f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]})"

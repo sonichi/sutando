@@ -262,6 +262,26 @@ class EngineRevisionDriftTest(unittest.TestCase):
                 self.assertEqual(r["status"], "ok", r)
                 self.assertIn("not an object", r["detail"])
 
+    def test_both_callers_agree_when_stat_itself_raises(self) -> None:
+        """An access error on the manifest is "no provenance", for BOTH callers.
+
+        `Path.is_file()` re-raises PermissionError, so a probe outside the
+        parser's boundary makes the always-on drift check throw while the
+        restart guard — which has its own outer boundary — returns cleanly.
+        """
+        d = Path(tempfile.mkdtemp())
+        repo = d / "repo"; repo.mkdir()
+        man = d / "ENGINE_MANIFEST.json"; man.write_text('{"sha": "abc123"}')
+        with mock.patch.object(Path, "is_file",
+                               side_effect=PermissionError(13, "Permission denied")):
+            sha, why = hc.engine_manifest_sha(man)
+            self.assertIsNone(sha)
+            self.assertIn("unreadable", why)
+            r = hc.check_engine_revision_drift(repo_dir=repo, manifest_path=man)
+            self.assertEqual(r["status"], "ok", r)
+            ok, _reason = hc._checkout_is_canonical(repo)
+            self.assertFalse(ok)
+
     def test_drift_check_and_restart_guard_share_one_verdict(self) -> None:
         """Both callers bind engine_manifest_sha, so they cannot disagree.
 
