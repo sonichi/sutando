@@ -216,6 +216,69 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
+   **⚠ THEN ASSERT THE WRITE LANDED — three misses in one session, 2026-08-22.** The append
+   reports success in every cheap way and still does not happen:
+
+   ```
+   printf '...' "$(date -u ...)"          # redirect dropped: renders to TERMINAL, reads as success
+   cat >> "$W/build_log.md" <<'EOF' ...   # landed
+   echo logged                            # proves the ECHO ran, never that the APPEND did
+   ```
+
+   Measured the same day: a `printf` whose `>> build_log.md` was omitted printed the entry to
+   stdout and looked identical to a successful write; a whole diagnosis was reported to the owner
+   and never written (`grep -c` returned **0** a pass later); and two completed owner tasks were
+   left with no result file at all. In every case the terminal showed the text.
+
+   **So close the write by reading it back, exactly as step 8 already does for the questions
+   reader** — same shape, different file. **But do NOT re-type the phrase to search for.** A probe
+   typed a second time from memory drifts from the text it is checking, and then fails the same way
+   the write fails. Measured on a peer node the same day: an audit of seven appends reported
+   **1 MISSING** because the probe used wording from the *commit message* while the entry said
+   something else. False MISSING is the dangerous polarity — it invites redoing work already done,
+   and a check that cries wolf gets demoted to the category that never fires.
+
+   **Define the marker ONCE and assert on the same variable**, so the probe cannot drift from its
+   subject and a dropped redirect cannot satisfy it:
+
+   ```python
+   MARK  = f"step7-{uuid.uuid4().hex[:12]}"  # UNIQUE BY CONSTRUCTION, not by circumstance
+   entry = f"### {ts} — ...  [{MARK}]\n..."  # interpolated into what is WRITTEN
+   with open(path, "a") as f:                # O_APPEND — NEVER read_text() + write_text()
+       f.write(entry); f.flush(); os.fsync(f.fileno())
+   assert path.read_text().count(MARK) == 1  # reads the FILE, never the terminal
+   ```
+
+   **⚠ NEVER close this write with `p.write_text(p.read_text() + entry)`.** `build_log.md` is
+   shared, synced, multi-writer state and is append-only by contract. A read-modify-replace lets any
+   append landing between the read and the write be **silently erased** — and the erasing writer's
+   own `count(MARK) == 1` still passes, because its marker is present in the file it just truncated.
+   That is the worst failure this section can have: the step that exists to certify a write becomes
+   the step that destroys another host's. Measured: two writers both reading `base\n` leave final
+   content `base\nB\n`, with A gone and B's assertion green. Use `O_APPEND` (atomic per write) or a
+   shared lock — never whole-file concatenate-and-replace.
+
+   **The marker must be unique per write, and `== 1` is why.** A literal constant passes on pass 1
+   and then fails forever: the marker survives in the log, so pass 2 finds it twice and a *correct*
+   append fails its own assertion — inside a loop step, where `assert` raises and takes the rest of
+   the pass with it. With `ts` in the marker, `== 1` means *this entry landed exactly once*; with a
+   constant it means *this log has been written to exactly once ever*, which is a different claim
+   and almost always false.
+
+   **Do not reach for a timestamp here.** `f"step7-{ts}"` is unique only by *circumstance* — it
+   holds while the clock is fine-grained enough and the writes are far enough apart, and collides
+   the moment two appends land in the same tick. At minute granularity that is an ordinary loop
+   pass. A random marker has no such premise. And confirm the check can still FAIL: re-append the
+   same marker deliberately and watch `count` reach 2, or you have a probe that passes by
+   construction, which certifies nothing.
+
+   `== 1`, not `> 0` — a 300 KB log may already contain the phrase somewhere else. And check that
+   the probe can produce a positive at all: a marker matching nothing scores 0 by construction and
+   cannot fail, which is a control that certifies nothing.
+
+   `echo logged` / `echo closed` is not this check. It asserts the *last* command in the chain
+   ran, which is true even when the append was the one that silently went elsewhere.
+
    **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or `pending-questions.md`? Typical relay-worthy events:
    - A PR opened, merged, or got a meaningful review reply
    - A pending question resolved (owner picked an option)

@@ -1314,8 +1314,8 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: `.backend-supervisor.lock.guard` is written by the desktop app, whose source
 #: is not in this repo (`backend-supervisor.lock.guard`: 0 hits here).
 #:
-#: `.voice-agent.pid` is deliberately NOT exempt: state/locks/ is a real
-#: destination that exists in-tree, so its warn names somewhere to go (#2722).
+#: `.voice-agent.pid` stays NOT exempt after the #2722 move: the writer now
+#: uses state/locks/, so a root copy is a pre-move straggler worth flagging.
 
 #: Migration sentinels are production-owned and DELIBERATELY retained at the
 #: workspace root — `workspace_default.py` writes `.notes-migrated`,
@@ -5581,6 +5581,117 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
     return max(0.0, (now - float(last)) / 3600.0)
 
 
+def check_runtime_identity(path: "Path | None" = None,
+                           head_sha: "str | None" = None) -> dict:
+    """#3279 verification layer 3: the RUNNING gateway process self-reports
+    build SHA / entry point / delivery engine into its status sidecar; this
+    probe compares that against the checkout so 'the code on disk' and 'the
+    code in memory' can no longer silently diverge. Absent sidecar = idle;
+    an UNREADABLE or MALFORMED one warns — the probe's own input being
+    damaged must never render as a clean pass."""
+    name = "runtime-identity"
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = Path(p)
+    if not p.exists():
+        return {"name": name, "status": "ok",
+                "detail": "no gateway sidecar — nothing to verify (probe idle)"}
+    try:
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"name": name, "status": "warn",
+                "detail": "gateway sidecar exists but is unreadable/unparseable "
+                          "— layer-3 verification is blind; inspect the file"}
+    if not isinstance(doc, dict):
+        return {"name": name, "status": "warn",
+                "detail": "gateway sidecar is not a JSON object — malformed"}
+    rt = doc.get("runtime")
+    if rt is None:
+        return {"name": name, "status": "warn",
+                "detail": "running bridge predates the runtime self-report — "
+                          "restart onto current code to enable layer-3 checks"}
+    def _bad(reason):
+        return {"name": name, "status": "warn",
+                "detail": f"runtime self-report malformed: {reason}"}
+    if not isinstance(rt, dict):
+        return _bad("runtime block is not an object")
+    sha = rt.get("build_sha")
+    ep = rt.get("entrypoint")
+    # None is the loader's honest report on a non-git (bundle) install — a
+    # property of the install, not damage. Only present-but-garbage is bad.
+    if sha is not None and not (isinstance(sha, str) and len(sha) >= 8):
+        return _bad("build_sha present but not a sha string")
+    if not (isinstance(ep, str) and ep):
+        return _bad("entrypoint missing")
+    if not isinstance(rt.get("engine"), str):
+        return _bad("engine missing")
+    for k in ("core_confirmed", "legacy_sends"):
+        v = rt.get(k)
+        if not (isinstance(v, int) and not isinstance(v, bool) and v >= 0):
+            return _bad(f"{k} is not a non-negative int")
+    bits = [f"engine={rt.get('engine')}",
+            f"core_confirmed={rt.get('core_confirmed')}",
+            f"legacy_sends={rt.get('legacy_sends')}"]
+    if head_sha is None:
+        try:
+            head_sha = subprocess.check_output(
+                git_argv("-C", str(REPO_DIR), "rev-parse", "HEAD"),
+                text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        except Exception:
+            head_sha = None
+    if not head_sha:
+        # Bundle install: ENGINE_MANIFEST.json's `sha` is the revision
+        # authority. Compare ONLY sha — built_at is a time, not a revision.
+        try:
+            mf = json.loads((REPO_DIR / "ENGINE_MANIFEST.json").read_text())
+            m_sha = mf.get("sha") if isinstance(mf, dict) else None
+            head_sha = m_sha if isinstance(m_sha, str) and len(m_sha) >= 8 else None
+        except (OSError, ValueError):
+            head_sha = None
+    # The SHA comparison needs both sides; either absent is an install shape,
+    # not a failure — the digest checks below are the git-free evidence.
+    if sha and head_sha:
+        if sha != head_sha:
+            return {"name": name, "status": "warn",
+                    "detail": f"build drift: process runs {sha[:8]}, checkout "
+                              f"HEAD is {head_sha[:8]} — restart to converge; "
+                              + " ".join(bits)}
+        bits.insert(0, f"sha={sha[:8]}")
+    else:
+        bits.insert(0, "revision comparison unavailable (non-git install) — "
+                       "digest verification only")
+    import hashlib
+    for key, rel in (("loader_sha256", ("src", "remote-gateway-bridge.py")),
+                     ("module_sha256", ("packages", "ag2-sparrow",
+                                        "ag2_sparrow", "remote_gateway_bridge.py"))):
+        reported_fp = rt.get(key)
+        if not (isinstance(reported_fp, str) and reported_fp):
+            continue
+        try:
+            disk_fp = hashlib.sha256(
+                REPO_DIR.joinpath(*rel).read_bytes()).hexdigest()
+        except OSError:
+            disk_fp = None
+        if disk_fp and disk_fp != reported_fp:
+            return {"name": name, "status": "warn",
+                    "detail": f"{key.split('_')[0]} bytes drift: the running "
+                              "process executes different contents than now on "
+                              "disk (same-HEAD change?) — restart to converge; "
+                              + " ".join(bits)}
+    expected = (REPO_DIR / "src" / "remote-gateway-bridge.py").resolve()
+    try:
+        actual = Path(ep).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return {"name": name, "status": "warn",
+                "detail": f"entrypoint path unresolvable (damaged telemetry): {ep!r}; "
+                          + " ".join(bits)}
+    if actual != expected:
+        return {"name": name, "status": "warn",
+                "detail": f"non-canonical entrypoint {ep} (expected {expected}); "
+                          + " ".join(bits)}
+    return {"name": name, "status": "ok",
+            "detail": ("entrypoint=canonical " + " ".join(bits))}
+
+
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
     """Whether the gateway bridge's own sidecar says the connection is serving.
 
@@ -5676,6 +5787,41 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     return out[-limit:]
 
 
+def _daily_completion_minutes(state: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-finished) from `state/<job>-YYYY-MM-DD.sentinel`.
+
+    Jobs that publish nothing dated into results/ still record completion here.
+    Prefer the body's ISO stamp; mtime is a fallback because a later touch
+    moves it while the recorded finish time cannot drift.
+    """
+    from datetime import datetime
+    out = []
+    if not state.is_dir():
+        return out
+    for f in state.glob(f"{job}-20*.sentinel"):
+        m = re.match(rf"{re.escape(job)}-(\d{{4}}-\d{{2}}-\d{{2}})\.sentinel$", f.name)
+        if not m:
+            continue
+        when = None
+        try:
+            # 3.9's fromisoformat rejects a `Z` suffix; and an aware stamp must be
+            # localised or its minute-of-day is UTC while cron times and mtime are local.
+            body = f.read_text(errors="ignore").strip()[:32].replace("Z", "+00:00")
+            when = datetime.fromisoformat(body)
+            if when.tzinfo is not None:
+                when = when.astimezone().replace(tzinfo=None)
+        except (OSError, ValueError):
+            when = None
+        if when is None:
+            try:
+                when = datetime.fromtimestamp(f.stat().st_mtime)
+            except OSError:  # pragma: no cover - file vanished between glob and stat
+                continue
+        out.append((m.group(1), when.hour * 60 + when.minute))
+    out.sort()
+    return out[-limit:]
+
+
 def check_daily_cron_punctuality() -> dict:
     """Report a daily job whose output never arrives at its scheduled time."""
     from datetime import datetime, time as dtime
@@ -5700,7 +5846,8 @@ def check_daily_cron_punctuality() -> dict:
     now = datetime.now()
     jobs, malformed = [], []
     for e in entries:
-        if not isinstance(e, dict) or e.get("launchd") or e.get("execution") == "codex-task":
+        # codex-task entries complete in another runtime that writes no sentinel.
+        if not isinstance(e, dict) or e.get("execution") == "codex-task":
             continue
         f = str(e.get("cron") or "").split()
         if len(f) != 5 or not f[0].isdigit() or not f[1].isdigit():
@@ -5719,12 +5866,18 @@ def check_daily_cron_punctuality() -> dict:
         # and never sees its real fleet-growth-<date>.mp4 output.
         declared = str(e.get("artifact") or "").strip()
         stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
-        arts = _daily_artifact_minutes(ws / "results", stem)
+        launchd = bool(e.get("launchd"))
+        # The launchd lane publishes no dated results file; its completion
+        # sentinel is the only dated record that it finished.
+        arts = (_daily_completion_minutes(ws / "state", jname) if launchd
+                else _daily_artifact_minutes(ws / "results", stem))
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
-            "stem": stem, "stem_declared": bool(declared),
+            # `artifact` names a results file, so it cannot vouch for a sentinel:
+            # only an observed history makes a missing sentinel today actionable.
+            "stem": stem, "stem_declared": bool(declared) and not launchd,
             # Renders only when new input exists, so a quiet day produces nothing
             # and absence is evidence of nothing rather than of a miss.
             "conditional": bool(e.get("conditional")),
@@ -5735,7 +5888,7 @@ def check_daily_cron_punctuality() -> dict:
                           f"fix the crons.json entry; punctuality unchecked for "
                           f"{len(malformed)} job(s)"}
     if not jobs:
-        return {"name": name, "status": "ok", "detail": "no session-owned daily jobs — skipped"}
+        return {"name": name, "status": "ok", "detail": "no plain-daily jobs — skipped"}
     return _interpret_daily_punctuality(jobs)
 
 
@@ -9176,6 +9329,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
+    checks.append(check_runtime_identity())
     checks.append(check_disk_space())
 
     return checks
