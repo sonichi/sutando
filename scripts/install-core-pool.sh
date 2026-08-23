@@ -286,6 +286,9 @@ PLIST_EOF
   # bootout first (idempotent — succeeds if not loaded) then bootstrap.
   launchctl bootout "$DOMAIN/com.sutando.core-$i" 2>/dev/null || true
   bootstrap_with_retry "$PLIST"
+  # bootstrap alone leaves the job loaded-but-never-started (observed: a
+  # scaled-up core sat dead until poked), and RunAtLoad does not close it.
+  launchctl kickstart "$DOMAIN/com.sutando.core-$i" 2>/dev/null || true
   echo "installed: com.sutando.core-$i (workspace=$WORKSPACE)"
 
   # Retired heartbeat sidecar: it ran `core_heartbeat.py`, which ignores

@@ -39,6 +39,19 @@ LEAD_LABEL = "pool-lead"
 # The daemon is the composition root: it binds the notify transport (a skill
 # script) so the policy module stays free of any concrete skill path.
 _NOTIFY_SCRIPT = _HERE.parent / "skills" / "task-progress" / "scripts" / "notify.py"
+_KICK_SCRIPT = _HERE / "kick-pool.sh"
+# launchd PENDS non-demand spawns (both KeepAlive and StartInterval), so the
+# plist never revives a dead follower — the lead drives recovery instead.
+RECOVERY_EVERY_S = 60
+
+
+def _run_recovery() -> str:
+    try:
+        r = subprocess.run(["bash", str(_KICK_SCRIPT)],
+                           capture_output=True, text=True, timeout=60)
+        return (r.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"recovery sweep failed: {e}"
 
 
 def _send_notice(source: str, channel: str, message: str) -> bool:
@@ -93,6 +106,7 @@ def main() -> int:
     notifier = PoolNotifier(tasks, state, _send_notice)
     ledger = ScaleLedger(state)
     last_prune = 0.0
+    last_recovery = 0.0
     beat = cores / f"{LEAD_LABEL}.alive"
     running = {"on": True}
 
@@ -124,6 +138,12 @@ def main() -> int:
             last_prune = time.time()
         for stem in notifier.check_stalls():
             print(f"notified-stall {stem}", flush=True)
+        if time.time() - last_recovery > RECOVERY_EVERY_S:
+            out = _run_recovery()
+            for line in out.splitlines():
+                if "NO SESSION" in line or "kickstart" in line or "staged" in line:
+                    print(f"recovery: {line}", flush=True)
+            last_recovery = time.time()
         # Autoscale, scale-UP only: shrinking can strand a core's live claims,
         # so it stays a manual operation (--pool N) for now.
         if a.pool_max > 0:

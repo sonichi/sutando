@@ -36,13 +36,28 @@ if [ -n "$SOCKET" ] && ! [ -S "$SOCKET" ]; then
 fi
 
 sessions=$(tmux_cmd list-sessions -F '#S' 2>/dev/null | grep "^${SESSION_PREFIX}")
-if [ -z "$sessions" ]; then
-  echo "kick-pool: no ${SESSION_PREFIX}* sessions found" >&2
-  exit 2
-fi
 
 kicked=0
-for sess in $sessions; do
+
+# A DEAD core has no session, so the pane walk below cannot see it. launchd
+# does not reliably revive one either: a KeepAlive job that exits 0 gets
+# "pended nondemand spawn", observed sitting dead indefinitely. Kickstart is
+# the arm that actually works, so drive it from the installed plists.
+for plist in "$HOME/Library/LaunchAgents/com.sutando.${SESSION_PREFIX}"*.plist; do
+  [ -e "$plist" ] || continue
+  label=$(basename "$plist" .plist)
+  inst="${label#com.sutando.}"
+  if echo "$sessions" | grep -qx "$inst"; then
+    continue
+  fi
+  echo "$inst: NO SESSION (dead) → launchctl kickstart"
+  if launchctl kickstart "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+    kicked=$((kicked+1))
+  else
+    echo "$inst: kickstart FAILED" >&2
+  fi
+done
+for sess in ${sessions:-}; do
   pane=$(tmux_cmd capture-pane -t "$sess" -p -S -8 2>/dev/null)
 
   if echo "$pane" | grep -q "esc to interrupt"; then
