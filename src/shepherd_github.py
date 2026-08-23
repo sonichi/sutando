@@ -157,6 +157,10 @@ def _identity(rec: dict) -> tuple:
             tuple(rec["failure_conditions"]), rec["state"])
 
 
+_CONDITION_KEYS = ("waiting_for", "success_conditions", "failure_conditions")
+_IDENTITY_KEYS = ("repo", "actor_scheme", "actor_value")
+
+
 def _validate_record(rec: dict, task_id: str) -> dict:
     """Fail closed on a record that cannot be a real contract. An unvalidated
     load lets a hand-edited or truncated file drive a live objective."""
@@ -165,12 +169,29 @@ def _validate_record(rec: dict, task_id: str) -> dict:
     missing = [k for k in _REQUIRED_KEYS if k not in rec]
     if missing:
         raise ValueError(f"contract for {task_id} is missing {missing}")
+    # The embedded id is the record's own claim about which task it belongs to;
+    # only comparing it to the requested id detects a copied or renamed file.
+    if rec["task_id"] != task_id:
+        raise ValueError(f"contract for {task_id} carries task_id {rec['task_id']!r}")
     if rec["state"] not in SHEPHERD_STATES:
         raise ValueError(f"contract for {task_id} carries invalid state {rec['state']!r}")
     if rec["provider"] != PROVIDER:
         raise ValueError(f"contract for {task_id} is not a {PROVIDER} record")
-    if not isinstance(rec["number"], int):
+    if isinstance(rec["number"], bool) or not isinstance(rec["number"], int):
         raise ValueError(f"contract for {task_id} has non-integer number")
+    for key in _IDENTITY_KEYS:
+        if not isinstance(rec[key], str) or not rec[key].strip():
+            raise ValueError(f"contract for {task_id} has blank/non-string {key}")
+    for key in _CONDITION_KEYS:
+        value = rec[key]
+        # A bare str is iterable, so frozenset() would explode it into characters.
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise ValueError(f"contract for {task_id}: {key} must be a list, "
+                             f"got {type(value).__name__}")
+        if any(not isinstance(x, str) or not x.strip() for x in value):
+            raise ValueError(f"contract for {task_id}: {key} must hold non-empty strings")
+    if set(rec["success_conditions"]) & set(rec["failure_conditions"]):
+        raise ValueError(f"contract for {task_id}: success/failure conditions overlap")
     return rec
 
 
@@ -206,13 +227,23 @@ def load(task_id: str) -> Optional[dict]:
     return _validate_record(json.loads(p.read_text()), task_id)
 
 
+def _conditions(rec: dict, key: str) -> frozenset:
+    """One place defines what a condition collection is. A bare str is iterable,
+    so frozenset() would silently reconstruct it as a set of characters."""
+    value = rec[key]
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise ValueError(f"{key} must be a collection of strings, "
+                         f"got {type(value).__name__}")
+    return frozenset(value)
+
+
 def scope_from_saved(rec: dict) -> ResponsibilityScope:
     return ResponsibilityScope(
         subjects=(subject_for(rec["repo"], rec["number"]),),
         actor=Actor(rec["actor_scheme"], rec["actor_value"]),
-        watch_conditions=frozenset(rec["waiting_for"]),
-        success_conditions=frozenset(rec["success_conditions"]),
-        failure_conditions=frozenset(rec["failure_conditions"]))
+        watch_conditions=_conditions(rec, "waiting_for"),
+        success_conditions=_conditions(rec, "success_conditions"),
+        failure_conditions=_conditions(rec, "failure_conditions"))
 
 
 def resume(task_id: str) -> tuple[str, str]:

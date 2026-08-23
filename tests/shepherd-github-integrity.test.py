@@ -161,11 +161,11 @@ base = {"task_id": "x", "provider": "github", "repo": "o/r", "number": 1,
 _write_raw("task-integrity-9", [1, 2, 3])
 raises("load rejects a non-object record", lambda: g.load("task-integrity-9"), ValueError)
 
-_write_raw("task-integrity-10", {**base, "provider": "gitlab"})
+_write_raw("task-integrity-10", {**base, "task_id": "task-integrity-10", "provider": "gitlab"})
 raises("load rejects another provider's record",
        lambda: g.load("task-integrity-10"), ValueError)
 
-_write_raw("task-integrity-11", {**base, "number": "1"})
+_write_raw("task-integrity-11", {**base, "task_id": "task-integrity-11", "number": "1"})
 raises("load rejects a non-integer number",
        lambda: g.load("task-integrity-11"), ValueError)
 
@@ -322,6 +322,52 @@ finally:
     g.observe = _real5
 check("a concurrent actor rebind is not reverted",
       g.load("task-integrity-19")["actor_value"], "second@x.z")
+
+# --- 11. the record's embedded id must equal the id it is loaded under -------
+_write_raw("task-integrity-20", {**base, "task_id": "task-somewhere-else"})
+raises("load rejects a record whose embedded task_id differs",
+       lambda: g.load("task-integrity-20"), ValueError)
+
+# --- 12. condition collections: scalar str, wrong type, mixed elements -------
+# A bare str is iterable, so frozenset() would reconstruct it as characters.
+for key in ("waiting_for", "success_conditions", "failure_conditions"):
+    tid = f"task-integrity-2{key[0]}x"
+    _write_raw(tid, {**base, "task_id": tid, key: "github.pull_request.updated"})
+    raises(f"load rejects a scalar string for {key}", lambda t=tid: g.load(t), ValueError)
+
+_write_raw("task-integrity-21", {**base, "task_id": "task-integrity-21",
+                                 "waiting_for": ["ok.event", 42]})
+raises("load rejects a non-string element in a condition list",
+       lambda: g.load("task-integrity-21"), ValueError)
+_write_raw("task-integrity-22", {**base, "task_id": "task-integrity-22",
+                                 "waiting_for": ["ok.event", "   "]})
+raises("load rejects a blank string element",
+       lambda: g.load("task-integrity-22"), ValueError)
+_write_raw("task-integrity-23", {**base, "task_id": "task-integrity-23",
+                                 "waiting_for": {"a": 1}})
+raises("load rejects a dict where a list belongs",
+       lambda: g.load("task-integrity-23"), ValueError)
+
+# --- 13. identity strings must be present and non-blank ----------------------
+for key in ("repo", "actor_scheme", "actor_value"):
+    tid = f"task-integrity-3{key[0]}x"
+    _write_raw(tid, {**base, "task_id": tid, key: "   "})
+    raises(f"load rejects a blank {key}", lambda t=tid: g.load(t), ValueError)
+
+_write_raw("task-integrity-24", {**base, "task_id": "task-integrity-24", "number": True})
+raises("load rejects a bool where an int number belongs",
+       lambda: g.load("task-integrity-24"), ValueError)
+
+# --- 14. contradictory conditions cannot survive reconstruction --------------
+_write_raw("task-integrity-25", {**base, "task_id": "task-integrity-25",
+                                 "success_conditions": ["both.event"],
+                                 "failure_conditions": ["both.event"]})
+raises("load rejects overlapping success/failure conditions",
+       lambda: g.load("task-integrity-25"), ValueError)
+
+# scope_from_saved is public: guard it at its own seam, not only via load()
+raises("scope_from_saved rejects a scalar condition string",
+       lambda: g.scope_from_saved({**base, "waiting_for": "abc.def"}), ValueError)
 
 print(f"integrity: {len(failures)} failure(s)")
 for f in failures:
