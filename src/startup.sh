@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh [--with-app] [--pool N]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job); --pool N installs the N-core pool + lead.
+# Usage: bash src/startup.sh [--with-app] [--pool N|auto]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job); --pool installs the core pool + lead (auto = start 2, lead autoscales).
 
 set -e
 
@@ -24,7 +24,10 @@ for _arg in "$@"; do
 done
 if [ -n "$POOL_N" ]; then
     case "$POOL_N" in
-        ''|*[!0-9]*) echo "✗ --pool needs a positive integer; got '$POOL_N'" >&2; exit 2 ;;
+        # auto = start at the 2-core baseline; the lead's autoscale grows the
+        # pool when every core saturates (cap SUTANDO_POOL_MAX, default 3).
+        auto) POOL_N=2 ;;
+        ''|*[!0-9]*) echo "✗ --pool needs a positive integer or 'auto'; got '$POOL_N'" >&2; exit 2 ;;
     esac
 fi
 
