@@ -165,6 +165,8 @@ sdir2.mkdir(parents=True)
     "[channel: !legacy:ag2.space]\nmatrix targeted body")
 (rdir2 / "proactive-201.txt").write_text(
     "[channel: 123456789012345678]\ndiscord targeted body")
+(rdir2 / "proactive-202.txt").write_text(
+    "[channel: !ported:example.org:8448]\nported room body")
 env2 = dict(env)
 env2["SUTANDO_WORKSPACE"] = tmp2
 proc2 = subprocess.Popen(
@@ -185,6 +187,20 @@ try:
     check(matrix_delivered,
           "reverse direction: matrix-targeted BODY is claimed despite "
           "discord activity (well inside the 180s grace)")
+    ported_deadline = time.monotonic() + 25
+    ported = None
+    while time.monotonic() < ported_deadline:
+        with LOCK:
+            ported = next((p for p in STATE["room_posts"]
+                           if "ported room body" in p.get("body", "")), None)
+        if ported or proc2.poll() is not None:
+            break
+        time.sleep(0.3)
+    # the port-qualified id must ride the SAME loader path to the SAME sink,
+    # addressed to its own room — not fall foreign (kewei P1, loader leg)
+    check(bool(ported), "ported room id delivered through the loader path")
+    check(ported and ported.get("room_id") == "!ported:example.org:8448",
+          "ported delivery addressed to the port-qualified room verbatim")
     time.sleep(4)
     with LOCK:
         bodies = [p.get("body", "") for p in STATE["room_posts"]]

@@ -37,15 +37,33 @@ class VendoredAliasRoute(unittest.TestCase):
             "[channel: 123456789012345678]\nhi")
         self.assertEqual((route, room), ("foreign", None))
 
+    def test_port_qualified_targets_route_send(self):
+        # Matrix server names may carry an explicit port; a ported id or
+        # alias is Matrix-owned and must not fall to foreign (kewei P1)
+        for dest in ("!r:example.org:8448", "#a:example.org:8448"):
+            route, room, _ = m._proactive_route(f"[channel: {dest}]\nhi")
+            self.assertEqual((route, room), ("send", dest), dest)
+
     def test_vendored_rule_matches_shared_classifier(self):
         # the src classifier is policy owner; the vendored default must not
-        # drift narrower than it on the Matrix families
+        # drift from it on ANY Matrix family, ported forms included
         sys.path.insert(0, str(REPO / "src"))
         pr = importlib.import_module("proactive_routing")
-        for dest in ("!r:s.org", "#a:s.org"):
+        for dest in ("!r:s.org", "#a:s.org",
+                     "!r:example.org:8448", "#a:example.org:8448",
+                     "!r:s.org:notaport", "!r:s:8448:9"):
             self.assertEqual(
                 bool(m._MATRIX_ROOM_RE.match(dest)),
                 bool(pr.MATRIX_TARGET_RE.match(dest)), dest)
+
+
+class AliasFailureNamesTheContract(unittest.TestCase):
+    def test_alias_note_only_for_alias_targets(self):
+        note = m._alias_contract_note("#general:ag2.space")
+        self.assertIn("broker-side alias resolution", note)
+        self.assertIn("undelivered/", note)
+        self.assertEqual(m._alias_contract_note("!room:ag2.space"), "")
+        self.assertEqual(m._alias_contract_note(None), "")
 
 
 if __name__ == "__main__":

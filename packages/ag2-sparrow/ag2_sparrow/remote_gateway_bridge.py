@@ -2638,7 +2638,7 @@ _PROACTIVE_MAX_BODY_B = 48 * 1024
 # validates the id format for its platform when applying" — result_markers).
 # Ids AND aliases: every other bridge declines '#alias:server' as Matrix-owned,
 # so a '!'-only rule here strands alias-directed bodies with no claimant.
-_MATRIX_ROOM_RE = re.compile(r"^[!#][^\s:]+:\S+$")
+_MATRIX_ROOM_RE = re.compile(r"^[!#][^\s:]+:[^\s:]+(?::\d+)?$")
 
 
 def _proactive_route(body: str) -> "tuple[str, str | None, str]":
@@ -2652,6 +2652,13 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
       * [dm-only]      → parse_markers already suppressed any redirect, so the
                          body falls through to the default (owner) room
       * [channel: !r:s]→ 'send' to that room, marker stripped
+      * [channel: #a:s]→ 'send' — Matrix-owned. DELIVERY CONTRACT: the
+                         gateway forwards the alias verbatim; resolution to a
+                         room id is the BROKER's job (server-side contract).
+                         Until the broker ships it, alias sends come back
+                         refused and park bounded in undelivered/ — the
+                         failure log names this contract so the operator
+                         knows what is missing, not just that it failed.
       * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
                          blocker: claiming it here would leak the raw body)
       * attach markers → stripped by the parser; uploads are unsupported on
@@ -2746,6 +2753,16 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
             claim.rename(original)
         except OSError:
             pass
+
+
+def _alias_contract_note(dest: "str | None") -> str:
+    """A failed '#alias' send is missing a CONTRACT, not just connectivity —
+    say so, or the park reads as an ordinary network fault."""
+    if dest and dest.startswith("#"):
+        return (" [alias target: delivery requires broker-side alias "
+                "resolution — not yet provided by this gateway; the body "
+                "stays recoverable in undelivered/]")
+    return ""
 
 
 def _resolve_send_failure(claim, original, exc) -> str:
@@ -2886,7 +2903,8 @@ def _post_proactive() -> None:
                     claim, f, _UnconfirmedDelivery("no event_id in response"))
                 _log(f"proactive send for {f.name} got no delivery signal "
                      f"(response {str(resp)[:120]!r}) — {outcome}; check "
-                     "REMOTE_PROACTIVE_ROOM and the agent's room membership")
+                     "REMOTE_PROACTIVE_ROOM and the agent's room membership"
+                     + _alias_contract_note(dest_room))
                 continue
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -2896,7 +2914,8 @@ def _post_proactive() -> None:
                     pass
                 raise
             outcome = _resolve_send_failure(claim, f, e)
-            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
+            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}"
+                 + _alias_contract_note(dest_room))
             continue
         except (urllib.error.URLError, TimeoutError) as e:
             outcome = _resolve_send_failure(claim, f, e)
