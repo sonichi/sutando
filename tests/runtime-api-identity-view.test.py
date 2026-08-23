@@ -370,6 +370,35 @@ class TestEntranceLinks(unittest.TestCase):
         for hay in (blob, dumped):
             self.assertNotIn("tok-sekret", hay)
 
+    def test_verify_discord_reads_me_via_client_seam(self):
+        calls = []
+
+        class _Client:
+            def get_json(self, path):
+                calls.append(path)
+                return {"id": 987, "global_name": "Sutando", "avatar": "abcd"}
+
+        orig = self.el._discord_client
+        self.el._discord_client = lambda token: _Client()
+        try:
+            link = self.el.verify_discord(self.state, "tok-sekret")
+        finally:
+            self.el._discord_client = orig
+        self.assertEqual(calls, ["/users/@me"])
+        self.assertEqual(link["provider_subject"],
+                         {"type": "bot_user", "id": "987"})
+        self.assertEqual(link["display"],
+                         {"name": "Sutando", "avatar_url":
+                          "https://cdn.discordapp.com/avatars/987/abcd.png"})
+        self.assertEqual(link["verification"]["method"],
+                         "discord_token_introspection")
+        self.assertNotIn("tok-sekret", json.dumps(link))
+
+    def test_discord_client_seam_is_the_census_chokepoint(self):
+        client = self.el._discord_client("tok")
+        self.assertEqual(type(client).__name__, "DiscordRestClient")
+        self.assertTrue(callable(client.get_json))
+
 
 class TestResolve(unittest.TestCase):
     def setUp(self):

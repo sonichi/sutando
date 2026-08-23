@@ -14,7 +14,6 @@ import json
 import os
 import secrets
 import tempfile
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -227,13 +226,19 @@ def _revoke_link_locked(state_dir, stand_id, provider, revoked_by, reason):
     raise ValueError(f"no active {provider} link to revoke")
 
 
+def _discord_client(token: str):
+    """Test seam; hand-rolled Discord REST is census-banned — the shared
+    client is the one transport (and gives this read 429/5xx retry)."""
+    import sys
+    src = str(Path(__file__).resolve().parent)
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from channels.discord.client import DiscordRestClient
+    return DiscordRestClient(token)
+
+
 def verify_discord(state_dir: str | Path, token: str) -> dict:
-    req = urllib.request.Request(
-        "https://discord.com/api/v10/users/@me",
-        headers={"Authorization": f"Bot {token}",
-                 "User-Agent": "sutando-entrance-verify (https://ag2.ai, v0)"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        me = json.loads(resp.read().decode())
+    me = _discord_client(token).get_json("/users/@me")
     subject = {"type": "bot_user", "id": str(me["id"])}
     display = {}
     name = me.get("global_name") or me.get("username")
