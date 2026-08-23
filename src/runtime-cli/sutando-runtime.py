@@ -617,7 +617,9 @@ def _print_entrances(result: dict) -> int:
         print(f"{e.get('provider','').ljust(width)}{e.get('status','')}")
         ident = e.get("identity") or {}
         if ident:
-            sub = ":".join(str(v) for k, v in sorted(ident.items()))
+            sub = ident.get("id", "")
+            if ident.get("type"):
+                sub = f"{ident['type']}:{sub}"
             print(f"  {'identity'.ljust(width)}{sub}")
         ver = e.get("verification") or {}
         if ver.get("method"):
