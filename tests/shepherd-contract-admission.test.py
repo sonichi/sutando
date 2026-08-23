@@ -46,9 +46,8 @@ check("mine accepted",
       admit(ObservedEvent("github.check_suite.completed", PR, MINE), SCOPE)[0],
       "accepted")
 
-# SAME subject, DIFFERENT actor -> ignored. Under a shared provider account the
-# subject alone is identical for both actors, so keying on it admits the wrong
-# work and attributes it here.
+# Under a shared provider account the subject is identical for both actors, so
+# subject-only keying admits the wrong work.
 check("same subject, peer actor -> ignored",
       admit(ObservedEvent("github.check_suite.completed", PR, PEER), SCOPE)[0],
       "ignored")
@@ -91,6 +90,40 @@ check("accepted non-outcome does not terminate",
       terminal_state_for(ObservedEvent("github.check_suite.completed", PR, MINE), SCOPE),
       None)
 
+# adjacent controls: every way an identity can fail to resolve must be refused
+# at construction, so an invalid boundary cannot exist to be matched against
+def raises(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+check("blank subject component rejected", raises(lambda: Subject("", "", "")), True)
+check("whitespace subject component rejected",
+      raises(lambda: Subject("github", "  ", "x/y#1")), True)
+check("blank actor scheme rejected", raises(lambda: Actor("", "me@x")), True)
+check("whitespace actor value rejected",
+      raises(lambda: Actor("git.commit_author_email", "   ")), True)
+
+# strength is an ALLOWLIST: a typoed or unknown scheme must be weak, not strong
+check("typoed shared-login scheme is weak",
+      Actor("provider_login", "qingyun-wu").is_discriminating, False)
+check("unknown scheme is weak",
+      Actor("totally.made.up", "whoever").is_discriminating, False)
+check("known-strong scheme is strong", MINE.is_discriminating, True)
+
+# contradictory outcome declarations must not be constructible: checking success
+# first would otherwise close a failed objective as succeeded
+check("overlapping success/failure rejected",
+      raises(lambda: ResponsibilityScope(
+          subjects=(PR,), actor=MINE,
+          success_conditions=frozenset({"done"}),
+          failure_conditions=frozenset({"done"}))), True)
+check("scope with no subject rejected",
+      raises(lambda: ResponsibilityScope(subjects=(), actor=MINE)), True)
+
 check("is_terminal(succeeded)", is_terminal("succeeded"), True)
 check("is_terminal(waiting)", is_terminal("waiting"), False)
 
@@ -112,4 +145,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 13 assertions, control verified")
+print("PASS: 22 assertions, control verified")

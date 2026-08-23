@@ -23,9 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-# The shepherd objective's lifecycle. DISTINCT from local_task_protocol's
-# LIFECYCLE_STATES, which tracks the task FILE (pending/result_written/
-# archived); a task file can be archived while its objective is still open.
+# Disjoint from local_task_protocol.LIFECYCLE_STATES by design: that tracks the
+# task FILE, this tracks the objective, and a file can outlive neither.
 SHEPHERD_STATES = (
     "active",      # doing work now
     "waiting",     # no one need act; a declared condition is outstanding
@@ -38,18 +37,23 @@ SHEPHERD_STATES = (
 
 TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
-# An event is admitted only when subject AND actor both resolve. Anything
-# weaker is recorded but never treated as this task's evidence.
+# Anything weaker than a subject+actor match is recorded but never evidence.
 ADMISSION = ("accepted", "ignored", "ambiguous")
 
 
 @dataclass(frozen=True)
 class Subject:
-    """A provider-native resource this task is responsible for."""
+    """A provider-native resource this task is responsible for. Every component
+    must be non-blank: an unresolved subject is not a subject."""
 
     provider: str        # "github", "ag2space", ...
     kind: str            # "pull_request", "room", ...
-    resource_id: str     # "sonichi/sutando#3303" -- provider-native, never a name
+    resource_id: str     # provider-native id, never a display name
+
+    def __post_init__(self) -> None:
+        for name in ("provider", "kind", "resource_id"):
+            if not str(getattr(self, name) or "").strip():
+                raise ValueError(f"Subject.{name} must be non-blank")
 
     def matches(self, other: "Subject") -> bool:
         return (
@@ -59,21 +63,30 @@ class Subject:
         )
 
 
+# Closed set: a scheme is strong only by being listed here. An unknown or
+# misspelled scheme is therefore weak, never strong by default.
+STRONG_ACTOR_SCHEMES = frozenset({
+    "git.commit_author_email",
+    "matrix.mxid",
+})
+
+
 @dataclass(frozen=True)
 class Actor:
-    """Who is responsible. `scheme` names how the adapter resolved it, so a
-    reader can tell a strong identity from a weak one without guessing."""
+    """Who is responsible. `scheme` names how the adapter resolved it, so
+    strength is declared and validated rather than inferred."""
 
-    scheme: str     # "git.commit_author_email", "matrix.mxid", "provider.login"
+    scheme: str
     value: str
 
-    # A provider account shared by several actors cannot discriminate, so an
-    # adapter must not resolve actor through it.
-    WEAK_SCHEMES = frozenset({"provider.login"})
+    def __post_init__(self) -> None:
+        for name in ("scheme", "value"):
+            if not str(getattr(self, name) or "").strip():
+                raise ValueError(f"Actor.{name} must be non-blank")
 
     @property
     def is_discriminating(self) -> bool:
-        return self.scheme not in Actor.WEAK_SCHEMES and bool(self.value)
+        return self.scheme in STRONG_ACTOR_SCHEMES
 
     def matches(self, other: "Actor") -> bool:
         return self.scheme == other.scheme and self.value == other.value
@@ -99,6 +112,14 @@ class ResponsibilityScope:
     watch_conditions: frozenset[str] = field(default_factory=frozenset)
     success_conditions: frozenset[str] = field(default_factory=frozenset)
     failure_conditions: frozenset[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        clash = self.success_conditions & self.failure_conditions
+        if clash:
+            raise ValueError(
+                f"event type(s) declared both success and failure: {sorted(clash)}")
+        if not self.subjects:
+            raise ValueError("ResponsibilityScope needs at least one subject")
 
     def covers_subject(self, subject: Subject) -> bool:
         return any(s.matches(subject) for s in self.subjects)
