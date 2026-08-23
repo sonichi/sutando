@@ -555,5 +555,47 @@ with tempfile.TemporaryDirectory() as td:
         check("fsync" in calls[:ri] and "fsync" in calls[ri+1:],
               f"ordering: fsync(temp) BEFORE replace, dir fsync AFTER ({calls})")
 
+# ── reviewer r3 permanent controls (kewei #2, corrupt terminal collision) ─────
+
+# 6) a colliding terminal NAME that fails C's total validator is NOT membership:
+#    import fails closed, unfenced, with A state and the collision untouched
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "r-coll"
+    a = DesignAClaimBackend(root)
+    a.publish("col-1", b"x")
+    tok = a.claim("col-1", "w0")
+    a.complete(tok, DeliveryOutcome.CONFIRMED, provider="P", destination="D")
+    arch = root / "archive"
+    arch.mkdir(parents=True, exist_ok=True)
+    (arch / f"{_safe_key('col-1')}.json").write_text("{not json")
+    rep = import_a_state(root)
+    check(not rep["verified"] and not rep["fenced"]
+          and "collision" in rep.get("unmigratable", ""),
+          f"corrupt terminal collision fails closed, unfenced ({rep})")
+    check(read_epoch(root) == "A" and (root / ".items").is_dir(),
+          "collision leaves epoch A and .items intact")
+    check((arch / f"{_safe_key('col-1')}.json").read_text() == "{not json",
+          "the colliding record's bytes are never touched")
+    r = resolve_delivery(root, "col-1")
+    check(r["source"] is None and not r["delivered"],
+          "unfenced root: no fallback answer is fabricated for the collided id")
+
+# 6b) a VALID pre-existing terminal for the same id is genuine C membership:
+#     the DELIVERED row skips and the migration fences
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "r-valid"
+    a = DesignAClaimBackend(root)
+    a.publish("col-2", b"x")
+    tok = a.claim("col-2", "w0")
+    a.complete(tok, DeliveryOutcome.CONFIRMED, provider="P", destination="D")
+    c_pre = DesignCClaimBackend(root, activate=True)
+    c_pre.publish("col-2", b"x")
+    t = c_pre.claim("col-2", "w1")
+    c_pre.complete(t, DeliveryOutcome.CONFIRMED, provider="P", destination="D")
+    rep = import_a_state(root)
+    check(rep["skipped"] >= 1 and rep["verified"] and rep["fenced"],
+          f"validator-passing terminal collision skips and fences ({rep})")
+    check(read_epoch(root) == "C", "valid-collision root reaches epoch C")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

@@ -116,7 +116,8 @@ def import_a_state(root: Path) -> dict:
     import json as _json
     import time as _time
 
-    from .backend_c import SEP, DesignCClaimBackend, _safe_component, _safe_key
+    from .backend_c import (SEP, DesignCClaimBackend, _safe_component,
+                            _safe_key, read_terminal_records)
 
     root = Path(root)
     items_dir = root / ".items"
@@ -172,6 +173,8 @@ def import_a_state(root: Path) -> dict:
     else:
         resume_rename_done = False
     c = DesignCClaimBackend(root, activate=True)
+    # A's key fn, distinct from C's _safe_key in scope: A-era filenames must
+    # be checked with A's encoding; kept local to avoid a legacy module dep.
     from ag2_sparrow.outbox import _safe_key as _a_key
     for f in sorted(items_dir.glob("*.json")):
         # Every A record must be a real local regular file whose name binds
@@ -223,8 +226,14 @@ def import_a_state(root: Path) -> dict:
         if status == "DELIVERED":
             dst = c._terminal_path(key)
             if dst.exists():
-                report["skipped"] += 1
-                continue
+                # A colliding NAME is not membership: only a record passing
+                # C's total validator for THIS id counts; else fail closed.
+                if read_terminal_records(root, item_id):
+                    report["skipped"] += 1
+                    continue
+                report["unmigratable"] = (
+                    f"terminal collision for {key} is not valid proof")
+                return report
             # Normative: a bare sentinel (no durable receipt) is
             # OUTCOME_UNKNOWN, never upgraded to a confirmed terminal.
             _ref = (rec.get("destination")
@@ -282,8 +291,12 @@ def import_a_state(root: Path) -> dict:
         if (isinstance(rec, dict) and isinstance(rec.get("item_id"), str)
                 and f.stem == _a_key(rec["item_id"])):
             k = _safe_key(rec["item_id"])
+            # Terminal membership is SEMANTIC — the total validator, not a
+            # name at the terminal path (a corrupt collision is not proof).
+            has_terminal = bool(read_terminal_records(root, rec["item_id"]))
         else:
             k = _safe_key(f.stem)
+            has_terminal = False    # quarantined records never map to terminals
         from .backend_c import TOKEN_PARTS
 
         def _valid_marker(e):
@@ -295,7 +308,7 @@ def import_a_state(root: Path) -> dict:
         valid_tokens = [t for t in raw_tokens
                         if len(t.name.split(SEP)) == TOKEN_PARTS]
         present = ((c._d("ready") / k).exists()
-                   or c._terminal_path(k).exists()
+                   or has_terminal
                    or any(_valid_marker(e)
                           for e in c._d("undelivered").iterdir())
                    or any(_valid_marker(e)
