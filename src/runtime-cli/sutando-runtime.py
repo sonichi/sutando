@@ -621,9 +621,6 @@ def _print_stand(result: dict, sub: "str | None") -> int:
     owner = result.get("owner") or {}
     if owner.get("person_id"):
         rows.append(("Owner", owner["person_id"]))
-    actor = result.get("actor") or {}
-    if actor.get("actor_id"):
-        rows.append(("Actor", actor["actor_id"]))
     inst = result.get("instance") or {}
     for key, label in (("instance_id", "Instance"),
                        ("installation_id", "Installation"),
