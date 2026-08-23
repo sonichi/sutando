@@ -12,6 +12,7 @@ must be sent; an undestined discord-bodied control must stay untouched.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -60,6 +61,71 @@ def _swallow(fn):
         fn()
     except BaseException:
         pass
+
+
+def split_write_drain():
+    """Own drain, own workspace, ONE undestined file.
+
+    An undestined proactive file falls through to activity routing
+    (`should_claim_proactive`), so telegram only claims it when
+    `state/last-owner-activity.json` names telegram — without that the file is
+    never claimed and any assertion about it is vacuous.
+    """
+    ws = Path(tempfile.mkdtemp(prefix="tg-splitwrite-ws-"))
+    results = ws / "results"
+    results.mkdir(parents=True)
+    (ws / "tasks").mkdir(exist_ok=True)
+    (ws / "state").mkdir(exist_ok=True)
+    (ws / "state" / "last-owner-activity.json").write_text(
+        json.dumps({"channel": "telegram", "ts": time.time()}))
+    mod = _load(ws)
+    mod.RESULTS_DIR = results
+    mod.ACCESS_FILE = _cfg / "access.json"
+    mod.presenter_mode_active = lambda *_a, **_k: False
+    mod.load_allowed = lambda: {"4242"}
+
+    split = results / "proactive-split.txt"
+    fd = open(split, "w")
+    fd.write("**[core: 1]**\n")
+    fd.flush()
+
+    sent, claimed = [], []
+
+    def _send_reply(_chat, text, task_id=None, message_thread_id=None):
+        sent.append(text)
+        return {"ok": True, "text_chunks": 1, "files_sent": 0}
+
+    _orig_claim = mod.claim_for_delivery
+
+    def _claim_then_producer_appends(path, recipient):
+        claim = _orig_claim(path, recipient)
+        if claim is not None and "proactive-split" in claim.name:
+            claimed.append(claim.name)
+            # The claim hard-links then unlinks; the producer still holds the
+            # ORIGINAL descriptor and keeps writing THIS inode.
+            fd.write("[channel: 1535008729106485288]\n"
+                     "private discord-directed body\n")
+            fd.flush()
+        return claim
+
+    def _api(method, **_kw):
+        if claimed:
+            raise _Stop()
+        return {"ok": True, "result": []}
+
+    mod.send_reply = _send_reply
+    mod.claim_for_delivery = _claim_then_producer_appends
+    mod.api = _api
+
+    t = threading.Thread(target=lambda: _swallow(mod.main), daemon=True)
+    t.start()
+    deadline = time.time() + 12
+    while time.time() < deadline and not claimed:
+        time.sleep(0.1)
+    time.sleep(1.0)
+    fd.close()
+    recoverable = split.exists() or bool(list(results.glob("proactive-split*.txt")))
+    return claimed, sent, recoverable
 
 
 def main() -> int:
@@ -112,6 +178,17 @@ def main() -> int:
           not list(results.glob("proactive-1*.sending*")))
     check("undestined discord-bodied control is NOT claimed by telegram",
           control.exists() and not any("foreign body" in s for s in sent))
+
+    # Split write, in its OWN drain: the shared drain above exits on the first
+    # send, so a third file there is never reached and asserts nothing.
+    _claimed, _sw_sent, _recoverable = split_write_drain()
+    check("split-write file was ACTUALLY CLAIMED (else the checks below are vacuous)",
+          bool(_claimed), f"claimed={_claimed!r}")
+    check("post-claim re-check refused a completed body directed elsewhere",
+          not any("private discord-directed body" in x for x in _sw_sent),
+          f"sent={_sw_sent!r}")
+    check("split-write claim RELEASED so the owning bridge can recover it",
+          _recoverable)
 
     if FAILURES:
         print(f"\nFAILED {len(FAILURES)}: {FAILURES}", file=sys.stderr)
