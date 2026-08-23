@@ -155,8 +155,14 @@ def _write_raw(task_id, obj):
 
 base = {"task_id": "x", "provider": "github", "repo": "o/r", "number": 1,
         "actor_scheme": g.ACTOR_SCHEME, "actor_value": "a@b.c",
-        "state": "waiting", "note": "", "waiting_for": [],
-        "success_conditions": [], "failure_conditions": []}
+        "state": "waiting", "note": "",
+        # A VALID record: every targeted test below mutates one field, so the
+        # fixture must not already violate a different rule — an empty
+        # collection would trip the arity check first and the test would pass
+        # on the wrong ValueError.
+        "waiting_for": ["github.pull_request.updated"],
+        "success_conditions": ["github.pull_request.merged"],
+        "failure_conditions": ["github.pull_request.closed_unmerged"]}
 
 _write_raw("task-integrity-9", [1, 2, 3])
 raises("load rejects a non-object record", lambda: g.load("task-integrity-9"), ValueError)
@@ -368,6 +374,28 @@ raises("load rejects overlapping success/failure conditions",
 # scope_from_saved is public: guard it at its own seam, not only via load()
 raises("scope_from_saved rejects a scalar condition string",
        lambda: g.scope_from_saved({**base, "waiting_for": "abc.def"}), ValueError)
+
+# --- 15. arity: an empty collection satisfies every element check by vacuity --
+# A record that watches nothing, or whose only outcomes are both empty, loads
+# cleanly and can then never progress or complete.
+_write_raw("task-integrity-26", {**base, "task_id": "task-integrity-26",
+                                 "success_conditions": [], "failure_conditions": []})
+raises("load rejects a record with no reachable outcome",
+       lambda: g.load("task-integrity-26"), ValueError)
+
+_write_raw("task-integrity-27", {**base, "task_id": "task-integrity-27", "waiting_for": []})
+raises("load rejects a record that observes nothing",
+       lambda: g.load("task-integrity-27"), ValueError)
+
+raises("scope_from_saved rejects an empty watch set",
+       lambda: g.scope_from_saved({**base, "waiting_for": []}), ValueError)
+
+# A success-only contract stays legal: requiring ALL THREE non-empty would
+# reject an objective that can succeed but has no defined failure event.
+_write_raw("task-integrity-28", {**base, "task_id": "task-integrity-28",
+                                 "failure_conditions": []})
+check("a success-only contract still loads",
+      g.load("task-integrity-28")["task_id"], "task-integrity-28")
 
 print(f"integrity: {len(failures)} failure(s)")
 for f in failures:

@@ -190,6 +190,13 @@ def _validate_record(rec: dict, task_id: str) -> dict:
                              f"got {type(value).__name__}")
         if any(not isinstance(x, str) or not x.strip() for x in value):
             raise ValueError(f"contract for {task_id}: {key} must hold non-empty strings")
+    # Arity, not just element type: [] satisfies every element check by vacuity.
+    if not rec["waiting_for"]:
+        raise ValueError(f"contract for {task_id}: waiting_for must be non-empty — "
+                         f"a contract that observes nothing can never progress")
+    if not (rec["success_conditions"] or rec["failure_conditions"]):
+        raise ValueError(f"contract for {task_id}: no reachable outcome — success and "
+                         f"failure conditions are both empty")
     if set(rec["success_conditions"]) & set(rec["failure_conditions"]):
         raise ValueError(f"contract for {task_id}: success/failure conditions overlap")
     return rec
@@ -227,23 +234,32 @@ def load(task_id: str) -> Optional[dict]:
     return _validate_record(json.loads(p.read_text()), task_id)
 
 
-def _conditions(rec: dict, key: str) -> frozenset:
+def _conditions(rec: dict, key: str, *, required: bool = False) -> frozenset:
     """One place defines what a condition collection is. A bare str is iterable,
     so frozenset() would silently reconstruct it as a set of characters."""
     value = rec[key]
     if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
         raise ValueError(f"{key} must be a collection of strings, "
                          f"got {type(value).__name__}")
+    if required and not value:
+        raise ValueError(f"{key} must be non-empty")
     return frozenset(value)
 
 
 def scope_from_saved(rec: dict) -> ResponsibilityScope:
+    # This is a public entry point in its own right — load() is not the only way
+    # in — so it repeats the arity rule rather than trusting a prior validation.
+    success = _conditions(rec, "success_conditions")
+    failure = _conditions(rec, "failure_conditions")
+    if not (success or failure):
+        raise ValueError("no reachable outcome — success and failure conditions "
+                         "are both empty")
     return ResponsibilityScope(
         subjects=(subject_for(rec["repo"], rec["number"]),),
         actor=Actor(rec["actor_scheme"], rec["actor_value"]),
-        watch_conditions=_conditions(rec, "waiting_for"),
-        success_conditions=_conditions(rec, "success_conditions"),
-        failure_conditions=_conditions(rec, "failure_conditions"))
+        watch_conditions=_conditions(rec, "waiting_for", required=True),
+        success_conditions=success,
+        failure_conditions=failure)
 
 
 def resume(task_id: str) -> tuple[str, str]:
