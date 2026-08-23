@@ -232,5 +232,33 @@ class MainTest(unittest.TestCase):
         self.assertIn("no transcript", out)
 
 
+class TerminalSafety(unittest.TestCase):
+    """This digest prints to a TTY, so transcript content must not carry controls."""
+
+    def test_osc52_clipboard_escape_is_neutralized(self):
+        out = digest_mod._one_line("safe\x1b]52;c;YXR0YWNr\x07text", 200)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x07", out)
+        self.assertIn("safe", out)
+
+    def test_csi_colour_sequence_is_neutralized(self):
+        self.assertNotIn("\x1b", digest_mod._one_line("a\x1b[31mred\x1b[0m", 50))
+
+    def test_c1_and_del_are_neutralized(self):
+        for ch in ("\x7f", "\x9b", "\x00"):
+            with self.subTest(ch=ch):
+                self.assertNotIn(ch, digest_mod._one_line(f"x{ch}y", 50))
+
+    def test_ordinary_text_is_untouched(self):
+        """Positive control: the guard must not mangle normal content."""
+        self.assertEqual(digest_mod._one_line("hello  world", 50), "hello world")
+
+    def test_tool_name_is_sanitized_too(self):
+        ev = digest_mod._event({"timestamp": "2026-08-23T00:00:00Z"},
+                        {"type": "tool_use", "name": "a\x1bb",
+                         "input": {"command": "ls"}}, 50)
+        self.assertNotIn("\x1b", ev[1])
+
+
 if __name__ == "__main__":
     unittest.main()

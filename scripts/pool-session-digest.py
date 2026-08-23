@@ -58,14 +58,29 @@ def find_transcript(session_id: str) -> "Path | None":
     return hits[0] if hits else None
 
 
+# C0, DEL and C1. Whitespace is collapsed before this runs, so anything left is
+# a control the terminal would ACT on (OSC 52 writes the clipboard).
+_CTRL = {c: "\ufffd" for c in [*range(0x00, 0x20), 0x7F, *range(0x80, 0xA0)]}
+
+
+def _safe(value) -> str:
+    """Neutralize terminal controls in untrusted transcript/session content.
+
+    This digest prints straight to a TTY, so an escape that survives here can
+    spoof output or drive terminal features. Replaced, not dropped, so a reader
+    can see something was removed.
+    """
+    return str(value if value is not None else "").translate(_CTRL)
+
+
 def _one_line(text: str, width: int) -> str:
-    flat = " ".join((text or "").split())
+    flat = _safe(" ".join((text or "").split()))
     return flat[:width] + ("…" if len(flat) > width else "")
 
 
 def _event(rec: dict, block: dict, width: int) -> "tuple[str, str, str] | None":
     """(ts, kind, summary) for a content block worth showing, else None."""
-    ts = (rec.get("timestamp") or "")[11:19]
+    ts = _safe((rec.get("timestamp") or "")[11:19])
     kind = block.get("type")
     if kind == "text":
         body = _one_line(block.get("text", ""), width)
@@ -74,7 +89,7 @@ def _event(rec: dict, block: dict, width: int) -> "tuple[str, str, str] | None":
         body = _one_line(block.get("thinking", ""), width)
         return (ts, "THINK", body) if body else None
     if kind == "tool_use":
-        name = block.get("name", "?")
+        name = _safe(block.get("name", "?"))
         inp = block.get("input") or {}
         detail = inp.get("command") or inp.get("file_path") or inp.get("pattern") or ""
         if not detail and isinstance(inp, dict) and inp:
@@ -155,14 +170,14 @@ def main() -> int:
 
     for sess in sessions:
         name, sid = sess.get("name", "?"), sess.get("sessionId", "")
-        head = f"{name}  [{sess.get('status','?')}]  pid={sess.get('pid','?')}"
+        head = _safe(f"{name}  [{sess.get('status','?')}]  pid={sess.get('pid','?')}")
         path = find_transcript(sid)
         if path is None:
             print(f"\n{head}\n  no transcript for {sid}")
             continue
         d = digest(path, a.n, a.width, a.thinking)
         mb = path.stat().st_size / 1048576
-        counts = " · ".join(f"{k} {v}" for k, v in d["blocks"].most_common(5))
+        counts = " · ".join(f"{_safe(k)} {v}" for k, v in d["blocks"].most_common(5))
         print(f"\n{head}")
         print(f"  {mb:.1f}M · {d['records']} records · last {age(d['last_ts'])}")
         print(f"  {counts}")
