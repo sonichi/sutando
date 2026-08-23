@@ -98,6 +98,14 @@ def test_archive_poll_degrades_to_pending():
         except UnicodeDecodeError as e:
             check(False, f"/result archive leg RAISED {type(e).__name__}")
 
+        # positive control for the archive leg: a COMPLETE archived body must
+        # still complete. Without this the torn case alone leaves the success
+        # return unexercised, and "always pending" would pass.
+        (arch / "task-2.txt").write_text(BODY)
+        r = api.get_task_result("task-2")
+        check(r and r.get("status") == "completed" and "emoji" in (r.get("result") or ""),
+              "control: a complete ARCHIVED body still returns completed with its text")
+
 
 def test_display_fields_narrow_guard_covers_decode_error():
     """`except OSError` alone does not catch it — UnicodeDecodeError is a ValueError."""
