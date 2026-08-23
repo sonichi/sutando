@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shlex
+import statistics
 import shutil
 import tempfile
 import socket
@@ -1227,11 +1228,15 @@ def check_file(path: Path, name: str) -> dict:
 
 
 def check_directory(path: Path, name: str) -> dict:
-    """Check if a directory exists and has files."""
+    """Check if a directory exists and has files.
+
+    The count names its directory: both callers (memory-dir, notes-dir) sit on
+    paths with a live twin, so a bare count reads as a claim about the wrong one.
+    """
     if not path.exists():
         return {"name": name, "status": "missing", "detail": str(path)}
     count = len(list(path.glob("*.md")))
-    return {"name": name, "status": "ok", "detail": f"{count} .md files"}
+    return {"name": name, "status": "ok", "detail": f"{count} .md files in {path}"}
 
 
 def check_memory_dir_override() -> "dict | None":
@@ -1309,8 +1314,8 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: `.backend-supervisor.lock.guard` is written by the desktop app, whose source
 #: is not in this repo (`backend-supervisor.lock.guard`: 0 hits here).
 #:
-#: `.voice-agent.pid` is deliberately NOT exempt: state/locks/ is a real
-#: destination that exists in-tree, so its warn names somewhere to go (#2722).
+#: `.voice-agent.pid` stays NOT exempt after the #2722 move: the writer now
+#: uses state/locks/, so a root copy is a pre-move straggler worth flagging.
 
 #: Migration sentinels are production-owned and DELIBERATELY retained at the
 #: workspace root — `workspace_default.py` writes `.notes-migrated`,
@@ -1328,7 +1333,9 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
 #: documented family, exactly as `_STATUS_FILES` does. @qingyun-wu and
 #: @john-the-dev caught it before merge — a permanent WARN on every upgraded
 #: install would have trained operators to ignore the detector.
-WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
+#: `.legacy-notice-printed` is a LITERAL because this family has no shared name
+#: shape: written once, read AT the root by init.sh, never unlinked, no destination.
+WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 
 #: `personal_path()` resolves these at the workspace root and never under `state/`,
 #: so the probe's "state belongs under state/" remedy would break the reader.
@@ -1394,7 +1401,8 @@ def check_workspace_root_tidy() -> "dict | None":
             if p.is_file()
             and p.name not in WORKSPACE_ROOT_ALLOWED
             and p.name not in WORKSPACE_ROOT_PERSONAL_ASSETS
-            and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
+            and not any(fnmatch.fnmatch(p.name, g)
+                        for g in WORKSPACE_ROOT_SENTINEL_GLOBS)
         )
     except OSError:
         return None                      # unreadable workspace is another probe's job
@@ -2190,8 +2198,24 @@ def check_memory_index_integrity() -> "dict | None":
     loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
     truncated = len(loaded_text) < len(effective_text)
 
+    # An index that outgrows the load budget compacts its entries to prefix
+    # abbreviations (`f:` for feedback_, `r:` for reference_, `p:` for project_).
+    _INDEX_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
+
     def _referenced_in(hay: str, name: str) -> bool:
-        return name in hay or name[:-3] in hay
+        stem = name[:-3] if name.endswith(".md") else name
+        if name in hay or stem in hay:
+            return True
+        # Without this the probe calls an indexed file unindexed, and the
+        # "fix" it invites — expanding the index — is what blows the read limit.
+        for full, short in _INDEX_ABBREV.items():
+            if not stem.startswith(full):
+                continue
+            token = short + stem[len(full):]
+            # Trailing boundary so `f:foo` is not satisfied by `f:foobar`.
+            if re.search(re.escape(token) + r"(?![\w-])", hay):
+                return True
+        return False
 
     # MEMORY.md is not the only index. Once a corpus outgrows the load budget the
     # overflow moves to sibling HUB indexes (MEMORY-reference.md, MEMORY-wire.md,
@@ -2275,6 +2299,19 @@ def check_memory_index_integrity() -> "dict | None":
                 f"({MEMORY_INDEX_LOAD_BYTES:,} B) / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
+    def _corpus_note() -> str:
+        """Name the corpus measured: "compact it now" is destructive advice about
+        one specific file, and SUTANDO_MEMORY_DIR can point this at another."""
+        try:
+            default = Path(_default_memory_dir())
+        except Exception:  # pragma: no cover - defensive; never break the check
+            return f" [corpus: {MEMORY_DIR}]"
+        if default.resolve() != MEMORY_DIR.resolve():
+            return (f" [corpus: {MEMORY_DIR} — set by SUTANDO_MEMORY_DIR, NOT the "
+                    f"workspace default {default}; if sessions load the default, "
+                    f"this verdict is about a corpus they never read]")
+        return f" [corpus: {MEMORY_DIR}]"
+
     def _hub_note() -> str:
         return (f"; {len(hub_only)} reachable via a sibling hub index "
                 f"({', '.join(sorted(index_names - {'MEMORY.md'}))}) — by design, not loaded"
@@ -2283,7 +2320,7 @@ def check_memory_index_integrity() -> "dict | None":
     if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
                 "detail": (f"all memory files reachable from the loaded MEMORY.md index"
-                           f"{_hub_note()} ({_size_note()})")}
+                           f"{_hub_note()} ({_size_note()}){_corpus_note()}")}
     parts = []
     if beyond_cut:
         parts.append(
@@ -2320,7 +2357,7 @@ def check_memory_index_integrity() -> "dict | None":
     # that still loaded fine once frontmatter/comments were excluded.)
     return {"name": "memory-index",
             "status": "fail" if beyond_cut else "warn",
-            "detail": "; ".join(parts)}
+            "detail": "; ".join(parts) + _corpus_note()}
 
 
 def check_memory_sync() -> dict:
@@ -2358,8 +2395,10 @@ def check_memory_sync() -> dict:
         if ws_git_fetch.exists():
             age_h = (time.time() - ws_git_fetch.stat().st_mtime) / 3600
             if age_h > 48:
-                return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
-            return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
+                return {"name": name, "status": "warn",
+                        "detail": f"workspace vault last fetched {age_h:.0f}h ago (stale)"}
+            return {"name": name, "status": "ok",
+                    "detail": f"workspace vault last fetched {age_h:.1f}h ago"}
         return {"name": name, "status": "ok", "detail": "workspace git repo, never fetched"}
     # Legacy memory-sync clone dir: PR #764 renamed legacy ~/.sutando-memory-sync/
     # → ~/.sutando/memory-sync/. Check new path first; fall back to legacy
@@ -2377,15 +2416,65 @@ def check_memory_sync() -> dict:
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
         if age_h > 48:
-            return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
-        return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
-    return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
+            return {"name": name, "status": "warn",
+                    "detail": f"legacy memory-sync clone last fetched {age_h:.0f}h ago (stale)"}
+        return {"name": name, "status": "ok",
+                "detail": f"legacy memory-sync clone last fetched {age_h:.1f}h ago"}
+    return {"name": name, "status": "ok",
+            "detail": "legacy memory-sync clone initialized, never fetched"}
 
 
 def _age_phrase(age_s) -> str:
     """None means the writer gave no usable timestamp — say so rather than
     printing a number a reader cannot tell apart from a real age."""
     return "age unknown" if age_s is None else f"{age_s}s ago"
+
+
+def _norm_remote(u: str) -> str:
+    """FETCH_HEAD drops a trailing `.git` that `remote get-url` keeps."""
+    u = u.strip().rstrip("/")
+    return u[:-4] if u.endswith(".git") else u
+
+
+def _last_fetch_age_s(repo, git_bin: str, expected: str) -> "int | None":
+    """Seconds since this checkout last fetched `expected` from a remote, or None.
+
+    Scoped to `origin/<expected>`, the exact comparison target: FETCH_HEAD's mtime is
+    the last fetch of ANYTHING, so a PR ref — or `main` from a second remote — would
+    otherwise date a stale origin/main.
+    """
+    try:
+        out = subprocess.run([git_bin, "-C", str(repo), "rev-parse", "--git-common-dir"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        common = Path(out.stdout.strip())
+        if not common.is_absolute():
+            common = Path(repo) / common
+        fetch_head = common / "FETCH_HEAD"
+        st = fetch_head.stat()
+        url = subprocess.run([git_bin, "-C", str(repo), "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10)
+        if url.returncode != 0:
+            return None
+        # `remote get-url` keeps a trailing `.git` that FETCH_HEAD drops, so an exact
+        # compare never matches on a real clone; normalise both ends before comparing.
+        want = _norm_remote(url.stdout)
+        marker = f"branch '{expected}' of "
+        for line in fetch_head.read_text(errors="replace").splitlines():
+            i = line.find(marker)
+            if i >= 0 and _norm_remote(line[i + len(marker):]) == want:
+                return max(int(time.time() - st.st_mtime), 0)
+        return None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def _fetch_age_phrase(age_s) -> str:
+    """A currency claim with no fetch behind it is worth naming, not omitting."""
+    if age_s is None:
+        return "no fetch of that branch recorded"
+    return f"a fetch {age_s // 3600}h{age_s % 3600 // 60}m ago"
 
 
 def check_onboarding_status() -> "dict | None":
@@ -2416,15 +2505,33 @@ def check_onboarding_status() -> "dict | None":
         rows = data["rows"]
         # Carry each row's own detail: "gateway" alone cannot distinguish "not
         # running" from a reconnect. `str()` because a separate repo writes this.
-        todo = [f"{k} ({d})" if (d := str(v.get("detail") or "").strip()[:120]) else k
-                for k, v in sorted(rows.items())
-                if isinstance(v, dict) and v.get("state") == "todo"]
+        todo_keys = [k for k, v in sorted(rows.items())
+                     if isinstance(v, dict) and v.get("state") == "todo"]
+        # A heartbeat refutes only the runtime-DOWN row; the writer also emits
+        # "core running, Claude sign-in required", a real gap on a running core.
+        _core = rows.get("core") if isinstance(rows.get("core"), dict) else {}
+        _down = (_core.get("claude_authed") is not False
+                 and "not running" in str(_core.get("detail") or "").lower())
+        stale_core = "core" in todo_keys and _down and _fresh_local_core_record() is not None
+        if stale_core:
+            todo_keys.remove("core")
+        todo = [f"{k} ({d})" if (d := str(rows[k].get("detail") or "").strip()[:120]) else k
+                for k in todo_keys]
         # Absent/null/0 updated_at is UNKNOWN, not the epoch — int(None or 0)
         # rendered the whole unix time as an age (~56 years) on both lines.
         _updated = int(data.get("updated_at", 0) or 0)
         age_s = max(0, int(time.time()) - _updated) if _updated > 0 else None
     except (ValueError, OSError, TypeError):
         return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+    if stale_core:
+        rest = f"; still todo: {', '.join(todo)}" if todo else ""
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"Console mirror is stale — its core row says 'not running' but this "
+                       f"host's heartbeat is live; mirror last written {_age_phrase(age_s)}"
+                       f"{rest}"),
+        }
     if todo:
         return {
             "name": name,
@@ -2902,7 +3009,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # census costs ten 5s-timeout pgreps to say so. None is unanswerable, so it probes.
     if behind == 0:
         return {"name": name, "status": "ok",
-                "detail": f"live checkout on {expected!r}"}
+                "detail": f"live checkout on {expected!r} "
+                          f"({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin, expected))})"}
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     # LIVE processes only: `src/` moves several times a day, so the running set
     # is what keeps this from becoming the alert fatigue the threshold prevents.
@@ -2949,7 +3057,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           f"{refresh} + restart the affected service. {tail}"}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
-                      + (f", {behind} commits behind" if behind else "")}
+                      + (f", {behind} commits behind" if behind else "")
+                      + f" ({_fetch_age_phrase(_last_fetch_age_s(repo, git_bin, expected))})"}
 
 
 def check_engine_revision_drift(repo_dir: "Path | None" = None,
@@ -3278,6 +3387,19 @@ def _default_local_notifier(msg: str) -> bool:
         return False
 
 
+# Per-bridge EXACT detail: gateway-bridge's other warns (not-serving, duplicate
+# pileup) describe a live process, so only this string may respawn one.
+GATEWAY_DOWN_DETAIL = (
+    "configured but NOT running — ag2.space mobile messages will not be delivered"
+)
+DOWN_BRIDGE_DETAILS = {
+    "telegram-bridge": "configured but not running",
+    "discord-bridge": "configured but not running",
+    "slack-bridge": "configured but not running",
+    "gateway-bridge": GATEWAY_DOWN_DETAIL,
+}
+
+
 def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
                      notifier=None) -> list:
     """Restart or alert on configured-but-not-running channel bridges."""
@@ -3312,10 +3434,12 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
 
     restarted = []
     for c in checks:
+        # The name gate is NOT redundant with the detail match: for an unknown
+        # name the lookup is None, and a check with no detail is also None.
         if not (
-            c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge")
+            c["name"] in DOWN_BRIDGE_DETAILS
             and c["status"] == "warn"
-            and c.get("detail") == "configured but not running"
+            and c.get("detail") == DOWN_BRIDGE_DETAILS[c["name"]]
         ):
             continue
         name = c["name"]
@@ -3354,6 +3478,19 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
         # No interpreter can import the bridge's dependency (startup.sh skips too).
         return None
     child_env = os.environ.copy()
+    if name == "gateway-bridge":
+        # The bridge exits without a token, and startup.sh sources the same
+        # channels/ag2space/.env before launching it.
+        gw_env = _load_channel_env("ag2space")
+        merged = {**os.environ, **gw_env}
+        token = merged.get("REMOTE_TASK_TOKEN") or merged.get("AG2_REMOTE_TOKEN")
+        if not token:
+            return None
+        child_env.update(gw_env)
+        child_env["REMOTE_TASK_TOKEN"] = token
+        # Marks the launch supervised so the bridge stamps launched_via and
+        # skips its own bare-launch file log (see remote_gateway_bridge._log).
+        child_env["SUTANDO_SUPERVISED"] = "1"
     if name == "slack-bridge":
         # slack-bridge exits without BOTH tokens non-empty; the Keychain vault is
         # a real source (same env -> .env -> vault tiering as the bridge itself).
@@ -3367,6 +3504,10 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
     return interp, child_env
 
 
+# Check name → src/<script>.py, for the bridges whose two names differ.
+_BRIDGE_SCRIPT = {"gateway-bridge": "remote-gateway-bridge"}
+
+
 def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
     """Spawn a bridge per _bridge_launch_plan; True if spawned."""
     plan = plan or _bridge_launch_plan(name)
@@ -3378,7 +3519,7 @@ def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
     # `with` closes the parent's handle after Popen; the child holds
     # its own dup of the fd, so the log stays writable.
     with open(str(log_path), "a") as log_f:
-        subprocess.Popen([interp, str(REPO_DIR / "src" / f"{name}.py")],
+        subprocess.Popen([interp, str(REPO_DIR / "src" / f"{_BRIDGE_SCRIPT.get(name, name)}.py")],
                          stdout=log_f, stderr=subprocess.STDOUT,
                          env=child_env, start_new_session=True)
     return True
@@ -3637,6 +3778,26 @@ def _filter_pids_this_checkout(pids: list) -> list:
         elif not argv:
             kept.append(pid)  # neither probe answered — fail open
     return kept
+
+
+def sutando_app_newest_source(app_dir: Optional[Path] = None) -> Path:
+    """Newest .swift under the app dir — the binary is stale if it predates any of them.
+
+    Globbed, not enumerated: the app is built from several sources now, and a
+    hardcoded list silently stops noticing the ones added after it was written.
+    """
+    d = app_dir if app_dir is not None else REPO_DIR / "src" / "Sutando"
+    main = d / "main.swift"
+    try:
+        srcs = [p for p in d.glob("*.swift") if p.is_file()]
+    except OSError:
+        return main
+    if not srcs:
+        return main
+    try:
+        return max(srcs, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return main
 
 
 def _binary_is_current(binary_path: Path, src_file: Path) -> bool:
@@ -5332,7 +5493,7 @@ def check_gateway_bridge() -> "dict | None":
         return {
             "name": "gateway-bridge",
             "status": "warn",
-            "detail": "configured but NOT running — ag2.space mobile messages will not be delivered",
+            "detail": GATEWAY_DOWN_DETAIL,
         }
     claimed = _gateway_lock_pids()
     if claimed:
@@ -5420,6 +5581,117 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
     return max(0.0, (now - float(last)) / 3600.0)
 
 
+def check_runtime_identity(path: "Path | None" = None,
+                           head_sha: "str | None" = None) -> dict:
+    """#3279 verification layer 3: the RUNNING gateway process self-reports
+    build SHA / entry point / delivery engine into its status sidecar; this
+    probe compares that against the checkout so 'the code on disk' and 'the
+    code in memory' can no longer silently diverge. Absent sidecar = idle;
+    an UNREADABLE or MALFORMED one warns — the probe's own input being
+    damaged must never render as a clean pass."""
+    name = "runtime-identity"
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = Path(p)
+    if not p.exists():
+        return {"name": name, "status": "ok",
+                "detail": "no gateway sidecar — nothing to verify (probe idle)"}
+    try:
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"name": name, "status": "warn",
+                "detail": "gateway sidecar exists but is unreadable/unparseable "
+                          "— layer-3 verification is blind; inspect the file"}
+    if not isinstance(doc, dict):
+        return {"name": name, "status": "warn",
+                "detail": "gateway sidecar is not a JSON object — malformed"}
+    rt = doc.get("runtime")
+    if rt is None:
+        return {"name": name, "status": "warn",
+                "detail": "running bridge predates the runtime self-report — "
+                          "restart onto current code to enable layer-3 checks"}
+    def _bad(reason):
+        return {"name": name, "status": "warn",
+                "detail": f"runtime self-report malformed: {reason}"}
+    if not isinstance(rt, dict):
+        return _bad("runtime block is not an object")
+    sha = rt.get("build_sha")
+    ep = rt.get("entrypoint")
+    # None is the loader's honest report on a non-git (bundle) install — a
+    # property of the install, not damage. Only present-but-garbage is bad.
+    if sha is not None and not (isinstance(sha, str) and len(sha) >= 8):
+        return _bad("build_sha present but not a sha string")
+    if not (isinstance(ep, str) and ep):
+        return _bad("entrypoint missing")
+    if not isinstance(rt.get("engine"), str):
+        return _bad("engine missing")
+    for k in ("core_confirmed", "legacy_sends"):
+        v = rt.get(k)
+        if not (isinstance(v, int) and not isinstance(v, bool) and v >= 0):
+            return _bad(f"{k} is not a non-negative int")
+    bits = [f"engine={rt.get('engine')}",
+            f"core_confirmed={rt.get('core_confirmed')}",
+            f"legacy_sends={rt.get('legacy_sends')}"]
+    if head_sha is None:
+        try:
+            head_sha = subprocess.check_output(
+                git_argv("-C", str(REPO_DIR), "rev-parse", "HEAD"),
+                text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        except Exception:
+            head_sha = None
+    if not head_sha:
+        # Bundle install: ENGINE_MANIFEST.json's `sha` is the revision
+        # authority. Compare ONLY sha — built_at is a time, not a revision.
+        try:
+            mf = json.loads((REPO_DIR / "ENGINE_MANIFEST.json").read_text())
+            m_sha = mf.get("sha") if isinstance(mf, dict) else None
+            head_sha = m_sha if isinstance(m_sha, str) and len(m_sha) >= 8 else None
+        except (OSError, ValueError):
+            head_sha = None
+    # The SHA comparison needs both sides; either absent is an install shape,
+    # not a failure — the digest checks below are the git-free evidence.
+    if sha and head_sha:
+        if sha != head_sha:
+            return {"name": name, "status": "warn",
+                    "detail": f"build drift: process runs {sha[:8]}, checkout "
+                              f"HEAD is {head_sha[:8]} — restart to converge; "
+                              + " ".join(bits)}
+        bits.insert(0, f"sha={sha[:8]}")
+    else:
+        bits.insert(0, "revision comparison unavailable (non-git install) — "
+                       "digest verification only")
+    import hashlib
+    for key, rel in (("loader_sha256", ("src", "remote-gateway-bridge.py")),
+                     ("module_sha256", ("packages", "ag2-sparrow",
+                                        "ag2_sparrow", "remote_gateway_bridge.py"))):
+        reported_fp = rt.get(key)
+        if not (isinstance(reported_fp, str) and reported_fp):
+            continue
+        try:
+            disk_fp = hashlib.sha256(
+                REPO_DIR.joinpath(*rel).read_bytes()).hexdigest()
+        except OSError:
+            disk_fp = None
+        if disk_fp and disk_fp != reported_fp:
+            return {"name": name, "status": "warn",
+                    "detail": f"{key.split('_')[0]} bytes drift: the running "
+                              "process executes different contents than now on "
+                              "disk (same-HEAD change?) — restart to converge; "
+                              + " ".join(bits)}
+    expected = (REPO_DIR / "src" / "remote-gateway-bridge.py").resolve()
+    try:
+        actual = Path(ep).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return {"name": name, "status": "warn",
+                "detail": f"entrypoint path unresolvable (damaged telemetry): {ep!r}; "
+                          + " ".join(bits)}
+    if actual != expected:
+        return {"name": name, "status": "warn",
+                "detail": f"non-canonical entrypoint {ep} (expected {expected}); "
+                          + " ".join(bits)}
+    return {"name": name, "status": "ok",
+            "detail": ("entrypoint=canonical " + " ".join(bits))}
+
+
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
     """Whether the gateway bridge's own sidecar says the connection is serving.
 
@@ -5446,6 +5718,178 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
 # operational" because nothing here looked at disk at all.
 DISK_WARN_GIB = 10.0
 DISK_FAIL_GIB = 2.0
+
+
+DAILY_LATE_TOLERANCE_MIN = 15
+DAILY_MISS_GRACE_MIN = 60
+
+
+def _interpret_daily_punctuality(jobs: list) -> dict:
+    """Score LATENESS, not presence: a file produced daily by another path looks
+    identical to one produced by a working schedule."""
+    name = "daily-cron-punctuality"
+    late, missed, unknown = [], [], []
+    for j in jobs:
+        due = j["hour"] * 60 + j["minute"]
+        if not j["artifacts"]:
+            unknown.append(j["name"])
+            continue
+        # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
+        # -1417 early. The filename date is logical, often a day off the mtime.
+        deltas = sorted(((w - due + 720) % 1440) - 720 for _, w in j["artifacts"])
+        median = statistics.median(deltas)
+        if median > DAILY_LATE_TOLERANCE_MIN:
+            late.append((j["name"], median, len(deltas)))
+        if (not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN
+                and not j.get("conditional")
+                and (j.get("stem_declared") or j["artifacts"])):
+            missed.append((j["name"], j["minutes_since_due"]))
+    if not late and not missed:
+        seen = len(jobs) - len(unknown)
+        detail = f"{seen} of {len(jobs)} daily job(s) observable"
+        detail += ", all on schedule" if seen else ""
+        if unknown:
+            detail += (f"; UNCHECKED (no dated artifact, cannot tell whether it ran): "
+                       f"{', '.join(sorted(unknown))}")
+        if unknown:
+            # `ok` would certify jobs nobody measured: on a 1-of-5 host the four
+            # UNCHECKED ones miss forever behind green. Coverage gates the verdict.
+            scope = "no coverage on this host" if not seen else \
+                    f"{len(unknown)} of {len(jobs)} unverifiable — status cannot be ok"
+            return {"name": name, "status": "warn", "detail": f"{detail} — {scope}"}
+        return {"name": name, "status": "ok", "detail": detail}
+    bits = []
+    for n, m, c in late:
+        bits.append(f"{n}: {c} run(s), median +{m} min late — the schedule is not what "
+                    f"produced these; something else is covering for it")
+    for n, m in missed:
+        bits.append(f"{n}: no output today, {m} min past due")
+    if unknown:
+        bits.append(f"unverifiable (no dated artifact): {', '.join(sorted(unknown))}")
+    return {"name": name, "status": "warn", "detail": "; ".join(bits)}
+
+
+def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
+    """(date, minute-of-day-written) for the newest `<stem>-YYYY-MM-DD.*` files."""
+    from datetime import datetime
+    out = []
+    if not results.is_dir():
+        return out
+    # rglob, not glob: delivered results are archived into MONTH buckets
+    # (results/archive/YYYY-MM/), so the durable copies sit two levels down.
+    for f in results.rglob(f"{stem}-20*"):
+        m = re.match(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})", f.name)
+        if not m:
+            continue
+        lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((m.group(1), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def _daily_completion_minutes(state: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-finished) from `state/<job>-YYYY-MM-DD.sentinel`.
+
+    Jobs that publish nothing dated into results/ still record completion here.
+    Prefer the body's ISO stamp; mtime is a fallback because a later touch
+    moves it while the recorded finish time cannot drift.
+    """
+    from datetime import datetime
+    out = []
+    if not state.is_dir():
+        return out
+    for f in state.glob(f"{job}-20*.sentinel"):
+        m = re.match(rf"{re.escape(job)}-(\d{{4}}-\d{{2}}-\d{{2}})\.sentinel$", f.name)
+        if not m:
+            continue
+        when = None
+        try:
+            # 3.9's fromisoformat rejects a `Z` suffix; and an aware stamp must be
+            # localised or its minute-of-day is UTC while cron times and mtime are local.
+            body = f.read_text(errors="ignore").strip()[:32].replace("Z", "+00:00")
+            when = datetime.fromisoformat(body)
+            if when.tzinfo is not None:
+                when = when.astimezone().replace(tzinfo=None)
+        except (OSError, ValueError):
+            when = None
+        if when is None:
+            try:
+                when = datetime.fromtimestamp(f.stat().st_mtime)
+            except OSError:  # pragma: no cover - file vanished between glob and stat
+                continue
+        out.append((m.group(1), when.hour * 60 + when.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def check_daily_cron_punctuality() -> dict:
+    """Report a daily job whose output never arrives at its scheduled time."""
+    from datetime import datetime, time as dtime
+    name = "daily-cron-punctuality"
+    ws = WORKSPACE_DIR
+    cfg = ws / "hosts" / _host_label() / "crons.json"
+    if not cfg.is_file():
+        return {"name": name, "status": "ok", "detail": "no per-host crons.json — skipped"}
+    try:
+        raw = json.loads(cfg.read_text())
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "ok", "detail": f"crons.json unreadable ({e}) — skipped"}
+    if isinstance(raw, list):
+        entries = raw
+    elif isinstance(raw, dict):
+        entries = raw.get("crons") or raw.get("jobs") or []
+    else:
+        # `1` is valid JSON: .get() on it aborted the whole always-on health run.
+        return {"name": name, "status": "ok",
+                "detail": f"crons.json root is {type(raw).__name__}, not a list or "
+                          f"object — skipped"}
+    now = datetime.now()
+    jobs, malformed = [], []
+    for e in entries:
+        # codex-task entries complete in another runtime that writes no sentinel.
+        if not isinstance(e, dict) or e.get("execution") == "codex-task":
+            continue
+        f = str(e.get("cron") or "").split()
+        if len(f) != 5 or not f[0].isdigit() or not f[1].isdigit():
+            continue
+        if f[2] != "*" or f[3] != "*" or f[4] != "*":
+            continue                       # not a plain every-day schedule
+        jname = str(e.get("name") or "?")
+        try:
+            # "61 24 * * *" is all digits and still invalid; dtime() would raise
+            # ValueError out of the always-on run_all_checks() path.
+            due = datetime.combine(now.date(), dtime(int(f[1]), int(f[0])))
+        except ValueError:
+            malformed.append(f"{jname} ({' '.join(f[:2])})")
+            continue
+        # A NAME is not an artifact: "talk-events-nightly" infers stem "nightly"
+        # and never sees its real fleet-growth-<date>.mp4 output.
+        declared = str(e.get("artifact") or "").strip()
+        stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
+        launchd = bool(e.get("launchd"))
+        # The launchd lane publishes no dated results file; its completion
+        # sentinel is the only dated record that it finished.
+        arts = (_daily_completion_minutes(ws / "state", jname) if launchd
+                else _daily_artifact_minutes(ws / "results", stem))
+        jobs.append({
+            "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
+            "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
+            "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
+            # `artifact` names a results file, so it cannot vouch for a sentinel:
+            # only an observed history makes a missing sentinel today actionable.
+            "stem": stem, "stem_declared": bool(declared) and not launchd,
+            # Renders only when new input exists, so a quiet day produces nothing
+            # and absence is evidence of nothing rather than of a miss.
+            "conditional": bool(e.get("conditional")),
+        })
+    if malformed:
+        return {"name": name, "status": "warn",
+                "detail": f"unparseable daily cron time(s): {', '.join(malformed)} — "
+                          f"fix the crons.json entry; punctuality unchecked for "
+                          f"{len(malformed)} job(s)"}
+    if not jobs:
+        return {"name": name, "status": "ok", "detail": "no plain-daily jobs — skipped"}
+    return _interpret_daily_punctuality(jobs)
 
 
 def check_disk_space() -> dict:
@@ -6126,15 +6570,17 @@ def check_proactive_quarantine() -> dict:
     the owner never saw was also destroyed — observed live here as
     `413 Payload Too Large (error code: 40005)`. The fix (#2626) moves the body
     to `results/undelivered/` instead of deleting it, which is strictly better
-    and still ends with nobody being told: a scan of the whole tree at that
+    but left the body with no consumer: a scan of the whole tree at that
     change's head finds the writer and **no reader at all**. The nearest
     candidate, `friction-detector.check_stale_results()`, is a stub that returns
     `[]` and is never called.
 
-    That is the shape this probe exists to close. Preservation without a reader
-    is a message that exists on disk and reaches no one — the same failure as
-    deletion from the owner's side, minus the recoverability. Losing it loudly
-    at least surfaces; losing it quietly does not.
+    That is the shape this probe exists to close, which makes it the reader —
+    so "nobody has been told" stopped being true the moment this shipped, and
+    saying it here or in what this probe emits invites the output to be quoted
+    back as independent evidence that no reader exists. What stays true is
+    narrower: nothing drains or re-drives the directory, so a preserved body
+    reaches no one until someone acts. Warning is not delivering.
 
     Deliberately NOT a failure: quarantine is the correct end state for a body
     Discord will never accept (a 413 never becomes a 200). The action is for a
@@ -6179,19 +6625,26 @@ def check_proactive_quarantine() -> dict:
         "name": name,
         "status": "warn",
         "detail": (f"{len(kept)} proactive message(s) kept in results/undelivered/ that Discord "
-                   f"refused — preserved, but nothing reads this directory, so nobody has been "
-                   f"told; oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
+                   f"refused — preserved, but no consumer drains this directory, so they stay "
+                   f"until someone acts; oldest {oldest_name} "
+                   f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
                    f"{partial}"),
     }
 
 
 def _ps_snapshot() -> "str | None":
-    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once."""
+    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once.
+
+    None means UNAVAILABLE, and that includes a `ps` that returned normally with
+    a nonzero exit: its empty stdout would otherwise read as a successful scan
+    that found nothing, which is the absence callers must not assert.
+    """
     try:
-        return subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5).stdout
+        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                              capture_output=True, text=True, timeout=5)
     except Exception:  # noqa: BLE001
         return None
+    return done.stdout if done.returncode == 0 else None
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
@@ -6374,17 +6827,27 @@ def check_task_watcher() -> dict:
     """
     name = "task-watcher"
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
-    if not _any_core_alive():
-        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
-    trees = _watcher_trees()
+    # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
+    # so take the snapshot here: None is unavailable, "" is genuinely empty.
+    ps_out = _ps_snapshot()
+    if ps_out is None:
+        return {"name": name, "status": "warn",
+                "detail": "cannot enumerate processes (ps unavailable) — watcher liveness is "
+                          "UNKNOWN, not clear; a dead or duplicate watcher would be invisible"}
+    # "Not expected" is a claim about THIS host, so it needs the local heartbeat
+    # and must not be made before enumerating: visible watchers outrank it.
+    trees = _watcher_trees(ps_out)
     roots = sorted(trees)
+    if not roots and _fresh_local_core_record() is None:
+        return {"name": name, "status": "ok",
+                "detail": "no local core running and no watcher processes — watcher not expected"}
     if not pid_file.exists():
         if roots:
             # Sentinel gone but watchers alive: they are draining tasks/ but
             # nothing supervises them, and each new start adds another (observed
             # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
             # duplicate processing, not a stalled queue).
-            ps_out = _ps_snapshot()
+
             # A KNOWN parent that is not init: its spawning session still owns it.
             # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
@@ -6575,6 +7038,56 @@ def _claim_ages(entries: list, workspace_dir: Path, now: float) -> tuple:
                 os.close(fd)
             except Exception:
                 pass
+
+
+def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
+    """A dual_read hit means C could not resolve an id the importer should have
+    covered — a finding, and the gate that blocks Design A's deletion."""
+    from datetime import datetime
+    name = "a-fallback-hits"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    hits = []
+    migrated = 0
+    for root in sorted(results.glob(".outbox*")):
+        counter = root / "a-fallback-hits.json"
+        if (root / ".items-migrated").is_dir():
+            migrated += 1
+            if not counter.is_file():
+                # Absence of evidence, not evidence of absence: a gate must not
+                # pass on an instrument that never ran (dual_read inits count 0).
+                hits.append(f"{root.name}: migrated but no counter — dual_read "
+                            "never ran here (instrument absent, not a measured zero)")
+                continue
+        if not counter.is_file():
+            continue
+        try:
+            rec = json.loads(counter.read_text(encoding="utf-8"))
+            if not isinstance(rec, dict):
+                raise ValueError("counter is not a JSON object")
+            count = int(rec.get("count", 0))
+        except (OSError, ValueError, TypeError):
+            hits.append(f"{root.name}: counter unreadable")
+            continue
+        if count > 0:
+            # fromtimestamp raises on domain garbage (inf/nan/1e30) that
+            # isinstance passes; a probe on the gate path must never raise.
+            try:
+                when_s = datetime.fromtimestamp(
+                    rec.get("last_hit_ts")).strftime("%m-%d %H:%M")
+            except (TypeError, ValueError, OSError, OverflowError):
+                when_s = "?"
+            hits.append(f"{root.name}: {count} hit(s), last {rec.get('last_item', '?')} at {when_s}")
+    if hits:
+        return {"name": name, "status": "warn",
+                "detail": "A-fallback (dual_read) HIT — importer coverage gap or "
+                          "phantom id; A deletion stays gated until a full release "
+                          "records zero new hits: " + "; ".join(hits)}
+    if migrated:
+        return {"name": name, "status": "ok",
+                "detail": f"no fallback hits — {migrated} migrated root(s), "
+                          "each with a live counter (measured zero)"}
+    return {"name": name, "status": "ok",
+            "detail": "no migrated outbox roots — dual-read window not active"}
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
@@ -8773,7 +9286,7 @@ def run_all_checks() -> list[dict]:
             if dev_bin.exists():
                 mark_stale_if_outdated(
                     check,
-                    REPO_DIR / "src" / "Sutando" / "main.swift",
+                    sutando_app_newest_source(),
                     "(Sutando|MacOS)/Sutando",
                     binary_path=dev_bin,
                 )
@@ -8811,9 +9324,12 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
+    checks.append(check_a_fallback_hits())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
+    checks.append(check_daily_cron_punctuality())
+    checks.append(check_runtime_identity())
     checks.append(check_disk_space())
 
     return checks
@@ -10237,7 +10753,7 @@ def main():
                     # here — the result string will say the restart failed.
                     result = fix_launchd(LAUNCHD_BACKED_CHECKS[c["name"]])  # pragma: no cover
                     print(f"  {c['name']}: {result}")  # pragma: no cover
-                elif c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge"):  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
+                elif c["name"] in DOWN_BRIDGE_DETAILS:  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
                     # LoginFailure means the token is bad — restarting won't help
                     # and would create a duplicate alongside the launchd-managed one.
                     if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):
@@ -10288,7 +10804,7 @@ def main():
                     #      observed 3 concurrent on 2026-04-19), so we
                     #      defer that path to a manual rebuild + relaunch.
                     binary = REPO_DIR / "src" / "Sutando" / "Sutando"
-                    source = REPO_DIR / "src" / "Sutando" / "main.swift"
+                    source = sutando_app_newest_source()
                     if (
                         c.get("status") == "warn"
                         and "not running" in (c.get("detail") or "")

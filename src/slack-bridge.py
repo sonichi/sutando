@@ -64,7 +64,7 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import fallback_claims_name  # noqa: E402
+from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
 
 
 def _slack_claims_name(name: str) -> bool:
@@ -82,7 +82,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
@@ -170,7 +170,7 @@ if not BOT_TOKEN or not APP_TOKEN:
 # silently dropped files other bridges would send). Slack extends it with its
 # OWN inbound dir so an uploaded file can be echoed back; that root stays
 # Slack-local rather than becoming global.
-from send_allowlist import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
+from policy.egress.attachment import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
 
 
 def _is_path_sendable(fpath: str) -> bool:
@@ -1606,16 +1606,13 @@ def result_watcher():
                         _record_skip_audit(delivery_id, "deduped")
                         f.unlink(missing_ok=True)
                         continue
-                    # Peek before claiming: skip Discord-targeted proactive files.
-                    # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                    # claiming it here dumps the literal text to Slack DM instead.
-                    # Leave it for discord-bridge to claim. (#1401)
+                    # Peek before claiming: a body addressed to another bridge
+                    # is delivered by that bridge, not dumped here as literal text.
                     try:
                         peek = f.read_text(errors="ignore").lstrip()
                     except OSError:
                         continue
-                    if peek.startswith("[channel:") and \
-                            re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                    if not body_claimable_by(peek, "slack"):
                         continue
                     # Explicit filename destination outranks the race.
                     if not _slack_claims_name(f.name):

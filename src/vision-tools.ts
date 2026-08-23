@@ -39,7 +39,9 @@ const execFileAsync = promisify(execFile);
 const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
-export const VISION_MIN_SEND_INTERVAL_MS = 900;
+// Push-path floor for the documented 1 fps cap: MAX_FPS below bounds only the
+// pull ticker (#3089 deferred this gate to #3090, which never landed it).
+export const VISION_MIN_SEND_INTERVAL_MS = 1000;
 // https://ai.google.dev/gemini-api/docs/live-api — video is sampled at 1 fps.
 // Cite it: the repo states this rate nowhere else, so an uncited literal here
 // would be unfalsifiable for the next reader.
@@ -207,6 +209,61 @@ export async function ensureScreenCaptureServer(): Promise<void> {
 	}
 }
 
+/**
+ * Which `screencapture -D<n>` display this session watches. Chosen once and held
+ * for the session: a stream that follows the frontmost screen would silently
+ * change what the user is being watched on mid-conversation.
+ */
+let _sessionDisplay: number | null = null;
+
+export function getSessionDisplay(): number | null {
+	return _sessionDisplay;
+}
+
+/** Exported for tests; the session choice is otherwise set only via start_vision. */
+export function setSessionDisplay(display: number | null): void {
+	_sessionDisplay = display;
+}
+
+export type DisplayInfo = { index: number; width: number; height: number; name?: string; is_main?: boolean };
+
+/** Ask the capture server which displays are attached. Empty list on any failure. */
+export async function listDisplays(): Promise<DisplayInfo[]> {
+	await ensureScreenCaptureServer();
+	const tok = readCaptureToken();
+	const res = await fetch('http://localhost:7845/displays', tok ? { headers: { 'X-Sutando-Capture-Token': tok } } : {});
+	const data = (await res.json()) as { status?: string; displays?: DisplayInfo[] };
+	return data.status === 'ok' && Array.isArray(data.displays) ? data.displays : [];
+}
+
+/** "2: U28E510 3840x2160" — what the model reads back to the user. */
+export function describeDisplay(d: DisplayInfo): string {
+	const label = d.name ? `${d.name}` : `Display ${d.index}`;
+	return `${d.index}: ${label}${d.is_main ? ' (main)' : ''} ${d.width}x${d.height}`;
+}
+
+export type DisplayGate =
+	| { kind: 'use'; display: number | null }
+	| { kind: 'ask'; displays: DisplayInfo[] };
+
+/**
+ * Decide whether the user still has a display choice to make.
+ *
+ * Asking is only worth a turn when the answer can differ, so a single display
+ * (or an enumeration that failed, giving an empty list) resolves silently
+ * rather than blocking the stream on a question with one answer.
+ */
+export function decideDisplayGate(
+	sessionDisplay: number | null,
+	requested: number | undefined,
+	displays: DisplayInfo[],
+): DisplayGate {
+	if (requested !== undefined) return { kind: 'use', display: requested };
+	if (sessionDisplay !== null) return { kind: 'use', display: sessionDisplay };
+	if (displays.length > 1) return { kind: 'ask', displays };
+	return { kind: 'use', display: displays.length === 1 ? displays[0].index : null };
+}
+
 const screenSource: VisionSource = {
 	name: 'screen',
 	async capture() {
@@ -219,8 +276,11 @@ const screenSource: VisionSource = {
 		// own process (P7 D7.4: compression never competes with this event
 		// loop) to the ~720p/q0.6 budget before the file comes back.
 		const _capTok = readCaptureToken();
+		// Without this the server captures its default display, so on a multi-display
+		// Mac the stream shows a screen the user did not pick.
+		const _display = _sessionDisplay !== null ? `&display=${_sessionDisplay}` : '';
 		const res = await fetch(
-			`http://localhost:7845/capture?format=jpeg&silent=true&maxdim=${VISION_FRAME_MAX_DIM}&quality=${VISION_FRAME_JPEG_QUALITY}`,
+			`http://localhost:7845/capture?format=jpeg&silent=true&maxdim=${VISION_FRAME_MAX_DIM}&quality=${VISION_FRAME_JPEG_QUALITY}${_display}`,
 			_capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {},
 		);
 		const data = (await res.json()) as { status: string; path?: string; error?: string };
@@ -1007,10 +1067,11 @@ export const startVisionTool: ToolDefinition = {
 	parameters: z.object({
 		source: z.string().optional().describe("Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."),
 		fps: z.number().optional().describe('Frames per second, 0.1–1.0 (Gemini Live caps video at 1 fps). Default 1. Webcam may not keep up above 0.5.'),
+		display: z.number().optional().describe('Which display to watch, as its index from the needs_display_choice list. Only for source=screen, and only needed on a multi-display Mac. Held for the rest of the session once set.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { source: sourceName, fps } = (args ?? {}) as { source?: string; fps?: number };
+		const { source: sourceName, fps, display } = (args ?? {}) as { source?: string; fps?: number; display?: number };
 		if (!getSendFile()) {
 			return { status: 'failed', error: 'No active voice session — vision streaming requires a connected session.' };
 		}
@@ -1031,8 +1092,34 @@ export const startVisionTool: ToolDefinition = {
 		}
 		try {
 			const source = resolveSource(sourceName);
+			if (source.name === 'screen') {
+				// Enumeration is best-effort: if it fails the gate sees an empty list
+				// and streams the default display rather than refusing to start.
+				const known = display === undefined && _sessionDisplay === null
+					? await listDisplays().catch(() => [] as DisplayInfo[])
+					: [];
+				const gate = decideDisplayGate(_sessionDisplay, display, known);
+				if (gate.kind === 'ask') {
+					return {
+						status: 'needs_display_choice',
+						displays: gate.displays,
+						note:
+							'This Mac has more than one display and screencapture would default to one of them. ' +
+							'Ask the user which to watch, then call start_vision again with display=<index>. ' +
+							'The choice is held for the rest of the session. Options — ' +
+							gate.displays.map(describeDisplay).join('; '),
+					};
+				}
+				_sessionDisplay = gate.display;
+			}
 			const info = startStream(source, fps ?? DEFAULT_FPS);
-			return { status: 'streaming', source: source.name, fps: info.fps, intervalMs: info.intervalMs };
+			return {
+				status: 'streaming',
+				source: source.name,
+				fps: info.fps,
+				intervalMs: info.intervalMs,
+				...(source.name === 'screen' && _sessionDisplay !== null ? { display: _sessionDisplay } : {}),
+			};
 		} catch (err) {
 			console.error(`${ts()} [Vision] startVisionTool threw: ${(err as Error)?.message ?? err}`);
 			return { status: 'failed', error: 'startStream failed' };

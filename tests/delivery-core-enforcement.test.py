@@ -60,7 +60,7 @@ class _KeyRecorder:
             raise out
         return DeliveryReceipt(outcome=out)
 
-    def reconcile(self, item_id, idempotency_key):
+    def reconcile(self, attempt):
         return None
 
 
@@ -160,6 +160,11 @@ class StaticKeyScan(unittest.TestCase):
                     key_arg = kw.get("idempotency_key")
                     if key_arg is None and node.args:
                         key_arg = node.args[-1]
+                    # reconcile takes DeliveryAttempt(...): the invariant moves
+                    # INSIDE the constructor — its key field must be derived.
+                    if isinstance(key_arg, ast.Call) and                             isinstance(key_arg.func, ast.Name) and                             key_arg.func.id == "DeliveryAttempt":
+                        akw = {k.arg: k.value for k in key_arg.keywords if k.arg}
+                        key_arg = akw.get("idempotency_key") or                             (key_arg.args[-1] if key_arg.args else None)
                     if key_arg is None:
                         # Unrecognised shape: fail closed, never `continue`.
                         bad.append(f"{src.name}:{node.lineno} (no key arg found)")
@@ -192,7 +197,7 @@ class _LeaseProvider:
         return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
                                provider_ref="rcpt-1")
 
-    def reconcile(self, item_id, idempotency_key):
+    def reconcile(self, attempt):
         return DeliveryReceipt(
             outcome=DeliveryOutcome.CONFIRMED if self.provider_confirmed
             else DeliveryOutcome.NOT_DELIVERED, provider_ref="rcpt-1")
@@ -419,6 +424,44 @@ class CreateExclusive(unittest.TestCase):
                 self.assertEqual(len(winners), 1, f"winners={winners}")
                 self.assertEqual(dst.read_bytes(), winners[0].encode(),
                                  "destination must hold the winner's bytes")
+
+
+class ReconcileSignatureAgreesWithContract(unittest.TestCase):
+    """Every `reconcile` in the tree takes the DeliveryAttempt the contract declares.
+
+    A Protocol check cannot catch this: `isinstance(obj, DeliveryProvider)`
+    is True for a provider whose `reconcile` still takes `(item_id, key)`, so
+    the mismatch only surfaces as a TypeError at call time — after the claim is
+    held and before `backend.complete()`, which wedges the item. It is also
+    invisible to a branch's own CI, because the stale adapter can arrive on main
+    while the contract change sits on the topic.
+    """
+
+    def test_no_bare_id_reconcile_survives_anywhere(self):
+        repo = Path(__file__).resolve().parent.parent
+        roots = [repo / "src", repo / "packages", repo / "tests"]
+        offenders, scanned = [], 0
+        for root in roots:
+            for path in root.rglob("*.py"):
+                try:
+                    tree = ast.parse(path.read_text(encoding="utf-8"))
+                except (SyntaxError, UnicodeDecodeError):
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    if node.name != "reconcile":
+                        continue
+                    scanned += 1
+                    args = [a.arg for a in node.args.args if a.arg != "self"]
+                    if args != ["attempt"]:
+                        offenders.append(
+                            f"{path.relative_to(repo)}:{node.lineno} takes {args}")
+        # A zero scan would pass vacuously; the contract itself is one definition.
+        self.assertGreater(scanned, 1,
+                           "scanner found almost no reconcile defs — it narrowed")
+        self.assertEqual(offenders, [],
+                         "reconcile must take (self, attempt): " + "; ".join(offenders))
 
 
 if __name__ == "__main__":
