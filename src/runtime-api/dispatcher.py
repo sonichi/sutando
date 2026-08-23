@@ -248,6 +248,9 @@ class RuntimeDispatcher:
                                     "identity surface is not configured on this daemon")
             if method == "sutando.stand":
                 return self.identity.stand_card(bool(params.get("details")))
+            if method == "sutando.resolve":
+                return self.identity.resolve(str(params.get("provider") or ""),
+                                             str(params.get("subject") or ""))
             fn = {"sutando.info": self.identity.info,
                   "sutando.entrances": self.identity.entrances,
                   "sutando.status": self.identity.status,

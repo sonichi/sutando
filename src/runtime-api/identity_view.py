@@ -114,6 +114,46 @@ class IdentityView:
             out.append(row)
         return out
 
+    # ── sutando.resolve ─────────────────────────────────────────────────────
+    def resolve(self, provider: str, subject: str) -> dict:
+        # Reverse index over EntranceLink records. Ambiguity is a loud,
+        # structured error — never auto-pick between Stands.
+        sid = subject.rsplit(":", 1)[-1].strip()
+        hits = []
+        for lk in self._all_links():
+            if lk.get("provider") != provider or lk.get("status") != "active":
+                continue
+            subj = lk.get("provider_subject") or {}
+            if str(subj.get("id", "")) == sid:
+                hits.append(lk)
+        stands = sorted({lk.get("stand_id", "") for lk in hits})
+        if not hits:
+            return {"resolved": False, "provider": provider, "subject": subject}
+        if len(stands) > 1:
+            return {"resolved": False, "conflict": True,
+                    "provider": provider, "subject": subject,
+                    "candidates": [
+                        {"stand_id": lk.get("stand_id"),
+                         "link_id": lk.get("link_id"),
+                         "verification": lk.get("verification")}
+                        for lk in hits]}
+        lk = hits[0]
+        return {"resolved": True, "stand_id": lk.get("stand_id"),
+                "link": {"link_id": lk.get("link_id"),
+                         "provider": provider,
+                         "provider_subject": lk.get("provider_subject"),
+                         "display": lk.get("display"),
+                         "status": lk.get("status"),
+                         "verification": lk.get("verification")}}
+
+    def _all_links(self) -> list:
+        try:
+            data = json.loads(
+                (self.state_dir / "auth" / "entrance-links.json").read_text())
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
     # ── sutando.entrances ───────────────────────────────────────────────────
     def entrances(self, details: bool = False) -> dict:
         # I1 evidence projection: folder facts only, no provider calls and
@@ -169,12 +209,7 @@ class IdentityView:
         return ent
 
     def _active_link(self, provider: str) -> "dict | None":
-        try:
-            data = json.loads(
-                (self.state_dir / "auth" / "entrance-links.json").read_text())
-        except (OSError, ValueError):
-            return None
-        for lk in data if isinstance(data, list) else []:
+        for lk in self._all_links():
             if lk.get("provider") == provider and lk.get("status") == "active":
                 return lk
         return None

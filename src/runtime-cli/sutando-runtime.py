@@ -646,6 +646,40 @@ def _print_entrance_rows(ents: list, width: int) -> None:
             print(f"    {'storage'.ljust(width)}{st['directory']}")
 
 
+def _print_resolve(result: dict) -> int:
+    if result.get("conflict"):
+        print("error: provider identity is linked to multiple Stands",
+              file=sys.stderr)
+        for c in result.get("candidates", []):
+            ver = (c.get("verification") or {}).get("method", "unverified")
+            print(f"  {c.get('stand_id','?')} — {ver}", file=sys.stderr)
+        print("manual resolution required", file=sys.stderr)
+        return 3
+    if not result.get("resolved"):
+        print(f"not linked: {result.get('provider')} "
+              f"{result.get('subject')}", file=sys.stderr)
+        return 1
+    lk = result.get("link") or {}
+    width = 12
+    print(f"{'Stand'.ljust(width)}{result.get('stand_id','')}")
+    print(f"{'Provider'.ljust(width)}{lk.get('provider','')}")
+    subj = lk.get("provider_subject") or {}
+    sv = subj.get("id", "")
+    if subj.get("type"):
+        sv = f"{subj['type']}:{sv}"
+    print(f"{'Subject'.ljust(width)}{sv}")
+    disp = (lk.get("display") or {}).get("name")
+    if disp:
+        print(f"{'Display'.ljust(width)}{disp}")
+    print(f"{'Link'.ljust(width)}{lk.get('link_id','')}")
+    print(f"{'Status'.ljust(width)}{lk.get('status','')}")
+    ver = lk.get("verification") or {}
+    if ver.get("method"):
+        print(f"{'Verified'.ljust(width)}{ver['method']}"
+              + (f", {ver['verified_at']}" if ver.get("verified_at") else ""))
+    return 0
+
+
 def _print_stand_card(card: dict, section: "str | None") -> int:
     stand = card.get("stand") or {}
     if section == "id":
@@ -778,7 +812,8 @@ def main(argv=None) -> int:
     std = idn.add_parser("stand")
     std.add_argument("sub", nargs="?",
                      choices=["id", "owner", "entrances", "devices",
-                              "instances"])
+                              "instances", "resolve"])
+    std.add_argument("extra", nargs="*")
     std.add_argument("--json", action="store_true", dest="as_json")
     std.add_argument("--details", action="store_true", dest="details")
 
@@ -952,11 +987,26 @@ def main(argv=None) -> int:
                                 timeout=15))
         elif args.group == "sutando":
             params = {}
-            if args.cmd == "stand" and getattr(args, "details", False):
-                params = {"details": True}
-            result = _rpc(f"sutando.{args.cmd}", params, timeout=15)
+            method = f"sutando.{args.cmd}"
+            if args.cmd == "stand":
+                if getattr(args, "details", False):
+                    params["details"] = True
+                if args.sub == "resolve":
+                    if len(getattr(args, "extra", []) or []) != 2:
+                        print("usage: sutando stand resolve <provider> <subject>",
+                              file=sys.stderr)
+                        return 2
+                    method = "sutando.resolve"
+                    params = {"provider": args.extra[0],
+                              "subject": args.extra[1]}
+            result = _rpc(method, params, timeout=15)
             if args.cmd == "stand" and not args.as_json:
-                return _print_stand_card(result, getattr(args, "sub", None))
+                if args.sub == "resolve":
+                    return _print_resolve(result)
+                return _print_stand_card(result, args.sub)
+            if args.cmd == "stand" and args.sub == "resolve"                     and not result.get("resolved"):
+                print(json.dumps(result, ensure_ascii=False, indent=1))
+                return 1
         elif args.group == "runtime":
             result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)
         elif args.group == "human-action":

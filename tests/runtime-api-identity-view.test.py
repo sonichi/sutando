@@ -350,6 +350,58 @@ class TestEntranceLinks(unittest.TestCase):
             self.assertNotIn("tok-sekret", hay)
 
 
+class TestResolve(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        (self.state / "auth").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_links(self, links):
+        (self.state / "auth" / "entrance-links.json").write_text(
+            json.dumps(links))
+
+    def test_forward_hit_and_subject_prefix_forms(self):
+        self._write_links([{
+            "link_id": "link_x", "provider": "discord", "status": "active",
+            "stand_id": "@stand:ag2.space",
+            "provider_subject": {"type": "bot_user", "id": "123"},
+            "display": {"name": "sutando-bot"},
+            "verification": {"method": "discord_token_introspection",
+                             "verified_at": "t"}}])
+        v = _mk(self.state)
+        for subject in ("123", "bot:123", "bot_user:123"):
+            out = v.resolve("discord", subject)
+            self.assertTrue(out["resolved"], subject)
+            self.assertEqual(out["stand_id"], "@stand:ag2.space")
+        self.assertEqual(v.resolve("discord", "123")["link"]["display"],
+                         {"name": "sutando-bot"})
+
+    def test_no_match_and_revoked_excluded(self):
+        self._write_links([{
+            "link_id": "l", "provider": "discord", "status": "revoked",
+            "stand_id": "@s:x",
+            "provider_subject": {"type": "bot_user", "id": "123"}}])
+        out = _mk(self.state).resolve("discord", "123")
+        self.assertFalse(out["resolved"])
+        self.assertNotIn("conflict", out)
+
+    def test_multi_stand_conflict_is_loud_never_autopicked(self):
+        self._write_links([
+            {"link_id": "a", "provider": "discord", "status": "active",
+             "stand_id": "@s1:x",
+             "provider_subject": {"type": "bot_user", "id": "123"}},
+            {"link_id": "b", "provider": "discord", "status": "active",
+             "stand_id": "@s2:x",
+             "provider_subject": {"type": "bot_user", "id": "123"}}])
+        out = _mk(self.state).resolve("discord", "123")
+        self.assertFalse(out["resolved"])
+        self.assertTrue(out["conflict"])
+        self.assertEqual(len(out["candidates"]), 2)
+
+
 class TestEnrolledActorFallback(unittest.TestCase):
     def test_enrolled_identity_beats_local_agent_fallback(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent

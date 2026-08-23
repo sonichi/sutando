@@ -69,6 +69,7 @@ METHODS = (
     "sutando.info",
     "sutando.stand",
     "sutando.entrances",
+    "sutando.resolve",
     "sutando.status",
     "sutando.owner",
     "sutando.allowlist",
