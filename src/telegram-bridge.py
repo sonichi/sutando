@@ -683,16 +683,23 @@ def log_privacy_setting(get_me):
         return f"[Telegram] privacy-setting: getMe failed ({e}) — setting unknown"
     if not me:
         return "[Telegram] privacy-setting: getMe returned no result — setting unknown"
+    BOT_EXCEPTION = (
+        "one exception applies regardless: Telegram never delivers a message sent by "
+        "another bot, even to an administrator or with privacy mode off "
+        "(https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)"
+    )
     if me.get("can_read_all_group_messages"):
         return ("[Telegram] privacy-setting: privacy mode OFF (BotFather, bot-wide) — "
-                "all group messages are delivered to this bot")
+                f"all group messages from human senders are delivered to this bot; "
+                f"{BOT_EXCEPTION}")
     return (
         "[Telegram] privacy-setting: privacy mode ON (BotFather, bot-wide). In a group where "
         f"@{me.get('username') or 'this bot'} is NOT an administrator it receives only "
         "commands addressed to it (/command@bot), replies to its own messages, messages sent "
         "via it inline, and general commands when it posted last — a plain @username mention "
-        "is NOT delivered. Where it IS a group administrator it receives everything regardless "
-        "of this setting, so this flag alone does not describe any particular group's reach"
+        "is NOT delivered. Where it IS a group administrator it receives everything from human "
+        f"senders regardless of this setting, so this flag alone does not describe any "
+        f"particular group's reach; {BOT_EXCEPTION}"
     )
 
 

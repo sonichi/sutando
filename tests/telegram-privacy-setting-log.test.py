@@ -65,6 +65,13 @@ check("says the flag does not describe a particular group's reach",
       "does not describe" in on and "reach" in on)
 check("scopes the setting as bot-wide", "bot-wide" in on and "bot-wide" in off)
 
+# CONTROL 3 — Telegram never delivers a bot-sent message, even to an admin bot
+# or with privacy off; both branches must qualify their claim accordingly.
+check("privacy-OFF branch does not claim ALL messages are delivered (bot senders excepted)",
+      "from human senders are delivered" in off and "never delivers a message sent by" in off)
+check("privacy-ON/administrator branch carries the same bot-sender exception",
+      "never delivers a message sent by" in on)
+
 # Failure modes must report unknown, never a clean OFF.
 raised = tb.log_privacy_setting(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
 check("getMe raising is reported as unknown, not OFF",
