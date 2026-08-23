@@ -75,5 +75,43 @@ class LiveCoreInstances(unittest.TestCase):
             self.assertFalse(self.hc._live_core_instances(ws))
 
 
+class ProbeVerdictIsPoolAware(unittest.TestCase):
+    """Drives the REAL check_task_watcher(), not the helper.
+
+    The helper-only tests below pass even with the production branch disabled —
+    a reviewer proved it with `if False and len(cores) > 1`. Only calling the
+    function pins the decision this fix exists to make.
+    """
+
+    def _verdict(self, core_names):
+        hc = _load()
+        td = tempfile.mkdtemp()
+        ws = Path(td)
+        (ws / "state" / "cores").mkdir(parents=True)
+        for n in core_names:
+            (ws / "state" / "cores" / f"{n}.alive").write_text("{}")
+        (ws / "state" / "watch-tasks-stream.pid").write_text("100")
+        hc.WORKSPACE_DIR = ws
+        # Only the OS-facing edges are stubbed; the decision under test is real.
+        hc._watcher_trees = lambda ps_output=None: {
+            "100": ["100"], "200": ["200"], "300": ["300"], "400": ["400"]}
+        hc._proc_argv = lambda pid: "bash src/watch-tasks-stream.sh"
+        hc._any_core_alive = lambda *a, **k: True
+        return hc.check_task_watcher()["detail"]
+
+    def test_pool_verdict_never_advises_stopping_the_extras(self):
+        d = self._verdict(["core-1", "core-2", "core-3", "main"])
+        self.assertNotIn("stop the rest", d,
+                         "multi-core verdict must not advise killing live watchers")
+        self.assertIn("DO NOT stop", d)
+        self.assertIn("4 cores are live", d)
+
+    def test_single_core_still_gets_the_duplicate_stop_advice(self):
+        """Positive control: the original advice is correct when one core runs."""
+        d = self._verdict(["main"])
+        self.assertIn("stop the rest", d)
+        self.assertNotIn("DO NOT stop", d)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
