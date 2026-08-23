@@ -57,7 +57,8 @@ class PoolInstallerHarness(unittest.TestCase):
                     repo / "src" / "launchd" / "com.sutando.pool-lead.plist")
         for w in ("pool-core-wrapper.sh", "pool-follower-beat.sh",
                   "pool-lead-wrapper.sh", "pool-lead-daemon.py",
-                  "kick-pool.sh"):
+                  "kick-pool.sh", "pool-runtime-drive.sh",
+                  "uninstall-core-pool.sh"):
             shutil.copy(REPO / "scripts" / w, repo / "scripts" / w)
         _write_exec(repo / "scripts" / "sutando-config.sh",
                     STUB_CONFIG.format(config_dir_body=config_dir_body))
@@ -73,8 +74,13 @@ class PoolInstallerHarness(unittest.TestCase):
         (home / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
         binstub = td / "bin"
         binstub.mkdir(exist_ok=True)
-        for name in ("launchctl", "tmux", "claude", "codex"):
+        for name in ("tmux", "claude", "codex"):
             _write_exec(binstub / name, "#!/bin/bash\nexit 0\n")
+        # Recording stub: which jobs a run actually touched is the contract for
+        # --only-core, and "exit 0" cannot answer it.
+        _write_exec(binstub / "launchctl",
+                    '#!/bin/bash\n[ -n "${LAUNCHCTL_LOG:-}" ] && '
+                    'printf "%s\\n" "$*" >> "$LAUNCHCTL_LOG"\nexit 0\n')
         ws = td / "ws"
         ws.mkdir(exist_ok=True)
         env = dict(
@@ -480,6 +486,102 @@ class RuntimeDimensionTest(PoolInstallerHarness):
             binstub = env["PATH"].split(":")[0]
             self.assertIn(f"core-1 runtime=claude bin={binstub}/claude", r.stdout)
             self.assertIn(f"core-2 runtime=codex bin={binstub}/codex", r.stdout)
+
+
+class SingleCoreLifecycleTest(PoolInstallerHarness):
+    """Turning one follower on or off must not restart the working pool."""
+
+    def install_pool(self, td: Path, *args):
+        resolved = td / "resolved-ccd"
+        repo = self.make_repo(td, config_dir_body=f"printf '%s' '{resolved}'")
+        env, home, ws = self.make_env(td)
+        r = self.run_installer(repo, env, *args)
+        self.assertEqual(r.returncode, 0, f"{r.stdout}\n{r.stderr}")
+        return repo, env, home, ws
+
+    def core_env(self, home: Path, i: int):
+        p = home / "Library" / "LaunchAgents" / f"com.sutando.core-{i}.plist"
+        return plistlib.loads(p.read_bytes())["EnvironmentVariables"]
+
+    def test_shared_drive_library_is_staged_beside_the_scripts(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            _, _, home, _ = self.install_pool(td, "1")
+            lib = home / ".sutando" / "bin" / "pool-runtime-drive.sh"
+            self.assertTrue(lib.exists(),
+                            "kick-pool resolves it as a sibling of its staged self")
+            self.assertTrue(os.access(lib, os.X_OK))
+
+    def test_only_core_converts_one_follower_and_leaves_the_rest_loaded(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            repo, env, home, _ = self.install_pool(td, "3")
+            agents = home / "Library" / "LaunchAgents"
+            before = {n: (agents / n).read_bytes()
+                      for n in ("com.sutando.core-1.plist",
+                                "com.sutando.core-3.plist",
+                                "com.sutando.pool-lead.plist")}
+            log = td / "launchctl.log"
+            env2 = dict(env, LAUNCHCTL_LOG=str(log))
+            r = self.run_installer(repo, env2, "--only-core=2",
+                                   "--core-runtime=2:codex")
+            self.assertEqual(r.returncode, 0, f"{r.stdout}\n{r.stderr}")
+            self.assertEqual(self.core_env(home, 2)["POOL_RUNTIME"], "codex")
+            self.assertEqual(self.core_env(home, 2)["SUTANDO_CORE_POOL_SIZE"], "3",
+                             "an inferred pool size must match the installed pool")
+            for n, body in before.items():
+                self.assertEqual((agents / n).read_bytes(), body,
+                                 f"{n} was rewritten by a single-core refresh")
+            touched = log.read_text()
+            for label in ("com.sutando.pool-lead", "com.sutando.core-1",
+                          "com.sutando.core-3"):
+                self.assertNotIn(label, touched,
+                                 f"--only-core restarted {label}")
+            self.assertIn("com.sutando.core-2", touched)
+
+    def test_only_core_outside_the_pool_is_an_error(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            repo, env, home, _ = self.install_pool(td, "2")
+            r = self.run_installer(repo, env, "2", "--only-core=5")
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertIn("outside the pool", r.stderr)
+
+    def test_uninstall_only_core_removes_plist_session_and_beat(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            repo, env, home, ws = self.install_pool(td, "2")
+            cores = ws / "state" / "cores"
+            cores.mkdir(parents=True, exist_ok=True)
+            for i in (1, 2):
+                (cores / f"core-{i}.alive").write_text("{}")
+            r = subprocess.run(
+                ["bash", str(repo / "scripts" / "uninstall-core-pool.sh"),
+                 "--only-core=2"],
+                env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            agents = home / "Library" / "LaunchAgents"
+            self.assertFalse((agents / "com.sutando.core-2.plist").exists())
+            self.assertTrue((agents / "com.sutando.core-1.plist").exists(),
+                            "a single-core teardown must not remove the pool")
+            self.assertTrue((agents / "com.sutando.pool-lead.plist").exists())
+            self.assertFalse((cores / "core-2.alive").exists(),
+                             "a stale beat keeps the lead assigning to a ghost")
+            self.assertTrue((cores / "core-1.alive").exists())
+
+    def test_uninstall_only_core_clears_state_left_by_a_hand_built_core(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            repo, env, home, ws = self.install_pool(td, "1")
+            cores = ws / "state" / "cores"
+            cores.mkdir(parents=True, exist_ok=True)
+            (cores / "core-4.alive").write_text("{}")
+            r = subprocess.run(
+                ["bash", str(repo / "scripts" / "uninstall-core-pool.sh"),
+                 "--only-core=4"],
+                env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse((cores / "core-4.alive").exists())
 
 
 if __name__ == "__main__":

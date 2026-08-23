@@ -4,14 +4,21 @@
 set -u
 SESSION="core-${SUTANDO_CORE_ID}"
 
+# Per-runtime session-driving policy has ONE owner; this wrapper is an adapter.
+DRIVE_LIB="$(dirname "$0")/pool-runtime-drive.sh"
+if ! [ -r "$DRIVE_LIB" ]; then
+  echo "pool-core-wrapper: missing $DRIVE_LIB — re-run scripts/install-core-pool.sh" >&2
+  exit 2
+fi
+# shellcheck source=./pool-runtime-drive.sh
+. "$DRIVE_LIB"
+
 # Runtime dimension: the installer declares it per core. A plist written before
 # the dimension existed carries only POOL_CLAUDE_BIN, so default to claude.
 POOL_RUNTIME="${POOL_RUNTIME:-claude}"
 POOL_RUNTIME_BIN="${POOL_RUNTIME_BIN:-${POOL_CLAUDE_BIN:-}}"
 
-# Codex has no slash-command surface, so the pool-mode entry is a prompt. Keep
-# it pointing at CODEX.md rather than restating the claim -> finish protocol.
-POOL_CODEX_ENTRY="Sutando pool mode. You are core-${SUTANDO_CORE_ID}. Do not read task files or write results/ directly — follow skills/proactive-loop-pool/CODEX.md: acquire work first, and complete only through the finish helper."
+POOL_CODEX_ENTRY="$(pool_drive_nudge_text codex "$SUTANDO_CORE_ID")"
 
 case "$POOL_RUNTIME" in
   claude)
@@ -68,26 +75,9 @@ BEAT=$!
 # Sweep nudge: the in-session cron expires after 7 days and the watcher can
 # miss events; this keystroke is the durable backstop (same pattern as the
 # app's checkWatcher). A duplicate sweep is a no-op (acquire returns None).
-send_nudge() {
-  case "$POOL_RUNTIME" in
-    codex)
-      # Codex input is not a durable queue — typing into a running turn can
-      # interleave, so leave the nudge unspent and retry on the next poll.
-      if "$POOL_TMUX_BIN" capture-pane -p -t "$SESSION" 2>/dev/null \
-          | tail -12 | grep -Fq 'esc to interrupt'; then
-        return 1
-      fi
-      "$POOL_TMUX_BIN" send-keys -t "$SESSION" -l -- "$POOL_CODEX_ENTRY" 2>/dev/null
-      # Codex's TUI submits on C-m; the symbolic Enter can stage without sending.
-      sleep 0.15
-      "$POOL_TMUX_BIN" send-keys -t "$SESSION" C-m 2>/dev/null
-      ;;
-    *)
-      "$POOL_TMUX_BIN" send-keys -t "$SESSION" "/proactive-loop-pool pass" Enter 2>/dev/null
-      ;;
-  esac
-  return 0
-}
+# The keystroke policy itself belongs to pool-runtime-drive.sh; this function
+# is only this wrapper's tmux binding.
+pool_tmux() { "$POOL_TMUX_BIN" "$@" 2>/dev/null; }
 
 NUDGE_S="${SUTANDO_POOL_SWEEP_NUDGE_S:-$NUDGE_DEFAULT}"
 LAST_NUDGE=$(date +%s)
@@ -95,7 +85,7 @@ while "$POOL_TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; do
   sleep "${SUTANDO_POOL_SESSION_POLL:-30}"
   NOW=$(date +%s)
   if [ $((NOW - LAST_NUDGE)) -ge "$NUDGE_S" ]; then
-    if send_nudge; then
+    if pool_drive_nudge "$POOL_RUNTIME" "$SESSION" pool_tmux "$SUTANDO_CORE_ID"; then
       LAST_NUDGE=$NOW
     fi
   fi

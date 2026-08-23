@@ -162,3 +162,38 @@ claims. `SUTANDO_AFFINITY_BUSY_MAX` (default 3) sets how backlogged a channel's
 handler must be before affinity yields — lower favors latency, higher favors
 conversational continuity; `continuity_breaks` in the pool metrics measures
 what that choice costs.
+
+### Turning on a Codex follower
+
+The runtime dimension (`--runtime` / `--core-runtime`) declares which CLI a core
+runs. Two things make it usable on a running pool:
+
+    # convert core 2 to codex, in place — the lead and cores 1,3 keep working
+    bash scripts/install-core-pool.sh --only-core=2 --core-runtime=2:codex
+
+    # remove it again — plist, tmux session AND the stale beat, in one step
+    bash scripts/uninstall-core-pool.sh --only-core=2
+
+Without `--only-core` the installer boots out the lead and every core, so
+changing one follower restarts the whole pool. Without the teardown path,
+`launchctl bootout` alone leaves the plist behind — the recovery sweep revives
+any installed plist whose session is gone — and a left-behind
+`state/cores/core-N.alive` keeps the lead assigning to a core that no longer
+exists.
+
+How the session is driven is owned by `scripts/pool-runtime-drive.sh`, sourced
+by both `pool-core-wrapper.sh` (the in-session sweep) and `kick-pool.sh` (the
+watchdog). Recognition is positive and fails closed: a session is typed into
+only when the pane shows *that* runtime's idle prompt. A pane nobody recognizes,
+a plist whose runtime is unreadable or unknown, and a codex startup dialog are
+all skipped and logged — never typed into with the other runtime's text.
+
+**Known gap — a Codex follower can look alive while missing work.** Its beat is
+a sidecar bound to the pane pid, so `.alive` stays fresh regardless of whether
+the model is reading anything. It has no in-session task watcher and
+`task-notifier.sh` has no pool mode, so it learns about an assignment only when
+something types the pool entry at it: the wrapper's own sweep (300s) or the
+watchdog (180s on this host). Worst-case assignment latency is therefore the
+sweep interval, not the sub-second watcher latency a Claude follower gets, and
+a Codex core wedged *inside* a turn is invisible to both — `esc to interrupt`
+reads as healthy work. Use assigned-but-unclaimed age, not `.alive`, to judge it.

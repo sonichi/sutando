@@ -227,5 +227,89 @@ class PoolWrapperRuntimeDispatchTest(unittest.TestCase):
             self.assertIn("unsupported core runtime", r.stderr)
 
 
+class PoolWrapperNudgeTest(unittest.TestCase):
+    """The sweep nudge is delegated, and claude's keystrokes are unchanged."""
+
+    STUB_TMUX = (
+        '#!/bin/bash\n'
+        'D="$STUB_TMUX_DIR"\n'
+        'for a in "$@"; do printf "%s\\n" "$a" >> "$D/argv"; done\n'
+        'printf "@@ENDCALL@@\\n" >> "$D/argv"\n'
+        'if [ "$1" = "has-session" ]; then [ -f "$D/session-alive" ]; exit $?; fi\n'
+        'case "$1" in\n'
+        '  new-session)\n'
+        '    touch "$D/session-alive"\n'
+        '    ( sleep 3; rm -f "$D/session-alive" ) &\n'
+        '    echo $! > "$D/pane-pid";;\n'
+        '  list-panes) cat "$D/pane-pid";;\n'
+        '  capture-pane) cat "$D/pane" 2>/dev/null;;\n'
+        'esac\n'
+        'exit 0\n')
+
+    def run_wrapper(self, td: Path, pane: str, **envextra):
+        stub_tmux = td / "stub-tmux"
+        stub_tmux.write_text(self.STUB_TMUX)
+        stub_tmux.chmod(0o755)
+        (td / "pane").write_text(pane)
+        for name in ("stub-claude", "stub-codex"):
+            b = td / name
+            b.write_text("#!/bin/bash\nsleep 5\n")
+            b.chmod(0o755)
+        env = dict(
+            os.environ,
+            POOL_REPO_DIR=str(REPO),
+            POOL_TMUX_BIN=str(stub_tmux),
+            STUB_TMUX_DIR=str(td),
+            POOL_WORKSPACE=str(td),
+            SUTANDO_CORE_ID="4",
+            SUTANDO_POOL_BEAT_INTERVAL="5",
+            SUTANDO_POOL_SESSION_POLL="1",
+            SUTANDO_POOL_SWEEP_NUDGE_S="0")
+        env.pop("POOL_RUNTIME", None)
+        env.pop("POOL_RUNTIME_BIN", None)
+        env.update(envextra)
+        subprocess.run(["bash", str(WRAPPER)], env=env,
+                       capture_output=True, text=True, timeout=90)
+        calls, cur = [], []
+        for line in (td / "argv").read_text().split("\n"):
+            if line == "@@ENDCALL@@":
+                calls.append(cur)
+                cur = []
+            else:
+                cur.append(line)
+        return [c for c in calls if c and c[0] == "send-keys"]
+
+    def test_claude_sweep_keystrokes_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            sends = self.run_wrapper(td, "", POOL_CLAUDE_BIN=str(td / "stub-claude"))
+            self.assertTrue(sends, "the wrapper never swept")
+            for c in sends:
+                self.assertEqual(
+                    c, ["send-keys", "-t", "core-4",
+                        "/proactive-loop-pool pass", "Enter"])
+
+    def test_codex_sweep_defers_while_the_session_is_busy(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            sends = self.run_wrapper(
+                td, "Working (5s • esc to interrupt)\n",
+                POOL_RUNTIME="codex", POOL_RUNTIME_BIN=str(td / "stub-codex"))
+            self.assertEqual(sends, [],
+                             "typing into a running codex turn interleaves")
+
+    def test_codex_sweep_types_the_codex_entry_when_free(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            sends = self.run_wrapper(
+                td, "› ready\n",
+                POOL_RUNTIME="codex", POOL_RUNTIME_BIN=str(td / "stub-codex"))
+            self.assertTrue(sends)
+            self.assertEqual(sends[0][:5],
+                             ["send-keys", "-t", "core-4", "-l", "--"])
+            self.assertIn("skills/proactive-loop-pool/CODEX.md", sends[0][5])
+            self.assertEqual(sends[1], ["send-keys", "-t", "core-4", "C-m"])
+
+
 if __name__ == "__main__":
     unittest.main()
