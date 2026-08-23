@@ -108,7 +108,9 @@ class ProbeVerdictIsPoolAware(unittest.TestCase):
             (ws / "state" / "cores" / f"{n}.alive").write_text("{}")
         (ws / "state" / "watch-tasks-stream.pid").write_text("100")
         hc.WORKSPACE_DIR = ws
-        # Only the OS-facing edges are stubbed; the decision under test is real.
+        # OS-facing edges only; the decision under test is real. _ps_snapshot
+        # included: without it the probe returns early wherever ps is absent.
+        hc._ps_snapshot = lambda: "PID TT  STAT  TIME COMMAND\n"
         hc._watcher_trees = lambda ps_output=None: {
             "100": ["100"], "200": ["200"], "300": ["300"], "400": ["400"]}
         hc._proc_argv = lambda pid: "bash src/watch-tasks-stream.sh"
