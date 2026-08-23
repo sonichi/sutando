@@ -26,10 +26,10 @@ from typing import Optional
 # Disjoint from local_task_protocol.LIFECYCLE_STATES by design: that tracks the
 # task FILE, this tracks the objective, and a file can outlive neither.
 SHEPHERD_STATES = (
-    "active",      # doing work now
-    "waiting",     # no one need act; a declared condition is outstanding
-    "blocked",     # someone or something else must act first
-    "needs_human", # owner authorization or judgement required
+    "active",
+    "waiting",      # nobody need act; a declared condition is outstanding
+    "blocked",      # someone or something else must act first
+    "needs_human",
     "succeeded",
     "failed",
     "cancelled",
@@ -46,8 +46,8 @@ class Subject:
     """A provider-native resource this task is responsible for. Every component
     must be non-blank: an unresolved subject is not a subject."""
 
-    provider: str        # "github", "ag2space", ...
-    kind: str            # "pull_request", "room", ...
+    provider: str
+    kind: str
     resource_id: str     # provider-native id, never a display name
 
     def __post_init__(self) -> None:
