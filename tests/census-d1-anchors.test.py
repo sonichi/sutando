@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -39,6 +40,29 @@ class CensusAnchors(unittest.TestCase):
                          "docs/census/d1-identity-census.md drifted from "
                          "scripts/census-d1.py — regenerate with --write-doc")
 
+
+
+class AbsentAnchorMechanism(unittest.TestCase):
+    def test_absent_anchor_fails_only_when_pattern_appears(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("census_d1", SCRIPT)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "mod.py").write_text("clean = True\n")
+            row = [("cell", {
+                "discord": ("claims none", [("mod.py", r"attempt_id", "absent")]),
+                "ag2space": ("x", [("mod.py", r"clean")]),
+                "slack": ("x", [("mod.py", r"clean")]),
+            })]
+            old_repo, old_rows = m.REPO, m.ROWS
+            try:
+                m.REPO, m.ROWS = Path(td), row
+                self.assertEqual(m.verify(), 0)   # absent + no match = clean
+                (Path(td) / "mod.py").write_text("attempt_id = 1\nclean = True\n")
+                self.assertEqual(m.verify(), 1)   # the tree GAINED it = rotted
+            finally:
+                m.REPO, m.ROWS = old_repo, old_rows
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

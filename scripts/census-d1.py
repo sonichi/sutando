@@ -41,12 +41,14 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
     ("normalized ingress identity", {
         "discord": ("none distinct — collapses into the freshly minted "
                     "task id (event replay after restart = new task)",
-                    [(DISCORD, r'task_id = f"task-\{ts\}"')]),
+                    [(DISCORD, r'task_id = f"task-\{ts\}"'),
+                     (DISCORD, r"ingress_id|ingress_identity", "absent")]),
         "ag2space": ("`task-<inst>~<broker_id>` — injective mapping from the "
                      "provider id, so a replayed lease maps to the same file",
                      [(AG2, r'return f"task-\{GATEWAY_INSTANCE\}~\{broker_tid\}"')]),
         "slack": ("none distinct — collapses into the freshly minted task id",
-                  [(SLACK, r'task_id = f"task-\{ts\}"')]),
+                  [(SLACK, r'task_id = f"task-\{ts\}"'),
+                   (SLACK, r"ingress_id|ingress_identity", "absent")]),
     }),
     ("task_id", {
         "discord": ("`task-<epoch-ms>` minted by the bridge at write time "
@@ -79,7 +81,8 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
                      [(AG2, r"dedupe_key")]),
         "slack": ("none stable — reply send is fire-and-forget; proactive "
                   "keyed by result filename in `slack_proactive_receipts`",
-                  [(SLACK, r"from slack_proactive_receipts import")]),
+                  [(SLACK, r"from slack_proactive_receipts import"),
+                   (SLACK, r"reply_receipt|reply_delivered", "absent")]),
     }),
     ("attempt_id", {
         "discord": ("proactive attempts durable in the outbox record; "
@@ -88,10 +91,12 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
         "ag2space": ("no distinct attempt id — re-POST until 200 "
                      "(at-least-once), in-flight set tracked in "
                      "`remote-task-inflight*.json`",
-                     [(AG2, r"INFLIGHT_FILE")]),
+                     [(AG2, r"INFLIGHT_FILE"),
+                      (AG2, r"attempt_id", "absent")]),
         "slack": ("none — a failed send is retried by the next watcher poll "
                   "pass",
-                  [(SLACK, r"watcher loop retry")]),
+                  [(SLACK, r"watcher loop retry"),
+                   (SLACK, r"attempt_id", "absent")]),
     }),
     ("provider receipt", {
         "discord": ("`DeliveryReceipt` (CONFIRMED carries the provider "
@@ -103,7 +108,8 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
                             r"record_delivered")]),
         "slack": ("none persisted for replies (failures printed); proactive "
                   "marked delivered in `slack_proactive_receipts`",
-                  [(SLACK, r"mark_delivered as mark_proactive_delivered")]),
+                  [(SLACK, r"mark_delivered as mark_proactive_delivered"),
+                   (SLACK, r"reply_receipt|persist_reply", "absent")]),
     }),
     ("process / entrypoint", {
         "discord": ("long-running discord.py gateway client, launched by "
@@ -204,13 +210,21 @@ def verify() -> int:
     for name, cells in ROWS:
         for chain in CHAINS:
             _claim, anchors = cells[chain]
-            for path, pattern in anchors:
+            for anchor in anchors:
+                path, pattern = anchor[0], anchor[1]
+                absent = len(anchor) > 2 and anchor[2] == "absent"
                 text = ""
                 target = REPO / path
                 if target.is_file():
                     text = target.read_text(errors="replace")
-                if not target.is_file() or (
-                        pattern and not re.search(pattern, text)):
+                hit = bool(pattern and re.search(pattern, text))
+                if absent:
+                    # an absence claim rots by the tree GAINING the thing
+                    if target.is_file() and hit:
+                        print(f"ROTTED [{name} / {chain}] {path} now matches "
+                              f"/{pattern}/ — the 'none' claim is stale")
+                        bad += 1
+                elif not target.is_file() or (pattern and not hit):
                     print(f"ROTTED [{name} / {chain}] {path} !~ /{pattern}/")
                     bad += 1
     print(f"census-d1: {'FAILED' if bad else 'OK'} "
