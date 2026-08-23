@@ -86,6 +86,11 @@ class ContractTest(unittest.TestCase):
 class DelegationTest(unittest.TestCase):
     """No consumer may re-implement the readiness check."""
 
+    def test_codex_notifier_delegates_lookup_and_readiness(self):
+        source = (REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh").read_text()
+        self.assertIn("from local_task_protocol import find_result", source)
+        self.assertIn("from delivery.readiness import read_ready_result", source)
+
     def test_every_consumer_imports_the_owner(self):
         for name, path in CONSUMERS.items():
             with self.subTest(consumer=name):

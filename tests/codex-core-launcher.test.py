@@ -45,12 +45,15 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
+            "src/delivery/readiness.py",
             "src/local_task_protocol.py",
             "src/result_markers.py",
             "src/task_priority.py",
             "src/task_workstreams.py",
+            "src/task-emit.sh",
             "src/util_paths.py",
             "src/watch-tasks-stream.sh",
+            "src/watcher_sentinel.sh",
             "src/workspace_default.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
@@ -749,6 +752,90 @@ exit 0
         calls = self.log.read_text() if self.log.exists() else ""
         self.assertNotIn("send-keys", calls)
 
+    def test_optional_handler_unready_results_reach_live_core(self):
+        handler = self.bin / "optional-handler"
+        handler.write_text('''#!/bin/bash
+for arg in "$@"; do
+  [ "$arg" = --probe ] && exit 0
+done
+filename="$(basename "$SUTANDO_TEST_TASK")"
+case "$SUTANDO_TEST_RESULT_LOCATION" in
+  live) target="$SUTANDO_RESULTS_DIR/$filename" ;;
+  archive)
+    mkdir -p "$SUTANDO_RESULTS_DIR/archive/2026-08"
+    target="$SUTANDO_RESULTS_DIR/archive/2026-08/$filename"
+    ;;
+esac
+printf '%s' "$SUTANDO_TEST_PLACEHOLDER" > "$target"
+exit 1
+''')
+        handler.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then exit 0; fi
+if [ "${1:-}" = send-keys ]; then
+  printf '%s\n' "$*" >> "$TMUX_LOG"
+  if [ "${*: -1}" = C-m ]; then
+    [ -f "$SUTANDO_TEST_FALLBACK" ] && touch "$SUTANDO_TEST_FALLBACK_SEEN"
+    printf 'live-core answer\n' > "$SUTANDO_RESULTS_DIR/$(basename "$SUTANDO_TEST_TASK")"
+  fi
+fi
+exit 0
+''')
+
+        for location, placeholder in (
+            ("live", ""),
+            ("live", "  \n\t"),
+            ("archive", ""),
+            ("archive", "  \n\t"),
+        ):
+            with self.subTest(location=location, placeholder=repr(placeholder)):
+                case = f"{location}-{'zero' if not placeholder else 'space'}"
+                workspace = Path(self.tmp.name) / case
+                tasks = workspace / "tasks"
+                results = workspace / "results"
+                task = tasks / f"task-{case}.txt"
+                fallback = workspace / "state" / "task-event-handler-fallbacks" / task.name
+                fallback_seen = workspace / "fallback-seen"
+                tasks.mkdir(parents=True)
+                results.mkdir(parents=True)
+                (workspace / "state").mkdir()
+                task.write_text("access_tier: owner\ntask: exercise fallback\n")
+                (workspace / "state" / "core-status.json").write_text(
+                    '{"status":"idle","ts":1}\n'
+                )
+                if self.log.exists():
+                    self.log.unlink()
+                env = dict(
+                    os.environ,
+                    PATH=f"{self.bin}:/usr/bin:/bin",
+                    TMUX_LOG=str(self.log),
+                    SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                    SUTANDO_TMUX_SESSION="sutando-core",
+                    SUTANDO_TASKS_DIR=str(tasks),
+                    SUTANDO_RESULTS_DIR=str(results),
+                    SUTANDO_CORE_STATUS_FILE=str(workspace / "state" / "core-status.json"),
+                    SUTANDO_CORE_RUNTIME="codex",
+                    SUTANDO_TASK_EVENT_HANDLER=str(handler),
+                    SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+                    SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+                    SUTANDO_TEST_TASK=str(task),
+                    SUTANDO_TEST_RESULT_LOCATION=location,
+                    SUTANDO_TEST_PLACEHOLDER=placeholder,
+                    SUTANDO_TEST_FALLBACK=str(fallback),
+                    SUTANDO_TEST_FALLBACK_SEEN=str(fallback_seen),
+                )
+                script = self.root / "src/agent/codex/cli/task-notifier.sh"
+                result = subprocess.run(
+                    ["/bin/bash", str(script)], env=env,
+                    capture_output=True, text=True, timeout=4,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertTrue(fallback_seen.exists(), "fallback receipt was erased before submission")
+                self.assertIn(task.name, self.log.read_text())
+                self.assertEqual((results / task.name).read_text(), "live-core answer\n")
+
     def test_managed_notifier_supplies_private_untrusted_workstream_context(self):
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"
@@ -807,7 +894,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  printf 'answer\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
   exit 0
 fi
 if [ "${1:-}" = send-keys ]; then
@@ -887,7 +974,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
+  printf 'answer\n' > "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
 fi
 exit 0
 ''')
@@ -938,7 +1025,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   n=0; [ -f "$SUBMIT_COUNT" ] && n=$(cat "$SUBMIT_COUNT")
   n=$((n + 1)); printf '%s' "$n" > "$SUBMIT_COUNT"
   if [ "$n" = 1 ]; then name=task-one.txt; else name=task-two.txt; fi
-  (sleep 0.12; touch "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
+  (sleep 0.12; printf 'answer\n' > "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
 fi
 exit 0
 ''')
@@ -996,7 +1083,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   prompt=$(grep 'Sutando task ready:' "$TMUX_LOG" | tail -1)
   name=${prompt#*Sutando task ready: }
   name=${name%%.*}.txt
-  touch "$SUTANDO_RESULTS_DIR/$name"
+  printf 'answer\n' > "$SUTANDO_RESULTS_DIR/$name"
 fi
 exit 0
 ''')
@@ -1051,7 +1138,7 @@ if [ "${1:-}" = capture-pane ]; then
   exit 0
 fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  printf 'answer\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
 fi
 exit 0
 ''')

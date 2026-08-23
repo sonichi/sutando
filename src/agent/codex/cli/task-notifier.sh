@@ -93,32 +93,20 @@ prepare_workstream_context() {
 }
 
 has_result() {
-  local filename="$1" stem archive_dir
-  if [ -f "$RESULTS_DIR/$filename" ]; then
-    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-    return 0
+  local filename="$1" task_id
+  task_id="${filename%.txt}"
+  if ! python3 - "$REPO/src" "$RESULTS_DIR" "$task_id" <<'PY' 2>/dev/null
+import pathlib, sys
+sys.path.insert(0, sys.argv[1])
+from local_task_protocol import find_result
+from delivery.readiness import read_ready_result
+found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
+raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
+PY
+  then
+    return 1
   fi
-  stem="${filename%.txt}"
-  # Local bridges archive as archive/YYYY-MM/<task>.txt. The remote gateway
-  # archives as archive/<task>-<epoch>.txt. Startup retention uses sibling
-  # archive-YYYY-MM-DD/<task>.txt directories. All are completed deliveries.
-  if [ -d "$RESULTS_DIR/archive" ] && find "$RESULTS_DIR/archive" \
-      -mindepth 1 -maxdepth 2 -type f \
-      \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-      | grep -q .; then
-    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-    return 0
-  fi
-  for archive_dir in "$RESULTS_DIR"/archive-*; do
-    [ -d "$archive_dir" ] || continue
-    if find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
-        \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-        | grep -q .; then
-      rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-      return 0
-    fi
-  done
-  return 1
+  rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
 }
 
 core_pane_is_busy() {
