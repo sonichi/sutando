@@ -205,6 +205,10 @@ class InstanceRegistryTests(unittest.TestCase):
         self.assertEqual(p.parent, Path(self.tmp.name))
         self.assertNotIn("/", p.name.replace(".json", ""))
 
+    def test_empty_agent_id_is_refused(self):
+        with self.assertRaises(ValueError):
+            reg.write_manifest("")
+
 
 
 
