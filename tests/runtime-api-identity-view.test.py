@@ -212,6 +212,80 @@ class TestStand(unittest.TestCase):
         self.assertEqual(out["stand_id"], "@stand:ag2.space")
 
 
+class TestEntrances(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        (self.state / "auth").mkdir(parents=True)
+        self.channels = Path(self.tmp.name) / "channels"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _mkchan(self, name, env=None, access=None, extra=None):
+        d = self.channels / name
+        d.mkdir(parents=True, exist_ok=True)
+        if env is not None:
+            (d / ".env").write_text(env)
+        if access is not None:
+            (d / "access.json").write_text(access)
+        if extra:
+            for fn, body in extra.items():
+                (d / fn).write_text(body)
+        return d
+
+    def test_statuses_are_honest_and_evidence_scoped(self):
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": "@stand:ag2.space"}))
+        self._mkchan("ag2space", env="TOKEN=sekret-ag2",
+                     access=json.dumps({"tofuOwner": "@owner:ag2.space"}))
+        self._mkchan("discord", env="DISCORD_TOKEN=sekret-dc",
+                     access=json.dumps({"tierMap": {"1": "owner"}}))
+        self._mkchan("slack", env="SLACK_TOKEN=sekret-sl")
+        self._mkchan("telegram")  # empty folder
+        self._mkchan("broken", access="{not json")
+        out = _mk(self.state, self.channels).entrances()
+        by = {e["provider"]: e for e in out["entrances"]}
+        self.assertEqual(by["ag2space"]["status"], "configured_unverified")
+        self.assertEqual(by["ag2space"]["evidence"]["subject_evidence"],
+                         "@stand:ag2.space")
+        self.assertEqual(by["ag2space"]["evidence"]["owner_evidence"],
+                         "@owner:ag2.space")
+        self.assertEqual(by["discord"]["status"], "configured_unverified")
+        # tierMap is not owner evidence at the entrance level either
+        self.assertNotIn("owner_evidence", by["discord"]["evidence"])
+        self.assertEqual(by["slack"]["status"], "configured_unverified")
+        self.assertEqual(by["telegram"]["status"], "not_configured")
+        self.assertEqual(by["broken"]["status"], "policy_invalid")
+        # nothing may ever claim "active" without provider verification (I2)
+        self.assertNotIn("active", {e["status"] for e in out["entrances"]})
+
+    def test_env_contents_never_leak(self):
+        self._mkchan("discord", env="DISCORD_TOKEN=sekret-dc-9911",
+                     access=json.dumps({"tofuOwner": "u1"}))
+        dumped = json.dumps(_mk(self.state, self.channels).entrances())
+        self.assertNotIn("sekret", dumped)
+        self.assertNotIn("9911", dumped)
+
+    def test_backup_policy_files_ignored(self):
+        self._mkchan("discord",
+                     access=json.dumps({"tofuOwner": "current"}),
+                     extra={"access.json.bak.1": json.dumps(
+                         {"tofuOwner": "stale-backup"})})
+        out = _mk(self.state, self.channels).entrances()
+        dumped = json.dumps(out)
+        self.assertNotIn("stale-backup", dumped)
+        self.assertIn("current", dumped)
+
+    def test_dispatch_routes_entrances(self):
+        d = RuntimeDispatcher(DispatchTests._No(), DispatchTests._No(),
+                              "@me:x", executors={},
+                              identity_view=IdentityView(self.state, "@me:x",
+                                                         channels_dir=self.channels))
+        out = asyncio.run(d.handle("sutando.entrances", {}))
+        self.assertIn("entrances", out)
+
+
 class TestEnrolledActorFallback(unittest.TestCase):
     def test_enrolled_identity_beats_local_agent_fallback(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent

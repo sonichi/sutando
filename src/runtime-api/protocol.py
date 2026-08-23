@@ -68,6 +68,7 @@ METHODS = (
     "agent.status",
     "sutando.info",
     "sutando.stand",
+    "sutando.entrances",
     "sutando.status",
     "sutando.owner",
     "sutando.allowlist",

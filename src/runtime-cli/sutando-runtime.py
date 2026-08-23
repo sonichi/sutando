@@ -606,6 +606,26 @@ def _chat(activity: bool = False, verbose: bool = False, full: bool = False) -> 
     return 0
 
 
+def _print_entrances(result: dict) -> int:
+    ents = result.get("entrances") or []
+    if not ents:
+        print("no entrances", file=sys.stderr)
+        return 1
+    width = max(len(e.get("provider", "")) for e in ents)
+    width = max(width, len("owner evidence")) + 2
+    for e in ents:
+        print(f"{e.get('provider','').ljust(width)}{e.get('status','')}")
+        ev = e.get("evidence") or {}
+        for key, label in (("subject_evidence", "subject"),
+                           ("owner_evidence", "owner evidence"),
+                           ("credential_present", "credential"),
+                           ("policy_present", "policy")):
+            if key in ev:
+                val = ev[key] if isinstance(ev[key], str) else "present"
+                print(f"  {label.ljust(width)}{val}")
+    return 0
+
+
 def _print_stand(result: dict, sub: "str | None") -> int:
     """Human/scripting views of sutando.stand; absent fields stay absent."""
     if sub == "id":
@@ -709,7 +729,7 @@ def main(argv=None) -> int:
     for name in ("info", "status", "owner", "allowlist"):
         idn.add_parser(name)
     std = idn.add_parser("stand")
-    std.add_argument("sub", nargs="?", choices=["id"])
+    std.add_argument("sub", nargs="?", choices=["id", "entrances"])
     std.add_argument("--json", action="store_true", dest="as_json")
 
     rt = sub.add_parser("runtime").add_subparsers(dest="cmd", required=True)
@@ -881,9 +901,14 @@ def main(argv=None) -> int:
                       else _rpc("agent.status", {"agentId": args.agent_id},
                                 timeout=15))
         elif args.group == "sutando":
-            result = _rpc(f"sutando.{args.cmd}", {}, timeout=15)
+            method = f"sutando.{args.cmd}"
+            if args.cmd == "stand" and getattr(args, "sub", None) == "entrances":
+                method = "sutando.entrances"
+            result = _rpc(method, {}, timeout=15)
             if args.cmd == "stand" and not args.as_json:
-                return _print_stand(result, getattr(args, "sub", None))
+                if args.sub == "entrances":
+                    return _print_entrances(result)
+                return _print_stand(result, args.sub)
         elif args.group == "runtime":
             result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)
         elif args.group == "human-action":

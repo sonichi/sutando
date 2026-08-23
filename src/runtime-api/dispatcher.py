@@ -248,6 +248,7 @@ class RuntimeDispatcher:
                                     "identity surface is not configured on this daemon")
             fn = {"sutando.info": self.identity.info,
                   "sutando.stand": self.identity.stand,
+                  "sutando.entrances": self.identity.entrances,
                   "sutando.status": self.identity.status,
                   "sutando.owner": self.identity.owner,
                   "sutando.allowlist": self.identity.allowlist}.get(method)

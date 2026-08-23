@@ -91,6 +91,48 @@ class IdentityView:
             out["instance"] = inst
         return out
 
+    # ── sutando.entrances ───────────────────────────────────────────────────
+    def entrances(self) -> dict:
+        # I1 evidence projection: folder facts only, no provider calls and
+        # no credential reads — nothing may claim more than unverified.
+        out = []
+        if self.channels_dir is not None and self.channels_dir.is_dir():
+            for d in sorted(self.channels_dir.iterdir()):
+                if not d.is_dir():
+                    continue
+                out.append(self._entrance(d))
+        return {"entrances": out}
+
+    def _entrance(self, d: Path) -> dict:
+        ent: dict = {"provider": d.name}
+        evidence: dict = {}
+        env = d / ".env"
+        if env.is_file():
+            evidence["credential_present"] = True
+        acc = d / "access.json"
+        policy_invalid = False
+        if acc.is_file():
+            try:
+                payload = json.loads(acc.read_text())
+                evidence["policy_present"] = True
+                if isinstance(payload, dict) and payload.get("tofuOwner"):
+                    evidence["owner_evidence"] = payload["tofuOwner"]
+            except (OSError, ValueError):
+                policy_invalid = True
+        if d.name == "ag2space":
+            enrolled = self._enrolled()
+            if enrolled.get("agent_id"):
+                evidence["subject_evidence"] = enrolled["agent_id"]
+        if policy_invalid:
+            ent["status"] = "policy_invalid"
+        elif evidence:
+            ent["status"] = "configured_unverified"
+        else:
+            ent["status"] = "not_configured"
+        if evidence:
+            ent["evidence"] = evidence
+        return ent
+
     # ── sutando.owner ───────────────────────────────────────────────────────
     def owner(self) -> dict:
         owners: dict = {}
