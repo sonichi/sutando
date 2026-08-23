@@ -61,11 +61,23 @@ def _enrolled_stand_id(state_dir: str | Path) -> "str | None":
         return None
 
 
+def require_resolved_identity(state_dir: str | Path) -> str:
+    """Identity mutations fail closed: an unresolved (placeholder) identity
+    may read and diagnose but never create or change a binding."""
+    sid = _enrolled_stand_id(state_dir)
+    if not sid:
+        raise PermissionError(
+            "identity not resolved (no enrolled record) — binding mutations "
+            "are refused; enroll first")
+    return sid
+
+
 def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
                 verification: dict, credential_fingerprint: str,
                 display: "dict | None" = None) -> dict:
     # UNIQUE(provider, canonical subject): an active link for the provider is
     # replaced only by the SAME subject; a different subject must be explicit.
+    stand_id = require_resolved_identity(state_dir)
     links = load_links(state_dir)
     existing = [l for l in links
                 if l.get("provider") == provider and l.get("status") == "active"]
@@ -74,7 +86,6 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
             raise ValueError(
                 f"active {provider} link exists with a different subject "
                 f"({l.get('provider_subject')}) — revoke it explicitly first")
-    stand_id = _enrolled_stand_id(state_dir)
     link = existing[0] if existing else {
         "link_id": "link_" + secrets.token_hex(8),
         "provider": provider,
@@ -82,8 +93,7 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
         "status": "active",
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    if stand_id:
-        link["stand_id"] = stand_id
+    link["stand_id"] = stand_id
     if display:
         # display fields are labels for humans — never binding keys
         link["display"] = display
@@ -97,18 +107,52 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
 
 
 def authorize_link(state_dir: str | Path, provider: str,
-                   authorized_by: str) -> dict:
+                   authorized_by: str,
+                   confirmation_ref: "str | None" = None) -> dict:
     """Explicit owner authorization: the act that turns a verified link into
     an active Stand binding. Never called automatically."""
+    stand_id = require_resolved_identity(state_dir)
+    links = load_links(state_dir)
+    for lk in links:
+        if lk.get("provider") != provider or lk.get("status") != "active":
+            continue
+        if lk.get("stand_id") and lk["stand_id"] != stand_id:
+            raise ValueError(
+                f"link belongs to Stand {lk['stand_id']}, not {stand_id} — "
+                "cross-Stand authorization refused")
+        prev = {k: lk.get(k) for k in ("authorized_by", "authorized_at")}
+        lk["authorized_by"] = authorized_by
+        lk["authorized_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+        if confirmation_ref:
+            lk["confirmation_ref"] = confirmation_ref
+        lk.setdefault("audit", []).append(
+            {"op": "authorize", "at": lk["authorized_at"],
+             "by": authorized_by, "prev": prev,
+             "confirmation_ref": confirmation_ref})
+        _save_links(state_dir, links)
+        return lk
+    raise ValueError(f"no active-eligible {provider} link to authorize")
+
+
+def revoke_link(state_dir: str | Path, provider: str, revoked_by: str,
+                reason: "str | None" = None) -> dict:
+    """Revocation is layered: kills THIS binding only, never the Stand."""
+    require_resolved_identity(state_dir)
     links = load_links(state_dir)
     for lk in links:
         if lk.get("provider") == provider and lk.get("status") == "active":
-            lk["authorized_by"] = authorized_by
-            lk["authorized_at"] = datetime.now(timezone.utc).isoformat(
-                timespec="seconds")
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            lk["status"] = "revoked"
+            lk["revocation"] = {"revoked_by": revoked_by, "revoked_at": now,
+                                "reason": reason}
+            lk.pop("authorized_by", None)
+            lk.setdefault("audit", []).append(
+                {"op": "revoke", "at": now, "by": revoked_by,
+                 "reason": reason})
             _save_links(state_dir, links)
             return lk
-    raise ValueError(f"no active-eligible {provider} link to authorize")
+    raise ValueError(f"no active {provider} link to revoke")
 
 
 def verify_discord(state_dir: str | Path, token: str) -> dict:

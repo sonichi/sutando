@@ -297,6 +297,8 @@ class TestEntranceLinks(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.state = Path(self.tmp.name) / "state"
         (self.state / "auth").mkdir(parents=True)
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": "@stand:ag2.space"}))
         self.channels = Path(self.tmp.name) / "channels"
         d = self.channels / "discord"
         d.mkdir(parents=True)
@@ -416,6 +418,95 @@ class TestResolve(unittest.TestCase):
         self.assertFalse(out["resolved"])
         self.assertTrue(out["conflict"])
         self.assertEqual(len(out["candidates"]), 2)
+
+
+class TestAuthorityBoundaries(unittest.TestCase):
+    """Owner review 2026-08-23: identity mutations fail closed; revocation
+    is layered; the full Discord lifecycle holds end to end."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        (self.state / "auth").mkdir(parents=True)
+        self.channels = Path(self.tmp.name) / "channels"
+        d = self.channels / "discord"
+        d.mkdir(parents=True)
+        (d / ".env").write_text("DISCORD_TOKEN=tok")
+        (d / "access.json").write_text("{}")
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "el_ab", Path(__file__).resolve().parent.parent / "src" / "entrance_links.py")
+        self.el = ilu.module_from_spec(spec)
+        spec.loader.exec_module(self.el)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _enroll(self):
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": "@stand:ag2.space"}))
+
+    def _verify(self):
+        return self.el.upsert_link(
+            self.state, "discord", {"type": "bot_user", "id": "123"},
+            {"method": "discord_token_introspection", "verified_at": "t"},
+            "sha256:abcd")
+
+    def test_unresolved_identity_mutations_all_fail_closed(self):
+        # no enrolled record: reads work, every mutation refuses
+        v = _mk(self.state, self.channels)
+        self.assertIn("stand", v.stand_card())  # read path fine
+        for fn in (lambda: self._verify(),
+                   lambda: self.el.authorize_link(self.state, "discord", "@o:x"),
+                   lambda: self.el.revoke_link(self.state, "discord", "@o:x")):
+            with self.assertRaises(PermissionError):
+                fn()
+
+    def test_cross_stand_authorization_refused(self):
+        self._enroll()
+        self._verify()
+        # link recorded for a DIFFERENT stand must refuse authorization
+        links = self.el.load_links(self.state)
+        links[0]["stand_id"] = "@other-stand:x"
+        (self.state / "auth" / "entrance-links.json").write_text(
+            json.dumps(links))
+        with self.assertRaises(ValueError):
+            self.el.authorize_link(self.state, "discord", "@o:x")
+
+    def test_full_discord_lifecycle(self):
+        self._enroll()
+        v = _mk(self.state, self.channels)
+        # verify -> verified_unlinked
+        self._verify()
+        e = v.entrances()["channels"][0]
+        self.assertEqual((e["status"], e["stand_binding"]),
+                         ("verified_unlinked", "absent"))
+        # owner authorize -> active, resolve returns the Stand
+        lk = self.el.authorize_link(self.state, "discord", "@owner:x",
+                                    confirmation_ref="msg$abc")
+        self.assertEqual(lk["confirmation_ref"], "msg$abc")
+        self.assertEqual(lk["audit"][-1]["op"], "authorize")
+        e = v.entrances()["channels"][0]
+        self.assertEqual((e["status"], e["stand_binding"]),
+                         ("active", "authorized"))
+        r = v.resolve("discord", "bot_user:123")
+        self.assertTrue(r["resolved"])
+        self.assertEqual(r["stand_id"], "@stand:ag2.space")
+        # revoke -> not active anywhere, authorization cleared, audited
+        rv = self.el.revoke_link(self.state, "discord", "@owner:x", "test")
+        self.assertEqual(rv["status"], "revoked")
+        self.assertNotIn("authorized_by", rv)
+        self.assertEqual(rv["audit"][-1]["op"], "revoke")
+        e = v.entrances()["channels"][0]
+        self.assertNotEqual(e["status"], "active")
+        self.assertFalse(v.resolve("discord", "bot_user:123")["resolved"])
+
+    def test_records_persist_facts_not_composite_states(self):
+        self._enroll()
+        self._verify()
+        blob = (self.state / "auth" / "entrance-links.json").read_text()
+        self.assertNotIn("verified_unlinked", blob)
+        self.assertNotIn("configured_unverified", blob)
 
 
 class TestEnrolledActorFallback(unittest.TestCase):
