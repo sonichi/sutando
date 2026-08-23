@@ -1119,6 +1119,12 @@ def main():  # pragma: no cover
                         if text is None:
                             release_claim(f)
                             continue
+                        # The claim hard-links then unlinks, so a producer still
+                        # holding the original fd keeps writing THIS inode.
+                        if not proactive_body_guard(
+                                f.with_suffix(".txt").name, text, "telegram"):
+                            release_claim(f)
+                            continue
                         try:
                             _s = send_reply(int(owner_id), text)
                             if _s["text_chunks"] or _s["files_sent"]:

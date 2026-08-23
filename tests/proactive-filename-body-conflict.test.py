@@ -83,6 +83,13 @@ def main() -> int:
     control = results / "proactive-2.txt"
     control.write_text("[channel: 1535008729106485288]\nforeign body")
 
+    # Split write (kewei P1): the claim hard-links + unlinks, so a producer
+    # holding the ORIGINAL fd keeps writing this inode after the claim.
+    split = results / "proactive-3.txt"
+    split_fd = open(split, "w")
+    split_fd.write("**[core: 1]**\n")
+    split_fd.flush()
+
     sent: list[str] = []
 
     def _send_reply(_chat, text, task_id=None, message_thread_id=None):
@@ -98,6 +105,18 @@ def main() -> int:
     mod.send_reply = _send_reply
     mod.api = _api
 
+    _orig_claim = mod.claim_for_delivery
+
+    def _claim_then_producer_appends(path, recipient):
+        claim = _orig_claim(path, recipient)
+        if claim is not None and "proactive-3" in claim.name:
+            split_fd.write("[channel: 1535008729106485288]\n"
+                           "private discord-directed body\n")
+            split_fd.flush()
+        return claim
+
+    mod.claim_for_delivery = _claim_then_producer_appends
+
     t = threading.Thread(target=lambda: _swallow(mod.main), daemon=True)
     t.start()
     deadline = time.time() + 8
@@ -112,6 +131,13 @@ def main() -> int:
           not list(results.glob("proactive-1*.sending*")))
     check("undestined discord-bodied control is NOT claimed by telegram",
           control.exists() and not any("foreign body" in s for s in sent))
+    # The regression: telegram must re-check routing on the body it SENDS, not
+    # only the one it peeked before claiming.
+    check("split-write body completed as discord-directed is NOT sent on telegram",
+          not any("private discord-directed body" in s for s in sent),
+          f"sent={sent!r}")
+    check("split-write claim is RELEASED so the real bridge can recover it",
+          split.exists() or bool(list(results.glob("proactive-3*.txt"))))
 
     if FAILURES:
         print(f"\nFAILED {len(FAILURES)}: {FAILURES}", file=sys.stderr)
