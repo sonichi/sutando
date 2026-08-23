@@ -134,8 +134,16 @@ try:
           "destined .to-discord body never reaches the gateway's room")
     check(any("alias directed body" in b for b in bodies),
           "alias-directed body IS delivered by the gateway (no strand)")
-    check(not (rdir / "proactive-102.txt").exists(),
-          "alias-directed file is consumed after delivery")
+    # consumption (claim -> deliver -> archive) is asynchronous: poll, don't
+    # snapshot — the instant form raced the drain on slower CI runners
+    consumed = False
+    deadline2 = time.monotonic() + 20
+    while time.monotonic() < deadline2:
+        if not (rdir / "proactive-102.txt").exists():
+            consumed = True
+            break
+        time.sleep(0.5)
+    check(consumed, "alias-directed file is consumed after delivery")
     check((rdir / "proactive-101.to-discord.txt").exists(),
           "destined file remains on disk under its original name")
     check((rdir / "proactive-000.txt").exists(),
