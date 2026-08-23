@@ -830,13 +830,17 @@ def main(argv=None) -> int:
     ist = ins.add_parser("start")
     ist.add_argument("agent_id")
     ist.add_argument("--wait", type=float, default=10.0)
+    ist.add_argument("--instance", default=None,
+                     help="instance id when the agent runs more than one")
     iat = ins.add_parser("attach")
     iat.add_argument("agent_id")
     iat.add_argument("--print", action="store_true",
                      help="print the tmux command instead of exec'ing it")
+    iat.add_argument("--instance", default=None)
     iop = ins.add_parser("open")
     iop.add_argument("agent_id")
     iop.add_argument("--window", action="store_true")
+    iop.add_argument("--instance", default=None)
 
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsk.add_parser("list")
@@ -871,11 +875,13 @@ def main(argv=None) -> int:
         import instance_registry
         if args.cmd == "start":
             out = instance_registry.start_instance(args.agent_id,
-                                                   wait_s=args.wait)
+                                                   wait_s=args.wait,
+                                                   instance=args.instance)
             print(json.dumps(out, ensure_ascii=False, indent=1))
             return 0 if out.get("ok") else 1
         if args.cmd == "attach":
-            out = instance_registry.attach(args.agent_id)
+            out = instance_registry.attach(args.agent_id,
+                                           instance=args.instance)
             if not out.get("ok"):
                 print(json.dumps(out, ensure_ascii=False), file=sys.stderr)
                 return 1
@@ -887,7 +893,8 @@ def main(argv=None) -> int:
             return 0
         if args.cmd == "open":
             import terminal_open
-            out = terminal_open.open_instance(args.agent_id, window=args.window)
+            out = terminal_open.open_instance(args.agent_id, window=args.window,
+                                              instance=args.instance)
             print(json.dumps(out, ensure_ascii=False, indent=1))
             return 0 if out.get("ok") else 1
         print(json.dumps({"instances": instance_registry.list_instances()},

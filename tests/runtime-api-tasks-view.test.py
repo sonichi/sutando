@@ -176,6 +176,20 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(self.view.get_result("task-b")["result"], "old result")
         self.assertIsNone(self.view.get_result("task-c"))
 
+    def test_get_result_monthly_and_gateway_archives(self):
+        # Both canonical archive layouts (find_result): bridge monthly
+        # archive/<YYYY-MM>/ and gateway epoch-suffixed archive/<id>-<epoch>.txt
+        month = self.results / "archive" / "2026-08"
+        month.mkdir(parents=True)
+        (month / "task-rtapi-archive.txt").write_text("monthly result")
+        (self.results / "archive" / "task-rtapi-gateway-123.txt").write_text(
+            "gateway result")
+        self.assertEqual(self.view.get_result("task-rtapi-archive")["result"],
+                         "monthly result")
+        self.assertEqual(self.view.status("task-rtapi-archive")["state"], "done")
+        self.assertEqual(self.view.get_result("task-rtapi-gateway")["result"],
+                         "gateway result")
+
     def test_details_roundtrip(self):
         tid = self.view.submit("inspect me", priority="low")["taskId"]
         d = self.view.details(tid)

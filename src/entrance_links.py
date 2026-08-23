@@ -85,7 +85,7 @@ def _save_links(state_dir: str | Path, links: list) -> None:
     os.replace(tmp, path)
 
 
-def _fingerprint(token: str) -> str:
+def credential_fingerprint(token: str) -> str:
     return "sha256:" + hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
@@ -226,30 +226,5 @@ def _revoke_link_locked(state_dir, stand_id, provider, revoked_by, reason):
     raise ValueError(f"no active {provider} link to revoke")
 
 
-def _discord_client(token: str):
-    """Test seam; hand-rolled Discord REST is census-banned — the shared
-    client is the one transport (and gives this read 429/5xx retry)."""
-    import sys
-    src = str(Path(__file__).resolve().parent)
-    if src not in sys.path:
-        sys.path.insert(0, src)
-    from channels.discord.client import DiscordRestClient
-    return DiscordRestClient(token)
-
-
-def verify_discord(state_dir: str | Path, token: str) -> dict:
-    me = _discord_client(token).get_json("/users/@me")
-    subject = {"type": "bot_user", "id": str(me["id"])}
-    display = {}
-    name = me.get("global_name") or me.get("username")
-    if name:
-        display["name"] = name
-    if me.get("avatar"):
-        display["avatar_url"] = (f"https://cdn.discordapp.com/avatars/"
-                                 f"{me['id']}/{me['avatar']}.png")
-    verification = {
-        "method": "discord_token_introspection",
-        "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    return upsert_link(state_dir, "discord", subject, verification,
-                       _fingerprint(token), display=display or None)
+# Provider verification I/O lives at each provider's edge (e.g.
+# channels/discord/entrance_verify.py); this module only records the facts.

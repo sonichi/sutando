@@ -27,7 +27,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
-from local_task_protocol import (find_archived_task,  # noqa: E402
+from local_task_protocol import (find_archived_task, find_result,  # noqa: E402
                                  parse_task_headers_lenient)
 sys.path.insert(0, str(_HERE.parent.parent / "packages" / "ag2-sparrow"))
 from ag2_sparrow.task_archive import find_task_file  # noqa: E402
@@ -270,8 +270,6 @@ class TasksView:
     def _result_path(self, task_id: str) -> Path | None:
         if _checked_task_id(task_id) is None:
             return None
-        for p in (self.results_dir / f"{task_id}.txt",
-                  self.results_dir / "archive" / f"{task_id}.txt"):
-            if p.is_file():
-                return p
-        return None
+        # Archive layouts (flat, monthly, epoch-suffixed) are owned by
+        # local_task_protocol.find_result — never re-enumerated here.
+        return find_result(self.results_dir, task_id)

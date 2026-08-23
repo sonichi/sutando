@@ -142,7 +142,7 @@ class InstanceRegistryTests(unittest.TestCase):
             return orig(*a, **kw)
         _sp.Popen = spy
         try:
-            reg.start_instance("agent-A", wait_s=1,
+            reg.start_instance("agent-A", wait_s=1, instance="inst-B",
                                _ready=lambda m: {"attachable": False, "stage": "x"})
         except Exception:
             pass
@@ -192,7 +192,7 @@ class InstanceRegistryTests(unittest.TestCase):
                            launcher={"type": "process", "executable": str(launcher),
                                      "args": [], "working_directory": self.tmp.name})
         # readiness true once the env dump exists
-        reg.start_instance("q-1", wait_s=5,
+        reg.start_instance("q-1", wait_s=5, instance="q-1",
                            _ready=lambda m: {"attachable": envdump.exists()})
         text = envdump.read_text()
         self.assertIn("SUTANDO_INSTANCE_ID=q-1", text)
@@ -204,6 +204,10 @@ class InstanceRegistryTests(unittest.TestCase):
         p = reg.write_manifest("../evil/../../id")
         self.assertEqual(p.parent, Path(self.tmp.name))
         self.assertNotIn("/", p.name.replace(".json", ""))
+
+    def test_empty_agent_id_is_refused(self):
+        with self.assertRaises(ValueError):
+            reg.write_manifest("")
 
 
 
@@ -257,7 +261,34 @@ class EdgeBranches(unittest.TestCase):
              "endpoint": {"path": str(Path(self.tmp.name) / "no.sock")}})
         self.assertFalse(out["attachable"])
 
-    def _stub_daemon(self, info_agent, health_state):
+    def test_registry_keys_compose_agent_and_instance(self):
+        # (1) two actors, both instance "default": the key is never the
+        # instance id alone — distinct manifests, no overwrite
+        pa = reg.write_manifest("@a:x", endpoint="/a.sock")
+        pb = reg.write_manifest("@b:x", endpoint="/b.sock")
+        self.assertNotEqual(pa, pb)
+        self.assertEqual(json.loads(pa.read_text())["endpoint"]["path"],
+                         "/a.sock")
+        # (2) one actor, two instances: independent manifests, desired state
+        # and lifecycle — a sibling can never mark or restore the other
+        p1 = reg.write_manifest("@a:x", endpoint="/a-work.sock",
+                                instance="work")
+        self.assertNotEqual(pa, p1)
+        self.assertEqual(json.loads(pa.read_text())["instance_id"], "default")
+        self.assertEqual(json.loads(p1.read_text())["instance_id"], "work")
+        reg.write_desired_state("@a:x", "paused", instance="work")
+        self.assertIsNone(reg.read_desired_state("@a:x"))
+        self.assertEqual(
+            reg.read_desired_state("@a:x", "work")["desired_state"], "paused")
+        reg.mark_stopped("@a:x", "work")
+        self.assertEqual(json.loads(p1.read_text())["status"], "stopped")
+        self.assertEqual(json.loads(pa.read_text())["status"], "running")
+        pairs = {(m.get("identity", {}).get("agent_id"), m.get("instance_id"))
+                 for m in reg.list_instances()}
+        self.assertEqual(pairs, {("@a:x", "default"), ("@a:x", "work"),
+                                 ("@b:x", "default")})
+
+    def _stub_daemon(self, info_agent, health_state, info_instance=None):
         import socket as _s
         import threading
         import uuid as _uuid
@@ -277,7 +308,9 @@ class EdgeBranches(unittest.TestCase):
                     if not data.strip():
                         continue
                     req = json.loads(data.splitlines()[0])
-                    r = ({"agentId": info_agent}
+                    r = ({"agentId": info_agent,
+                          **({"instanceId": info_instance}
+                             if info_instance else {})}
                          if req.get("method") == "sutando.info"
                          else {"state": health_state})
                     conn.sendall(json.dumps(
@@ -309,6 +342,20 @@ class EdgeBranches(unittest.TestCase):
             out = reg.attachable({"identity": {"agent_id": "@real:x"},
                                   "endpoint": {"path": sock}})
             self.assertTrue(out["attachable"])
+        finally:
+            srv.close()
+
+    def test_attachable_rejects_sibling_instance_of_same_stand(self):
+        # (3) endpoint answers the RIGHT agentId but the WRONG instanceId —
+        # a stale/swapped socket must fail closed, never route work there
+        sock, srv = self._stub_daemon("@real:x", "online",
+                                      info_instance="other-install")
+        try:
+            out = reg.attachable({"identity": {"agent_id": "@real:x"},
+                                  "instance_id": "mine",
+                                  "endpoint": {"path": sock}})
+            self.assertFalse(out["attachable"])
+            self.assertEqual(out["stage"], "identity")
         finally:
             srv.close()
 

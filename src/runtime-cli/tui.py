@@ -75,9 +75,11 @@ def instance_view(manifest: dict) -> dict:
     live protocol probe. The manifest 'status' is only last-known intent — it
     is NEVER trusted as running; the socket probe is the running signal."""
     agent_id = (manifest.get("identity") or {}).get("agent_id") or "?"
+    inst = manifest.get("instance_id") or "default"
     endpoint = (manifest.get("endpoint") or {}).get("path")
     view = {
         "agentId": agent_id,
+        "instanceId": inst,
         "existence": "registered",              # the manifest exists
         "server": "unreachable",
         "core": "unknown",
@@ -90,10 +92,13 @@ def instance_view(manifest: dict) -> dict:
         view["server"] = "stopped"
         return view
     view["server"] = "running"
-    # Identity: the socket answering must be THIS instance, never assumed.
+    # Identity: the socket answering must be THIS instance — both axes. The
+    # same Stand's sibling instance answers agentId-true but instanceId-false.
     try:
         info = _rpc_at(endpoint, "sutando.info", {})
-        view["identityVerified"] = (info.get("agentId") == agent_id)
+        view["identityVerified"] = (
+            info.get("agentId") == agent_id
+            and (info.get("instanceId") or "default") == inst)
     except (OSError, RuntimeError, ValueError):
         view["identityVerified"] = False
     # Core + health, kept distinct from server reachability.
@@ -115,6 +120,7 @@ def render_view(view: dict) -> str:
     lines = [
         "Sutando Instance",
         f"  ID:         {view['agentId']}",
+        f"  Instance:   {view.get('instanceId') or 'default'}",
         f"  Existence:  {view['existence']}",
         f"  Server:     {view['server']}",
         f"  Core:       {view['core']}",
@@ -147,7 +153,8 @@ def main(argv=None) -> int:  # pragma: no cover — interactive key loop; instan
         print("Sutando Instances")
         for v in views:
             dot = "●" if v["server"] == "running" else "○"
-            print(f"  {dot} {v['agentId']:<28} {v['server']:<10} "
+            sel = f"{v['agentId']}/{v['instanceId']}"
+            print(f"  {dot} {sel:<28} {v['server']:<10} "
                   f"core={v['core']} health={v['health']}")
         if not views:
             print("  (none registered)")
@@ -164,11 +171,18 @@ def main(argv=None) -> int:  # pragma: no cover — interactive key loop; instan
             return 0
         if cmd == "l":
             continue
-        by_id = {v["agentId"]: v for v in views}
+        # Instances are addressed agentId/instanceId; a bare agentId is only
+        # accepted while it names exactly ONE instance (never a silent pick).
+        by_id = {f"{v['agentId']}/{v['instanceId']}": v for v in views}
+        for v in views:
+            by_id[v["agentId"]] = (
+                None if sum(1 for x in views
+                            if x["agentId"] == v["agentId"]) > 1 else v)
         if cmd in ("s", "c", "a", "o", "t", "h") and rest:
             v = by_id.get(rest[0])
             if v is None:
-                print(f"  no such instance: {rest[0]}\n")
+                print(f"  no such instance (or ambiguous agent id — use "
+                      f"agentId/instanceId): {rest[0]}\n")
                 continue
             if cmd in ("a", "o", "t", "h") and v.get("identityVerified") is not True:
                 # the socket answered as a DIFFERENT instance (or never
@@ -179,19 +193,22 @@ def main(argv=None) -> int:  # pragma: no cover — interactive key loop; instan
                 continue
             try:
                 if cmd == "s":
-                    print(" ", instance_registry.start_instance(rest[0]), "\n")
+                    print(" ", instance_registry.start_instance(
+                        v["agentId"], instance=v["instanceId"]), "\n")
                 elif cmd == "c":
                     print(render_view(instance_view(v["_manifest"])), "\n")
                 elif cmd == "a":
                     # hand the whole terminal to the native TUI (v1 attach)
-                    ac = instance_registry.attach(rest[0])
+                    ac = instance_registry.attach(v["agentId"],
+                                                  instance=v["instanceId"])
                     if not ac.get("ok"):
                         print(f"  {ac.get('error')}\n")
                         continue
                     os.execvp(ac["argv"][0], ac["argv"])
                 elif cmd == "o":
                     import terminal_open
-                    print(" ", terminal_open.open_instance(rest[0]), "\n")
+                    print(" ", terminal_open.open_instance(
+                        v["agentId"], instance=v["instanceId"]), "\n")
                 elif cmd == "t":
                     ep = v.get("endpoint")
                     if not ep or v["server"] != "running":

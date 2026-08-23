@@ -54,14 +54,16 @@ def run(coro):
 _n = 0
 
 
-def fresh(executors=None, actor="test-actor"):
+def fresh(executors=None, actor="test-actor", granted=frozenset()):
     """A dispatcher over disposable store + human-action dir."""
     global _n
     _n += 1
     d = Path(tempfile.mkdtemp(prefix=f"rt-disp-{_n}-"))
     store = RequestStore(str(d / "state.sqlite"))
     ha = HumanActionAdapter(str(d / "ha"))
-    return RuntimeDispatcher(store, ha, actor, executors or {}), store, ha, d
+    return (RuntimeDispatcher(store, ha, actor, executors or {},
+                              granted_methods=granted),
+            store, ha, d)
 
 
 def approve(ha, disp, rid, decision="approved", answer=None):
@@ -290,8 +292,18 @@ check("recovery relinks a pending approval to its card", a_rid in d._ha_of, str(
 check("recovery relinks a pending elicitation to its card", e_rid in d._ha_of, str(d._ha_of))
 check("recovered approval is still pending", store.get(a_rid)["status"] == "pending")
 
-print("── approval.respond (device-plane; transport gates access) ──")
-d, store, ha, _ = fresh(actor="responder")
+print("── approval.respond (device-plane; needs a daemon-resolved grant) ──")
+d0, store0, ha0, _ = fresh(actor="ungranted")
+ra0 = run(d0.handle("approval.request", {"action": "x.y"}))
+raises("respond WITHOUT a grant is not callable (fails closed)",
+       lambda: run(d0.handle("approval.respond",
+                             {"requestId": ra0["requestId"],
+                              "decision": "approve"})),
+       code=-32601, substr="grant")
+check("ungranted respond leaves the approval pending",
+      store0.get(ra0["requestId"])["status"] == "pending")
+d, store, ha, _ = fresh(actor="responder",
+                        granted=frozenset({"approval.respond"}))
 raises("respond requires requestId",
        lambda: run(d.handle("approval.respond", {})), code=-32602, substr="requestId")
 raises("respond requires a valid decision",

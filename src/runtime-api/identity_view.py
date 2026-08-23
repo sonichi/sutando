@@ -25,17 +25,19 @@ from agents_view import ALIVE_MAX_AGE_S
 class IdentityView:
     def __init__(self, state_dir: str | Path, actor_id: str,
                  channels_dir: str | Path | None = None,
-                 host_label: str | None = None):
+                 host_label: str | None = None,
+                 instance: str | None = None):
         self.state_dir = Path(state_dir)
         self.actor_id = actor_id
         self.channels_dir = Path(channels_dir) if channels_dir else None
         self.host_label = host_label
+        self.instance = instance or "default"
 
     # ── sutando.info ────────────────────────────────────────────────────────
     def info(self) -> dict:
-        # Identity only — pid/sockets/heartbeat internals are runtime
-        # diagnostics and live on runtime.details (owner taxonomy ruling).
-        out = {"agentId": self.actor_id}
+        # Identity only — runtime internals live on runtime.details. The
+        # daemon-resolved instanceId says WHICH installation is answering.
+        out = {"agentId": self.actor_id, "instanceId": self.instance}
         if self.host_label:
             out["hostLabel"] = self.host_label
         beat = self._own_beat()
