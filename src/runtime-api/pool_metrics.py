@@ -99,7 +99,9 @@ class PoolMetrics:
         breaks_by_channel: Counter = Counter()
         pairs = 0
         for c, seq in chan_seq.items():
-            seq.sort()
+            # by TIME only, stable: sorting the (ts, instance) tuple would
+            # reorder equal-timestamp rows by core name and invent switches
+            seq.sort(key=lambda r: r[0])
             for (t0, i0), (t1, i1) in zip(seq, seq[1:]):
                 if t1 - t0 > continuity_window_s:
                     continue
