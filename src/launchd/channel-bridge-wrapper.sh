@@ -22,9 +22,13 @@ esac
 
 # The bridge resolves env -> .env -> vault, so an .env-only gate here is NARROWER
 # than the thing it gates and parks a bridge whose token is merely in the vault.
-if [ -z "$TOKEN" ] && command -v python3 >/dev/null 2>&1; then
+# Honor the SAME interpreter contract the bridge launch uses below, or a host
+# relying on the explicit override gets a runnable bridge and an unrunnable gate.
+_GATE_PY="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
+if [ -z "$_GATE_PY" ] && command -v python3 >/dev/null 2>&1; then _GATE_PY=python3; fi
+if [ -z "$TOKEN" ] && [ -n "$_GATE_PY" ]; then
   _tok_rc=0
-  python3 "$REPO/src/channel_token.py" --has "$TOKEN_VAR" --env-file "$ENV_FILE" 2>/dev/null || _tok_rc=$?
+  "$_GATE_PY" "$REPO/src/channel_token.py" --has "$TOKEN_VAR" --env-file "$ENV_FILE" 2>/dev/null || _tok_rc=$?
   # 0 = usable, 3 = definitively absent, anything else = resolver unrunnable, so
   # fall through to the .env answer rather than taking the bridge down on a bug.
   [ "$_tok_rc" -eq 0 ] && TOKEN="vault"
