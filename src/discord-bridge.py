@@ -3259,6 +3259,11 @@ async def _handle_discord_message(message, force=False):
         if isinstance(message.channel, discord.Thread):
             try:
                 access_data = json.loads(ACCESS_FILE.read_text())
+            except Exception:
+                # First-run/wipe: no access.json yet — degrade like
+                # load_allowed()/load_policy(), don't drop the seed.
+                access_data = {}
+            try:
                 access_groups = access_data.setdefault('groups', {})
                 thread_id_str = str(message.channel.id)
                 # Multi-bot-safe seed gate. In a fleet deployment (siblingBots
