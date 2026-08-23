@@ -324,6 +324,18 @@ def cmd_acquire(args):
                 os.unlink(args.pidfile)
             except FileNotFoundError:
                 pass
+        # A live legacy record (#2722 pre-move owner) holds this acquisition;
+        # stale-retire and the held-verdict both stay inside THIS transaction.
+        legacy_path = getattr(args, "legacy_pidfile", None)
+        if legacy_path:
+            legacy = read_lock(legacy_path)
+            if legacy["kind"] != "absent":
+                if _owner_liveness(legacy) == "live":
+                    _emit({"code": "held", "holder": legacy, "at": "legacy"}, 7)
+                try:
+                    os.unlink(legacy_path)
+                except FileNotFoundError:
+                    pass
         try:
             record = _create_lock(args.pidfile, args.pid, args.entry, args.workspace)
         except OSError as e:
@@ -667,6 +679,7 @@ def main(argv=None):
     sp.add_argument("--pid", type=int, required=True)
     sp.add_argument("--entry", required=True)
     sp.add_argument("--workspace", required=True)
+    sp.add_argument("--legacy-pidfile", default=None)
     sp.set_defaults(fn=cmd_acquire)
 
     sp = sub.add_parser("read")

@@ -247,6 +247,7 @@ function acquirePidLock(): void {
 	try { mkdirSync(join(WORKSPACE_DIR, 'state', 'locks'), { recursive: true }); } catch { /* acquire fails closed below */ }
 	const res = acquireVoiceLock({
 		pidfile: PIDFILE,
+		legacyPidfile: LEGACY_PIDFILE,
 		guard,
 		pid: myPid,
 		entry,
@@ -263,9 +264,6 @@ function acquirePidLock(): void {
 		console.error(`${ts()} [Startup] Fix the lock helper (scripts/voice-lock.py + its python3), then restart. Exiting.`);
 		process.exit(1);
 	}
-	// Self-healing migration (#2722): holding the guard proves any root-path
-	// copy is stale metadata, so retire it the way check-pending-questions.py does.
-	try { unlinkSync(LEGACY_PIDFILE); } catch { /* absent on post-transition hosts */ }
 	// Capability-marker binding token: a stale marker can never match a later
 	// acquisition, even one that reuses this pid.
 	voiceLockId = res.lockId;
