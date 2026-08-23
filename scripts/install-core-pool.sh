@@ -3,7 +3,10 @@
 # that share one workspace and coordinate via the claim primitive (#880).
 #
 # Usage:
-#   bash scripts/install-core-pool.sh [N]
+#   bash scripts/install-core-pool.sh [N] [--force] [--check-only]
+#
+# --check-only runs every preflight (config dir, skill, binaries, staging) and
+# exits without touching launchd — the seam the preflight tests exercise.
 #
 # Defaults to N=3 per #881 design (owner directive 2026-05-18: "Set N=3 by default").
 # Set N=1 to disable parallelism while keeping the plumbing installed.
@@ -20,7 +23,20 @@
 
 set -euo pipefail
 
-N="${1:-3}"
+N=""
+FORCE=0
+CHECK_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --check-only) CHECK_ONLY=1 ;;
+    --*) echo "error: unknown option '$arg'" >&2; exit 2 ;;
+    *)
+      [ -z "$N" ] || { echo "error: more than one N given ('$N', '$arg')" >&2; exit 2; }
+      N="$arg" ;;
+  esac
+done
+N="${N:-3}"
 case "$N" in
   ''|*[!0-9]*) echo "error: N must be a positive integer; got '$N'" >&2; exit 2 ;;
 esac
@@ -39,9 +55,21 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
 # capture the installer's PATH: launchd strips env, and the sessions need brew bins
 POOL_PATH="${PATH}"
-# followers must share the LIVE session's credential store — a defaulted
-# ~/.claude may hold expired OAuth (measured: launchd session auth-failed)
-CLAUDE_CONFIG_DIR_EFFECTIVE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Followers must share the LIVE session's credential store, so resolve it the
+# way every other Sutando launcher does (startup.sh, start-cli.sh) instead of
+# guessing: an ad-hoc default silently selects a foreign credential store.
+# shellcheck source=../src/claude_config_dir.sh
+source "$REPO_DIR/src/claude_config_dir.sh"
+if CLAUDE_CONFIG_DIR_EFFECTIVE="$(resolve_claude_config_dir "$REPO_DIR" install-core-pool)"; then
+  :
+else
+  # 2 = config helper absent and the caller scoped it; any other code means the
+  # helper refused, and refusing to install beats installing against the wrong store.
+  _ccd_rc=$?
+  [ "$_ccd_rc" = "2" ] || exit 1
+  echo "  ~ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR_EFFECTIVE (caller-provided; config helper absent)"
+fi
+CLAUDE_CONFIG_DIR_EFFECTIVE="${CLAUDE_CONFIG_DIR_EFFECTIVE/#\~/$HOME}"
 
 # Preflight: followers fail with opaque one-liners when these are wrong —
 # check here where the operator can still see and fix them.
@@ -101,18 +129,16 @@ bootstrap_with_retry() {
 # a non-existent skill, launchd's KeepAlive will restart the failing claude
 # process every ThrottleInterval seconds and burn quota. Refuse the install
 # unless the skill is on disk OR the caller explicitly passes --force.
+#
+# Check the dir the followers actually load skills from — the resolved
+# CLAUDE_CONFIG_DIR this script just symlinked into. `-d` follows the symlink,
+# so a checkout without the skill leaves a dangling link and still fails here.
 SKILL_DIR_CANDIDATES=(
-  "$HOME/.claude/skills/proactive-loop-pool"
-  "$HOME/.claude/projects/-Users-qingyunwu-Documents-github-sutando/skills/proactive-loop-pool"
+  "$CLAUDE_CONFIG_DIR_EFFECTIVE/skills/proactive-loop-pool"
 )
 SKILL_FOUND=0
 for d in "${SKILL_DIR_CANDIDATES[@]}"; do
   if [ -d "$d" ]; then SKILL_FOUND=1; break; fi
-done
-
-FORCE=0
-for arg in "$@"; do
-  [ "$arg" = "--force" ] && FORCE=1
 done
 
 if [ "$SKILL_FOUND" -eq 0 ] && [ "$FORCE" -eq 0 ]; then
@@ -128,6 +154,13 @@ To bypass and install anyway (e.g. for plist-shape testing), re-run with:
   bash scripts/install-core-pool.sh $N --force
 MSG
   exit 1
+fi
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  echo "preflight OK: CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR_EFFECTIVE"
+  echo "preflight OK: skill=${SKILL_DIR_CANDIDATES[0]}"
+  echo "preflight OK: workspace=$WORKSPACE"
+  exit 0
 fi
 
 # Stop any pre-existing pool members beyond N so we shrink cleanly when
