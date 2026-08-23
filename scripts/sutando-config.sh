@@ -81,6 +81,22 @@ from src.sutando_config import resolve_workspace
 print(resolve_workspace(), end='')
 "
     ;;
+  voice-pidfile)
+    # Single resolver for the voice-agent pid metadata file (#2722). Canonical
+    # lives under state/locks/; the root path is a ~30-day reader fallback so an
+    # agent started under pre-move code stays stoppable (docs/migration-transition-window.md).
+    # $2 (optional): an already-resolved workspace root — callers that hold one
+    # inject it so this cannot disagree with the tree they operate on.
+    if [ -n "${2:-}" ]; then _ws="$2"; else _ws="$(bash "$0" workspace)" || exit 1; fi
+    _canon="$_ws/state/locks/voice-agent.pid"
+    _legacy="$_ws/.voice-agent.pid"
+    if [ ! -f "$_canon" ] && [ -f "$_legacy" ]; then
+      echo "sutando-config: voice-pidfile using legacy $_legacy (pre-move agent; transition window per #2722)" >&2
+      printf '%s' "$_legacy"
+    else
+      printf '%s' "$_canon"
+    fi
+    ;;
 
   vault-enabled)
     py -c "
