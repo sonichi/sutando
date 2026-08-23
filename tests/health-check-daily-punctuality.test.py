@@ -200,13 +200,25 @@ class TestCollector(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("root is int", r["detail"])
 
-    def test_launchd_and_codex_entries_are_out_of_scope(self):
+    def test_codex_entries_are_out_of_scope(self):
+        """Codex-task jobs complete in another runtime that writes no sentinel,
+        so there is nothing here that could observe them."""
         r = self._run(json.dumps([
-            {"name": "a", "cron": "50 6 * * *", "launchd": True},
             {"name": "b", "cron": "57 6 * * *", "execution": "codex-task"},
         ]))
-        self.assertIn("no session-owned daily jobs", r["detail"],
-                      "these have their own runner and must not be scored here")
+        self.assertIn("no plain-daily jobs", r["detail"],
+                      "that runner owns them and must not be scored here")
+
+    def test_launchd_entries_are_in_scope_via_their_completion_sentinel(self):
+        """Reverses the previous exclusion: the launchd lane publishes no dated
+        results file, and its sentinel is the only record that it finished."""
+        r = self._run(json.dumps([
+            {"name": "a", "cron": "50 6 * * *", "launchd": True},
+        ]))
+        self.assertIn("0 of 1 daily job(s) observable", r["detail"],
+                      "in the population, and UNCHECKED until it stamps")
+        self.assertNotIn("median", r["detail"],
+                         "a job that never stamps must not warn, only stay unchecked")
 
     def test_sub_daily_and_non_every_day_schedules_are_out_of_scope(self):
         r = self._run(json.dumps([
@@ -215,7 +227,7 @@ class TestCollector(unittest.TestCase):
             {"name": "monthly", "cron": "0 9 1 * *"},
             {"name": "dynamic"},
         ]))
-        self.assertIn("no session-owned daily jobs", r["detail"])
+        self.assertIn("no plain-daily jobs", r["detail"])
 
     def test_end_to_end_late_daily_job_warns(self):
         arts = [(f"insight-2026-08-0{d}.txt", (2026, 8, d, 7, 30, 0, 0, 0, -1))
@@ -234,7 +246,7 @@ class TestCollector(unittest.TestCase):
 
     def test_a_dict_shaped_config_is_read_too(self):
         r = self._run(json.dumps({"crons": [{"name": "x", "cron": "*/5 * * * *"}]}))
-        self.assertIn("no session-owned daily jobs", r["detail"])
+        self.assertIn("no plain-daily jobs", r["detail"])
 
     def test_a_declared_artifact_beats_the_name_derived_stem(self):
         """`talk-events-nightly` infers stem `nightly`, so its real
