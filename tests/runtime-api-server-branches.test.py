@@ -240,6 +240,39 @@ class RequestsWatcherStoreFailures(unittest.TestCase):
 
 
 class EmitNewResults(unittest.TestCase):
+    def test_archive_between_read_and_stat_still_delivers(self):
+        # read succeeds, file is archived before stat: the frame must still
+        # go out and the watcher must NOT raise (daemon-killing race)
+        tmp = tempfile.TemporaryDirectory()
+        (Path(tmp.name) / "state").mkdir()
+        s = _mk_server(tmp.name)
+        rdir = Path(tmp.name) / "results"
+        rdir.mkdir()
+        f = rdir / "task-race.txt"
+        f.write_text("race body")
+
+        real_read = srv.read_ready_result
+
+        def read_then_unlink(p):
+            body = real_read(p)
+            if body is not None:
+                Path(p).unlink()      # concurrent archival wins the gap
+            return body
+
+        live = _LiveWriter()
+        s._subscribers.add(live)
+        seen: set = set()
+        import unittest.mock as mock
+        with mock.patch.object(srv, "read_ready_result", read_then_unlink):
+            class _T:
+                def _result_files(self):
+                    return [f]
+            run(s._emit_new_results(_T(), seen))
+        joined = b"".join(live.frames).decode(errors="replace")
+        self.assertIn("race body", joined)
+        self.assertIn("task-race.txt", seen)
+        tmp.cleanup()
+
     def test_oserror_listing_returns_and_unreadable_file_skipped(self):
         tmp = tempfile.TemporaryDirectory()
         (Path(tmp.name) / "state").mkdir()

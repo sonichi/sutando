@@ -426,9 +426,13 @@ class RuntimeServer:
             if body is None:
                 continue
             seen.add(f.name)
+            try:
+                ts = int(f.stat().st_mtime)
+            except OSError:
+                ts = int(time.time())  # archived between read and stat
             frame = notification_frame("task.result", {
                 "taskId": f.name.removesuffix(".txt"),
-                "result": body, "ts": int(f.stat().st_mtime)})
+                "result": body, "ts": ts})
             for w in list(self._subscribers):
                 try:
                     w.write(frame)
