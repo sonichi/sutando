@@ -678,7 +678,7 @@ function resetSessionGateState(): void {
 // resolver function.
 import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
 
-import { createOutputSanitizer, wireSanitizerToTransport } from './output_sanitizer.js';
+import { wireSanitizerToTransport } from './output_sanitizer.js';
 function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
