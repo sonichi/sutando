@@ -13,12 +13,22 @@ ENV_FILE="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path "channels/$C
 [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
 
 case "$CHANNEL" in
-  slack) TOKEN="${SLACK_BOT_TOKEN:-}"; MODULE=slack_bolt ;;
-  discord) TOKEN="${DISCORD_BOT_TOKEN:-}"; MODULE=discord ;;
+  slack) TOKEN_VAR=SLACK_BOT_TOKEN; TOKEN="${SLACK_BOT_TOKEN:-}"; MODULE=slack_bolt ;;
+  discord) TOKEN_VAR=DISCORD_BOT_TOKEN; TOKEN="${DISCORD_BOT_TOKEN:-}"; MODULE=discord ;;
   # telegram has no third-party dep; urllib.request is stdlib, so this stays an
   # interpreter probe rather than a network one.
-  telegram) TOKEN="${TELEGRAM_BOT_TOKEN:-}"; MODULE=urllib.request ;;
+  telegram) TOKEN_VAR=TELEGRAM_BOT_TOKEN; TOKEN="${TELEGRAM_BOT_TOKEN:-}"; MODULE=urllib.request ;;
 esac
+
+# The bridge resolves env -> .env -> vault, so an .env-only gate here is NARROWER
+# than the thing it gates and parks a bridge whose token is merely in the vault.
+if [ -z "$TOKEN" ] && command -v python3 >/dev/null 2>&1; then
+  _tok_rc=0
+  python3 "$REPO/src/channel_token.py" --has "$TOKEN_VAR" --env-file "$ENV_FILE" 2>/dev/null || _tok_rc=$?
+  # 0 = usable, 3 = definitively absent, anything else = resolver unrunnable, so
+  # fall through to the .env answer rather than taking the bridge down on a bug.
+  [ "$_tok_rc" -eq 0 ] && TOKEN="vault"
+fi
 if [ -z "$TOKEN" ]; then
   # KeepAlive=true is intentionally unconditional: the conditional
   # Crashed/SuccessfulExit dictionary can remain pended instead of respawning
