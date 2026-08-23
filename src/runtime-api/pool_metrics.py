@@ -52,16 +52,22 @@ class PoolMetrics:
 
     # ── the summary the benchmark reads ─────────────────────────────────────
     def summarize(self, day: "str | None" = None,
-                  head_of_line_s: float = 120.0) -> dict:
+                  head_of_line_s: float = 120.0,
+                  continuity_window_s: float = 1800.0) -> dict:
         """Distribution + incident counts for one day's log. head-of-line
         incident = a task that waited longer than `head_of_line_s` before
-        assignment (queue starvation, the #884 symptom the bar names)."""
+        assignment (queue starvation, the #884 symptom the bar names).
+        Continuity break = two same-channel assignments within
+        `continuity_window_s` landing on different cores — the measured cost
+        of every affinity yield, paired against wait time to tune the
+        busy threshold from data instead of feel."""
         if day:
             path = self.dir / f"pool-{day}.jsonl"
         else:
             path = self._path()
         dist: Counter = Counter()
         per_channel: dict = defaultdict(list)
+        chan_seq: dict = defaultdict(list)  # channel -> [(ts, instance)]
         incidents = fallback_claims = reclaims = rows = bad = 0
         try:
             lines = path.read_text().splitlines()
@@ -80,6 +86,8 @@ class PoolMetrics:
                 w = float(r.get("wait_s") or 0)
                 if r.get("channel"):
                     per_channel[r["channel"]].append(w)
+                    chan_seq[r["channel"]].append(
+                        (float(r.get("ts") or 0), r.get("instance", "?")))
                 if w > head_of_line_s:
                     incidents += 1
             elif ev == "claimed" and r.get("fallback"):
@@ -88,9 +96,22 @@ class PoolMetrics:
                 reclaims += 1
         chan_latency = {c: round(sum(v) / len(v), 3)
                         for c, v in per_channel.items() if v}
+        breaks_by_channel: Counter = Counter()
+        pairs = 0
+        for c, seq in chan_seq.items():
+            seq.sort()
+            for (t0, i0), (t1, i1) in zip(seq, seq[1:]):
+                if t1 - t0 > continuity_window_s:
+                    continue
+                pairs += 1
+                if i0 != i1:
+                    breaks_by_channel[c] += 1
         return {"rows": rows, "bad_lines": bad,
                 "assignment_distribution": dict(dist),
                 "head_of_line_incidents": incidents,
                 "fallback_claims": fallback_claims,
                 "reclaims": reclaims,
-                "mean_wait_by_channel": chan_latency}
+                "mean_wait_by_channel": chan_latency,
+                "continuity_breaks": sum(breaks_by_channel.values()),
+                "continuity_pairs": pairs,
+                "continuity_breaks_by_channel": dict(breaks_by_channel)}

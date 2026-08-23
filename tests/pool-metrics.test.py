@@ -56,5 +56,23 @@ class MetricsTests(unittest.TestCase):
         self.assertIn("note", self.m.summarize(day="1999-01-01"))
 
 
+    def test_continuity_breaks_count_same_channel_core_switches(self):
+        self.m.assigned("t1", "a", "C1", wait_s=0.0)
+        self.m.assigned("t2", "b", "C1", wait_s=0.0)   # switch -> break
+        self.m.assigned("t3", "b", "C1", wait_s=0.0)   # same core -> no break
+        self.m.assigned("t4", "a", "C2", wait_s=0.0)   # other channel, first
+        s = self.m.summarize()
+        self.assertEqual(s["continuity_breaks"], 1)
+        self.assertEqual(s["continuity_pairs"], 2)
+        self.assertEqual(s["continuity_breaks_by_channel"], {"C1": 1})
+
+    def test_switch_outside_window_is_not_a_break(self):
+        self.m.assigned("t1", "a", "C1", wait_s=0.0)
+        far = PoolMetrics(self.tmp.name, now_fn=lambda: 1_700_000_000.0 + 4000)
+        far.assigned("t2", "b", "C1", wait_s=0.0)
+        s = self.m.summarize()
+        self.assertEqual(s["continuity_breaks"], 0)
+        self.assertEqual(s["continuity_pairs"], 0)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
