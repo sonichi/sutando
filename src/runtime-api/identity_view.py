@@ -35,10 +35,8 @@ class IdentityView:
 
     # ── sutando.info ────────────────────────────────────────────────────────
     def info(self) -> dict:
-        # Identity only — pid/sockets/heartbeat internals are runtime
-        # diagnostics and live on runtime.details (owner taxonomy ruling).
-        # instanceId is daemon-resolved: WHICH installation answers, so a
-        # client can fail closed when a sibling of the same Stand replies.
+        # Identity only — runtime internals live on runtime.details. The
+        # daemon-resolved instanceId says WHICH installation is answering.
         out = {"agentId": self.actor_id, "instanceId": self.instance}
         if self.host_label:
             out["hostLabel"] = self.host_label
