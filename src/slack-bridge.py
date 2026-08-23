@@ -91,6 +91,11 @@ from util_paths import channel_access_path, claude_home_path, write_private_text
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from task_archive import archive_file as _shared_archive_file  # noqa: E402
+# Entrypoint-owned path setup: ``import ag2_sparrow`` resolves uninstalled (5b).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow")  # lint-workspace-resolution: allow-repo-root — locates the CODE package (gateway-shim parity)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
@@ -1046,8 +1051,23 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
             f"Write the sandboxed output to `results/{{task_id}}.txt` as the user-facing reply.\n"
         )
 
+    # The id derives from the provider event (channel+ts is Slack's message
+    # identity), so a redelivered event maps to the same file — never a second task.
     ts = int(time.time() * 1000)
-    task_id = f"task-{ts}"
+    _ev_channel, _ev_ts = event.get("channel"), event.get("ts")
+    if _ev_channel and _ev_ts:
+        task_id = provider_task_id(f"sl{event.get('team') or '0'}",
+                                   f"{_ev_channel}-{_ev_ts}")
+        from datetime import datetime as _dt
+        if already_admitted(task_id, TASKS_DIR, RESULTS_DIR,
+                            lambda tid: (ARCHIVE_TASKS_DIR /
+                                         _dt.now().strftime("%Y-%m") /
+                                         f"{tid}.txt").exists()):
+            print(f"  [ingress-dedup] replay of {task_id} — already admitted",
+                  flush=True)
+            return None
+    else:  # pragma: no cover — eventless call shape (startup edge): legacy mint
+        task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
     priority = default_priority_for_source("slack", access_tier)
 
