@@ -97,3 +97,14 @@ and no consensus protocol enters the system. launchd restarts the lead.
 - Each slice lands on this branch; the branch merges to the server branch (or
   main, post-train) only when the owner calls it sound — quality bar, not
   feature count, gates sharing.
+
+## Install troubleshooting (each observed on the first real N=2 install)
+
+| Symptom | Cause | Fix (now automated in `install-core-pool.sh`) |
+|---|---|---|
+| launchd job exits instantly, `last exit code = 78`, or never spawns | macOS TCC: launchd cannot exec scripts under `~/Documents`, open log files there, or use it as `WorkingDirectory` | Wrapper is staged to `~/.sutando/bin/`, logs go to `~/Library/Application Support/Sutando/logs/`, `WorkingDirectory=$HOME` |
+| `Failed to authenticate: OAuth session expired` | Follower defaulted to `~/.claude` while the live session's credentials live in `CLAUDE_CONFIG_DIR` | Installer captures its own `CLAUDE_CONFIG_DIR` into the plist env; preflight warns if no `.credentials.json` there |
+| `Unknown command: /proactive-loop-pool` | Pool skill not discoverable in the shared config dir | Installer symlinks `skills/proactive-loop-pool` into `$CLAUDE_CONFIG_DIR/skills/` |
+| Old error text after a fix | `core-N.err` accumulates across runs | Append a `=== MARK ===` line, kickstart, read only post-mark lines |
+
+Debug recipe: reproduce outside launchd first (`cd $POOL_REPO_DIR && $POOL_CLAUDE_BIN --dangerously-skip-permissions --add-dir $POOL_WORKSPACE --print "Reply with exactly: BOOT-OK"`) — userland success + launchd failure isolates the plist env; userland failure isolates auth/skill/config.

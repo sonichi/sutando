@@ -37,6 +37,14 @@ POOL_PATH="${PATH}"
 # followers must share the LIVE session's credential store — a defaulted
 # ~/.claude may hold expired OAuth (measured: launchd session auth-failed)
 CLAUDE_CONFIG_DIR_EFFECTIVE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+
+# Preflight: followers fail with opaque one-liners when these are wrong —
+# check here where the operator can still see and fix them.
+if [ ! -f "$CLAUDE_CONFIG_DIR_EFFECTIVE/.credentials.json" ]; then
+  echo "WARN: no credentials at $CLAUDE_CONFIG_DIR_EFFECTIVE (followers will fail auth)" >&2
+fi
+mkdir -p "$CLAUDE_CONFIG_DIR_EFFECTIVE/skills"
+ln -sfn "$REPO_DIR/skills/proactive-loop-pool" "$CLAUDE_CONFIG_DIR_EFFECTIVE/skills/proactive-loop-pool"
 WORKSPACE="${WORKSPACE/#\~/$HOME}"
 mkdir -p "$WORKSPACE/logs"
 mkdir -p "$WORKSPACE/state/cores"
