@@ -43,6 +43,16 @@ for plist in "$LAUNCH_AGENTS"/com.sutando.core-[0-9]*.plist; do
 done
 shopt -u nullglob
 
+# The lead is a pool member too — leaving its KeepAlive job behind would keep
+# restarting a daemon whose followers are gone.
+LEAD_PLIST="$LAUNCH_AGENTS/com.sutando.pool-lead.plist"
+if [ -f "$LEAD_PLIST" ]; then
+  launchctl bootout "$DOMAIN/com.sutando.pool-lead" 2>/dev/null || true
+  rm -f "$LEAD_PLIST"
+  echo "removed: com.sutando.pool-lead.plist"
+  removed=$((removed + 1))
+fi
+
 if [ "$removed" -eq 0 ]; then
   echo "no pool members installed; nothing to remove"
 else

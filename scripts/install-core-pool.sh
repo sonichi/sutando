@@ -3,10 +3,12 @@
 # that share one workspace and coordinate via the claim primitive (#880).
 #
 # Usage:
-#   bash scripts/install-core-pool.sh [N] [--force] [--check-only]
+#   bash scripts/install-core-pool.sh [N] [--force] [--check-only] [--lead-only]
 #
 # --check-only runs every preflight (config dir, skill, binaries, staging) and
 # exits without touching launchd — the seam the preflight tests exercise.
+# --lead-only installs just the lead's launchd job (startup.sh's recovery path
+# when the pool is installed but the lead job is not).
 #
 # Defaults to N=3 per #881 design (owner directive 2026-05-18: "Set N=3 by default").
 # Set N=1 to disable parallelism while keeping the plumbing installed.
@@ -26,10 +28,12 @@ set -euo pipefail
 N=""
 FORCE=0
 CHECK_ONLY=0
+LEAD_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
     --check-only) CHECK_ONLY=1 ;;
+    --lead-only) LEAD_ONLY=1 ;;
     --*) echo "error: unknown option '$arg'" >&2; exit 2 ;;
     *)
       [ -z "$N" ] || { echo "error: more than one N given ('$N', '$arg')" >&2; exit 2; }
@@ -87,14 +91,20 @@ mkdir -p "$WORKSPACE/state/cores"
 STAGE_DIR="$HOME/.sutando/bin"
 LOG_DIR="$HOME/Library/Application Support/Sutando/logs"
 mkdir -p "$STAGE_DIR" "$LOG_DIR"
-cp "$REPO_DIR/scripts/pool-core-wrapper.sh" "$STAGE_DIR/pool-core-wrapper.sh"
-cp "$REPO_DIR/scripts/pool-follower-beat.sh" "$STAGE_DIR/pool-follower-beat.sh"
-chmod +x "$STAGE_DIR/pool-core-wrapper.sh" "$STAGE_DIR/pool-follower-beat.sh"
+for w in pool-core-wrapper.sh pool-follower-beat.sh pool-lead-wrapper.sh; do
+  cp "$REPO_DIR/scripts/$w" "$STAGE_DIR/$w"
+  chmod +x "$STAGE_DIR/$w"
+done
 
 # Resolve claude + python3 binaries. Caller's $PATH may not include the
 # install dirs on launchd-spawned processes, so capture absolute paths now.
 CLAUDE_BIN="$(command -v claude || true)"
 TMUX_BIN="$(command -v tmux || true)"
+PY_BIN="$(command -v python3 || true)"
+if [ -z "$PY_BIN" ]; then
+  echo "error: 'python3' not found on \$PATH (the lead daemon is python)" >&2
+  exit 1
+fi
 if [ -z "$TMUX_BIN" ]; then
   echo "error: 'tmux' not found on \$PATH (persistent-form followers run in tmux)" >&2
   exit 1
@@ -124,6 +134,40 @@ bootstrap_with_retry() {
   launchctl bootstrap "$DOMAIN" "$plist"
 }
 
+# The lead is supervised like every other Sutando service. Without a job of its
+# own it was the single pool component nothing restarted, and the followers
+# degrade to leaderless claiming for as long as it stays dead.
+install_pool_lead() {
+  local template="$REPO_DIR/src/launchd/com.sutando.pool-lead.plist"
+  local plist="$LAUNCH_AGENTS/com.sutando.pool-lead.plist"
+  [ -f "$template" ] || { echo "error: missing lead plist template: $template" >&2; return 1; }
+  STAGE_DIR="$STAGE_DIR" LOG_DIR="$LOG_DIR" REPO_DIR="$REPO_DIR" \
+  PY_BIN="$PY_BIN" POOL_PATH="$POOL_PATH" \
+  "$PY_BIN" - "$template" "$plist" <<'PY'
+import os, plistlib, sys
+src, dst = sys.argv[1:]
+sub = {"__STAGE_DIR__": os.environ["STAGE_DIR"], "__LOG_DIR__": os.environ["LOG_DIR"],
+       "__REPO__": os.environ["REPO_DIR"], "__PY__": os.environ["PY_BIN"],
+       "__PATH__": os.environ["POOL_PATH"], "__HOME__": os.environ["HOME"]}
+def rep(v):
+    if isinstance(v, str):
+        for k, n in sub.items():
+            v = v.replace(k, n)
+    elif isinstance(v, list):
+        v = [rep(x) for x in v]
+    elif isinstance(v, dict):
+        v = {k: rep(x) for k, x in v.items()}
+    return v
+with open(src, "rb") as fh:
+    data = plistlib.load(fh)
+with open(dst, "wb") as fh:
+    plistlib.dump(rep(data), fh, sort_keys=False)
+PY
+  launchctl bootout "$DOMAIN/com.sutando.pool-lead" 2>/dev/null || true
+  bootstrap_with_retry "$plist"
+  echo "installed: com.sutando.pool-lead (log: $LOG_DIR/pool-lead.log)"
+}
+
 # Regression guard: Phase 2a ships the launchd plumbing + claim primitive,
 # but NOT the `/proactive-loop-pool` skill. If we install plists that invoke
 # a non-existent skill, launchd's KeepAlive will restart the failing claude
@@ -141,7 +185,8 @@ for d in "${SKILL_DIR_CANDIDATES[@]}"; do
   if [ -d "$d" ]; then SKILL_FOUND=1; break; fi
 done
 
-if [ "$SKILL_FOUND" -eq 0 ] && [ "$FORCE" -eq 0 ]; then
+# The lead runs the python daemon, not the skill, so --lead-only is not gated on it.
+if [ "$SKILL_FOUND" -eq 0 ] && [ "$FORCE" -eq 0 ] && [ "$LEAD_ONLY" -eq 0 ]; then
   cat >&2 <<MSG
 error: '/proactive-loop-pool' skill not found at:
 $(for d in "${SKILL_DIR_CANDIDATES[@]}"; do echo "  $d"; done)
@@ -160,6 +205,11 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   echo "preflight OK: CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR_EFFECTIVE"
   echo "preflight OK: skill=${SKILL_DIR_CANDIDATES[0]}"
   echo "preflight OK: workspace=$WORKSPACE"
+  exit 0
+fi
+
+install_pool_lead
+if [ "$LEAD_ONLY" -eq 1 ]; then
   exit 0
 fi
 
@@ -248,7 +298,8 @@ PLIST_EOF
 done
 
 echo
-echo "Installed pool of $N core(s). Logs: $WORKSPACE/logs/core-{1..$N}.log"
+echo "Installed pool of $N core(s) + lead."
+echo "Logs: $LOG_DIR/core-{1..$N}.log, $LOG_DIR/pool-lead.log"
 echo
 echo "IMPORTANT: This PR ships the launchd plumbing + claim primitive."
 echo "The pool-aware skill '/proactive-loop-pool' is NOT in this PR (Phase 2b)."

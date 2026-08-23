@@ -1313,6 +1313,28 @@ if [ "$WITH_APP" -eq 1 ]; then
     fi
 fi
 
+# Pool lead — runs whenever pool followers are installed: without it they
+# degrade to leaderless claiming. Never starts one alongside launchd; the
+# helper returns 0 once a lead from this checkout is running.
+shopt -s nullglob
+_pool_members=("$HOME/Library/LaunchAgents"/com.sutando.core-[0-9]*.plist)
+shopt -u nullglob
+if [ "${#_pool_members[@]}" -gt 0 ]; then
+    if pool_lead_supervised; then
+        echo "  ✓ pool lead (launchd-supervised)" >&2
+    else
+        _POOL_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+        nohup "$PY" "$REPO/scripts/pool-lead-daemon.py" \
+            > "$_POOL_WS/logs/pool-lead.log" 2>&1 &
+        sleep 1
+        if pgrep -f "$REPO/scripts/pool-lead-daemon.py" > /dev/null 2>&1; then
+            echo "  ⚠ pool lead started unsupervised (log: $_POOL_WS/logs/pool-lead.log)" >&2
+        else
+            echo "  ✗ pool lead failed to start — followers will run leaderless; see $_POOL_WS/logs/pool-lead.log" >&2
+        fi
+    fi
+fi
+
 if [ -t 0 ] && [ -z "${TMUX:-}" ]; then
     exec >/dev/tty 2>&1
 fi

@@ -540,3 +540,30 @@ start_gateway_lanes() {
     done
   fi
 }
+
+# Same shape as channel_bridge_supervised(): kickstart a loaded service, install
+# the job when absent, non-zero so the caller can fall back unsupervised.
+#
+# A lead already running from this checkout counts as supervised — the launchd
+# job stands down while it lives and takes over the moment it exits.
+# Requires REPO set by the caller (same contract as start_gateway_lanes).
+pool_lead_supervised() {
+  local label="com.sutando.pool-lead"
+  local service="gui/$(id -u)/$label"
+  local daemon="$REPO/scripts/pool-lead-daemon.py"
+  local installer="$REPO/scripts/install-core-pool.sh"
+  local template="$REPO/src/launchd/$label.plist"
+
+  [ -f "$installer" ] && [ -f "$template" ] && [ -f "$daemon" ] || return 1
+  if launchctl print "$service" > /dev/null 2>&1; then
+    pgrep -f "$daemon" > /dev/null 2>&1 && return 0
+    launchctl kickstart -k "$service" > /dev/null 2>&1 || return 1
+  else
+    bash "$installer" --lead-only > /dev/null 2>&1 || return 1
+  fi
+  for _ in $(seq 1 "${SUTANDO_POOL_LEAD_WAIT_S:-12}"); do
+    pgrep -f "$daemon" > /dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
