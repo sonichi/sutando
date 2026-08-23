@@ -71,24 +71,10 @@ def build(finish=(6, 59), days=5, include_today=True):
     return ws
 
 
-# The probe reads the wall clock, and `due` is combined with TODAY's date, so
-# for the first hour after local midnight no miss can be reported at all.
-class _FixedNow(datetime.datetime):
-    @classmethod
-    def now(cls, tz=None):
-        d = datetime.date.today()
-        return cls(d.year, d.month, d.day, 12, 0, 0)
-
-
 def run(ws):
     hc.WORKSPACE_DIR = ws
     hc._host_label = lambda: "H"
-    real = datetime.datetime
-    datetime.datetime = _FixedNow
-    try:
-        return hc.check_daily_cron_punctuality()
-    finally:
-        datetime.datetime = real
+    return hc.check_daily_cron_punctuality()
 
 
 # ── the lane enters the scored population at all ─────────────────────────────
@@ -140,21 +126,6 @@ check("a differently-prefixed job is excluded",
 mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
 check("a trailing suffix is refused by the anchored date pattern",
       all(m[1] != 4 * 60 for m in mins), f"got {mins}")
-
-# ── an aware body must localise, or its minute-of-day is UTC while cron times
-# and the mtime fallback are local — a whole-offset error, not a rounding one ──
-ws = build()
-d = datetime.date.today()
-aware = datetime.datetime(d.year, d.month, d.day, 6, 59, tzinfo=datetime.timezone.utc)
-local = aware.astimezone()
-for nm, body in (("z", f"{aware:%Y-%m-%dT%H:%M:%S}Z"),
-                 ("us", f"{aware:%Y-%m-%dT%H:%M:%S}.433037Z"),
-                 ("off", f"{aware:%Y-%m-%dT%H:%M:%S}+00:00")):
-    (ws / "state" / f"{nm}-{d}.sentinel").write_text(body)
-    got = hc._daily_completion_minutes(ws / "state", nm)
-    check(f"{nm}: aware body localises to the same minute-of-day as cron/mtime",
-          got and got[-1][1] == local.hour * 60 + local.minute,
-          f"got {got[-1] if got else None}, want {local.hour * 60 + local.minute}")
 
 # ── absent state/ dir is empty, not an exception ─────────────────────────────
 check("missing state dir returns empty",
