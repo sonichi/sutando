@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# sutando — friendly front door to the local Sutando Server (runtime API v0).
+#   sutando serve                 start the server daemon (foreground)
+#   sutando status|info|owner|allowlist          identity group shortcuts
+#   sutando task submit "text" | task status <id> | ...
+#   sutando agent list | agent status <id>
+# Everything else passes through to the full runtime CLI unchanged.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+case "${1:-help}" in
+  serve)
+    shift
+    exec python3 "$REPO/src/runtime-api/server.py" "$@" ;;
+  chat|watch|submit|results|get-result)
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" task "$@" ;;
+  info|status|owner|allowlist)
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" sutando "$@" ;;
+  health|details)
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" runtime "$@" ;;
+  list)
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" instance list ;;
+  start)
+    shift
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" instance start "$@" ;;
+  tui)
+    exec python3 "$REPO/src/runtime-cli/tui.py" ;;
+  attach)
+    shift
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" instance attach "$@" ;;
+  open)
+    shift
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" instance open "$@" ;;
+  help|-h|--help)
+    sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+  *)
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" "$@" ;;
+esac

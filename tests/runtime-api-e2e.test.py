@@ -131,11 +131,20 @@ GW_URL = f"http://127.0.0.1:{_gw_srv.server_address[1]}"
 
 TMP = tempfile.mkdtemp(prefix="runtime-api-e2e-")
 ENV = {**os.environ,
+       # instance lock + run dir must not collide with a live daemon's default
+       "SUTANDO_RUN_DIR": str(Path(TMP) / "run"),
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
        "SUTANDO_RUNTIME_DB": str(Path(TMP) / "runtime-state.sqlite"),
        "SUTANDO_HA_DIR": str(Path(TMP) / "human-actions"),
+       "SUTANDO_RUNTIME_STATE": str(Path(TMP) / "state"),
        "SUTANDO_RUNTIME_RESOLVE_POLL": "0.3",
        "SUTANDO_AGENT_ID": "@test-agent:example.org",
+       "SUTANDO_HOST_LABEL": "e2e-host",  # runtime.* reads its own beat by label
+       "SUTANDO_INSTANCE_REGISTRY": str(Path(TMP) / "instances"),
+       "SUTANDO_TMUX_SOCKET": "/tmp/e2e-tmux.sock",
+       "SUTANDO_TMUX_SESSION": "e2e-core",
+       "SUTANDO_LAUNCHER_EXECUTABLE": str(REPO / "bin" / "sutando"),
+       "SUTANDO_LAUNCHER_ARGS": '["serve"]',
        "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
        "REMOTE_TASK_TOKEN": "test-bearer"}
 
@@ -473,12 +482,203 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         g8 = cli("request", "get", r8["requestId"])
         check(g8["status"] == "cancelled",
               "late owner answer cannot overwrite a terminal state (CAS)")
+
+        # 9. agent discovery through the REAL daemon + CLI (Sutando Server
+        # slice 1): cores heartbeats surface as identity+liveness; a stale
+        cores = Path(ENV["SUTANDO_RUNTIME_STATE"]) / "cores"
+        cores.mkdir(parents=True, exist_ok=True)
+        (cores / "e2e-host.alive").write_text(json.dumps(
+            {"host": "e2e-host", "pid": 42, "status": "running"}))
+        stale = cores / "stale-host.alive"
+        stale.write_text(json.dumps({"host": "stale-host"}))
+        _old = time.time() - 300
+        os.utime(stale, (_old, _old))
+        al = cli("agent", "list")
+        by_id = {a["agentId"]: a for a in al["agents"]}
+        check(by_id.get("e2e-host", {}).get("alive") is True
+              and by_id.get("stale-host", {}).get("alive") is False,
+              "agent list: fresh beat alive, stale beat present-but-dead")
+        st9 = cli("agent", "status", "e2e-host")
+        check(st9["alive"] is True and st9["pid"] == 42,
+              "agent status resolves identity + heartbeat metadata via CLI")
+        cli("agent", "status", "no-such-agent", expect_rc=1)
+        check(True, "agent status for unknown id exits 1 (loud, not empty)")
+
+        # 10. identity surface (sutando.*) through the real daemon + CLI.
+        # The daemon booted before core-status.json existed — identity reads
+        Path(ENV["SUTANDO_RUNTIME_STATE"], "core-status.json").write_text(
+            json.dumps({"status": "running", "step": "e2e", "ts": 1}))
+        s10 = cli("sutando", "status")
+        check(s10.get("status") == "running" and s10.get("step") == "e2e",
+              "sutando status reflects live core-status.json")
+        i10 = cli("sutando", "info")
+        check(i10.get("agentId") == "@test-agent:example.org",
+              "sutando info reports the daemon-resolved actor id")
+        a10 = cli("sutando", "allowlist")
+        check(isinstance(a10.get("channels"), dict),
+              "sutando allowlist answers with a channels map")
+
+        # 11. task pipeline (task.*) through the real daemon + CLI: submit
+        # lands a canonical task file, status tracks it, a result completes
+        t11 = cli("task", "submit", "e2e: do the thing", "--priority", "low")
+        tid11 = t11["taskId"]
+        check(t11["state"] == "pending", "task submit returns pending")
+        tf = Path(TMP) / "tasks" / f"{tid11}.txt"
+        check(tf.is_file() and "access_tier: owner" in tf.read_text()
+              and "task: e2e: do the thing" in tf.read_text(),
+              "submit wrote a canonical owner-tier task file")
+        d11 = cli("task", "details", tid11)
+        check(d11["task"] == "e2e: do the thing" and d11["priority"] == "low",
+              "task details round-trips through the real parser")
+        Path(TMP, "results").mkdir(exist_ok=True)
+        Path(TMP, "results", f"{tid11}.txt").write_text("all done")
+        s11 = cli("task", "status", tid11)
+        check(s11["state"] == "done", "a result file completes the task")
+        r11 = cli("task", "get-result", tid11)
+        check(r11["result"] == "all done", "task get-result returns the body")
+        t12 = cli("task", "submit", "cancel me")
+        c12 = cli("task", "cancel", t12["taskId"])
+        check(c12["cancelled"] == "requested" and c12.get("cancelTaskId"),
+              "cancel emits a CANCEL_INSTRUCTION signal task")
+
+        # 13. runtime surface (runtime.*): health is the coarse end-user
+        # readout (fresh e2e-host beat from section 9 + live core-status
+        (cores / "e2e-host.alive").write_text(json.dumps(
+            {"host": "e2e-host", "pid": 42, "socket": "/tmp/e2e-tmux.sock"}))
+        h13 = cli("runtime", "health")
+        check(h13["state"] == "online" and h13.get("currentActivity") == "e2e",
+              "runtime health: online + current activity from core-status")
+        d13 = cli("runtime", "details")
+        check(d13.get("pid") == 42 and d13.get("socket") == "/tmp/e2e-tmux.sock"
+              and d13.get("runtimeSocket", "").endswith("rt.sock"),
+              "runtime details: pid + tmux socket + daemon runtime socket")
+        i13 = cli("sutando", "info")
+        check("pid" not in i13 and "socket" not in i13
+              and "runtimeSocket" not in i13,
+              "sutando info no longer leaks runtime internals")
+
+        # 14. human_action.* (third HITL type) through the real daemon + CLI:
+        # request mirrors a Done/Decline card; the owner's card answer
+        h14 = cli("human-action", "request", "--action", "Sign the e2e form",
+                  "--instructions", "Review it first")
+        act14 = pending_action_for(h14["requestId"], store)
+        check(act14 is not None
+              and "Sign the e2e form" in json.dumps(act14["questions"])
+              and [o["label"] for o in act14["questions"][0]["options"]] == ["Done", "Decline"],
+              "human_action card carries the act + Done/Decline options")
+        store.resolve(act14["action_id"], {"1": [1]}, "@owner:example.org")
+        w14 = cli("request", "wait", h14["requestId"], "--timeout", "10")
+        check(w14["status"] == "completed" and w14["resolvedBy"] == "@owner:example.org",
+              "owner card answer Done resolves the request to completed")
+        h15 = cli("human-action", "request", "--action", "Plug in the drive")
+        c15 = cli("human-action", "complete", h15["requestId"], "--note", "done irl")
+        check(c15["status"] == "completed",
+              "API complete path resolves the request")
+        act15 = pending_action_for(h15["requestId"], store)
+        check(act15 is not None and act15["status"] == "resolved",
+              "API completion closes the mirrored card (no dangling question)")
+        s15 = cli("human-action", "status", h15["requestId"])
+        check(s15["status"] == "completed" and s15["result"] == {"note": "done irl"},
+              "human_action status returns the terminal record")
+
+        # 15. task waiting_for_* weave: a live task with a pending HITL
+        # request is parked in its waiting state; resolving the request
+        t16 = cli("task", "submit", "e2e: needs a signature")
+        tid16 = t16["taskId"]
+        h16 = cli("human-action", "request", "--action", "Sign it",
+                  "--task-id", tid16)
+        st16 = cli("task", "status", tid16)
+        check(st16["state"] == "waiting_for_human_action"
+              and st16["waitingOn"] == ["waiting_for_human_action"],
+              "pending human_action parks the task in waiting_for_human_action")
+        cli("human-action", "complete", h16["requestId"])
+        st16b = cli("task", "status", tid16)
+        check(st16b["state"] == "pending",
+              "resolving the request returns the task to the normal lifecycle")
+
+        # 15b. enumeration (acceptance-test gap 1): a client with NO known
+        # ids lists live tasks and pending human requests.
+        tl = cli("task", "list")
+        ids15 = [t["taskId"] for t in tl["tasks"]]
+        check(tid16 in ids15 and t12["taskId"] in ids15,
+              "task list enumerates live tasks without prior ids")
+        h15b = cli("human-action", "request", "--action", "List me")
+        rl = cli("request", "list")
+        rl_ids = [r["requestId"] for r in rl["requests"]]
+        check(h15b["requestId"] in rl_ids
+              and any(r.get("action") == "List me" for r in rl["requests"]),
+              "request list enumerates pending human requests with summaries")
+        cli("human-action", "complete", h15b["requestId"])
+        rl2 = cli("request", "list")
+        check(h15b["requestId"] not in [r["requestId"] for r in rl2["requests"]],
+              "resolved requests leave the pending list")
+
+        # 16. instance manifest registry (M1): the daemon registered itself at
+        # boot; file-based discovery answers through the CLI; the manifest is
+        l17 = cli("instance", "list")
+        inst = [m for m in l17["instances"]
+                if m.get("identity", {}).get("agent_id") == "@test-agent:example.org"]
+        check(len(inst) == 1 and inst[0]["status"] == "running"
+              and inst[0]["endpoint"]["path"].endswith("rt.sock"),
+              "daemon wrote its instance manifest at boot (status running)")
+        mtext = Path(inst[0]["_file"]).read_text().lower()
+        check(all(n not in mtext for n in ("token", "secret", "password")),
+              "manifest carries no secrets")
+        rt18 = inst[0].get("runtime", {})
+        check(rt18.get("tmux_socket") == "/tmp/e2e-tmux.sock"
+              and rt18.get("session") == "e2e-core",
+              "manifest records the tmux attach coords (socket + session)")
+        at18 = subprocess.run(
+            [sys.executable, str(CLI), "instance", "attach",
+             "@test-agent:example.org", "--print"],
+            capture_output=True, text=True, env=ENV)
+        check(at18.stdout.strip() ==
+              "tmux -S /tmp/e2e-tmux.sock attach-session -t e2e-core",
+              "attach resolves the tmux argv from the manifest")
+        check(inst[0].get("launcher", {}).get("args") == ["serve"]
+              and inst[0]["launcher"]["executable"].endswith("bin/sutando"),
+              "manifest carries a structured launcher (no shell strings)")
+
+        # 16b. same-instance double start is refused by the instance lock
+        # (different instances may run in parallel; this one may not fork).
+        dup = subprocess.run(
+            [sys.executable, str(REPO / "src" / "runtime-api" / "server.py")],
+            env=ENV, capture_output=True, text=True, timeout=15)
+        check(dup.returncode != 0 and "refusing double start" in
+              (dup.stderr + dup.stdout),
+              "second server for the SAME instance exits loudly (lock held)")
     finally:
         daemon.terminate()
         try:
             daemon.wait(timeout=5)
         except subprocess.TimeoutExpired:
             daemon.kill()
+    # 17. clean shutdown (SIGTERM) marks the manifest stopped — discovery
+    # still lists the instance with the daemon fully down.
+    _mf = Path(TMP) / "instances"
+    _stopped = [json.loads(f.read_text()) for f in _mf.glob("*.json")
+                if "test-agent" in f.name]
+    check(len(_stopped) == 1 and _stopped[0]["status"] == "stopped",
+          "SIGTERM shutdown marked the instance manifest stopped")
+
+    # 18. the start verb: with the daemon fully down, `instance start` reads
+    # the manifest, execs the recorded launcher and waits for the endpoint —
+    st18 = cli("instance", "start", "@test-agent:example.org")
+    check(st18.get("ok") is True and st18.get("state") == "started",
+          "start verb boots a stopped instance via its manifest launcher")
+    i18 = cli("sutando", "info")
+    check(i18.get("agentId") == "@test-agent:example.org",
+          "restarted instance answers with the same identity")
+    st18b = cli("instance", "start", "@test-agent:example.org")
+    check(st18b.get("state") == "already_running",
+          "start verb is idempotent on a live instance (attachable, not just socket)")
+    # the started instance must be ATTACHABLE: identity verified over its socket
+    i18b = cli("sutando", "info")
+    check(i18b.get("agentId") == "@test-agent:example.org",
+          "started instance is attachable — identity verified over its socket")
+    import signal as _signal
+    os.kill(st18["pid"], _signal.SIGTERM)
+    time.sleep(1.5)
 
     print(f"\n{'PASS — runtime-api v0 E2E green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0

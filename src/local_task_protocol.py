@@ -160,6 +160,9 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
+    # Which instance a task belongs to; header status defangs forged
+    # body-line claims, consumers may verify before executing.
+    "instance_id",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 

@@ -21,7 +21,8 @@ import time
 import uuid
 
 TERMINAL = frozenset(
-    {"approved", "denied", "resolved", "completed", "failed", "cancelled", "expired"}
+    {"approved", "denied", "resolved", "completed", "declined", "failed",
+     "cancelled", "expired"}
 )
 
 _SCHEMA = """

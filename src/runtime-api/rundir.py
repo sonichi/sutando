@@ -35,6 +35,31 @@ def run_dir() -> Path:
     return Path.home() / ".sutando" / "run"
 
 
-def socket_path() -> str:
-    return (os.environ.get("SUTANDO_RUNTIME_SOCKET")
-            or str(run_dir() / "sutando-runtime.sock"))
+def instance_id() -> str:
+    """The instance this process belongs to. "default" preserves the
+    single-instance world; a second instance sets SUTANDO_INSTANCE_ID and
+    every runtime resource scopes under it (isolation spec V1)."""
+    return os.environ.get("SUTANDO_INSTANCE_ID") or "default"
+
+
+def instance_run_dir(instance: str | None = None) -> Path:
+    return run_dir() / (instance or instance_id())
+
+
+def socket_path(instance: str | None = None) -> str:
+    """SUTANDO_RUNTIME_SOCKET overrides; otherwise instance-scoped
+    <run dir>/<instance>/runtime.sock so two instances can never collide.
+    The legacy flat <run dir>/sutando-runtime.sock is still honored for the
+    default instance when it already exists (pre-M2 daemons/clients)."""
+    env = os.environ.get("SUTANDO_RUNTIME_SOCKET")
+    if env:
+        return env
+    inst = instance or instance_id()
+    legacy = run_dir() / "sutando-runtime.sock"
+    if inst == "default" and legacy.exists():
+        return str(legacy)
+    return str(instance_run_dir(inst) / "runtime.sock")
+
+
+def lock_path(instance: str | None = None) -> Path:
+    return instance_run_dir(instance) / "instance.lock"
