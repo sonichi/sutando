@@ -1,0 +1,119 @@
+---
+name: proactive-loop-pool
+description: "Pool-aware variant of /proactive-loop for the multi-core agent pool (#880). Each session in the pool runs this skill; the only behavioral diff vs /proactive-loop is a claim step before processing each task."
+user-invocable: true
+---
+
+# Proactive Loop (Pool-Aware)
+
+Variant of `/proactive-loop` that's safe to run in N parallel claude sessions sharing one workspace. The **only behavioral difference** from `/proactive-loop` is step 1 — task pickup goes through the atomic-rename claim before reading the task file. Losing the claim race means another session is processing the task; this session walks away. The rest of the loop body is unchanged.
+
+This skill exists for the multi-core pool installed by `bash scripts/install-core-pool.sh N`. Each launchd-managed core session in the pool invokes `/proactive-loop-pool` instead of `/proactive-loop`.
+
+**Single-core users**: keep using `/proactive-loop`. This skill is only useful when N > 1 sessions exist; in single-core mode it adds claim overhead with no benefit.
+
+**Usage**: `/proactive-loop-pool [interval]`
+
+ARGUMENTS: $ARGUMENTS
+
+## Required env vars
+
+Each pool session sets these via its launchd plist (see `scripts/install-core-pool.sh`):
+- `SUTANDO_CORE_ID` — this session's 1-based core ID (e.g. `1`, `2`, `3`).
+- `SUTANDO_CORE_POOL_SIZE` — total pool size (informational; not enforced by this skill).
+- Workspace resolved via `bash scripts/sutando-config.sh workspace` (env override retired post-#1440).
+
+If `SUTANDO_CORE_ID` is unset, abort with a clear error: "proactive-loop-pool requires SUTANDO_CORE_ID — are you sure you meant to invoke this instead of /proactive-loop?"
+
+## Activation, scheduling, watcher
+
+Identical to `/proactive-loop` — `/schedule-crons` and the streaming task watcher start the same way. See `~/.claude/skills/proactive-loop/SKILL.md` for the full body, or follow these steps verbatim:
+
+1. `/schedule-crons` to set up recurring crons.
+2. Start the streaming task watcher via the `Monitor` tool.
+
+## The claim step (what's different from /proactive-loop)
+
+When the task watcher emits `TASK_FILE: <basename>` for a new task, **before** reading the task body, run the claim step. There are two flavors:
+
+### Plain claim (no channel affinity)
+
+For voice / phone / un-channeled tasks, or as a fallback when the task body has no `channel_id:` field:
+
+1. Extract the task ID from the filename (`task-<id>.txt` → `<id>`).
+2. Run: `python3 src/pool_follower (acquire_work).py <id> $SUTANDO_CORE_ID`
+3. Exit 0 → claim won, read the printed path; Exit 1 → skip; Exit 2 → log and skip.
+
+### Channel-affinity claim (Discord / Telegram / Slack)
+
+For tasks with a `channel_id:` field in the body (`#884`):
+
+1. Extract the task ID from the filename.
+2. Peek at the task body (without claiming yet) to read the `channel_id:` line. (Use `head` / `grep` — don't run a full Read tool yet since other cores may grab the task first.)
+3. Run: `python3 src/claim_task.py <id> $SUTANDO_CORE_ID <channel_id>`
+4. Outcomes:
+   - **Exit 0** → claim won. Script prints the renamed path (`tasks/task-<id>.claimed-core-<n>.txt`). Read THIS path. Your core is now the channel's handler for the next 30 min (default `SUTANDO_CORE_IDLE_THRESHOLD_SEC`).
+   - **Exit 1** → respect-handler OR lost-race. Either another core is the channel's active handler, or another core won the race-claim. Skip this task entirely.
+   - **Exit 2** → validation error. Log and skip.
+
+The affinity machinery is **inside** `claim_task.py` — your only responsibility is to pass `channel_id` when present. The script reads `state/cores/channel-<id>.handler` and `state/cores/core-<n>.alive` to decide whether you're allowed to claim.
+
+Use the renamed `task-<id>.claimed-core-<n>.txt` path for all subsequent reads + result writes. The bridges look for results by task ID, so writing to `results/task-<id>.txt` (without the `claimed-core-<n>` suffix) still routes correctly.
+
+**Initial sweep on session start**: the watcher's initial sweep emits TASK_FILE events for any pre-existing files. Run the claim step on each; expect to win some and lose others depending on which sibling session got there first.
+
+### Why channel affinity matters
+
+Without it, three follow-up Discord messages on the same topic would scatter across the 3 cores. Each core would run a partial proactive-loop pass and write a partial result; the latest task's result would carry the consolidated reply via `[deduped:]` marker. That's wasteful — 3× quota burn for 1× user-visible reply.
+
+With affinity, all 3 tasks land on the same core; that core has the conversational context in its session memory and produces one coherent reply. Quota burn matches what a single-core setup would have done.
+
+## The rest of the loop
+
+Identical to `/proactive-loop`'s numbered steps 2-11:
+
+2. Check pending questions.
+3. Check system health.
+4. Read the build log.
+5. Pick highest-ROI work.
+6. Act on it.
+7. Update build_log.
+8. If blocked, ask.
+9. Ensure the streaming watcher is running.
+10. Monitor Discord.
+11. Heartbeat.
+
+These steps run independently per session. Quota / active-engagement / presenter-mode skip conditions all apply per-session — each pool member checks them on its own pass.
+
+## Phase 2a known limitations
+
+This skill ships in Phase 2a of #880. Two pieces are NOT yet wired in:
+
+- **Done-flag side-effect gate** (Phase 2b). Without it, the rare crash-then-replay window can fire a side effect twice. Mitigation today: rare crashes within the few-second window between claim and side-effect-completion.
+- **Boot-time orphan watchdog** (Phase 2b). If a pool session crashes after claiming but before processing, the claim file is stranded until owner manually renames it back. Mitigation today: `launchctl bootout <core> && launchctl bootstrap <core>` re-runs the session which won't re-claim a stale file (but won't release it either — manual rename needed).
+
+For "let me try it tonight" the limitations above are acceptable. Phase 2b ships the watchdog + done-flag gate.
+
+## Disabling the pool
+
+To revert to single-core:
+1. Remove `SUTANDO_CORE_POOL_SIZE` from `.env` (or set to 1).
+2. Run `bash scripts/uninstall-core-pool.sh` to remove the launchd plists.
+3. `bash src/restart.sh` to restart the foreground core.
+
+## Lead-follower mode (L2+, supersedes raw claiming)
+
+Each pass, acquire work via the assignment loop — NEVER claim unassigned
+tasks directly while the lead is alive:
+
+```python
+import sys; sys.path.insert(0, "src")
+from pool_follower import acquire_work
+got = acquire_work(WORKSPACE/"tasks", WORKSPACE/"state",
+                   f"core-{CORE_ID}", "pool-lead")
+```
+
+`acquire_work` returns your claimed task path or None. It honors lead
+assignments in priority order and degrades to leaderless claiming only when
+`pool-lead.alive` is stale/absent/future-dated. Done-flags before side
+effects, exactly as below.
