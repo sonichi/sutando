@@ -86,9 +86,12 @@ supervised service that can restart itself. Nothing needs to go wrong for the
 hazard to exist — a `KeepAlive=true` service that crashes during the window comes
 back on whatever the tree holds, and no one issued a deploy.
 
-This repo already ships a detector for it. `health-check.py` warns when the live
-checkout is off the default branch, citing a host that spent four days serving a
-PR branch from a checkout nobody remembered parking there:
+This repo already ships a detector for it: the **`live-checkout-branch`** probe in
+`health-check.py`. Naming it matters — a rule with a live detector behind it is
+enforceable, and one without is the discipline-versus-mechanism gap this document
+exists to close. It warns when the live checkout is off the default branch, citing
+a host that spent four days serving a PR branch from a checkout nobody remembered
+parking there:
 
 ```
 live checkout is on branch 'feat/...', expected 'main' — bridges/core
@@ -100,6 +103,21 @@ So: park the shared checkout on a non-default ref only for as long as you are
 watching it, and treat the warn as a deploy notice rather than branch-hygiene
 nagging. Author PRs in worktrees, which have no supervised service pointed at
 them.
+
+**The remedy is narrower than "never park the tree", and the corollary above is
+why.** The reason parking feels necessary is usually that a branch had to be
+deployed for a live witness, so restoring the checkout looks like it costs you the
+evidence. It does not. Because a running process binds its code at import,
+`git switch main` leaves the already-running services exactly as they were — same
+pids, same behaviour — and changes only what a *future* restart would load.
+Measured by a reviewer on their own host: after `git switch main`, both bridge pids
+were unchanged and still serving, and the probe returned to `ok`.
+
+That is the same fact as the corollary, read in the other direction. "A running
+process is not its file" is usually stated as a warning — you cannot infer the
+process from the tree. Here it pays: you can clear the parked-tree exposure without
+giving up whatever the deployed tree was giving you. The two readings look opposed
+and are one property.
 
 ## Evidence
 
