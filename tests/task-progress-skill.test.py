@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 REPO = Path(__file__).parent.parent
 SCRIPT = REPO / "skills" / "task-progress" / "scripts" / "notify.py"
+sys.path.insert(0, str(REPO / "src"))
 
 
 def _load() -> types.ModuleType:
@@ -46,6 +47,74 @@ class TestTokenResolution(unittest.TestCase):
             result = self.mod._token("slack", "SLACK_BOT_TOKEN")
             # May be non-empty if the real file exists — just check it's a string
             self.assertIsInstance(result, str)
+
+    def test_falls_back_to_vault_when_env_and_env_file_are_empty(self):
+        """The vault is the third tier — a token that lives ONLY there must resolve.
+
+        Measured 2026-08-23 on a live host: TELEGRAM_BOT_TOKEN was in the vault,
+        absent from the process env, and absent from channels/telegram/.env, so
+        every Telegram progress notification failed with "not found" while the
+        bridge — which already consults the vault — worked. This asserts the
+        delegation, not a reimplementation of it.
+
+        Hermetic: the vault reader is injected, never the real Keychain.
+        """
+        import channel_token
+
+        empty = Path(tempfile.mkdtemp()) / "absent.env"
+        seen = []
+
+        def fake_vault(key):
+            seen.append(key)
+            return "tg-from-vault"
+
+        def resolver(var, env_file=None, environ=None, vault_get=None):
+            return channel_token.resolve_channel_token(
+                var, env_file=empty, environ={}, vault_get=fake_vault)
+
+        with patch.object(self.mod, "_resolve_channel_token", resolver):
+            got = self.mod._token("telegram", "TELEGRAM_BOT_TOKEN")
+
+        self.assertEqual(got, "tg-from-vault")
+        self.assertEqual(seen, ["TELEGRAM_BOT_TOKEN"])
+
+    def test_vault_only_token_resolves_end_to_end(self):
+        """The behavioural regression: env empty, `.env` absent, token only in the vault.
+
+        This one does NOT patch notify's own seam — it patches the vault reader
+        underneath, so it fails the way the live bug failed (returns "") against
+        any build that does not consult the vault at all.
+        """
+        import vault_intercept
+
+        empty_home = Path(tempfile.mkdtemp())          # no channels/telegram/.env under it
+        with patch.dict("os.environ",
+                        {"CLAUDE_CONFIG_DIR": str(empty_home)}, clear=False):
+            os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            with patch.object(vault_intercept, "get_vault_key",
+                              lambda k: "tg-vault-only" if k == "TELEGRAM_BOT_TOKEN" else ""):
+                got = self.mod._token("telegram", "TELEGRAM_BOT_TOKEN")
+        self.assertEqual(got, "tg-vault-only")
+
+    def test_env_still_wins_over_vault(self):
+        """An exported value must keep winning, so working hosts are unaffected."""
+        import channel_token
+
+        def resolver(var, env_file=None, environ=None, vault_get=None):
+            return channel_token.resolve_channel_token(
+                var, env_file=None, environ={"TELEGRAM_BOT_TOKEN": "tg-from-env"},
+                vault_get=lambda k: "tg-from-vault")
+
+        with patch.object(self.mod, "_resolve_channel_token", resolver):
+            self.assertEqual(
+                self.mod._token("telegram", "TELEGRAM_BOT_TOKEN"), "tg-from-env")
+
+    def test_degrades_to_env_when_resolver_unavailable(self):
+        """A missing src/ must not fail the notification — fail-open by design."""
+        with patch.object(self.mod, "_resolve_channel_token", None), \
+             patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-degraded"}):
+            self.assertEqual(
+                self.mod._token("slack", "SLACK_BOT_TOKEN"), "xoxb-degraded")
 
 
 class TestProgressMessageGuard(unittest.TestCase):
