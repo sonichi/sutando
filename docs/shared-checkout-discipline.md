@@ -67,25 +67,49 @@ git grep <pattern> <ref>    # search branch X, not the tree
 If you cannot name which of the three questions your measurement answered, you
 have not measured any of them.
 
-### 3. Report the ref, not just the value
+### 3. Report the OID, not just the ref — a ref is ambient too
 
-"Zero hits" is not a finding. "Zero hits in `git show origin/<branch>:<path>`" is.
+"Zero hits" is not a finding. But "zero hits in `origin/<branch>`" is not one
+either: **worktrees share refs**, so a fetch or a peer can move that ref after you
+measured, and the same reported name then identifies two different commits:
+
+```text
+reported-ref=measured oid=9965422e subject=first
+same-reported-ref=measured oid=ba0735b4 subject=second
+```
+
+So resolve the ref to an immutable OID **once**, measure against the OID, and
+report both — the name for meaning, the OID for identity:
+
+```bash
+OID=$(git rev-parse "origin/$BRANCH")     # pin ONCE
+git grep <pattern> "$OID" -- <path>       # measure the pinned state
+echo "zero hits in origin/$BRANCH ($OID)" # report both
+```
+
 A bare value gives a reader no way to detect that it was measured against the
-wrong tree state, which is the failure this document exists for. The obligation
-is heaviest when the report contradicts something the reader observed directly.
+wrong tree state, which is the failure this document exists for; a bare ref gives
+them no way to detect that the state moved underneath it. The obligation is
+heaviest when the report contradicts something the reader observed directly.
 
 ## Corollary: a running process is not its file
 
 Python binds module-level constants at import. A daemon that imported a module
 hours ago is executing the values the file held *then*, so current file content
-is not evidence about it — in either direction. For a long-lived process the
-discriminating evidence is what it imported at start:
+is not evidence about it — in either direction. What you want is the revision it
+imported; what these commands give you is **context, not proof**:
 
 ```bash
-ps -o lstart= -p <pid>                   # when it imported
-lsof -a -p <pid> -d cwd                  # which checkout it imported from
-git reflog --date=format:'%H:%M:%S'      # which ref that tree held at that time
+ps -o lstart= -p <pid>                   # process START — not import time
+lsof -a -p <pid> -d cwd                  # CURRENT cwd — not module provenance
+git reflog --date=format:'%H:%M:%S'      # host-local, and may not be recoverable
 ```
+
+Measured gaps: start-to-import was **1.218 s** in one control, and `lsof` cwd read
+`/private/tmp` while the module actually came from `src/`. Each is off by an
+amount you cannot bound from outside. **Exact provenance needs a recorded
+revision/import witness** — the process logging its own build sha at startup, as
+`runtime-identity` does — not an inference from these three.
 
 The same holds for anything else that caches at load: config read once at
 startup, a resolved TypeScript module graph, a skill manifest folded into a tool
@@ -148,9 +172,12 @@ detached-worktree service path rather than parking the shared checkout.
 
 That is the same fact as the corollary, read in the other direction. "A running
 process is not its file" is usually stated as a warning — you cannot infer the
-process from the tree. Here it pays: you can clear the parked-tree exposure without
-giving up whatever the deployed tree was giving you. The two readings look opposed
-and are one property.
+process from the tree. Here it pays, but only as narrowly as stated above: you can
+clear the parked-tree exposure without giving up **already-imported state**. It
+does NOT preserve anything re-read from disk, so a disk-backed witness still needs
+a detached worktree. Retargeting a capability path between two calls to the
+production runner changed its output with the parent pid unchanged
+(`parent-pid-before == parent-pid-after`, first call vs second call differing).
 
 ## Evidence
 
