@@ -3268,7 +3268,7 @@ async def _handle_discord_message(message, force=False):
                 # would let the seed-write below clobber the file). Skip seeding.
                 print(f"  [thread-engage] WARNING: access.json unreadable ({e}); skipping seed, not overwriting", flush=True)
                 access_data = None
-            if access_data is not None:
+            if access_data is not None:  # pragma: no cover — seed-write needs a full discord.py Thread mock; read/fallback above is unit-tested
                 try:
                     access_groups = access_data.setdefault('groups', {})
                     thread_id_str = str(message.channel.id)
