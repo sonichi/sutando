@@ -29,6 +29,11 @@ if [ "$N" -lt 1 ] || [ "$N" -gt 16 ]; then
   exit 2
 fi
 
+# Resolve repo root first: the preflight below and the staging block both
+# address repo files by absolute path. This script lives at
+# `<repo>/scripts/install-core-pool.sh`.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # Resolve workspace via the canonical default (matches every other Sutando
 # component). Resolved via the M0 helper (env override retired post-#1440).
 WORKSPACE="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
@@ -49,28 +54,20 @@ WORKSPACE="${WORKSPACE/#\~/$HOME}"
 mkdir -p "$WORKSPACE/logs"
 mkdir -p "$WORKSPACE/state/cores"
 
-# Resolve repo root so the heartbeat sidecar plists can address
-# `src/core_heartbeat.py` by absolute path. This script lives at
-# `<repo>/scripts/install-core-pool.sh`.
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # TCC: launchd cannot exec scripts under ~/Documents nor open log paths
 # there — stage the wrapper and logs outside (memory: feedback_pool_wrapper_tcc).
 STAGE_DIR="$HOME/.sutando/bin"
 LOG_DIR="$HOME/Library/Application Support/Sutando/logs"
 mkdir -p "$STAGE_DIR" "$LOG_DIR"
 cp "$REPO_DIR/scripts/pool-core-wrapper.sh" "$STAGE_DIR/pool-core-wrapper.sh"
-chmod +x "$STAGE_DIR/pool-core-wrapper.sh"
+cp "$REPO_DIR/scripts/pool-follower-beat.sh" "$STAGE_DIR/pool-follower-beat.sh"
+chmod +x "$STAGE_DIR/pool-core-wrapper.sh" "$STAGE_DIR/pool-follower-beat.sh"
 
 # Resolve claude + python3 binaries. Caller's $PATH may not include the
 # install dirs on launchd-spawned processes, so capture absolute paths now.
 CLAUDE_BIN="$(command -v claude || true)"
 if [ -z "$CLAUDE_BIN" ]; then
   echo "error: 'claude' CLI not found on \$PATH" >&2
-  exit 1
-fi
-PYTHON_BIN="$(command -v python3 || true)"
-if [ -z "$PYTHON_BIN" ]; then
-  echo "error: 'python3' not found on \$PATH (needed for heartbeat sidecar)" >&2
   exit 1
 fi
 
@@ -200,43 +197,15 @@ PLIST_EOF
   bootstrap_with_retry "$PLIST"
   echo "installed: com.sutando.core-$i (workspace=$WORKSPACE)"
 
-  # Heartbeat sidecar — always-on writer of `state/cores/core-$i.alive`.
-  # Required by `claim_task.py:_is_alive()` for channel-affinity (#884).
-  # Without it, the affinity check sees the handler's .alive file missing
-  # → treats handler as dead → falls back to race-claim on every task,
-  # silently defeating the sticky-handler design.
+  # Retired heartbeat sidecar: it ran `core_heartbeat.py`, which ignores
+  # SUTANDO_CORE_ID (writes `<hostlabel>.alive`) and gates on a tmux pane a
+  # `--print` follower never has — so `core-$i.alive` was never written and
+  # the lead saw zero followers. The wrapper now owns the beat
+  # (pool-follower-beat.sh, pid-bound to the claude child). Remove any
+  # sidecar left by a previous install.
   HEART_PLIST="$LAUNCH_AGENTS/com.sutando.core-$i-heartbeat.plist"
-  cat > "$HEART_PLIST" <<HEART_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-                       "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.sutando.core-$i-heartbeat</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$PYTHON_BIN</string>
-    <string>$REPO_DIR/src/core_heartbeat.py</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>SUTANDO_CORE_ID</key><string>$i</string>
-    <key>PATH</key><string>$POOL_PATH</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key>
-  <string>$WORKSPACE/logs/core-$i-heartbeat.log</string>
-  <key>StandardErrorPath</key>
-  <string>$WORKSPACE/logs/core-$i-heartbeat.err</string>
-</dict>
-</plist>
-HEART_EOF
   launchctl bootout "$DOMAIN/com.sutando.core-$i-heartbeat" 2>/dev/null || true
-  bootstrap_with_retry "$HEART_PLIST"
-  echo "installed: com.sutando.core-$i-heartbeat"
+  rm -f "$HEART_PLIST"
 done
 
 echo
