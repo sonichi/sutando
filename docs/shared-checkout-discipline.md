@@ -8,19 +8,30 @@ same repository sits next to it. Under those conditions a working tree is a
 shared mutable variable: its branch and its file content change between two of
 your own commands, without either command causing the change.
 
-Two failures on the same day, from opposite directions, share one root cause —
-neither session pinned the tree state before acting on it.
+Three failures on the same day share one root cause — no session pinned the tree
+state at the moment it acted on it.
 
 ## The rule
 
-### 1. Assert the branch before any write
+### 1. Assert the branch immediately before each write
 
-Before `rebase`, `reset`, `checkout`, `commit`, or `push`, assert that
-`git branch --show-current` is the branch you intend to operate on. Do not infer
-it from what you last did; another session may have moved the tree since.
+Before `rebase`, `reset`, `checkout`, `commit`, or `push` — before each one, not
+once per pass — assert that `git branch --show-current` is the branch you intend
+to operate on. Do not infer it from what you last did, and do not carry an
+earlier answer forward.
+
+The per-pass form is the trap precisely because it does not look like one: it is
+a real check, it passes, and running it reads as compliance. But what it
+establishes is where the tree *was*. On a variable another session can write,
+that answer expires the moment control leaves your process.
+
+Prefer operations that name their target over operations that act on ambient
+`HEAD`. Where the target cannot be named — `commit` — put the assertion in the
+same command as the write, so nothing can interleave between checking and acting:
 
 ```bash
-[ "$(git branch --show-current)" = "$INTENDED" ] || { echo "wrong branch"; exit 1; }
+[ "$(git branch --show-current)" = "$INTENDED" ] && git commit -m "<message>"
+git push origin HEAD:"$INTENDED"    # names the destination; HEAD supplies only the commit
 ```
 
 ### 2. Cite the ref when a conclusion rests on file content
@@ -65,7 +76,7 @@ does.
 
 ## Evidence
 
-Both incidents occurred on 2026-08-23 in one checkout shared by two concurrent
+All three incidents occurred on 2026-08-23 in one checkout shared by concurrent
 agent sessions.
 
 **A worktree read reported as a branch fact.** One session concluded that an
@@ -99,9 +110,28 @@ caught at the `Successfully rebased and updated refs/heads/...` line, never
 pushed, and undone with `git reset --hard` to the origin-matching SHA, verified
 against `git ls-remote`. No lasting damage; disclosed unprompted.
 
-The two are one defect read from opposite ends: one session trusted the tree's
-content without pinning the ref, the other trusted the tree's branch without
-pinning it.
+**A pass's work landed on a branch the tree moved to mid-pass.** A third session
+did check `git branch --show-current` at the start of its pass and got its own
+branch. Its reflog shows what happened next:
+
+```
+checkout: moving from feat/pool-operability to fix/pool-bridge-assigned-blind
+```
+
+That checkout was another session's. Everything after it — edit, added test,
+commit, push — went to the other branch: `4c7c3297` landed on
+`origin/fix/pool-bridge-assigned-blind` on top of `8f3b355a`. The push was a
+clean fast-forward, confirmed with `git merge-base --is-ancestor`, so nothing was
+rewritten or lost; the author cherry-picked the work onto its own branch as
+`54f71855` and disclosed immediately, and the branch owner reviewed it and chose
+to leave it in place. The check here was run and was correct when it ran; it was
+simply a per-pass reading of a variable another session can write.
+
+The three are one defect in three positions: content trusted without pinning the
+ref, branch trusted without pinning it, and a pinned branch trusted after the pin
+had expired. None of them was carelessness about git — each session knew the
+commands it was running. All three came from treating a shared working tree as
+stable state.
 
 ## Related
 
