@@ -5327,6 +5327,12 @@ async def poll_proactive():
                     # Parse ONCE, here, and reuse below: a second grammar would
                     # miss what parse_markers peels (D7 `**[core: N]**` headers).
                     _pp = parse_markers(text)
+                    # Honor suppression markers, same as poll_dm_fallback —
+                    # else a skip-marked file still gets DM-attempted here.
+                    if any(a.kind == "skip" for a in _pp.actions):
+                        print(f"  [proactive] skipped (suppression marker): {f.name}", flush=True)
+                        _proactive_fence().drop(f, "suppression marker (no-send/deduped/REPLIED)")
+                        continue
                     _early_redirect = next(
                         (a for a in _pp.actions if a.kind == "redirect"), None)
                     if _early_redirect is not None and redirect_target_is_foreign(
