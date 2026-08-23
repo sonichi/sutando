@@ -34,6 +34,9 @@ fi
 WORKSPACE="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
 # capture the installer's PATH: launchd strips env, and the sessions need brew bins
 POOL_PATH="${PATH}"
+# followers must share the LIVE session's credential store — a defaulted
+# ~/.claude may hold expired OAuth (measured: launchd session auth-failed)
+CLAUDE_CONFIG_DIR_EFFECTIVE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 WORKSPACE="${WORKSPACE/#\~/$HOME}"
 mkdir -p "$WORKSPACE/logs"
 mkdir -p "$WORKSPACE/state/cores"
@@ -171,6 +174,7 @@ for i in $(seq 1 "$N"); do
     <key>POOL_REPO_DIR</key><string>$REPO_DIR</string>
     <key>POOL_CLAUDE_BIN</key><string>$CLAUDE_BIN</string>
     <key>POOL_WORKSPACE</key><string>$WORKSPACE</string>
+    <key>CLAUDE_CONFIG_DIR</key><string>$CLAUDE_CONFIG_DIR_EFFECTIVE</string>
     <key>PATH</key><string>$POOL_PATH</string>
   </dict>
   <key>RunAtLoad</key><true/>
