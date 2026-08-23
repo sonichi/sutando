@@ -7,6 +7,7 @@ because a result file states nothing about which task it answers. So the check
 has to happen at the write, and it has to be all-or-nothing — a refused write
 that still leaves a temp file behind is the same bug with extra steps.
 """
+import io
 import os
 import subprocess
 import sys
@@ -214,6 +215,88 @@ class PairedResultWriteCliTests(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
         self.assertIn("usage:", p.stderr)
+
+
+class CliInProcessTests(unittest.TestCase):
+    """Same CLI, called in-process so the coverage gate can see the lines.
+
+    PairedResultWriteCliTests above spawns a subprocess: it proves the real shell
+    entry works, but the gate instruments only this process, so those lines read
+    as uncovered.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.results = self.ws / "results"
+        self._stdin = sys.stdin
+
+    def tearDown(self):
+        sys.stdin = self._stdin
+        self.tmp.cleanup()
+
+    def cli(self, argv, body=""):
+        sys.stdin = io.StringIO(body)
+        return result_write._write_cli(argv)
+
+    def test_happy_path_returns_zero_and_writes(self):
+        rc = self.cli(["a1", "--workspace", str(self.ws)], "task: a1\nbody\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.results / "task-a1.txt").read_text(), "body\n")
+
+    def test_explicit_dirs_bypass_workspace_resolution(self):
+        r = self.ws / "R"; k = self.ws / "K"
+        rc = self.cli(["a2", "--results-dir", str(r), "--receipts-dir", str(k)],
+                      "task: a2\nbody\n")
+        self.assertEqual(rc, 0)
+        self.assertTrue((r / "task-a2.txt").is_file())
+        self.assertTrue(result_write.has_pairing_receipt(k, "a2"))
+
+    def test_crossed_body_returns_two_and_writes_nothing(self):
+        rc = self.cli(["b2", "--workspace", str(self.ws)], "task: a1\nwrong\n")
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.results.exists() and any(self.results.iterdir()))
+
+    def test_usage_errors_return_two(self):
+        for argv in ([], ["x", "novalue"], ["x", "--results-dir"],
+                     ["x", "--bogus", "v"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.cli(argv, "task: x\nb\n"), 2)
+
+
+class ReceiptFailuresDoNotLoseTheResult(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_unwritable_receipts_dir_still_returns_the_result(self):
+        """A durable result must never be rolled back for a diagnostic sidecar."""
+        blocker = self.ws / "blocker"
+        blocker.write_text("")
+        out = result_write.write_paired_result(
+            self.ws / "results", "c3", "task: c3\nbody\n",
+            receipts_dir=blocker / "under-a-file")
+        self.assertEqual(out.read_text(), "body\n")
+
+    def test_has_pairing_receipt_is_false_when_the_path_raises(self):
+        """pathlib swallows most of these, so raise at the seam the guard wraps."""
+        orig = result_write.receipt_path
+        def boom(*a, **k):
+            raise OSError("unreadable")
+        result_write.receipt_path = boom
+        try:
+            self.assertFalse(result_write.has_pairing_receipt(self.ws, "c3"))
+        finally:
+            result_write.receipt_path = orig
+
+    def test_resolve_dirs_falls_back_to_the_workspace_helper(self):
+        """No explicit dirs and no --workspace: the module must resolve one."""
+        results, receipts = result_write._resolve_dirs({})
+        self.assertEqual(results.name, "results")
+        self.assertEqual(receipts.parts[-2:], result_write.RECEIPTS_SUBPATH)
 
 
 if __name__ == "__main__":
