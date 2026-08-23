@@ -735,6 +735,31 @@ def main() -> int:
     check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
           and "sk-live" not in (_posted[0].get("body") or ""),
           "team deduped with out-of-grammar extra is withheld, not re-posted")
+    # A malformed holder must reach the SHARED plan, which reports it. Gating
+    # _dedup_plan on validity retired the ask silently instead.
+    import dedup_recovery as _dr
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TDMAL.txt").write_text(
+        "id: task-TDMAL\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDMAL.txt").write_text(
+        "[deduped: ../../../etc/passwd]\n")
+    _logged: list[str] = []
+    _real_log = rtc._log
+    rtc._log = lambda m: (_logged.append(m), _real_log(m))[1]
+    try:
+        rtc._post_ready_results({"task-TDMAL"})
+    finally:
+        rtc._log = _real_log
+    _posted = STATE["results"][_before:]
+    _body = (_posted[0].get("body") or "") if _posted else ""
+    check(bool(_posted) and _dr.MALFORMED_TEMPLATE in _body,
+          "malformed dedup holder REPORTS via the shared plan, not a silent close")
+    check(_body.strip() != "[no-send]",
+          "malformed holder is not retired as an ordinary skip")
+    check("etc/passwd" not in _body,
+          "the raw out-of-grammar holder is never echoed into the report")
+    check(bool(_logged) and not any("etc/passwd" in m for m in _logged),
+          "nor into the log line (sender-controlled bytes stay out of the record)")
     import team_result_guard as _guard
     # suppression_stub_for_tier was replaced by is_suppression_only: the guard
     # classifies and journals, it no longer reconstructs a stub to close with.

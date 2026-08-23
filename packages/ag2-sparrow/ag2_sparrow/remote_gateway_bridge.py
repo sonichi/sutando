@@ -3015,11 +3015,9 @@ def _post_ready_results(inflight: set[str]) -> None:
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
-        # A holder id outside the lookup grammar cannot address a result, so it
-        # drives no recovery; it closes the lease as an ordinary skip instead.
-        if (skip and skip.value == "deduped"
-                and local_task_protocol.valid_archive_lookup_id(
-                    (skip.extra or "").strip())):
+        # Every dedup marker routes through the shared plan, malformed included:
+        # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
+        if skip and skip.value == "deduped":
             action, payload, room = _dedup_plan(tid, skip.extra)
             if action == "defer":
                 # Nothing was retired; the next pass retries the whole decision.
@@ -3038,7 +3036,12 @@ def _post_ready_results(inflight: set[str]) -> None:
                     if not _deliver_result_payload(tid, _broker_tid(_delivery),
                                                   payload):
                         continue
-                _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
+                _holder = (skip.extra or "").strip()
+                # An out-of-grammar holder is sender-controlled; name its shape,
+                # never its bytes.
+                _shown = (_holder if local_task_protocol.valid_archive_lookup_id(_holder)
+                          else f"<malformed, {len(_holder)} chars>")
+                _log(f"dedup {action} for {tid} (holder {_shown} delivered nothing)")
                 _archive_result(rfile, tid)
                 inflight.discard(tid)
                 _forget_task_room(tid)
