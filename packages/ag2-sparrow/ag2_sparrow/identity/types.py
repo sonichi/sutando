@@ -21,6 +21,9 @@ _MAX_LEN = 200
 # at least one unit — empty components are constructor-impossible.
 _COMPONENT = r"(?:[^%@#+~:/\\]|%[0-9A-F]{2})+"
 _DELIVERY_BASE = rf"(?:d|legacy):{_COMPONENT}@{_COMPONENT}(?:\+r[1-9][0-9]*)*"
+# delivery_core's shipped key <item_id>#<epoch>, unescaped. Disjoint from
+# "e:...@...", which has no '#', so the two shapes stay unambiguous.
+_LEGACY_KEY = r"[^/\\]+#[0-9]+"
 
 
 def _validate(value: str, kind: str) -> None:
@@ -70,9 +73,11 @@ class AttemptId(_Identity):
 
 
 class IdempotencyKey(_Identity):
-    """One external side-effect, deduplicated. Stable across re-sends."""
+    """One external side-effect, deduplicated. Stable across re-sends. Two
+    admissible shapes: the canonical e:<task>@<boundary>, and the pre-B
+    provider key <item_id>#<epoch> that legacy_idempotency_key preserves."""
 
-    _PATTERN = re.compile(rf"e:{_COMPONENT}@{_COMPONENT}")
+    _PATTERN = re.compile(rf"e:{_COMPONENT}@{_COMPONENT}|{_LEGACY_KEY}")
 
 
 class IncarnationId(_Identity):

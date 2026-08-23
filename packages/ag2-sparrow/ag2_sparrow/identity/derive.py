@@ -12,6 +12,7 @@ Namespace prefixes keep the kinds parseable and collision-free:
     <delivery>+r<n>                post-reconciliation re-send successor
     <delivery>#a<n>                attempt n of a delivery
     e:<task>@<boundary>            idempotency key (stable across re-sends)
+    <item_id>#<epoch>              the pre-B provider key, preserved verbatim
 """
 from __future__ import annotations
 
@@ -99,6 +100,24 @@ def idempotency_key(task: TaskId, boundary: str) -> IdempotencyKey:
     _require(task, TaskId, "task")
     return IdempotencyKey(f"e:{escape_component(task.value)}@"
                           f"{escape_component(boundary)}")
+
+
+def legacy_idempotency_key(item_id: str, resend_epoch: int = 0
+                           ) -> IdempotencyKey:
+    """The provider key ALREADY SHIPPED by delivery_core — <item_id>#<epoch>,
+    reproduced byte-for-byte. Components are NOT escaped: these bytes are what
+    a provider has already seen, so re-deriving them is the whole point, and
+    the shape is opaque rather than injective. Deliveries begun before the
+    canonical key exists must keep this key, or the same side effect is
+    re-offered under a name the provider cannot recognise as a duplicate."""
+    if not isinstance(item_id, str) or not item_id:
+        raise ValueError("item_id must be a non-empty string")
+    if isinstance(resend_epoch, bool) or not isinstance(resend_epoch, int):
+        raise TypeError(f"resend_epoch must be an int, "
+                        f"got {type(resend_epoch).__name__}")
+    if resend_epoch < 0:
+        raise ValueError("resend_epoch is 0-based")
+    return IdempotencyKey(f"{item_id}#{resend_epoch}")
 
 
 def incarnation_id_from(worker: str, pid: int, start_usec: int) -> IncarnationId:

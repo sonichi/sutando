@@ -53,10 +53,12 @@ def to_record_fields(**identities) -> dict:
     must be field names from the frozen doc; values must be the right type."""
     out = {}
     for name, value in identities.items():
-        if value is None:
-            continue
+        # Validate the NAME before the None short-circuit: a misspelled
+        # optional field would otherwise be silently discarded.
         if name not in _FIELDS:
             raise ValueError(f"unknown identity field {name!r}")
+        if value is None:
+            continue
         want = _FIELDS[name][0]
         if type(value) is not want:
             raise TypeError(f"{name} must be {want.__name__}, "

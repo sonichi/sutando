@@ -15,19 +15,24 @@ R-A  Wall-clock task minting. The census showed a replayed provider event
      below means a site was strangled — lower the pin in the same change.
 
 R-B  delivery_id constructor exclusivity: any src/ file (recursive) that
-     names delivery_id must either predate this ratchet (pinned below) or
-     import the canonical constructors from ag2_sparrow.identity.
+     names delivery_id must import the canonical constructors from
+     ag2_sparrow.identity, or have every site pinned below. Both halves are
+     AST-based: a comment or string cannot satisfy the import, a shadowed or
+     privately-aliased binding is rejected, and the legacy exemption is per
+     (file, function) site rather than whole-file — so a private constructor
+     added to a legacy file is a new site, not an exempt one.
 
 Positive controls at the bottom run the SAME scanners against hostile
-fixtures (nested files, single quotes, .format, concatenation) so a silent
-scanner regression reds this suite, not slice 3.
+fixtures (nested files, single quotes, .format, concatenation; comment and
+string import spoofs, a shadowed import, a private alias, and a private
+constructor smuggled into a pinned legacy file) so a silent scanner
+regression reds this suite, not slice 3.
 
 Run: python3 tests/sparrow-identity-ratchet.test.py   (stdlib only)
 """
 from __future__ import annotations
 
 import ast
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,13 +60,17 @@ TASK_MINT_PIN = {
     ("telegram-bridge.py", "main"): 1,
 }
 
-# Files that referenced delivery_id before the canonical package existed.
-DELIVERY_ID_LEGACY_FILES = {
-    "slack-bridge.py",
-    "slack_proactive_receipts.py",
+# Pre-canonical delivery_id sites, pinned per (file, function) like
+# TASK_MINT_PIN. A whole-file exemption here would hide a new constructor.
+DELIVERY_ID_LEGACY_SITES = {
+    ("slack-bridge.py", "result_watcher"): 5,
+    ("slack_proactive_receipts.py", "_receipt_path"): 2,
+    ("slack_proactive_receipts.py", "mark_delivered"): 3,
+    ("slack_proactive_receipts.py", "was_delivered"): 2,
 }
-_CANONICAL_IMPORT = re.compile(r"from\s+ag2_sparrow\.identity\s+import|"
-                               r"from\s+ag2_sparrow\s+import\s+identity")
+
+_DELIVERY_NAME = "delivery_id"
+_IDENTITY_MODULE = "ag2_sparrow.identity"
 
 
 def _is_task_literal(node) -> bool:
@@ -122,16 +131,129 @@ def scan_task_mints(root: Path) -> dict:
     return counts
 
 
-def scan_delivery_id_files(root: Path) -> dict:
-    """relpath -> has canonical import, for every .py under root (recursive)
-    whose text names delivery_id."""
-    out = {}
-    for py in sorted(root.rglob("*.py")):
-        text = py.read_text(errors="replace")
-        if "delivery_id" in text:
-            out[py.relative_to(root).as_posix()] = bool(
-                _CANONICAL_IMPORT.search(text))
+def _identity_imports(tree) -> dict:
+    """import node -> names it binds from the canonical package. Comments and
+    string literals are invisible to the AST, so neither can satisfy this."""
+    found = {}
+    for node in ast.walk(tree):
+        names = set()
+        if isinstance(node, ast.ImportFrom):
+            if node.module == _IDENTITY_MODULE:
+                names = {a.asname or a.name for a in node.names}
+            elif node.module == "ag2_sparrow":
+                names = {a.asname or a.name for a in node.names
+                         if a.name == "identity"}
+        elif isinstance(node, ast.Import):
+            names = {a.asname or a.name.split(".")[0] for a in node.names
+                     if a.name == _IDENTITY_MODULE}
+        if names:
+            found[node] = names
+    return found
+
+
+def _rebound_names(tree, import_nodes) -> set:
+    """Every name the module binds by any means OTHER than those imports.
+    A canonical name that also appears here is shadowed: the identifier at a
+    use site may resolve to the local definition, so the import proves
+    nothing about what the file actually calls."""
+    out = set()
+    for node in ast.walk(tree):
+        if node in import_nodes:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            out.update(a.asname or a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.arg):
+            out.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            out.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            out.update(node.names)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx,
+                                                       (ast.Store, ast.Del)):
+            out.add(node.id)
     return out
+
+
+def has_canonical_binding(tree) -> bool:
+    """True only when a real, public, unshadowed import of the canonical
+    package is in force."""
+    imports = _identity_imports(tree)
+    if not imports:
+        return False
+    bound = set().union(*imports.values())
+    rebound = _rebound_names(tree, set(imports))
+    # A private alias is not a canonical binding: it re-exports the package
+    # under a name the ratchet cannot follow across files.
+    return any(n for n in bound if not n.startswith("_") and n not in rebound)
+
+
+def scan_delivery_id_sites(root: Path) -> dict:
+    """(relpath, enclosing function) -> count of delivery_id SITES, for every
+    .py under root (recursive). A site is an identifier or string constant
+    naming delivery_id — the places a delivery identity is defined, passed,
+    or recorded. Files with a canonical binding contribute nothing."""
+    counts = {}
+    for py in sorted(root.rglob("*.py")):
+        rel = py.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(py.read_text(errors="replace"))
+        except SyntaxError:
+            counts[(rel, "<unparseable>")] = 1
+            continue
+        if has_canonical_binding(tree):
+            continue
+        stack = ["<module>"]
+
+        def record():
+            key = (rel, stack[-1])
+            counts[key] = counts.get(key, 0) + 1
+
+        class V(ast.NodeVisitor):
+            def _scoped(self, n):
+                if n.name == _DELIVERY_NAME:
+                    record()
+                stack.append(n.name)
+                self.generic_visit(n)
+                stack.pop()
+            visit_FunctionDef = _scoped
+            visit_AsyncFunctionDef = _scoped
+            visit_ClassDef = _scoped
+
+            def visit_Name(self, n):
+                if n.id == _DELIVERY_NAME:
+                    record()
+                self.generic_visit(n)
+
+            def visit_Attribute(self, n):
+                if n.attr == _DELIVERY_NAME:
+                    record()
+                self.generic_visit(n)
+
+            def visit_arg(self, n):
+                if n.arg == _DELIVERY_NAME:
+                    record()
+                self.generic_visit(n)
+
+            def visit_keyword(self, n):
+                if n.arg == _DELIVERY_NAME:
+                    record()
+                self.generic_visit(n)
+
+            def visit_alias(self, n):
+                if (n.asname or n.name) == _DELIVERY_NAME:
+                    record()
+                self.generic_visit(n)
+
+            def visit_Constant(self, n):
+                if isinstance(n.value, str) and _DELIVERY_NAME in n.value:
+                    record()
+                self.generic_visit(n)
+
+        V().visit(tree)
+    return counts
 
 
 class WallClockTaskMintRatchet(unittest.TestCase):
@@ -158,15 +280,26 @@ class WallClockTaskMintRatchet(unittest.TestCase):
 
 
 class DeliveryIdConstructorExclusivity(unittest.TestCase):
-    def test_new_delivery_id_users_import_the_canonical_package(self):
-        for rel, has_import in sorted(scan_delivery_id_files(SRC).items()):
-            if rel in DELIVERY_ID_LEGACY_FILES:
-                continue
-            self.assertTrue(
-                has_import,
-                f"src/{rel} names delivery_id but does not import "
-                f"ag2_sparrow.identity — the canonical constructors are the "
-                f"only legal source of a delivery identity (freeze doc R1/R3).")
+    def test_delivery_id_sites_are_canonical_or_pinned_legacy(self):
+        counts = scan_delivery_id_sites(SRC)
+        for key, n in sorted(counts.items()):
+            pinned = DELIVERY_ID_LEGACY_SITES.get(key, 0)
+            self.assertLessEqual(
+                n, pinned,
+                f"src/{key[0]} ({key[1]}) has {n} delivery_id site(s), pin is "
+                f"{pinned}. A delivery identity may only come from "
+                f"ag2_sparrow.identity — import the canonical constructors "
+                f"(freeze doc R1/R3). A private constructor in a legacy file "
+                f"is a new site, not an exempt one.")
+            self.assertGreaterEqual(
+                n, pinned,
+                f"src/{key[0]} ({key[1]}) dropped below its pin "
+                f"({n} < {pinned}) — a legacy site was migrated. Lower "
+                f"DELIVERY_ID_LEGACY_SITES in this test in the same change.")
+        for key in sorted(DELIVERY_ID_LEGACY_SITES):
+            self.assertIn(key, counts,
+                          f"pinned legacy site src/{key[0]} ({key[1]}) is "
+                          f"gone — remove its DELIVERY_ID_LEGACY_SITES entry.")
 
 
 class ScannerPositiveControls(unittest.TestCase):
@@ -203,8 +336,78 @@ class ScannerPositiveControls(unittest.TestCase):
             f = Path(tmp) / "runtime-api" / "b.py"
             f.parent.mkdir(parents=True)
             f.write_text("delivery_id = compute()\n")
-            self.assertEqual(scan_delivery_id_files(Path(tmp)),
-                             {"runtime-api/b.py": False})
+            self.assertEqual(scan_delivery_id_sites(Path(tmp)),
+                             {("runtime-api/b.py", "<module>"): 1})
+
+
+class DeliveryGateHostileControls(unittest.TestCase):
+    """The exclusivity arm must not accept a *claimed* canonical import. Each
+    fixture names delivery_id and would be gated; only a real, public,
+    unshadowed import may clear it."""
+
+    SPOOFS = {
+        "comment_spoof.py":
+            "# from ag2_sparrow.identity import delivery_id\n"
+            'delivery_id = "d:" + str(1)\n',
+        "string_spoof.py":
+            'DOC = "from ag2_sparrow.identity import delivery_id"\n'
+            'delivery_id = "d:" + str(1)\n',
+        "real_import_shadowed.py":
+            "from ag2_sparrow.identity import delivery_id\n"
+            "def delivery_id(t, b):\n"
+            '    return "d:%s@%s" % (t, b)\n'
+            'x = delivery_id("t", "b")\n',
+        "private_alias.py":
+            "from ag2_sparrow.identity import delivery_id as _d\n"
+            'delivery_id = "d:" + str(1)\n',
+        "no_import_control.py": 'delivery_id = "d:" + str(1)\n',
+    }
+
+    def _canonical(self, source: str) -> bool:
+        return has_canonical_binding(ast.parse(source))
+
+    def test_no_spoof_or_shadow_clears_the_gate(self):
+        for name, source in sorted(self.SPOOFS.items()):
+            self.assertFalse(self._canonical(source),
+                             f"{name} was accepted as canonical")
+
+    def test_a_real_public_unshadowed_import_does_clear_the_gate(self):
+        # Negative control for the controls: without this the arm could be
+        # vacuously strict and nobody would notice.
+        for source in (
+            "from ag2_sparrow.identity import delivery_id\n"
+            'x = delivery_id("t", "b")\n',
+            "from ag2_sparrow import identity\n"
+            'x = identity.delivery_id("t", "b")\n',
+            "import ag2_sparrow.identity\n"
+            'x = ag2_sparrow.identity.delivery_id("t", "b")\n',
+        ):
+            self.assertTrue(self._canonical(source), source)
+
+    def test_private_constructor_in_a_legacy_file_reds_the_ratchet(self):
+        """The exemption is per SITE, not per file: future delivery work
+        cannot hide a private constructor in a pre-existing legacy file."""
+        legacy_rel, legacy_fn = "slack-bridge.py", "result_watcher"
+        self.assertIn((legacy_rel, legacy_fn), DELIVERY_ID_LEGACY_SITES)
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / legacy_rel
+            f.write_text(
+                "def result_watcher():\n"
+                "    delivery_id = f.name\n"
+                "    return delivery_id\n"
+                "def _mint_delivery_id(task, boundary):\n"
+                '    return "d:%s@%s" % (task, boundary)\n'
+                "def _use():\n"
+                '    delivery_id = _mint_delivery_id("t", "b")\n'
+                "    return delivery_id\n")
+            counts = scan_delivery_id_sites(Path(tmp))
+        unpinned = {k: n for k, n in counts.items()
+                    if n > DELIVERY_ID_LEGACY_SITES.get(k, 0)}
+        self.assertTrue(
+            unpinned,
+            "a private delivery-id constructor added to a legacy file left "
+            "the ratchet green")
+        self.assertIn((legacy_rel, "_use"), unpinned)
 
 
 if __name__ == "__main__":
