@@ -47,7 +47,7 @@ def _read_channel(path: Path) -> "str | None":
 
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
-                 now_fn=time.time):
+                 now_fn=time.time, metrics=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
         production binder wires instance_registry + the .alive files."""
@@ -56,6 +56,7 @@ class PoolLead:
         self.followers_fn = followers_fn
         self.alive_fn = alive_fn
         self.now = now_fn
+        self.metrics = metrics  # PoolMetrics or None; recording is optional
 
     # ── affinity table (single-writer: the lead) ────────────────────────────
     def _affinity_path(self) -> Path:
@@ -120,11 +121,18 @@ class PoolLead:
             target = f.with_name(
                 f.name[:-len(".txt")] + f".assigned-{inst}.txt")
             try:
+                arrived = f.stat().st_mtime  # before rename — f is gone after
+            except OSError:
+                arrived = self.now()
+            try:
                 os.rename(f, target)  # atomic; a racing writer keeps its file
             except OSError:
                 continue
             if channel:
                 affinity[channel] = {"instance": inst, "ts": self.now()}
+            if self.metrics is not None:
+                self.metrics.assigned(f.name, inst, channel,
+                                      max(0.0, self.now() - arrived))
             out.append((f.name, inst))
         if out:
             self._save_affinity(affinity)

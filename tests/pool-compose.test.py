@@ -67,6 +67,17 @@ class ComposeTests(unittest.TestCase):
         got = pf.acquire_work(self.tasks, self.state, "f2", "lead")
         self.assertEqual(got.name, "task-r.claimed-f2.txt")
 
+    def test_lead_records_assignment_metrics(self):
+        sys.path.insert(0, str(REPO / "src" / "runtime-api"))
+        from pool_metrics import PoolMetrics
+        m = PoolMetrics(self.state, now_fn=lambda: 1_700_000_000.0)
+        self.lead.metrics = m
+        (self.tasks / "task-m1.txt").write_text("channel_id: C5\ntask: t\n")
+        self.lead.sweep()
+        s = m.summarize()
+        self.assertEqual(sum(s["assignment_distribution"].values()), 1)
+        self.assertIn("C5", s["mean_wait_by_channel"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
