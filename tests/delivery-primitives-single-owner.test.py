@@ -97,19 +97,23 @@ def scan_instantiations(sources: dict) -> dict:
         except SyntaxError:
             continue
         recognized = set(_CTORS)
+        # local spelling -> the constructor it is actually BOUND to. A local
+        # name that equals the OTHER ctor must resolve by binding, or
+        # `DesignCClaimBackend as DesignAClaimBackend` reports A while building C.
+        bound = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 for a in node.names:
-                    if a.name in _CTORS and a.asname:
-                        recognized.add(a.asname)
+                    if a.name in _CTORS:
+                        bound[a.asname or a.name] = a.name
+                        recognized.add(a.asname or a.name)
 
         def hits(node):
-            if isinstance(node, ast.Name) and node.id in recognized:
-                yield node.id if node.id in _CTORS else next(
-                    c for c in _CTORS
-                    if any(isinstance(n, ast.ImportFrom) and any(
-                        a.name == c and a.asname == node.id for a in n.names)
-                        for n in ast.walk(tree)))
+            if isinstance(node, ast.Name):
+                if node.id in bound:
+                    yield bound[node.id]
+                elif node.id in recognized and node.id in _CTORS:
+                    yield node.id
             elif isinstance(node, ast.Attribute) and node.attr in _CTORS:
                 yield node.attr
 
@@ -186,6 +190,19 @@ mviol4 = instantiation_violations(scan_instantiations(mutated4),
                                   INSTANTIATION_OWNERS)
 check(any("_import_alias_leg::DesignCClaimBackend" in v for v in mviol4),
       "import-as aliased constructor mutation FAILS the gate and names its site")
+# kewei r7 P1a: alias whose LOCAL name equals the OTHER constructor. Identifying a
+# ctor by local spelling reported A while constructing C at the A-sanctioned site.
+_rgb = "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"
+mutated4a = dict(prod_sources)
+mutated4a[_rgb] = prod_sources[_rgb].replace(
+    "DesignAClaimBackend", "DesignCClaimBackend as DesignAClaimBackend", 1)
+_scan4a = scan_instantiations(mutated4a)
+check(any(k.startswith(_rgb) and k.endswith("::DesignCClaimBackend")
+          for k in _scan4a),
+      "alias collision resolves to the IMPORTED ctor, not the local spelling")
+check(not any(k.startswith(_rgb) and k.endswith("::DesignAClaimBackend")
+              for k in _scan4a),
+      "alias collision no longer reports the shadowed A name")
 # qualified-attribute rebinding: Backend = dc.DesignCClaimBackend (reviewer P1 r3)
 mutated5 = dict(prod_sources)
 mutated5[_db] = prod_sources[_db] + (
@@ -293,6 +310,21 @@ def _is_backend_mod(dotted):
 def _is_facade_mod(dotted):
     return _path_parts(dotted)[-1] == "delivery_core"
 
+def _resolve_from(path, node):
+    """Absolute dotted module for an ImportFrom, relative forms included.
+
+    `node.module` is None for `from . import x`, so the raw value hides the
+    facade entirely — the relative-facade false negative.
+    """
+    mod = node.module or ""
+    if not getattr(node, "level", 0):
+        return mod
+    base = tuple(str(path).split("/")[:-1])
+    if node.level > 1:
+        base = base[:-(node.level - 1)] or ()
+    return ".".join(base + ((mod,) if mod else ()))
+
+
 def scan_backend_module_imports(sources: dict) -> list[str]:
     """Module ratchet: outside delivery_core, importing a concrete backend
     module OR holding the facade as a module object fails closed — getattr
@@ -313,18 +345,36 @@ def scan_backend_module_imports(sources: dict) -> list[str]:
                     elif _is_facade_mod(a.name):
                         out.append(f"{path} imports facade module {a.name}")
             elif isinstance(node, ast.ImportFrom):
-                mod = node.module or ""
+                mod = _resolve_from(path, node)
                 if _is_backend_mod(mod):
                     out.append(f"{path} imports from {mod}")
                 elif _is_facade_mod(mod):
                     for a in node.names:
                         if a.name in ("backend_a", "backend_c"):
                             out.append(f"{path} imports {mod}.{a.name}")
-                elif mod and _path_parts(mod)[-1] == "ag2_sparrow":
+                else:
+                    # `from <pkg> import delivery_core` binds a MODULE object,
+                    # the same getattr escape as a plain module import.
                     for a in node.names:
                         if a.name == "delivery_core":
-                            out.append(f"{path} imports facade module {mod}.{a.name}")
+                            out.append(f"{path} imports facade module "
+                                       f"{mod}.{a.name}" if mod else
+                                       f"{path} imports facade module {a.name}")
+                        elif a.name in ("backend_a", "backend_c"):
+                            out.append(f"{path} imports {mod}.{a.name}")
     return sorted(out)
+
+# kewei r7 P1a: a package sibling importing the facade RELATIVELY. node.module is
+# None for `from . import x`, so the unresolved value hid the facade entirely and
+# dynamic construction through it escaped both scanners.
+_rel = "packages/ag2-sparrow/ag2_sparrow/relative_delivery_leg.py"
+mutated4r = dict(prod_sources)
+mutated4r[_rel] = ("from . import delivery_core as dc\n"
+                   "def leg():\n"
+                   "    return getattr(dc, 'Design' + 'CClaimBackend')()\n")
+check(any(_rel in v and "delivery_core" in v
+          for v in scan_backend_module_imports(mutated4r)),
+      "relative facade import FAILS the module ratchet and names its file")
 
 mod_viol = scan_backend_module_imports(prod_sources)
 check(not mod_viol,
