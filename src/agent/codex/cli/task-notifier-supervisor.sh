@@ -84,6 +84,8 @@ while tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; do
   fi
   echo "task-notifier-supervisor: notifier exited with status $status; restarting in ${delay}s" >&2
   sleep "$delay"
-  delay=$(( delay * 2 ))
-  [ "$delay" -gt "$RESTART_DELAY_MAX" ] && delay="$RESTART_DELAY_MAX"
+  # awk, not $(( )): bash arithmetic is integer-only and the delay is
+  # documented as fractional -- tests drive it at 0.01 to stay fast.
+  delay="$(awk -v d="$delay" -v m="$RESTART_DELAY_MAX" \
+    'BEGIN { d *= 2; if (d > m) d = m; print d }')"
 done
