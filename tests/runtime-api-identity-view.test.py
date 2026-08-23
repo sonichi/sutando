@@ -142,5 +142,25 @@ class DispatchTests(unittest.TestCase):
             asyncio.run(d.handle("sutando.info", {}))
 
 
+class TestEnrolledActorFallback(unittest.TestCase):
+    def test_enrolled_identity_beats_local_agent_fallback(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent
+                              / "src" / "runtime-api"))
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "rt_server", Path(__file__).resolve().parent.parent
+            / "src" / "runtime-api" / "server.py")
+        srv = ilu.module_from_spec(spec)
+        spec.loader.exec_module(srv)
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "auth").mkdir()
+            (Path(td) / "auth" / "ag2space.json").write_text(
+                '{"agent_id": "@enrolled:ag2.space"}')
+            self.assertEqual(srv._enrolled_agent_id(td), "@enrolled:ag2.space")
+            self.assertIsNone(srv._enrolled_agent_id(None))
+        with tempfile.TemporaryDirectory() as td2:
+            self.assertIsNone(srv._enrolled_agent_id(td2))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

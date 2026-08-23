@@ -103,6 +103,17 @@ def _host_label() -> str | None:
         return None
 
 
+
+def _enrolled_agent_id(state_dir) -> "str | None":
+    if not state_dir:
+        return None
+    try:
+        rec = json.loads((Path(state_dir) / "auth" / "ag2space.json").read_text())
+        v = (rec.get("agent_id") or "").strip()
+        return v or None
+    except (OSError, ValueError):
+        return None
+
 class RuntimeServer:
     def __init__(self, socket_path: str, db_path: str, ha_dir: str,
                  state_dir: str | None = None,
@@ -122,9 +133,12 @@ class RuntimeServer:
         self._state_dir = state_dir
         # Actor identity is resolved DAEMON-SIDE, here, and handed to the
         # dispatcher explicitly — a client parameter can never override it.
+        # Env first, then the enrolled identity (same chain as the WSS leg),
+        # so info/agent-list rows join on the real agent id, not a fallback.
         self.actor_id = (os.environ.get("SUTANDO_AGENT_ID")
                          or os.environ.get("AGENT_MXID")
                          or os.environ.get("AGENT_ID")
+                         or _enrolled_agent_id(state_dir)
                          or "local-agent")
         # Request-domain orchestration (dispatch, approvals, governed
         # capabilities, idempotency, durable transitions, recovery) lives in
