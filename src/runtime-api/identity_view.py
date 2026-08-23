@@ -19,7 +19,7 @@ import json
 import time
 from pathlib import Path
 
-from agents_view import ALIVE_MAX_AGE_S
+from agents_view import ALIVE_MAX_AGE_S, AgentsView
 
 
 class IdentityView:
@@ -60,39 +60,62 @@ class IdentityView:
             out["beatAgeS"] = beat["beatAgeS"]
         return out
 
-    # ── sutando.stand ───────────────────────────────────────────────────────
-    def stand(self) -> dict:
-        # Stand = the durable owner-governed subject; every field must come
-        # from an explicit record (enrolled identity, stand.json bindings).
-        out: dict = {}
-        enrolled = self._enrolled()
-        if enrolled.get("agent_id"):
-            out["stand_id"] = enrolled["agent_id"]
-        # Top-level Owner only from an explicit OwnerBinding (stand.json);
-        # channel tofuOwner is entrance-scoped evidence, never promoted.
+    # ── sutando.stand (Stand Card) ──────────────────────────────────────────
+    def stand_card(self, details: bool = False) -> dict:
+        # One complete safe summary; owners[] vs owner_evidence[] never mix.
         rec = self._stand_record()
-        owners = [o for o in (rec.get("owners") or [])
-                  if isinstance(o, dict) and o.get("person_id")]
-        if owners:
-            prim = owners[0]
-            owner_out = {"person_id": prim["person_id"]}
-            for k in ("display_name", "role"):
-                if prim.get(k):
-                    owner_out[k] = prim[k]
-            owner_out["verification"] = "explicit_owner_binding"
-            out["owner"] = owner_out
-        if rec.get("display_name"):
-            out["display_name"] = rec["display_name"]
-        out["actor"] = {"actor_id": self.actor_id}
-        inst: dict = {}
-        if self.host_label:
-            inst["host_label"] = self.host_label
-        if inst:
-            out["instance"] = inst
+        enrolled = self._enrolled()
+        stand: dict = {}
+        if enrolled.get("agent_id"):
+            stand["stand_id"] = enrolled["agent_id"]
+        for k in ("display_name", "status"):
+            if rec.get(k):
+                stand[k] = rec[k]
+        owners = []
+        for o in (rec.get("owners") or []):
+            if isinstance(o, dict) and o.get("person_id"):
+                row = {k: o[k] for k in ("person_id", "display_name", "role")
+                       if o.get(k)}
+                row["verification"] = "explicit_owner_binding"
+                owners.append(row)
+        evidence = [{"provider": name, "subject": acc["tofuOwner"]}
+                    for name, acc in self._channels() if acc.get("tofuOwner")]
+        card = {"stand": stand, "owners": owners, "owner_evidence": evidence,
+                "entrances": self.entrances(details)["entrances"],
+                "devices": self._devices(details),
+                "instances": self._instances()}
+        return card
+
+    def _devices(self, details: bool = False) -> list:
+        out = []
+        ddir = self.state_dir / "auth" / "devices"
+        if not ddir.is_dir():
+            return out
+        for f in sorted(ddir.glob("*.json")):
+            try:
+                rec = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            row = {k: rec[k] for k in ("device_id", "label", "device_type")
+                   if rec.get(k) not in (None, "", "None")}
+            if details and rec.get("granted_methods"):
+                row["granted_methods"] = rec["granted_methods"]
+            if rec.get("last_seen_at") not in (None, "None"):
+                row["last_seen_at"] = rec["last_seen_at"]
+            out.append(row)
+        return out
+
+    def _instances(self) -> list:
+        rows = AgentsView(self.state_dir).list_agents().get("agents", [])
+        out = []
+        for r in rows:
+            row = {"host_label": r.get("host") or r.get("agentId"),
+                   "status": "alive" if r.get("alive") else "stale"}
+            out.append(row)
         return out
 
     # ── sutando.entrances ───────────────────────────────────────────────────
-    def entrances(self) -> dict:
+    def entrances(self, details: bool = False) -> dict:
         # I1 evidence projection: folder facts only, no provider calls and
         # no credential reads — nothing may claim more than unverified.
         out = []
@@ -100,10 +123,10 @@ class IdentityView:
             for d in sorted(self.channels_dir.iterdir()):
                 if not d.is_dir():
                     continue
-                out.append(self._entrance(d))
+                out.append(self._entrance(d, details))
         return {"entrances": out}
 
-    def _entrance(self, d: Path) -> dict:
+    def _entrance(self, d: Path, details: bool = False) -> dict:
         ent: dict = {"provider": d.name}
         link = self._active_link(d.name)
         evidence: dict = {}
@@ -130,13 +153,19 @@ class IdentityView:
             # a verified EntranceLink record is the ONLY path to "active"
             ent["status"] = "active"
             ent["identity"] = link.get("provider_subject")
+            if link.get("display"):
+                ent["display"] = link["display"]
             ent["verification"] = link.get("verification")
+            if details and link.get("credential"):
+                ent["credential"] = link["credential"]
         elif evidence:
             ent["status"] = "configured_unverified"
         else:
             ent["status"] = "not_configured"
         if evidence:
             ent["evidence"] = evidence
+        if details:
+            ent["storage"] = {"type": "channel_directory", "directory": str(d)}
         return ent
 
     def _active_link(self, provider: str) -> "dict | None":

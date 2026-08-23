@@ -246,8 +246,9 @@ class RuntimeDispatcher:
             if self.identity is None:
                 raise ProtocolError(-32601,
                                     "identity surface is not configured on this daemon")
+            if method == "sutando.stand":
+                return self.identity.stand_card(bool(params.get("details")))
             fn = {"sutando.info": self.identity.info,
-                  "sutando.stand": self.identity.stand,
                   "sutando.entrances": self.identity.entrances,
                   "sutando.status": self.identity.status,
                   "sutando.owner": self.identity.owner,

@@ -62,7 +62,8 @@ def _enrolled_stand_id(state_dir: str | Path) -> "str | None":
 
 
 def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
-                verification: dict, credential_fingerprint: str) -> dict:
+                verification: dict, credential_fingerprint: str,
+                display: "dict | None" = None) -> dict:
     # UNIQUE(provider, canonical subject): an active link for the provider is
     # replaced only by the SAME subject; a different subject must be explicit.
     links = load_links(state_dir)
@@ -83,6 +84,9 @@ def upsert_link(state_dir: str | Path, provider: str, provider_subject: dict,
     }
     if stand_id:
         link["stand_id"] = stand_id
+    if display:
+        # display fields are labels for humans — never binding keys
+        link["display"] = display
     link["verification"] = verification
     link["credential"] = {"kind": "bot_token", "status": "verified",
                           "fingerprint": credential_fingerprint}
@@ -100,9 +104,16 @@ def verify_discord(state_dir: str | Path, token: str) -> dict:
     with urllib.request.urlopen(req, timeout=15) as resp:
         me = json.loads(resp.read().decode())
     subject = {"type": "bot_user", "id": str(me["id"])}
+    display = {}
+    name = me.get("global_name") or me.get("username")
+    if name:
+        display["name"] = name
+    if me.get("avatar"):
+        display["avatar_url"] = (f"https://cdn.discordapp.com/avatars/"
+                                 f"{me['id']}/{me['avatar']}.png")
     verification = {
         "method": "discord_token_introspection",
         "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     return upsert_link(state_dir, "discord", subject, verification,
-                       _fingerprint(token))
+                       _fingerprint(token), display=display or None)

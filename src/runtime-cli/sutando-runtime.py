@@ -606,25 +606,31 @@ def _chat(activity: bool = False, verbose: bool = False, full: bool = False) -> 
     return 0
 
 
-def _print_entrances(result: dict) -> int:
-    ents = result.get("entrances") or []
-    if not ents:
-        print("no entrances", file=sys.stderr)
-        return 1
-    width = max(len(e.get("provider", "")) for e in ents)
-    width = max(width, len("owner evidence")) + 2
+def _fmt_subject(provider: str, subject: str) -> str:
+    if subject.startswith("@"):
+        return subject
+    return f"{provider}:user:{subject}"
+
+
+def _print_entrance_rows(ents: list, width: int) -> None:
     for e in ents:
-        print(f"{e.get('provider','').ljust(width)}{e.get('status','')}")
+        print(f"  {e.get('provider','').ljust(width)}{e.get('status','')}")
         ident = e.get("identity") or {}
         if ident:
             sub = ident.get("id", "")
             if ident.get("type"):
                 sub = f"{ident['type']}:{sub}"
-            print(f"  {'identity'.ljust(width)}{sub}")
+            disp = (e.get("display") or {}).get("name")
+            if disp:
+                sub = f"{disp}   {sub}"
+            print(f"    {'identity'.ljust(width)}{sub}")
         ver = e.get("verification") or {}
         if ver.get("method"):
-            print(f"  {'verified by'.ljust(width)}{ver['method']}"
+            print(f"    {'verified by'.ljust(width)}{ver['method']}"
                   + (f" ({ver['verified_at']})" if ver.get("verified_at") else ""))
+        cred = e.get("credential") or {}
+        if cred.get("fingerprint"):
+            print(f"    {'fingerprint'.ljust(width)}{cred['fingerprint']}")
         ev = e.get("evidence") or {}
         for key, label in (("subject_evidence", "subject"),
                            ("owner_evidence", "owner evidence"),
@@ -632,45 +638,76 @@ def _print_entrances(result: dict) -> int:
                            ("policy_present", "policy")):
             if key in ev:
                 val = ev[key] if isinstance(ev[key], str) else "present"
-                print(f"  {label.ljust(width)}{val}")
-    return 0
+                if key == "owner_evidence":
+                    val = _fmt_subject(e.get("provider", ""), val)
+                print(f"    {label.ljust(width)}{val}")
+        st = e.get("storage") or {}
+        if st.get("directory"):
+            print(f"    {'storage'.ljust(width)}{st['directory']}")
 
 
-def _print_stand(result: dict, sub: "str | None") -> int:
-    """Human/scripting views of sutando.stand; absent fields stay absent."""
-    if sub == "id":
-        sid = result.get("stand_id")
+def _print_stand_card(card: dict, section: "str | None") -> int:
+    stand = card.get("stand") or {}
+    if section == "id":
+        sid = stand.get("stand_id")
         if not sid:
             print("no stand record", file=sys.stderr)
             return 1
         print(sid)
         return 0
-    rows = []
-    if result.get("stand_id"):
-        label = result["stand_id"]
-        if result.get("display_name"):
-            label = f"{result['display_name']} ({label})"
-        rows.append(("Stand", label))
-    owner = result.get("owner") or {}
-    if owner.get("person_id"):
-        oid = owner["person_id"]
-        if owner.get("display_name"):
-            oid = f"{owner['display_name']} ({oid})"
-        rows.append(("Owner", oid))
-    inst = result.get("instance") or {}
-    for key, label in (("instance_id", "Instance"),
-                       ("installation_id", "Installation"),
-                       ("host_label", "Host")):
-        if inst.get(key):
-            rows.append((label, inst[key]))
-    if result.get("status"):
-        rows.append(("Status", result["status"]))
-    if not rows:
-        print("no stand record", file=sys.stderr)
-        return 1
-    width = max(len(k) for k, _ in rows)
-    for k, v in rows:
-        print(f"{k.ljust(width + 2)}{v}")
+    width = 16
+    show = lambda name: section is None or section == name  # noqa: E731
+    if section is None:
+        label = stand.get("stand_id", "")
+        if stand.get("display_name"):
+            label = f"{stand['display_name']}   {label}"
+        print(f"Stand   {label}")
+        if stand.get("status"):
+            print(f"  {'Status'.ljust(width)}{stand['status']}")
+        print()
+    if show("owner"):
+        owners = card.get("owners") or []
+        if owners:
+            o = owners[0]
+            oid = o.get("person_id", "")
+            if o.get("display_name"):
+                oid = f"{o['display_name']} ({oid})"
+            role = f"   {o['role']}" if o.get("role") else ""
+            print(f"Owner   {oid}{role}")
+        else:
+            print("Owner   Not established")
+            for ev in card.get("owner_evidence") or []:
+                print(f"  {'Evidence'.ljust(width)}"
+                      f"{_fmt_subject(ev['provider'], ev['subject'])}"
+                      f" via {ev['provider']}")
+        print()
+    if show("entrances"):
+        ents = card.get("entrances") or []
+        print("Entrances")
+        if ents:
+            _print_entrance_rows(ents, width)
+        else:
+            print("  none configured")
+        print()
+    if show("devices"):
+        devs = card.get("devices") or []
+        print("Devices")
+        if devs:
+            for d in devs:
+                row = f"  {d.get('label', d.get('device_id', '')).ljust(width)}"
+                row += (d.get("device_type") or "").ljust(10)
+                print(row.rstrip())
+        else:
+            print("  No enrolled devices")
+        print()
+    if show("instances"):
+        rows = card.get("instances") or []
+        print("Instances")
+        if rows:
+            for r in rows:
+                print(f"  {r.get('host_label','').ljust(28)}{r.get('status','')}")
+        else:
+            print("  none registered")
     return 0
 
 
@@ -739,8 +776,11 @@ def main(argv=None) -> int:
     for name in ("info", "status", "owner", "allowlist"):
         idn.add_parser(name)
     std = idn.add_parser("stand")
-    std.add_argument("sub", nargs="?", choices=["id", "entrances"])
+    std.add_argument("sub", nargs="?",
+                     choices=["id", "owner", "entrances", "devices",
+                              "instances"])
     std.add_argument("--json", action="store_true", dest="as_json")
+    std.add_argument("--details", action="store_true", dest="details")
 
     rt = sub.add_parser("runtime").add_subparsers(dest="cmd", required=True)
     for name in ("health", "details"):
@@ -911,14 +951,12 @@ def main(argv=None) -> int:
                       else _rpc("agent.status", {"agentId": args.agent_id},
                                 timeout=15))
         elif args.group == "sutando":
-            method = f"sutando.{args.cmd}"
-            if args.cmd == "stand" and getattr(args, "sub", None) == "entrances":
-                method = "sutando.entrances"
-            result = _rpc(method, {}, timeout=15)
+            params = {}
+            if args.cmd == "stand" and getattr(args, "details", False):
+                params = {"details": True}
+            result = _rpc(f"sutando.{args.cmd}", params, timeout=15)
             if args.cmd == "stand" and not args.as_json:
-                if args.sub == "entrances":
-                    return _print_entrances(result)
-                return _print_stand(result, args.sub)
+                return _print_stand_card(result, getattr(args, "sub", None))
         elif args.group == "runtime":
             result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)
         elif args.group == "human-action":

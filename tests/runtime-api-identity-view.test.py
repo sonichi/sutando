@@ -170,37 +170,42 @@ class TestStand(unittest.TestCase):
              "owners": [{"person_id": "@owner:ag2.space",
                          "display_name": "Owner Person",
                          "role": "primary_owner"}]}))
-        out = _mk(self.state, self.channels, host_label="host-1").stand()
-        self.assertEqual(out["stand_id"], "@stand:ag2.space")
-        self.assertEqual(out["display_name"], "Sutando")
-        self.assertEqual(out["owner"],
-                         {"person_id": "@owner:ag2.space",
-                          "display_name": "Owner Person",
-                          "role": "primary_owner",
-                          "verification": "explicit_owner_binding"})
-        self.assertEqual(out["actor"], {"actor_id": "@me:example.org"})
-        self.assertEqual(out["instance"], {"host_label": "host-1"})
+        out = _mk(self.state, self.channels, host_label="host-1").stand_card()
+        self.assertEqual(out["stand"],
+                         {"stand_id": "@stand:ag2.space",
+                          "display_name": "Sutando"})
+        self.assertEqual(out["owners"],
+                         [{"person_id": "@owner:ag2.space",
+                           "display_name": "Owner Person",
+                           "role": "primary_owner",
+                           "verification": "explicit_owner_binding"}])
+        self.assertEqual(out["owner_evidence"],
+                         [{"provider": "ag2space",
+                           "subject": "@owner:ag2.space"}])
+        self.assertIn("entrances", out)
+        self.assertEqual(out["devices"], [])
+        self.assertEqual(out["instances"], [])
 
     def test_absent_records_are_omitted_not_null(self):
-        # no enrolled record, no channels, no host label
-        out = _mk(self.state).stand()
-        self.assertNotIn("stand_id", out)
-        self.assertNotIn("owner", out)
-        self.assertNotIn("instance", out)
-        self.assertEqual(out["actor"], {"actor_id": "@me:example.org"})
-        self.assertNotIn(None, out.values())
+        # no enrolled record, no channels: empty sections, no invented values
+        out = _mk(self.state).stand_card()
+        self.assertEqual(out["stand"], {})
+        self.assertEqual(out["owners"], [])
+        self.assertEqual(out["owner_evidence"], [])
+        self.assertNotIn(None, out["stand"].values())
 
     def test_owner_never_promoted_from_channel_evidence(self):
         self._enroll()
-        # tofuOwner anywhere is entrance-scoped evidence, not a Stand-level
-        # OwnerBinding — top-level owner must stay absent without stand.json
+        # tofuOwner is evidence — owners[] stays empty without stand.json,
+        # and the evidence lands in owner_evidence, never in owners
         self._native_channel({"tofuOwner": "@o:ag2.space",
                               "tierMap": {"@o:ag2.space": "owner"}})
         d = self.channels / "slack"
         d.mkdir(parents=True)
         (d / "access.json").write_text(json.dumps({"tofuOwner": "U1"}))
-        out = _mk(self.state, self.channels).stand()
-        self.assertNotIn("owner", out)
+        out = _mk(self.state, self.channels).stand_card()
+        self.assertEqual(out["owners"], [])
+        self.assertEqual(len(out["owner_evidence"]), 2)
 
     def test_dispatch_routes_stand(self):
         self._enroll()
@@ -209,7 +214,7 @@ class TestStand(unittest.TestCase):
                               executors={},
                               identity_view=IdentityView(self.state, "@me:x"))
         out = asyncio.run(d.handle("sutando.stand", {}))
-        self.assertEqual(out["stand_id"], "@stand:ag2.space")
+        self.assertEqual(out["stand"]["stand_id"], "@stand:ag2.space")
 
 
 class TestEntrances(unittest.TestCase):
