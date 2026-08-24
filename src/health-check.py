@@ -59,6 +59,7 @@ import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
+import process_pins  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 
@@ -3622,8 +3623,18 @@ def _load_channel_env(channel: str) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+def _pin_verdicts(service: str, lstart_by_pid: dict) -> list:
+    """Restart pins naming `service`, evaluated against its live pids."""
+    if not service:
+        return []
+    return process_pins.evaluate(
+        process_pins.load_pins(WORKSPACE_DIR / "state" / "process-pins.json"),
+        service, lstart_by_pid, time.time())
+
+
 def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800,
-                          binary_path: Optional[Path] = None, artifact_threshold_sec: int = 120) -> None:
+                          binary_path: Optional[Path] = None, artifact_threshold_sec: int = 120,
+                          service: Optional[str] = None) -> None:
     """Mark `check` as 'stale' in place if a process matching `pgrep_pattern`
     started more than `threshold_sec` before `src_file`'s mtime.
 
@@ -3684,18 +3695,31 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         if not pids:
             return
         ps_out = subprocess.run(
-            ["/bin/ps", "-o", "lstart=", "-p", ",".join(pids)],
+            ["/bin/ps", "-o", "pid=,lstart=", "-p", ",".join(pids)],
             capture_output=True, text=True, timeout=5
         ).stdout.strip().split("\n")
         from datetime import datetime as _dt
         starts = []
+        lstart_by_pid = {}
         for line in ps_out:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            # Accept both shapes: `pid lstart` (what we ask ps for) and a bare
+            # lstart, so a caller or fixture supplying the older form still works.
+            pid_tok, lstart_tok = "", line
+            try:
+                stamp = _dt.strptime(lstart_tok, "%a %b %d %H:%M:%S %Y")
+            except ValueError:
+                pid_tok, _, lstart_tok = line.partition(" ")
+                pid_tok, lstart_tok = pid_tok.strip(), lstart_tok.strip()
                 try:
-                    starts.append(_dt.strptime(line, "%a %b %d %H:%M:%S %Y").timestamp())
+                    stamp = _dt.strptime(lstart_tok, "%a %b %d %H:%M:%S %Y")
                 except ValueError:
-                    pass
+                    continue
+            starts.append(stamp.timestamp())
+            if pid_tok:
+                lstart_by_pid[pid_tok] = lstart_tok
         if not starts:
             return
         # Pick the OLDEST start time — the tsx wrapper spawns a child node
@@ -3730,8 +3754,21 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
             # bump — the running code is still current.
             if _file_unchanged_since(src_file, proc_start):
                 return
+            age_min = int((src_mtime - proc_start) / 60)
+            pin_notes = _pin_verdicts(service or check.get("name") or "", lstart_by_pid)
+            armed = process_pins.armed_detail(pin_notes)
+            if armed:
+                # The tree moved BACKWARD past this process. Restarting adopts the
+                # tree and discards what only exists in the running process.
+                check["status"] = "warn"
+                check["detail"] = f"code is {age_min} min newer than process, but {armed}"
+                return
             check["status"] = "stale"
-            check["detail"] = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
+            check["detail"] = f"running but code is {age_min} min newer than process — restart needed"
+            for _v, _p, note in pin_notes:
+                # A pin that stopped matching is a finding: it means the thing it
+                # protected is already gone, and silence would hide that.
+                check["detail"] += f" [{note}]"
     except (subprocess.TimeoutExpired, OSError):
         pass
 
@@ -9165,8 +9202,19 @@ def run_all_checks() -> list[dict]:
                         # for voice-agent + web-client via mark_stale_if_outdated,
                         # this path does the same check inline to reach bridges.
                         if not _file_unchanged_since(src_file, proc_start):
-                            status = "stale"
-                            detail = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
+                            age_min = int((src_mtime - proc_start) / 60)
+                            # Same pin policy as mark_stale_if_outdated; this path
+                            # recomputes staleness inline, so it must ask too.
+                            notes = _pin_verdicts(name, {pids[0]: ps_out})
+                            armed = process_pins.armed_detail(notes)
+                            if armed:
+                                status = "warn"
+                                detail = f"code is {age_min} min newer than process, but {armed}"
+                            else:
+                                status = "stale"
+                                detail = f"running but code is {age_min} min newer than process — restart needed"
+                                for _v, _p, note in notes:
+                                    detail += f" [{note}]"
         except (subprocess.TimeoutExpired, ValueError, OSError):
             pass
 
