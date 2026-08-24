@@ -6612,6 +6612,16 @@ def check_proactive_quarantine() -> dict:
         except OSError:
             unreadable += 1
             continue
+        # A declared skip had nothing to deliver, so it can never drain.
+        # `[deduped:]` stays counted: it promises delivery elsewhere.
+        try:
+            from result_markers import parse_markers  # noqa: PLC0415
+            skips = {a.value for a in parse_markers(path.read_text()).actions
+                     if a.kind == "skip"}
+        except (OSError, ValueError, ImportError):
+            skips = set()          # unreadable -> judge it as before, never silently clear
+        if skips & {"no-send", "REPLIED"}:
+            continue
         kept.append((path.name, int(age)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
@@ -8697,9 +8707,70 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
     return out
 
 
-def _interpret_core_model_pin(pinned: list, socket: str, running=()) -> dict:
+def _settings_candidates() -> "tuple":
+    """The settings files the runtime actually consults, ((label, Path), ...).
+
+    claude_home_path() resolves CLAUDE_CONFIG_DIR with its own fallback; reading
+    that fallback separately would report a file the runtime does not consult.
+    """
+    return (
+        ("user", Path(claude_home_path("settings.json"))),
+        ("project", REPO_DIR / ".claude" / "settings.json"),
+    )
+
+
+def _settings_model_pins(candidates=None) -> list:
+    """[(label, model)] for every settings.json that sets `model`.
+
+    Read at the edge so the interpreter stays pure. A settings pin is a THIRD
+    way the core's model is decided, invisible to both tmux env and argv.
+    """
+    out = []
+    seen = set()
+    for label, path in (_settings_candidates() if candidates is None
+                        else candidates):
+        try:
+            resolved = path.resolve()
+            if resolved in seen or not path.is_file():
+                continue
+            seen.add(resolved)
+            model = json.loads(path.read_text()).get("model")
+        except (OSError, ValueError, TypeError):
+            continue  # unreadable/malformed settings is not a pin claim either way
+        if isinstance(model, str) and model.strip():
+            out.append((label, model.strip()))
+    return out
+
+
+def _live_core_runtime(socket: str, sessions) -> "str | None":
+    """Runtime stamped on the LIVE core sessions, or None when not knowable.
+
+    Config can disagree with a running pane mid-switch, so the pane's own stamp
+    decides; absent, unreadable or CONFLICTING stamps are unknown, never Claude.
+    """
+    seen = set()
+    for sess in sessions:
+        res = _run_tmux(socket, "show-environment", "-t", f"={sess}",
+                        "SUTANDO_CORE_RUNTIME")
+        if res is None or res.returncode != 0:
+            continue
+        out = (res.stdout or "").strip()
+        if out.startswith("SUTANDO_CORE_RUNTIME="):
+            val = out.split("=", 1)[1].strip()
+            if val:
+                seen.add(val)
+    return seen.pop() if len(seen) == 1 else None
+
+
+def _interpret_core_model_pin(pinned: list, socket: str, running=(),
+                              settings=(), runtime: str = "claude") -> dict:
     """Interpret tmux pins AND the live core's argv. A tmux clear cannot change an
-    already-running process, so argv must be reported even when tmux is clean."""
+    already-running process, so argv must be reported even when tmux is clean.
+
+    `settings` carries settings.json `model` values. They are a legitimate,
+    intended way to choose the model, so they never make this WARN — but the
+    clean line must not claim the default window while one is set.
+    """
     name = "core-model-pin"
     live = [(s, v) for s, v in running if v and v.strip()]
     # An empty-string argv read is as unverified as None; both mean "ps told us
@@ -8714,9 +8785,22 @@ def _interpret_core_model_pin(pinned: list, socket: str, running=()) -> dict:
                                f"({', '.join(sorted(unknown))}), so it cannot be "
                                f"confirmed unpinned — the tmux env is clear, but a "
                                f"clear cannot move a running core off a pinned model")}
+        if runtime != "claude":
+            # The argv scan matches only `claude` panes and settings.json is
+            # Claude-scoped, so neither says anything about this runtime.
+            return {"name": name, "status": "ok",
+                    "detail": (f"no SUTANDO_CORE_MODEL pin in tmux env; the live core runtime is "
+                               f"{runtime!r}, and the argv scan and settings.json are Claude-scoped, "
+                               f"so they were NOT consulted and its window is unassessed here")}
+        if settings:
+            where = ", ".join(f"{lbl}={val!r}" for lbl, val in settings)
+            return {"name": name, "status": "ok",
+                    "detail": (f"no SUTANDO_CORE_MODEL pin in tmux env or core argv, "
+                               f"but settings.json DOES select the model ({where}) — "
+                               f"so the core is not on the default window")}
         return {"name": name, "status": "ok",
-                "detail": ("no model pin on any session or the global env "
-                           "(core uses the default window)")}
+                "detail": ("no model pin in tmux env or core argv, and no settings.json "
+                           "selects a model — core uses the default window")}
     if live:
         where_live = ", ".join(f"{s} argv={v!r}" for s, v in live)
         extra = ""
@@ -8822,13 +8906,18 @@ def check_core_model_pin() -> dict:
         sessions = _tmux_sessions(socket)
     except (OSError, subprocess.SubprocessError) as e:
         if _tmux_no_server(e):
-            return _interpret_core_model_pin(pinned, socket, ())
+            # No session list here, so the live stamp is unreadable -> unknown.
+            return _interpret_core_model_pin(
+                pinned, socket, (), _settings_model_pins(), "unknown")
         # sessions=[] here would report a clean argv pass having read no core at all.
         return {"name": name, "status": "warn",
                 "detail": (f"could not enumerate core tmux sessions ({e}), so no core "
                            f"argv was inspected — the tmux env is clear, but a clear "
                            f"cannot move a running core off a pinned model")}
-    return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
+    return _interpret_core_model_pin(pinned, socket,
+                                     _core_argv_pins(socket, sessions),
+                                     _settings_model_pins(),
+                                     _live_core_runtime(socket, sessions) or "unknown")
 
 
 def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
