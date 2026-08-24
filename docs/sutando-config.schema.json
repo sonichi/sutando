@@ -179,8 +179,7 @@
           "oneOf": [
             {
               "type": "string",
-              "pattern": "\\S",
-              "description": "Path to a Python file exporting validate(channel_id, payload). Applied to every channel."
+              "description": "Path to a Python file exporting validate(channel_id, payload). Applied to every channel. Blank is the legacy UNCONFIGURED form: the resolver strips and treats it as unset, so the schema must not reject it."
             },
             {
               "type": "object",

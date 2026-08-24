@@ -120,7 +120,8 @@ CASES = [
     ("map WITHOUT `*`", {"111": "gates/dev.py"}, False, "refuse-all"),
     ("empty map", {}, False, "refuse-all"),
     ("blank `*`", {"111": "gates/dev.py", "*": "   "}, False, "refuse-all"),
-    ("blank string", "   ", False, "ungated"),
+    ("blank string (legacy unconfigured)", "   ", True, "ungated"),
+    ("empty string (legacy unconfigured)", "", True, "ungated"),
     ("wrong type", 7, False, "refuse-all"),
 ]
 
@@ -138,8 +139,10 @@ with tempfile.TemporaryDirectory() as td:
 # `{"*": "gates/all.py"}` gated correctly while the schema called it invalid.
 check("no schema-VALID config refuses every send",
       not [l for l, v, r in table if v and r == "refuse-all"])
-check("no normally-gating config is schema-INVALID",
-      not [l for l, v, r in table if not v and r == "gated"])
+# Widened after review: `gated` was too narrow. `ungated` is a SUPPORTED runtime
+# outcome too, so rejecting it is the same schema/runtime drift, pointed the other way.
+check("no runtime-supported config is schema-INVALID",
+      not [l for l, v, r in table if not v and r != "refuse-all"])
 
 # `*` is required by the schema, not merely mentioned in prose.
 obj = [s for s in GATE["oneOf"] if s.get("type") == "object"]
