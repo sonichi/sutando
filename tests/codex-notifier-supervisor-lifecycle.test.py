@@ -11,6 +11,7 @@ rather than measured wall-clock gaps -- a sleep-timing assertion is flaky under
 CI load, and a flaky guard is worse than none.
 """
 import os
+import time
 import subprocess
 import tempfile
 import textwrap
@@ -137,6 +138,148 @@ class SupervisorLifecycleTest(unittest.TestCase):
         owners = self.lease_owners_seen()
         self.assertTrue(owners and "none" not in owners, f"lease never taken: {owners}")
         self.assertFalse(self.lock.exists(), "lease outlived the supervisor")
+
+
+class LeaseOwnershipTest(unittest.TestCase):
+    """Contention controls. Every one drives the production supervisor: a
+    hand-rolled recipe would certify a script the repo does not ship."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.runs = self.d / "runs"
+        self.lock = self.d / "lease.lock"
+        self.stop = self.d / "stop"
+        # Alive until the test says otherwise, so two supervisors can overlap.
+        _write(self.d / "tmux", f"""
+            #!/bin/bash
+            [ -f "{self.stop}" ] && exit 1
+            exit 0
+        """, executable=True)
+
+    def _notifier(self, tag):
+        n = _write(self.d / f"notifier-{tag}.sh", f"""
+            #!/bin/bash
+            echo "{tag}" >> "{self.runs}"
+            sleep 30
+        """, executable=True)
+        return n
+
+    def _env(self, tag, **extra):
+        env = dict(os.environ)
+        env.update({
+            "PATH": f"{self.d}:{env['PATH']}",
+            "TMPDIR": str(self.d),
+            "SUTANDO_NOTIFIER_SCRIPT": str(self._notifier(tag)),
+            "SUTANDO_NOTIFIER_RESTART_DELAY": "1",
+            "SUTANDO_NOTIFIER_RESTART_DELAY_MAX": "2",
+            "SUTANDO_NOTIFIER_STABLE_AFTER": "600",
+        })
+        env.pop("SUTANDO_NOTIFIER_LOCK_DIR", None)
+        env.update(extra)
+        return env
+
+    def _run(self, tag, **extra):
+        return subprocess.run(["bash", str(SUPERVISOR)], env=self._env(tag, **extra),
+                              capture_output=True, text=True, timeout=60)
+
+    def _bg(self, tag, **extra):
+        proc = subprocess.Popen(["bash", str(SUPERVISOR)], env=self._env(tag, **extra),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self._reap, proc)
+        return proc
+
+    def _reap(self, proc):
+        self.stop.touch()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    def _ran(self):
+        return self.runs.read_text().split() if self.runs.exists() else []
+
+    def _await_run(self, tag, timeout=25):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if tag in self._ran():
+                return
+            time.sleep(0.2)
+        self.fail(f"supervisor {tag} never started its notifier; ran={self._ran()}")
+
+    # --- incomplete publication (kewei's P1 repro: mkdir before metadata) ---
+
+    def test_incomplete_publication_defers_rather_than_deleting(self):
+        """A directory with no metadata is a winner caught mid-publication.
+        Deleting it hands a second supervisor the lease the first one holds."""
+        self.lock.mkdir()
+        r = self._run("second", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("second", self._ran(), "ran while a winner was publishing")
+        self.assertTrue(self.lock.exists(), "deleted a publishing winner's lease")
+
+    def test_incomplete_publication_is_reclaimed_once_stale(self):
+        """The defer above is bounded: a crash inside publication must not
+        wedge the notifier off forever."""
+        self.lock.mkdir()
+        old = time.time() - 600
+        os.utime(self.lock, (old, old))
+        self._bg("late", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                 SUTANDO_NOTIFIER_PUBLISH_GRACE="10")
+        self._await_run("late")
+
+    # --- former owner must not delete its successor ---
+
+    def test_former_owner_leaves_its_successors_lease_alone(self):
+        holder = self._bg("holder", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("holder")
+        successor = (self.lock / "token").read_text()
+
+        # Reclaim it out from under the holder, as a stale-lease sweep would.
+        (self.lock / "token").write_text("999999:elsewhere\n")
+        (self.lock / "pid").write_text("999999\n")
+
+        holder.terminate()   # runs the trap -> release_lease, the path under test
+        holder.wait(timeout=25)
+        self.assertTrue(self.lock.exists(),
+                        "the former owner deleted a lease it no longer held")
+        self.assertNotEqual((self.lock / "token").read_text(), successor)
+
+    # --- P2: the lease is keyed per (socket, session), as start-cli launches ---
+
+    def test_a_second_socket_does_not_suppress_the_first(self):
+        self._bg("A", SUTANDO_TMUX_SOCKET="/tmp/sock-A", SUTANDO_TMUX_SESSION="s")
+        self._await_run("A")
+
+        same = self._run("same", SUTANDO_TMUX_SOCKET="/tmp/sock-A",
+                         SUTANDO_TMUX_SESSION="s")
+        self.assertEqual(same.returncode, 0)
+        self.assertNotIn("same", self._ran(),
+                         "two notifiers on one (socket, session) — the lease failed")
+
+        other = self._bg("B", SUTANDO_TMUX_SOCKET="/tmp/sock-B",
+                         SUTANDO_TMUX_SESSION="s")
+        self._await_run("B")
+        self.assertIsNone(other.poll(), "a second socket was suppressed by the first")
+
+    # --- cleanup must not be recursive on a configurable path ---
+
+    def test_cleanup_never_removes_unrelated_contents(self):
+        self.lock.mkdir()
+        keep = self.lock / "not-ours"
+        keep.write_text("someone else's data\n")
+        old = time.time() - 600
+        os.utime(self.lock, (old, old))
+        r = self._run("recurse", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                      SUTANDO_NOTIFIER_PUBLISH_GRACE="10")
+        self.assertTrue(keep.exists(),
+                        "supervisor deleted a pre-existing file under the lock path")
+        # Fail closed and say which path: refusing to run beats emptying a
+        # directory that is not ours because it sits at a configurable path.
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(str(self.lock), r.stderr)
+        self.assertNotIn("recurse", self._ran())
 
 
 if __name__ == "__main__":
