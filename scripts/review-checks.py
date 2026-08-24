@@ -28,8 +28,8 @@ allows = [a for a in os.environ.get("RC_ALLOWS", "").split("\n") if a]
 paired = [tuple(x.strip() for x in a.split("::", 1))
           for a in os.environ.get("RC_ALLOW_PAIRED", "").split("\n")
           if a and "::" in a]
-# checks.hardcoded-paths.skip_glob: a stored patch's own removal lines read as
-# ADDED lines in the outer diff, so exempt by extension, not by content.
+# checks.hardcoded-paths.skip_glob: exempts only a matched file's inner-removal
+# lines (see '+' handling below) — an inner addition stays in scope.
 skip_globs = [g for g in os.environ.get("RC_SKIP_GLOB", "").split("\n") if g]
 DELIMS = set("\"'()" + ", ;=" + chr(96) + chr(9))   # quotes, brackets, backtick, tab, etc.
 SKIP = re.compile(r"\.md$|(^|/)tests/|\.test\.|review-checks\.(sh|py)$")
@@ -933,9 +933,11 @@ def main():
             prev_added = _code_part(raw[1:])
             continue
         if raw.startswith("+"):
-            if skip:
-                continue
             line = raw[1:]
+            # Only an inner-removal line (nested diff's own '-') is exempt here —
+            # an inner-addition/context line is what a re-applied patch introduces.
+            if skip and line.startswith("-"):
+                continue
             cur = ln
             ln += 1
             # Decide skip from the state at the line's START, then advance it —
