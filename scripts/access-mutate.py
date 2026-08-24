@@ -65,8 +65,8 @@ def _backup(data: dict) -> None:
         pass
 
 
-def _mutate(mutator) -> dict:
-    result = mutate_access_file(resolve_discord_access_file(), mutator, backup=_backup)
+def _mutate(mutator, path: Path | None = None) -> dict:
+    result = mutate_access_file(path or resolve_discord_access_file(), mutator, backup=_backup)
     if result is None:
         return {"ok": False, "error": "access.json unreadable/corrupt — not modified"}
     return result
@@ -74,6 +74,9 @@ def _mutate(mutator) -> dict:
 
 def _pair(code: str) -> dict:
     approved = {}
+    # Resolve once: a first successful mutation's _backup() flips
+    # resolve_discord_access_file() from legacy to canonical mid-transaction.
+    access_path = resolve_discord_access_file()
 
     def _mutator(data):
         pending = data.get("pending", {})
@@ -94,11 +97,11 @@ def _pair(code: str) -> dict:
         approved["chatId"] = chat_id
         return data, {"ok": True, "senderId": sender_id, "chatId": chat_id}
 
-    result = _mutate(_mutator)
+    result = _mutate(_mutator, access_path)
     # Write the approved-marker only after the locked mutation commits — a
     # failed access.json write must never leave a stray "you're in" marker.
     if result.get("ok") and approved.get("senderId"):
-        approved_dir = resolve_discord_access_file().parent / "approved"
+        approved_dir = access_path.parent / "approved"
         try:
             approved_dir.mkdir(parents=True, exist_ok=True)
             (approved_dir / str(approved["senderId"])).write_text(str(approved["chatId"]))
@@ -251,10 +254,7 @@ def _group_append(channel_id: str, sender_ids: list[str]) -> dict:
         data["groups"] = groups
         return data, {"ok": True, "added": added, "skipped": [s for s in sender_ids if s not in added]}
 
-    result = mutate_access_file(resolve_discord_access_file(), _mutator, backup=_backup)
-    if result is None:
-        return {"ok": False, "error": "access.json unreadable/corrupt — not modified"}
-    return result
+    return _mutate(_mutator)
 
 
 def _group_rm_allow(channel_id: str, sender_ids: list[str]) -> dict:
@@ -273,10 +273,7 @@ def _group_rm_allow(channel_id: str, sender_ids: list[str]) -> dict:
         data["groups"] = groups
         return data, {"ok": True, "removed": removed, "skipped": [s for s in sender_ids if s not in removed]}
 
-    result = mutate_access_file(resolve_discord_access_file(), _mutator, backup=_backup)
-    if result is None:
-        return {"ok": False, "error": "access.json unreadable/corrupt — not modified"}
-    return result
+    return _mutate(_mutator)
 
 
 _USAGE = """usage:
