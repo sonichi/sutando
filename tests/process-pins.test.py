@@ -107,6 +107,20 @@ st, det = pp.stale_verdict(pp.evaluate([pin(expires_at=PAST)], "discord-bridge",
 check("stale_verdict expired -> still stale", st == "stale")
 check("stale_verdict expired -> surfaces the lost pin", "expired" in det)
 
+# An ARMED sibling changes the PRESCRIPTION; it must not retract the other
+# pins' notes. Orphan removal is manual, so "stale pin left behind, new pin
+# armed" is the ordinary sequence and the dropped note is a lost finding.
+orphan = pin(pid=91000)
+for order, label in (([orphan, pin()], "orphan first"),
+                     ([pin(), orphan], "armed first")):
+    r = pp.evaluate(order, "discord-bridge", LIVE, NOW)
+    st, det = pp.stale_verdict(r, 821)
+    check(f"stale_verdict armed+orphan ({label}) -> warn", st == "warn")
+    check(f"stale_verdict armed+orphan ({label}) -> keeps the armed reason",
+          "DO NOT RESTART" in det)
+    check(f"stale_verdict armed+orphan ({label}) -> STILL surfaces the orphan",
+          "no longer running" in det)
+
 # A naive (tz-less) expiry must be read as UTC, not crash or read as eternal.
 naive_past = datetime.fromtimestamp(NOW, timezone.utc).replace(tzinfo=None) - timedelta(days=1)
 r = pp.evaluate([pin(expires_at=naive_past.isoformat())], "discord-bridge", LIVE, NOW)

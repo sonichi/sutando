@@ -106,13 +106,16 @@ def stale_verdict(results: list, age_min: int) -> tuple:
     stopped matching is appended to the still-stale detail rather than dropped.
     """
     armed = armed_detail(results)
+    # A non-matching pin is a finding at BOTH verdicts: an armed sibling
+    # changes the prescription, it does not retract the other pins' notes.
+    others = "".join(f" [{note}]" for verdict, _pin, note in results
+                     if verdict != ARMED)
     if armed:
-        return ("warn", f"code is {age_min} min newer than process, but {armed}")
-    detail = (f"running but code is {age_min} min newer than process "
-              "\u2014 restart needed")
-    for _verdict, _pin, note in results:
-        detail += f" [{note}]"
-    return ("stale", detail)
+        return ("warn",
+                f"code is {age_min} min newer than process, but {armed}{others}")
+    return ("stale",
+            f"running but code is {age_min} min newer than process "
+            f"\u2014 restart needed{others}")
 
 
 def armed_detail(results: list):
