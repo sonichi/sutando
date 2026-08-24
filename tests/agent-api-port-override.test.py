@@ -43,6 +43,12 @@ class AgentApiPortOverrideTest(unittest.TestCase):
     def test_env_overrides_the_port(self):
         self.assertEqual(_load("7999"), 7999)
 
+    def test_malformed_value_refuses_rather_than_defaulting(self):
+        """7843 is the live service: a typo'd witness port must not land on it."""
+        with self.assertRaises(ValueError) as cm:
+            _load("7999x")
+        self.assertIn("not a port number", str(cm.exception))
+
     def test_port_is_an_int_not_a_string(self):
         """ThreadingHTTPServer takes (host, port); a str port raises at bind."""
         self.assertIsInstance(_load("7999"), int)

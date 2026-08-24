@@ -113,7 +113,12 @@ TASK_DIR = WORKSPACE_DIR / "tasks"
 TASK_WORKSTREAM_GROUPING_SKILL = REPO_DIR / "skills" / "task-workstream-grouping" / "SKILL.md"
 # Overridable so a live-path witness can run against an isolated instance
 # instead of restarting the owner's service; mirrors AGENT_API_BIND below.
-PORT = int(os.environ.get("AGENT_API_PORT", 7843))
+_PORT_ENV = os.environ.get("AGENT_API_PORT")
+if _PORT_ENV is not None and not _PORT_ENV.isdigit():
+    # Refusing rather than defaulting: 7843 is the live service, so a typo'd
+    # witness port must not silently collide with it.
+    raise ValueError(f"AGENT_API_PORT={_PORT_ENV!r} is not a port number")
+PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
