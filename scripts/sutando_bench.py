@@ -22,8 +22,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 SCHEMA = 1
-DEFAULT_SUITE = Path(__file__).resolve().parent.parent / "benchmarks" / "smoke.json"
-DEFAULT_SUTANDO_CONFIG = Path(__file__).resolve().parent / "sutando-config.sh"
+SCRIPT_DIR = Path(__file__).parent
+DEFAULT_SUITE = SCRIPT_DIR.parent / "benchmarks" / "smoke.json"
+DEFAULT_SUTANDO_CONFIG = SCRIPT_DIR / "sutando-config.sh"
 CODE_IDENTITY_FIELDS = (
     "revision", "commit", "branch", "describe", "tree_sha", "tree_digest",
     "dirty", "source", "built_at",
