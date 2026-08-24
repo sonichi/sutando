@@ -36,7 +36,13 @@ SKIP = re.compile(r"\.md$|(^|/)tests/|\.test\.|review-checks\.(sh|py)$")
 
 
 def _skip_file(f):
-    return bool(SKIP.search(f)) or any(fnmatch.fnmatchcase(f, g) for g in skip_globs)
+    """File-class exemption: never scanned at all."""
+    return bool(SKIP.search(f))
+
+
+def _patch_file(f):
+    """skip_glob match: only its INNER-REMOVAL lines are exempt, not the file."""
+    return any(fnmatch.fnmatchcase(f, g) for g in skip_globs)
 
 
 def token_at(s, pos):
@@ -833,6 +839,7 @@ def _hunk_body(all_lines, start):
 def main():
     diff = sys.stdin.read()  # streamed by the runner — see module docstring (#2281)
     skip = False
+    is_patch = False
     ln = 0
     cur_file = ""
     hits = 0
@@ -898,6 +905,7 @@ def main():
             cur_file = f
             ln = 0
             skip = _skip_file(f)
+            is_patch = _patch_file(f)
             in_doc = False
             prev_added = None
             in_block = False
@@ -934,9 +942,11 @@ def main():
             continue
         if raw.startswith("+"):
             line = raw[1:]
-            # Only an inner-removal line (nested diff's own '-') is exempt here —
-            # an inner-addition/context line is what a re-applied patch introduces.
-            if skip and line.startswith("-"):
+            if skip:
+                continue
+            # A skip_glob file is exempt ONLY on its nested diff's own removal
+            # lines; an inner addition is what a re-applied patch introduces.
+            if is_patch and line.startswith("-"):
                 continue
             cur = ln
             ln += 1
