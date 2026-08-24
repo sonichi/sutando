@@ -55,12 +55,32 @@ REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
 REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
 export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
 
+# The bridge resolves env -> .env -> VAULT (_token_from_vault_ag2space, which
+# reuses channel_token.token_from_vault), so an .env-only gate here is NARROWER
+# than the thing it gates: a vault-only token parks the job before the bridge
+# ever gets the chance to resolve it. Ask the same shared resolver the bridge
+# would. rc 0 = usable, 3 = definitively absent; any other rc means the resolver
+# itself is unrunnable, so fall through to the .env answer rather than taking
+# the bridge down on a resolver bug.
+_TOKEN_PRESENT="$REMOTE_TASK_TOKEN"
+if [ -z "$_TOKEN_PRESENT" ]; then
+    for _tok_var in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
+        _tok_rc=0
+        python3 "$REPO/src/channel_token.py" --has "$_tok_var" \
+            ${_RELAY_ENV:+--env-file "$_RELAY_ENV"} >/dev/null 2>&1 || _tok_rc=$?
+        if [ "$_tok_rc" -eq 0 ]; then
+            _TOKEN_PRESENT="vault"
+            break
+        fi
+    done
+fi
+
 # If there's still no token, the bridge would FATAL-exit and KeepAlive would
 # crash-loop. Exit 0 quietly instead — the install path only loads this job when
 # a token is configured, so reaching here means the token was removed after
 # install; don't hammer the system, just stop cleanly (launchd honors the clean
 # exit under our KeepAlive.SuccessfulExit=false policy).
-if [ -z "$REMOTE_TASK_TOKEN" ]; then
+if [ -z "$_TOKEN_PRESENT" ]; then
     echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — nothing to run; exiting cleanly." >&2
     exit 0
 fi
