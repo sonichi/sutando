@@ -30,9 +30,11 @@ the paths are usable but no live core is visible, and 2 for an unusable
 workspace.
 
 The command writes `run.json` and `report.md` under
-`benchmark-runs/<run-id>/` by default. The smoke suite is intentionally
-read-only, but the task subject still has normal Sutando permissions; inspect
-custom suites before running them.
+`benchmark-runs/<run-id>/` by default. A suite is owner-trust input: Sutando
+executes each prompt with the same capability as an owner message, and neither
+the declared access tier nor the task envelope constrains it. The smoke suite
+is intentionally read-only; inspect every custom or externally sourced suite
+before running it.
 
 Every run captures the runtime descriptor before the first task and after the
 last task. `run.json` records the full revision, short commit, source, branch,
