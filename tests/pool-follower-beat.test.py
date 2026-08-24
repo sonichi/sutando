@@ -298,17 +298,41 @@ class PoolWrapperNudgeTest(unittest.TestCase):
             self.assertEqual(sends, [],
                              "typing into a running codex turn interleaves")
 
-    def test_codex_sweep_types_the_codex_entry_when_free(self):
+    # The wrapper path drives codex every 300s. It must reach the SAME verdict
+    # as the kick path, which classifies each of these panes positively.
+    ESC = "\033"
+    IDLE = f"{ESC}[1m\u203a{ESC}[0m \n"          # true ANSI idle prompt
+    STAGED = f"{ESC}[1m\u203a{ESC}[0m ready\n"   # user text already staged
+    DIALOG = "Update available\nPress enter to continue\n"
+    GARBLED = "\u2588\u2588 \n"                 # unparseable capture
+
+    def _codex_sends(self, td, pane):
+        return self.run_wrapper(
+            td, pane, POOL_RUNTIME="codex",
+            POOL_RUNTIME_BIN=str(td / "stub-codex"))
+
+    def test_codex_sweep_types_the_codex_entry_only_when_truly_idle(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
-            sends = self.run_wrapper(
-                td, "› ready\n",
-                POOL_RUNTIME="codex", POOL_RUNTIME_BIN=str(td / "stub-codex"))
-            self.assertTrue(sends)
+            sends = self._codex_sends(td, self.IDLE)
+            self.assertTrue(sends, "an idle ANSI prompt must receive the entry")
             self.assertEqual(sends[0][:5],
                              ["send-keys", "-t", "core-4", "-l", "--"])
             self.assertIn("skills/proactive-loop-pool/CODEX.md", sends[0][5])
             self.assertEqual(sends[1], ["send-keys", "-t", "core-4", "C-m"])
+
+    def test_codex_sweep_never_types_into_a_pane_it_did_not_recognize(self):
+        """This test previously asserted the OPPOSITE for the staged case: it fed
+        '> ready' and expected a send, encoding the fail-open rather than catching
+        it. Each pane below is one the kick path already refuses."""
+        for label, pane in (("staged user text", self.STAGED),
+                            ("startup dialog", self.DIALOG),
+                            ("garbled capture", self.GARBLED),
+                            ("empty pane", "")):
+            with self.subTest(pane=label), tempfile.TemporaryDirectory() as t:
+                sends = self._codex_sends(Path(t), pane)
+                self.assertEqual(sends, [],
+                                 f"typed into {label}: {sends}")
 
 
 if __name__ == "__main__":

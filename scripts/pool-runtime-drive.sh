@@ -101,6 +101,33 @@ _pool_drive_capture() {
   "$tmux_fn" capture-pane -t "$sess" -p ${flags[@]+"${flags[@]}"} 2>/dev/null
 }
 
+# ONE classifier for both drive paths. The nudge used to check only the busy
+# marker, so every other pane state fell through to typing.
+# Prints exactly one of: busy|menu|unrecognized|staged_entry|staged_other|idle
+_pool_drive_classify() {
+  local rt="$1" pane="$2" last menu_re staged_re
+  if printf '%s\n' "$pane" | grep -qF "$(_pool_drive_knob "$rt" busy_marker)"; then
+    printf 'busy'; return 0
+  fi
+  menu_re=$(_pool_drive_knob "$rt" menu_re)
+  if [ -n "$menu_re" ] && printf '%s\n' "$pane" | grep -qE "$menu_re"; then
+    printf 'menu'; return 0
+  fi
+  # The LAST prompt-marker line is the live input box; earlier ones are history.
+  last=$(printf '%s\n' "$pane" | grep -E "$(_pool_drive_knob "$rt" prompt_re)" | tail -1)
+  if [ -z "$last" ]; then
+    printf 'unrecognized'; return 0
+  fi
+  staged_re=$(_pool_drive_knob "$rt" staged_submit_re)
+  if [ -n "$staged_re" ] && printf '%s\n' "$last" | grep -qE "$staged_re"; then
+    printf 'staged_entry'; return 0
+  fi
+  if ! printf '%s\n' "$last" | grep -qE "$(_pool_drive_knob "$rt" idle_re)"; then
+    printf 'staged_other'; return 0
+  fi
+  printf 'idle'
+}
+
 # Type the runtime's pool entry and submit it. Claude's input IS a durable
 # queue, so its nudge is unguarded; codex interleaves keystrokes into a running
 # turn, so its nudge stays unspent until the session is free.
@@ -121,35 +148,37 @@ pool_drive_send() {
 }
 
 pool_drive_nudge() {
-  local rt="$1" sess="$2" tmux_fn="$3" core_id="$4" text
+  local rt="$1" sess="$2" tmux_fn="$3" core_id="$4" text state
   pool_runtime_supported "$rt" || return 2
-  if [ "$rt" = "codex" ]; then
-    if "$tmux_fn" capture-pane -p -t "$sess" 2>/dev/null \
-        | tail -12 | grep -Fq "$(_pool_drive_knob "$rt" busy_marker)"; then
-      return 1
-    fi
-  fi
   text=$(pool_drive_nudge_text "$rt" "$core_id") || return 2
-  pool_drive_send "$rt" "$sess" "$tmux_fn" "$text"
+  # Claude's input IS a durable queue, so typing into it is always safe.
+  if [ "$rt" != "codex" ]; then
+    pool_drive_send "$rt" "$sess" "$tmux_fn" "$text"
+    return 0
+  fi
+  # Codex interleaves keystrokes into whatever holds focus, so it sends ONLY on
+  # a positive idle read; every other state — including one added later — defers.
+  state=$(_pool_drive_classify "$rt" "$(_pool_drive_capture "$rt" "$sess" "$tmux_fn" 8)")
+  case "$state" in
+    idle) pool_drive_send "$rt" "$sess" "$tmux_fn" "$text" ;;
+    staged_entry)
+      "$tmux_fn" send-keys -t "$sess" "$(_pool_drive_knob "$rt" submit_key)" ;;
+    *) return 1 ;;
+  esac
 }
 
 pool_drive_kick() {
   local rt="$1" sess="$2" tmux_fn="$3" core_id="$4"
-  local pane last menu_re menu_key staged_re
+  local pane state menu_key
   if ! pool_runtime_supported "$rt"; then
     echo "$sess: UNRESOLVED RUNTIME ('$rt') — skip (won't type another runtime's text)"
     return 2
   fi
   pane=$(_pool_drive_capture "$rt" "$sess" "$tmux_fn" 8)
+  state=$(_pool_drive_classify "$rt" "$pane")
 
-  if printf '%s\n' "$pane" | grep -qF "$(_pool_drive_knob "$rt" busy_marker)"; then
-    echo "$sess: BUSY (processing) — skip"
-    return 1
-  fi
-
-  menu_re=$(_pool_drive_knob "$rt" menu_re)
-  menu_key=$(_pool_drive_knob "$rt" menu_key)
-  if [ -n "$menu_re" ] && printf '%s\n' "$pane" | grep -qE "$menu_re"; then
+  if [ "$state" = "menu" ]; then
+    menu_key=$(_pool_drive_knob "$rt" menu_key)
     if [ -z "$menu_key" ]; then
       echo "$sess: in interactive menu, no safe dismiss key for $rt — skip"
       return 1
@@ -157,28 +186,22 @@ pool_drive_kick() {
     echo "$sess: in interactive menu → $menu_key"
     "$tmux_fn" send-keys -t "$sess" "$menu_key"
     sleep 1
-    pane=$(_pool_drive_capture "$rt" "$sess" "$tmux_fn" 8)
+    state=$(_pool_drive_classify "$rt" "$(_pool_drive_capture "$rt" "$sess" "$tmux_fn" 8)")
   fi
 
-  # The LAST prompt-marker line is the live input box; earlier ones are history.
-  last=$(printf '%s\n' "$pane" | grep -E "$(_pool_drive_knob "$rt" prompt_re)" | tail -1)
-  if [ -z "$last" ]; then
-    echo "$sess: no $rt prompt recognized in pane — skip (fail closed)"
-    return 1
-  fi
-
-  staged_re=$(_pool_drive_knob "$rt" staged_submit_re)
-  if [ -n "$staged_re" ] && printf '%s\n' "$last" | grep -qE "$staged_re"; then
-    echo "$sess: pool entry staged → $(_pool_drive_knob "$rt" submit_key)"
-    "$tmux_fn" send-keys -t "$sess" "$(_pool_drive_knob "$rt" submit_key)"
-    return 0
-  fi
-
-  if ! printf '%s\n' "$last" | grep -qE "$(_pool_drive_knob "$rt" idle_re)"; then
-    echo "$sess: HAS STAGED INPUT — skip (won't overwrite)"
-    return 1
-  fi
-
-  echo "$sess: idle REPL → type + send $rt pool entry"
-  pool_drive_send "$rt" "$sess" "$tmux_fn" "$(pool_drive_nudge_text "$rt" "$core_id")"
+  case "$state" in
+    busy) echo "$sess: BUSY (processing) — skip"; return 1 ;;
+    menu) echo "$sess: still in a menu after dismiss — skip"; return 1 ;;
+    unrecognized)
+      echo "$sess: no $rt prompt recognized in pane — skip (fail closed)"; return 1 ;;
+    staged_other) echo "$sess: HAS STAGED INPUT — skip (won't overwrite)"; return 1 ;;
+    staged_entry)
+      echo "$sess: pool entry staged → $(_pool_drive_knob "$rt" submit_key)"
+      "$tmux_fn" send-keys -t "$sess" "$(_pool_drive_knob "$rt" submit_key)"
+      return 0 ;;
+    idle)
+      echo "$sess: idle REPL → type + send $rt pool entry"
+      pool_drive_send "$rt" "$sess" "$tmux_fn" "$(pool_drive_nudge_text "$rt" "$core_id")" ;;
+    *) echo "$sess: unclassified pane state '$state' — skip (fail closed)"; return 1 ;;
+  esac
 }

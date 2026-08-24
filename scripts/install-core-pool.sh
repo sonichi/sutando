@@ -85,18 +85,28 @@ for arg in "$@"; do
       N="$arg" ;;
   esac
 done
-# A single-core refresh must not silently redeclare the pool size: infer it from
-# the plists already installed, so every core keeps agreeing on POOL_SIZE.
-if [ -n "$ONLY_CORE" ] && [ -z "$N" ]; then
-  _max="$ONLY_CORE"
+# A single-core refresh must not redeclare the pool size, so infer the installed
+# size and either adopt it or require an explicit N to agree with it.
+if [ -n "$ONLY_CORE" ]; then
+  # Installed size comes from the plists ALONE. Seeding it with $ONLY_CORE made
+  # the "installed" size depend on which core was being asked for.
+  _installed=0
   shopt -s nullglob
   for _p in "$HOME/Library/LaunchAgents"/com.sutando.core-[0-9]*.plist; do
     _s="$(basename "$_p" .plist)"; _s="${_s#com.sutando.core-}"; _s="${_s%-heartbeat}"
     case "$_s" in ''|*[!0-9]*) continue ;; esac
-    [ "$_s" -gt "$_max" ] && _max="$_s"
+    [ "$_s" -gt "$_installed" ] && _installed="$_s"
   done
   shopt -u nullglob
-  N="$_max"
+  if [ -z "$N" ]; then
+    N="$_installed"; [ "$ONLY_CORE" -gt "$N" ] && N="$ONLY_CORE"
+  elif [ "$_installed" -gt 0 ] && [ "$N" -ne "$_installed" ]; then
+    # Writing N into this core alone would leave it declaring a size its peers
+    # do not; a full install is how the size changes for everyone.
+    echo "error: --only-core preserves the installed pool size ($_installed), but N=$N" >&2
+    echo "       was given. Drop the N, or run a full install to resize the pool." >&2
+    exit 2
+  fi
 fi
 N="${N:-3}"
 case "$N" in

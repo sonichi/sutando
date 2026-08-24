@@ -539,6 +539,25 @@ class SingleCoreLifecycleTest(PoolInstallerHarness):
                                  f"--only-core restarted {label}")
             self.assertIn("com.sutando.core-2", touched)
 
+    def test_only_core_rejects_an_n_that_disagrees_with_the_installed_pool(self):
+        """An installed size-2 pool refreshed as `--only-core=2 3` would write
+        POOL_SIZE=3 into core 2 alone, leaving it disagreeing with its peers."""
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            repo, env, _home, _ws = self.install_pool(td, "2")
+            r = self.run_installer(repo, env, "3", "--only-core=2")
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertIn("preserves the installed pool size", r.stderr)
+
+    def test_only_core_accepts_an_n_that_agrees(self):
+        """Control: the rejection must be caused by DISAGREEMENT, not by the
+        presence of an N — the out-of-pool test below relies on an agreeing N."""
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            repo, env, _home, _ws = self.install_pool(td, "2")
+            r = self.run_installer(repo, env, "2", "--only-core=1", "--check-only")
+            self.assertNotIn("preserves the installed pool size", r.stderr)
+
     def test_only_core_outside_the_pool_is_an_error(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
