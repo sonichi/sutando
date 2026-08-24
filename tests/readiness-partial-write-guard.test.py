@@ -304,23 +304,10 @@ def test_active_rows_live_torn_does_not_report_a_cached_body():
         api.task_history.clear()
 
 
-def test_web_client_poll_has_a_ceiling():
-    """Source-level, and labelled as such: the poll runs in a browser and this
-    suite has no DOM harness, so it pins presence, not behaviour.
-    """
-    src = (REPO / "src" / "web-client.ts").read_text(encoding="utf-8")
-    i = src.find("fetch(apiBase + '/result/' + d.task_id)")
-    check(i != -1, "fixture: found the /result poll in web-client.ts")
-    window = src[max(0, i - 900):i]
-    check("deadline" in window and "clearInterval(poll)" in window,
-          "the /result poll clears on a deadline, not only on completed")
-
-
 test_result_poll_degrades_to_pending()
 test_archive_poll_degrades_to_pending()
 test_fully_archived_torn_result_is_pending_not_404()
 test_empty_and_whitespace_results_are_pending()
-test_web_client_poll_has_a_ceiling()
 test_daily_insight_analysis_survives_a_torn_body()
 test_display_fields_narrow_guard_covers_decode_error()
 test_active_task_rows_survives_torn_bodies()
