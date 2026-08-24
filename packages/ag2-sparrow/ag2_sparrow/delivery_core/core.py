@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..identity import legacy_idempotency_key
 from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
                        DrainResult, DrainStatus, ProviderIndeterminate,
                        ProviderRefused, RecoverReport)
@@ -35,8 +36,13 @@ class RetryPolicy:
 
 def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:
     """Stable per logical side effect; NEVER derived from claim material.
-    resend_epoch changes only on a DELIBERATE operator re-send."""
-    return f"{item_id}#{resend_epoch}"
+    resend_epoch changes only on a DELIBERATE operator re-send.
+
+    Derivation belongs to ag2_sparrow.identity, the single owner of identity
+    grammar; this stays the delivery core's public name for the same key. The
+    bytes are unchanged and must remain so — a provider has already seen them
+    for every item in flight."""
+    return legacy_idempotency_key(item_id, resend_epoch).value
 
 
 class DeliveryCore:

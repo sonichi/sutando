@@ -12,6 +12,7 @@ Namespace prefixes keep the kinds parseable and collision-free:
     <delivery>+r<n>                post-reconciliation re-send successor
     <delivery>#a<n>                attempt n of a delivery
     e:<task>@<boundary>            idempotency key (stable across re-sends)
+    <item_id>#<epoch>              the pre-B provider key, preserved verbatim
 """
 from __future__ import annotations
 
@@ -23,17 +24,33 @@ _RESERVED = "%@#+~:"
 
 
 def escape_component(raw: str) -> str:
-    if not raw:
-        raise ValueError("identity component must be non-empty")
+    """Injective: safe chars pass through; everything else (reserved,
+    whitespace, path separators, ALL non-ASCII) becomes fixed-width uppercase
+    %XX per UTF-8 byte. '%' itself is always escaped, so decoding is
+    unambiguous and two distinct inputs can never share an output."""
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("identity component must be a non-empty string")
     out = []
     for ch in raw:
-        if ch in _RESERVED:
-            out.append(f"%{ord(ch):02X}")
-        elif ch in "/\\" or ch.isspace() or not ch.isprintable():
-            out.append(f"%{ord(ch):02X}")
-        else:
+        if 0x21 <= ord(ch) <= 0x7E and ch not in _RESERVED and ch not in "/\\":
             out.append(ch)
+        else:
+            out.extend(f"%{b:02X}" for b in ch.encode("utf-8"))
     return "".join(out)
+
+
+def _require(value, want, name: str):
+    if not isinstance(value, want):
+        raise TypeError(f"{name} must be {want.__name__}, "
+                        f"got {type(value).__name__}")
+
+
+def _require_ordinal(ordinal, name: str) -> None:
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+        raise TypeError(f"{name} must be an int, "
+                        f"got {type(ordinal).__name__}")
+    if ordinal < 1:
+        raise ValueError(f"{name} is 1-based")
 
 
 def ingress_task_id(instance: str, provider_event_id: str) -> TaskId:
@@ -48,6 +65,7 @@ def ingress_task_id(instance: str, provider_event_id: str) -> TaskId:
 def delivery_id(task: TaskId, boundary: str) -> DeliveryId:
     """One object crossing one boundary. Deterministic from (task, boundary);
     a retry or crash recovery re-derives the same id (ratchet R2)."""
+    _require(task, TaskId, "task")
     return DeliveryId(f"d:{escape_component(task.value)}@"
                       f"{escape_component(boundary)}")
 
@@ -64,28 +82,50 @@ def legacy_delivery_id(content_key: str, boundary: str) -> DeliveryId:
 def resend_delivery_id(predecessor: DeliveryId, ordinal: int) -> DeliveryId:
     """Post-reconciliation re-send: a NEW delivery with lineage to its
     predecessor (R2's only minting row). Ordinal is 1-based per predecessor."""
-    if ordinal < 1:
-        raise ValueError("resend ordinal is 1-based")
+    _require(predecessor, DeliveryId, "predecessor")
+    _require_ordinal(ordinal, "resend ordinal")
     return DeliveryId(f"{predecessor.value}+r{ordinal}")
 
 
 def attempt_id(delivery: DeliveryId, ordinal: int) -> AttemptId:
     """One physical try. Ordered per delivery, 1-based, never reused."""
-    if ordinal < 1:
-        raise ValueError("attempt ordinal is 1-based")
+    _require(delivery, DeliveryId, "delivery")
+    _require_ordinal(ordinal, "attempt ordinal")
     return AttemptId(f"{delivery.value}#a{ordinal}")
 
 
 def idempotency_key(task: TaskId, boundary: str) -> IdempotencyKey:
     """One external side-effect. A re-send successor keeps the SAME key —
     derive from the task and boundary, never from the delivery lineage."""
+    _require(task, TaskId, "task")
     return IdempotencyKey(f"e:{escape_component(task.value)}@"
                           f"{escape_component(boundary)}")
+
+
+def legacy_idempotency_key(item_id: str, resend_epoch: int = 0
+                           ) -> IdempotencyKey:
+    """The provider key ALREADY SHIPPED by delivery_core — <item_id>#<epoch>,
+    reproduced byte-for-byte. Components are NOT escaped: these bytes are what
+    a provider has already seen, so re-deriving them is the whole point, and
+    the shape is opaque rather than injective. Deliveries begun before the
+    canonical key exists must keep this key, or the same side effect is
+    re-offered under a name the provider cannot recognise as a duplicate."""
+    if not isinstance(item_id, str) or not item_id:
+        raise ValueError("item_id must be a non-empty string")
+    if isinstance(resend_epoch, bool) or not isinstance(resend_epoch, int):
+        raise TypeError(f"resend_epoch must be an int, "
+                        f"got {type(resend_epoch).__name__}")
+    if resend_epoch < 0:
+        raise ValueError("resend_epoch is 0-based")
+    return IdempotencyKey(f"{item_id}#{resend_epoch}")
 
 
 def incarnation_id_from(worker: str, pid: int, start_usec: int) -> IncarnationId:
     """Attribution identity for one process lifetime. The caller supplies the
     process material; nothing derived here may feed the constructors above."""
-    if pid < 0 or start_usec < 0:
-        raise ValueError("pid and start_usec must be non-negative")
+    for name, val in (("pid", pid), ("start_usec", start_usec)):
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise TypeError(f"{name} must be an int, got {type(val).__name__}")
+        if val < 0:
+            raise ValueError(f"{name} must be non-negative")
     return IncarnationId(f"{escape_component(worker)}:{pid}:{start_usec}")

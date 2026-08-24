@@ -63,6 +63,25 @@ class AbsentAnchorMechanism(unittest.TestCase):
                 self.assertEqual(m.verify(), 1)   # the tree GAINED it = rotted
             finally:
                 m.REPO, m.ROWS = old_repo, old_rows
+    def test_no_present_anchor_is_a_bare_identifier(self):
+        # a bare \w+ pattern is satisfied by a COMMENT mentioning the name
+        # (rui's #3308 limit 1) — present anchors must bind syntax
+        import importlib.util
+        import re as _re
+        spec = importlib.util.spec_from_file_location("census_d1r", SCRIPT)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        bare = _re.compile(r"^[\w./-]+$")
+        offenders = []
+        for name, cells in m.ROWS:
+            for chain, (claim, anchors) in cells.items():
+                for a in anchors:
+                    if len(a) > 2 and a[2] == "absent":
+                        continue  # absence probes stay broad by design
+                    if a[1] and bare.match(a[1]):
+                        offenders.append(f"{name}/{chain}: {a[1]}")
+        self.assertEqual(offenders, [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

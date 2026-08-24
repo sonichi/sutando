@@ -30,7 +30,10 @@ Source = "https://github.com/sonichi/sutando"
 ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
 
 [tool.setuptools]
-packages = ["ag2_sparrow"]
+packages = ["ag2_sparrow", "ag2_sparrow.delivery_core", "ag2_sparrow.identity"]
+
+[tool.setuptools.package-data]
+"ag2_sparrow.identity" = ["vectors.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }
