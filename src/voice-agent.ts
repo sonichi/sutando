@@ -157,7 +157,10 @@ const HOST = process.env.HOST || '127.0.0.1';
 // the file pipeline); the dual-use rationale is obsolete.
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
-const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
+// Canonical since #2722; the root `.voice-agent.pid` is the pre-move legacy
+// location, read by the shell side only via `sutando-config.sh voice-pidfile`.
+const PIDFILE = join(WORKSPACE_DIR, 'state', 'locks', 'voice-agent.pid');
+const LEGACY_PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
 
 /** Bounded primitive-only crash record — shared by BOTH fatal paths (the
  * uncaught handler and `main().catch`), which obey identical crash-only
@@ -241,8 +244,10 @@ function acquirePidLock(): void {
 		console.error(`${ts()} [Startup] Lock operations fail closed. Fix: install python3 (brew install python), set SUTANDO_PY to a working interpreter, or run xcode-select --install. Exiting.`);
 		process.exit(1);
 	}
+	try { mkdirSync(join(WORKSPACE_DIR, 'state', 'locks'), { recursive: true }); } catch { /* acquire fails closed below */ }
 	const res = acquireVoiceLock({
 		pidfile: PIDFILE,
+		legacyPidfile: LEGACY_PIDFILE,
 		guard,
 		pid: myPid,
 		entry,
