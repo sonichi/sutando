@@ -8,12 +8,20 @@ _gather_pending_task_ids, out of main()'s tick loop, and out of a bare
 the crash that produced the tear, so it is the likeliest caller to meet one.
 """
 import importlib.util
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+
+# Isolate the channel root BEFORE exec_module: the bridge resolves ACCESS_FILE
+# at module level, so unset it reads the operator's real per-user allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-tg-torn-")
+_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": ["4242"]}')
 
 _spec = importlib.util.spec_from_file_location("tg", REPO / "src" / "telegram-bridge.py")
 tg = importlib.util.module_from_spec(_spec)
