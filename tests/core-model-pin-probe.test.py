@@ -666,31 +666,52 @@ class SettingsJsonIsAThirdWayTheModelIsChosen(unittest.TestCase):
             [], "/s", [("sutando-core", None)], [("~/.claude", "opus[1m]")])
         self.assertEqual(r["status"], "warn", r)
 
-    def test_reader_ignores_missing_malformed_and_modelless_settings(self):
+    def test_reader_body_over_the_REAL_function(self):
+        """Drives _settings_model_pins itself. The previous version of this test
+        re-implemented the read inline, so it asserted on a copy (REVIEW.md L14)
+        and left the shipped body at 71.4% in CI, where neither candidate exists."""
         import json as _json
         with tempfile.TemporaryDirectory() as d:
-            good = Path(d) / "good.json"
-            good.write_text(_json.dumps({"model": "sonnet"}))
-            bad = Path(d) / "bad.json"
-            bad.write_text("{not json")
-            empty = Path(d) / "empty.json"
-            empty.write_text(_json.dumps({"model": "   "}))
-            none = Path(d) / "none.json"
-            none.write_text(_json.dumps({"other": 1}))
-            missing = Path(d) / "missing.json"
+            dd = Path(d)
+            (dd / "good.json").write_text(_json.dumps({"model": "sonnet"}))
+            (dd / "pad.json").write_text(_json.dumps({"model": "  opus[1m]  "}))
+            (dd / "bad.json").write_text("{not json")
+            (dd / "blank.json").write_text(_json.dumps({"model": "   "}))
+            (dd / "none.json").write_text(_json.dumps({"other": 1}))
+            (dd / "nonstr.json").write_text(_json.dumps({"model": 7}))
+            (dd / "adir.json").mkdir()
 
-            def read(p):
-                try:
-                    if not p.is_file():
-                        return None
-                    m = _json.loads(p.read_text()).get("model")
-                except (OSError, ValueError, TypeError):
-                    return None
-                return m.strip() if isinstance(m, str) and m.strip() else None
+            got = self.hc._settings_model_pins([
+                ("good", dd / "good.json"),
+                ("pad", dd / "pad.json"),
+                ("bad", dd / "bad.json"),
+                ("blank", dd / "blank.json"),
+                ("none", dd / "none.json"),
+                ("nonstr", dd / "nonstr.json"),
+                ("adir", dd / "adir.json"),
+                ("missing", dd / "missing.json"),
+            ])
+            self.assertEqual(got, [("good", "sonnet"), ("pad", "opus[1m]")], got)
 
-            self.assertEqual(read(good), "sonnet")
-            for p in (bad, empty, none, missing):
-                self.assertIsNone(read(p), p.name)
+    def test_reader_dedups_two_labels_on_ONE_resolved_file(self):
+        """CLAUDE_CONFIG_DIR unset makes both candidates the same path; without
+        the resolve()-keyed seen set the same pin would be reported twice."""
+        import json as _json
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "settings.json"
+            real.write_text(_json.dumps({"model": "sonnet"}))
+            link = Path(d) / "alias.json"
+            link.symlink_to(real)
+            got = self.hc._settings_model_pins(
+                [("user", real), ("project", link)])
+            self.assertEqual(got, [("user", "sonnet")], got)
+
+    def test_default_candidates_are_the_runtime_ones(self):
+        """The injectable default must still be what the probe reads live."""
+        labels = [lbl for lbl, _ in self.hc._settings_candidates()]
+        self.assertEqual(labels, ["user", "project"])
+        self.assertEqual(self.hc._settings_model_pins(),
+                         self.hc._settings_model_pins(self.hc._settings_candidates()))
 
     def test_live_reader_returns_pairs_and_dedups_by_resolved_path(self):
         """Shape contract on the real reader: labelled pairs, no duplicate file."""

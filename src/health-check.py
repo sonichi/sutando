@@ -8697,7 +8697,19 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
     return out
 
 
-def _settings_model_pins() -> list:
+def _settings_candidates() -> "tuple":
+    """The settings files the runtime actually consults, ((label, Path), ...).
+
+    claude_home_path() resolves CLAUDE_CONFIG_DIR with its own fallback; reading
+    that fallback separately would report a file the runtime does not consult.
+    """
+    return (
+        ("user", Path(claude_home_path("settings.json"))),
+        ("project", REPO_DIR / ".claude" / "settings.json"),
+    )
+
+
+def _settings_model_pins(candidates=None) -> list:
     """[(label, model)] for every settings.json that sets `model`.
 
     Read at the edge so the interpreter stays pure. A settings pin is a THIRD
@@ -8705,12 +8717,8 @@ def _settings_model_pins() -> list:
     """
     out = []
     seen = set()
-    # claude_home_path() resolves CLAUDE_CONFIG_DIR with its own fallback; reading
-    # that fallback separately would report a file the runtime does not consult.
-    for label, path in (
-        ("user", Path(claude_home_path("settings.json"))),
-        ("project", REPO_DIR / ".claude" / "settings.json"),
-    ):
+    for label, path in (_settings_candidates() if candidates is None
+                        else candidates):
         try:
             resolved = path.resolve()
             if resolved in seen or not path.is_file():
