@@ -124,8 +124,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'find-pids.test.py failed' }
           python tests/single-instance.test.py
           if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
+          python tests/file-lock.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'file-lock.test.py failed' }
           python tests/voice-lock-windows.test.py
           if ($LASTEXITCODE -ne 0) { throw 'voice-lock-windows.test.py failed' }
+          python -c "import sys; sys.path.insert(0, 'src'); import task_workstreams"
+          if ($LASTEXITCODE -ne 0) { throw 'task_workstreams Windows import failed' }
 
       - name: Run voice-agent crash-only integration
         shell: pwsh
@@ -139,3 +143,5 @@ jobs:
           src/screen-capture-server.py
           src/sutando_platform.py
           src/health-check.py
+          src/file_lock.py
+          src/task_workstreams.py

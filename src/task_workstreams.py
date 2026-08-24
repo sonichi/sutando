@@ -9,7 +9,6 @@ prepares inert snapshots, validates the model's proposal, and applies it atomica
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import logging
@@ -25,6 +24,7 @@ from typing import Optional
 
 import local_task_protocol
 from result_markers import parse_markers
+from file_lock import locked_file
 from workspace_default import status_read_path
 
 
@@ -90,13 +90,8 @@ def _classifier_state_path(workspace: Path) -> Path:
 def _workstream_store_lock(workspace: Path):
     """Serialize sidecar/state read-modify-write operations across processes."""
     lock_path = Path(workspace) / "data" / "task-workstreams.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with locked_file(lock_path):
+        yield
 
 
 def _empty_store() -> dict:

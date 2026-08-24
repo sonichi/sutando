@@ -25,21 +25,11 @@ import os
 import sys
 from pathlib import Path
 
-try:
-    import fcntl  # POSIX advisory file locking
-except ModuleNotFoundError:  # Windows
-    fcntl = None
-    import msvcrt
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from file_lock import lock_fd  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 _held_fds: list[int] = []  # keep refs so GC doesn't close them
-
-# Windows msvcrt.locking locks a byte *range* at the current file position.
-# We lock a sentinel byte well past the PID text so the lock region never
-# overlaps the human-readable PID we write at offset 0.
-_WIN_LOCK_OFFSET = 1 << 20
 
 
 def acquire(name: str) -> None:
@@ -53,17 +43,10 @@ def acquire(name: str) -> None:
     lock_path = lock_dir / f"{name}.lock"
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
 
-    if fcntl is not None:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            _exit_contended(fd, name)
-    else:
-        try:
-            os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        except OSError:
-            _exit_contended(fd, name)
+    try:
+        lock_fd(fd, blocking=False)
+    except (BlockingIOError, OSError):
+        _exit_contended(fd, name)
 
     # Overwrite PID so tooling can inspect who holds the lock (offset 0,
     # outside the Windows lock region).

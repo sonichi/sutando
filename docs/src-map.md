@@ -67,6 +67,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
+- **`file_lock.py`** — Cross-platform advisory file-lock primitives for shared runtime state.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
