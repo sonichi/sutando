@@ -68,7 +68,10 @@ def test_wrapper_restart_signal() -> None:
         )
         helper.chmod(0o755)
         fake_python = root / "python"
-        fake_python.write_text("#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\n")
+        # Exit 1: this file covers CRASH recovery, and the wrapper treats a
+        # clean exit as a deliberate stand-down rather than something to respawn.
+        fake_python.write_text(
+            "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\nexit 1\n")
         fake_python.chmod(0o755)
         exec_log = root / "exec.log"
         env = os.environ.copy()
