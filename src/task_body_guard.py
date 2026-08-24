@@ -89,3 +89,15 @@ def confine_user_content(text: str) -> str:
         else:
             out.append(line)
     return "\n".join(out)
+
+
+def confine_header_value(text: str) -> str:
+    """Return `text` safe to interpolate into a single `field: value` line.
+
+    Defanging is not enough for a header value: a separator inside it makes the
+    remainder a standalone line, which a forged `access_tier: owner` turns into
+    a real field. Folding to spaces keeps the value on its own line.
+    """
+    if not text:
+        return text
+    return _LINE_SEP_RE.sub(" ", text.replace("\n", " ")).strip()

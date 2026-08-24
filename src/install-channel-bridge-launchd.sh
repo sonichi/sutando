@@ -11,8 +11,8 @@ set -e
 CHANNEL="${1:-}"
 ACTION="${2:-install}"
 case "$CHANNEL" in
-  slack|discord|telegram) ;;
-  *) echo "Usage: $0 {slack|discord|telegram} [install|--uninstall|--status]" >&2; exit 2 ;;
+  slack|discord|telegram|teams) ;;
+  *) echo "Usage: $0 {slack|discord|telegram|teams} [install|--uninstall|--status]" >&2; exit 2 ;;
 esac
 
 LABEL="com.sutando.$CHANNEL-bridge"
@@ -100,5 +100,5 @@ PY
       echo "(not loaded)"
     fi
     ;;
-  *) echo "Usage: $0 {slack|discord|telegram} [install|--uninstall|--status]" >&2; exit 2 ;;
+  *) echo "Usage: $0 {slack|discord|telegram|teams} [install|--uninstall|--status]" >&2; exit 2 ;;
 esac
