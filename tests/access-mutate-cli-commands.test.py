@@ -35,6 +35,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -42,6 +43,36 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import access_store  # noqa: E402
+
+# discord-bridge.py resolves host config at import time, so isolating
+# CLAUDE_CONFIG_DIR inside setUp() would already be too late.
+_BRIDGE_CCD = tempfile.mkdtemp(prefix="access-mutate-cmds-bridge-ccd-")
+_BRIDGE_SRC = tempfile.mkdtemp(prefix="access-mutate-cmds-bridge-vanilla-")
+os.environ["CLAUDE_CONFIG_DIR"] = _BRIDGE_CCD
+os.environ["SOURCE_CLAUDE_CONFIG_DIR"] = _BRIDGE_SRC
+os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
+_bridge_ch = Path(_BRIDGE_CCD) / "channels" / "discord"
+_bridge_ch.mkdir(parents=True, exist_ok=True)
+(_bridge_ch / "access.json").write_text(json.dumps({"allowFrom": ["4242"]}))
+
+try:  # pragma: no cover - present in dev, absent in clean CI
+    import discord  # noqa: F401
+except Exception:
+    _stub = types.ModuleType("discord")
+    _stub.Intents = type("Intents", (), {"default": staticmethod(
+        lambda: type("I", (), {"message_content": False})())})
+    _stub.Client = type("Client", (), {"__init__": lambda self, **kw: None,
+                                       "event": staticmethod(lambda fn: fn)})
+    _stub.File = type("File", (), {"__init__": lambda self, *a, **kw: None})
+    _stub.Message = type("Message", (), {})
+    _stub.DMChannel = type("DMChannel", (), {})
+    sys.modules["discord"] = _stub
+
+_bspec = importlib.util.spec_from_file_location(
+    "dbridge_access_mutate_cmds", REPO / "src" / "discord-bridge.py")
+db_bridge = importlib.util.module_from_spec(_bspec)
+sys.modules["dbridge_access_mutate_cmds"] = db_bridge
+_bspec.loader.exec_module(db_bridge)
 
 _spec = importlib.util.spec_from_file_location(
     "access_mutate_cmds", REPO / "scripts" / "access-mutate.py"
@@ -181,7 +212,7 @@ class TestPairPathOwnership(_Isolated):
     def test_committed_marker_dir_is_one_the_bridge_polls(self):
         """Consumer half: _approved_dirs() is derived from the bridge's own
         ACCESS_FILE, so a marker beside a DIFFERENT access.json is never seen."""
-        db = _load_bridge()
+        db = db_bridge
         legacy = self.d / "legacy" / "channels" / "discord" / "access.json"
         canonical = self.d / "canonical" / "channels" / "discord" / "access.json"
         old_af = db.ACCESS_FILE
@@ -340,36 +371,6 @@ class TestArityForNewlyRoutedCommands(_Isolated):
         self.assertIn("usage:", err)
 
 
-def _load_bridge():
-    """Import discord-bridge.py with its optional deps stubbed. Cached: the
-    module is expensive and its globals are rebound per test, not per import."""
-    global _BRIDGE
-    if _BRIDGE is not None:
-        return _BRIDGE
-    import types
-    try:
-        import discord  # noqa: F401
-    except Exception:
-        stub = types.ModuleType("discord")
-        stub.Intents = type("Intents", (), {"default": staticmethod(
-            lambda: type("I", (), {"message_content": False})())})
-        stub.Client = type("Client", (), {"__init__": lambda self, **kw: None,
-                                          "event": staticmethod(lambda fn: fn)})
-        stub.File = type("File", (), {"__init__": lambda self, *a, **kw: None})
-        stub.Message = type("Message", (), {})
-        stub.DMChannel = type("DMChannel", (), {})
-        sys.modules["discord"] = stub
-    os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
-    spec = importlib.util.spec_from_file_location(
-        "dbridge_access_mutate_cmds", REPO / "src" / "discord-bridge.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["dbridge_access_mutate_cmds"] = mod
-    spec.loader.exec_module(mod)
-    _BRIDGE = mod
-    return mod
-
-
-_BRIDGE = None
 
 if __name__ == "__main__":
     _r = unittest.main(exit=False)
