@@ -123,6 +123,11 @@ def test_get_schedules_formats_all_branches():
         # mechanical launchd job → shell kind and command-derived desc
         {"name": "poll", "cron": f"{soon.minute} {soon.hour} * * *",
          "shell_command": "bash scripts/poll.sh"},
+        # MIXED form: the runner executes shell_command and ignores prompt_skill,
+        # so every rendered field must describe the shell — not the skill that
+        # never runs. crons.json is read unvalidated, so this record can exist.
+        {"name": "mixed", "cron": f"{soon.minute} {soon.hour} * * *",
+         "shell_command": "echo hi", "prompt_skill": "fallback"},
         # valid expr but no match in horizon → ">7d"
         {"name": "leap", "cron": "0 0 30 2 *"},
         # no cron → "invalid"; no name → "?"
@@ -139,6 +144,13 @@ def test_get_schedules_formats_all_branches():
     assert by_name["poll"]["kind"] == "shell", f'shell job rendered as {by_name["poll"]["kind"]!r}'
     assert by_name["poll"]["desc"] == "Runs shell command: bash scripts/poll.sh", \
         f'shell desc was {by_name["poll"]["desc"]!r}'
+
+    # A mixed record must not advertise the skill launchd will never run.
+    mixed = by_name["mixed"]
+    assert mixed["kind"] == "shell", f'mixed rendered as {mixed["kind"]!r}'
+    assert mixed["desc"] == "Runs shell command: echo hi", \
+        f'mixed desc named the un-run skill: {mixed["desc"]!r}'
+    assert "fallback" not in mixed["desc"], f'skill leaked into desc: {mixed["desc"]!r}'
 
     # next-string buckets
     assert by_name["loop"]["next"].endswith("(in 0m)") or "in " in by_name["loop"]["next"]

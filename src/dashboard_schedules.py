@@ -167,22 +167,29 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
             next_str = f'{nxt.strftime("%a %H:%M")} ({rel})'
         else:
             next_str = ">7d" if expr else "invalid"
+        # Select the execution form ONCE, shell > skill > prompt, matching the
+        # runner (src/cron-runner.py). Deriving kind and description separately
+        # let a mixed record render as its skill while launchd ran its shell.
         _cmd = (job.get("shell_command") or "").strip()
-        _shell = bool(_cmd)
+        _prompt = (job.get("prompt") or "").strip()
+        if _cmd:
+            kind, target = "shell", _cmd
+        elif skill:
+            kind, target = "skill", skill
+        else:
+            kind, target = "prompt", _prompt
         if job.get("description"):
             desc = job["description"]
-        elif skill:
-            desc = f"Runs the /{skill} skill"
-        elif _shell:
-            # A shell job has no `prompt`, so the prompt branch left it blank —
-            # the dashboard then showed a mechanical job with no description.
-            desc = f"Runs shell command: {_cmd}"
+        elif kind == "shell":
+            desc = f"Runs shell command: {target}"
+        elif kind == "skill":
+            desc = f"Runs the /{target} skill"
         else:
-            _p = _RUN_PREFIX_RE.sub("", (job.get("prompt") or "").strip())
+            _p = _RUN_PREFIX_RE.sub("", target)
             desc = (_p[:100] + "…") if len(_p) > 100 else _p
         out.append({"name": job.get("name", "?"), "cron": expr,
-                    "kind": "shell" if _shell else ("skill" if skill else "prompt"),
-                    "prompt_or_skill": skill or (job.get("prompt") or ""),
+                    "kind": kind,
+                    "prompt_or_skill": target if kind != "prompt" else _prompt,
                     "owner": schedule_owner(job),
                     "description": desc,
                     "next_run": next_str,
