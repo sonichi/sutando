@@ -40,7 +40,9 @@ from outbox import (
 from outbox_adapter import DeliveryAdapter, DeliveryReceipt
 from policy.egress.attachment import is_path_sendable
 from result_markers import has_skip_action, parse_markers
-from task_body_guard import confine_header_value, confine_user_content
+from task_body_guard import confine_header_value
+from task_body_guard import confine_user_content
+from util_paths import claude_home_path
 from task_priority import default_priority_for_source
 from workspace_default import resolve_workspace
 
@@ -65,9 +67,7 @@ MAX_ATTEMPTS = int(os.environ.get("SUTANDO_TEAMS_MAX_ATTEMPTS", "5"))
 
 def channel_dir() -> Path:
     """Per-channel config root, mirroring the other bridges' layout."""
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
-    root = Path(base) if base else Path.home() / ".claude"
-    return root / "channels" / "teams"
+    return claude_home_path("channels", "teams")
 
 
 # -- inbound: activity -> task file -------------------------------------------

@@ -45,6 +45,7 @@ for _f in (
     "src/discord-bridge.py",
     "src/telegram-bridge.py",
     "src/slack-bridge.py",
+    "src/teams-bridge.py",
     "src/github-webhook.py",
     "src/agent-api.py",
 ):
@@ -356,6 +357,7 @@ _GUARDED_PY_WRITERS = {
     "src/discord-bridge.py",
     "src/telegram-bridge.py",
     "src/slack-bridge.py",
+    "src/teams-bridge.py",
     "src/github-webhook.py",
     "src/agent-api.py",
     "src/cron-runner.py",
