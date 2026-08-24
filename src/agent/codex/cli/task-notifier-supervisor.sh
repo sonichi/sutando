@@ -8,7 +8,10 @@ SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 RESTART_DELAY="${SUTANDO_NOTIFIER_RESTART_DELAY:-1}"
 RESTART_DELAY_MAX="${SUTANDO_NOTIFIER_RESTART_DELAY_MAX:-30}"
 STABLE_AFTER="${SUTANDO_NOTIFIER_STABLE_AFTER:-60}"
-LOCK_DIR="${SUTANDO_NOTIFIER_LOCK_DIR:-${TMPDIR:-/tmp}/sutando-notifier-${SESSION}.lock}"
+# start-cli.sh launches one notifier per (socket, session); keying on SESSION
+# alone makes two cores on different sockets suppress each other.
+_lease_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+LOCK_DIR="${SUTANDO_NOTIFIER_LOCK_DIR:-${TMPDIR:-/tmp}/sutando-notifier-$(_lease_key "${TMUX_SOCKET}#${SESSION}").lock}"
 NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}"
 # task-notifier.sh exits 2 only for a usage/configuration fault; respawning
 # re-runs the same broken invocation, so that one is terminal rather than retried.
@@ -26,28 +29,84 @@ stop_child() {
   child_pid=""
 }
 
+# Our token: pid plus this process's start identity, so a recycled pid cannot
+# impersonate us. Read once — /proc is absent on macOS, so ps is the portable source.
+_own_token() {
+  printf '%s:%s' "$$" "$(ps -o lstart= -p "$$" 2>/dev/null | tr -s ' ' '_' || echo unknown)"
+}
+OWNER_TOKEN="$(_own_token)"
+
+_lease_token() { cat "$LOCK_DIR/token" 2>/dev/null || true; }
+
+# Non-recursive by construction: remove the files we know we wrote, then rmdir,
+# which FAILS if anything else is inside. `rm -rf` on a configurable path can
+# delete a pre-existing directory and its contents.
+_lease_rm() {
+  rm -f "$LOCK_DIR/token" "$LOCK_DIR/pid" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
 release_lease() {
   [ -n "$lease_held" ] || return 0
-  rm -rf "$LOCK_DIR" 2>/dev/null || true
+  # Verify the path still holds OUR lease. Without this a former owner whose
+  # lease was already reclaimed deletes its successor's.
+  if [ "$(_lease_token)" = "$OWNER_TOKEN" ]; then
+    _lease_rm
+  fi
   lease_held=""
+}
+
+PUBLISH_GRACE="${SUTANDO_NOTIFIER_PUBLISH_GRACE:-10}"
+
+_pid_token() { printf '%s:%s' "$1" "$(ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' '_' || echo unknown)"; }
+
+_lease_age() {
+  local now mt
+  now="$(date +%s)"
+  mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo "$now")"
+  echo $(( now - mt ))
 }
 
 # mkdir is the portable atomic test-and-set; macOS ships no flock(1).
 acquire_lease() {
-  local attempt owner
+  local attempt owner token age
   for attempt in 1 2 3; do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
+      # Publish via rename so a contender sees the token whole or not at all.
       printf '%s\n' "$$" > "$LOCK_DIR/pid"
+      printf '%s' "$OWNER_TOKEN" > "$LOCK_DIR/.token.$$" \
+        && mv -f "$LOCK_DIR/.token.$$" "$LOCK_DIR/token"
       lease_held=1
       return 0
     fi
-    owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+    token="$(_lease_token)"
+    owner="${token%%:*}"
+    if [ -z "$token" ]; then
+      # No token. A `pid` file is still usable identity (a pre-token lease), so
+      # fall through to the liveness check rather than widening the grace window.
+      owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    fi
+    if [ -z "$owner" ]; then
+      # Neither token nor pid: the ONLY genuinely ambiguous state — a winner
+      # between mkdir and publication, or a crash inside it. Bounded, and it
+      # defers, because deleting here races a live owner into a double-run.
+      age="$(_lease_age)"
+      if [ "$age" -lt "$PUBLISH_GRACE" ]; then
+        echo "task-notifier-supervisor: lease $LOCK_DIR is publishing (${age}s); exiting" >&2
+        exit 0
+      fi
+      _lease_rm
+      continue
+    fi
+    # A token pins the START identity too, so a recycled pid cannot impersonate
+    # the owner. A pre-token lease has only the pid to go on.
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null \
+       && { [ -z "$token" ] || [ "$(_pid_token "$owner")" = "$token" ]; }; then
       echo "task-notifier-supervisor: pid $owner already supervises '$SESSION'; exiting" >&2
       exit 0
     fi
-    # Owner is gone: the lease is stale, not contended. Clear it and retry.
-    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    # Owner is gone (or its pid was recycled by an unrelated process): stale.
+    _lease_rm
   done
   echo "task-notifier-supervisor: could not acquire lease $LOCK_DIR" >&2
   exit 1
