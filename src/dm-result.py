@@ -168,8 +168,7 @@ def _open_dm_channel(owner_id: str, token: str) -> str:
 def send_dm(text: str) -> bool:
     """Send text to the resolved owner's Discord DM."""
     # This sender only ever opens the owner's DM, so a [channel:] redirect names a
-    # destination it cannot reach. Refuse before sending; delivering the body to the
-    # DM anyway would misroute it silently.
+    # destination it cannot reach; refusing beats misrouting the body silently.
     redirects = [a.value for a in parse_markers(text).actions if a.kind == "redirect"]
     if redirects:
         print(
