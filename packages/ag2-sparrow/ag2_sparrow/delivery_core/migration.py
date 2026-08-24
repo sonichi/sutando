@@ -297,7 +297,7 @@ def import_a_state(root: Path) -> dict:
         else:
             k = _safe_key(f.stem)
             has_terminal = False    # quarantined records never map to terminals
-        from .backend_c import TOKEN_PARTS
+        from .backend_c import is_producer_token
 
         def _valid_marker(e):
             parts = e.name.split(SEP)
@@ -306,7 +306,7 @@ def import_a_state(root: Path) -> dict:
         # prefix-matching junk name must fail verification, not satisfy it.
         raw_tokens = c._tokens(k)
         valid_tokens = [t for t in raw_tokens
-                        if len(t.name.split(SEP)) == TOKEN_PARTS]
+                        if is_producer_token(t.name)]
         present = ((c._d("ready") / k).exists()
                    or has_terminal
                    or any(_valid_marker(e)

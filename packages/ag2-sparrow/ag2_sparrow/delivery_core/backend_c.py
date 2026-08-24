@@ -38,6 +38,16 @@ TERMINAL_TAG = "terminal"
 SEP = "~"
 TOKEN_PARTS = 5
 
+
+def is_producer_token(name: str) -> bool:
+    """A name C's claim writer could have produced, arity AND pid.
+
+    recover() and _live_and_dead() both ignore a non-numeric pid forever, so a
+    caller that checks only arity calls a permanently-unrecoverable name valid.
+    """
+    parts = name.split(SEP)
+    return len(parts) == TOKEN_PARTS and parts[2].isdigit()
+
 _ACTIVATED: set[str] = set()
 _ACTIVATE_GUARD = threading.Lock()
 
@@ -197,7 +207,7 @@ class DesignCClaimBackend:
         live, dead = [], []
         for f in self._tokens(key):
             parts = f.name.split(SEP)
-            if len(parts) != TOKEN_PARTS:
+            if not is_producer_token(f.name):
                 continue
             try:
                 ident = outbox.process_identity(int(parts[2]))
@@ -512,7 +522,7 @@ class DesignCClaimBackend:
                 rep.retired.append(key)
         for f in sorted(self._d(INFLIGHT).iterdir()):
             parts = f.name.split(SEP)
-            if len(parts) != TOKEN_PARTS or not parts[2].isdigit():
+            if not is_producer_token(f.name):
                 continue
             key = parts[0]
             # M-D window: retire ONLY a claim whose OWN incarnation is
