@@ -62,7 +62,7 @@ def resolve(mapping):
 P = {"content": "x"}
 
 # --- the feature: two channels, two FILES -------------------------------
-v = resolve({"111": str(D / "refuse.py"), "222": str(D / "allow.py")})
+v = resolve({"111": str(D / "refuse.py"), "222": str(D / "allow.py"), "*": str(D / "allow.py")})
 check("mapped channel 111 refuses via its own file", v("111", P) == "refused-by-A", repr(v("111", P)))
 check("mapped channel 222 allows via its own file", not v("222", P), repr(v("222", P)))
 check("int channel id resolves like its str form", v(111, P) == "refused-by-A", repr(v(111, P)))
@@ -72,13 +72,31 @@ v = resolve({"111": str(D / "allow.py"), "*": str(D / "star.py")})
 check("unlisted channel falls back to `*`", v("999", P) == "refused-by-STAR", repr(v("999", P)))
 check("listed channel is NOT overridden by `*`", not v("111", P), repr(v("111", P)))
 
-# --- the deliberate widening, pinned ------------------------------------
-v = resolve({"111": str(D / "refuse.py")})
-check("no id match and no `*` is UNGATED (documented)", v("999", P) is None, repr(v("999", P)))
-check("...while the mapped channel still refuses", v("111", P) == "refused-by-A")
+# --- P1: an OMITTED `*` must never create an ungated send. client.py's
+# contract: config selects WHICH ruleset applies, never WHETHER one does.
+for partial in ({"111": str(D / "refuse.py")},
+                {"111": str(D / "refuse.py"), "*": None},
+                {"111": str(D / "refuse.py"), "*": "   "}):
+    v = resolve(partial)
+    r = v("999", P)
+    check(f"omitted/unusable `*` refuses UNLISTED channel ({partial.get('*')!r})",
+          isinstance(r, str) and "unvalidated" in r, repr(r))
+    r2 = v("111", P)
+    check(f"...and refuses the LISTED one too, whole map is closed ({partial.get('*')!r})",
+          isinstance(r2, str), repr(r2))
+
+# a listed key whose validator is falsy must NOT fall through to `*`
+class _Falsy:
+    def __bool__(self): return False
+    def __call__(self, c, p): return "refused-by-FALSY-CALLABLE"
+v = _dispatch_direct = None
+import channels.discord.post_gate as _dpg
+v = _dpg._dispatching({"111": _Falsy(), "*": lambda c, p: None})
+check("listed key with a FALSY validator does not fall through to `*`",
+      v("111", P) == "refused-by-FALSY-CALLABLE", repr(v("111", P)))
 
 # --- a broken entry fails closed for ITS channel only --------------------
-v = resolve({"111": str(D / "broken.py"), "222": str(D / "allow.py")})
+v = resolve({"111": str(D / "broken.py"), "222": str(D / "allow.py"), "*": str(D / "allow.py")})
 r = v("111", P)
 check("broken policy refuses its own channel", isinstance(r, str) and "failed to load" in r, repr(r))
 check("broken policy does NOT refuse a sibling channel", not v("222", P), repr(v("222", P)))
@@ -99,9 +117,10 @@ for empty_val in (None, "", "   "):
 
 v = resolve({"111": str(D / "allow.py"), "*": None})
 r = v("999", P)
-check("an empty `*` refuses unmatched channels rather than ungating them",
-      isinstance(r, str) and "no policy path" in r, repr(r))
-check("...while the explicitly listed channel is unaffected", not v("111", P))
+check("an empty `*` closes the WHOLE map (no ungated send anywhere)",
+      isinstance(r, str) and "unvalidated" in r, repr(r))
+check("...including the listed channel -- fail-closed is not per-key here",
+      isinstance(v("111", P), str), repr(v("111", P)))
 
 # --- a mapping naming nothing is configured-but-empty, not unconfigured --
 for empty in ({}, {"111": ""}, {"111": None}):

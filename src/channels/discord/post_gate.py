@@ -16,11 +16,12 @@ resolves the validator from launch wiring the personal layer controls:
 
          "discord_post_gate": {"1234": "gates/dev.py", "*": "gates/default.py"}
 
-     A channel matched by neither an id nor `"*"` is UNGATED — that is the
-     point of a per-channel map, and it is the one way a *configured* gate
-     can leave a send unvalidated, so state the omission deliberately. Every
-     named path is loaded EAGERLY at resolve time, so a broken policy refuses
-     from startup instead of lurking until the first send to its channel.
+     A usable `"*"` is REQUIRED. Without one an unlisted channel would send
+     unvalidated, making config omission a policy bypass and contradicting
+     `DiscordRestClient`, whose contract states config selects WHICH ruleset
+     applies, never WHETHER one does. Absent or unusable `"*"` refuses every
+     send. Paths load EAGERLY at resolve, so a broken policy refuses from
+     startup rather than at its channel's first send.
 
 Unconfigured -> None (ungated; the repo ships mechanism only). Configured
 but unloadable -> a validator that REFUSES every send, naming the load
@@ -90,15 +91,15 @@ def _load_one(path: str, repo_root=None):
 
 
 def _dispatching(by_channel: dict):
-    """Route each send to its channel's validator; `*` is the fallback.
+    """Route each send to its channel's validator; `*` is the required fallback.
 
-    A channel matched by neither is ungated -- the deliberate meaning of a
-    per-channel map. Every entry is already loaded, so this never widens a
-    load failure across channels: a broken policy refuses only its own.
+    Membership test, never `or`: a listed key must not fall through to `*`
+    because its validator is falsy. `*` is guaranteed present by resolve.
     """
     def _dispatch(channel_id, payload):
-        v = by_channel.get(str(channel_id)) or by_channel.get("*")
-        return v(channel_id, payload) if v else None
+        key = str(channel_id)
+        v = by_channel[key] if key in by_channel else by_channel["*"]
+        return v(channel_id, payload)
     return _dispatch
 
 
@@ -124,6 +125,12 @@ def resolve_validator(repo_root=None):
                 "refusing unvalidated sends")
         # KEEP every explicit key: dropping an empty one lets `*` answer for
         # a channel the config named. Listed-but-unusable must refuse.
+        if not target.get("*"):
+            # Without a usable `*` an unlisted channel sends UNVALIDATED, making
+            # config omission a policy bypass and breaking client.py's contract.
+            return _fail_closed(
+                "post-gate mapping configured without a usable '*' fallback; "
+                "an unlisted channel would send unvalidated -- refusing all sends")
         loaded = {
             k: (_load_one(v, repo_root) if v else _fail_closed(
                 f"post-gate mapping lists channel {k!r} with no policy path; "
