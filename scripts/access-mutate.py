@@ -13,6 +13,7 @@ Usage:
   python3 scripts/access-mutate.py deny <code>
   python3 scripts/access-mutate.py allow <senderId>
   python3 scripts/access-mutate.py remove <senderId>
+  python3 scripts/access-mutate.py ack-notify <senderId>
   python3 scripts/access-mutate.py policy <pairing|allowlist|disabled>
   python3 scripts/access-mutate.py group-add <channelId> [--no-mention] [--allow id1,id2]
   python3 scripts/access-mutate.py group-rm <channelId>
@@ -93,22 +94,45 @@ def _pair(code: str) -> dict:
         pending = dict(pending)
         del pending[code]
         data["pending"] = pending
+        # Same locked transaction as the grant — a crash right after this
+        # commits can never leave a grant with no record a notify is owed.
+        pending_notify = dict(data.get("pendingNotify", {}))
+        pending_notify[sender_id] = chat_id
+        data["pendingNotify"] = pending_notify
         approved["senderId"] = sender_id
         approved["chatId"] = chat_id
         return data, {"ok": True, "senderId": sender_id, "chatId": chat_id}
 
     result = _mutate(_mutator, access_path)
-    # Write the approved-marker only after the locked mutation commits — a
-    # failed access.json write must never leave a stray "you're in" marker.
+    # Best-effort fast-path marker; pendingNotify above is the durable record,
+    # so a failure here is a warning, not an error — the bridge poller covers it.
     if result.get("ok") and approved.get("senderId"):
         approved_dir = access_path.parent / "approved"
         try:
             approved_dir.mkdir(parents=True, exist_ok=True)
-            (approved_dir / str(approved["senderId"])).write_text(str(approved["chatId"]))
+            _atomic_write_owner_only(approved_dir / str(approved["senderId"]), str(approved["chatId"]))
         except OSError as e:
             result = dict(result)
-            result["warning"] = f"allowFrom updated but approved-marker write failed: {e}"
+            result["warning"] = f"allowFrom updated but approved-marker write failed (pendingNotify still owed): {e}"
     return result
+
+
+def _ack_notify(sender_id: str) -> dict:
+    """Remove `sender_id` from pendingNotify — called by the bridge after it
+    has successfully delivered the confirmation. Idempotent: acking an id
+    that isn't pending is a no-op success, not an error, so a retried ack
+    after an uncertain-outcome send can never itself fail."""
+
+    def _mutator(data):
+        pending_notify = data.get("pendingNotify", {})
+        if sender_id not in pending_notify:
+            return None, {"ok": True, "removed": False}
+        pending_notify = dict(pending_notify)
+        del pending_notify[sender_id]
+        data["pendingNotify"] = pending_notify
+        return data, {"ok": True, "removed": True}
+
+    return _mutate(_mutator)
 
 
 def _deny(code: str) -> dict:
@@ -281,6 +305,7 @@ _USAGE = """usage:
   access-mutate.py deny <code>
   access-mutate.py allow <senderId>
   access-mutate.py remove <senderId>
+  access-mutate.py ack-notify <senderId>
   access-mutate.py policy <pairing|allowlist|disabled>
   access-mutate.py group-add <channelId> [--no-mention] [--allow id1,id2]
   access-mutate.py group-rm <channelId>
@@ -294,6 +319,7 @@ _ONE_ARG_COMMANDS = {
     "deny": _deny,
     "allow": _allow,
     "remove": _remove,
+    "ack-notify": _ack_notify,
     "policy": _policy,
     "group-rm": _group_rm,
 }

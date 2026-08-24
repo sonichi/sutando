@@ -2696,6 +2696,7 @@ async def on_ready():
         client.loop.create_task(_supervise_loop(poll_results, "poll_results"))
         client.loop.create_task(_supervise_loop(poll_progress, "poll_progress"))
         client.loop.create_task(_supervise_loop(poll_approved, "poll_approved"))
+        client.loop.create_task(_supervise_loop(poll_pending_notify, "poll_pending_notify"))
         client.loop.create_task(_supervise_loop(poll_proactive, "poll_proactive"))
         client.loop.create_task(_supervise_loop(poll_dm_fallback, "poll_dm_fallback"))
         # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
@@ -4317,6 +4318,95 @@ async def poll_approved():
                     f.unlink(missing_ok=True)
         except Exception as e:
             print(f"  Approved poll error: {e}")
+        await asyncio.sleep(3)
+
+
+_pending_notify_failed_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
+
+
+def _ack_pending_notify(sender_id: str) -> None:
+    """Idempotently clear `sender_id` from pendingNotify via the same locked
+    transaction every other access.json writer uses (#3318)."""
+
+    def _mutator(data):
+        pending_notify = data.get("pendingNotify", {})
+        if sender_id not in pending_notify:
+            return None, None
+        pending_notify = dict(pending_notify)
+        del pending_notify[sender_id]
+        data["pendingNotify"] = pending_notify
+        return data, None
+
+    mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
+
+
+def _park_pending_notify(sender_id: str, chat_id) -> None:
+    """Move `sender_id` from pendingNotify into notifyFailed, atomically.
+
+    Mirrors poll_approved()'s undelivered/ quarantine: a permanently-failing
+    obligation must stop being retried every 3s (log spam, wasted API calls)
+    without ever being silently dropped. notifyFailed keeps it visible in
+    access.json itself for manual recovery, and — unlike the in-memory
+    attempts counter — survives a bridge restart.
+    """
+
+    def _mutator(data):
+        pending_notify = data.get("pendingNotify", {})
+        if sender_id not in pending_notify:
+            return None, None
+        pending_notify = dict(pending_notify)
+        del pending_notify[sender_id]
+        data["pendingNotify"] = pending_notify
+        notify_failed = dict(data.get("notifyFailed", {}))
+        notify_failed[sender_id] = chat_id
+        data["notifyFailed"] = notify_failed
+        return data, None
+
+    mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
+
+
+async def poll_pending_notify():
+    """Poll access.json's `pendingNotify` field and send 'you're in'
+    confirmations. This is the durable source of truth for the grant ->
+    confirmation-owed obligation (#3318): `_pair()` writes it in the SAME
+    locked transaction as the `allowFrom` grant, so unlike the `approved/`
+    marker files `poll_approved()` reads, there is no window where the
+    process can crash after granting access but before the obligation is
+    recorded anywhere. `poll_approved()` remains as a low-latency fast path
+    on top of this — a sender may be acked here before its marker file (if
+    any) is ever read, which is fine: both paths converge on the same
+    idempotent ack.
+    """
+    while True:
+        try:
+            data = read_access_for_transaction(ACCESS_FILE)
+            # None = present-but-corrupt (access_store's three-way contract) —
+            # never treat that as "nothing pending"; just wait for repair.
+            pending_notify = dict(data.get("pendingNotify", {})) if isinstance(data, dict) else {}
+            for sender_id, chat_id in pending_notify.items():
+                try:
+                    channel = await client.fetch_channel(int(chat_id))
+                    await channel.send("You're in! Access approved.")
+                    print(f"  Sent approval confirmation to {sender_id} in {chat_id} (pendingNotify)")
+                    _pending_notify_failed_attempts.pop(sender_id, None)
+                    _ack_pending_notify(sender_id)
+                except Exception as e:
+                    # Same bounded-retry, never-drop discipline as poll_approved —
+                    # pendingNotify IS the obligation record, so a failed send must never ack.
+                    print(f"  Failed to send pendingNotify approval to {sender_id}: {e}")
+                    attempts = _pending_notify_failed_attempts.get(sender_id, 0)
+                    _pending_notify_failed_attempts[sender_id] = attempts + 1
+                    if not send_failure_policy.should_retry(e, attempts):
+                        _pending_notify_failed_attempts.pop(sender_id, None)
+                        print(
+                            f"  [pendingNotify] {sender_id} exceeded retry budget "
+                            f"({attempts + 1}/{send_failure_policy.MAX_TRANSIENT_ATTEMPTS}) — "
+                            f"moved to notifyFailed; NOT deleted, a confirmation is still owed",
+                            flush=True,
+                        )
+                        _park_pending_notify(sender_id, chat_id)
+        except Exception as e:
+            print(f"  pendingNotify poll error: {e}")
         await asyncio.sleep(3)
 
 

@@ -169,6 +169,107 @@ class TestPair(_Isolated):
         self.assertEqual(self._read()["allowFrom"], ["s-1"])
 
 
+class TestPairPendingNotifyAtomicity(_Isolated):
+    """#3318 blocker 1: the grant and the 'approval owed' record must land in
+    ONE transaction. These simulate a crash between _pair()'s locked mutator
+    returning and the external marker file ever being written — pendingNotify
+    must already be durable at that point, with no dependency on the marker."""
+
+    def _pending(self, code, sender="s-1", chat="c-1", ttl_ms=60_000):
+        return {"dmPolicy": "pairing", "allowFrom": [], "pending": {
+            code: {"senderId": sender, "chatId": chat,
+                   "expiresAt": int(time.time() * 1000) + ttl_ms}}}
+
+    def test_pending_notify_committed_in_the_same_write_as_the_grant(self):
+        self._write(self._pending("PN01"))
+        r = self._ok(["pair", "PN01"])
+        self.assertEqual(r["senderId"], "s-1")
+        # Read the file back directly — no marker check anywhere in this
+        # path — proving pendingNotify is durable on its own.
+        doc = self._read()
+        self.assertEqual(doc["allowFrom"], ["s-1"])
+        self.assertEqual(doc["pendingNotify"], {"s-1": "c-1"})
+
+    def test_pending_notify_survives_even_when_the_marker_write_fails(self):
+        self._write(self._pending("PN02"))
+        (self.access_file.parent / "approved").write_text("not a directory")
+        r = self._ok(["pair", "PN02"])
+        self.assertIn("warning", r)
+        # The obligation is recorded regardless of the marker failure.
+        self.assertEqual(self._read()["pendingNotify"], {"s-1": "c-1"})
+
+    def test_ack_notify_clears_the_obligation(self):
+        self._write(self._pending("PN03"))
+        self._ok(["pair", "PN03"])
+        r = self._ok(["ack-notify", "s-1"])
+        self.assertTrue(r["removed"])
+        self.assertEqual(self._read()["pendingNotify"], {})
+
+    def test_ack_notify_on_an_absent_sender_is_a_noop_success_not_an_error(self):
+        self._write({"dmPolicy": "pairing", "allowFrom": [], "pending": {}, "pendingNotify": {}})
+        r = self._ok(["ack-notify", "never-paired"])
+        self.assertFalse(r["removed"])
+
+    def test_ack_notify_is_idempotent_on_retry(self):
+        self._write(self._pending("PN04"))
+        self._ok(["pair", "PN04"])
+        first = self._ok(["ack-notify", "s-1"])
+        second = self._ok(["ack-notify", "s-1"])
+        self.assertTrue(first["removed"])
+        self.assertFalse(second["removed"])
+
+    def test_pending_notify_keys_multiple_senders_independently(self):
+        self._write(self._pending("PN05", sender="s-a", chat="c-a"))
+        self._ok(["pair", "PN05"])
+        doc = self._read()
+        doc["pending"] = {"PN06": {"senderId": "s-b", "chatId": "c-b",
+                                    "expiresAt": int(time.time() * 1000) + 60_000}}
+        self.access_file.write_text(json.dumps(doc))
+        self._ok(["pair", "PN06"])
+        self.assertEqual(self._read()["pendingNotify"], {"s-a": "c-a", "s-b": "c-b"})
+        self._ok(["ack-notify", "s-a"])
+        self.assertEqual(self._read()["pendingNotify"], {"s-b": "c-b"})
+
+
+class TestBridgePendingNotifyAck(_Isolated):
+    """Consumer-side ack/park primitives, exercised directly against the
+    imported bridge module — mirrors the CLI-side assertions above so both
+    halves of the same locked-mutator contract are pinned."""
+
+    def setUp(self):
+        super().setUp()
+        self._write({"dmPolicy": "pairing", "allowFrom": ["s-1"], "pending": {},
+                     "pendingNotify": {"s-1": "c-1", "s-2": "c-2"}})
+        self._old_access_file = db_bridge.ACCESS_FILE
+        db_bridge.ACCESS_FILE = self.access_file
+
+    def tearDown(self):
+        db_bridge.ACCESS_FILE = self._old_access_file
+        super().tearDown()
+
+    def test_ack_pending_notify_removes_only_the_named_sender(self):
+        db_bridge._ack_pending_notify("s-1")
+        self.assertEqual(self._read()["pendingNotify"], {"s-2": "c-2"})
+
+    def test_ack_pending_notify_on_absent_sender_does_not_raise_or_touch_file(self):
+        before = self.access_file.read_text()
+        db_bridge._ack_pending_notify("never-there")  # must not raise
+        self.assertEqual(self.access_file.read_text(), before)
+
+    def test_park_pending_notify_moves_entry_to_notify_failed(self):
+        db_bridge._park_pending_notify("s-1", "c-1")
+        doc = self._read()
+        self.assertNotIn("s-1", doc["pendingNotify"])
+        self.assertEqual(doc["notifyFailed"], {"s-1": "c-1"})
+        # The other sender's obligation is untouched.
+        self.assertEqual(doc["pendingNotify"], {"s-2": "c-2"})
+
+    def test_park_pending_notify_on_absent_sender_is_a_noop(self):
+        before = self.access_file.read_text()
+        db_bridge._park_pending_notify("never-there", "c-x")
+        self.assertEqual(self.access_file.read_text(), before)
+
+
 class TestPairPathOwnership(_Isolated):
     """The marker must land beside the access.json the mutation committed to,
     even when the resolver's answer changes mid-transaction."""
@@ -359,7 +460,7 @@ class TestSet(_Isolated):
 
 class TestArityForNewlyRoutedCommands(_Isolated):
     def test_each_one_arg_command_rejects_the_wrong_arity(self):
-        for cmd in ("pair", "deny", "allow", "remove", "policy", "group-rm"):
+        for cmd in ("pair", "deny", "allow", "remove", "ack-notify", "policy", "group-rm"):
             for rest in ([], ["a", "b"]):
                 rc, _, err = self._run(["access-mutate.py", cmd] + rest)
                 self.assertEqual(rc, 1, cmd)
