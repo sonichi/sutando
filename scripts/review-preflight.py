@@ -113,10 +113,14 @@ def prior_art(pr: str, runner=None) -> "list[str] | None":
             return None
         for row in rows:
             state = row.get(verdict) if verdict else None
-            if state == "COMMENTED":
-                continue        # a review carrying no verdict; its body is a comment
+            # Skip on EMPTY, never on state. A COMMENTED review's body lives in
+            # pulls/reviews and is absent from issues/comments, so filtering it
+            # deletes the record rather than deduping it.
+            if not (row.get("body") or "").strip():
+                continue
             who = (row.get("user") or {}).get("login", "?")
-            out.append(f"{row.get(when, '?')}  {who}{f' {state}' if state else ''} ({kind})")
+            label = kind if not state else f"{kind}, {state}"
+            out.append(f"{row.get(when, '?')}  {who} ({label})")
     return sorted(out)
 
 
@@ -129,8 +133,8 @@ def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
     if not seen:
         return ["ALREADY ON THIS THREAD: nothing — no reviews or comments yet."]
     return ([f"ALREADY ON THIS THREAD ({len(seen)}) — read these before writing yours.",
-             "A finding posted as a COMMENT never appears in the review list, which is",
-             "how a reviewer files a duplicate while believing they checked:"]
+             "Findings hide in BOTH endpoints: an issue comment is not in the review",
+             "list, and a COMMENTED review's body is not in the comments list:"]
             + [f"  {line}" for line in seen[-8:]])
 
 

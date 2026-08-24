@@ -188,15 +188,31 @@ class PriorArtTest(unittest.TestCase):
 
     def test_a_comment_is_surfaced_even_though_it_is_not_a_review(self):
         run = self._runner(comments='[{"created_at":"2026-08-24T11:36:36Z",'
-                                    '"user":{"login":"sonichi"}}]')
+                                    '"user":{"login":"sonichi"},"body":"the finding"}]')
         seen = pf.prior_art("3327", runner=run)
         self.assertEqual(len(seen), 1)
         self.assertIn("sonichi", seen[0])
         self.assertIn("(comment)", seen[0])
 
-    def test_a_COMMENTED_review_is_not_double_counted(self):
+    def test_a_COMMENTED_review_with_a_body_IS_surfaced(self):
+        """Regression: filtering on state deleted the record, not a duplicate.
+
+        Measured on #3356 — its ONLY review was a 2805-byte COMMENTED blocking
+        finding, and that body is absent from issues/comments, so the old
+        `state == "COMMENTED": continue` hid the most substantial prior art on
+        the thread. On a repo where agents share a login, a COMMENTED review is
+        the only review shape an agent can leave."""
         run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
-                                   '"state":"COMMENTED"}]')
+                                   '"state":"COMMENTED","body":"a real finding"}]')
+        seen = pf.prior_art("1", runner=run)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("COMMENTED", seen[0])
+
+    def test_an_empty_bodied_review_is_skipped(self):
+        """The real rule is skip-on-EMPTY: an approval with no prose says nothing
+        a reviewer needs to read before writing."""
+        run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
+                                   '"state":"APPROVED","body":"   "}]')
         self.assertEqual(pf.prior_art("1", runner=run), [])
 
     def test_unknown_is_not_empty(self):
@@ -214,7 +230,7 @@ class PriorArtTest(unittest.TestCase):
 
     def test_the_block_says_why_reviews_alone_are_not_enough(self):
         body = "\n".join(pf.prior_art_block("1", ["t  sonichi (comment)"]))
-        self.assertIn("COMMENT", body)
+        self.assertIn("COMMENTED", body)
         self.assertIn("sonichi", body)
 
 
