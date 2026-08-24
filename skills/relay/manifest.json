@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Write a handoff/continuity note for the NEXT Sutando session. Captures what was just in flight, what to check first, what might go wrong, and implicit context the structured snapshot doesn't carry. Read first by /catchup-after-startup.",
+  "description": "Write a handoff/continuity note for the NEXT Sutando session. Captures what was just in flight, what to check first, what might go wrong, and implicit context the structured snapshot doesn't carry. Drained into session-state.md by src/session-handoff.sh.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

@@ -49,7 +49,7 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 # A tmux server inherits its GLOBAL environment from whichever process starts it,
 # and `start-server` on a serverless socket is a no-op — so unset before any tmux.
 unset SUTANDO_CORE_MODEL
-SESSION="sutando-core"
+SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 
 # Marker identifying THIS process as the long-lived sutando-core session (as
 # opposed to an ad-hoc `claude` in the same checkout — PR review, codex, etc.).
@@ -62,6 +62,8 @@ SESSION="sutando-core"
 export SUTANDO_CORE_SESSION=1
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
+[ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
+[ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
@@ -85,9 +87,29 @@ fi
 # only wire up when a LISTENer actually holds the proxy port — never point
 # the core at a dead port (the #1086/#1291 failure class; same
 # LISTEN-not-any-socket rule as src/restart.sh).
-if [ -z "${ANTHROPIC_BASE_URL:-}" ] \
-   && lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1; then
-  export ANTHROPIC_BASE_URL=http://localhost:7846
+proxy_listener_up() {
+  lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
+}
+if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
+  # A loaded launchd job means the proxy is EXPECTED on this host even when its
+  # listener hasn't bound yet (same loaded-job check as startup.sh/restart.sh).
+  PROXY_EXPECTED=""
+  if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
+    PROXY_EXPECTED=1
+  fi
+  if [ -n "$PROXY_EXPECTED" ]; then
+    # Bounded wait (~10s): a supervised proxy can bind seconds after the core on
+    # a cold boot, and a one-shot check would leave the core unrouted for life.
+    for _ in $(seq 1 20); do
+      proxy_listener_up && break
+      sleep 0.5
+    done
+  fi
+  if proxy_listener_up; then
+    export ANTHROPIC_BASE_URL=http://localhost:7846
+  elif [ -n "$PROXY_EXPECTED" ]; then
+    echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — core runs unrouted this session (no proxy protection, no quota telemetry)" >&2
+  fi
 fi
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   CORE_ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
@@ -180,18 +202,9 @@ fi
 # equivalent so the tmux-wrapped core process writes sessions / memory / state
 # into the workspace tree rather than the global ~/.claude/.
 #
-# Defense in depth:
-#   - M0 helper missing → silent fallback (legacy install, extracted tarball).
-#   - Helper present + config valid → export env for every claude invocation
-#     below (no-tmux fallback at L~75, TTY exec at L~115, no-TTY detached at
-#     L~120 all inherit it).
-#   - Helper present + config violates the workspace-sub-folder invariant →
-#     refuse to start. Silently falling back to ~/.claude/ would hide a real
-#     config error AND scatter state into a location the M2 vault sync engine
-#     doesn't include.
-if [ -x "$REPO/scripts/sutando-config.sh" ]; then
-  _ccd_err="$(mktemp -t start-cli-ccd.XXXXXX)"
-  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+# Resolve-or-refuse is shared with src/startup.sh; only the seeding is ours.
+source "$REPO/src/claude_config_dir.sh"
+if _ccd="$(resolve_claude_config_dir "$REPO" start-cli)"; then
     mkdir -p "$_ccd"
     export CLAUDE_CONFIG_DIR="$_ccd"
     echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
@@ -321,13 +334,12 @@ if changed:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
 PY
     fi
-  else
-    echo "start-cli: claude_sutando_config_dir invalid — refusing to start core" >&2
-    cat "$_ccd_err" >&2
-    rm -f "$_ccd_err"
-    exit 1
-  fi
-  rm -f "$_ccd_err"
+else
+  _ccd_rc=$?
+  # 2 = caller already scoped the config dir; nothing to seed, and the core
+  # still reaches the intended credential store.
+  [ "$_ccd_rc" = "2" ] || exit 1
+  echo "  ✓ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 fi
 
 # NO --model flag: the core inherits the user's global model, so 1M stays the
@@ -383,18 +395,6 @@ fi
 # Optional feature-owned task handler.  The adapter injects the capability at
 # the edge; the generic watcher remains unaware of concrete skills and falls
 # back to its legacy TASK_FILE event whenever this script is absent/unhandled.
-WORKSTREAM_SESSION_HANDLER="$REPO/skills/task-workstream-sessions/scripts/session-worker.py"
-if [ -x "$WORKSTREAM_SESSION_HANDLER" ]; then
-  export SUTANDO_TASK_EVENT_HANDLER="$WORKSTREAM_SESSION_HANDLER"
-  export SUTANDO_ISOLATED_WORKING_DIR="${SUTANDO_CLAUDE_WORKING_DIR:-$REPO}"
-  CORE_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
-  CORE_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
-  if [ -n "${CORE_SETTINGS_JSON:-}" ]; then
-    export SUTANDO_ISOLATED_CLAUDE_SETTINGS="$CORE_SETTINGS_JSON"
-    CORE_ENV_ARGS+=(-e "SUTANDO_ISOLATED_CLAUDE_SETTINGS=$SUTANDO_ISOLATED_CLAUDE_SETTINGS")
-  fi
-fi
-
 # ---- obs metering (CC native OTel token + cost) -----------------------------
 # Hooks give obs events but carry NO tokens. Claude Code's OTel
 # `claude_code.token.usage` / `cost.usage` metrics are the authoritative usage

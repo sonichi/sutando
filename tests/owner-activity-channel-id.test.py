@@ -42,6 +42,9 @@ _TMP_HOME = tempfile.mkdtemp(prefix="owner-activity-test-home-")
 atexit.register(lambda: shutil.rmtree(_TMP_HOME, ignore_errors=True))
 os.environ["HOME"] = _TMP_HOME
 os.environ["CLAUDE_CONFIG_DIR"] = str(Path(_TMP_HOME) / ".claude")
+# AG2_DEVICE_ENV outranks CLAUDE_CONFIG_DIR in _ag2space_access_path; this suite
+# passes without it only while the operator's real map omits its fixture sender.
+os.environ["AG2_DEVICE_ENV"] = ""
 _ch_env = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / ".env"
 _ch_env.parent.mkdir(parents=True, exist_ok=True)
 _ch_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")

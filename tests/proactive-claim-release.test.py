@@ -17,7 +17,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 
 CONSUMERS = {
     "discord-bridge": REPO / "src" / "discord-bridge.py",
@@ -106,12 +106,20 @@ class DelegationTest(unittest.TestCase):
                 )
 
     def test_every_bridge_imports_release_claim(self):
+        # discord reaches release_claim through the 5b claim fence, which is
+        # itself pinned to delegate (fence source + its behavioral suite).
         for name, path in CONSUMERS.items():
             with self.subTest(consumer=name):
-                self.assertIn(
-                    "release_claim", path.read_text(),
-                    f"{name}: does not delegate to proactive_recovery.release_claim",
-                )
+                text = path.read_text()
+                if name == "discord-bridge":
+                    self.assertIn("_proactive_fence().release", text)
+                    fence = (REPO / "src" / "proactive_claim_fence.py").read_text()
+                    self.assertIn("release_claim", fence)
+                else:
+                    self.assertIn(
+                        "release_claim", text,
+                        f"{name}: does not delegate to proactive_recovery.release_claim",
+                    )
 
 
 if __name__ == "__main__":

@@ -114,7 +114,9 @@ class ParseResult:
 _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^\s*\[no-send\]\s*", re.IGNORECASE), "no-send"),
     (re.compile(r"^\s*\[REPLIED\]\s*"), "REPLIED"),
-    (re.compile(r"^\s*\[deduped:\s*([^\]]+)\]\s*", re.IGNORECASE), "deduped"),
+    # `*` not `+`: `[deduped:]` and `[deduped: ]` differ only by a space and
+    # must parse alike, or one is audited and the other ships its own marker.
+    (re.compile(r"^\s*\[deduped:\s*([^\]]*)\]\s*", re.IGNORECASE), "deduped"),
 ]
 
 # Redirect marker — Discord channel IDs are 17-20 digits; Slack channel IDs
@@ -123,7 +125,7 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # Note: used with `.match()` below, which always anchors at string start —
 # no MULTILINE flag needed (re.MULTILINE only affects `^`/`$` in scan-style
 # methods like `.search()` / `.finditer()`).
-_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]+)\]\s*\n?")
+_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]*)\]\s*\n?")
 
 # D7 reply-header pattern (owner directive 2026-05-19) — pool cores prepend
 # `**[core: N]**` plus an optional italic `_(...)_` sub-line to every
@@ -136,8 +138,32 @@ _D7_HEADER_RE = re.compile(
     r"\A\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*"
 )
 
-# Attach markers — file/send/attach are aliases.
-_ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
+# Attach markers — file/send/attach aliases. A marker inside markdown code is
+# being SHOWN, not issued; _code_lines and _SPAN_RE below mask those regions.
+_ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]*)\](?!`)")
+
+_FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
+
+# A run of N backticks closed by the same run. Matching the SPAN, not the
+# characters beside a marker, is what catches one mid-span.
+_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\1).)+?\1(?!`)", re.DOTALL)
+
+
+def _code_lines(text: str) -> set:
+    """Line indices inside a fenced or indented markdown code block.
+
+    An unclosed fence swallows the rest of the body on purpose: the alternative
+    is treating shown-but-unterminated example text as a live directive.
+    """
+    lines, out, fenced = text.split("\n"), set(), False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            fenced = not fenced
+            out.add(i)
+            continue
+        if fenced or line.startswith(("    ", "\t")):
+            out.add(i)
+    return out
 
 # DM-only privacy marker — matched ANYWHERE in the body (not anchored) so it
 # suppresses a [channel:] redirect regardless of which came first. All
@@ -231,8 +257,10 @@ def parse_markers(text: str) -> ParseResult:
     # private body stays in the owner's DM.
     redirect_match = _REDIRECT_RE.match(body)
     if redirect_match:
-        if not dm_only:
-            channel = redirect_match.group(1).strip()
+        channel = redirect_match.group(1).strip()
+        if not dm_only and channel:
+            # Empty target = no action: value="" release-loops at the default
+            # sink (claimable yet foreign) and int("")s in Discord conversion.
             actions.append(Action(kind="redirect", value=channel))
         body = body[redirect_match.end():]
 
@@ -243,12 +271,23 @@ def parse_markers(text: str) -> ParseResult:
 
     # 3. ATTACH — scan everywhere in the (possibly already-redirected) body.
     # Document-order paths.
-    for m in _ATTACH_RE.finditer(body):
-        path = m.group(1).strip()
-        actions.append(Action(kind="attach", value=path))
+    code = _code_lines(body)
+    spans = [(m.start(), m.end()) for m in _SPAN_RE.finditer(body)]
 
-    # Strip the attach markers from body so the user never sees them.
-    body = _ATTACH_RE.sub("", body).strip()
+    def _in_code(pos: int) -> bool:
+        if body.count("\n", 0, pos) in code:
+            return True
+        return any(a <= pos < b for a, b in spans)
+
+    for m in _ATTACH_RE.finditer(body):
+        if _in_code(m.start()):
+            continue
+        actions.append(Action(kind="attach", value=m.group(1).strip()))
+
+    # Strip only the markers we acted on — one shown in a code block stays
+    # visible, which is the whole point of showing it.
+    body = _ATTACH_RE.sub(
+        lambda m: "" if not _in_code(m.start()) else m.group(0), body).strip()
 
     return ParseResult(body=body, actions=actions)
 
@@ -400,3 +439,9 @@ def first_action(result: ParseResult, kind: ActionKind) -> Action | None:
         if a.kind == kind:
             return a
     return None
+
+
+def has_skip_action(actions) -> bool:
+    """True if `actions` (a ParseResult.actions list) carries a skip-kind
+    marker (`[no-send]`/`[REPLIED]`/`[deduped:...]`) — the body must never be sent."""
+    return any(a.kind == "skip" for a in actions)

@@ -300,6 +300,19 @@ describe('publishLifecycleSnapshot — atomic temp+rename (A9)', () => {
 		} finally { rmSync(ws, { recursive: true, force: true }); }
 	});
 
+	it('P7 D7.1: inputHealth rides the snapshot additively when supplied', () => {
+		const ws = mkdtempSync(join(tmpdir(), 'agent-state-lifecycle-ih-'));
+		try {
+			publishLifecycleSnapshot(ws, frameFixture(), { now: () => 700, inputHealth: 'stalled' });
+			const snap = JSON.parse(readFileSync(voiceLifecyclePath(ws), 'utf-8'));
+			assert.equal(snap.inputHealth, 'stalled', 'P4\'s evidence ladder consumes this');
+			// Omitted → absent (additive field, older readers unaffected).
+			publishLifecycleSnapshot(ws, frameFixture(), { now: () => 701 });
+			const snap2 = JSON.parse(readFileSync(voiceLifecyclePath(ws), 'utf-8'));
+			assert.equal('inputHealth' in snap2, false);
+		} finally { rmSync(ws, { recursive: true, force: true }); }
+	});
+
 	it('category included only for failed frames; write errors go to onError (never throw)', () => {
 		const ws = mkdtempSync(join(tmpdir(), 'agent-state-lifecycle-cat-'));
 		try {
@@ -676,7 +689,7 @@ describe('agent.state emission (integration, spawned agent)', () => {
 			// acquisition — pid and lockId equal the structured lock's.
 			const marker = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
 			assert.equal(marker.probeIsolation, true);
-			const lock = JSON.parse(readFileSync(join(ws, '.voice-agent.pid'), 'utf-8'));
+			const lock = JSON.parse(readFileSync(join(ws, 'state', 'locks', 'voice-agent.pid'), 'utf-8'));
 			assert.equal(marker.pid, lock.pid, 'marker.pid = lock holder pid');
 			assert.equal(marker.lockId, lock.lockId, 'marker.lockId = lock acquisition token');
 		} finally {
