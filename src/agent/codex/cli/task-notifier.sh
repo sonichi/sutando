@@ -237,7 +237,14 @@ submit_task() {
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
-  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, then write the result ONLY with: python3 $RESULT_WRITER write $filename --results-dir $RESULTS_DIR --receipts-dir $RESULT_PAIRING_DIR — result body on stdin, its FIRST line exactly 'task: $task_id'. That line is a pairing check: the helper refuses with zero writes if it names a different task, which is what stops a reply reaching the wrong user; it strips the line and writes $RESULTS_DIR/$filename atomically. Never hand-write that file."
+  # The prompt embeds a command Codex will RUN, so every path must survive a
+  # shell: an unquoted workspace containing spaces breaks every completion.
+  local q_writer q_file q_results q_receipts
+  printf -v q_writer   '%q' "$RESULT_WRITER"
+  printf -v q_file     '%q' "$filename"
+  printf -v q_results  '%q' "$RESULTS_DIR"
+  printf -v q_receipts '%q' "$RESULT_PAIRING_DIR"
+  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, then write the result ONLY with: python3 $q_writer write $q_file --results-dir $q_results --receipts-dir $q_receipts — result body on stdin, its FIRST line exactly 'task: $task_id'. That line is a pairing check: the helper refuses with zero writes if it names a different task, which is what stops a reply reaching the wrong user; it strips the line and writes $RESULTS_DIR/$filename atomically. Never hand-write that file."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
   fi
