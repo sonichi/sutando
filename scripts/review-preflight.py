@@ -113,9 +113,8 @@ def prior_art(pr: str, runner=None) -> "list[str] | None":
             return None
         for row in rows:
             state = row.get(verdict) if verdict else None
-            # Skip on EMPTY, never on state. A COMMENTED review's body lives in
-            # pulls/reviews and is absent from issues/comments, so filtering it
-            # deletes the record rather than deduping it.
+            # Skip on EMPTY, never on state: a COMMENTED review's body is in
+            # pulls/reviews and absent from issues/comments, so a state filter deletes it.
             if not (row.get("body") or "").strip():
                 continue
             who = (row.get("user") or {}).get("login", "?")
