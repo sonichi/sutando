@@ -2,9 +2,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main, staging-interaction-planes]
+    branches: [main, feat/sutando-server]
   push:
-    branches: [main, staging-interaction-planes]
+    branches: [main, feat/sutando-server]
 
 # Tests must never emit product telemetry (no PostHog writes from CI).
 env:
