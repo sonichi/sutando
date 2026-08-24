@@ -63,7 +63,13 @@ _pid_token() { printf '%s:%s' "$1" "$(ps -o lstart= -p "$1" 2>/dev/null | tr -s 
 _lease_age() {
   local now mt
   now="$(date +%s)"
-  mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo "$now")"
+  # GNU first and validate: `stat -f` on GNU is --file-system and SUCCEEDS with
+  # non-numeric output, so a BSD-first probe never falls through on Linux.
+  mt="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || true)"
+  case "$mt" in '' | *[!0-9]*) mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || true)" ;; esac
+  # Unreadable mtime reads as just-published, so the guard defers rather than
+  # reclaiming: an unknown age must never authorise deleting a live lease.
+  case "$mt" in '' | *[!0-9]*) mt="$now" ;; esac
   echo $(( now - mt ))
 }
 
