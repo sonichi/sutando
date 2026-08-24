@@ -235,6 +235,75 @@ def test_empty_and_whitespace_results_are_pending():
               "control: a real body on that same path returns completed")
 
 
+OLD = "OLD ANSWER — superseded"
+NEW = "NEW ANSWER — the one the client is waiting for"
+
+
+def test_live_torn_never_falls_back_to_a_readable_archive():
+    """@keweichen's repro: the newest body is mid-write and an OLDER archived
+    body is readable. Answering `completed` with the archive is TERMINAL — the
+    client stops polling and the new answer is stranded. `pending` is retryable.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        _bind(Path(td))
+        arch = api.RESULT_DIR / "archive" / "2026-08"
+        arch.mkdir(parents=True)
+        (arch / "task-9.txt").write_text(OLD)
+        (api.RESULT_DIR / "task-9.txt").write_bytes(torn(NEW))
+        r = api.get_task_result("task-9")
+        check(r is not None and r.get("status") == "pending",
+              f"live torn + readable archive -> pending, got {r!r}")
+        check(OLD not in str(r), "the superseded archive body is NOT returned")
+        # Positive control: once the live body lands whole, it wins over the archive.
+        (api.RESULT_DIR / "task-9.txt").write_text(NEW)
+        r = api.get_task_result("task-9")
+        check(r and r.get("status") == "completed" and r.get("result") == NEW,
+              f"the same path returns the NEW body once readable, got {r!r}")
+
+
+def test_newest_archive_torn_never_falls_back_to_an_older_archive():
+    """Same rule one tier down: archives are consulted newest-first, so a torn
+    newest archive must not surface an older month's body as completed."""
+    with tempfile.TemporaryDirectory() as td:
+        _bind(Path(td))
+        old_m = api.RESULT_DIR / "archive" / "2026-07"
+        new_m = api.RESULT_DIR / "archive" / "2026-08"
+        old_m.mkdir(parents=True); new_m.mkdir(parents=True)
+        (old_m / "task-8.txt").write_text(OLD)
+        (new_m / "task-8.txt").write_bytes(torn(NEW))
+        r = api.get_task_result("task-8")
+        check(r is not None and r.get("status") == "pending",
+              f"newest archive torn + older readable -> pending, got {r!r}")
+        check(OLD not in str(r), "the older month's body is NOT returned")
+        # Negative control: an id with nothing on disk must still be None (404),
+        # so this is not a blanket `pending`.
+        check(api.get_task_result("task-absent") is None,
+              "control: an unknown id still returns None so /result can 404")
+
+
+def test_active_rows_live_torn_does_not_report_a_cached_body():
+    """The row and /result must answer the same question. A torn live body with
+    a cached `done` row previously reported done-with-the-OLD-body while
+    /result said pending — the inconsistency this PR exists to remove."""
+    with tempfile.TemporaryDirectory() as td:
+        _bind(Path(td))
+        (api.RESULT_DIR / "archive").mkdir(parents=True, exist_ok=True)
+        api.task_history.clear()
+        (api.TASK_DIR / "task-7.txt").write_text("id: task-7\ntask: x\n")
+        (api.RESULT_DIR / "task-7.txt").write_text(OLD)
+        api._active_task_rows()
+        check(api.task_history.get("task-7", {}).get("status") == "done",
+              "fixture: the readable body first caches a done row")
+        (api.RESULT_DIR / "task-7.txt").write_bytes(torn(NEW))
+        api._active_task_rows()
+        row = api.task_history.get("task-7", {})
+        check(row.get("status") == "working",
+              f"torn live body -> working, not the cached done (got {row.get('status')!r})")
+        check(OLD not in str(row.get("result", "")),
+              "the cached superseded body is NOT reported")
+        api.task_history.clear()
+
+
 def test_web_client_poll_has_a_ceiling():
     """Source-level, and labelled as such: the poll runs in a browser and this
     suite has no DOM harness, so it pins presence, not behaviour.
@@ -256,5 +325,8 @@ test_daily_insight_analysis_survives_a_torn_body()
 test_display_fields_narrow_guard_covers_decode_error()
 test_active_task_rows_survives_torn_bodies()
 test_task_envelope_census_survives_a_torn_body()
+test_live_torn_never_falls_back_to_a_readable_archive()
+test_newest_archive_torn_never_falls_back_to_an_older_archive()
+test_active_rows_live_torn_does_not_report_a_cached_body()
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

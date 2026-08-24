@@ -376,6 +376,12 @@ def _active_task_rows() -> list[dict]:
         if live_body is not None:
             status = "done"
             result_text = live_body
+        elif result_file.exists():
+            # Live body observed but mid-write. The cached row and the archive
+            # both hold the SUPERSEDED answer, so reporting either as `done`
+            # is the stale-body inconsistency this guard exists to remove.
+            status = "working"
+            result_text = ""
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
@@ -614,36 +620,36 @@ def delegation_archive_result(data: dict):
 
 
 def get_task_result(task_id: str):
-    """Check if a task result exists."""
-    observed_unready = False
+    """Check if a task result exists.
+
+    Candidates are consulted in priority order — live first, then newest
+    archive — mirroring local_task_protocol.find_result. The FIRST candidate
+    that exists but is not yet readable ENDS the search as `pending`: falling
+    past it to an older one answers `completed` with a superseded body, and
+    that is terminal, so the client stops polling and the newer answer is
+    stranded. `pending` is merely retryable.
+    """
+    safe_id = _safe_id(task_id)
+    candidates = []
     result_file = _safe_path(RESULT_DIR, task_id)
     if result_file:
-        # Readiness, not existence: a body read mid-write decodes fatally, and
-        # "not ready yet" is the pending answer two branches down.
-        body = read_ready_result(result_file)
-        if body is not None:
-            return {"task_id": _safe_id(task_id), "status": "completed", "result": body}
-        if result_file.exists():
-            observed_unready = True
-    # Check archive — task-bridge archives results within seconds of delivery,
-    # so direct /result polls often arrive after the file has been moved.
-    safe_id = _safe_id(task_id)
+        candidates.append(result_file)
     if safe_id:
+        # task-bridge archives within seconds of delivery, so a direct /result
+        # poll often arrives after the file has moved.
         filename = f"{safe_id}.txt"
-        for month_dir in sorted((RESULT_DIR / "archive").glob("*/"), reverse=True):
-            candidate = month_dir / filename
-            body = read_ready_result(candidate)
-            if body is not None:
-                return {"task_id": safe_id, "status": "completed", "result": body}
-            if candidate.exists():
-                observed_unready = True
+        candidates += [d / filename for d in
+                       sorted((RESULT_DIR / "archive").glob("*/"), reverse=True)]
+    for candidate in candidates:
+        # Readiness, not existence: a body read mid-write decodes fatally.
+        body = read_ready_result(candidate)
+        if body is not None:
+            return {"task_id": safe_id, "status": "completed", "result": body}
+        if candidate.exists():
+            return {"task_id": safe_id, "status": "pending"}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
-        return {"task_id": _safe_id(task_id), "status": "pending"}
-    if observed_unready:
-        # None here answers 404, which is terminal: the client stops polling
-        # and never sees the bytes that land moments later.
-        return {"task_id": _safe_id(task_id), "status": "pending"}
+        return {"task_id": safe_id, "status": "pending"}
     return None
 
 
