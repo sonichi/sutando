@@ -42,6 +42,39 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 ## On Activation
 
 1. Read `<workspace>/hosts/<hostname>/crons.json` (resolve `<workspace>` via `bash scripts/sutando-config.sh workspace`; `<hostname>` = `bash scripts/sutando-config.sh host-label`). **Transition / self-heal:** if that file is missing, seed it once — from the interim `<workspace>/crons/<hostname>.json` if it still exists (folded-in from the pre-#1717 layout), else the legacy `skills/schedule-crons/crons.json` (one-time migration), else `skills/schedule-crons/crons.example.json` — then read it: `WS="$(bash scripts/sutando-config.sh workspace)"; H="$(bash scripts/sutando-config.sh host-label)"; CF="$WS/hosts/$H/crons.json"; if [ ! -f "$CF" ]; then mkdir -p "$WS/hosts/$H"; SRC="$(ls "$WS/crons/$H.json" 2>/dev/null || ls skills/schedule-crons/crons.json 2>/dev/null || echo skills/schedule-crons/crons.example.json)"; cp "$SRC" "$CF"; fi`
+
+1.5. **Start the streaming task watcher NOW, before registering any cron jobs.** This step used to run last (as step 5, after every `CronCreate` round-trip below) — moved here so an incoming task isn't queued unprocessed for the entire registration loop. Measured impact (startup-latency post-mortem, 2026-08-24, RC9 onboarding): with N session crons the old ordering left the watcher unarmed for ~76 seconds on a fresh boot (one `CronCreate` round-trip per entry, 9 entries measured), during which a brand-new user's first onboarding ping sat unprocessed — the single biggest contributor to "Sutando took a while to respond" reports on first boot.
+
+   Start it via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. **Gate on running watcher TREES, not on the sentinel** — if one is already running, skip the Monitor call; the existing one continues. Reuse the shared enumerator rather than restating its rules here (the copies drift, and step 5 used to be one of the copies that did):
+
+   ```bash
+   python3 -c "
+   import importlib.util, sys
+   s = importlib.util.spec_from_file_location('hc', 'src/health-check.py')
+   m = importlib.util.module_from_spec(s)
+   try: s.loader.exec_module(m)
+   except SystemExit: pass
+   ps = m._ps_snapshot()
+   sys.exit(2 if ps is None else (0 if m._watcher_trees(ps) else 1))"
+   case $? in
+     0) echo skip;;
+     1) echo start;;
+     *) echo 'UNKNOWN: ps did not run — do NOT start; a watcher may be live';;
+   esac
+   ```
+
+   **Three states, not two: an unavailable `ps` is UNKNOWN, not "no watcher".**
+   `_watcher_trees()` catches every `ps` timeout/error and returns `{}`, which is
+   byte-identical to a clean empty scan — so the earlier `0 if m._watcher_trees()
+   else 1` form printed `start` when enumeration merely failed. Starting there is
+   exactly the duplicate this step exists to prevent, and it is the same
+   can't-distinguish defect the paragraph below names for the sentinel, pointing
+   the other way. `_ps_snapshot()` separates them: `None` means ps did not run,
+   `""` means it ran and found nothing. On UNKNOWN, do nothing — a missing
+   watcher costs delayed tasks, a duplicate one processes every task twice.
+
+   **Do not gate on the sentinel alone.** `watch-tasks-stream.sh` writes it once at startup, so an absent file means "no watcher" OR "a live watcher whose file was removed" — indistinguishable. Measured 2026-08-07 on a live core: `_watcher_trees()` returned `{'12631': ['12631']}` (functioning — it emitted `TASK_FILE:` for a probe) with the sentinel absent from disk. Gating on the sentinel there would have started a **second** watcher, and both then emit every task, so every task is processed twice. `_watcher_trees()` is also what makes the `pgrep` warning below unnecessary to re-solve: it drops its own pid and matches on argv shape. Don't use `pgrep -f watch-tasks-stream`: pgrep's `-f` argument matches the literal string `watch-tasks-stream` against full argv, which matches the bash wrapper invoking this very pgrep call (the wrapper's argv contains the search string), producing a transient self-match that returns a PID for a subshell that's already gone by the next `ps`. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 0 — single anti-pattern, single fix. Documented as F5 in `workspace/build_log.md` 2026-06-03T00:02Z validation pass; replayed on the very next session bootstrap (07:25Z) — Sutando.app's checkWatcher Timer caught the gap and sent a `watcher` keystroke, but two owner DMs were silently held in `tasks/` for ~5 min first. Don't kick off `bash src/watch-tasks.sh` (retired 2026-05-14).
+
 2. Check existing cron jobs with CronList
 3. For each job in the config:
    - Skip entries carrying a `monitor` object — they are Monitors, not crons (no `cron`, no prompt to register); step 5.4 owns their arming, and a `CronCreate` attempt on one is invalid.
@@ -74,36 +107,8 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
      - Otherwise pass `prompt: <prompt-string-from-config>`.
      - **If the entry is a dynamic loop** (`loop: "dynamic"` / no interval), do NOT `CronCreate` it. Instead invoke the built-in **`/loop` with no interval** (the adaptive/self-pacing mode), passing the entry's prompt (`/skill-name` or `prompt`) plus any `loop_hint` as the loop body, and append to that body: "on each re-arm, also stamp `state/dynamic-loop-<entry-name>.alive` with `{ts, next_delay_s}`". `/loop`-no-interval then self-paces via ScheduleWakeup by its own judgment — no min/max/signal needed. **Durability comes from schedule-crons re-launching it on every boot.** Double-launch guard: a dynamic loop is NOT visible in `CronList` (ScheduleWakeup schedules a wakeup, not a cron job), and it isn't an OS process either, so neither the cron check nor a PID sentinel can see it. Use the mtime-freshness heartbeat pattern instead (same shape as `state/cores/<hostname>.alive`): the loop stamps its `.alive` sentinel on every re-arm (per the body clause above). On **boot** (first `/schedule-crons` of a new session), always launch — wakeups are session-scoped and died with the old session, so any leftover sentinel is definitionally stale. On a **mid-session re-run**, skip the launch if the sentinel's `ts` is younger than `next_delay_s + 120` seconds (loop still armed); launch only if stale or absent. This guard is also what prevents the inline-fire failure mode below for dynamic loops: launching `/loop` runs the body's first iteration immediately, which is intended at boot but must not repeat on a mid-session `/schedule-crons` re-invocation.
    - **Do NOT invoke the skill or run the prompt body inline during /schedule-crons.** Crons fire at their scheduled cron expression, never on registration. (Exception: a dynamic-loop entry's first iteration runs at launch by design — at boot only; the freshness-sentinel guard above is what keeps a mid-session re-run from repeating it.) (Past bug 2026-06-03T16:52Z: a mid-session `/schedule-crons` re-invocation inline-fired every entry — `/morning-briefing` plus 5 cron-body prompts — at one instant, dropping 8 spurious prompts atop legit watcher TASK_FILE events. The long-running session drowned and ended at 16:54 without processing queued owner DMs.)
-4. **Fallback — ensure `/proactive-loop` is scheduled.** After step 3, check whether any job in `crons.json` references `/proactive-loop` (either `"prompt_skill": "proactive-loop"` or a `"prompt"` whose body invokes the loop). If none does, call `CronCreate` directly with `cron: "*/10 * * * *"` and `prompt: "/proactive-loop"` as a bootstrap-safety net. Rationale: post-#954 the CLI boots with `-- "/schedule-crons"` and exits after step 5, so if `crons.json` is missing/empty/forgot-to-include-the-loop-entry the session goes idle with no recurring work driver. The fallback guarantees the loop runs at least every 10 min regardless of config state. Idempotent: if the user has a custom `*/5 * * * *` or `*/15 * * * *` entry, that satisfies the check and the fallback is skipped (no duplicate cron).
-5. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. (Pattern mirrors `/proactive-loop` activation step 2 — both bootstrap paths land here, so post-#954 CLI startup via `/schedule-crons` immediately gets a watcher; no gap until the first `main-loop` cron fire.) **Gate on running watcher TREES, not on the sentinel** — if one is already running, skip the Monitor call; the existing one continues. Reuse the shared enumerator rather than restating its rules here (the copies drift, and this step is one of the copies that did):
-
-   ```bash
-   python3 -c "
-   import importlib.util, sys
-   s = importlib.util.spec_from_file_location('hc', 'src/health-check.py')
-   m = importlib.util.module_from_spec(s)
-   try: s.loader.exec_module(m)
-   except SystemExit: pass
-   ps = m._ps_snapshot()
-   sys.exit(2 if ps is None else (0 if m._watcher_trees(ps) else 1))"
-   case $? in
-     0) echo skip;;
-     1) echo start;;
-     *) echo 'UNKNOWN: ps did not run — do NOT start; a watcher may be live';;
-   esac
-   ```
-
-   **Three states, not two: an unavailable `ps` is UNKNOWN, not "no watcher".**
-   `_watcher_trees()` catches every `ps` timeout/error and returns `{}`, which is
-   byte-identical to a clean empty scan — so the earlier `0 if m._watcher_trees()
-   else 1` form printed `start` when enumeration merely failed. Starting there is
-   exactly the duplicate this step exists to prevent, and it is the same
-   can't-distinguish defect the paragraph below names for the sentinel, pointing
-   the other way. `_ps_snapshot()` separates them: `None` means ps did not run,
-   `""` means it ran and found nothing. On UNKNOWN, do nothing — a missing
-   watcher costs delayed tasks, a duplicate one processes every task twice.
-
-   **Do not gate on the sentinel alone.** `watch-tasks-stream.sh` writes it once at startup, so an absent file means "no watcher" OR "a live watcher whose file was removed" — indistinguishable. Measured 2026-08-07 on a live core: `_watcher_trees()` returned `{'12631': ['12631']}` (functioning — it emitted `TASK_FILE:` for a probe) with the sentinel absent from disk. Gating on the sentinel there would have started a **second** watcher, and both then emit every task, so every task is processed twice. `_watcher_trees()` is also what makes the `pgrep` warning below unnecessary to re-solve: it drops its own pid and matches on argv shape. Don't use `pgrep -f watch-tasks-stream`: pgrep's `-f` argument matches the literal string `watch-tasks-stream` against full argv, which matches the bash wrapper invoking this very pgrep call (the wrapper's argv contains the search string), producing a transient self-match that returns a PID for a subshell that's already gone by the next `ps`. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 0 — single anti-pattern, single fix. Documented as F5 in `workspace/build_log.md` 2026-06-03T00:02Z validation pass; replayed on the very next session bootstrap (07:25Z) — Sutando.app's checkWatcher Timer caught the gap and sent a `watcher` keystroke, but two owner DMs were silently held in `tasks/` for ~5 min first. Don't kick off `bash src/watch-tasks.sh` (retired 2026-05-14).
+4. **Fallback — ensure `/proactive-loop` is scheduled.** After step 3, check whether any job in `crons.json` references `/proactive-loop` (either `"prompt_skill": "proactive-loop"` or a `"prompt"` whose body invokes the loop). If none does, call `CronCreate` directly with `cron: "*/10 * * * *"` and `prompt: "/proactive-loop"` as a bootstrap-safety net. Rationale: post-#954 the CLI boots with `-- "/schedule-crons"` and exits once registration finishes, so if `crons.json` is missing/empty/forgot-to-include-the-loop-entry the session goes idle with no recurring work driver. The fallback guarantees the loop runs at least every 10 min regardless of config state. Idempotent: if the user has a custom `*/5 * * * *` or `*/15 * * * *` entry, that satisfies the check and the fallback is skipped (no duplicate cron).
+5. **Streaming task watcher — already started in step 1.5, before this step's registration loop ran.** (Moved 2026-08-24: previously ran here, after every `CronCreate` round-trip in steps 2-4, leaving the watcher unarmed for the whole registration window — see step 1.5 for the measured impact and the gate logic, which is unchanged, just earlier.) No action needed here on a normal pass; nothing in steps 2-4 above needs the watcher running to complete.
 
 5.4. **Arm `monitor`-type entries (durable Monitors).** For each crons.json entry carrying a `monitor` object, arm its persistent driver via the `Monitor` tool — `command`: the entry's `monitor.command`, `persistent: true`, `description`: the entry's `monitor.description` — UNLESS a process matching `monitor.match` is already running. Gate exactly like step 5's watcher: on a running PROCESS, never on a sentinel. At boot (a fresh session) nothing is running so it always arms; on a mid-session re-run it skips if the driver is live, so it never double-drives. Use a check whose own process tree can NEVER contain the match string (the same self-match trap step 5 warns about — do NOT use `pgrep -f`, and do NOT pass the match string as a literal anywhere on the command line: not as an argv to the checker, and not via a `printf | python` pipe either — the `bash -c` wrapper running the pipeline carries the WHOLE command text, match literal included, in its own argv, and it is alive during the scan, so excluding only the checker's pid still false-matches and reports `skip` while the monitor never arms). The checker must read the match from the crons.json FILE, keyed by entry NAME — the entry name is the only literal on the command line, and no driver's argv contains entry names. AND ITS FAILURES MUST NOT ARM: a two-way `&& skip || arm` maps every checker failure (resolver error, missing/malformed crons.json, ps failure, exception) to `arm`, duplicating the monitor exactly when the host is least healthy. Three-way exit semantics — 0 = driver RUNNING (skip), 1 = VERIFIED absent (arm), 2 = CHECK FAILED (do NOT arm; post the failure like a loud-stop):
    ```bash
