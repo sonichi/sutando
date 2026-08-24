@@ -205,6 +205,24 @@ class BenchTests(unittest.TestCase):
             self.assertIsNone(path)
             self.assertGreaterEqual(elapsed, 5)
 
+    def test_wait_for_result_does_not_consume_a_partial_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = workspace(Path(td))
+            path = ws / "results" / "task-partial.txt"
+
+            def write_in_parts():
+                path.write_text("O")
+                time.sleep(0.002)
+                with path.open("a") as handle:
+                    handle.write("K")
+
+            writer = threading.Thread(target=write_in_parts)
+            writer.start()
+            response, found, _ = bench._wait_for_result(
+                ws / "results", "task-partial", 1, 0.001)
+            writer.join()
+            self.assertEqual((response, found), ("OK", path))
+
     def test_run_suite_and_reports(self):
         suite = {
             "schema": 1, "name": "mini", "description": "test",

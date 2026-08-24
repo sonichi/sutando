@@ -28,6 +28,7 @@ CODE_IDENTITY_FIELDS = (
     "revision", "commit", "branch", "describe", "tree_sha", "tree_digest",
     "dirty", "source", "built_at",
 )
+RESULT_SETTLE_S = 0.01
 
 
 def utc_now() -> str:
@@ -211,7 +212,19 @@ def _wait_for_result(results: Path, task_id: str, timeout_s: float,
     deadline = start + timeout_s
     while time.perf_counter() < deadline:
         for path in _result_candidates(results, task_id):
-            return path.read_text(errors="replace"), path, (time.perf_counter() - start) * 1000
+            try:
+                before = path.stat()
+                time.sleep(RESULT_SETTLE_S)
+                after = path.stat()
+                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    continue
+                response = path.read_text(errors="replace")
+                final = path.stat()
+                if (after.st_size, after.st_mtime_ns) != (final.st_size, final.st_mtime_ns):
+                    continue
+                return response, path, (time.perf_counter() - start) * 1000
+            except OSError:
+                continue
         time.sleep(poll_s)
     return None, None, (time.perf_counter() - start) * 1000
 
