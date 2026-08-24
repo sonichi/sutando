@@ -23,6 +23,11 @@
 const FLAG = '--user-data-dir=';
 
 /**
+ * NOT the production decider (see pidsFromLsofFields — open descriptors decide).
+ * A strict "this row is definitely ours" predicate, kept because it documents the
+ * boundary: flattened argv cannot say where a path ends, so it answers only when
+ * the value is exact and fails closed on everything else.
+ *
  * True when `line` (one `pgrep -fl` row) runs Chrome against exactly `profileDir`.
  *
  * `pgrep -fl` prints `PID <argv joined by single spaces>`, so an argument ends at the
@@ -41,14 +46,9 @@ export function lineHoldsProfile(line, profileDir) {
 		const value = line.slice(i + FLAG.length);
 		// Exact, or exact-then-argument-boundary. `startsWith(profileDir)` alone is the
 		// bug: "/tmp/x-profile" is a prefix of "/tmp/x-profile-copy".
+		// EXACT only. A trailing space is undecidable in flattened argv — a following
+		// `--flag` is equally part of a profile path literally named that (qingyun, #2133).
 		if (value === profileDir) return true;
-		if (value.startsWith(profileDir + ' ')) {
-			// A following FLAG proves the path ended at that space. A bare token does
-			// not: "/tmp/x-profile copy" is equally a path containing a space.
-			// `--`, not `-`: `-copy` is a bare token, and matching it hands an
-			// unrelated browser's pid to releaseProfileLock() for SIGTERM/SIGKILL.
-			if (value.slice(profileDir.length + 1).startsWith('--')) return true;
-		}
 		i += FLAG.length;
 	}
 }
@@ -60,4 +60,38 @@ export function pidsHoldingProfile(pgrepOutput, profileDir) {
 		.filter((l) => lineHoldsProfile(l, profileDir))
 		.map((l) => l.trim().split(/\s+/)[0])
 		.filter(Boolean);
+}
+
+
+/**
+ * PIDs from `lsof -F pn +D <dir>` output. `+D` already scoped the search to that
+ * directory, so the kernel did the matching and no path parsing is needed — which
+ * is the point: a flattened argv cannot say where a path ends, an open file descriptor
+ * can. Field format: a `p<pid>` line opens a process block, `n<path>` lines follow.
+ */
+export function pidsFromLsofFields(out) {
+	const pids = [];
+	let cur = null;
+	for (const raw of String(out ?? '').split('\n')) {
+		if (raw.startsWith('p')) {
+			const pid = raw.slice(1).trim();
+			cur = /^\d+$/.test(pid) ? pid : null;
+		} else if (raw.startsWith('n') && cur && !pids.includes(cur)) {
+			pids.push(cur);
+		}
+	}
+	return pids;
+}
+
+/**
+ * PIDs of Google-Chrome-for-Testing processes from `pgrep -fl` output, excluding
+ * renderer/GPU helpers. This answers "is this pid GCfT", never "whose profile is it" —
+ * the profile question belongs to pidsFromLsofFields().
+ */
+export function gcftPids(pgrepOutput) {
+	return String(pgrepOutput ?? '')
+		.split('\n')
+		.filter((l) => l.trim() && !l.includes('--type='))
+		.map((l) => l.trim().split(/\s+/)[0])
+		.filter((p) => /^\d+$/.test(p));
 }

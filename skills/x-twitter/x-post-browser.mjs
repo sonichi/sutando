@@ -44,7 +44,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
-import { pidsHoldingProfile } from './profile-match.mjs';
+import { pidsFromLsofFields, gcftPids } from './profile-match.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
 import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
 
@@ -149,13 +149,35 @@ const { app: CHROME_APP, bin: CHROME_BIN } = resolveChromium();
  *  (qingyun review, #2133). The match itself lives in ./profile-match.mjs — it
  *  gates a SIGKILL, so it is exact and independently tested. */
 function pidsForProfile() {
-  let out;
+  let pgrepOut = '';
   try {
-    out = execFileSync('pgrep', ['-fl', 'Google Chrome for Testing'], { encoding: 'utf8' });
+    pgrepOut = execFileSync('pgrep', ['-fl', 'Google Chrome for Testing'], { encoding: 'utf8' });
   } catch {
     return []; // pgrep exits 1 when nothing matches
   }
-  return pidsHoldingProfile(out, PROFILE_DIR);
+  // WHOSE profile a process holds is answered by open file descriptors, not by argv:
+  // `pgrep -fl` has flattened argv, so "--user-data-dir=/p --copy" is equally the single
+  // path "/p --copy", and guessing kills an unrelated browser (qingyun, #2133). `+D`
+  // scopes the search to this directory, so the kernel decides and nothing is parsed.
+  let holders = [];
+  try {
+    holders = pidsFromLsofFields(
+      execFileSync('lsof', ['-w', '-F', 'pn', '+D', PROFILE_DIR], { encoding: 'utf8' }),
+    );
+  } catch (e) {
+    // lsof exits 1 even when it PRINTS holders (verified: one holder, output correct,
+    // exit=1). Discarding e.stdout made this decider silently return nothing every run.
+    holders = pidsFromLsofFields(e && e.stdout);
+  }
+  if (holders.length === 0) {
+    // Nothing holds the profile, or lsof is absent: kill NOTHING. The string predicate
+    // is not a fallback — it cannot decide the ordinary launch shape either, so
+    // offering it would be pretend-safety in front of a SIGKILL.
+    return [];
+  }
+  // AND: hold a file in OUR profile, AND be a Chrome-for-Testing process (not a helper).
+  const gcft = new Set(gcftPids(pgrepOut));
+  return holders.filter((pid) => gcft.has(pid));
 }
 
 /** Kill any GCfT holding THIS profile and clear the SingletonLock, so the next

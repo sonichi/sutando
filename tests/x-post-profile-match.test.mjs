@@ -14,7 +14,12 @@
  *
  * Run: node tests/x-post-profile-match.test.mjs
  */
-import { lineHoldsProfile, pidsHoldingProfile } from '../skills/x-twitter/profile-match.mjs';
+import {
+	lineHoldsProfile,
+	pidsHoldingProfile,
+	pidsFromLsofFields,
+	gcftPids,
+} from '../skills/x-twitter/profile-match.mjs';
 
 let failures = 0;
 const check = (name, cond, detail = '') => {
@@ -59,10 +64,19 @@ check(
 
 // --- must still match, or the lock cleanup silently stops working -----------
 check('exact match at end of line', lineHoldsProfile(line(DIR), DIR) === true);
-check('exact match followed by another flag', lineHoldsProfile(line(DIR, ' --no-first-run'), DIR) === true);
+// These three USED to assert true, on the rule that a following `--flag` proves the
+// path ended. qingyun disproved it: `--user-data-dir=/p --copy` is equally the single
+// path `/p --copy`, so the rule handed an unrelated browser to SIGKILL. Flattened argv
+// cannot decide, so this predicate now answers only on an exact value.
+check('a following flag is NOT an argv boundary', lineHoldsProfile(line(DIR, ' --no-first-run'), DIR) === false);
 check(
-	'matches when the flag is not the last argument',
-	lineHoldsProfile(`4242 chrome --enable-x --user-data-dir=${DIR} --remote-debugging-port=0`, DIR) === true,
+	'undecidable when the flag is not the last argument',
+	lineHoldsProfile(`4242 chrome --enable-x --user-data-dir=${DIR} --remote-debugging-port=0`, DIR) === false,
+);
+check(
+	"qingyun's exact case: `<dir> --copy` is not claimed",
+	lineHoldsProfile(line(DIR, ' --copy'), DIR) === false,
+	'a profile literally named "<dir> --copy" would have been killed',
 );
 
 // --- helper processes inherit the flag; killing them is wrong ---------------
@@ -90,8 +104,8 @@ for (const [name, l] of [
 ]) {
 	check(`bare token after space does not match: ${name}`, lineHoldsProfile(l, DIR) === false);
 }
-check('a real flag after a space still matches (feature preserved)',
-	lineHoldsProfile(line(DIR).replace(DIR, `${DIR} --foo`), DIR) === true);
+check('a real flag after a space is undecidable, so not claimed',
+	lineHoldsProfile(line(DIR).replace(DIR, `${DIR} --foo`), DIR) === false);
 check('no pid is offered for the disputed line',
 	JSON.stringify(pidsHoldingProfile(line(DIR).replace(DIR, `${DIR} -copy`), DIR)) === '[]');
 
@@ -103,9 +117,44 @@ const out = [
 	`7777 /Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing --user-data-dir=${DIR} --x`,
 ].join('\n');
 const pids = pidsHoldingProfile(out, DIR);
-check('pidsHoldingProfile returns only our browser PIDs', JSON.stringify(pids) === JSON.stringify(['4242', '7777']), JSON.stringify(pids));
+// 7777's row ends `--user-data-dir=<DIR> --x` — undecidable, so it is no longer offered.
+check('pidsHoldingProfile returns only EXACT-match browser PIDs', JSON.stringify(pids) === JSON.stringify(['4242']), JSON.stringify(pids));
 check('pidsHoldingProfile tolerates empty input', JSON.stringify(pidsHoldingProfile('', DIR)) === '[]');
 check('pidsHoldingProfile tolerates null input', JSON.stringify(pidsHoldingProfile(null, DIR)) === '[]');
+
+// --- the production decider: open descriptors, not argv ---------------------
+// `lsof -F pn +D <dir>` — `+D` scopes the search, so the kernel answers "whose
+// profile is this" and nothing is parsed out of a path. Verified live before this
+// was written: a process holding "<box>/prof --copy/held.txt" returns 0 rows for
+// "<box>/prof", while the same query against its own dir returns it (positive control).
+const FIELDS = ['p4242', 'n/tmp/x-profile/Default/Cookies', 'n/tmp/x-profile/lockfile',
+	'p7777', 'n/tmp/x-profile/Default/History'].join('\n');
+check('pidsFromLsofFields collects each process block once',
+	JSON.stringify(pidsFromLsofFields(FIELDS)) === JSON.stringify(['4242', '7777']),
+	JSON.stringify(pidsFromLsofFields(FIELDS)));
+check('a p-block with no open file is not a holder',
+	JSON.stringify(pidsFromLsofFields('p4242\np7777\nn/tmp/x-profile/x')) === JSON.stringify(['7777']));
+check('a non-numeric p field is ignored',
+	JSON.stringify(pidsFromLsofFields('pnotapid\nn/tmp/x-profile/x')) === JSON.stringify([]));
+for (const [name, v] of [['empty', ''], ['null', null], ['undefined', undefined]]) {
+	check(`pidsFromLsofFields degenerate: ${name}`, JSON.stringify(pidsFromLsofFields(v)) === '[]');
+}
+
+// --- gcftPids answers "is this GCfT", never "whose profile" ------------------
+const PG = [line(DIR), line('/somewhere/else').replace('4242', '5150'),
+	line(DIR, ' --type=renderer').replace('4242', '6161')].join('\n');
+check('gcftPids returns every GCfT pid regardless of its profile',
+	JSON.stringify(gcftPids(PG)) === JSON.stringify(['4242', '5150']), JSON.stringify(gcftPids(PG)));
+check('gcftPids excludes renderer/GPU helpers', !gcftPids(PG).includes('6161'));
+for (const [name, v] of [['empty', ''], ['null', null]]) {
+	check(`gcftPids degenerate: ${name}`, JSON.stringify(gcftPids(v)) === '[]');
+}
+
+// The production intersection: hold a file in OUR dir AND be a GCfT browser.
+const holders = pidsFromLsofFields(FIELDS);           // 4242, 7777
+const gcft = new Set(gcftPids(PG));                   // 4242, 5150
+check('intersection kills only a GCfT process holding our profile',
+	JSON.stringify(holders.filter((x) => gcft.has(x))) === JSON.stringify(['4242']));
 
 console.log(failures ? `\nFAIL — ${failures} profile-match check(s)` : '\nPASS — x-post profile match');
 process.exit(failures ? 1 : 0);
