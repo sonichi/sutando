@@ -111,7 +111,9 @@ import task_workstreams  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
 TASK_WORKSTREAM_GROUPING_SKILL = REPO_DIR / "skills" / "task-workstream-grouping" / "SKILL.md"
-PORT = 7843
+# Overridable so a live-path witness can run against an isolated instance
+# instead of restarting the owner's service; mirrors AGENT_API_BIND below.
+PORT = int(os.environ.get("AGENT_API_PORT", 7843))
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
