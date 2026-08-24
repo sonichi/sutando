@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main, staging-interaction-planes]
   push:
-    branches: [main, staging-interaction-planes]
+    branches: [main]
 
 # Tests must never emit product telemetry (no PostHog writes from CI).
 env:

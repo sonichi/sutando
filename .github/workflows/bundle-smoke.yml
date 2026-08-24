@@ -16,7 +16,7 @@ on:
       - 'package-lock.json'
       - '.github/workflows/bundle-smoke.yml'
   push:
-    branches: [main, staging-interaction-planes]
+    branches: [main]
     paths:
       - 'src/**'
       - 'skills/phone-conversation/scripts/conversation-server.ts'
