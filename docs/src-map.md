@@ -163,6 +163,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.
 - **`team_result_guard.py`** — Alias of `policy.egress.result` (phase-1a restructure); one transition window.
+- **`teams-bridge.py`** — Microsoft Teams channel bridge: Bot Framework activities <-> the task bridge.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
