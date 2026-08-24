@@ -641,9 +641,8 @@ def get_task_result(task_id: str):
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}
     if observed_unready:
-        # Present but not readable yet, with its task already archived. None
-        # here answers 404 — terminal — so a client stops polling and never
-        # sees the bytes that land moments later.
+        # None here answers 404, which is terminal: the client stops polling
+        # and never sees the bytes that land moments later.
         return {"task_id": _safe_id(task_id), "status": "pending"}
     return None
 
