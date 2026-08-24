@@ -10590,8 +10590,14 @@ def main():
         if do_fix:
             print()
             print("Attempting fixes...")
+            # ONE evaluation for every source-backed restart below. The guard is
+            # the policy's, not this loop's — branches consult it, never restate it.
+            _restart_ok, _restart_why = stale_restart_allowed(REPO_DIR)
             for c in issues:
                 if c["name"].startswith("com.sutando."):
+                    if not _restart_ok:
+                        print(f"  {c['name']}: refused — {_restart_why}")
+                        continue
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
                 elif c["name"] in LAUNCHD_BACKED_CHECKS:  # pragma: no cover — dispatch in untested main()
@@ -10603,6 +10609,9 @@ def main():
                     # launchd-owned listener. A rogue non-launchd port-holder
                     # (issue #1888 bug 2, double-management) is out of scope
                     # here — the result string will say the restart failed.
+                    if not _restart_ok:
+                        print(f"  {c['name']}: refused — {_restart_why}")
+                        continue
                     result = fix_launchd(LAUNCHD_BACKED_CHECKS[c["name"]])  # pragma: no cover
                     print(f"  {c['name']}: {result}")  # pragma: no cover
                 elif c["name"] in DOWN_BRIDGE_DETAILS:  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
@@ -10701,9 +10710,15 @@ def main():
                                    capture_output=True, timeout=10)
                     print(f"  {c['name']}: restarted")
                 elif c["name"] == "voice-transport" and c.get("_stuck_connecting"):
+                    if not _restart_ok:
+                        print(f"  voice-agent (stuck CONNECTING): refused — {_restart_why}")
+                        continue
                     result = fix_launchd("com.sutando.voice-agent")
                     print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
+                    if not _restart_ok:
+                        print(f"  {c['name']}: refused — {_restart_why}")
+                        continue
                     # If stale, kill old PIDs first so the new process doesn't
                     # bind-fail or end up alongside a still-running zombie.
                     if c["status"] == "stale":
