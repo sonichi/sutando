@@ -107,9 +107,23 @@ git reflog --date=format:'%H:%M:%S'      # host-local, and may not be recoverabl
 
 Measured gaps: start-to-import was **1.218 s** in one control, and `lsof` cwd read
 `/private/tmp` while the module actually came from `src/`. Each is off by an
-amount you cannot bound from outside. **Exact provenance needs a recorded
-revision/import witness** — the process logging its own build sha at startup, as
-`runtime-identity` does — not an inference from these three.
+amount you cannot bound from outside. **Exact provenance needs a witness of the
+BYTES that were imported**, not an inference from these three.
+
+A startup build sha is not by itself that witness. It names the ref at process
+start, which is the imported revision only when execution comes from a verified
+clean, immutable artifact. Two adjacent cases break it: a dirty tree yields the
+same OID for different bytes, and a ref that moves after start leaves the
+recorded OID naming a revision the process never ran. Treat a startup sha as
+CONTEXT; for a dirty tree or anything lazily imported, require a content or
+import-time witness.
+
+`runtime-identity` is stronger than a build sha alone, and that is the reason it
+works: `src/remote-gateway-bridge.py:117-120` records `loader_sha256` and
+`module_sha256` beside `build_sha`, so it hashes the artifacts it actually loads
+(`tests/gateway-runtime-identity.test.py:224-241` pins that same-HEAD byte drift
+is detected). The content digests are what make it provenance — and they attest
+only the files it hashes, not the whole tree.
 
 The same holds for anything else that caches at load: config read once at
 startup, a resolved TypeScript module graph, a skill manifest folded into a tool
