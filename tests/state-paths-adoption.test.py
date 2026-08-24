@@ -150,6 +150,14 @@ ALLOWLIST = {
     # must run before any other Sutando module is loaded, so it inlines
     # the workspace resolution rather than importing workspace_default.
     "src/core_heartbeat.py",
+    # "state"/"results" here are runtime-status and request fields, not the
+    # workspace dirs; none composes a path. Same case as workspace_layout.py.
+    "src/runtime-api/instance_registry.py",
+    "src/runtime-api/runtime_dispatch.py",
+    "src/runtime-api/runtime_view.py",
+    "src/runtime-api/tasks_view.py",
+    "src/runtime-api/ws_transport.py",
+    "src/runtime-cli/tui.py",
     # task_archive.py is a pure locator helper — it takes tasks_dir as a
     # parameter from the caller and never resolves workspace itself. The
     # flagged token appears only in the module docstring (example usage),
