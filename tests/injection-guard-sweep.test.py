@@ -186,9 +186,25 @@ if _ag2_path.exists():
 # ---------------------------------------------------------------------------
 
 _tb = _src("src/task-bridge.ts")
+_guard_mod = _src("src/task_body_guard.ts")
 _check(
-    "task-bridge: confineUserContent defined",
-    "function confineUserContent" in _tb,
+    "task_body_guard.ts: confineUserContent is defined and exported",
+    "export function confineUserContent" in _guard_mod,
+)
+_check(
+    "task-bridge: DELEGATES to the shared guard (no private copy)",
+    "from './task_body_guard.js'" in _tb and "function confineUserContent" not in _tb,
+)
+_vh = _src("src/voice-host.ts")
+_check(
+    "voice-host: DELEGATES to the shared guard",
+    "from './task_body_guard.js'" in _vh and "function confineUserContent" not in _vh,
+)
+_check(
+    # Importing the guard is not applying it: the earlier form of this check
+    # stayed green when the call was deleted from the task body.
+    "voice-host: confineUserContent APPLIED to the task body",
+    "`task: ${confineUserContent(task)" in _vh,
 )
 _check(
     "task-bridge: confineUserContent(task) — voice body",
@@ -394,6 +410,7 @@ for _pyf in sorted(
 
 _GUARDED_TS_WRITERS = {
     "src/task-bridge.ts",
+    "src/voice-host.ts",
     "skills/phone-conversation/scripts/conversation-server.ts",
 }
 
@@ -450,7 +467,9 @@ else:
         )
         _py_header_keys = set(re.findall(r"[\"']([^\"']+)[\"']", _body))
 
-_tb2 = _src("src/task-bridge.ts")
+# The TS key list moved to the shared guard module; task-bridge.ts now
+# imports it, so parity must be checked against its real home.
+_tb2 = _src("src/task_body_guard.ts")
 _ts_keys_m = re.search(r"const _HEADER_KEYS\s*=\s*\[([^\]]+)\]", _tb2, re.DOTALL)
 _ts_header_keys: set[str] = set()
 if _ts_keys_m:
@@ -461,7 +480,7 @@ if _ts_keys_m:
     }
 
 _check(
-    "header-key-parity: task_body_guard.py _HEADER_KEYS matches task-bridge.ts",
+    "header-key-parity: task_body_guard.py _HEADER_KEYS matches task_body_guard.ts",
     bool(_py_header_keys) and _py_header_keys == _ts_header_keys,
     f"key mismatch: py={sorted(_py_header_keys - _ts_header_keys)} "
     f"ts={sorted(_ts_header_keys - _py_header_keys)} — "
