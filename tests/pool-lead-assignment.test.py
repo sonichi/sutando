@@ -48,6 +48,45 @@ class PoolLeadTests(unittest.TestCase):
     def _names(self):
         return sorted(f.name for f in self.tasks.iterdir())
 
+    def _result(self, stem, where="."):
+        d = self.tasks.parent / "results" / where
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{stem}.txt").write_text("answer\n")
+
+    def _flag(self, stem, inst):
+        d = self.state / "cores" / inst / "done"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{stem}.flag").write_text("")
+
+    def test_result_without_flag_is_not_reassigned(self):
+        """finish_task writes the result BEFORE the flag, so result-without-flag
+        is the reachable crash residue and the work is already COMPLETE.
+        Gating on both halves swept it back out for re-execution."""
+        self._task("task-T1.txt")
+        self._result("task-T1")            # crashed after result, before flag
+        self.assertEqual(self.lead.sweep(), [])
+        self.assertEqual(self._names(), ["task-T1.txt"])
+
+    def test_both_halves_present_is_not_reassigned(self):
+        self._task("task-T2.txt")
+        self._result("task-T2")
+        self._flag("task-T2", "core-a")
+        self.assertEqual(self.lead.sweep(), [])
+
+    def test_flag_without_result_IS_assigned(self):
+        """The unreachable-by-finish_task case, kept as the negative control:
+        no result means no user-visible effect, so the task must still run."""
+        self._task("task-T3.txt")
+        self._flag("task-T3", "core-a")
+        self.assertEqual([n for n, _ in self.lead.sweep()], ["task-T3.txt"])
+
+    def test_consumed_result_dispositions_also_count(self):
+        for i, where in enumerate(("archive", "undelivered")):
+            stem = f"task-T4{i}"
+            self._task(f"{stem}.txt")
+            self._result(stem, where)
+        self.assertEqual(self.lead.sweep(), [])
+
     def test_urgent_assigned_before_low_backlog(self):
         self._task("task-low1.txt", priority="low")
         self._task("task-low2.txt", priority="low")
