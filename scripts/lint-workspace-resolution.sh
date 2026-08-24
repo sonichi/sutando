@@ -101,7 +101,7 @@ PATTERN_DOC_ENV_PATH='\$SUTANDO_WORKSPACE/'
 # which predate this --diff lint and are grandfathered. A repo-tooling script has
 # no workspace to go through the wrapper for; the wrapper resolves the workspace,
 # which is the wrong directory here.
-ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/pool-session-digest\.py|scripts/check-python39-compat\.py|scripts/review-preflight\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
+ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/check-python39-compat\.py|scripts/review-preflight\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
 
 # Allowed .md files — legitimate uses of `$SUTANDO_WORKSPACE/path` in
 # prose, e.g. the workspace contract docs that DESCRIBE the legacy form

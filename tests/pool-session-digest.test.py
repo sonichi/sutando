@@ -363,6 +363,118 @@ class UntrustedSessionIdTest(unittest.TestCase):
                                  "control: a legitimate id must still resolve")
 
 
+
+class UntrustedInputTest(unittest.TestCase):
+    """A transcript and the CLI's JSON are external artifacts. Every decoded
+    level is untrusted, and one bad one must not hide the rest."""
+
+    def _fresh(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "dg_fresh", Path(__file__).resolve().parent.parent
+            / "scripts" / "pool-session-digest.py")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def _discovery(self, payload):
+        """`m.subprocess` is the SHARED module object — assigning to its .run
+        mutates it for every test. Patch inside a scope instead."""
+        m = self._fresh()
+
+        class R:
+            returncode, stdout, stderr = 0, payload, ""
+
+        return m, unittest.mock.patch.object(
+            m.subprocess, "run", lambda *a, **k: R())
+
+    def test_a_malformed_record_does_not_suppress_a_later_session(self):
+        m = self._fresh()
+        with tempfile.TemporaryDirectory() as td:
+            good = json.dumps({"timestamp": "2026-08-24T19:00:00Z",
+                               "message": {"content": [{"type": "text",
+                                                        "text": "hi"}]}})
+            (Path(td) / "s1.jsonl").write_text("[]\n" + good + "\n")
+            (Path(td) / "s2.jsonl").write_text(good + "\n")
+            m.live_sessions = lambda: (
+                [{"name": "one", "sessionId": "s1", "status": "r", "pid": 1},
+                 {"name": "two", "sessionId": "s2", "status": "r", "pid": 2}], None)
+            m.find_transcript = lambda sid: Path(td) / f"{sid}.jsonl"
+            buf = io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", ["d"]), \
+                 contextlib.redirect_stdout(buf):
+                rc = m.main()
+        self.assertEqual(rc, 0)
+        self.assertIn("two", buf.getvalue(),
+                      "a bad record in session one hid session two entirely")
+
+    def test_an_unreadable_session_does_not_end_the_sweep(self):
+        """Record validation cannot cover a session that fails at the FILE
+        level (vanished, permissions, IO). That is what the wrapper is for."""
+        m = self._fresh()
+        with tempfile.TemporaryDirectory() as td:
+            good = json.dumps({"timestamp": "2026-08-24T19:00:00Z",
+                               "message": {"content": [{"type": "text",
+                                                        "text": "hi"}]}})
+            (Path(td) / "s2.jsonl").write_text(good + "\n")
+            (Path(td) / "s1.jsonl").write_text(good + "\n")
+            real = m.digest
+
+            def boom(path, *a, **k):
+                if path.name == "s1.jsonl":
+                    raise OSError("Input/output error")
+                return real(path, *a, **k)
+
+            m.digest = boom
+            m.live_sessions = lambda: (
+                [{"name": "one", "sessionId": "s1", "status": "r", "pid": 1},
+                 {"name": "two", "sessionId": "s2", "status": "r", "pid": 2}], None)
+            m.find_transcript = lambda sid: Path(td) / f"{sid}.jsonl"
+            buf = io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", ["d"]), \
+                 contextlib.redirect_stdout(buf):
+                rc = m.main()
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("unreadable transcript", out, "the failure was not reported")
+        self.assertIn("two", out, "one unreadable session ended the sweep")
+
+    def test_a_string_message_or_unhashable_type_is_survivable(self):
+        m = self._fresh()
+        with tempfile.TemporaryDirectory() as td:
+            t = Path(td) / "t.jsonl"
+            t.write_text('"just a string"\n'
+                         '{"message": "not-an-object"}\n'
+                         '{"message": {"content": [{"type": ["un", "hashable"]}]}}\n')
+            d = m.digest(t, 5, 80, False)
+        self.assertEqual(d["blocks"]["?"], 1, "unhashable type was not coerced")
+
+    def test_null_member_is_rejected_rather_than_passed_through(self):
+        # `next(..., None)` cannot express this: None IS the invalid member.
+        m, patched = self._discovery("[null]")
+        with patched:
+            sessions, reason = m.live_sessions()
+        self.assertEqual(sessions, [])
+        self.assertIn("NoneType", reason)
+
+    def test_non_string_identity_fields_are_rejected(self):
+        for payload, kind in (('[{"name": "a", "sessionId": 5}]', "int"),
+                              ('[{"name": null, "sessionId": "x"}]', "NoneType")):
+            m, patched = self._discovery(payload)
+            with patched:
+                sessions, reason = m.live_sessions()
+            self.assertEqual(sessions, [], payload)
+            self.assertIn(kind, reason, payload)
+
+    def test_a_rejected_discovery_exits_two_not_a_traceback(self):
+        m, patched = self._discovery("[null]")
+        buf = io.StringIO()
+        with patched, unittest.mock.patch.object(sys, "argv", ["d"]), \
+             contextlib.redirect_stderr(buf):
+            rc = m.main()
+        self.assertEqual(rc, 2, "malformed discovery must take the diagnostic path")
+        self.assertIn("could not list sessions", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
-

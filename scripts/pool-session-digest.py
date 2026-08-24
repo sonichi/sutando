@@ -30,7 +30,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))  # lint-workspace-resolution: allow-repo-root
 
 from util_paths import claude_home_path  # noqa: E402
 
@@ -67,10 +67,17 @@ def live_sessions() -> "tuple[list[dict], str | None]":
     # then raises AttributeError on the first .get() downstream.
     if not isinstance(data, list):
         return [], f"expected a JSON list of session objects, got {type(data).__name__}"
-    bad = next((d for d in data if not isinstance(d, dict)), None)
-    if bad is not None:
+    if any(not isinstance(d, dict) for d in data):
+        # `next(..., None)` cannot work here: None is itself an invalid member,
+        # so a [null] list would report "no bad member found".
+        kinds = sorted({type(d).__name__ for d in data if not isinstance(d, dict)})
         return [], ("expected a JSON list of session OBJECTS, got a list "
-                    f"containing {type(bad).__name__}")
+                    f"containing {', '.join(kinds)}")
+    for d in data:
+        for field in ("name", "sessionId"):
+            if field in d and not isinstance(d[field], str):
+                return [], (f"session {field!r} must be a string, got "
+                            f"{type(d[field]).__name__}")
     return data, None
 
 
@@ -152,17 +159,25 @@ def digest(path: Path, keep: int, width: int, want_thinking: bool) -> dict:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # A transcript is an external artifact: every decoded level is
+            # untrusted, and one bad record must not end the whole digest.
+            if not isinstance(rec, dict):
+                continue
             records += 1
-            if rec.get("timestamp"):
+            if isinstance(rec.get("timestamp"), str):
                 last_ts = rec["timestamp"]
-            content = (rec.get("message") or {}).get("content")
+            msg = rec.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
             if not isinstance(content, list):
                 continue
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                blocks[block.get("type", "?")] += 1
-                if block.get("type") == "thinking" and not want_thinking:
+                btype = block.get("type", "?")
+                if not isinstance(btype, str):
+                    btype = "?"          # an unhashable type would raise here
+                blocks[btype] += 1
+                if btype == "thinking" and not want_thinking:
                     continue
                 ev = _event(rec, block, width)
                 if ev:
@@ -217,6 +232,7 @@ def main() -> int:
             print(f"no session matching {a.session!r}", file=sys.stderr)
             return 1
 
+    failed = 0
     for sess in sessions:
         name, sid = sess.get("name", "?"), sess.get("sessionId", "")
         head = _safe(f"{name}  [{sess.get('status','?')}]  pid={sess.get('pid','?')}")
@@ -224,14 +240,22 @@ def main() -> int:
         if path is None:
             print(f"\n{head}\n  no transcript for {_safe(sid)}")
             continue
-        d = digest(path, a.n, a.width, a.thinking)
-        mb = path.stat().st_size / 1048576
+        try:
+            d = digest(path, a.n, a.width, a.thinking)
+            mb = path.stat().st_size / 1048576
+        except Exception as e:      # noqa: BLE001 — one session must not end the sweep
+            print(f"\n{head}\n  unreadable transcript: "
+                  f"{_safe(type(e).__name__)}: {_safe(_one_line(str(e), 90))}")
+            failed += 1
+            continue
         counts = " · ".join(f"{_safe(k)} {v}" for k, v in d["blocks"].most_common(5))
         print(f"\n{head}")
         print(f"  {mb:.1f}M · {d['records']} records · last {age(d['last_ts'])}")
         print(f"  {counts}")
         for ts, kind, body in d["tail"]:
             print(f"    {ts}  {kind:<6} {body}")
+    if failed and failed == len(sessions):
+        return 2                  # every session unreadable is a failure, not a report
     return 0
 
 
