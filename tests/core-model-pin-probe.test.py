@@ -706,6 +706,37 @@ class SettingsJsonIsAThirdWayTheModelIsChosen(unittest.TestCase):
                 [("user", real), ("project", link)])
             self.assertEqual(got, [("user", "sonnet")], got)
 
+    def test_claude_settings_must_not_vouch_for_a_CODEX_core(self):
+        """The argv scan skips any pane without `claude`, so a Codex core supplies
+        no running evidence; a Claude-only settings.json must not then be read as
+        proof about its window."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", (), [("user", "opus[1m]")], "codex")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("not on the default window", r["detail"])
+        self.assertNotIn("opus[1m]", r["detail"])
+        self.assertIn("codex", r["detail"])
+        self.assertIn("NOT consulted", r["detail"])
+
+    def test_CONTROL_the_same_settings_DO_qualify_a_claude_core(self):
+        """Without this, a detail string that never mentioned settings would pass
+        the Codex test above."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", (), [("user", "opus[1m]")], "claude")
+        self.assertIn("opus[1m]", r["detail"])
+        self.assertIn("not on the default window", r["detail"])
+
+    def test_codex_core_through_the_SHIPPED_check_path(self):
+        """Drives check_core_model_pin() itself with the runtime resolver forced
+        to codex — the reviewer's ask, not just the interpreter in isolation."""
+        with mock.patch.object(self.hc, "_codex_runtime_selected", lambda: True), \
+             mock.patch.object(self.hc, "_settings_model_pins",
+                               lambda *a, **k: [("user", "opus[1m]")]):
+            r = self.hc.check_core_model_pin()
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("opus[1m]", r["detail"],
+                         "a Claude settings value must not appear in a codex verdict")
+
     def test_default_candidates_are_the_runtime_ones(self):
         """The injectable default must still be what the probe reads live."""
         labels = [lbl for lbl, _ in self.hc._settings_candidates()]

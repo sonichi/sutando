@@ -8733,7 +8733,7 @@ def _settings_model_pins(candidates=None) -> list:
 
 
 def _interpret_core_model_pin(pinned: list, socket: str, running=(),
-                              settings=()) -> dict:
+                              settings=(), runtime: str = "claude") -> dict:
     """Interpret tmux pins AND the live core's argv. A tmux clear cannot change an
     already-running process, so argv must be reported even when tmux is clean.
 
@@ -8755,6 +8755,13 @@ def _interpret_core_model_pin(pinned: list, socket: str, running=(),
                                f"({', '.join(sorted(unknown))}), so it cannot be "
                                f"confirmed unpinned — the tmux env is clear, but a "
                                f"clear cannot move a running core off a pinned model")}
+        if runtime != "claude":
+            # The argv scan matches only `claude` panes and settings.json is
+            # Claude-scoped, so neither says anything about this runtime.
+            return {"name": name, "status": "ok",
+                    "detail": (f"no SUTANDO_CORE_MODEL pin in tmux env; the argv scan and "
+                               f"settings.json are Claude-scoped and were NOT consulted for "
+                               f"this {runtime} core, so its window is unassessed here")}
         if settings:
             where = ", ".join(f"{lbl}={val!r}" for lbl, val in settings)
             return {"name": name, "status": "ok",
@@ -8869,7 +8876,9 @@ def check_core_model_pin() -> dict:
         sessions = _tmux_sessions(socket)
     except (OSError, subprocess.SubprocessError) as e:
         if _tmux_no_server(e):
-            return _interpret_core_model_pin(pinned, socket, (), _settings_model_pins())
+            return _interpret_core_model_pin(
+                pinned, socket, (), _settings_model_pins(),
+                "codex" if _codex_runtime_selected() else "claude")
         # sessions=[] here would report a clean argv pass having read no core at all.
         return {"name": name, "status": "warn",
                 "detail": (f"could not enumerate core tmux sessions ({e}), so no core "
@@ -8877,7 +8886,8 @@ def check_core_model_pin() -> dict:
                            f"cannot move a running core off a pinned model")}
     return _interpret_core_model_pin(pinned, socket,
                                      _core_argv_pins(socket, sessions),
-                                     _settings_model_pins())
+                                     _settings_model_pins(),
+                                     "codex" if _codex_runtime_selected() else "claude")
 
 
 def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
