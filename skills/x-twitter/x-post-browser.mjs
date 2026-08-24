@@ -149,7 +149,7 @@ const { app: CHROME_APP, bin: CHROME_BIN } = resolveChromium();
  *  (qingyun review, #2133). The match itself lives in ./profile-match.mjs — it
  *  gates a SIGKILL, so it is exact and independently tested. */
 function pidsForProfile() {
-  let pgrepOut = '';
+  let pgrepOut;
   try {
     pgrepOut = execFileSync('pgrep', ['-fl', 'Google Chrome for Testing'], { encoding: 'utf8' });
   } catch {
@@ -159,7 +159,7 @@ function pidsForProfile() {
   // `pgrep -fl` has flattened argv, so "--user-data-dir=/p --copy" is equally the single
   // path "/p --copy", and guessing kills an unrelated browser (qingyun, #2133). `+D`
   // scopes the search to this directory, so the kernel decides and nothing is parsed.
-  let holders = [];
+  let holders;
   try {
     holders = pidsFromLsofFields(
       execFileSync('lsof', ['-w', '-F', 'pn', '+D', PROFILE_DIR], { encoding: 'utf8' }),
