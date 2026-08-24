@@ -43,6 +43,9 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cron_execution_form import MALFORMED, select_execution_form  # noqa: E402
 from typing import Iterator, Optional
 
 # --- workspace + host resolution (mirror the rest of the codebase) ----------
@@ -463,11 +466,11 @@ def run(now_epoch: Optional[int] = None) -> list:
             expr = entry.get("cron")
             if not name or not expr:
                 continue
-            has_shell_command = "shell_command" in entry
+            # Shared with dashboard_schedules so the two cannot disagree about
+            # which form an entry runs as (or that it will not run at all).
+            form, _form_detail = select_execution_form(entry)
             shell_command = entry.get("shell_command")
-            if has_shell_command and (
-                not isinstance(shell_command, str) or not shell_command.strip()
-            ):
+            if form == MALFORMED:
                 print(
                     f"cron-runner: skipping {name}: shell_command must be a non-empty string",
                     file=sys.stderr,

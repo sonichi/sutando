@@ -89,6 +89,39 @@ def _with_crons(tmp: Path, jobs):
     return dashboard.get_schedules()
 
 
+def _domain_rows(tmp: Path, jobs):
+    """Call the DOMAIN function, not the dashboard adapter: `prompt_or_skill`
+    exists only here, so an adapter-shaped test cannot observe it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "dsched", REPO / "src" / "dashboard_schedules.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    cf = tmp / "crons.json"
+    cf.write_text(json.dumps(jobs))
+    return {r["name"]: r for r in m.list_schedules(cf)}
+
+
+def test_domain_prompt_or_skill_carries_the_shell_command():
+    """Regression pin. Reverting `prompt_or_skill` to the old `skill or prompt`
+    fallback survived every adapter-level test; only this observes the field."""
+    with tempfile.TemporaryDirectory() as td:
+        rows = _domain_rows(Path(td), [
+            {"name": "mixed", "cron": "0 9 * * *",
+             "shell_command": "echo hi", "prompt_skill": "fallback"},
+            {"name": "blankshell", "cron": "0 9 * * *",
+             "shell_command": "   ", "prompt_skill": "fallback"},
+            {"name": "intshell", "cron": "0 9 * * *",
+             "shell_command": 123, "prompt_skill": "fallback"},
+        ])
+    assert rows["mixed"]["prompt_or_skill"] == "echo hi", rows["mixed"]
+    assert rows["mixed"]["kind"] == "shell"
+    for nm in ("blankshell", "intshell"):
+        assert rows[nm]["kind"] == "malformed", rows[nm]
+        assert rows[nm]["prompt_or_skill"] == "", rows[nm]
+        assert "fallback" not in rows[nm]["description"], rows[nm]
+
+
 def test_get_schedules_missing_file_returns_empty():
     with tempfile.TemporaryDirectory() as td:
         dashboard._crons_path = lambda: Path(td) / "crons.json"  # missing
@@ -123,11 +156,16 @@ def test_get_schedules_formats_all_branches():
         # mechanical launchd job → shell kind and command-derived desc
         {"name": "poll", "cron": f"{soon.minute} {soon.hour} * * *",
          "shell_command": "bash scripts/poll.sh"},
-        # MIXED form: the runner executes shell_command and ignores prompt_skill,
-        # so every rendered field must describe the shell — not the skill that
-        # never runs. crons.json is read unvalidated, so this record can exist.
+        # MIXED form: the runner executes shell_command, so every rendered field
+        # must describe the shell, not the skill that never runs.
         {"name": "mixed", "cron": f"{soon.minute} {soon.hour} * * *",
          "shell_command": "echo hi", "prompt_skill": "fallback"},
+        # Shell key PRESENT but unusable: the runner skips the entry outright,
+        # so no surface may advertise the fallback skill.
+        {"name": "blankshell", "cron": f"{soon.minute} {soon.hour} * * *",
+         "shell_command": "   ", "prompt_skill": "fallback"},
+        {"name": "intshell", "cron": f"{soon.minute} {soon.hour} * * *",
+         "shell_command": 123, "prompt_skill": "fallback"},
         # valid expr but no match in horizon → ">7d"
         {"name": "leap", "cron": "0 0 30 2 *"},
         # no cron → "invalid"; no name → "?"
@@ -151,6 +189,13 @@ def test_get_schedules_formats_all_branches():
     assert mixed["desc"] == "Runs shell command: echo hi", \
         f'mixed desc named the un-run skill: {mixed["desc"]!r}'
     assert "fallback" not in mixed["desc"], f'skill leaked into desc: {mixed["desc"]!r}'
+
+    # A blank or non-string shell key must not fall through to the skill leg,
+    # and a non-string must not raise on either listing surface.
+    for nm in ("blankshell", "intshell"):
+        r = by_name[nm]
+        assert r["kind"].startswith("malformed"), f'{nm} rendered as {r["kind"]!r}'
+        assert "fallback" not in r["desc"], f'{nm} advertises the un-run skill: {r["desc"]!r}'
 
     # next-string buckets
     assert by_name["loop"]["next"].endswith("(in 0m)") or "in " in by_name["loop"]["next"]
@@ -222,6 +267,7 @@ def main():
         test_cron_next_run_matches,
         test_cron_next_run_wrong_arity,
         test_cron_next_run_no_match_in_horizon,
+        test_domain_prompt_or_skill_carries_the_shell_command,
         test_get_schedules_missing_file_returns_empty,
         test_get_schedules_bad_json_returns_empty,
         test_get_schedules_formats_all_branches,

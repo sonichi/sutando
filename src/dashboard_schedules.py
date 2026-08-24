@@ -30,6 +30,11 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cron_execution_form import (  # noqa: E402
+    MALFORMED, PROMPT, SHELL, SKILL, select_execution_form)
+
 
 def cron_field_match(spec: str, value: int) -> bool:
     """Match one cron field value against a spec supporting *, */N, A-B, A,B, N."""
@@ -145,8 +150,10 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
     run. The read policy behind the dashboard Schedules card and SCP
     schedule.list; [] on missing/invalid file (never raises).
 
-    Per entry: name, cron ("" for a dynamic loop), kind (shell|skill|prompt),
-    prompt_or_skill (the skill name or prompt text), owner (session|launchd|
+    Per entry: name, cron ("" for a dynamic loop), kind (shell|skill|prompt|
+    malformed),
+    prompt_or_skill (shell command, skill name or prompt text; "" when
+    malformed), owner (session|launchd|
     codex|dynamic-loop — who fires it), description (UNescaped — HTML escaping
     is presentation), next_run (display string: "Mon 21:00 (in 2m)" | ">7d" |
     "invalid"), next_run_ts (epoch seconds, None when uncomputable)."""
@@ -167,29 +174,25 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
             next_str = f'{nxt.strftime("%a %H:%M")} ({rel})'
         else:
             next_str = ">7d" if expr else "invalid"
-        # Select the execution form ONCE, shell > skill > prompt, matching the
-        # runner (src/cron-runner.py). Deriving kind and description separately
-        # let a mixed record render as its skill while launchd ran its shell.
-        _cmd = (job.get("shell_command") or "").strip()
-        _prompt = (job.get("prompt") or "").strip()
-        if _cmd:
-            kind, target = "shell", _cmd
-        elif skill:
-            kind, target = "skill", skill
-        else:
-            kind, target = "prompt", _prompt
-        if job.get("description"):
+        # One selector, shared with the runner: describing an entry the runner
+        # refuses to execute is how the two surfaces silently disagree.
+        kind, target = select_execution_form(job)
+        if job.get("description") and kind != MALFORMED:
             desc = job["description"]
-        elif kind == "shell":
+        elif kind == SHELL:
             desc = f"Runs shell command: {target}"
-        elif kind == "skill":
+        elif kind == SKILL:
             desc = f"Runs the /{target} skill"
+        elif kind == MALFORMED:
+            # Never fall through to the skill leg: the runner skips this entry
+            # entirely, so any skill named here would describe work that stops.
+            desc = f"WILL NOT RUN — {target}"
         else:
             _p = _RUN_PREFIX_RE.sub("", target)
             desc = (_p[:100] + "…") if len(_p) > 100 else _p
         out.append({"name": job.get("name", "?"), "cron": expr,
                     "kind": kind,
-                    "prompt_or_skill": target if kind != "prompt" else _prompt,
+                    "prompt_or_skill": "" if kind == MALFORMED else target,
                     "owner": schedule_owner(job),
                     "description": desc,
                     "next_run": next_str,
