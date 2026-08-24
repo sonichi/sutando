@@ -22,6 +22,7 @@ and succeeds is the failure mode this exists to prevent.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -87,6 +88,52 @@ def count_check_patterns(checks_section: str) -> "tuple[int, int]":
     return counts["flag"], counts["allow"]
 
 
+def prior_art(pr: str, runner=None) -> "list[str] | None":
+    """Reviews and non-COMMENTED activity already on the PR, oldest first.
+
+    None means COULD NOT CHECK, which is not the same as "nothing there" — a
+    reviewer told nothing and a reviewer told the check failed behave
+    differently, so the two must never render alike.
+    """
+    run = runner or (lambda a: subprocess.run(a, capture_output=True,
+                                              text=True, timeout=20))
+    out: "list[str]" = []
+    for kind, path, when, verdict in (
+            ("review", f"pulls/{pr}/reviews", "submitted_at", "state"),
+            ("comment", f"issues/{pr}/comments", "created_at", None)):
+        try:
+            r = run(["gh", "api", "repos/{owner}/{repo}/" + path, "--paginate"])
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        try:
+            rows = json.loads(r.stdout) if r.stdout.strip() else []
+        except ValueError:
+            return None
+        for row in rows:
+            state = row.get(verdict) if verdict else None
+            if state == "COMMENTED":
+                continue        # a review carrying no verdict; its body is a comment
+            who = (row.get("user") or {}).get("login", "?")
+            out.append(f"{row.get(when, '?')}  {who}{f' {state}' if state else ''} ({kind})")
+    return sorted(out)
+
+
+def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
+    """Render prior art so "nothing there" can never read as "unchecked"."""
+    if seen is None:
+        return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — gh is unavailable or",
+                "the call failed. Read the thread yourself: an unchecked thread is not an",
+                "empty one."]
+    if not seen:
+        return ["ALREADY ON THIS THREAD: nothing — no reviews or comments yet."]
+    return ([f"ALREADY ON THIS THREAD ({len(seen)}) — read these before writing yours.",
+             "A finding posted as a COMMENT never appears in the review list, which is",
+             "how a reviewer files a duplicate while believing they checked:"]
+            + [f"  {line}" for line in seen[-8:]])
+
+
 def render(guide: Path, pr: str | None) -> str:
     text = guide.read_text(encoding="utf-8", errors="replace")
     lessons = extract_section(text, LESSONS_HEADING)
@@ -94,6 +141,7 @@ def render(guide: Path, pr: str | None) -> str:
     out = [f"review-preflight: criteria from {guide}", ""]
     if pr:
         out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
+        out += prior_art_block(pr, prior_art(pr)) + [""]
     out.append(lessons if lessons else
                "WARNING: no '## Lessons' section found — the guide's criteria could not be read.")
     n_flag, n_allow = count_check_patterns(checks)
