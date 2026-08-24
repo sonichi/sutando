@@ -281,6 +281,19 @@ checks:
       - 'nohup.out'
 
   hardcoded-paths:
+    # Files matching these globs are exempt from content scanning entirely
+    # (checked against the WHOLE path, matched full-diff-line via fnmatch, so
+    # '*.patch' also matches a nested path like 'skills/x/y.patch'). A stored
+    # .patch/.diff's OWN removal lines ("-/some/real/path") are the nested
+    # diff's syntax, not this repo's content — they read as ADDED lines in the
+    # outer PR diff and the scanner has no way to distinguish that from a real
+    # hardcoded path, so the file is exempted by extension. Omitting the key
+    # uses these defaults rather than disabling the exemption. Mirrors
+    # root-artifacts' root_artifact_glob, which lists the same two extensions
+    # for the same underlying reason (a stored patch is not code to police).
+    skip_glob:
+      - '*.patch'
+      - '*.diff'
     # Added lines containing any of these substrings are flagged as errors...
     flag:
       - '/Users/'
