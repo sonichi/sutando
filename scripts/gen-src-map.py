@@ -169,7 +169,9 @@ def collect() -> list[tuple[str, str]]:
         # Test files describe a test, not a module of the system.
         if ".test." in p.name:
             continue
-        rows.append((str(p.relative_to(REPO)), purpose(p)))
+        # POSIX separators, not the platform's: the artifact is diffed by CI on
+        # Linux, so a Windows run must not emit backslashes it can never match.
+        rows.append((p.relative_to(REPO).as_posix(), purpose(p)))
     return rows
 
 

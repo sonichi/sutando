@@ -55,6 +55,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "_helpers"))
+from os_probes import PS_SKIP_REASON, ps_available  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 
 MOD_PATH = REPO / "src" / "health-check.py"
@@ -547,6 +550,11 @@ def case_h_proc_argv_reads_a_real_process() -> list[str]:
     caller expects.
     """
     fails = []
+    if not ps_available():
+        # Loud, never silent: without ps this case would assert '' == '' and
+        # pass for the wrong reason, which is worse than not running it.
+        print(f"      SKIP h) {PS_SKIP_REASON}")
+        return fails
     mine = hc._proc_argv(os.getpid())
     if not mine:
         fails.append("h) _proc_argv(os.getpid()) returned empty for a live process")
