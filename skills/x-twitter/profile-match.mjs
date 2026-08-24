@@ -95,3 +95,25 @@ export function gcftPids(pgrepOutput) {
 		.map((l) => l.trim().split(/\s+/)[0])
 		.filter((p) => /^\d+$/.test(p));
 }
+
+/**
+ * Decide holders from one `lsof -F pn +D <dir>` probe outcome — pure, so the
+ * inconclusive-vs-confirmed-empty distinction is unit-testable without spawning lsof.
+ *
+ * `lsof` exits non-zero even when it PRINTED real holder lines (verified: one holder,
+ * output correct, exit=1) — a thrown error is therefore not itself proof of "no
+ * holders". Only a probe that produced no usable stdout at all is inconclusive:
+ * permission denied, the binary missing, or our own timeout (`killed`).
+ *
+ * qingyun (#2133, 2026-08-24): the caller used to collapse both cases to an empty PID
+ * list, and releaseProfileLock() then deleted the singleton lock files regardless —
+ * risking a second Chrome launching against a still-active profile. Callers MUST fail
+ * closed on `known: false`: treat it as "cannot say", never as "zero holders".
+ */
+export function classifyLsofProbe({ threw, killed, stdout } = {}) {
+	if (killed) return { known: false, pids: [] };
+	if (threw && !(typeof stdout === 'string' && stdout.length > 0)) {
+		return { known: false, pids: [] };
+	}
+	return { known: true, pids: pidsFromLsofFields(stdout) };
+}

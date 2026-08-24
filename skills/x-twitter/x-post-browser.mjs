@@ -44,7 +44,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
-import { pidsFromLsofFields, gcftPids } from './profile-match.mjs';
+import { gcftPids, classifyLsofProbe } from './profile-match.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
 import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
 
@@ -143,57 +143,79 @@ if (cmd === 'post' && !arg) {
 
 const { app: CHROME_APP, bin: CHROME_BIN } = resolveChromium();
 
-/** PIDs of Google-Chrome-for-Testing procs holding THIS profile. Argv-safe:
- *  pgrep runs via execFileSync (no shell), and PROFILE_DIR is matched in JS, so
- *  a profile path with quotes/metacharacters can't break or inject a command
+/** Which GCfT procs hold THIS profile, or `{known: false}` if the probe couldn't say.
+ *  Argv-safe: pgrep runs via execFileSync (no shell), and PROFILE_DIR is matched in JS,
+ *  so a profile path with quotes/metacharacters can't break or inject a command
  *  (qingyun review, #2133). The match itself lives in ./profile-match.mjs — it
- *  gates a SIGKILL, so it is exact and independently tested. */
+ *  gates a SIGKILL, so it is exact and independently tested.
+ *
+ *  Returns `{known: true, pids}` when the lsof probe can be trusted (including the
+ *  documented exit-1-with-output case), or `{known: false, pids: []}` when it can't —
+ *  permission denied, lsof missing, or our own timeout. Callers MUST fail closed on
+ *  `known: false`: it means "cannot say", never "zero holders" (qingyun, #2133 P1 —
+ *  the prior version collapsed both to an empty list and releaseProfileLock() then
+ *  deleted the singleton files regardless, risking a second Chrome launching against
+ *  a still-active profile). */
 function pidsForProfile() {
   let pgrepOut;
   try {
     pgrepOut = execFileSync('pgrep', ['-fl', 'Google Chrome for Testing'], { encoding: 'utf8' });
   } catch {
-    return []; // pgrep exits 1 when nothing matches
+    return { known: true, pids: [] }; // pgrep exits 1 when nothing matches — confirmed empty
   }
   // WHOSE profile a process holds is answered by open file descriptors, not by argv:
   // `pgrep -fl` has flattened argv, so "--user-data-dir=/p --copy" is equally the single
   // path "/p --copy", and guessing kills an unrelated browser (qingyun, #2133). `+D`
   // scopes the search to this directory, so the kernel decides and nothing is parsed.
-  let holders;
+  // `timeout` bounds the recursive directory walk so a stuck probe can't hang the
+  // lock-release cycle indefinitely (qingyun, #2133 P1).
+  let probe;
   try {
-    holders = pidsFromLsofFields(
-      execFileSync('lsof', ['-w', '-F', 'pn', '+D', PROFILE_DIR], { encoding: 'utf8' }),
-    );
+    const out = execFileSync('lsof', ['-w', '-F', 'pn', '+D', PROFILE_DIR], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    probe = classifyLsofProbe({ threw: false, killed: false, stdout: out });
   } catch (e) {
     // lsof exits 1 even when it PRINTS holders (verified: one holder, output correct,
-    // exit=1). Discarding e.stdout made this decider silently return nothing every run.
-    holders = pidsFromLsofFields(e && e.stdout);
+    // exit=1) — classifyLsofProbe knows that shape. `e.killed` marks our own timeout.
+    probe = classifyLsofProbe({ threw: true, killed: !!(e && e.killed), stdout: e && e.stdout });
   }
-  if (holders.length === 0) {
-    // Nothing holds the profile, or lsof is absent: kill NOTHING. The string predicate
-    // is not a fallback — it cannot decide the ordinary launch shape either, so
-    // offering it would be pretend-safety in front of a SIGKILL.
-    return [];
+  if (!probe.known) return { known: false, pids: [] };
+  if (probe.pids.length === 0) {
+    // Confirmed: nothing holds the profile. Kill NOTHING. The string predicate is not
+    // a fallback — it cannot decide the ordinary launch shape either, so offering it
+    // would be pretend-safety in front of a SIGKILL.
+    return { known: true, pids: [] };
   }
   // AND: hold a file in OUR profile, AND be a Chrome-for-Testing process (not a helper).
   const gcft = new Set(gcftPids(pgrepOut));
-  return holders.filter((pid) => gcft.has(pid));
+  return { known: true, pids: probe.pids.filter((pid) => gcft.has(pid)) };
 }
 
 /** Kill any GCfT holding THIS profile and clear the SingletonLock, so the next
  *  launch (open or Playwright) doesn't collide on the single-instance lock. */
 function releaseProfileLock() {
   try {
-    for (const pid of pidsForProfile()) {
+    for (const pid of pidsForProfile().pids) {
       try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch {}
     }
   } catch {}
   try { execFileSync('sleep', ['1']); } catch {}
   try {
-    for (const pid of pidsForProfile()) {
+    for (const pid of pidsForProfile().pids) {
       try { process.kill(parseInt(pid, 10), 'SIGKILL'); } catch {}
     }
   } catch {}
+  // Only clear the singleton files once a probe taken AFTER the kill pass confirms no
+  // holder remains. An unknown probe (permission denied, lsof missing, our own timeout)
+  // or a holder that survived SIGKILL both mean "cannot say the profile is free" —
+  // deleting the lock then would let a second Chrome launch against a still-active
+  // profile and corrupt its state (qingyun, #2133 P1). Leaving it is a visible,
+  // recoverable "already in use" error on next launch — the same safe direction this
+  // file already commits to for the argv-match predicate in profile-match.mjs.
+  const confirmed = pidsForProfile();
+  if (!confirmed.known || confirmed.pids.length > 0) return;
   try { rmSync(join(PROFILE_DIR, 'SingletonLock'), { force: true }); } catch {}
   try { rmSync(join(PROFILE_DIR, 'SingletonCookie'), { force: true }); } catch {}
   try { rmSync(join(PROFILE_DIR, 'SingletonSocket'), { force: true }); } catch {}
