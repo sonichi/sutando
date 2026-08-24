@@ -29,6 +29,7 @@ markers live in `src/result_markers.py`. Stdlib only, no network, no daemon.
 from __future__ import annotations
 
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -95,8 +96,10 @@ def write_paired_result(results_dir, task_id: str, body: str,
 
     Refuses with ValueError and ZERO writes when the echo does not match.
     `tmp_tag` disambiguates the temp file when several writers share a results
-    directory. The receipt is best-effort: a result already durable on disk must
-    never be rolled back because a diagnostic sidecar could not be written.
+    directory; it defaults to a unique token, because a SHARED temp name lets
+    one writer's os.replace move the file the other is about to replace. The
+    receipt is best-effort: a result already durable on disk must never be
+    rolled back because a diagnostic sidecar could not be written.
     """
     task_id = task_id_from(task_id)
     rest = strip_pairing_echo(task_id, body)
@@ -104,7 +107,7 @@ def write_paired_result(results_dir, task_id: str, body: str,
     results = Path(results_dir)
     results.mkdir(parents=True, exist_ok=True)
     result = results / f"task-{task_id}.txt"
-    suffix = f"-{tmp_tag}" if tmp_tag else ""
+    suffix = f"-{tmp_tag}" if tmp_tag else f"-{os.getpid()}-{secrets.token_hex(8)}"
     tmp = results / f".task-{task_id}.txt.tmp{suffix}"
     tmp.write_text(rest)
     os.replace(tmp, result)

@@ -102,7 +102,12 @@ class PairedResultWriteTests(unittest.TestCase):
         finally:
             result_write.os.replace = real_replace
         self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0][0].endswith(".tmp"), calls[0][0])
+        # Assert the PROPERTY, not the spelling — `.endswith(".tmp")` also
+        # failed for any caller passing tmp_tag, so it never held generally.
+        src = Path(calls[0][0])
+        self.assertEqual(src.parent, self.results, calls[0][0])
+        self.assertTrue(src.name.startswith(".task-a1.txt.tmp"), calls[0][0])
+        self.assertNotEqual(src, self.results / "task-a1.txt")
         self.assertEqual((self.results / "task-a1.txt").read_text(), "replacement\n")
 
     def test_empty_body_refused(self):
@@ -297,6 +302,88 @@ class ReceiptFailuresDoNotLoseTheResult(unittest.TestCase):
         results, receipts = result_write._resolve_dirs({})
         self.assertEqual(results.name, "results")
         self.assertEqual(receipts.parts[-2:], result_write.RECEIPTS_SUBPATH)
+
+
+
+class ConcurrentDefaultWritersTest(unittest.TestCase):
+    """Two writers with no explicit tmp_tag must not share a temp path: the
+    first os.replace would move the file the second is about to replace."""
+
+    def _race(self, tags):
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            results = Path(td)
+            barrier = threading.Barrier(2)
+            real = result_write.os.replace
+
+            def synced(src, dst):
+                # Hold both writers until each has created its temp file, so
+                # the collision is deterministic rather than timing-dependent.
+                barrier.wait(timeout=10)
+                return real(src, dst)
+
+            out, errs = [], []
+
+            def go(tag):
+                try:
+                    out.append(result_write.write_paired_result(
+                        results, "race", "task: race\nbody\n", tmp_tag=tag))
+                except Exception as e:      # noqa: BLE001 — recorded, not raised
+                    errs.append(type(e).__name__)
+
+            result_write.os.replace = synced
+            try:
+                ts = [threading.Thread(target=go, args=(t,)) for t in tags]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(timeout=20)
+            finally:
+                result_write.os.replace = real
+            return len(out), errs
+
+    def test_default_tags_do_not_collide(self):
+        returned, errs = self._race(["", ""])
+        self.assertEqual(errs, [], "concurrent default writers lost a write")
+        self.assertEqual(returned, 2)
+
+    def test_explicit_tags_still_work(self):
+        returned, errs = self._race(["core-1", "core-2"])
+        self.assertEqual(errs, [])
+        self.assertEqual(returned, 2)
+
+    def test_the_race_harness_can_actually_fail(self):
+        """Control: force the pre-fix shared name and the collision appears."""
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            results = Path(td)
+            barrier = threading.Barrier(2)
+            real = result_write.os.replace
+            errs = []
+
+            def synced(src, dst):
+                barrier.wait(timeout=10)
+                return real(src, dst)
+
+            def go():
+                try:
+                    # the shared name the default used to produce
+                    result_write.write_paired_result(results, "race",
+                                           "task: race\nbody\n", tmp_tag="shared")
+                except Exception as e:      # noqa: BLE001
+                    errs.append(type(e).__name__)
+
+            result_write.os.replace = synced
+            try:
+                ts = [threading.Thread(target=go) for _ in range(2)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(timeout=20)
+            finally:
+                result_write.os.replace = real
+        self.assertIn("FileNotFoundError", errs,
+                      "harness cannot produce the collision it claims to prevent")
 
 
 if __name__ == "__main__":
