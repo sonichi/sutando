@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""`bridges.discord_post_gate` as a {channel_id: path} map routes each send
+to its own policy FILE, and a broken entry refuses only its own channel.
+
+The single-path form is what shipped; a deployment needing #dev gated
+differently from #gtm had to put both rulesets in one file and branch inside
+`validate`. This proves the map form works AND that it does not weaken the
+two properties the single-path form guaranteed:
+
+  - a configured-but-unloadable policy still fails CLOSED, and
+  - a load failure does not spread past the channel that named it.
+
+The one property it deliberately CHANGES is stated as its own case: a channel
+matched by neither an id nor `*` is ungated. That is the point of a map, and
+a test that did not pin it would let the widening happen silently.
+
+Run: python3 tests/discord-post-gate-per-channel.test.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
+os.environ["SUTANDO_TEST_MODE"] = "1"
+os.environ.pop("SUTANDO_DISCORD_POST_GATE", None)
+
+import channels.discord.post_gate as dpg  # noqa: E402
+
+FAILS = []
+
+
+def check(name, cond, detail=""):
+    print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILS.append(name)
+
+
+D = Path(tempfile.mkdtemp(prefix="pg-per-channel-"))
+(D / "refuse.py").write_text(
+    "def validate(channel_id, payload):\n    return 'refused-by-A'\n", encoding="utf-8")
+(D / "allow.py").write_text(
+    "def validate(channel_id, payload):\n    return None\n", encoding="utf-8")
+(D / "broken.py").write_text("raise RuntimeError('boom')\n", encoding="utf-8")
+(D / "star.py").write_text(
+    "def validate(channel_id, payload):\n    return 'refused-by-STAR'\n", encoding="utf-8")
+
+
+def resolve(mapping):
+    """resolve_validator with `mapping` as the config value."""
+    orig = dpg._configured_target
+    dpg._configured_target = lambda repo_root=None: mapping
+    try:
+        return dpg.resolve_validator()
+    finally:
+        dpg._configured_target = orig
+
+
+P = {"content": "x"}
+
+# --- the feature: two channels, two FILES -------------------------------
+v = resolve({"111": str(D / "refuse.py"), "222": str(D / "allow.py")})
+check("mapped channel 111 refuses via its own file", v("111", P) == "refused-by-A", repr(v("111", P)))
+check("mapped channel 222 allows via its own file", not v("222", P), repr(v("222", P)))
+check("int channel id resolves like its str form", v(111, P) == "refused-by-A", repr(v(111, P)))
+
+# --- `*` fallback --------------------------------------------------------
+v = resolve({"111": str(D / "allow.py"), "*": str(D / "star.py")})
+check("unlisted channel falls back to `*`", v("999", P) == "refused-by-STAR", repr(v("999", P)))
+check("listed channel is NOT overridden by `*`", not v("111", P), repr(v("111", P)))
+
+# --- the deliberate widening, pinned ------------------------------------
+v = resolve({"111": str(D / "refuse.py")})
+check("no id match and no `*` is UNGATED (documented)", v("999", P) is None, repr(v("999", P)))
+check("...while the mapped channel still refuses", v("111", P) == "refused-by-A")
+
+# --- a broken entry fails closed for ITS channel only --------------------
+v = resolve({"111": str(D / "broken.py"), "222": str(D / "allow.py")})
+r = v("111", P)
+check("broken policy refuses its own channel", isinstance(r, str) and "failed to load" in r, repr(r))
+check("broken policy does NOT refuse a sibling channel", not v("222", P), repr(v("222", P)))
+r = v("111", P)
+check("refusal names the failing path", isinstance(r, str) and "broken.py" in r, repr(r))
+
+# --- a mapping naming nothing is configured-but-empty, not unconfigured --
+for empty in ({}, {"111": ""}, {"111": None}):
+    r = resolve(empty)
+    got = r("111", P) if callable(r) else r
+    check(f"empty mapping {empty!r} fails CLOSED, never None",
+          callable(r) and isinstance(got, str) and "names no policy path" in got, repr(got))
+
+# --- regression: the single-path form is unchanged -----------------------
+v = resolve(str(D / "refuse.py"))
+check("string path still gates every channel (regression)",
+      v("111", P) == "refused-by-A" and v("999", P) == "refused-by-A")
+check("unconfigured empty string still resolves to None (regression)",
+      resolve("") is None, repr(resolve("")))
+r = resolve(str(D / "broken.py"))
+check("string path to a broken policy still fails closed (regression)",
+      callable(r) and "failed to load" in r("111", P))
+
+# --- env override stays a single GLOBAL path -----------------------------
+os.environ["SUTANDO_DISCORD_POST_GATE"] = str(D / "refuse.py")
+try:
+    t = dpg._configured_target()
+    check("env override returns a str, never a mapping", isinstance(t, str), repr(t))
+    check("env override wins over a config mapping", t == str(D / "refuse.py"))
+finally:
+    os.environ.pop("SUTANDO_DISCORD_POST_GATE", None)
+
+print(("\nFAILED: " + ", ".join(FAILS)) if FAILS else "\nAll per-channel post-gate checks passed.")
+sys.exit(1 if FAILS else 0)
