@@ -98,6 +98,23 @@ def evaluate(pins: list, service: str, lstart_by_pid: dict, now_ts: float) -> li
     return out
 
 
+def stale_verdict(results: list, age_min: int) -> tuple:
+    """(status, detail) for a process the mtime check has already called stale.
+
+    One decision for every call site: an armed pin yields `warn` (so a
+    `status == "stale"` auto-restart skips it structurally), and any pin that
+    stopped matching is appended to the still-stale detail rather than dropped.
+    """
+    armed = armed_detail(results)
+    if armed:
+        return ("warn", f"code is {age_min} min newer than process, but {armed}")
+    detail = (f"running but code is {age_min} min newer than process "
+              "\u2014 restart needed")
+    for _verdict, _pin, note in results:
+        detail += f" [{note}]"
+    return ("stale", detail)
+
+
 def armed_detail(results: list):
     """The first ARMED detail, or None. A caller uses this to REPLACE a
     `restart needed` prescription; non-armed results must still be surfaced."""

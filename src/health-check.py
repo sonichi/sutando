@@ -3758,21 +3758,11 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
             # bump — the running code is still current.
             if _file_unchanged_since(src_file, proc_start):
                 return
-            age_min = int((src_mtime - proc_start) / 60)
-            pin_notes = _pin_verdicts(service or check.get("name") or "", lstart_by_pid)
-            armed = process_pins.armed_detail(pin_notes)
-            if armed:
-                # The tree moved BACKWARD past this process. Restarting adopts the
-                # tree and discards what only exists in the running process.
-                check["status"] = "warn"
-                check["detail"] = f"code is {age_min} min newer than process, but {armed}"
-                return
-            check["status"] = "stale"
-            check["detail"] = f"running but code is {age_min} min newer than process — restart needed"
-            for _v, _p, note in pin_notes:
-                # A pin that stopped matching is a finding: it means the thing it
-                # protected is already gone, and silence would hide that.
-                check["detail"] += f" [{note}]"
+            # An armed pin means the tree moved BACKWARD past this process:
+            # restarting adopts the tree and discards what only the process has.
+            check["status"], check["detail"] = process_pins.stale_verdict(
+                _pin_verdicts(service or check.get("name") or "", lstart_by_pid),
+                int((src_mtime - proc_start) / 60))
     except (subprocess.TimeoutExpired, OSError):
         pass
 
@@ -9206,19 +9196,11 @@ def run_all_checks() -> list[dict]:
                         # for voice-agent + web-client via mark_stale_if_outdated,
                         # this path does the same check inline to reach bridges.
                         if not _file_unchanged_since(src_file, proc_start):
-                            age_min = int((src_mtime - proc_start) / 60)
-                            # Same pin policy as mark_stale_if_outdated; this path
-                            # recomputes staleness inline, so it must ask too.
-                            notes = _pin_verdicts(name, {pids[0]: ps_out})
-                            armed = process_pins.armed_detail(notes)
-                            if armed:
-                                status = "warn"
-                                detail = f"code is {age_min} min newer than process, but {armed}"
-                            else:
-                                status = "stale"
-                                detail = f"running but code is {age_min} min newer than process — restart needed"
-                                for _v, _p, note in notes:
-                                    detail += f" [{note}]"
+                            # Same pin decision as mark_stale_if_outdated; this
+                            # path recomputes staleness inline, so it must ask too.
+                            status, detail = process_pins.stale_verdict(
+                                _pin_verdicts(name, {pids[0]: ps_out}),
+                                int((src_mtime - proc_start) / 60))
         except (subprocess.TimeoutExpired, ValueError, OSError):
             pass
 

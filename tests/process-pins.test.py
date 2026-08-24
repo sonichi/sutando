@@ -91,6 +91,30 @@ with tempfile.TemporaryDirectory() as td:
     good.write_text(json.dumps({"pins": [pin(), "junk"]}))
     check("valid file loads only dict entries", len(pp.load_pins(good)) == 1)
 
+# --- stale_verdict: the ONE decision both health-check call sites delegate to
+r = pp.evaluate([pin()], "discord-bridge", LIVE, NOW)
+st, det = pp.stale_verdict(r, 821)
+check("stale_verdict armed -> warn, never stale", st == "warn")
+check("stale_verdict armed -> keeps the age and the reason",
+      "821 min" in det and "DO NOT RESTART" in det)
+
+st, det = pp.stale_verdict([], 821)
+check("stale_verdict no pins -> stale + restart needed",
+      st == "stale" and "restart needed" in det)
+check("stale_verdict no pins -> no bracketed note", "[" not in det)
+
+st, det = pp.stale_verdict(pp.evaluate([pin(expires_at=PAST)], "discord-bridge", LIVE, NOW), 5)
+check("stale_verdict expired -> still stale", st == "stale")
+check("stale_verdict expired -> surfaces the lost pin", "expired" in det)
+
+# A naive (tz-less) expiry must be read as UTC, not crash or read as eternal.
+naive_past = datetime.fromtimestamp(NOW, timezone.utc).replace(tzinfo=None) - timedelta(days=1)
+r = pp.evaluate([pin(expires_at=naive_past.isoformat())], "discord-bridge", LIVE, NOW)
+check("naive expires_at is treated as UTC and expires", [v for v, _, _ in r] == [pp.EXPIRED])
+naive_future = datetime.fromtimestamp(NOW, timezone.utc).replace(tzinfo=None) + timedelta(days=1)
+r = pp.evaluate([pin(expires_at=naive_future.isoformat())], "discord-bridge", LIVE, NOW)
+check("naive future expires_at still arms", [v for v, _, _ in r] == [pp.ARMED])
+
 # --- controls: the evaluator can produce both polarities --------------------
 check("control: ARMED is reachable",
       pp.armed_detail(pp.evaluate([pin()], "discord-bridge", LIVE, NOW)) is not None)
@@ -114,7 +138,11 @@ def _drive(pins_on_disk, live_lstart):
         if "/usr/bin/pgrep" in argv[0]:
             out = "\n".join(live_lstart) + "\n"
         elif "/bin/ps" in argv[0]:
-            out = "\n".join(f"{pid} {ls}" for pid, ls in live_lstart.items()) + "\n"
+            # A blank line and an unparseable one must be skipped, not crash and
+            # not key a pin — ps output is not guaranteed clean.
+            rows = ["", "   not a timestamp   "]
+            rows += [f"{pid} {ls}" for pid, ls in live_lstart.items()]
+            out = "\n".join(rows) + "\n"
         return types.SimpleNamespace(stdout=out, returncode=0)
 
     orig_run, orig_filter, orig_unchanged, orig_pins = (
@@ -163,6 +191,11 @@ with tempfile.TemporaryDirectory() as td:
 c = _drive([], {"87258": LSTART})
 check("wiring: no pin -> unchanged stale prescription", c["status"] == "stale")
 check("wiring: no pin -> no pin noise in the detail", "[" not in c["detail"])
+
+# The ps parser takes `pid lstart` AND a bare lstart; only the first can key a
+# pin, so a bare-lstart fixture fails toward no suppression.
+c = _drive([pin()], {"87258": LSTART})
+check("ps `pid lstart` shape keys the pin", "DO NOT RESTART" in c["detail"])
 
 print(f"\n{len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
