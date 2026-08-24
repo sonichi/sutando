@@ -49,10 +49,16 @@ check("does NOT tell you to stop it", "stop them" not in v["detail"], v["detail"
 check("says do NOT stop it", "Do NOT stop it" in v["detail"], v["detail"])
 check("names the live parent", "ppid 12626" in v["detail"], v["detail"])
 
+def says_stop(detail):
+    """A stop REMEDY, not the substring. 'Do NOT stop them' contains 'stop
+    them', so a bare `in` check passes on the opposite verdict — it did."""
+    return "Stop those" in detail and "Do NOT stop" not in detail
+
+
 print("single REPARENTED watcher (a true orphan):")
 v2 = _verdict({"555": {"555"}}, {"555": "1"})
 check("keeps the orphan verdict", "orphaned" in v2["detail"], v2["detail"])
-check("keeps the stop remedy", "stop them" in v2["detail"], v2["detail"])
+check("keeps the stop remedy", says_stop(v2["detail"]), v2["detail"])
 
 print("single watcher with UNKNOWN parent (must stay an orphan):")
 # An unknown ppid cannot support "runs under a live session" — saying so would
@@ -61,10 +67,19 @@ vU = _verdict({"9000": {"9000"}}, {})
 check("keeps the orphan verdict", "orphaned" in vU["detail"], vU["detail"])
 check("does not claim a live session", "live session" not in vU["detail"], vU["detail"])
 
-print("TWO supervised watchers (duplicates are still a real problem):")
+print("TWO supervised watchers (a pool, not duplicates — BEHAVIOUR CHANGE):")
+# A pool runs one watcher per core and the claim protocol dedups, so a second
+# SUPERVISED tree is not a duplicate. This block used to assert the opposite.
 v3 = _verdict({"100": {"100"}, "200": {"200"}}, {"100": "99", "200": "98"})
-check("keeps the orphan/stop verdict for 2 trees", "stop them" in v3["detail"], v3["detail"])
-check("counts both", "2 orphaned" in v3["detail"], v3["detail"])
+check("does NOT tell you to stop a pool", not says_stop(v3["detail"]), v3["detail"])
+check("says leave them alone", "Do NOT stop them" in v3["detail"], v3["detail"])
+check("counts both trees", "2 watcher trees" in v3["detail"], v3["detail"])
+check("names both roots", "100" in v3["detail"] and "200" in v3["detail"], v3["detail"])
+
+print("TWO watchers, both REPARENTED (genuine duplicates — unchanged):")
+v3b = _verdict({"100": {"100"}, "200": {"200"}}, {"100": "1", "200": "1"})
+check("still says stop", says_stop(v3b["detail"]), v3b["detail"])
+check("counts both orphans", "2 of 2 are orphaned" in v3b["detail"], v3b["detail"])
 
 print("no watchers at all (unchanged):")
 v4 = _verdict({}, {})

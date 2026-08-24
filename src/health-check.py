@@ -6894,9 +6894,10 @@ def check_task_watcher() -> dict:
                                   f"tasks/. Re-stamp the sentinel with --fix"}
             return {"name": name, "status": "warn",
                     "detail": f"{len(roots)} watcher trees running with no PID sentinel — "
-                              f"{len(unowned)} of {len(roots)} have NO live owning session (root "
-                              f"pids {', '.join(unowned)}); duplicates process each task more than "
-                              f"once. Stop those" + _owned_clause(supervised)}
+                              f"{len(unowned)} of {len(roots)} are orphaned, with NO live owning "
+                              f"session (root pids {', '.join(unowned)}); tasks/ IS being drained, "
+                              f"but duplicates process each task more than once. Stop those"
+                              + _owned_clause(supervised)}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
@@ -6919,9 +6920,9 @@ def check_task_watcher() -> dict:
                                   f"these are legitimate. Do NOT stop them: tasks/ IS being drained"}
             return {"name": name, "status": "warn",
                     "detail": f"sentinel pid {pid} is dead; {len(unowned)} of {len(roots)} watcher "
-                              f"tree(s) have NO live owning session (root pids "
-                              f"{', '.join(unowned)}); duplicates process each task more than once. "
-                              f"Stop those" + _owned_clause(owned)}
+                              f"tree(s) are orphaned, with NO live owning session (root pids "
+                              f"{', '.join(unowned)}) — tasks/ IS being drained, but duplicates "
+                              f"process each task more than once. Stop those" + _owned_clause(owned)}
         return {"name": name, "status": "warn",
                 "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
     if "watch-tasks-stream" not in argv:
