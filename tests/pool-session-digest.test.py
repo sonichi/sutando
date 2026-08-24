@@ -171,23 +171,49 @@ class DiscoveryTest(unittest.TestCase):
         payload = '[{"name": "core-1", "sessionId": "abc", "status": "busy", "pid": 1}]'
         with unittest.mock.patch.object(subprocess, "run",
                                         return_value=self._run_result(stdout=payload)):
-            self.assertEqual(digest_mod.live_sessions()[0]["name"], "core-1")
+            sessions, reason = digest_mod.live_sessions()
+            self.assertIsNone(reason)
+            self.assertEqual(sessions[0]["name"], "core-1")
 
-    def test_live_sessions_empty_on_nonzero_exit(self):
-        with unittest.mock.patch.object(subprocess, "run",
-                                        return_value=self._run_result(rc=1, stdout="")):
-            self.assertEqual(digest_mod.live_sessions(), [])
-
-    def test_live_sessions_empty_on_unparsable_output(self):
-        with unittest.mock.patch.object(subprocess, "run",
-                                        return_value=self._run_result(stdout="not json")):
-            self.assertEqual(digest_mod.live_sessions(), [])
-
-    def test_live_sessions_empty_when_cli_missing_or_hangs(self):
-        for exc in (FileNotFoundError("claude"), subprocess.TimeoutExpired("claude", 30)):
+    def test_every_discovery_failure_is_distinguishable(self):
+        """These all used to return [] — so "none running" and "the CLI is
+        gone/hung/unauthenticated" rendered identically on a liveness tool."""
+        run_cases = {
+            "empty":     self._run_result(stdout="[]"),
+            "auth":      self._run_result(rc=2, stdout=""),
+            "not json":  self._run_result(stdout="<html>502</html>"),
+            "dict":      self._run_result(stdout='{"sessions": []}'),
+            "non-dicts": self._run_result(stdout='["core-1"]'),
+        }
+        raise_cases = {
+            "missing":   FileNotFoundError(2, "No such file"),
+            "denied":    PermissionError(13, "Permission denied"),
+            "timeout":   subprocess.TimeoutExpired("claude", 30),
+        }
+        reasons = {}
+        for label, result in run_cases.items():
+            with unittest.mock.patch.object(subprocess, "run", return_value=result):
+                sessions, reasons[label] = digest_mod.live_sessions()
+                self.assertEqual(sessions, [], label)
+        for label, exc in raise_cases.items():
             with unittest.mock.patch.object(subprocess, "run", side_effect=exc):
-                self.assertEqual(digest_mod.live_sessions(), [],
-                                 f"{type(exc).__name__} must not propagate")
+                sessions, reasons[label] = digest_mod.live_sessions()
+                self.assertEqual(sessions, [], f"{label} must not propagate")
+
+        self.assertIsNone(reasons["empty"],
+                          "a CLEAN answer of zero sessions is not a failure")
+        failures = {k: v for k, v in reasons.items() if k != "empty"}
+        self.assertTrue(all(failures.values()), f"a failure carried no reason: {failures}")
+        self.assertEqual(len(set(failures.values())), len(failures),
+                         f"two failure modes share a message: {failures}")
+
+    def test_wrong_shape_does_not_reach_the_caller(self):
+        """{"sessions": []} parses, then raises AttributeError on the first .get()."""
+        with unittest.mock.patch.object(subprocess, "run",
+                                        return_value=self._run_result(stdout='{"sessions": []}')):
+            sessions, reason = digest_mod.live_sessions()
+        self.assertEqual(sessions, [])
+        self.assertIn("list", reason)
 
     def test_find_transcript_locates_by_session_id_else_none(self):
         proj = self.cfg / "projects" / "-some-slug"
@@ -214,11 +240,12 @@ class MainTest(unittest.TestCase):
                "message": {"content": [{"type": "text", "text": "did a thing"}]}}
         (self.proj / f"{sid}.jsonl").write_text(json.dumps(rec) + "\n")
 
-    def _main(self, argv, sessions):
+    def _main(self, argv, sessions, reason=None):
         out = io.StringIO()
         err = io.StringIO()
         with unittest.mock.patch.object(sys, "argv", ["prog", *argv]), \
-             unittest.mock.patch.object(digest_mod, "live_sessions", return_value=sessions), \
+             unittest.mock.patch.object(digest_mod, "live_sessions",
+                                        return_value=(sessions, reason)), \
              unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = digest_mod.main()
@@ -235,6 +262,14 @@ class MainTest(unittest.TestCase):
         rc, _, err = self._main([], [])
         self.assertEqual(rc, 1)
         self.assertIn("no live sessions", err)
+
+    def test_broken_discovery_exits_differently_from_an_empty_pool(self):
+        rc_broken, _, err_broken = self._main([], [], reason="`claude` is not on PATH")
+        rc_empty, _, err_empty = self._main([], [])
+        self.assertEqual(rc_broken, 2, "a broken CLI must not look like an idle pool")
+        self.assertNotEqual(rc_broken, rc_empty)
+        self.assertIn("not on PATH", err_broken)
+        self.assertNotEqual(err_broken, err_empty)
 
     def test_session_filter_matches_and_misses(self):
         self._transcript()

@@ -40,20 +40,38 @@ def config_dir() -> Path:
     return claude_home_path()
 
 
-def live_sessions() -> "list[dict]":
-    """Sessions from `claude agents --json`. Empty list if the CLI is absent —
-    a digest of nothing beats a traceback in an ops script."""
+def live_sessions() -> "tuple[list[dict], str | None]":
+    """(sessions, reason). `reason` is None ONLY when the CLI answered cleanly.
+
+    Every failure used to return [], so "no sessions running" and "the CLI is
+    gone / hung / unauthenticated / speaking HTML" rendered identically — on a
+    tool whose job is telling an operator whether cores are alive.
+    """
     try:
         out = subprocess.run(["claude", "agents", "--json"],
                              capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+    except FileNotFoundError:
+        return [], "`claude` is not on PATH"
+    except subprocess.TimeoutExpired:
+        return [], "`claude agents --json` timed out after 30s"
+    except OSError as exc:
+        return [], f"could not run `claude`: {exc.strerror or exc}"
     if out.returncode != 0:
-        return []
+        detail = _one_line(out.stderr or out.stdout, 120) or "no output"
+        return [], f"`claude agents --json` exited {out.returncode}: {detail}"
     try:
-        return json.loads(out.stdout)
+        data = json.loads(out.stdout)
     except json.JSONDecodeError:
-        return []
+        return [], f"`claude agents --json` was not JSON: {_one_line(out.stdout, 120)!r}"
+    # Shape matters as much as parseability: {"sessions": []} parses fine and
+    # then raises AttributeError on the first .get() downstream.
+    if not isinstance(data, list):
+        return [], f"expected a JSON list of session objects, got {type(data).__name__}"
+    bad = next((d for d in data if not isinstance(d, dict)), None)
+    if bad is not None:
+        return [], ("expected a JSON list of session OBJECTS, got a list "
+                    f"containing {type(bad).__name__}")
+    return data, None
 
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -182,9 +200,13 @@ def main() -> int:
     ap.add_argument("--thinking", action="store_true", help="include reasoning")
     a = ap.parse_args()
 
-    sessions = live_sessions()
+    sessions, reason = live_sessions()
+    if reason is not None:
+        print(f"could not list sessions: {reason}", file=sys.stderr)
+        return 2                      # distinct from "asked, answered, none"
     if not sessions:
-        print("no live sessions (is `claude` on PATH?)", file=sys.stderr)
+        print("no live sessions (the CLI answered, none are running)",
+              file=sys.stderr)
         return 1
     if a.session:
         needle = a.session.lower()
