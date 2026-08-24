@@ -40,6 +40,54 @@ def write_fence(root: Path, epoch: str) -> None:
     os.replace(tmp, p)
 
 
+def _stage(c, path: Path, data: bytes) -> None:
+    """Publish `path` by rename, never by writing the final name in place.
+    A crash mid-write otherwise leaves a truncated file that every
+    `if not path.exists()` idempotence check reads as already-written.
+    Staged inside C's tmp/ under a unique name: a leftover beside the
+    published names would both block the retry and satisfy verification."""
+    import time as _time
+    from .backend_c import TMP as _TMP
+    tmp = c._d(_TMP) / f"import{os.getpid()}.{_time.time_ns()}.tmp"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        off = 0
+        while off < len(data):
+            off += os.write(fd, data[off:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def _same_bytes(path: Path, payload: bytes) -> bool:
+    try:
+        return path.read_bytes() == payload
+    except OSError:
+        return False
+
+
+def _receipt_matches(records, rec) -> bool:
+    """A terminal record proves THIS A record migrated only if it carries
+    that record's receipt. Otherwise C is holding an earlier cycle's."""
+    want = (rec.get("provider"), rec.get("destination"))
+    for r in records:
+        got = r.get("receipt") or {}
+        if (got.get("provider"), got.get("destination")) == want:
+            return True
+    return False
+
+
+def _attempts_intact(ap: Path) -> bool:
+    """An attempts file counts as written only if it parses as the integer
+    it is supposed to hold — a legacy truncated file must be repaired."""
+    try:
+        int(ap.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def classify_legacy_sentinel(
         receipt_ref: Optional[str]) -> DeliveryOutcome:
     """Sentinel-mapping table (normative). receipt_ref is the provider's
@@ -122,6 +170,7 @@ def import_a_state(root: Path) -> dict:
     root = Path(root)
     items_dir = root / ".items"
     migrated_dir = root / ".items-migrated"
+    conflicts: list = []
     report = {"ready": 0, "parked": 0, "delivered": 0, "unknown": 0,
               "skipped": 0, "verified": False, "fenced": False}
     # Import is defined ONLY for epoch A. Already-C is an explicit no-op;
@@ -183,7 +232,7 @@ def import_a_state(root: Path) -> dict:
             key = _safe_key(f.stem)
             marker = c._d("undelivered") / f"{key}{SEP}import-invalid-file{SEP}import"
             if not marker.exists():
-                marker.write_bytes(b"")
+                _stage(c, marker, b"")
                 report["unknown"] += 1
             else:
                 report["skipped"] += 1
@@ -199,14 +248,14 @@ def import_a_state(root: Path) -> dict:
             if marker.exists():
                 report["skipped"] += 1       # idempotent: one marker per record
             else:
-                marker.write_bytes(f.read_bytes() if f.exists() else b"")
+                _stage(c, marker, f.read_bytes() if f.exists() else b"")
                 report["unknown"] += 1
             continue
         if f.stem != _a_key(rec["item_id"]):
             key = _safe_key(f.stem)
             marker = c._d("undelivered") / f"{key}{SEP}import-name-mismatch{SEP}import"
             if not marker.exists():
-                marker.write_bytes(f.read_bytes())
+                _stage(c, marker, f.read_bytes())
                 report["unknown"] += 1
             else:
                 report["skipped"] += 1
@@ -218,8 +267,10 @@ def import_a_state(root: Path) -> dict:
         n = int(rec.get("attempts", 0) or 0)
         if n:
             ap = c._attempts_path(key)
-            if not ap.exists():
-                ap.write_text(str(n))
+            # Existence alone is not proof of a complete write: a pre-staging
+            # crash could leave a truncated file at the final name. Repair it.
+            if not _attempts_intact(ap):
+                _stage(c, ap, str(n).encode())
         from . import contract as _contract  # noqa: F401 — outcome names below
         import ag2_sparrow.outbox as _outbox
         claim = _outbox.read_delivery_claim(root, item_id)
@@ -228,8 +279,14 @@ def import_a_state(root: Path) -> dict:
             if dst.exists():
                 # A colliding NAME is not membership: only a record passing
                 # C's total validator for THIS id counts; else fail closed.
-                if read_terminal_records(root, item_id):
-                    report["skipped"] += 1
+                _recs = read_terminal_records(root, item_id)
+                if _recs:
+                    # Presence proves SOME cycle imported this key, not
+                    # THIS A record; a republish would serve the old receipt.
+                    if _receipt_matches(_recs, rec):
+                        report["skipped"] += 1
+                    else:
+                        conflicts.append(key)
                     continue
                 report["unmigratable"] = (
                     f"terminal collision for {key} is not valid proof")
@@ -243,7 +300,7 @@ def import_a_state(root: Path) -> dict:
                 if marker.exists():
                     report["skipped"] += 1
                 else:
-                    marker.write_bytes(payload)
+                    _stage(c, marker, payload)
                     report["unknown"] += 1
                 continue
             c._write_terminal(key, {
@@ -261,20 +318,27 @@ def import_a_state(root: Path) -> dict:
             reason = _safe_component(str(rec.get("reason") or "parked")[:40])
             marker = c._d("undelivered") / f"{key}{SEP}{reason}{SEP}import"
             if marker.exists():
-                report["skipped"] += 1
+                if _same_bytes(marker, payload):
+                    report["skipped"] += 1
+                else:
+                    conflicts.append(key)
             else:
-                marker.write_bytes(payload)
+                _stage(c, marker, payload)
                 report["parked"] += 1
         elif claim is not None:
             marker = c._d("undelivered") / f"{key}{SEP}import-outcome-unknown{SEP}import"
             if marker.exists():
                 report["skipped"] += 1
             else:
-                marker.write_bytes(payload)
+                _stage(c, marker, payload)
                 report["unknown"] += 1
         else:
-            if (c._d("ready") / key).exists():
-                report["skipped"] += 1
+            rp = c._d("ready") / key
+            if rp.exists():
+                if _same_bytes(rp, payload):
+                    report["skipped"] += 1
+                else:
+                    conflicts.append(key)
             elif c.publish(item_id, payload):
                 report["ready"] += 1
             else:
@@ -321,6 +385,11 @@ def import_a_state(root: Path) -> dict:
             continue
         if not present:
             missing.append(k)
+    if conflicts:
+        # C holds a DIFFERENT representation for these keys: skipping serves
+        # the stale one, and overwriting a receipt is not the importer's call.
+        report["conflicts"] = sorted(set(conflicts))[:5]
+        return report
     if missing:
         report["missing"] = missing[:5]
         return report                        # fence NOT written; re-run resumes
