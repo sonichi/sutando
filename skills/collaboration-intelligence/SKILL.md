@@ -297,7 +297,7 @@ key bounds escalation to a single message without borrowing the repair steps' ke
 6. Update the record idempotently. Preserve contradictory evidence; do not silently overwrite it.
 7. Use the map to choose the smallest useful collaboration set. Prefer the responsible agent; cc its owner or relevant human when accountability, approval, ambiguity, or risk requires it.
 8. Report material changes: unfamiliar participants, ownership changes, conflicting identity claims, stale room purpose, or newly inferred sensitive relationships.
-9. **PR notification contract (owner rule 2026-08-23): whenever the messaging tests below fire for a PR, the message must be both SOLICITED and NOTIFIED — address each reviewer's Sutando Stand on the channels where they actually are.** This item defines what ADDRESSING means; it does not define when to send. **The trigger is owned solely by "The trigger to message is a state change the other party would want to know about" below** — opening a PR, a new head needing re-review, an addressed finding, a changed direction, or the ownership horizon. A cosmetic title, body, or label edit fires nothing, and each trigger fires once: an unchanged gap is not re-announced. Stating the trigger in two places is what let this item drift into commanding a duplicate solicitation on every edit. Soliciting and notifying are two acts, not one: soliciting is the GitHub review request; notifying is the addressed message that reaches the Stand. A review request alone is not notification — the review-request queue is where PRs stall. Send the notification where that Stand is present rather than wherever you happen to be: check the map for its live channels and honour `exclusive: true`, since a message on a surface it does not read reaches nobody. "Addressed to" means an action that reaches the Stand and triggers it: an **explicit @-mention** in a channel that supports it (Matrix: the literal `@<agent-mxid>` string, e.g. `@sutando-rui:ag2.space` — resolver handles are unreliable, use the mxid; Discord: `<@numeric-id>`), or a **reply-to** on a message from that Stand. Plain-text names are not addressing (measured 2026-08-23: a plain "rui / Chi:" Triage post drew nothing; the agent-mxid mention produced two formal reviews within the hour). Route via the map: find each reviewer's Stand/agent identity and its supported channels there, not from recall; record who actually responded back into the map.
+9. **PR notification contract (owner rule 2026-08-23): whenever the messaging tests below fire for a PR, the message must be both SOLICITED and NOTIFIED — addressed to each reviewer's Sutando Stand on the channels where they actually are.** This item defines what ADDRESSING means; it does not define when to send. **The trigger is owned solely by "The trigger to message is a state change the other party would want to know about" below** — opening a PR, a new head needing re-review, an addressed finding, a changed direction, or the ownership horizon. A cosmetic title, body, or label edit fires nothing, and each trigger fires once: an unchanged gap is not re-announced. Stating the trigger here as well as there is what let this item drift into commanding a duplicate solicitation on every edit. Soliciting and notifying are two acts, not one: soliciting is the GitHub review request; notifying is the addressed message that reaches the Stand. A review request alone is not notification — the review-request queue is where PRs stall. Send the notification where that Stand is present rather than wherever you happen to be: check the map for its live channels and honour `exclusive: true`, since a message on a surface it does not read reaches nobody. "Addressed to" means an action that reaches the Stand and triggers it: an **explicit @-mention** in a channel that supports it (Matrix: the literal `@<agent-mxid>` string, e.g. `@sutando-rui:ag2.space` — resolver handles are unreliable, use the mxid; Discord: `<@numeric-id>`), or a **reply-to** on a message from that Stand. Plain-text names are not addressing (measured 2026-08-23: a plain "rui / Chi:" Triage post drew nothing; the agent-mxid mention produced two formal reviews within the hour). **Mentioning the HUMAN is also not addressing the Stand** — correct mention syntax with the person's id notifies the person and triggers nothing (second failure shape, owner-corrected 2026-08-23: `<@Chi> <@kewei>` in #game had to be re-sent as `<@Sutando-Mini> <@kewei-agent>`). And a mention that REACHES a Stand still only *triggers* it if the sender is on that Stand's allowlist (Sutando-Mini bounced an off-allowlist mention with an automated notice) — for action-triggering, confirm allowlist standing first or route through the owner. Route via the map: find each reviewer's Stand/agent identity and its supported channels there, not from recall; record who actually responded back into the map. **Use `scripts/notify_reviewers.py` for the send** — it resolves each reviewer through the roster (`<workspace>/data/collaboration-intelligence/reviewer-stands.json`) and refuses unknown names, human-only targets, and known-off-allowlist Stands, so the rule holds even when acted from momentum.
 
 ## Quick lookup index
 
@@ -387,6 +387,56 @@ Keep stable team relationships separate from short-lived work-item collaboration
 - A short burst of PR collaboration can strengthen expertise evidence, but must not overwrite the underlying team relationship.
 
 Never convert one interaction into a stable behavior claim. Require repeated observations or an explicit statement. Use neutral, operational wording such as “usually reviews backend delivery changes” rather than personality judgments.
+
+## Work with customers
+
+Customer collaboration needs a clear owner, a shared working surface, and a durable record. Track,
+per customer:
+
+- the customer organization and its key contacts
+- each contact's role: decision-maker, champion, technical owner, user, or procurement
+- the internal owner and the responsible agent
+- active scope, commitments, blockers, deadlines, and the next action
+- preferred channels, response expectations, and VIP/priority status
+
+### Use each venue for the right purpose
+
+| Venue | Purpose |
+|---|---|
+| Slack Connect, AG2 Space, WhatsApp | day-to-day coordination |
+| GitHub or issue tracker | technical work and delivery status |
+| Email, documents, contracts, CRM | formal decisions and commitments |
+| Meetings | synchronous discussion — record the outcome in a durable venue afterward |
+
+**Always identify the source of truth, and do not let an important decision exist only in chat.** A
+decision that lives in a message thread has no owner, no version, and no reader after scrollback.
+
+### Keep the work moving
+
+1. Acknowledge customer requests promptly.
+2. Clarify the desired outcome, the urgency, and who the decision-maker is.
+3. Assign one internal owner and one clear next action.
+4. Give progress updates **when the state changes**, and before an agreed update deadline **even if
+   the work is not finished** — an update whose content is "still working" is still a state report.
+5. Surface blockers with options and a recommendation, not only a problem statement.
+6. Close the loop: record the outcome and confirm completion with the customer.
+
+⇒ **A customer request must never remain "waiting on nobody."** If ownership is unclear, establish an
+internal owner *before* promising a result. An unowned internal item stalls quietly; an unowned
+customer item stalls while someone outside is waiting on an answer they were led to expect.
+
+### Protect the boundary
+
+- Treat customer-facing rooms as **external or mixed-audience** spaces.
+- Do not carry internal discussion, blame, private incidents, credentials, or personnel context into
+  them.
+- **Distinguish a customer request from an accepted commitment.** The two look alike in a chat log and
+  differ entirely in what they oblige.
+- Do not promise scope, dates, pricing, or policy exceptions without the appropriate authority.
+- Keep an internal backchannel for private coordination, **and keep the customer-facing status
+  accurate and consistent with it** — a backchannel that diverges from what the customer has been told
+  is worse than no backchannel.
+
 
 ## Handle VIP and priority participants
 
