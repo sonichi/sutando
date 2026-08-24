@@ -8709,7 +8709,7 @@ def _settings_model_pins() -> list:
     # that fallback separately would report a file the runtime does not consult.
     for label, path in (
         ("user", Path(claude_home_path("settings.json"))),
-        ("project", Path(__file__).resolve().parent.parent / ".claude" / "settings.json"),
+        ("project", REPO_DIR / ".claude" / "settings.json"),
     ):
         try:
             resolved = path.resolve()
