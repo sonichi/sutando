@@ -123,6 +123,9 @@ def prior_art(pr: str, runner=None) -> "list[str] | None":
     return sorted(out)
 
 
+PRIOR_ART_SHOWN = 8
+
+
 def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
     """Render prior art so "nothing there" can never read as "unchecked"."""
     if seen is None:
@@ -131,10 +134,15 @@ def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
                 "empty one."]
     if not seen:
         return ["ALREADY ON THIS THREAD: nothing — no reviews or comments yet."]
-    return ([f"ALREADY ON THIS THREAD ({len(seen)}) — read these before writing yours.",
+    # Name the truncation: a bare count above a short list reads as the count
+    # being wrong, not the list being cut.
+    head = (f"ALREADY ON THIS THREAD — showing last {PRIOR_ART_SHOWN} of {len(seen)};"
+            " read these before writing yours." if len(seen) > PRIOR_ART_SHOWN
+            else f"ALREADY ON THIS THREAD ({len(seen)}) — read these before writing yours.")
+    return ([head,
              "Findings hide in BOTH endpoints: an issue comment is not in the review",
              "list, and a COMMENTED review's body is not in the comments list:"]
-            + [f"  {line}" for line in seen[-8:]])
+            + [f"  {line}" for line in seen[-PRIOR_ART_SHOWN:]])
 
 
 def render(guide: Path, pr: str | None) -> str:

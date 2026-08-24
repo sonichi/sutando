@@ -233,6 +233,21 @@ class PriorArtTest(unittest.TestCase):
         self.assertIn("COMMENTED", body)
         self.assertIn("sonichi", body)
 
+    def test_a_truncated_list_says_it_is_truncated(self):
+        """A bare count above a shorter list reads as a wrong count, not a cut list."""
+        many = [f"t{i}  sonichi (comment)" for i in range(63)]
+        body = pf.prior_art_block("1", many)
+        rows = [ln for ln in body if ln.startswith("  t")]
+        self.assertEqual(len(rows), pf.PRIOR_ART_SHOWN)
+        self.assertIn(f"showing last {pf.PRIOR_ART_SHOWN} of 63", body[0])
+        self.assertNotIn("(63)", body[0])
+
+    def test_an_untruncated_list_does_not_claim_truncation(self):
+        few = [f"t{i}  sonichi (comment)" for i in range(pf.PRIOR_ART_SHOWN)]
+        head = pf.prior_art_block("1", few)[0]
+        self.assertIn(f"({pf.PRIOR_ART_SHOWN})", head)
+        self.assertNotIn("showing last", head)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
