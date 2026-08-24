@@ -132,12 +132,13 @@ def test_get_schedules_formats_all_branches():
         out = _with_crons(Path(td), jobs)
 
     by_name = {r["name"]: r for r in out}
-    assert by_name["loop"]["kind"] == "skill:proactive-loop"
+    assert by_name["loop"]["kind"] == "skill:proactive-loop", f'got {by_name["loop"]["kind"]!r}'
     assert by_name["loop"]["desc"] == "Runs the /proactive-loop skill"
     assert by_name["brief"]["desc"] == "Daily briefing"
     assert by_name["brief"]["kind"] == "prompt"
-    assert by_name["poll"]["kind"] == "shell"
-    assert by_name["poll"]["desc"] == "Runs shell command: bash scripts/poll.sh"
+    assert by_name["poll"]["kind"] == "shell", f'shell job rendered as {by_name["poll"]["kind"]!r}'
+    assert by_name["poll"]["desc"] == "Runs shell command: bash scripts/poll.sh", \
+        f'shell desc was {by_name["poll"]["desc"]!r}'
 
     # next-string buckets
     assert by_name["loop"]["next"].endswith("(in 0m)") or "in " in by_name["loop"]["next"]

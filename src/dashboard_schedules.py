@@ -167,14 +167,19 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
             next_str = f'{nxt.strftime("%a %H:%M")} ({rel})'
         else:
             next_str = ">7d" if expr else "invalid"
+        _cmd = (job.get("shell_command") or "").strip()
+        _shell = bool(_cmd)
         if job.get("description"):
             desc = job["description"]
         elif skill:
             desc = f"Runs the /{skill} skill"
+        elif _shell:
+            # A shell job has no `prompt`, so the prompt branch left it blank —
+            # the dashboard then showed a mechanical job with no description.
+            desc = f"Runs shell command: {_cmd}"
         else:
             _p = _RUN_PREFIX_RE.sub("", (job.get("prompt") or "").strip())
             desc = (_p[:100] + "…") if len(_p) > 100 else _p
-        _shell = bool((job.get("shell_command") or "").strip())
         out.append({"name": job.get("name", "?"), "cron": expr,
                     "kind": "shell" if _shell else ("skill" if skill else "prompt"),
                     "prompt_or_skill": skill or (job.get("prompt") or ""),

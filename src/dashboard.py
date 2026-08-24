@@ -501,8 +501,10 @@ def get_schedules() -> list[dict]:
     # formatting) lives in dashboard_schedules; only HTML escaping stays here.
     out = []
     for s in dashboard_schedules.list_schedules(_crons_path()):
+        # Three kinds come back from the domain module; a two-branch map
+        # silently rendered every mechanical `shell` job as a `prompt`.
         kind = (f'skill:{s["prompt_or_skill"]}' if s["kind"] == "skill"
-                else "prompt")
+                else s["kind"])
         desc = (s["description"].replace("&", "&amp;")
                 .replace("<", "&lt;").replace(">", "&gt;"))
         out.append({"name": s["name"], "cron": s["cron"], "kind": kind,
