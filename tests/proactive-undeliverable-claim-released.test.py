@@ -235,6 +235,30 @@ class UndeliverableClaimDelegationTest(unittest.TestCase):
                     f"line {min(resolves)} -- the claim hides the file from peers first",
                 )
 
+    def test_the_body_guard_runs_AFTER_the_claim(self):
+        """The claim hard-links then unlinks, so a producer holding the original fd
+        keeps writing that inode: a guard run only pre-claim inspects a body that is
+        not the one sent. telegram had this; slack guarded the pre-claim peek only."""
+        for name, path in CONSUMERS.items():
+            with self.subTest(consumer=name):
+                tree = ast.parse(path.read_text())
+                claims = [n.lineno for n in ast.walk(tree)
+                          if isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Name)
+                          and n.func.id == "claim_for_delivery"]
+                guards = [n.lineno for n in ast.walk(tree)
+                          if isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Name)
+                          and n.func.id == "proactive_body_guard"]
+                self.assertTrue(claims, f"{name}: no claim -- test is stale")
+                self.assertTrue(guards, f"{name}: no body guard -- test is stale")
+                self.assertTrue(
+                    any(g > min(claims) for g in guards),
+                    f"{name}: every proactive_body_guard call (lines {guards}) precedes "
+                    f"the claim at line {min(claims)} -- the guarded body is not the "
+                    f"body delivered",
+                )
+
     def test_a_raised_send_releases_and_never_deletes(self):
         """The handler for a failed proactive send must not consume the claim."""
         for name, path in CONSUMERS.items():

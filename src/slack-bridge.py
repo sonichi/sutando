@@ -1654,6 +1654,11 @@ def result_watcher():
                     if text is None:
                         release_claim(claim)
                         continue
+                    # The claim hard-links then unlinks, so a producer still
+                    # holding the original fd keeps writing THIS inode.
+                    if not proactive_body_guard(f.name, text, "slack"):
+                        release_claim(claim)
+                        continue
                     if owner_id is not None:
                         # Open a DM channel to the owner (idempotent).
                         try:
