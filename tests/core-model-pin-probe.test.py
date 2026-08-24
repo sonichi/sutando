@@ -627,5 +627,82 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("opus", r["detail"])
 
+
+class SettingsJsonIsAThirdWayTheModelIsChosen(unittest.TestCase):
+    """settings.json `model` is invisible to both tmux env and argv, so the clean
+    line used to claim "core uses the default window" on a host where a settings
+    pin WAS selecting opus[1m]. Literally true about its scope, materially false
+    about its subject."""
+
+    def setUp(self):
+        self.hc = _load()
+
+    def test_clean_line_does_NOT_claim_default_window_when_settings_selects_one(self):
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", (), [("CLAUDE_CONFIG_DIR", "opus[1m]")])
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("opus[1m]", r["detail"])
+        self.assertIn("not on the default window", r["detail"])
+
+    def test_CONTROL_no_settings_pin_still_claims_the_default_window(self):
+        """The control that proves the branch above discriminates: same inputs,
+        empty settings, and the ORIGINAL claim must come back. Without this, a
+        detail string that always mentions settings would pass the test above."""
+        r = self.hc._interpret_core_model_pin([], "/s", (), [])
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("core uses the default window", r["detail"])
+        self.assertNotIn("opus", r["detail"])
+
+    def test_a_settings_pin_never_downgrades_a_REAL_argv_warn(self):
+        """settings is informational; it must not mask a live pinned core."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", [("sutando-core", "opus")], [("~/.claude", "opus[1m]")])
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("LIVE core", r["detail"])
+
+    def test_a_settings_pin_never_downgrades_the_UNREADABLE_argv_warn(self):
+        """The unknown-argv warn is the one that guards a core we could not read."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", [("sutando-core", None)], [("~/.claude", "opus[1m]")])
+        self.assertEqual(r["status"], "warn", r)
+
+    def test_reader_ignores_missing_malformed_and_modelless_settings(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as d:
+            good = Path(d) / "good.json"
+            good.write_text(_json.dumps({"model": "sonnet"}))
+            bad = Path(d) / "bad.json"
+            bad.write_text("{not json")
+            empty = Path(d) / "empty.json"
+            empty.write_text(_json.dumps({"model": "   "}))
+            none = Path(d) / "none.json"
+            none.write_text(_json.dumps({"other": 1}))
+            missing = Path(d) / "missing.json"
+
+            def read(p):
+                try:
+                    if not p.is_file():
+                        return None
+                    m = _json.loads(p.read_text()).get("model")
+                except (OSError, ValueError, TypeError):
+                    return None
+                return m.strip() if isinstance(m, str) and m.strip() else None
+
+            self.assertEqual(read(good), "sonnet")
+            for p in (bad, empty, none, missing):
+                self.assertIsNone(read(p), p.name)
+
+    def test_live_reader_returns_pairs_and_dedups_by_resolved_path(self):
+        """Shape contract on the real reader: labelled pairs, no duplicate file."""
+        pins = self.hc._settings_model_pins()
+        self.assertIsInstance(pins, list)
+        for entry in pins:
+            self.assertEqual(len(entry), 2, entry)
+            self.assertIsInstance(entry[1], str)
+            self.assertTrue(entry[1].strip())
+        self.assertEqual(len(pins), len({lbl for lbl, _ in pins}),
+                         "one label must not appear twice")
+
+
 if __name__ == "__main__":
     unittest.main()
