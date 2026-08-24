@@ -6612,6 +6612,16 @@ def check_proactive_quarantine() -> dict:
         except OSError:
             unreadable += 1
             continue
+        # A declared skip had nothing to deliver, so it can never drain.
+        # `[deduped:]` stays counted: it promises delivery elsewhere.
+        try:
+            from result_markers import parse_markers  # noqa: PLC0415
+            skips = {a.value for a in parse_markers(path.read_text()).actions
+                     if a.kind == "skip"}
+        except (OSError, ValueError, ImportError):
+            skips = set()          # unreadable -> judge it as before, never silently clear
+        if skips & {"no-send", "REPLIED"}:
+            continue
         kept.append((path.name, int(age)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
