@@ -17,6 +17,8 @@ say() { [ "$1" = ok ] && echo "  ok  $2" || { echo "  FAIL: $2"; fails=$((fails+
 REPO="$TMP/repo"
 mkdir -p "$REPO/src/launchd" "$REPO/scripts" "$TMP/bin"
 cp "$REAL_REPO/src/launchd/gateway-bridge-wrapper.sh" "$REPO/src/launchd/"
+# The wrapper resolves its interpreter through this, so the skeleton needs it.
+cp "$REAL_REPO/scripts/python-binary.sh" "$REPO/scripts/"
 ENVF="$TMP/ag2space.env"
 
 cat > "$REPO/scripts/sutando-config.sh" <<CFG
@@ -32,6 +34,11 @@ cat > "$TMP/bin/python3" <<PY
 printf '%s\n' "\$*" >> "$TMP/argv.log"
 case "\${MODE:-absent}" in
   vault)  exit 0 ;;
+  alias)  case "\$*" in
+            *channel_token.py*REMOTE_TASK_TOKEN*) exit 3 ;;
+            *channel_token.py*AG2_REMOTE_TOKEN*)  exit 0 ;;
+            *) exit 0 ;;
+          esac ;;
   absent) case "\$*" in *channel_token.py*) exit 3 ;; *) exit 0 ;; esac ;;
 esac
 PY
@@ -43,6 +50,7 @@ chmod +x "$TMP/bin/python3"
 run() {  # run(mode, envfile-contents) -> rc in $RC, stderr in $TMP/err
   : > "$TMP/argv.log"; printf '%s' "$2" > "$ENVF"
   env -i HOME="$TMP" MODE="$1" PATH="$TMP/bin:/usr/bin:/bin" \
+    SUTANDO_PY="$TMP/bin/python3" \
     bash "$REPO/src/launchd/gateway-bridge-wrapper.sh" > "$TMP/out" 2> "$TMP/err"
   RC=$?
 }
@@ -90,10 +98,20 @@ else
   say ok ".env token still works and short-circuits the resolver"
 fi
 
-echo "4. legacy AG2_REMOTE_TOKEN in the vault is also accepted"
-run vault ""
-grep -q 'AG2_REMOTE_TOKEN' "$TMP/argv.log" || grep -q 'REMOTE_TASK_TOKEN' "$TMP/argv.log" \
-  && say ok "gate queries the documented token var(s)" \
-  || say FAIL "neither token var was queried"
+echo "4. ONLY the legacy AG2_REMOTE_TOKEN is in the vault: must still start"
+# Discriminating by construction: the resolver answers 3 (absent) for
+# REMOTE_TASK_TOKEN and 0 only for AG2_REMOTE_TOKEN, so a gate that dropped the
+# legacy alias from its loop parks here. The previous form asserted only that
+# SOME var was queried, which the always-first REMOTE_TASK_TOKEN satisfied.
+run alias ""
+if [ "$RC" -ne 0 ]; then
+  say FAIL "a legacy-alias-only vault token must start the bridge (rc=$RC)"
+elif grep -q 'no REMOTE_TASK_TOKEN configured' "$TMP/err"; then
+  say FAIL "parked despite a vault AG2_REMOTE_TOKEN — legacy alias not consulted"
+elif ! grep -q 'AG2_REMOTE_TOKEN' "$TMP/argv.log"; then
+  say FAIL "the legacy alias was never queried"
+else
+  say ok "legacy AG2_REMOTE_TOKEN alone starts the bridge"
+fi
 
 [ "$fails" -eq 0 ] && echo "ALL PASS" || { echo "$fails FAILURE(S)"; exit 1; }

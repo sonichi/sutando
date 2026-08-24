@@ -32,6 +32,10 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+from channel_token import gateway_token as _gateway_token  # noqa: E402
 
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
@@ -206,16 +210,18 @@ def _gateway_configured():
     channels/ag2space/.env). Returns True (configured), False (config readable,
     no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
     Mirrors health-check.check_gateway_bridge's detection."""
-    if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
-        return True
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    env_file = Path(cfg, "channels", "ag2space", ".env") if cfg else None
+    # env -> .env -> vault, the resolver the bridge uses. Positive is decisive
+    # even with no CLAUDE_CONFIG_DIR: the vault does not need one.
+    if _gateway_token(env_file=env_file):
+        return True
     if not cfg:
         return None
     try:
-        with open(os.path.join(cfg, "channels", "ag2space", ".env")) as f:
-            for ln in f:
-                if ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN=")):
-                    return True
+        # Contract preserved: an absent/unreadable .env is "can't tell", NOT
+        # "no gateway" — only a readable file with no token line is False.
+        env_file.read_text(errors="replace")
     except OSError:
         return None
     return False

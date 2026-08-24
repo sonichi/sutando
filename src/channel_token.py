@@ -72,7 +72,9 @@ def _clean(value: object) -> str:
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
     try:
-        text = env_file.read_text()
+        # errors="replace": one non-UTF-8 byte would otherwise raise past the
+        # OSError guard and crash a caller that asked a yes/no question.
+        text = env_file.read_text(errors="replace")
     except OSError:
         return ""
     for line in text.splitlines():
@@ -121,6 +123,26 @@ def resolve_channel_token(var: str, env_file: Path | None = None,
         if found:
             return found
     return token_from_vault(var, vault_get=vault_get)
+
+
+#: Both spellings of the ag2.space gateway token, newest first.
+GATEWAY_TOKEN_VARS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+
+
+def gateway_token(env_file: Path | None = None, environ=None,
+                  vault_get=None) -> str:
+    """The ag2.space gateway token from env -> `.env` -> vault, or ''.
+
+    ONE resolver for every lifecycle gate. Launch, health and recovery each had
+    their own env+file copy, so a vault-only host was configured for the bridge
+    and invisible to the gates that install, watch and restart it.
+    """
+    for var in GATEWAY_TOKEN_VARS:
+        found = resolve_channel_token(var, env_file=env_file, environ=environ,
+                                      vault_get=vault_get)
+        if found:
+            return found
+    return ""
 
 
 def main(argv: list[str] | None = None) -> int:

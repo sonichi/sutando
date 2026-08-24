@@ -407,9 +407,19 @@ reap_stale_task_watcher() {
 # by the caller — same contract as every other block in startup.sh.
 start_gateway_lanes() {
   local _RELAY_ENV
-  if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
-     { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
-     || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+  # env -> .env -> VAULT, matching the bridge and its wrapper. An env+file-only
+  # gate here never installs or kickstarts the job on a vault-only host.
+  local _tok_rc=1
+  _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)" || _RELAY_ENV=""
+  if [ -z "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+    for _tok_var in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
+      python3 "$REPO/src/channel_token.py" --has "$_tok_var" \
+        ${_RELAY_ENV:+--env-file "$_RELAY_ENV"} >/dev/null 2>&1 && { _tok_rc=0; break; }
+    done
+  else
+    _tok_rc=0
+  fi
+  if [ "$_tok_rc" -eq 0 ]; then
     [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
     # Tell the bridge where the durable token lives so auth-rejection recovery
     # (revoked/expired key) can re-read it after the connect flow rewrites it —

@@ -53,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
+from channel_token import gateway_token as _gateway_token  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 import slack_access  # noqa: E402
@@ -3482,8 +3483,10 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
         # The bridge exits without a token, and startup.sh sources the same
         # channels/ag2space/.env before launching it.
         gw_env = _load_channel_env("ag2space")
-        merged = {**os.environ, **gw_env}
-        token = merged.get("REMOTE_TASK_TOKEN") or merged.get("AG2_REMOTE_TOKEN")
+        # Same resolver as the gate that decided this host HAS a gateway; a
+        # narrower lookup here would refuse to recover the bridge it watches.
+        token = _gateway_token(environ={**os.environ, **gw_env},
+                               env_file=claude_home_path("channels", "ag2space", ".env"))
         if not token:
             return None
         child_env.update(gw_env)
@@ -5412,19 +5415,11 @@ def _gateway_configured() -> bool:
     the bug this helper exists to close.
     """
     try:
-        if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
-            return True
+        # env -> .env -> VAULT, via the one resolver the bridge itself uses. A
+        # local env+file copy made a vault-only host read as unconfigured here.
         gw_env = claude_home_path("channels", "ag2space", ".env")
-        if gw_env.exists():
-            return any(
-                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
-                # errors="replace" is load-bearing, not cosmetic: without it a
-                # single non-UTF-8 byte raises, the except below swallows it, and a
-                # CONFIGURED gateway reads as unconfigured — which now also silences
-                # the gateway-down warn. Fail-open on a decode error is exactly the
-                # class this PR closes. (Caught in review by Sutando-Pro.)
-                for ln in gw_env.read_text(errors="replace").splitlines()
-            )
+        if _gateway_token(env_file=gw_env):
+            return True
     except OSError:
         # EXPECTED failures only: the env file is unreadable / the path is bad.
         # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.

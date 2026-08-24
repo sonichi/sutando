@@ -19,15 +19,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO"
 
-# python3 resolves via PATH. The launchd plist sets PATH to
-# "__BREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin", where __BREW_BIN__ is the
-# interpreter dir the installer resolved from its own `command -v python3` — so
-# the bridge runs under the same interpreter the installer validated, with no
-# clone-, arch-, or user-specific fallback probe baked into this committed file.
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "[gateway-bridge-wrapper] no python3 on PATH (check the plist PATH)" >&2
-    exit 1
-fi
+# `command -v` proves a PATH entry EXISTS; on a Mac without the Xcode CLT that
+# entry is Apple's stub, and merely running it raises the install dialog.
+# shellcheck source=../../scripts/python-binary.sh
+. "$REPO/scripts/python-binary.sh"
+PYBIN="$(require_python "$REPO" "run the ag2.space gateway bridge")" || exit 1
 
 # Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
 # $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
@@ -66,7 +62,7 @@ _TOKEN_PRESENT="$REMOTE_TASK_TOKEN"
 if [ -z "$_TOKEN_PRESENT" ]; then
     for _tok_var in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
         _tok_rc=0
-        python3 "$REPO/src/channel_token.py" --has "$_tok_var" \
+        "$PYBIN" "$REPO/src/channel_token.py" --has "$_tok_var" \
             ${_RELAY_ENV:+--env-file "$_RELAY_ENV"} >/dev/null 2>&1 || _tok_rc=$?
         if [ "$_tok_rc" -eq 0 ]; then
             _TOKEN_PRESENT="vault"
@@ -97,4 +93,4 @@ if [ -f "$_EVICT_HELPER" ]; then
   sleep 0.3
 fi
 
-exec python3 "$REPO/src/remote-gateway-bridge.py"
+exec "$PYBIN" "$REPO/src/remote-gateway-bridge.py"
