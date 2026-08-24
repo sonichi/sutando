@@ -85,6 +85,27 @@ check("broken policy does NOT refuse a sibling channel", not v("222", P), repr(v
 r = v("111", P)
 check("refusal names the failing path", isinstance(r, str) and "broken.py" in r, repr(r))
 
+# --- P1 (qingyun-wu, review of 0f6a8d27): a LISTED channel with an empty
+# path must not be answered by `*`. My first cut dropped falsey entries before
+# dispatch, so `{"sensitive": null, "*": allow}` let the permissive wildcard
+# answer for the very channel the config named. Both halves of the axis were
+# tested -- empty entries, and `*` fallback -- and their INTERSECTION was not.
+for empty_val in (None, "", "   "):
+    v = resolve({"sensitive": empty_val, "*": str(D / "allow.py")})
+    r = v("sensitive", P)
+    check(f"listed channel with {empty_val!r} path REFUSES, `*` cannot answer for it",
+          isinstance(r, str) and "no policy path" in r, repr(r))
+    check(f"...and the refusal names the channel ({empty_val!r})",
+          isinstance(r, str) and "sensitive" in r, repr(r))
+    check(f"...while a genuinely unlisted channel still uses `*` ({empty_val!r})",
+          v("other", P) is None, repr(v("other", P)))
+
+v = resolve({"111": str(D / "allow.py"), "*": None})
+r = v("999", P)
+check("an empty `*` refuses unmatched channels rather than ungating them",
+      isinstance(r, str) and "no policy path" in r, repr(r))
+check("...while the explicitly listed channel is unaffected", not v("111", P))
+
 # --- a mapping naming nothing is configured-but-empty, not unconfigured --
 for empty in ({}, {"111": ""}, {"111": None}):
     r = resolve(empty)

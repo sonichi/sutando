@@ -42,9 +42,8 @@ def _configured_target(repo_root=None):
     """The configured gate: a path str, a {channel_id: path} dict, or ""."""
     env = os.environ.get("SUTANDO_DISCORD_POST_GATE", "").strip()
     if env:
-        # The env override stays a single global path. A mapping would have to
-        # ride in as JSON, and a malformed blob there is indistinguishable from
-        # a path that merely looks odd -- use the config file for per-channel.
+        # Single global path by design: a JSON mapping in an env var is
+        # indistinguishable from a path that merely looks odd.
         return env
     # May raise: a config layer that cannot load leaves gating state UNKNOWN,
     # and the caller must fail closed rather than treat it as unconfigured.
@@ -113,15 +112,24 @@ def resolve_validator(repo_root=None):
             f"post-gate config unreadable ({type(e).__name__}: {e}); "
             "refusing unvalidated sends")
     if isinstance(target, dict):
-        entries = {k: v for k, v in target.items() if v}
-        if not entries:
+        # Normalize here too: a safety property must not depend on an
+        # upstream caller having stripped its input ("   " is truthy).
+        target = {str(k): (v.strip() if isinstance(v, str) else v)
+                  for k, v in target.items()}
+        if not any(target.values()):
             # A mapping naming no usable path is a CONFIGURED gate that would
             # validate nothing. Unconfigured is `None`; this is not that.
             return _fail_closed(
                 "post-gate mapping configured but names no policy path; "
                 "refusing unvalidated sends")
-        return _dispatching(
-            {k: _load_one(v, repo_root) for k, v in entries.items()})
+        # KEEP every explicit key: dropping an empty one lets `*` answer for
+        # a channel the config named. Listed-but-unusable must refuse.
+        loaded = {
+            k: (_load_one(v, repo_root) if v else _fail_closed(
+                f"post-gate mapping lists channel {k!r} with no policy path; "
+                "refusing unvalidated sends"))
+            for k, v in target.items()}
+        return _dispatching(loaded)
     if not target:
         return None
     return _load_one(target, repo_root)
