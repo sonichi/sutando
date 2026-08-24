@@ -615,6 +615,7 @@ def delegation_archive_result(data: dict):
 
 def get_task_result(task_id: str):
     """Check if a task result exists."""
+    observed_unready = False
     result_file = _safe_path(RESULT_DIR, task_id)
     if result_file:
         # Readiness, not existence: a body read mid-write decodes fatally, and
@@ -622,6 +623,8 @@ def get_task_result(task_id: str):
         body = read_ready_result(result_file)
         if body is not None:
             return {"task_id": _safe_id(task_id), "status": "completed", "result": body}
+        if result_file.exists():
+            observed_unready = True
     # Check archive — task-bridge archives results within seconds of delivery,
     # so direct /result polls often arrive after the file has been moved.
     safe_id = _safe_id(task_id)
@@ -632,8 +635,15 @@ def get_task_result(task_id: str):
             body = read_ready_result(candidate)
             if body is not None:
                 return {"task_id": safe_id, "status": "completed", "result": body}
+            if candidate.exists():
+                observed_unready = True
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
+        return {"task_id": _safe_id(task_id), "status": "pending"}
+    if observed_unready:
+        # Present but not readable yet, with its task already archived. None
+        # here answers 404 — terminal — so a client stops polling and never
+        # sees the bytes that land moments later.
         return {"task_id": _safe_id(task_id), "status": "pending"}
     return None
 

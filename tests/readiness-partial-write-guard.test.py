@@ -178,8 +178,46 @@ def test_daily_insight_analysis_survives_a_torn_body():
             check(False, f"analyze_task_patterns RAISED {type(e).__name__}")
 
 
+def test_fully_archived_torn_result_is_pending_not_404():
+    """Both task and result archived — normal post-delivery state — and the
+    archived result torn. Returning None here becomes HTTP 404, which a client
+    reads as terminal; `main` raised instead, which at least retries.
+
+    The other archive test keeps a LIVE task file, so the `tasks/<id>.txt`
+    fallback answers before this path is reached and masks it.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        _bind(Path(td))
+        res_arch = api.RESULT_DIR / "archive" / "2026-08"
+        task_arch = api.TASK_DIR / "archive" / "2026-08"
+        res_arch.mkdir(parents=True)
+        task_arch.mkdir(parents=True)
+        (task_arch / "task-9.txt").write_text("id: task-9\ntask: x\n")
+        (res_arch / "task-9.txt").write_bytes(torn(BODY))
+        check(not (api.TASK_DIR / "task-9.txt").exists(),
+              "fixture: no LIVE task file, or the pending fallback masks this path")
+        try:
+            r = api.get_task_result("task-9")
+            check(r is not None and r.get("status") == "pending",
+                  f"fully-archived torn result is pending, not 404, got {r!r}")
+        except UnicodeDecodeError as e:
+            check(False, f"/result RAISED {type(e).__name__}")
+
+        # Negative control: an id with nothing on disk must STILL be None (404).
+        # Without this, a blanket `return pending` would pass the case above.
+        check(api.get_task_result("task-does-not-exist") is None,
+              "control: an unknown id still returns None so /result can 404")
+
+        # Positive control: the same archived path returns the body once whole.
+        (res_arch / "task-9.txt").write_text(BODY)
+        r = api.get_task_result("task-9")
+        check(r and r.get("status") == "completed" and "emoji" in (r.get("result") or ""),
+              "control: the same fully-archived pair returns completed once readable")
+
+
 test_result_poll_degrades_to_pending()
 test_archive_poll_degrades_to_pending()
+test_fully_archived_torn_result_is_pending_not_404()
 test_daily_insight_analysis_survives_a_torn_body()
 test_display_fields_narrow_guard_covers_decode_error()
 test_active_task_rows_survives_torn_bodies()
