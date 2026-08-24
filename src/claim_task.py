@@ -94,9 +94,11 @@ def claim(task_id: str, core_id: str, workspace: Path | None = None) -> Path | N
         return dst
     except FileNotFoundError:
         return None
-    except OSError:
-        # EXDEV/permission = lost-race; the contract is "won or lost",
-        # never "threw"
+    except OSError as exc:
+        # A lost race and a core that can NEVER claim both return None; the
+        # errno is the only thing separating them, so say it before dropping it.
+        print(f"claim_task: unexpected errno {exc.errno} claiming "
+              f"{src.name}: {exc.strerror}", file=sys.stderr)
         return None
 
 
