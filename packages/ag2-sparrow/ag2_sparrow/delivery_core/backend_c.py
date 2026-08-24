@@ -309,11 +309,30 @@ class DesignCClaimBackend:
     def _terminal_path(self, key: str) -> Path:
         return self._d(ARCHIVE) / f"{key}.json"
 
+    def _next_cycle(self, key: str) -> int:
+        """Durable logical cycle for `key`: one past the highest already recorded.
+
+        The archive (plus any staged record not yet finalized) IS the ledger, so
+        ordering never depends on `time.time_ns()` moving forward. Callers hold
+        the per-key lock, which is what makes read-max-then-write safe.
+        """
+        hi = 0
+        for f in self._d(ARCHIVE).glob(f"{key}*.json"):
+            rec = _regular_json(f)
+            if isinstance(rec, dict) and _exact_int(rec.get("cycle")):
+                hi = max(hi, rec["cycle"])
+        for f in self._d(TMP).glob(f"{TERMINAL_TAG}{SEP}{key}{SEP}*.json"):
+            rec = _regular_json(f)
+            if isinstance(rec, dict) and _exact_int(rec.get("cycle")):
+                hi = max(hi, rec["cycle"])
+        return hi + 1
+
     def _write_terminal(self, key: str, record: dict, incarnation: str) -> None:
         """R->F->M of the terminal protocol: atomic tmp write, fsync per the
         durability mode, then rename into archive/. Caller releases the claim.
         The staging name embeds the INCARNATION so recovery can bind a staged
         record to exactly the claim that produced it, never a sibling's."""
+        record = dict(record, cycle=self._next_cycle(key))
         tmp = self._d(TMP) / f"{TERMINAL_TAG}{SEP}{incarnation}{SEP}{time.time_ns()}.json"
         data = json.dumps(record).encode()
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -367,7 +386,10 @@ class DesignCClaimBackend:
             if self._record_is_terminal_proof(data) \
                     and data.get("item_id") == item_id:
                 out.append(data)
-        out.sort(key=lambda r: r["completed_ns"])
+        # cycle FIRST: a clock correction must not let an older receipt win.
+        # completed_ns only breaks ties (legacy records carry no cycle -> 0).
+        out.sort(key=lambda r: (r.get("cycle") if _exact_int(r.get("cycle")) else 0,
+                               r["completed_ns"]))
         return out
 
     @staticmethod

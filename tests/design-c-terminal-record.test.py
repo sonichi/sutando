@@ -612,5 +612,35 @@ with tempfile.TemporaryDirectory() as td:
     check(ba.terminal_records("item-a2") == [],
           "and terminal_records() lists nothing for it")
 
+
+    # ── a clock correction must not let an older receipt win: regressing
+    # time.time_ns() between cycles used to return the FIRST one's destination.
+    import ag2_sparrow.delivery_core.backend_c as _bc
+    bclk = fresh(td, "clockback")
+    real_ns = _bc.time.time_ns
+    ticks = iter([2_000_000_000, 1_999_999_999])   # second cycle is EARLIER
+
+    def cycle(dest, forced_ns):
+        bclk.publish("item-clk", b"p")
+        tok = bclk.claim("item-clk", "w0")
+        _bc.time.time_ns = lambda: forced_ns
+        try:
+            bclk.complete(tok, DeliveryOutcome.CONFIRMED, provider="P", destination=dest)
+        finally:
+            _bc.time.time_ns = real_ns
+
+    cycle("D1", next(ticks))
+    cycle("D2", next(ticks))          # newer cycle, EARLIER timestamp
+
+    recs = bclk.terminal_records("item-clk")
+    hist = [(r["completed_ns"], r["receipt"]["destination"]) for r in recs]
+    check(len(recs) == 2, f"both cycles recorded ({len(recs)})")
+    check(hist[-1][1] == "D2",
+          f"the LATER cycle wins despite the earlier clock: history={hist}")
+    check(bclk.terminal_record("item-clk")["receipt"]["destination"] == "D2",
+          "terminal_record() returns the current cycle's destination")
+    check([r["cycle"] for r in recs] == [1, 2],
+          f"cycles are logical and monotonic ({[r.get('cycle') for r in recs]})")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
