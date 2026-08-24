@@ -450,6 +450,9 @@ class DesignCClaimBackend:
                 os.rename(str(t), str(dst))
                 self._strict_dir_barrier()   # durable BEFORE the release
                 (self.root / INFLIGHT / inc).unlink(missing_ok=True)
+                # Retirement ends the cycle, so its attempt budget dies with it —
+                # a republished item must start at 0, not inherit a spent count.
+                self._attempts_path(key).unlink(missing_ok=True)
                 rep.retired.append(key)
         for f in sorted(self._d(INFLIGHT).iterdir()):
             parts = f.name.split(SEP)
@@ -465,6 +468,7 @@ class DesignCClaimBackend:
                         # claim dies, or a crash strands neither proof nor claim.
                         self._strict_dir_barrier()
                         f.unlink(missing_ok=True)
+                        self._attempts_path(key).unlink(missing_ok=True)
                         rep.retired.append(key)
                 continue
             ident = outbox.process_identity(int(parts[2]))
