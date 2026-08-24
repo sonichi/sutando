@@ -24,6 +24,7 @@ import calendar
 import collections
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -53,9 +54,28 @@ def live_sessions() -> "list[dict]":
         return []
 
 
+_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
 def find_transcript(session_id: str) -> "Path | None":
-    hits = sorted(config_dir().glob(f"projects/*/{session_id}.jsonl"))
-    return hits[0] if hits else None
+    """Locate a transcript by LITERAL filename.
+
+    The id comes from session metadata, so interpolating it into a glob let
+    `*` match an unrelated session's transcript. Validate, then match exactly.
+    """
+    if not _SESSION_ID.match(session_id or ""):
+        return None
+    name = f"{session_id}.jsonl"
+    projects = config_dir() / "projects"
+    try:
+        dirs = sorted(d for d in projects.iterdir() if d.is_dir())
+    except OSError:
+        return None
+    for d in dirs:
+        cand = d / name
+        if cand.is_file():
+            return cand
+    return None
 
 
 # C0, DEL and C1. Whitespace is collapsed before this runs, so anything left is
@@ -173,7 +193,7 @@ def main() -> int:
         head = _safe(f"{name}  [{sess.get('status','?')}]  pid={sess.get('pid','?')}")
         path = find_transcript(sid)
         if path is None:
-            print(f"\n{head}\n  no transcript for {sid}")
+            print(f"\n{head}\n  no transcript for {_safe(sid)}")
             continue
         d = digest(path, a.n, a.width, a.thinking)
         mb = path.stat().st_size / 1048576

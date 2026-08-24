@@ -260,5 +260,55 @@ class TerminalSafety(unittest.TestCase):
         self.assertNotIn("\x1b", ev[1])
 
 
+ATTACK_SID = "abc\x1b]52;c;YXR0YWNr\x07def"
+
+
+class UntrustedSessionIdTest(unittest.TestCase):
+    """sessionId is metadata, not a name we control: it reaches a TTY and a path."""
+
+    def _main_with(self, session_id):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            cfg = td / "cfg"
+            (cfg / "projects" / "p1").mkdir(parents=True)
+            (cfg / "projects" / "p1" / "real-session.jsonl").write_text(
+                '{"timestamp":"2026-08-24T10:00:00.000Z"}\n')
+            payload = td / "payload.json"
+            payload.write_text(json.dumps(
+                [{"name": "n1", "status": "ok", "pid": 1,
+                  "sessionId": session_id}]))
+            stub = td / "bin"
+            stub.mkdir()
+            (stub / "claude").write_text(f"#!/bin/sh\ncat {payload}\n")
+            (stub / "claude").chmod(0o755)
+            env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg),
+                       PATH=f"{stub}:{os.environ['PATH']}")
+            r = subprocess.run([sys.executable, str(SCRIPT)],
+                               capture_output=True, text=True, env=env)
+            return r.stdout + r.stderr
+
+    def test_no_transcript_path_neutralizes_terminal_controls(self):
+        out = self._main_with(ATTACK_SID)
+        self.assertNotIn("\x1b", out, "ESC reached the terminal")
+        self.assertNotIn("\x07", out, "BEL reached the terminal (OSC 52 sets the clipboard)")
+        self.assertIn("\ufffd", out,
+                      "control: the escape was present and REPLACED, not merely absent")
+
+    def test_session_id_is_matched_literally_never_as_a_pattern(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "cfg"
+            (cfg / "projects" / "p1").mkdir(parents=True)
+            real = cfg / "projects" / "p1" / "real-session.jsonl"
+            real.write_text("{}\n")
+            with unittest.mock.patch.dict(os.environ,
+                                          {"CLAUDE_CONFIG_DIR": str(cfg)}):
+                for bad in ("*", "real-*", "../../etc/passwd", ""):
+                    self.assertIsNone(digest_mod.find_transcript(bad),
+                                      f"{bad!r} selected a transcript")
+                self.assertEqual(digest_mod.find_transcript("real-session"), real,
+                                 "control: a legitimate id must still resolve")
+
+
 if __name__ == "__main__":
     unittest.main()
+
