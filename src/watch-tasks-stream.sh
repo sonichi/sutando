@@ -24,6 +24,21 @@ exec 9>&1
 
 set -u
 
+write_claim_disposition() {
+  local claim="$1" expected_writer="$2" task_path="$3" disposition="$4"
+  local owner_pid owner_id temporary
+  owner_pid="$(sed -n '1p' "$claim" 2>/dev/null)"
+  owner_id="$(sed -n '2p' "$claim" 2>/dev/null)"
+  [ -n "$owner_pid" ] && [ "$owner_id" = "$expected_writer" ] || return 1
+  temporary="${claim%/*}/.$disposition-$expected_writer-${claim##*/}"
+  printf '%s\n%s\n%s\n%s\n' "$owner_pid" "$owner_id" "$task_path" "$disposition" > "$temporary" || return 1
+  if mv "$temporary" "$claim"; then
+    return 0
+  fi
+  rm -f "$temporary"
+  return 1
+}
+
 if [ "${1:-}" = "--handler-runner" ]; then
   handler="$2"
   runtime="$3"
@@ -33,6 +48,8 @@ if [ "${1:-}" = "--handler-runner" ]; then
   repo="$7"
   events_fifo="$8"
   filename="$9"
+  claim="${10}"
+  watcher_id="${11}"
   if "$handler" \
       --runtime "$runtime" \
       --workspace "$workspace" \
@@ -42,6 +59,11 @@ if [ "${1:-}" = "--handler-runner" ]; then
     handler_rc=0
   else
     handler_rc=$?
+  fi
+  if [ "$handler_rc" -eq 75 ]; then
+    write_claim_disposition "$claim" "$watcher_id" "$task_path" "held" || true
+  elif [ "$handler_rc" -ne 0 ]; then
+    write_claim_disposition "$claim" "$watcher_id" "$task_path" "fallback" || true
   fi
   printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
   exit 0
@@ -108,8 +130,11 @@ claim_is_live() {
   kill -0 "$owner_pid" 2>/dev/null
 }
 
-claim_is_held() {
-  [ "$(sed -n '4p' "$1" 2>/dev/null)" = "held" ]
+claim_is_retained() {
+  case "$(sed -n '4p' "$1" 2>/dev/null)" in
+    handling|held) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 remove_claim() {
@@ -119,7 +144,7 @@ remove_claim() {
 
 retire_stale_claim() {
   local claim="$1" retired
-  claim_is_held "$claim" && return 1
+  claim_is_retained "$claim" && return 1
   claim_is_live "$claim" && return 1
   retired="$CLAIMS_DIR/.stale-$WATCHER_ID-$(basename "$claim")"
   if mv "$claim" "$retired" 2>/dev/null; then
@@ -141,7 +166,7 @@ acquire_task_claim() {
       rm -f "$temporary"
       return 0
     fi
-    if claim_is_held "$claim"; then
+    if claim_is_retained "$claim"; then
       rm -f "$temporary"
       return 1
     fi
@@ -175,31 +200,39 @@ claim_is_ours() {
   [ "$owner_id" = "$WATCHER_ID" ]
 }
 
-# 0 = must-handle, 1 = fallback, 2 = unknown, 3 = held outcome-unknown.
-# Held claims never reach the live-core fallback.
+# 0 = must-handle, 1 = fallback, 2 = unknown, 3 = held, 4 = handling.
+# Handling and held claims never reach the live-core fallback.
 claim_disposition() {
   local filename="$1"
   case "$(sed -n '4p' "$CLAIMS_DIR/$filename" 2>/dev/null)" in
     must-handle) return 0 ;;
     fallback) return 1 ;;
     held) return 3 ;;
+    handling) return 4 ;;
     *) return 2 ;;
   esac
 }
 
-hold_task_claim() {
-  local filename="$1" claim task_path temporary
+set_task_claim_disposition() {
+  local filename="$1" disposition="$2" claim task_path
   claim="$CLAIMS_DIR/$filename"
   claim_is_ours "$filename" || return 1
   task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
   [ -n "$task_path" ] || return 1
-  temporary="$CLAIMS_DIR/.held-$WATCHER_ID-$filename"
-  printf '%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "held" > "$temporary" || return 1
-  if mv "$temporary" "$claim"; then
-    return 0
-  fi
-  rm -f "$temporary"
-  return 1
+  write_claim_disposition "$claim" "$WATCHER_ID" "$task_path" "$disposition"
+}
+
+fallback_task_claim() {
+  local filename="$1" task_path="$2"
+  claim_disposition "$filename"
+  case $? in
+    1) ;;
+    4) set_task_claim_disposition "$filename" "fallback" || return 1 ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename" || return 1
+  release_task_claim "$filename" || return 1
+  emit_fallback_task_file "$filename"
 }
 
 # 0 = the task is settled (failure published, or a real answer already exists).
@@ -237,7 +270,7 @@ if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER
   for claim in "$CLAIMS_DIR"/task-*.txt; do
     # Overlapping watchers preserve a live owner's claim. A dead owner's
     # record is atomically quarantined before the new sweep retries it.
-    claim_is_held "$claim" || claim_is_live "$claim" || retire_stale_claim "$claim" || true
+    claim_is_retained "$claim" || claim_is_live "$claim" || retire_stale_claim "$claim" || true
   done
   shopt -u nullglob
 fi
@@ -260,12 +293,11 @@ finish_handler_task() {
   worker_receipt="$DISPATCH_DIR/workers/$filename"
   settled="$DISPATCH_DIR/settled/$filename.worker"
   # Cleanup and the completion path race by atomically moving the same receipt.
-  # On failure, keep the durable at-least-once order: fallback receipt, event,
-  # then claim release. A signal between event and release may duplicate the
-  # event during cleanup, but it cannot strand the task without either path.
+  # On ordinary failure, persist the fallback receipt before releasing the
+  # claim; a restart sweep can recover it if shutdown lands before the emit.
   if mv "$marker" "$settled" 2>/dev/null; then
     if [ "$rc" -eq 75 ] && claim_is_ours "$filename"; then
-      if hold_task_claim "$filename"; then
+      if set_task_claim_disposition "$filename" "held"; then
         echo "watch-tasks-stream: optional handler outcome is unsettled for $filename; preserving claim without live-core fallback" >&2
       else
         echo "watch-tasks-stream: could not mark unsettled claim for $filename; retaining existing claim without live-core fallback" >&2
@@ -281,13 +313,24 @@ finish_handler_task() {
           publish_terminal_failure "$filename" "failed" || claim_settled=0
           ;;
         1)
-          printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-          echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-          emit_fallback_task_file "$filename"
+          claim_settled=0
+          if fallback_task_claim "$filename" "$task_path"; then
+            echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+          else
+            echo "watch-tasks-stream: could not durably hand failed optional claim to fallback; retaining $filename" >&2
+          fi
           ;;
         3)
           echo "watch-tasks-stream: unsettled outcome claim retained for $filename" >&2
           claim_settled=0
+          ;;
+        4)
+          claim_settled=0
+          if fallback_task_claim "$filename" "$task_path"; then
+            echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+          else
+            echo "watch-tasks-stream: could not mark failed optional claim for fallback; retaining $filename without live-core fallback" >&2
+          fi
           ;;
         *)
           echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -363,6 +406,13 @@ drain_dispatch_queue() {
       continue
     fi
     task_path="$(cat "$running_marker")"
+    filename="$(basename "$marker")"
+    claim_disposition "$filename"
+    if [ "$?" -eq 1 ] && ! set_task_claim_disposition "$filename" "handling"; then
+      fallback_task_claim "$filename" "$task_path" || true
+      rm -f "$running_marker"
+      continue
+    fi
     worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
     : > "$worker_receipt"
     /bin/bash "$0" --handler-runner \
@@ -373,7 +423,9 @@ drain_dispatch_queue() {
       "$RESULTS_DIR" \
       "$__REPO_ROOT" \
       "$WATCH_RUNTIME_DIR/events" \
-      "$(basename "$marker")" &
+      "$(basename "$marker")" \
+      "$CLAIMS_DIR/$filename" \
+      "$WATCHER_ID" &
     printf '%s\n' "$!" > "$worker_receipt"
     running_count=$((running_count + 1))
   done
@@ -544,6 +596,10 @@ fallback_outstanding_handlers() {
             echo "watch-tasks-stream: unsettled outcome claim retained for $filename" >&2
             claim_settled=0
             ;;
+          4)
+            echo "watch-tasks-stream: interrupted provider claim retained for $filename" >&2
+            claim_settled=0
+            ;;
           *)
             echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
             ;;
@@ -582,6 +638,10 @@ fallback_outstanding_handlers() {
         ;;
       3)
         echo "watch-tasks-stream: unsettled outcome claim retained for $filename" >&2
+        claim_settled=0
+        ;;
+      4)
+        echo "watch-tasks-stream: interrupted provider claim retained for $filename" >&2
         claim_settled=0
         ;;
       *)

@@ -113,9 +113,11 @@ semantics, but it must not name, locate, or import a concrete skill. This keeps
 the dependency direction adapter → helper while preserving the rule that core
 does not depend on installed skills.
 
-Injected optional task handlers use exit 75 only after execution has become
-outcome-unknown and no durable settlement sink is writable. The watcher owns
-the claim transition to `held`; held claims survive restart and never fall back.
+Before launching an injected optional handler, the watcher durably changes its
+claim from `fallback` to fail-closed `handling`. Exit 75 means execution became
+outcome-unknown with no durable settlement sink; the watcher then refines the
+claim to `held`. If that refinement fails, `handling` remains durable. Both
+states survive restart and never reach live-core fallback.
 
 ### Shared adapter policy
 

@@ -386,6 +386,92 @@ raise SystemExit(module.main())
         h.stop()
 
 
+def scenario_failed_held_transition_survives_restart(graceful: bool) -> None:
+    """The pre-provider handling state stays fail-closed if held cannot publish."""
+    h = Harness()
+    suffix = "graceful" if graceful else "abrupt"
+    calls = h.tmp / f"failed-held-{suffix}-calls"
+    release = h.tmp / f"failed-held-{suffix}-release"
+    worker = REPO / "skills" / "ag2space-room-sessions" / "scripts" / "session-worker.py"
+    h.handler.write_text(
+        f'''#!/usr/bin/env python3
+import importlib.util
+import time
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("held_worker", {str(worker)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def provider(*args, **kwargs):
+    with Path({str(calls)!r}).open("a") as handle:
+        handle.write("call\\n")
+    deadline = time.time() + 10
+    while not Path({str(release)!r}).exists() and time.time() < deadline:
+        time.sleep(0.05)
+    raise module.OutcomeUnknownError(module.OUTCOME_UNKNOWN_BODY)
+
+def unavailable(*args, **kwargs):
+    raise OSError("settlement unavailable")
+
+module._run_claude = provider
+module._atomic_text = unavailable
+module._publish_once = unavailable
+raise SystemExit(module.main())
+'''
+    )
+    h.handler.chmod(0o755)
+    h.runtime = "claude"
+    filename = f"task-failed-held-{suffix}.txt"
+    task = h.ws / "tasks" / filename
+    task.write_text(
+        f"id: {filename[:-4]}\n"
+        "session_scope: room\n"
+        "source: ag2space\n"
+        f"channel_id: !failed-held-{suffix}:ag2.space\n"
+        "access_tier: owner\n"
+        "task: exercise failed held transition\n"
+    )
+    claim = h.ws / "state" / "task-event-handler-claims" / filename
+    fallback = h.ws / "state" / "task-event-handler-fallbacks" / filename
+    h.start()
+    try:
+        active = wait_for(
+            lambda: calls.is_file()
+            and claim.is_file()
+            and claim.read_text().splitlines()[-1:] == ["handling"]
+        )
+        check(f"{suffix} control reaches durable pre-provider handling state", active)
+        if not active:
+            return
+        watcher_id = claim.read_text().splitlines()[1]
+        (claim.parent / f".held-{watcher_id}-{filename}").mkdir()
+        release.write_text("go\n")
+        completed = wait_for(
+            lambda: h.dispatch() is not None
+            and not (h.dispatch() / "workers" / filename).exists()
+        )
+        check(f"{suffix} faulted held transition completes its worker", completed)
+        retained = claim.is_file() and claim.read_text().splitlines()[-1:] == ["handling"]
+        check(f"{suffix} failed held write retains the fail-closed claim", retained)
+        check(f"{suffix} failed held write creates no fallback receipt", not fallback.exists())
+        h.stop(graceful=graceful)
+
+        restarted = Harness.attach(h.ws, h.tmp)
+        restarted.runtime = "claude"
+        restarted.start()
+        try:
+            time.sleep(1.0)
+            check(f"{suffix} restart preserves the fail-closed claim", claim.is_file())
+            check(f"{suffix} restart does not re-run the provider",
+                  calls.read_text().splitlines() == ["call"])
+            check(f"{suffix} restart never emits live-core fallback", not fallback.exists())
+        finally:
+            restarted.stop()
+    finally:
+        h.stop()
+
+
 
 
 
@@ -397,6 +483,8 @@ def main() -> int:
     scenario_unready_destination_is_left_untouched_and_unsettled()
     scenario_answer_landing_during_the_reap_stays_deliverable()
     scenario_outcome_unknown_claim_survives_restart()
+    scenario_failed_held_transition_survives_restart(graceful=True)
+    scenario_failed_held_transition_survives_restart(graceful=False)
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1

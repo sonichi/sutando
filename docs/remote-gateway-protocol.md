@@ -77,8 +77,10 @@ different rooms use different sessions. Team and Guest tasks keep their
 established guarded paths. A provider timeout after launch is terminal because
 its side effects are outcome-unknown; the skill suppresses automatic fallback
 replay and checkpoints a reported session handle when available. If both
-settlement sinks fail, the watcher retains a durable held claim across restart;
-it never releases the task to the unrestricted live-core fallback.
+settlement sinks fail, the watcher retains the fail-closed claim established
+before provider launch across restart. A successful transition labels it
+`held`; a failed transition leaves it `handling`. Neither state reaches the
+unrestricted live-core fallback.
 
 ### `POST /v1/tasks/<id>/ack`
 

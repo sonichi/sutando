@@ -18,8 +18,9 @@ also return the task to the live core so a transient CLI failure cannot strand
 an owner request. A timeout after provider launch is outcome-unknown instead:
 the skill checkpoints a session handle when available, records durable replay
 suppression, and publishes a terminal explanation without re-running the task.
-If neither the receipt nor result sink is writable, exit 75 tells the watcher
-to retain the task claim across restart instead of falling back and replaying it.
+Before provider launch, the watcher durably changes the optional claim from
+fallback-capable to `handling`. If neither settlement sink is writable, exit 75
+refines it to `held`; either retained state survives restart without replay.
 
 Session IDs live in `<workspace>/state/ag2space-room-sessions.json`. Remove this
 skill or revert its adapter wiring to return every task to the legacy main
