@@ -91,13 +91,17 @@ PATTERN_DOC_ENV_PATH='\$SUTANDO_WORKSPACE/'
 # the contract this lint exists to enforce, so the guard already complies where it
 # counts. Listed here rather than reworded to `parents[1]`, per the note above.
 #
+# scripts/pool-session-digest.py is the same category: it walks to the REPO
+# ROOT solely to import src/util_paths.claude_home_path, the sanctioned resolver
+# for the Claude home. It reads no workspace path at all.
+#
 # scripts/gen-src-map.py uses PATTERN_REPO_WALK to resolve the REPO ROOT
 # (to read tracked files under src/ and write docs/), NOT a workspace — same
 # category as scripts/check-utc-z-strftime.py and scripts/dedup-conversation-store.py,
 # which predate this --diff lint and are grandfathered. A repo-tooling script has
 # no workspace to go through the wrapper for; the wrapper resolves the workspace,
 # which is the wrong directory here.
-ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/check-python39-compat\.py|scripts/review-preflight\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
+ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/pool-session-digest\.py|scripts/check-python39-compat\.py|scripts/review-preflight\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
 
 # Allowed .md files — legitimate uses of `$SUTANDO_WORKSPACE/path` in
 # prose, e.g. the workspace contract docs that DESCRIBE the legacy form
