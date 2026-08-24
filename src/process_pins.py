@@ -17,7 +17,8 @@ A pin names the second case. It is deliberately hard to trust:
   - a pin that no longer matches a live process is a FINDING, not silence:
     the pinned process died and whatever it was protecting is already gone
 
-Pin file (default `<workspace>/state/process-pins.json`):
+The caller supplies the pin file's path — this module names no location, so the
+adapter that already resolves the workspace stays the one that decides. Shape:
 
     {"pins": [{"service": "discord-bridge", "pid": 87258,
                "lstart": "Sat Aug 23 12:24:57 2026",

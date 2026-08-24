@@ -79,6 +79,7 @@ assert_class "state/auth/device.json" "structural" || fail=1
 assert_class "state/contextual-chips.json" "structural" || fail=1
 assert_class "state/voice-state.json" "structural" || fail=1
 assert_class "state/core-status.json" "structural" || fail=1
+assert_class "state/process-pins.json" "structural" || fail=1
 assert_class "state/quota-state.json" "structural" || fail=1
 assert_class "state/dynamic-content.json" "structural" || fail=1
 # Accumulated grants, not a snapshot: newest-mtime drops the granted set when an

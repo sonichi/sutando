@@ -3624,7 +3624,11 @@ def _load_channel_env(channel: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _pin_verdicts(service: str, lstart_by_pid: dict) -> list:
-    """Restart pins naming `service`, evaluated against its live pids."""
+    """Restart pins naming `service`, evaluated against its live pids.
+
+    This is where the pin file lives: `state/process-pins.json` under the
+    resolved workspace. `process_pins` itself names no path.
+    """
     if not service:
         return []
     return process_pins.evaluate(

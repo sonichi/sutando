@@ -233,6 +233,9 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
+    # A pin names a pid on ONE machine, so two hosts' copies are not versions
+    # of one record: newest-mtime would drop the loser and its armed witness.
+    "state/process-pins.json|structural"
     # Accumulated grants, not a snapshot: newest-mtime drops the whole
     # allow-set when a fresh install writes an empty one first.
     "state/slack-allowed-recipients.json|union-json-array"
