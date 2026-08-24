@@ -102,10 +102,21 @@ else:
     check("noncanonical: voice-agent not kickstarted", l_ref == [], f"launchd={l_ref}")
     check("canonical control: it is kickstarted", bool(l_ok), f"launchd={l_ok}")
 
-print("\nthe guard is evaluated ONCE, not restated per branch:")
+print("\nthe guard is LAZY and memoized:")
 src = (REPO / "src" / "health-check.py").read_text()
-check("exactly one call inside main()'s fix loop",
-      src.count("_restart_ok, _restart_why = stale_restart_allowed(") == 1)
+check("one call site, reached through the memo", src.count("_gate[\"v\"] = stale_restart_allowed(") == 1)
+calls = []
+with mock.patch.object(hc, "run_all_checks", return_value=[_chk("some-unrelated-check", "warn", "x")]), \
+     mock.patch.object(hc, "stale_restart_allowed",
+                       side_effect=lambda r: calls.append(r) or (True, "ok")), \
+     mock.patch.object(hc, "fix_down_bridges", return_value=[]), \
+     mock.patch.object(sys, "argv", ["health-check.py", "--fix", "--quiet"]), \
+     mock.patch("builtins.print", side_effect=lambda *a, **k: None):
+    try:
+        hc.main()
+    except SystemExit:
+        pass
+check("NOT evaluated when no source-backed branch is reached", calls == [], f"calls={calls}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}): {failures}")

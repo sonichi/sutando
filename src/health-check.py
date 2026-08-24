@@ -10590,13 +10590,19 @@ def main():
         if do_fix:
             print()
             print("Attempting fixes...")
-            # ONE evaluation for every source-backed restart below. The guard is
-            # the policy's, not this loop's — branches consult it, never restate it.
-            _restart_ok, _restart_why = stale_restart_allowed(REPO_DIR)
+            # LAZY + memoized: one evaluation, and only if a source-backed
+            # branch is actually reached — --fix must not probe git otherwise.
+            _gate: dict = {}
+
+            def _restart_gate():
+                if "v" not in _gate:
+                    _gate["v"] = stale_restart_allowed(REPO_DIR)
+                return _gate["v"]
             for c in issues:
                 if c["name"].startswith("com.sutando."):
-                    if not _restart_ok:
-                        print(f"  {c['name']}: refused — {_restart_why}")
+                    _ok, _why = _restart_gate()
+                    if not _ok:
+                        print(f"  {c['name']}: refused — {_why}")
                         continue
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
@@ -10609,8 +10615,9 @@ def main():
                     # launchd-owned listener. A rogue non-launchd port-holder
                     # (issue #1888 bug 2, double-management) is out of scope
                     # here — the result string will say the restart failed.
-                    if not _restart_ok:
-                        print(f"  {c['name']}: refused — {_restart_why}")
+                    _ok, _why = _restart_gate()
+                    if not _ok:
+                        print(f"  {c['name']}: refused — {_why}")
                         continue
                     result = fix_launchd(LAUNCHD_BACKED_CHECKS[c["name"]])  # pragma: no cover
                     print(f"  {c['name']}: {result}")  # pragma: no cover
@@ -10710,14 +10717,16 @@ def main():
                                    capture_output=True, timeout=10)
                     print(f"  {c['name']}: restarted")
                 elif c["name"] == "voice-transport" and c.get("_stuck_connecting"):
-                    if not _restart_ok:
-                        print(f"  voice-agent (stuck CONNECTING): refused — {_restart_why}")
+                    _ok, _why = _restart_gate()
+                    if not _ok:
+                        print(f"  voice-agent (stuck CONNECTING): refused — {_why}")
                         continue
                     result = fix_launchd("com.sutando.voice-agent")
                     print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
-                    if not _restart_ok:
-                        print(f"  {c['name']}: refused — {_restart_why}")
+                    _ok, _why = _restart_gate()
+                    if not _ok:
+                        print(f"  {c['name']}: refused — {_why}")
                         continue
                     # If stale, kill old PIDs first so the new process doesn't
                     # bind-fail or end up alongside a still-running zombie.
