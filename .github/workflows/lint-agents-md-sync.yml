@@ -20,7 +20,7 @@ name: lint-agents-md-sync
 on:
   pull_request:
   push:
-    branches: [main, staging-interaction-planes]
+    branches: [main]
 
 jobs:
   lint-agents-md-sync:

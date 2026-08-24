@@ -22,7 +22,7 @@ name: eslint
 on:
   pull_request:
   push:
-    branches: [main, staging-interaction-planes]
+    branches: [main]
 
 jobs:
   eslint:

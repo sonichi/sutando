@@ -19,7 +19,7 @@ name: workspace-leak-check
 on:
   pull_request:
   push:
-    branches: [main, staging-workspace-revamp]
+    branches: [main]
 
 jobs:
   workspace-leak-check:

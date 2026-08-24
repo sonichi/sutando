@@ -15,7 +15,7 @@ name: lint-claude-home-path
 on:
   pull_request:
   push:
-    branches: [main, staging-workspace-revamp]
+    branches: [main]
 
 jobs:
   lint-claude-home-path:

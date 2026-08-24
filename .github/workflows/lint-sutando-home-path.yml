@@ -16,7 +16,7 @@ name: lint-sutando-home-path
 on:
   pull_request:
   push:
-    branches: [main, staging-workspace-revamp]
+    branches: [main]
 
 jobs:
   lint-sutando-home-path:
