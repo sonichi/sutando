@@ -365,32 +365,35 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
-   **⚠ NEVER STOP A PID WITHOUT TRACING IT LOCALLY FIRST.** The sentinel is
-   single-valued, but a pool legitimately runs **one watcher per core**, so on a pool host N-1 correct
-   watchers always read as "untracked duplicates" and which pid holds the sentinel is arbitrary.
+   **⚠ STOP ONLY THE PIDS THE PROBE ITSELF CLASSIFIES AS OWNERLESS.** The sentinel is
+   single-valued, but a pool legitimately runs **one watcher per core**, so N-1 correct watchers
+   always read as "untracked duplicates" and which pid holds the sentinel is arbitrary.
 
-   Before stopping anything the probe names, resolve each root pid to its owning session **on this
-   machine** and stop only a tree whose owner is gone:
+   The probe does this classification for you, same-host, from the local process table: its verdict
+   names the untracked roots that have **NO live owning session**, and separately names any that are
+   session-owned and must be left alone. Act only on that split:
 
-   ```bash
-   for pid in <the root pids the probe named>; do
-     ps -o pid=,ppid=,lstart=,command= -p "$pid" 2>/dev/null || echo "$pid: gone"
-   done
-   ```
+   - verdict names owner**less** roots → stop exactly those, leave the rest.
+   - verdict says every untracked tree still runs under a live session → **change nothing**.
+   - verdict does not make the distinction at all (older build) → **change nothing** and say so.
+     Ambiguous ownership is not a licence to stop a watcher; it is a reason not to.
 
-   A pid whose owning session is alive is a working watcher, whatever the sentinel says.
+   **Do not re-derive this yourself.** `ps -p <pid>` prints an identical row for a supervised watcher
+   and an ownerless one — the roots come from `_watcher_trees()` and are alive by construction — so a
+   hand-rolled trace cannot produce the split it appears to, and eyeballing raw PPIDs is the guessing
+   this step exists to prevent. That is also what the "don't hand-roll a process check" rule below
+   means: the probe is the authority for ownership as well as for liveness.
 
    **Do NOT scope this by counting `state/cores/*.alive`.** That directory is SYNCED ACROSS HOSTS, so a
    peer's fresh heartbeat inflates the count on a single-core machine and suppresses cleanup of
    genuinely orphaned local watchers — the inverse failure, equally bad. Measured on a live host: a
-   remote `Mac-186.alive` carried the *same pid* as the local record, so a synced record's pid says
-   nothing about local processes. The pid table is the only same-host authority here.
+   remote `Mac-186.alive` carried the *same pid* as the local record.
 
-   | probe says | action (after the local trace above) |
+   | probe says | action (obey its ownerless/owned split) |
    |---|---|
    | `ok` | nothing to do. |
-   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. Stop only the traced-gone pids, then ensure exactly one runs. |
-   | sentinel pid dead but **other watcher(s) still run** | same: stop only the traced-gone pids, then ensure one runs. If every named pid traces to a live session, change NOTHING. |
+   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. Stop only the roots the probe calls ownerless, then ensure exactly one runs. |
+   | sentinel pid dead but **other watcher(s) still run** | same: stop only the roots the probe calls ownerless, then ensure one runs. If it reports every untracked tree session-owned, change NOTHING. |
    | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
