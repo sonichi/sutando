@@ -224,6 +224,12 @@ def _fence_with(env, *, activate=False, malform=False, corrupt_fence=False,
         elif c_state == "epoch-dir":
             r = Path(td) / ".outbox-discord-proactive"
             (r / "protocol-epoch").mkdir(parents=True)
+        elif c_state == "staged-fence":
+            # write_fence() faulted at its os.replace: staged temp, NO final
+            # fence, and no A entries — so the caller's root_is_clean is True.
+            r = Path(td) / ".outbox-discord-proactive"
+            r.mkdir(parents=True, exist_ok=True)
+            (r / "protocol-epoch.tmp").write_text("C", encoding="utf-8")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             fence = db._proactive_fence()
@@ -480,7 +486,8 @@ with tempfile.TemporaryDirectory() as td:
 
 # kewei r-latest P1: the fence must GATE selection and never raise into startup.
 from ag2_sparrow.delivery_core.migration import (  # noqa: E402
-    EPOCH_FILE, classify_epoch, c_selection_allowed, write_fence)
+    EPOCH_FILE, classify_epoch, c_selection_allowed, write_fence,
+    staged_fence_path)
 
 
 def _root(content=None, kind="file"):
@@ -492,6 +499,9 @@ def _root(content=None, kind="file"):
         p_.mkdir()
     elif kind == "dangling":
         p_.symlink_to(d / "does-not-exist")
+    elif kind == "staged":
+        # write_fence() interrupted between its temp write and os.replace
+        staged_fence_path(d).write_text("C", encoding="utf-8")
     return d
 
 
@@ -502,6 +512,7 @@ _EPOCH_CASES = [
     ("unknown",      _root(b"garbage"),        "unknown",    False),
     ("missing",      _root(None),              "missing",    True),
     ("dangling",     _root(kind="dangling"),   "unreadable", False),
+    ("staged",       _root(kind="staged"),     "staged",     False),
     ("invalid-utf8", _root(b"\xff"),           "unreadable", False),
     ("dir",          _root(kind="dir"),        "unreadable", False),
 ]
@@ -527,6 +538,40 @@ _crashed = _root(b"A")
 (_crashed / "ready").mkdir()
 check(c_selection_allowed(_crashed, True)[0] is False,
       "crash-before-final-fence: A fence with C namespaces must refuse C")
+
+# The row above writes an explicit final A fence, so it cannot reach the
+# default-A-by-ABSENCE window. Fault write_fence() at its os.replace instead.
+_staged = _root(kind="staged")
+check(not (_staged / EPOCH_FILE).exists(),
+      "premise: the faulted write leaves NO final fence (else this is the A-fence row)")
+check(staged_fence_path(_staged).exists(), "premise: the staged temp is present")
+_allow, _why = c_selection_allowed(_staged, True)
+check(_allow is False, f"interrupted-fence window must refuse C on a clean root (got {_why!r})")
+# CONTROL: same helper, no fault -> a genuinely clean root must STILL bootstrap,
+# or the fix has simply disabled the feature rather than closed the window.
+check(c_selection_allowed(_root(None), True)[0] is True,
+      "control: an untouched clean root must still bootstrap C")
+# CONTROL: a COMPLETED write_fence leaves no temp, so it must not read as staged.
+_done = _root(None)
+write_fence(_done, "C")
+check(classify_epoch(_done)[0] == "ok" and c_selection_allowed(_done, True)[0] is True,
+      "control: a completed fence write must not be mistaken for a staged one")
+
+# At the ADAPTER: the unit check above proves the policy, this proves the
+# shipped selector consumes it.
+kind, out = _fence_with("c", activate=True, c_state="staged-fence")
+check(kind != "DesignCClaimBackend",
+      f"interrupted-fence window must not start C through the adapter (got {kind})")
+check(kind == "DesignAClaimBackend",
+      f"and must fall back to Design A, the epoch owner's authoritative protocol (got {kind})")
+check("refused" in out and "staged" in out,
+      f"the refusal must be ANNOUNCED and name the staged fence, not silent: {out!r}")
+# CONTROL: without the fault C must still start, or this passes on a build
+# where C never starts at all.
+kind_ok, _ = _fence_with("c", activate=True)
+check(kind_ok == "DesignCClaimBackend",
+      f"control: the SAME activated root without the staged temp must still "
+      f"select C — the pair differs only by the fault (got {kind_ok})")
 
 # kewei r-latest P2: a Protocol class attribute is a REQUIRED structural member.
 

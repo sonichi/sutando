@@ -37,7 +37,14 @@ EPOCH_OK = "ok"
 EPOCH_MISSING = "missing"
 EPOCH_UNREADABLE = "unreadable"
 EPOCH_UNKNOWN = "unknown"
+EPOCH_STAGED = "staged"
 SUPPORTED_EPOCHS = ("A", "C")
+
+
+def staged_fence_path(root: Path) -> Path:
+    """The temp name write_fence() stages at — same derivation, one place."""
+    p = Path(root) / EPOCH_FILE
+    return p.with_name(p.name + ".tmp")
 
 
 def classify_epoch(root: Path) -> "tuple[str, str]":
@@ -51,6 +58,10 @@ def classify_epoch(root: Path) -> "tuple[str, str]":
         # anomalous state someone created — never a clean-root bootstrap.
         if os.path.lexists(p):
             return (EPOCH_UNREADABLE, "")
+        # A staged temp means write_fence() was interrupted before its
+        # os.replace: mid-transition, never an untouched clean root.
+        if os.path.lexists(staged_fence_path(root)):
+            return (EPOCH_STAGED, "")
         return (EPOCH_MISSING, DEFAULT_EPOCH)
     except (OSError, ValueError):
         return (EPOCH_UNREADABLE, "")
@@ -72,6 +83,8 @@ def c_selection_allowed(root: Path, root_is_clean: bool) -> "tuple[bool, str]":
         if root_is_clean:
             return (True, "clean-root bootstrap (no fence, no A entries)")
         return (False, "no fence and the root holds A entries")
+    if state == EPOCH_STAGED:
+        return (False, "an interrupted epoch write is staged; not a clean root")
     return (False, f"epoch {state}")
 
 
