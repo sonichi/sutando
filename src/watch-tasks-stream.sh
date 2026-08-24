@@ -222,7 +222,7 @@ set_task_claim_disposition() {
   write_claim_disposition "$claim" "$WATCHER_ID" "$task_path" "$disposition"
 }
 
-fallback_task_claim() {
+prepare_fallback_task_claim() {
   local filename="$1" task_path="$2"
   claim_disposition "$filename"
   case $? in
@@ -231,7 +231,12 @@ fallback_task_claim() {
     *) return 1 ;;
   esac
   printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename" || return 1
-  release_task_claim "$filename" || return 1
+  release_task_claim "$filename"
+}
+
+fallback_task_claim() {
+  local filename="$1" task_path="$2"
+  prepare_fallback_task_claim "$filename" "$task_path" || return 1
   emit_fallback_task_file "$filename"
 }
 
@@ -588,9 +593,14 @@ fallback_outstanding_handlers() {
             publish_terminal_failure "$filename" "was interrupted" || claim_settled=0
             ;;
           1)
-            printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-            echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-            emit_task_file "$filename"
+            if prepare_fallback_task_claim "$filename" "$task_path"; then
+              echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+              emit_task_file "$filename"
+              claim_settled=0
+            else
+              echo "watch-tasks-stream: could not durably hand interrupted optional claim to fallback; retaining $filename" >&2
+              claim_settled=0
+            fi
             ;;
           3)
             echo "watch-tasks-stream: unsettled outcome claim retained for $filename" >&2
@@ -632,9 +642,14 @@ fallback_outstanding_handlers() {
         publish_terminal_failure "$filename" "was interrupted" || claim_settled=0
         ;;
       1)
-        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        emit_task_file "$filename"
+        if prepare_fallback_task_claim "$filename" "$task_path"; then
+          echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+          emit_task_file "$filename"
+          claim_settled=0
+        else
+          echo "watch-tasks-stream: could not durably hand interrupted optional claim to fallback; retaining $filename" >&2
+          claim_settled=0
+        fi
         ;;
       3)
         echo "watch-tasks-stream: unsettled outcome claim retained for $filename" >&2
