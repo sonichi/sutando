@@ -47,6 +47,14 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 
    Start it via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. **Gate on running watcher TREES, not on the sentinel** — if one is already running, skip the Monitor call; the existing one continues. Reuse the shared enumerator rather than restating its rules here (the copies drift, and step 5 used to be one of the copies that did):
 
+   **Capture is not the same as handling.** Because the watcher is now armed *before* the
+   registration loop, a `TASK_FILE` notification can arrive while steps 2-4 are still running —
+   which was impossible when this ran last. If that happens, **finish registration first, then
+   process the queued task(s)**: the watcher's job here is to ensure the task is not MISSED, not
+   to have it handled immediately. Pivoting mid-loop can leave step 4's `/proactive-loop`
+   fallback unregistered, which is the one thing that guarantees the session has a recurring
+   work driver at all.
+
    ```bash
    python3 -c "
    import importlib.util, sys
