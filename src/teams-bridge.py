@@ -221,7 +221,7 @@ class ActivityAuth:
         )
 
 
-def _get_json(url: str, timeout: float = 10.0) -> dict:
+def _get_json(url: str, timeout: float = 10.0) -> dict:  # pragma: no cover - urllib plumbing
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -258,7 +258,7 @@ class ConnectorToken:
             return self._token
 
 
-def _post_form(url: str, fields: dict, timeout: float = 15.0) -> dict:
+def _post_form(url: str, fields: dict, timeout: float = 15.0) -> dict:  # pragma: no cover - urllib plumbing
     data = urllib.parse.urlencode(fields).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -360,14 +360,11 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter than BaseHTTPRequestHandler
         print(f"  [teams] {self.address_string()} {fmt % args}", flush=True)
 
-    def _reply(self, code: int, body: str = ""):
-        payload = body.encode("utf-8")
+    def _reply(self, code: int):
+        """Status only: Teams ignores the body, and an unread one wedges keep-alive."""
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Length", "0")
         self.end_headers()
-        if payload:
-            self.wfile.write(payload)
 
     def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
         if self.path.rstrip("/") != "/api/messages":
@@ -404,6 +401,18 @@ def accept_activity(act: InboundActivity, tier_map: dict,
     return write_task(build_task_text(act, tier, task_id), task_id, tasks_dir)
 
 
+def _serve(port: int) -> int:  # pragma: no cover - binds a socket and blocks
+    server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    print(f"teams-bridge: listening on 127.0.0.1:{port}/api/messages", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def main() -> int:
     cfg = channel_dir()
     access = load_access(cfg / "access.json")
@@ -427,17 +436,7 @@ def main() -> int:
     _Handler.auth = ActivityAuth(app_id)
     _Handler.on_activity = staticmethod(
         lambda act: accept_activity(act, tier_map))
-
-    port = int(os.environ.get("SUTANDO_TEAMS_PORT", "8770"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
-    print(f"teams-bridge: listening on 127.0.0.1:{port}/api/messages", flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-    return 0
+    return _serve(int(os.environ.get("SUTANDO_TEAMS_PORT", "8770")))
 
 
 if __name__ == "__main__":
