@@ -52,8 +52,13 @@ def creds_on_host(*, env_token=None, envfile_token=None, vault_token=None,
         os.environ["CLAUDE_CONFIG_DIR"] = cfg
         slack = Path(cfg, "channels", "slack")
         slack.mkdir(parents=True)
-        # access.json is always valid, so the token is the ONLY variable.
-        (slack / "access.json").write_text(json.dumps({"tofuOwner": owner}))
+        # access.json is always valid, so the token is the ONLY variable. The
+        # shape matches a live host: tofuOwner is IN allowFrom at owner tier.
+        _access = {"tofuOwner": owner}
+        if owner:
+            _access["allowFrom"] = [owner]
+            _access["tierMap"] = {owner: "owner"}
+        (slack / "access.json").write_text(json.dumps(_access))
         if envfile_token:
             (slack / ".env").write_text(f"SLACK_BOT_TOKEN={envfile_token}\n")
         if env_token:
@@ -108,6 +113,51 @@ check("the vault was still asked before giving up", "SLACK_BOT_TOKEN" in asked, 
 print("control — a token with no resolvable owner is still None:")
 creds, _ = creds_on_host(vault_token="xoxb-vault", owner="")
 check("token without owner -> None (nobody to DM)", creds is None, repr(creds))
+
+print("the recipient is TIER-selected, not the first allowFrom entry:")
+# Activating the vault path turned "no send" into a send, so recipient policy is
+# newly reachable here — a team-tier or demoted user must NOT get a watchdog DM.
+def creds_with_access(access: dict, vault_token="xoxb-vault"):
+    import importlib.util
+    import json as _j
+    import os
+    import tempfile
+
+    import channel_token as ct
+    saved_v, saved_cfg = ct.token_from_vault, os.environ.get("CLAUDE_CONFIG_DIR")
+    cfg = tempfile.mkdtemp()
+    try:
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        slack = Path(cfg, "channels", "slack"); slack.mkdir(parents=True)
+        (slack / "access.json").write_text(_j.dumps(access))
+        os.environ.pop("SLACK_BOT_TOKEN", None)
+        ct.token_from_vault = lambda var, vault_get=None: vault_token
+        spec = importlib.util.spec_from_file_location("hc_tier", REPO / "src" / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(hc)
+        except SystemExit:
+            pass
+        return hc._slack_owner_creds()
+    finally:
+        ct.token_from_vault = saved_v
+        if saved_cfg is not None: os.environ["CLAUDE_CONFIG_DIR"] = saved_cfg
+        else: os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+c = creds_with_access({"allowFrom": ["team-only"], "tierMap": {"team-only": "team"}})
+check("a team-tier-only host sends to NOBODY", c is None, repr(c))
+
+c = creds_with_access({"tofuOwner": "demoted", "allowFrom": ["demoted", "realowner"],
+                       "tierMap": {"demoted": "team", "realowner": "owner"}})
+check("a DEMOTED tofuOwner does not win", bool(c) and c[1] == "realowner", repr(c))
+
+c = creds_with_access({"allowFrom": ["teamguy", "realowner"],
+                       "tierMap": {"teamguy": "team", "realowner": "owner"}})
+check("team-first ordering does not win", bool(c) and c[1] == "realowner", repr(c))
+
+c = creds_with_access({"tofuOwner": "o1", "allowFrom": ["o1"]})
+check("control: an unmapped allowlist keeps the legacy owner default",
+      bool(c) and c[1] == "o1", repr(c))
 
 if failures:
     print(f"\nFAILED ({len(failures)}): {failures}")

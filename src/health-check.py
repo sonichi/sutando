@@ -9637,10 +9637,10 @@ def _slack_owner_creds() -> "tuple[str, str] | None":
         data = json.loads(access.read_text())
     except Exception:
         return None
-    owner = data.get("tofuOwner")
-    if not owner:
-        allow = data.get("allowFrom") or []
-        owner = allow[0] if allow else None
+    # Owner selection is slack_owner's policy, not this function's: a demoted
+    # tofuOwner or a team-tier allowFrom[0] must never receive a watchdog DM.
+    from slack_owner import resolve_proactive_owner_id
+    owner = resolve_proactive_owner_id(data)
     if not owner:
         return None
     return token, owner
