@@ -95,6 +95,12 @@ class PlanTest(unittest.TestCase):
             sp = _Space(td); sp.holder("the full answer", month=True); sp.orig()
             self.assertEqual(sp.plan()[0], "honour")
 
+    def test_unready_live_holder_falls_through_to_ready_archive(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.holder("the full answer", month=True); sp.orig()
+            (sp.results / f"{HOLDER}.txt").write_text("  \n\t")
+            self.assertEqual(sp.plan(), ("honour", None))
+
     def test_second_failure_reports(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.holder(""); sp.orig(ORIG + "dedup_requeue_count: 1\n")
@@ -232,14 +238,13 @@ class DelegationTest(unittest.TestCase):
                 )
 
     def test_result_lookup_is_not_reimplemented(self):
-        """Live-then-archive is one policy: an archive-only copy reads a
-        delivered-but-unarchived result as never delivered."""
+        """Ready live-or-archive lookup is one shared policy."""
         for name, path in LOOKUP_CONSUMERS.items():
             with self.subTest(consumer=name):
                 src = path.read_text()
                 self.assertIn(
-                    "find_result", src,
-                    f"{name}: must use local_task_protocol.find_result",
+                    "find_ready_result", src,
+                    f"{name}: must use local_task_protocol.find_ready_result",
                 )
                 self.assertNotIn(
                     "find_archived_result", src,

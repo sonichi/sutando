@@ -356,6 +356,13 @@ check("find result: newest startup-retention directory",
 check("find result: newest collision in startup-retention directory",
       ltp.find_result(_results, "task-collision")
       == _results / "archive-2026-08-21" / "task-collision.txt.1")
+(_results / "task-ready-behind-placeholder.txt").write_text("  \n\t")
+(_results / "archive-2026-08-21" / "task-ready-behind-placeholder.txt").write_text(
+    "delivered answer\n"
+)
+check("ready result: unready live candidate falls through to ready archive",
+      ltp.find_ready_result(_results, "task-ready-behind-placeholder")
+      == _results / "archive-2026-08-21" / "task-ready-behind-placeholder.txt")
 
 # _has_task_line: OSError branch (unreadable file returns False, not an exception).
 # Skip when running as root — root can read 0o000 files.

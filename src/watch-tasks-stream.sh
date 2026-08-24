@@ -359,10 +359,8 @@ handler_result_exists() {
   "$SUTANDO_PY_BIN" - "$__REPO_ROOT" "$RESULTS_DIR" "$task_id" <<'PYEOF' 2>/dev/null
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "src"))
-from local_task_protocol import find_result
-from delivery.readiness import read_ready_result
-found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
-raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
+from local_task_protocol import find_ready_result
+raise SystemExit(0 if find_ready_result(pathlib.Path(sys.argv[2]), sys.argv[3]) is not None else 1)
 PYEOF
 }
 
@@ -394,7 +392,11 @@ drain_dispatch_queue() {
     if handler_result_exists "$filename"; then
       finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 0
     else
-      finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 1
+      claim_disposition "$filename"
+      case $? in
+        3|4) finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 75 ;;
+        *) finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 1 ;;
+      esac
     fi
   done
   while [ "$running_count" -lt "$TASK_HANDLER_WORKERS" ]; do

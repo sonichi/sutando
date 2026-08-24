@@ -152,6 +152,8 @@ and retain only provider-specific delivery. For example,
 `src/proactive_recovery.py` restores proactive delivery claims stranded by a
 crash, while Discord, Slack, and Telegram decide how the recovered result is
 sent. Copying the filesystem state machine into each adapter is not permitted.
+`local_task_protocol.find_ready_result` owns readiness-aware live/archive
+selection: an unready live placeholder must not mask a ready archived result.
 
 ### HTTP transport handlers
 

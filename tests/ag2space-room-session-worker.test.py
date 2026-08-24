@@ -249,6 +249,15 @@ if 'resume' not in args:
               "gateway-archived result settles task")
         check(len(log.read_text().splitlines()) == before, "archived task is never replayed")
 
+        shadowed = task(workspace, "task-shadowed-archive", room_id="!shadowed:a")
+        (workspace / "results" / shadowed.name).write_text("  \n\t")
+        (archive / shadowed.name).write_text("already delivered\n")
+        before = len(log.read_text().splitlines())
+        check(run_worker("codex", workspace, shadowed, env).returncode == 0,
+              "ready archive settles behind an unready live placeholder")
+        check(len(log.read_text().splitlines()) == before,
+              "shadowed archived result never launches the room provider")
+
         retained = task(workspace, "task-retained", room_id="!retained:a")
         retention = workspace / "results" / "archive-2026-08-21"
         retention.mkdir()

@@ -182,6 +182,7 @@ def scenario_reap_publishes_only_without_an_exact_result() -> None:
     (arch / "task-1234-999.txt").write_text("a different task's answer\n")
     # A genuine archived result for task-abc — the reap must stay silent here.
     (arch / "task-abc-999.txt").write_text("the real answer\n")
+    (h.ws / "results" / "task-abc.txt").write_text("  \n\t")
     h.task("task-123.txt")
     h.task("task-abc.txt")
     h.start()
@@ -200,9 +201,9 @@ def scenario_reap_publishes_only_without_an_exact_result() -> None:
               "no terminal failure published for task-123")
         # Negative control: the fix must not become "always publish".
         time.sleep(1.0)
-        check("a genuine archived result still suppresses the terminal failure",
-              not (res / "task-abc.txt").exists(),
-              f"spurious failure written: {(res/'task-abc.txt').read_text()[:60] if (res/'task-abc.txt').exists() else ''}")
+        check("a ready archive behind an unready live result suppresses failure",
+              (res / "task-abc.txt").read_text() == "  \n\t",
+              f"live body changed: {(res/'task-abc.txt').read_text()[:60]!r}")
     finally:
         h.stop()
 
@@ -472,6 +473,67 @@ raise SystemExit(module.main())
         h.stop()
 
 
+def scenario_dead_optional_runner_stays_fail_closed() -> None:
+    """A runner that dies in handling never confirms ordinary fallback."""
+    h = Harness()
+    calls = h.tmp / "dead-optional-calls"
+    h.handler.write_text(
+        f'''#!/bin/bash
+probe=0
+task=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --probe) probe=1; shift ;;
+    --task-file) task="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ "$probe" -eq 1 ] && exit 0
+case "$task" in
+  *task-dead-optional.txt)
+    printf 'call\\n' >> {str(calls)!r}
+    exec sleep 100000
+    ;;
+  *) exit 1 ;;
+esac
+'''
+    )
+    h.handler.chmod(0o755)
+    task = h.ws / "tasks" / "task-dead-optional.txt"
+    task.write_text("id: task-dead-optional\naccess_tier: owner\ntask: side effect then crash\n")
+    claim = h.ws / "state" / "task-event-handler-claims" / task.name
+    fallback = h.ws / "state" / "task-event-handler-fallbacks" / task.name
+    h.start()
+    try:
+        active = wait_for(
+            lambda: calls.is_file()
+            and claim.is_file()
+            and claim.read_text().splitlines()[-1:] == ["handling"]
+        )
+        check("dead optional control reaches handling after one side effect", active)
+        check("dead optional runner is killed", len(h.kill_workers()) >= 1)
+        h.deliver("task-dead-optional-nudge.txt")
+        held = wait_for(
+            lambda: claim.is_file() and claim.read_text().splitlines()[-1:] == ["held"]
+        )
+        check("dead optional runner is reaped to held, not fallback", held)
+        check("dead optional runner creates no live-core fallback", not fallback.exists())
+        h.stop()
+
+        restarted = Harness.attach(h.ws, h.tmp)
+        restarted.start()
+        try:
+            time.sleep(1.0)
+            check("dead optional claim survives abrupt restart", claim.is_file())
+            check("dead optional provider side effect is not repeated",
+                  calls.read_text().splitlines() == ["call"])
+            check("dead optional restart remains hidden from live core", not fallback.exists())
+        finally:
+            restarted.stop()
+    finally:
+        h.stop()
+
+
 
 
 
@@ -485,6 +547,7 @@ def main() -> int:
     scenario_outcome_unknown_claim_survives_restart()
     scenario_failed_held_transition_survives_restart(graceful=True)
     scenario_failed_held_transition_survives_restart(graceful=False)
+    scenario_dead_optional_runner_stays_fail_closed()
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1

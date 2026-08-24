@@ -100,10 +100,8 @@ has_result() {
   if ! "$PY" - "$REPO/src" "$RESULTS_DIR" "$task_id" <<'PY' 2>/dev/null
 import pathlib, sys
 sys.path.insert(0, sys.argv[1])
-from local_task_protocol import find_result
-from delivery.readiness import read_ready_result
-found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
-raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
+from local_task_protocol import find_ready_result
+raise SystemExit(0 if find_ready_result(pathlib.Path(sys.argv[2]), sys.argv[3]) is not None else 1)
 PY
   then
     return 1

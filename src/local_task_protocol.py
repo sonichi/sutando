@@ -510,8 +510,8 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
     return base / "archive" / iso_timestamp[:7]
 
 
-def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
-    """Locate an archived result across BOTH layouts in use.
+def _iter_archived_results(results_dir: Path, task_id: str) -> Iterable[Path]:
+    """Yield archived result candidates in established lookup order.
 
     The messaging bridges archive as `archive/<YYYY-MM>/<id>.txt` via
     `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`.
@@ -524,13 +524,13 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     globbing with them (traversal gate).
     """
     if not valid_archive_lookup_id(task_id):
-        return None
+        return
     archive = Path(results_dir) / "archive"
     fname = f"{task_id}.txt"
 
     direct = archive / fname
     if direct.is_file():
-        return direct
+        yield direct
 
     try:
         with os.scandir(archive) as entries:
@@ -542,13 +542,12 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     for month in months:
         candidate = archive / month / fname
         if candidate.is_file():
-            return candidate
+            yield candidate
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
-    flat = sorted(archive.glob(f"{task_id}-*.txt"))
-    if flat:
-        return flat[-1]
+    for candidate in reversed(sorted(archive.glob(f"{task_id}-*.txt"))):
+        yield candidate
 
     # Startup retention archives are siblings of archive/, not descendants.
     # They carry the same exact result names and collision suffixes.
@@ -562,7 +561,29 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     for directory in retention_dirs:
         found = newest_archived(directory, task_id)
         if found is not None:
-            return found
+            yield found
+
+
+def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
+    """Locate the first archived result across every supported layout."""
+    return next(iter(_iter_archived_results(results_dir, task_id)), None)
+
+
+def find_ready_result(results_dir: Path, task_id: str) -> Path | None:
+    """Locate the first deliverable live or archived result for a task."""
+    if not valid_archive_lookup_id(task_id):
+        return None
+    try:
+        from .result_ready import read_ready_result
+    except ImportError:
+        from delivery.readiness import read_ready_result
+
+    live = Path(results_dir) / f"{task_id}.txt"
+    if live.is_file() and read_ready_result(live) is not None:
+        return live
+    for candidate in _iter_archived_results(results_dir, task_id):
+        if read_ready_result(candidate) is not None:
+            return candidate
     return None
 
 

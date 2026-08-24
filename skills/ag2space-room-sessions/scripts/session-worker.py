@@ -45,7 +45,7 @@ if REPO_ROOT is None:
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from local_task_protocol import find_result, parse_task_headers_trusted
+from local_task_protocol import find_ready_result, parse_task_headers_trusted
 from result_ready import read_ready_result
 from team_result_guard import resolve_access_tier
 
@@ -117,8 +117,7 @@ def _locked(path: Path):
 
 
 def _completed_result_exists(results_dir: Path, filename: str) -> bool:
-    found = find_result(results_dir, Path(filename).stem)
-    return found is not None and read_ready_result(found) is not None
+    return find_ready_result(results_dir, Path(filename).stem) is not None
 
 
 def resolve_room_key(task_file: Path) -> Optional[str]:

@@ -88,8 +88,15 @@ class DelegationTest(unittest.TestCase):
 
     def test_codex_notifier_delegates_lookup_and_readiness(self):
         source = (REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh").read_text()
-        self.assertIn("from local_task_protocol import find_result", source)
-        self.assertIn("from delivery.readiness import read_ready_result", source)
+        self.assertIn("from local_task_protocol import find_ready_result", source)
+
+    def test_room_worker_and_watcher_delegate_ready_lookup(self):
+        for path in (
+            REPO / "src" / "watch-tasks-stream.sh",
+            REPO / "skills" / "ag2space-room-sessions" / "scripts" / "session-worker.py",
+        ):
+            with self.subTest(path=path):
+                self.assertIn("find_ready_result", path.read_text())
 
     def test_every_consumer_imports_the_owner(self):
         for name, path in CONSUMERS.items():
