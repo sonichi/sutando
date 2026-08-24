@@ -107,9 +107,8 @@ st, det = pp.stale_verdict(pp.evaluate([pin(expires_at=PAST)], "discord-bridge",
 check("stale_verdict expired -> still stale", st == "stale")
 check("stale_verdict expired -> surfaces the lost pin", "expired" in det)
 
-# An ARMED sibling changes the PRESCRIPTION; it must not retract the other
-# pins' notes. Orphan removal is manual, so "stale pin left behind, new pin
-# armed" is the ordinary sequence and the dropped note is a lost finding.
+# An armed sibling changes the prescription, not the other pins' notes;
+# orphan removal is manual, so armed-beside-stale is the ordinary case.
 orphan = pin(pid=91000)
 for order, label in (([orphan, pin()], "orphan first"),
                      ([pin(), orphan], "armed first")):
