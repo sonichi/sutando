@@ -62,7 +62,7 @@ mkdir -p "$TMP/bundle/engine/sutando"
 rsync -a --exclude '.git' --exclude 'node_modules' --exclude 'workspace' \
       "$REPO/" "$TMP/bundle/engine/sutando/" 2>/dev/null
 cat > "$TMP/bundle/engine/ENGINE_MANIFEST.json" <<'JSON'
-{"sha":"1234567890abcdef1234567890abcdef12345678","branch":"release/test","dirty":false,"built_at":"2026-08-24T00:00:00Z","post_build_tree_digest":"sha256:abcdef"}
+{"sha":"1234567890abcdef1234567890abcdef12345678","branch":"release/test","dirty":true,"built_at":"2026-08-24T00:00:00Z","post_build_tree_digest":"sha256:abcdef"}
 JSON
 : > "$GITLOG"
 bundle_json="$(cd "$TMP/bundle/engine/sutando" && PATH="$TMP/shim:$PATH" bash scripts/sutando-config.sh runtime 2>/dev/null)"
@@ -74,7 +74,7 @@ import json,sys
 c=json.load(sys.stdin)["code"]
 want={
  "commit":"1234567", "revision":"1234567890abcdef1234567890abcdef12345678",
- "branch":"release/test", "describe":"1234567", "dirty":False,
+ "branch":"release/test", "describe":"1234567", "dirty":True,
  "source":"engine-manifest", "built_at":"2026-08-24T00:00:00Z",
  "tree_digest":"sha256:abcdef", "tree_sha":None,
 }

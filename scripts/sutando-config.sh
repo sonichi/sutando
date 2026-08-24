@@ -648,7 +648,8 @@ except Exception:
 # and to spot a locally-modified core. Git is authoritative for checkouts;
 # packaged engines fall back to the build-authored ENGINE_MANIFEST beside the
 # copied repo. tree_sha is the content hash of TRACKED files (version-
-# independent); dirty flags uncommitted edits. A stronger working-tree
+# independent); packaged consumers use tree_digest instead. dirty flags
+# uncommitted edits. A stronger working-tree
 # 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
 # follow-up alongside the identity block.
 # Resolve ONCE, before any spawn. Two gates, both required:
@@ -682,7 +683,7 @@ def _git(*a):
         return None
 
 def _engine_manifest():
-    # Packaged installs place the manifest beside the copied engine directory.
+    # Packaging authors the parent manifest; the in-repo path is compatibility-only.
     for path in (os.path.join(os.path.dirname(repo), 'ENGINE_MANIFEST.json'),
                  os.path.join(repo, 'ENGINE_MANIFEST.json')):
         try:
@@ -714,7 +715,7 @@ code = {
     'branch': _git('rev-parse', '--abbrev-ref', 'HEAD') or _manifest_branch,
     'describe': _git_describe or (_revision[:7] if _revision else None),
     'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
-    'dirty': bool(_git('status', '--porcelain')) if _git_bin else _manifest_dirty,
+    'dirty': bool(_git('status', '--porcelain')) if _git_revision else _manifest_dirty,
     'source': 'git' if _git_revision else ('engine-manifest' if _manifest_revision else None),
     'built_at': _manifest.get('built_at') if isinstance(_manifest.get('built_at'), str) else None,
     'tree_digest': (_manifest.get('post_build_tree_digest')
