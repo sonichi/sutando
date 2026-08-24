@@ -85,11 +85,8 @@ check("broken policy does NOT refuse a sibling channel", not v("222", P), repr(v
 r = v("111", P)
 check("refusal names the failing path", isinstance(r, str) and "broken.py" in r, repr(r))
 
-# --- P1 (qingyun-wu, review of 0f6a8d27): a LISTED channel with an empty
-# path must not be answered by `*`. My first cut dropped falsey entries before
-# dispatch, so `{"sensitive": null, "*": allow}` let the permissive wildcard
-# answer for the very channel the config named. Both halves of the axis were
-# tested -- empty entries, and `*` fallback -- and their INTERSECTION was not.
+# --- P1: a LISTED channel with an empty path must not be answered by `*`.
+# Both halves of this axis were tested; their INTERSECTION was the hole.
 for empty_val in (None, "", "   "):
     v = resolve({"sensitive": empty_val, "*": str(D / "allow.py")})
     r = v("sensitive", P)
