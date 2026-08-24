@@ -34,6 +34,9 @@ STALL_EXCLUDED_SOURCES = frozenset({"slack"})
 _HEADER_RE = re.compile(
     r"^(?:(?P<key>source|channel_id|chat_id):\s*(?P<val>\S+))", re.M)
 _CLAIMED_RE = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
+# Same stem in all three states; anchored so task-1 cannot match task-12.
+_PRESENT_RE = re.compile(
+    r"^(task-[A-Za-z0-9._~-]+?)(?:\.(?:assigned|claimed)-.+)?\.txt$")
 
 
 def read_routing(path: Path) -> "tuple[str, str] | None":
@@ -108,23 +111,24 @@ class PoolNotifier:
 
     # ── stall notices ───────────────────────────────────────────────────────
     def check_stalls(self) -> "list[str]":
-        """Scan claimed tasks; notify each channel at most once when its
-        task has been claimed longer than `stall_after_s` with no done-flag.
+        """Scan claimed tasks; notify each channel at most once while its
+        task is unfinished longer than `stall_after_s` with no done-flag.
         First-seen times live in the ledger (rename keeps mtime, and ctime
-        is not portable). Returns the task stems notified this pass."""
+        is not portable) and survive a repool, so the at-most-once marker
+        and the clock both span re-claims. Returns the stems notified."""
         try:
             entries = list(self.tasks_dir.iterdir())
         except OSError:
             return []
         ledger = self._load()
-        live = set()
+        present = {m.group(1) for m in
+                   (_PRESENT_RE.match(f.name) for f in entries) if m}
         notified = []
         for f in entries:
             m = _CLAIMED_RE.match(f.name)
             if not m:
                 continue
             stem, inst = m.group(1), m.group(2)
-            live.add(stem)
             row = ledger["tasks"].setdefault(
                 stem, {"first_claimed": self.now(), "notified": []})
             if "stall" in row["notified"]:
@@ -143,9 +147,10 @@ class PoolNotifier:
             if self._try_send(routing[0], routing[1], msg):
                 row["notified"].append("stall")
                 notified.append(stem)
-        # entries for archived/renamed-away claims are dead weight — drop them
+        # Prune on presence, not on claimed: a repool renames the file back and
+        # dropping the row here would lose the marker and re-arm the stall.
         ledger["tasks"] = {k: v for k, v in ledger["tasks"].items()
-                           if k in live}
+                           if k in present}
         self._save(ledger)
         return notified
 

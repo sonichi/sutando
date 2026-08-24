@@ -131,6 +131,44 @@ class StallTests(NotifyBase):
         self.assertEqual(n.check_stalls(), [])       # send failed → not marked
         self.assertEqual(n.check_stalls(), ["task-1"])  # retried, succeeded
 
+    def test_repool_keeps_the_at_most_once_marker(self):
+        """A stall-notified task that is repooled and re-claimed by another
+        core must not notify again — the marker lives in a row that used to
+        be pruned the moment the file stopped being `.claimed-`."""
+        p = self._claimed("task-1", "core-A")
+        self.n.check_stalls()
+        self.clock[0] += 601
+        self.assertEqual(self.n.check_stalls(), ["task-1"])
+        p.rename(self.tasks / "task-1.txt")        # lead repools it
+        self.n.check_stalls()
+        self._claimed("task-1", "core-B")          # another core claims it
+        for _ in range(3):                         # past the re-armed clock
+            self.clock[0] += 601
+            self.n.check_stalls()
+        self.assertEqual(len(self.sent), 1, [m for _, _, m in self.sent])
+        self.assertIn("core-A", self.sent[0][2])
+
+    def test_repool_control_same_claimer_also_notifies_once(self):
+        self._claimed("task-1", "core-A")
+        self.n.check_stalls()
+        for _ in range(4):
+            self.clock[0] += 601
+            self.n.check_stalls()
+        self.assertEqual(len(self.sent), 1, [m for _, _, m in self.sent])
+
+    def test_presence_prune_does_not_alias_a_longer_stem(self):
+        """task-1 must not be kept alive by task-12 — the prefix-collision
+        that the same-shaped archive glob shipped elsewhere."""
+        p = self._claimed("task-1", "core-A")
+        self._claimed("task-12", "core-B")
+        self.n.check_stalls()
+        p.unlink()                                  # only task-1 goes away
+        self.n.check_stalls()
+        import json
+        ledger = json.loads(
+            (self.state / "pool" / "notify-ledger.json").read_text())
+        self.assertEqual(sorted(ledger["tasks"]), ["task-12"])
+
     def test_ledger_drops_archived_claims(self):
         p = self._claimed("task-1", "core-2")
         self.n.check_stalls()
