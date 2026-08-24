@@ -6804,6 +6804,29 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
     return trees
 
 
+def _split_by_session_ownership(roots, ps_out) -> tuple:
+    """Partition watcher roots into (session-owned, ownerless).
+
+    A KNOWN parent that is not init means the spawning session still owns the
+    tree; unknown parentage cannot support that claim, so it fails closed.
+    """
+    owned = [r for r in roots if (_pid_parent(r, ps_out) or "1") != "1"]
+    return owned, [r for r in roots if r not in owned]
+
+
+def _owned_clause(owned) -> str:
+    """The 'these are session-owned' half of a two-group verdict.
+
+    Every multi-root verdict must present owned and ownerless as two labelled
+    groups: consumers key on that structure, not on adjectives, so emitting one
+    undifferentiated pid list reads as 'stop all of them'.
+    """
+    if not owned:
+        return ""
+    return (f"; {len(owned)} other tree(s) ({', '.join(owned)}) are "
+            f"session-owned and must be left alone")
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -6848,10 +6871,8 @@ def check_task_watcher() -> dict:
             # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
             # duplicate processing, not a stalled queue).
 
-            # A KNOWN parent that is not init: its spawning session still owns it.
-            # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
-            supervised = [r for r, pp in parents.items() if pp and pp != "1"]
+            supervised, unowned = _split_by_session_ownership(roots, ps_out)
             if len(roots) == 1 and supervised:
                 # Its session is still its parent, so it IS supervised and there is
                 # no second tree to duplicate work. Killing it is what opens a gap.
@@ -6864,10 +6885,18 @@ def check_task_watcher() -> dict:
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
+            if not unowned:
+                return {"name": name, "status": "warn",
+                        "detail": f"{len(roots)} watcher trees running with no PID sentinel "
+                                  f"(root pids {', '.join(roots)}) — but every one still runs "
+                                  f"under a live session, and a pool runs one watcher per core, so "
+                                  f"these are legitimate. Do NOT stop them: they ARE draining "
+                                  f"tasks/. Re-stamp the sentinel with --fix"}
             return {"name": name, "status": "warn",
-                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
-                              f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"{len(roots)} watcher trees running with no PID sentinel — "
+                              f"{len(unowned)} of {len(roots)} have NO live owning session (root "
+                              f"pids {', '.join(unowned)}); duplicates process each task more than "
+                              f"once. Stop those" + _owned_clause(supervised)}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
@@ -6881,10 +6910,18 @@ def check_task_watcher() -> dict:
         if roots:
             # The sentinel tracks only the MOST RECENT start, so a dead one does
             # NOT mean nothing drains tasks/ — restarting here makes duplicates.
+            owned, unowned = _split_by_session_ownership(roots, ps_out)
+            if not unowned:
+                return {"name": name, "status": "warn",
+                        "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher tree(s) "
+                                  f"still run — every one under a live session (root pids "
+                                  f"{', '.join(roots)}), and a pool runs one watcher per core, so "
+                                  f"these are legitimate. Do NOT stop them: tasks/ IS being drained"}
             return {"name": name, "status": "warn",
-                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
-                              f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"sentinel pid {pid} is dead; {len(unowned)} of {len(roots)} watcher "
+                              f"tree(s) have NO live owning session (root pids "
+                              f"{', '.join(unowned)}); duplicates process each task more than once. "
+                              f"Stop those" + _owned_clause(owned)}
         return {"name": name, "status": "warn",
                 "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
     if "watch-tasks-stream" not in argv:
@@ -6894,10 +6931,7 @@ def check_task_watcher() -> dict:
                 "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
     extras = sorted(r for r, members in trees.items() if str(pid) not in members)
     if extras:
-        # Same locality rule as the no-sentinel branch above: a KNOWN parent that
-        # is not init means the spawning session still owns this tree.
-        owned = [r for r in extras if (_pid_parent(r, ps_out) or "1") != "1"]
-        orphaned = [r for r in extras if r not in owned]
+        owned, orphaned = _split_by_session_ownership(extras, ps_out)
         if not orphaned:
             return {"name": name, "status": "warn",
                     "detail": f"{len(trees)} watcher trees running, {len(extras)} not tracked by the "
@@ -6909,9 +6943,7 @@ def check_task_watcher() -> dict:
                 "detail": f"{len(trees)} watcher trees running — {len(orphaned)} of {len(extras)} "
                           f"untracked tree(s) have NO live owning session (root pids "
                           f"{', '.join(orphaned)}); duplicates process each task more than once. "
-                          f"Stop those, keep the sentinel's ({pid})"
-                          + (f"; {len(owned)} other untracked tree(s) ({', '.join(owned)}) are "
-                             f"session-owned and must be left alone" if owned else "")}
+                          f"Stop those, keep the sentinel's ({pid})" + _owned_clause(owned)}
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 

@@ -12,6 +12,7 @@ The single-core verdict is unchanged: there the extra tree really is a duplicate
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import tempfile
 import time
@@ -93,6 +94,73 @@ class ProbeVerdictUsesLOCALSessionOwnership(unittest.TestCase):
         """Fail closed: an unreadable parent cannot support an ownership claim."""
         d = self._verdict({"200": None})
         self.assertIn("Stop those", d)
+
+
+class EveryMultiRootBranchSplitsOwnership(unittest.TestCase):
+    """The tracked-sentinel branch was split first; these two were not — and they
+    are the branches a pool actually lands in, because a pool's sentinel is
+    routinely absent (never stamped) or stale (stamped by a core that exited).
+    Each emitted ONE undifferentiated pid list ending in "stop them and restart
+    one cleanly", naming every root including the session-owned ones.
+    """
+
+    def _verdict(self, ppids, sentinel):
+        """sentinel: 'absent' (never stamped) or 'dead' (stamped, pid gone)."""
+        hc = _load()
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state" / "cores").mkdir(parents=True)
+        (ws / "state" / "cores" / "main.alive").write_text("{}")
+        if sentinel == "dead":
+            (ws / "state" / "watch-tasks-stream.pid").write_text("999")
+        hc.WORKSPACE_DIR = ws
+        hc._ps_snapshot = lambda: "PID TT  STAT  TIME COMMAND\n"
+        hc._watcher_trees = lambda ps_output=None: {r: [r] for r in ppids}
+        hc._proc_argv = lambda pid: None  # the stamped pid is gone
+        hc._any_core_alive = lambda *a, **k: True
+        hc._pid_parent = lambda pid, ps=None: ppids.get(str(pid))
+        return hc.check_task_watcher()["detail"]
+
+    POOL = {"200": "199", "300": "299", "400": "399"}
+    ORPHANS = {"200": "1", "300": "1", "400": "1"}
+    MIXED = {"200": "199", "300": "1", "400": "399"}
+
+    def test_absent_sentinel_pool_is_left_alone(self):
+        d = self._verdict(self.POOL, "absent")
+        self.assertIn("Do NOT stop them", d)
+        self.assertNotIn("Stop those", d)
+
+    def test_dead_sentinel_pool_is_left_alone(self):
+        """This host's live verdict shape: sentinel dead, four owned watchers."""
+        d = self._verdict(self.POOL, "dead")
+        self.assertIn("Do NOT stop them", d)
+        self.assertNotIn("Stop those", d)
+
+    def test_absent_sentinel_all_orphaned_still_says_stop(self):
+        """Positive control: without it, a verdict that never advises stopping
+        anything would satisfy both tests above."""
+        d = self._verdict(self.ORPHANS, "absent")
+        self.assertIn("Stop those", d)
+        self.assertIn("NO live owning session", d)
+
+    def test_dead_sentinel_all_orphaned_still_says_stop(self):
+        d = self._verdict(self.ORPHANS, "dead")
+        self.assertIn("Stop those", d)
+        self.assertIn("NO live owning session", d)
+
+    def test_a_stop_instruction_never_names_a_session_owned_root(self):
+        """The invariant the consuming instruction keys on: whatever pids follow
+        'NO live owning session', none of them may be owned. A verdict that
+        listed every root — the pre-fix shape — fails here on both branches."""
+        for sentinel in ("absent", "dead"):
+            d = self._verdict(self.MIXED, sentinel)
+            named = re.search(r"NO live owning session \(root pids ([^)]*)\)", d)
+            self.assertIsNotNone(named, f"{sentinel}: no ownerless group named in {d!r}")
+            stopped = {p.strip() for p in named.group(1).split(",")}
+            self.assertEqual(stopped, {"300"}, f"{sentinel}: stop list was {stopped}")
+            self.assertIn("must be left alone", d, sentinel)
+            for owned in ("200", "400"):
+                self.assertIn(owned, d.split("must be left alone")[0].split("Stop those")[1],
+                              f"{sentinel}: owned root {owned} missing from the protected group")
 
 
 if __name__ == "__main__":
