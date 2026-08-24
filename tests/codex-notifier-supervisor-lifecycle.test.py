@@ -162,7 +162,7 @@ class LeaseOwnershipTest(unittest.TestCase):
         n = _write(self.d / f"notifier-{tag}.sh", f"""
             #!/bin/bash
             echo "{tag}" >> "{self.runs}"
-            sleep 30
+            sleep 10
         """, executable=True)
         return n
 
@@ -191,11 +191,15 @@ class LeaseOwnershipTest(unittest.TestCase):
         return proc
 
     def _reap(self, proc):
+        # SIGTERM, not the tmux stop file: the supervisor is blocked in `wait`
+        # on its child, so polling teardown costs a whole notifier lifetime.
         self.stop.touch()
+        proc.terminate()
         try:
-            proc.wait(timeout=20)
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=5)
 
     def _ran(self):
         return self.runs.read_text().split() if self.runs.exists() else []
@@ -241,7 +245,7 @@ class LeaseOwnershipTest(unittest.TestCase):
         (self.lock / "pid").write_text("999999\n")
 
         holder.terminate()   # runs the trap -> release_lease, the path under test
-        holder.wait(timeout=25)
+        holder.wait(timeout=15)
         self.assertTrue(self.lock.exists(),
                         "the former owner deleted a lease it no longer held")
         self.assertNotEqual((self.lock / "token").read_text(), successor)
