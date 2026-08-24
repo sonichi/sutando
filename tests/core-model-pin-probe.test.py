@@ -706,6 +706,30 @@ class SettingsJsonIsAThirdWayTheModelIsChosen(unittest.TestCase):
                 [("user", real), ("project", link)])
             self.assertEqual(got, [("user", "sonnet")], got)
 
+    @contextlib.contextmanager
+    def _probe_on_any_host(self, runtime, settings):
+        """check_core_model_pin() early-returns 'no core tmux socket' when the
+        socket file is absent — true in CI, false on a dev box. Give it a real
+        temp file and stub only the tmux/OS edges so the decision under test runs."""
+        with tempfile.TemporaryDirectory() as d:
+            sock = Path(d) / "probe.sock"
+            sock.write_text("")
+            old = os.environ.get("SUTANDO_TMUX_SOCKET")
+            os.environ["SUTANDO_TMUX_SOCKET"] = str(sock)
+            try:
+                with mock.patch.object(self.hc, "_tmux_sessions", lambda s: ["sutando-core"]), \
+                     mock.patch.object(self.hc, "_query_pin", lambda s, a: ""), \
+                     mock.patch.object(self.hc, "_core_argv_pins", lambda s, ss: []), \
+                     mock.patch.object(self.hc, "_live_core_runtime", lambda s, ss: runtime), \
+                     mock.patch.object(self.hc, "_settings_model_pins",
+                                       lambda *a, **k: settings):
+                    yield
+            finally:
+                if old is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = old
+
     def test_claude_settings_must_not_vouch_for_a_CODEX_core(self):
         """The argv scan skips any pane without `claude`, so a Codex core supplies
         no running evidence; a Claude-only settings.json must not then be read as
@@ -755,32 +779,20 @@ class SettingsJsonIsAThirdWayTheModelIsChosen(unittest.TestCase):
 
     def test_SHIPPED_path_unresolvable_runtime_must_not_default_to_claude(self):
         """The call-site fallback itself. Mutating `or "unknown"` to `or "claude"`
-        passed every other test in this file — the unknown test drives the
-        interpreter directly and the mirror test resolves a real value, so neither
-        reaches the fallback. This one does."""
-        with mock.patch.object(self.hc, "_live_core_runtime", lambda s, ss: None), \
-             mock.patch.object(self.hc, "_settings_model_pins",
-                               lambda *a, **k: [("user", "opus[1m]")]):
+        passed every other test here — the unknown test drives the interpreter
+        directly and the mirror test resolves a real value, so neither reaches the
+        fallback. This one does."""
+        with self._probe_on_any_host(None, [("user", "opus[1m]")]):
             r = self.hc.check_core_model_pin()
         self.assertNotIn("opus[1m]", r["detail"],
                          "an unresolvable runtime must not consume Claude settings")
         self.assertIn("unassessed", r["detail"])
 
     def test_MIRROR_live_codex_pane_beats_a_claude_CONFIG(self):
-        """The reviewer's mirror case: config says claude (or is invalid, which
-        _codex_runtime_selected collapses to claude) while the live pane is codex.
-        Settings must still not be consulted."""
-        class _R:
-            def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+        """Config says claude (what an invalid config also collapses to) while the
+        live pane is codex. Settings must still not be consulted."""
         with mock.patch.object(self.hc, "_codex_runtime_selected", lambda: False), \
-             mock.patch.object(self.hc, "_run_tmux",
-                               lambda sock, *a: _R(0, "SUTANDO_CORE_RUNTIME=codex")), \
-             mock.patch.object(self.hc, "_settings_model_pins",
-                               lambda *a, **k: [("user", "opus[1m]")]), \
-             mock.patch.object(self.hc, "_tmux_sessions", lambda s: ["sutando-core"]), \
-             mock.patch.object(self.hc, "_query_pin", lambda s, a: ""), \
-             mock.patch.object(self.hc, "_core_argv_pins", lambda s, ss: []), \
-             mock.patch.object(self.hc, "Path", self.hc.Path):
+             self._probe_on_any_host("codex", [("user", "opus[1m]")]):
             r = self.hc.check_core_model_pin()
         self.assertNotIn("opus[1m]", r["detail"],
                          "a live codex pane must veto the Claude settings value")
@@ -793,9 +805,7 @@ class SettingsJsonIsAThirdWayTheModelIsChosen(unittest.TestCase):
         moved to the live pane that mock went inert and this test failed — which is
         the test noticing its own premise had been removed.
         """
-        with mock.patch.object(self.hc, "_live_core_runtime", lambda s, ss: "codex"), \
-             mock.patch.object(self.hc, "_settings_model_pins",
-                               lambda *a, **k: [("user", "opus[1m]")]):
+        with self._probe_on_any_host("codex", [("user", "opus[1m]")]):
             r = self.hc.check_core_model_pin()
         self.assertEqual(r["status"], "ok", r)
         self.assertNotIn("opus[1m]", r["detail"],
