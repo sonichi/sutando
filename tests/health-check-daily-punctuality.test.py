@@ -358,10 +358,8 @@ class TestNamingDriftIsUncheckedNotLate(unittest.TestCase):
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("UNCHECKED", r["detail"])
         self.assertIn("2026-07-16", r["detail"])
-        # The two claims it must NOT make from a dead corpus. Assert the RENDERED
-        # claim shapes, not bare phrases: the UNCHECKED message quotes "no output
-        # today" while explaining that it is unmeasurable, so a substring test
-        # matches the explanation and fails on a correct fix.
+        # Assert the RENDERED claim shapes, not bare phrases: the UNCHECKED text
+        # quotes these terms while explaining them, so a substring test misfires.
         self.assertNotIn("no output today, 459 min past due", r["detail"])
         self.assertNotIn("run(s), median", r["detail"])
 

@@ -5722,9 +5722,8 @@ DISK_FAIL_GIB = 2.0
 
 DAILY_LATE_TOLERANCE_MIN = 15
 DAILY_MISS_GRACE_MIN = 60
-# A daily job that has matched nothing for this long is not late — the probe has
-# stopped matching its output. Reporting lateness from a dead corpus asserts more
-# than was measured, so the job is demoted to UNCHECKED instead.
+# Past this, a daily job's silence means the probe stopped matching its output,
+# not that the job is late; scoring a dead corpus asserts more than was measured.
 DAILY_ARTIFACT_STALE_DAYS = 10
 
 
@@ -5738,9 +5737,8 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         if not j["artifacts"]:
             unknown.append(j["name"])
             continue
-        # Matching stopped long ago: the median below would describe a corpus the
-        # job no longer writes, and "no output today" would blame the job for the
-        # probe's own blind spot. Neither claim is measurable, so make neither.
+        # The median would describe a corpus this job no longer writes, and a
+        # missed-today verdict would blame it for the probe's own blind spot.
         if j.get("naming_stale"):
             drifted.append((j["name"], j.get("newest_artifact") or "?",
                             j.get("artifact_age_days")))
