@@ -55,6 +55,18 @@
    "canonical_for": "running, attributing, reporting, and comparing black-box Sutando benchmarks",
    "last_verified": "2026-08-24"
   },
+  "docs/benchmark-reports/2026-08-24-3a73e03.md": {
+   "title": "Sutando comprehensive benchmark — 2026-08-24",
+   "audience": [
+    "users",
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "historical",
+   "canonical_for": "benchmark results for packaged Sutando revision 3a73e03 on 2026-08-24",
+   "last_verified": "2026-08-24"
+  },
   "docs/built-in-tools.md": {
    "title": "Built-in tools",
    "audience": [
