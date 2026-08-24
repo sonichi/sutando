@@ -27,6 +27,7 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import importlib.util
 import io
@@ -472,6 +473,88 @@ class TestArityForNewlyRoutedCommands(_Isolated):
         self.assertIn("usage:", err)
 
 
+
+
+class _Sentinel(Exception):
+    """Breaks a poller loop after exactly one iteration."""
+
+
+class TestSingleSendOwner(_Isolated):
+    """Two pollers, one grant, one confirmation.
+
+    `_pair()` leaves BOTH durable records — the legacy `approved/<sender>`
+    marker and `pendingNotify[sender]`. `poll_approved()` must adopt the
+    marker rather than deliver it, so only `poll_pending_notify()` sends.
+    """
+
+    def _drive(self, coro_fn, sends):
+        class _Chan:
+            def __init__(self, cid): self.cid = cid
+
+            async def send(self, text):
+                sends.append((self.cid, text))
+
+        class _Client:
+            async def fetch_channel(self, cid):
+                return _Chan(cid)
+
+        db_bridge.ACCESS_FILE = self.access_file
+        db_bridge.client = _Client()
+
+        async def _sleep(_secs):
+            raise _Sentinel()
+
+        orig = db_bridge.asyncio.sleep
+        db_bridge.asyncio.sleep = _sleep
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                asyncio.run(coro_fn())
+        except _Sentinel:
+            pass
+        finally:
+            db_bridge.asyncio.sleep = orig
+
+    def test_only_one_confirmation_from_the_post_pair_state(self):
+        self._write({"dmPolicy": "pairing", "allowFrom": [], "pending": {
+            "ONE1": {"senderId": "s-one", "chatId": "424242",
+                     "expiresAt": int(time.time() * 1000) + 60_000}}})
+        self._ok(["pair", "ONE1"])
+
+        marker = self.access_file.parent / "approved" / "s-one"
+        doc = self._read()
+        self.assertTrue(marker.exists(), "premise: pair must leave the legacy marker")
+        self.assertEqual(doc.get("pendingNotify", {}).get("s-one"), "424242",
+                         "premise: pair must leave the pendingNotify obligation")
+
+        sends = []
+        self._drive(db_bridge.poll_approved, sends)
+        self.assertEqual(sends, [], "poll_approved must adopt, never deliver")
+        self.assertFalse(marker.exists(), "adopted marker should be consumed")
+        self.assertEqual(self._read().get("pendingNotify", {}).get("s-one"), "424242",
+                         "the obligation must survive adoption")
+
+        self._drive(db_bridge.poll_pending_notify, sends)
+        self.assertEqual(len(sends), 1, f"exactly one confirmation, got {sends}")
+        self.assertEqual(sends[0][1], "You're in! Access approved.")
+        self.assertNotIn("s-one", self._read().get("pendingNotify", {}),
+                         "a delivered obligation must be acked")
+
+    def test_a_marker_with_no_pending_entry_is_still_delivered_once(self):
+        """Legacy ingress: the upstream plugin writes a marker and no
+        pendingNotify, so adoption is what keeps that path working."""
+        self._write({"dmPolicy": "pairing", "allowFrom": ["s-legacy"], "pending": {}})
+        d = self.access_file.parent / "approved"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s-legacy").write_text("515151")
+
+        sends = []
+        self._drive(db_bridge.poll_approved, sends)
+        self.assertEqual(sends, [])
+        self.assertEqual(self._read().get("pendingNotify", {}).get("s-legacy"), "515151")
+
+        self._drive(db_bridge.poll_pending_notify, sends)
+        self.assertEqual(len(sends), 1, f"exactly one confirmation, got {sends}")
+        self.assertEqual(sends[0][0], 515151)
 
 if __name__ == "__main__":
     _r = unittest.main(exit=False)

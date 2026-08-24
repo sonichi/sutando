@@ -4231,7 +4231,9 @@ def _approved_dirs() -> "list[Path]":
 
 
 async def poll_approved():
-    """Poll approved/ dirs and send 'you're in' confirmations."""
+    """Poll approved/ dirs and ADOPT each marker into pendingNotify.
+    This loop does not send: pendingNotify is the sole send owner, so two
+    pollers over the same grant cannot both deliver a confirmation (#3318)."""
     _legacy_warned = False
     while True:
         try:
@@ -4259,9 +4261,14 @@ async def poll_approved():
                     # marker in the directory and the loop just slept.
                     try:
                         chat_id = f.read_text().strip()
-                        channel = await client.fetch_channel(int(chat_id))
-                        await channel.send("You're in! Access approved.")
-                        print(f"  Sent approval confirmation to {sender_id} in {chat_id}")
+                        # A corrupt access.json makes mutate_access_file a silent
+                        # no-op; raising routes it into the never-delete path below.
+                        if not _adopt_pending_notify(sender_id, chat_id):
+                            raise RuntimeError(
+                                f"could not record pendingNotify for {sender_id} — "
+                                f"access.json unreadable; keeping the marker"
+                            )
+                        print(f"  Adopted approval marker for {sender_id} ({chat_id}) into pendingNotify")
                         if _i > 0 and not _legacy_warned:
                             _legacy_warned = True
                             print(
@@ -4324,6 +4331,24 @@ async def poll_approved():
 _pending_notify_failed_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
 
 
+def _adopt_pending_notify(sender_id: str, chat_id) -> bool:
+    """Record a legacy `approved/` marker as a pendingNotify obligation.
+    Returns False when nothing was committed — the caller MUST then keep the
+    marker, which is still the only record that a confirmation is owed."""
+
+    def _mutator(data):
+        pending_notify = data.get("pendingNotify", {})
+        if sender_id in pending_notify:
+            return None, {"ok": True}
+        pending_notify = dict(pending_notify)
+        pending_notify[sender_id] = chat_id
+        data["pendingNotify"] = pending_notify
+        return data, {"ok": True}
+
+    result = mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
+    return bool(result and result.get("ok"))
+
+
 def _ack_pending_notify(sender_id: str) -> None:
     """Idempotently clear `sender_id` from pendingNotify via the same locked
     transaction every other access.json writer uses (#3318)."""
@@ -4372,10 +4397,9 @@ async def poll_pending_notify():
     locked transaction as the `allowFrom` grant, so unlike the `approved/`
     marker files `poll_approved()` reads, there is no window where the
     process can crash after granting access but before the obligation is
-    recorded anywhere. `poll_approved()` remains as a low-latency fast path
-    on top of this — a sender may be acked here before its marker file (if
-    any) is ever read, which is fine: both paths converge on the same
-    idempotent ack.
+    recorded anywhere. `poll_approved()` is an INGRESS for the legacy marker
+    files the upstream plugin still writes — it adopts them into pendingNotify
+    and never sends — so this is the only loop that delivers.
     """
     while True:
         try:
