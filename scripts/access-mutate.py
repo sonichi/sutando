@@ -99,6 +99,11 @@ def _pair(code: str) -> dict:
         pending_notify = dict(data.get("pendingNotify", {}))
         pending_notify[sender_id] = chat_id
         data["pendingNotify"] = pending_notify
+        # Clear a stale fulfilled-obligation record so a fresh grant (deny +
+        # re-pair) can still notify (#3318).
+        notified = dict(data.get("notified", {}))
+        notified.pop(sender_id, None)
+        data["notified"] = notified
         approved["senderId"] = sender_id
         approved["chatId"] = chat_id
         return data, {"ok": True, "senderId": sender_id, "chatId": chat_id}
@@ -121,7 +126,12 @@ def _ack_notify(sender_id: str) -> dict:
     """Remove `sender_id` from pendingNotify — called by the bridge after it
     has successfully delivered the confirmation. Idempotent: acking an id
     that isn't pending is a no-op success, not an error, so a retried ack
-    after an uncertain-outcome send can never itself fail."""
+    after an uncertain-outcome send can never itself fail.
+
+    Also records the fulfilled obligation in `notified`, mirroring
+    discord-bridge.py's `_ack_pending_notify` — the same durable state, so
+    a stale legacy marker adopted afterward can never re-arm this obligation
+    regardless of which ack path fulfilled it (#3318)."""
 
     def _mutator(data):
         pending_notify = data.get("pendingNotify", {})
@@ -130,6 +140,9 @@ def _ack_notify(sender_id: str) -> dict:
         pending_notify = dict(pending_notify)
         del pending_notify[sender_id]
         data["pendingNotify"] = pending_notify
+        notified = dict(data.get("notified", {}))
+        notified[sender_id] = True
+        data["notified"] = notified
         return data, {"ok": True, "removed": True}
 
     return _mutate(_mutator)

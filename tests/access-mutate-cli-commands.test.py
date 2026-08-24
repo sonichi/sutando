@@ -556,6 +556,40 @@ class TestSingleSendOwner(_Isolated):
         self.assertEqual(len(sends), 1, f"exactly one confirmation, got {sends}")
         self.assertEqual(sends[0][0], 515151)
 
+    def test_pending_first_order_is_not_duplicated_by_a_stale_marker(self):
+        """Reviewer repro (#3318, review 5004371632): the two pollers are
+        independent async loops and can interleave pendingNotify-first
+        instead of marker-first. `poll_pending_notify()` sends and acks
+        before `poll_approved()` ever looks at the still-on-disk legacy
+        marker; adopting that stale marker afterward must not re-arm the
+        already-fulfilled obligation and trigger a second send."""
+        self._write({"dmPolicy": "pairing", "allowFrom": [], "pending": {
+            "ONE2": {"senderId": "s-one", "chatId": "424242",
+                     "expiresAt": int(time.time() * 1000) + 60_000}}})
+        self._ok(["pair", "ONE2"])
+
+        marker = self.access_file.parent / "approved" / "s-one"
+        self.assertTrue(marker.exists(), "premise: pair must leave the legacy marker")
+
+        sends = []
+        self._drive(db_bridge.poll_pending_notify, sends)
+        self.assertEqual(len(sends), 1, f"after_pending_first: sends={sends}")
+        self.assertTrue(marker.exists(), "after_pending_first: marker=False (not yet adopted)")
+        self.assertEqual(self._read().get("pendingNotify", {}), {},
+                         "after_pending_first: pendingNotify must be acked")
+
+        self._drive(db_bridge.poll_approved, sends)
+        self.assertEqual(len(sends), 1,
+                         f"after_marker_adopt: a stale marker must not re-arm an "
+                         f"already-acked obligation, sends={sends}")
+        self.assertFalse(marker.exists(), "after_marker_adopt: marker still consumed")
+        self.assertEqual(self._read().get("pendingNotify", {}), {},
+                         "after_marker_adopt: pendingNotify must stay empty")
+
+        self._drive(db_bridge.poll_pending_notify, sends)
+        self.assertEqual(len(sends), 1,
+                         f"after_pending_second: exactly one confirmation total, sends={sends}")
+
 if __name__ == "__main__":
     _r = unittest.main(exit=False)
     try:

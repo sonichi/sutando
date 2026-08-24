@@ -4334,11 +4334,18 @@ _pending_notify_failed_attempts: dict = {}  # pragma: no cover — bridge not un
 def _adopt_pending_notify(sender_id: str, chat_id) -> bool:
     """Record a legacy `approved/` marker as a pendingNotify obligation.
     Returns False when nothing was committed — the caller MUST then keep the
-    marker, which is still the only record that a confirmation is owed."""
+    marker, which is still the only record that a confirmation is owed.
+
+    No-ops if `sender_id` is already in `notified`: the marker's obligation
+    was already delivered and acked by the other poller, and adopting it
+    again would re-arm a fulfilled obligation for a second send (#3318 —
+    the "pending-first" poll-order race)."""
 
     def _mutator(data):
         pending_notify = data.get("pendingNotify", {})
         if sender_id in pending_notify:
+            return None, {"ok": True}
+        if sender_id in data.get("notified", {}):
             return None, {"ok": True}
         pending_notify = dict(pending_notify)
         pending_notify[sender_id] = chat_id
@@ -4351,7 +4358,13 @@ def _adopt_pending_notify(sender_id: str, chat_id) -> bool:
 
 def _ack_pending_notify(sender_id: str) -> None:
     """Idempotently clear `sender_id` from pendingNotify via the same locked
-    transaction every other access.json writer uses (#3318)."""
+    transaction every other access.json writer uses (#3318).
+
+    Also records the fulfilled obligation in `notified`, in the SAME
+    transaction, so a stale legacy marker adopted afterward by
+    `poll_approved()` can never re-arm `pendingNotify` and cause a duplicate
+    send. Only stamps `notified` when there was actually something to ack —
+    a no-op ack (sender absent from pendingNotify) must not touch the file."""
 
     def _mutator(data):
         pending_notify = data.get("pendingNotify", {})
@@ -4360,6 +4373,9 @@ def _ack_pending_notify(sender_id: str) -> None:
         pending_notify = dict(pending_notify)
         del pending_notify[sender_id]
         data["pendingNotify"] = pending_notify
+        notified = dict(data.get("notified", {}))
+        notified[sender_id] = True
+        data["notified"] = notified
         return data, None
 
     mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
