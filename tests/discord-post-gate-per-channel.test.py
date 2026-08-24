@@ -10,9 +10,10 @@ two properties the single-path form guaranteed:
   - a configured-but-unloadable policy still fails CLOSED, and
   - a load failure does not spread past the channel that named it.
 
-The one property it deliberately CHANGES is stated as its own case: a channel
-matched by neither an id nor `*` is ungated. That is the point of a map, and
-a test that did not pin it would let the widening happen silently.
+`*` is REQUIRED, and that is the security property a map most easily loses: an
+omitted `*` would let an unlisted channel send unvalidated, making config
+omission a policy bypass. A mapping without a usable `*` refuses EVERY send,
+and dispatch tests membership so a listed channel never falls through to `*`.
 
 Run: python3 tests/discord-post-gate-per-channel.test.py
 """
