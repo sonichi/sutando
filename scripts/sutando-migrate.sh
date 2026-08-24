@@ -233,9 +233,9 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
-    # Accumulated protections, not a snapshot: newest-mtime drops a live pin and
-    # structural sidecars it, and the health check reads neither sidecar.
-    "state/process-pins.json|union-json-array"
+    # A pin names a LOCAL pid + lstart, so it is meaningless on another host and
+    # a union can never express the removal the cleanup contract prescribes.
+    "state/process-pins.json|skip-ephemeral"
     # Accumulated grants, not a snapshot: newest-mtime drops the whole
     # allow-set when a fresh install writes an empty one first.
     "state/slack-allowed-recipients.json|union-json-array"

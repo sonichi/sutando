@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
-"""A pin that survives migration as bytes but not as PROTECTION.
+"""A pin is host-local, so migrating it is not preservation — it is resurrection.
 
-`state/process-pins.json` was classed `structural`, so a collision left one
-version canonical and moved the other to a `.legacy-*` sidecar. The only
-runtime reader (src/health-check.py, via process_pins.load_pins) loads the
-canonical path and never reads sidecars — so a live pin could migrate into a
-file nothing opens, the stale probe would prescribe a restart, and the 30-min
-`--fix` cycle would kill the pinned process. That is the exact failure the pin
-exists to prevent.
+`state/process-pins.json` records a LOCAL pid plus its `lstart`. On any other
+host that pair names a different process or nothing at all, so the record has no
+meaning off the machine that wrote it.
 
-A class-only assertion cannot see this: `structural` and `union-json-array`
-both "preserve the bytes". This drives the real migration script and then the
-real reader, which is the only thing that distinguishes them.
+Two earlier classifications both failed, in opposite directions, and neither is
+visible to a class-only assertion — both "preserve the bytes":
+
+  structural         collision sidecars one copy to `.legacy-*`; the only runtime
+                     reader (health-check via `process_pins.load_pins`) opens the
+                     canonical path and never a sidecar, so a live pin migrated
+                     into a file nothing reads.
+  union-json-array   accumulates by record fingerprint, so a newer file can never
+                     delete or supersede an older pin. An operator who RELEASES a
+                     pin (the cleanup contract in `src/process_pins.py` prescribes
+                     exactly that for orphan/mismatch/expired pins) gets it
+                     re-armed by the next migration, and the `--fix` cycle then
+                     keeps stale code running until the resurrected pin expires.
+
+`skip-ephemeral` is the honest class, with a direct sibling precedent one screen
+up in the same rule table: `state/cores/*.alive`, also per-host, also a local pid.
+
+These drive the real migration script and then the real reader — the only thing
+that separates "the bytes survived" from "the decision survived".
 
 Run: python3 tests/process-pins-migration-visibility.test.py
 """
@@ -46,19 +58,15 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="pin-migrate-"))
         for leaf in ("src/a", "src/b", "src/c", "dest", "home"):
             (self.tmp / leaf).mkdir(parents=True)
-        # A is NEWER with a DEAD pin, C older with the LIVE one: newest-mtime
-        # picks A, structural sidecars C, and either way the live pin is unread.
-        self._write("src/a", pin(DEAD_PID, "Sat Aug 23 01:00:00 2026", "stale witness"), mtime=2_000_000_000)
-        self._write("src/c", pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed"), mtime=1_000_000_000)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _write(self, leaf, one_pin, mtime):
+    def _write(self, leaf, pins, mtime):
         d = self.tmp / leaf / "state"
         d.mkdir(parents=True, exist_ok=True)
         f = d / "process-pins.json"
-        f.write_text(json.dumps({"pins": [one_pin]}, indent=2))
+        f.write_text(json.dumps({"pins": pins}, indent=2))
         os.utime(f, (mtime, mtime))
         return f
 
@@ -83,36 +91,57 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                               {LIVE_PID: LIVE_LSTART}, now_ts=0.0)
         return pp.stale_verdict(results, age_min=42)
 
-    # Control first. Without it every assertion below could pass on a harness
-    # that never reproduced the loss it claims to fix.
-    def test_NEGATIVE_CONTROL_the_losing_source_alone_loses_protection(self) -> None:
-        """A canonical record holding only A's pin prescribes a restart."""
-        status, detail = self._verdict(self.tmp / "src/a" / "state" / "process-pins.json")
+    # ---- controls first: without these, every assertion below could pass on a
+    # harness that never exercised the mechanism it claims to protect. ----
+
+    def test_POSITIVE_CONTROL_a_local_armed_pin_still_suppresses_the_restart(self) -> None:
+        """The pin mechanism itself is untouched by the reclassification."""
+        f = self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
+        status, detail = self._verdict(f)
+        self.assertEqual(status, "warn", detail)
+        self.assertIn(f"DO NOT RESTART {SERVICE} pid {LIVE_PID}", detail)
+
+    def test_NEGATIVE_CONTROL_a_released_record_prescribes_a_restart(self) -> None:
+        """An empty pin set is the operator saying 'you may restart now'."""
+        f = self._write("src/a", [], 2_000_000_000)
+        status, detail = self._verdict(f)
         self.assertEqual(status, "stale", detail)
         self.assertIn("restart needed", detail)
 
-    def test_migration_keeps_every_pin_in_the_record_the_reader_reads(self) -> None:
+    # ---- the contract ----
+
+    def test_migration_does_not_write_a_pin_file_at_the_destination(self) -> None:
+        self._write("src/a", [pin(DEAD_PID, "Sat Aug 23 01:00:00 2026", "stale witness")], 2_000_000_000)
+        self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
         self._migrate()
         canonical = self.tmp / "dest" / "state" / "process-pins.json"
-        self.assertTrue(canonical.exists(), "canonical pin file missing after migrate")
-        pids = sorted(str(p.get("pid")) for p in pp.load_pins(canonical))
-        self.assertEqual(pids, [DEAD_PID, LIVE_PID],
-                         f"pins lost in migration: {pids}")
+        self.assertFalse(canonical.exists(),
+                         "a host-local pin was migrated onto another host's record")
 
     def test_no_pin_is_stranded_in_an_unread_sidecar(self) -> None:
+        self._write("src/a", [pin(DEAD_PID, "Sat Aug 23 01:00:00 2026", "stale witness")], 2_000_000_000)
+        self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
         self._migrate()
         state = self.tmp / "dest" / "state"
-        strays = [p.name for p in state.glob("process-pins.json.legacy-*")]
-        self.assertEqual(strays, [], f"pin stranded where no reader looks: {strays}")
+        strays = [p.name for p in state.glob("process-pins.json*")] if state.exists() else []
+        self.assertEqual(strays, [], f"pin written where it does not belong: {strays}")
 
-    def test_the_live_pin_still_suppresses_the_restart_after_migration(self) -> None:
-        """The behavioral claim: protection survives, not just the bytes."""
+    def test_migration_does_not_resurrect_a_RELEASED_pin(self) -> None:
+        """The deletion-authority case: older armed pin, newer released record.
+
+        Under `union-json-array` the destination ends up holding the older armed
+        pin and the reader answers DO NOT RESTART, silently overriding an operator
+        who had deliberately released it.
+        """
+        self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
+        self._write("src/a", [], 2_000_000_000)          # released, and newer
         self._migrate()
-        status, detail = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
-        self.assertEqual(status, "warn", detail)
-        self.assertIn(f"DO NOT RESTART {SERVICE} pid {LIVE_PID}", detail)
-        # The dead pin is not silently dropped either — it stays a finding.
-        self.assertIn(DEAD_PID, detail)
+        canonical = self.tmp / "dest" / "state" / "process-pins.json"
+        self.assertFalse(canonical.exists(), "release was overridden by migration")
+        # And a host whose own record is the released one keeps its own answer.
+        status, detail = self._verdict(self.tmp / "src/a" / "state" / "process-pins.json")
+        self.assertEqual(status, "stale", detail)
+        self.assertIn("restart needed", detail)
 
 
 if __name__ == "__main__":
