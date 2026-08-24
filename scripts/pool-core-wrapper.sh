@@ -1,5 +1,6 @@
 #!/bin/bash
-# Staged to ~/.sutando/bin at install: launchd's TCC blocks shebang-exec on
+# Staged into the install bin dir (scripts/install-core-pool.sh owns that
+# path): launchd's TCC blocks shebang-exec on
 # scripts under ~/Documents, so ProgramArguments must point OUTSIDE it.
 set -u
 SESSION="core-${SUTANDO_CORE_ID}"
