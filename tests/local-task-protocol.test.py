@@ -375,6 +375,48 @@ if _os.getuid() != 0:
           not ltp._has_task_line(_unreadable))
     _unreadable.chmod(0o644)  # restore for tempdir cleanup
 
+# ── Flat gateway archives must not alias hyphen-prefixed ids ─────────────────
+# The gateway writes `<task-id>-<decimal-epoch>.txt`. Both `task-a` and
+# `task-a-b` are valid ids, so an unfiltered `{id}-*` glob served
+# `task-a-b-<epoch>.txt` as task-a's result: one task silently marking another
+# complete, suppressing its provider run. `task-123`/`task-1234` cannot catch
+# this — they share no delimiter boundary. Tested through find_ready_result,
+# the entry the notifier, room worker, watcher and dedup recovery all call.
+_ga = Path(tempfile.mkdtemp(prefix="ltp-gwalias-"))
+(_ga / "archive").mkdir()
+(_ga / "archive" / "task-a-b-1780000000.txt").write_text("different task answer\n")
+
+check("flat archive: neighbouring id is NOT served to task-a",
+      ltp.find_ready_result(_ga, "task-a") is None)
+check("flat archive: task-a-b still finds its own result",
+      (lambda r: r is not None and r.name == "task-a-b-1780000000.txt")(
+          ltp.find_ready_result(_ga, "task-a-b")))
+check("flat archive: unrelated id finds nothing",
+      ltp.find_ready_result(_ga, "task-z") is None)
+
+# Both present: the exact id must win, never the neighbour, whichever sorts later.
+_gb = Path(tempfile.mkdtemp(prefix="ltp-gwexact-"))
+(_gb / "archive").mkdir()
+(_gb / "archive" / "task-a-b-1780000001.txt").write_text("different task answer\n")
+(_gb / "archive" / "task-a-1780000000.txt").write_text("correct answer\n")
+check("flat archive: exact id wins over a later-sorting neighbour",
+      (lambda r: r is not None and r.name == "task-a-1780000000.txt")(
+          ltp.find_ready_result(_gb, "task-a")))
+
+# Suffix must be a decimal epoch, and ASCII — str.isdigit() accepts U+00B2.
+_gc = Path(tempfile.mkdtemp(prefix="ltp-gwsuffix-"))
+(_gc / "archive").mkdir()
+(_gc / "archive" / "task-123-1780000000.txt").write_text("ok\n")
+(_gc / "archive" / "task-q-notanepoch.txt").write_text("x\n")
+(_gc / "archive" / "task-u-\u00b2.txt").write_text("x\n")
+check("flat archive: ordinary epoch suffix still resolves (no regression)",
+      (lambda r: r is not None and r.name == "task-123-1780000000.txt")(
+          ltp.find_ready_result(_gc, "task-123")))
+check("flat archive: non-numeric suffix rejected",
+      ltp.find_ready_result(_gc, "task-q") is None)
+check("flat archive: non-ASCII digit suffix rejected",
+      ltp.find_ready_result(_gc, "task-u") is None)
+
 if failures:
     sys.exit(1)
 print("PASS — local_task_protocol read-side golden tests")

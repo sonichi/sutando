@@ -500,6 +500,7 @@ def media_attachment_headers(attachment_refs: Iterable["AttachmentRef"], has_tex
 # ── Archive rules ────────────────────────────────────────────────────────────
 
 _MONTH_DIR_RE = re.compile(r"^\d{4}-\d{2}$")
+_FLAT_EPOCH_SUFFIX_RE = re.compile(r"\A[0-9]+\.txt\Z")
 
 
 def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
@@ -546,8 +547,13 @@ def _iter_archived_results(results_dir: Path, task_id: str) -> Iterable[Path]:
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
-    for candidate in reversed(sorted(archive.glob(f"{task_id}-*.txt"))):
-        yield candidate
+    # The gateway suffix is a decimal epoch. `task-a` and `task-a-b` are both
+    # valid ids, so an unfiltered `{id}-*` glob accepts `task-a-b-<epoch>.txt`
+    # as `task-a`'s result — one task silently completing another.
+    prefix = f"{task_id}-"
+    for candidate in reversed(sorted(archive.glob(f"{prefix}*.txt"))):
+        if _FLAT_EPOCH_SUFFIX_RE.match(candidate.name[len(prefix):]):
+            yield candidate
 
     # Startup retention archives are siblings of archive/, not descendants.
     # They carry the same exact result names and collision suffixes.
