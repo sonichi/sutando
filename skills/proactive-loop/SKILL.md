@@ -365,29 +365,32 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
-   **⚠ FIRST, COUNT LIVE CORES — the stop-rows below are only valid on a SINGLE-core host.**
-   The sentinel is single-valued, but a pool legitimately runs **one watcher per core**, so on a pool
-   host N-1 correct watchers always read as "untracked duplicates" and which pid owns the sentinel is
-   arbitrary. Obeying the table there stops working watchers:
+   **⚠ NEVER STOP A PID WITHOUT TRACING IT LOCALLY FIRST.** The sentinel is
+   single-valued, but a pool legitimately runs **one watcher per core**, so on a pool host N-1 correct
+   watchers always read as "untracked duplicates" and which pid holds the sentinel is arbitrary.
+
+   Before stopping anything the probe names, resolve each root pid to its owning session **on this
+   machine** and stop only a tree whose owner is gone:
 
    ```bash
-   # live cores = heartbeats younger than ~90s (same signal every other reader uses)
-   W="$(bash scripts/sutando-config.sh workspace)"
-   python3 -c "
-   import time, pathlib
-   d = pathlib.Path('$W/state/cores'); now = time.time()
-   fresh = [p.stem for p in d.glob('*.alive') if now - p.stat().st_mtime < 90]
-   print(len(fresh), sorted(fresh))"
+   for pid in <the root pids the probe named>; do
+     ps -o pid=,ppid=,lstart=,command= -p "$pid" 2>/dev/null || echo "$pid: gone"
+   done
    ```
 
-   **More than one live core → the stop-rows DO NOT APPLY.** Treat the warn as expected pool state,
-   change nothing, and do not stop any pid. Start a watcher only if THIS core has none.
+   A pid whose owning session is alive is a working watcher, whatever the sentinel says.
 
-   | probe says | action (single live core only) |
+   **Do NOT scope this by counting `state/cores/*.alive`.** That directory is SYNCED ACROSS HOSTS, so a
+   peer's fresh heartbeat inflates the count on a single-core machine and suppresses cleanup of
+   genuinely orphaned local watchers — the inverse failure, equally bad. Measured on a live host: a
+   remote `Mac-186.alive` carried the *same pid* as the local record, so a synced record's pid says
+   nothing about local processes. The pid table is the only same-host authority here.
+
+   | probe says | action (after the local trace above) |
    |---|---|
    | `ok` | nothing to do. |
-   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. Stop the pids it names, then start exactly one. |
-   | sentinel pid dead but **other watcher(s) still run** | same: stop the named pids, then start one. |
+   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. Stop only the traced-gone pids, then ensure exactly one runs. |
+   | sentinel pid dead but **other watcher(s) still run** | same: stop only the traced-gone pids, then ensure one runs. If every named pid traces to a live session, change NOTHING. |
    | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
