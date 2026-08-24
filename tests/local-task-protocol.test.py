@@ -375,13 +375,8 @@ if _os.getuid() != 0:
           not ltp._has_task_line(_unreadable))
     _unreadable.chmod(0o644)  # restore for tempdir cleanup
 
-# ── Flat gateway archives must not alias hyphen-prefixed ids ─────────────────
-# The gateway writes `<task-id>-<decimal-epoch>.txt`. Both `task-a` and
-# `task-a-b` are valid ids, so an unfiltered `{id}-*` glob served
-# `task-a-b-<epoch>.txt` as task-a's result: one task silently marking another
-# complete, suppressing its provider run. `task-123`/`task-1234` cannot catch
-# this — they share no delimiter boundary. Tested through find_ready_result,
-# the entry the notifier, room worker, watcher and dedup recovery all call.
+# Flat gateway archives must not alias hyphen-prefixed ids. `task-123`/`task-1234`
+# cannot catch it: they share no delimiter boundary. Driven via find_ready_result.
 _ga = Path(tempfile.mkdtemp(prefix="ltp-gwalias-"))
 (_ga / "archive").mkdir()
 (_ga / "archive" / "task-a-b-1780000000.txt").write_text("different task answer\n")

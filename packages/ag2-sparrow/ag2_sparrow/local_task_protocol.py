@@ -547,9 +547,8 @@ def _iter_archived_results(results_dir: Path, task_id: str) -> Iterable[Path]:
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
-    # The gateway suffix is a decimal epoch. `task-a` and `task-a-b` are both
-    # valid ids, so an unfiltered `{id}-*` glob accepts `task-a-b-<epoch>.txt`
-    # as `task-a`'s result — one task silently completing another.
+    # Suffix must be the writer's decimal epoch: `task-a` and `task-a-b` are
+    # both valid ids, so a bare `{id}-*` serves task-a-b's file as task-a's.
     prefix = f"{task_id}-"
     for candidate in reversed(sorted(archive.glob(f"{prefix}*.txt"))):
         if _FLAT_EPOCH_SUFFIX_RE.match(candidate.name[len(prefix):]):
