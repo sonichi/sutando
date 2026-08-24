@@ -25,6 +25,7 @@ from typing import Optional
 
 UNHANDLED = 3
 OUTCOME_UNSETTLED = 75
+_SETTLE_ABSENT, _SETTLE_PUBLISHED, _SETTLE_UNSETTLED = 0, 1, 2
 SCHEMA_VERSION = 1
 OUTCOME_UNKNOWN_BODY = (
     "The room-session provider timed out after execution started. Its outcome is unknown, "
@@ -147,14 +148,23 @@ def _outcome_path(workspace: Path, filename: str) -> Path:
     return workspace / "state" / "ag2space-room-session-outcomes" / f"{key}.txt"
 
 
-def _settle_outcome_unknown(workspace: Path, results_dir: Path, filename: str) -> bool:
+def _settle_outcome_unknown(workspace: Path, results_dir: Path, filename: str) -> int:
+    # A readable receipt proves a provider run already completed, so a failed
+    # republish must hold, never fall back — the rerun would repeat its effect.
     receipt = _outcome_path(workspace, filename)
     body = read_ready_result(receipt)
     if body is None:
-        return False
-    if _publish_once(results_dir / filename, body):
-        receipt.unlink(missing_ok=True)
-    return True
+        return _SETTLE_ABSENT
+    try:
+        if _publish_once(results_dir / filename, body):
+            receipt.unlink(missing_ok=True)
+    except OSError:
+        print(
+            "AG2 Space room-session worker: settlement unavailable; preserving claim",
+            file=sys.stderr,
+        )
+        return _SETTLE_UNSETTLED
+    return _SETTLE_PUBLISHED
 
 
 def _record_outcome_unknown(workspace: Path, results_dir: Path, filename: str, body: str) -> bool:
@@ -487,14 +497,20 @@ def handle(
     assert room_key is not None
     if _completed_result_exists(results_dir, task_file.name):
         return 0
-    if _settle_outcome_unknown(workspace, results_dir, task_file.name):
+    settled = _settle_outcome_unknown(workspace, results_dir, task_file.name)
+    if settled == _SETTLE_UNSETTLED:
+        return OUTCOME_UNSETTLED
+    if settled == _SETTLE_PUBLISHED:
         return 0
     lock = workspace / "state" / "ag2space-room-session-locks" / f"{runtime}-{room_key}.lock"
     try:
         with _locked(lock):
             if _completed_result_exists(results_dir, task_file.name):
                 return 0
-            if _settle_outcome_unknown(workspace, results_dir, task_file.name):
+            settled = _settle_outcome_unknown(workspace, results_dir, task_file.name)
+            if settled == _SETTLE_UNSETTLED:
+                return OUTCOME_UNSETTLED
+            if settled == _SETTLE_PUBLISHED:
                 return 0
             try:
                 body = (

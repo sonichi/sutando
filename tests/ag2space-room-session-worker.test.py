@@ -520,7 +520,8 @@ def test_direct_failure_and_cli_edges() -> None:
 
         outcome_name = "task-outcome.txt"
         worker._atomic_text(worker._outcome_path(workspace, outcome_name), "unknown\n")
-        check(worker._settle_outcome_unknown(workspace, results, outcome_name),
+        check(worker._settle_outcome_unknown(workspace, results, outcome_name)
+              == worker._SETTLE_PUBLISHED,
               "durable outcome receipt publishes when the destination is available")
         check(not worker._outcome_path(workspace, outcome_name).exists(),
               "published outcome receipt is removed")
@@ -570,6 +571,49 @@ def test_direct_failure_and_cli_edges() -> None:
             check(worker.main() == 18, "CLI main dispatches handle mode")
 
 
+def test_settlement_failure_holds_instead_of_falling_back() -> None:
+    # A receipt means the provider already ran: a failed republish must return 75
+    # (held), never 1 -- the watcher maps other nonzero to fallback, which reruns.
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        workspace = root / "ws"
+        results = workspace / "results"
+        results.mkdir(parents=True)
+        (workspace / "state").mkdir(exist_ok=True)
+
+        blocked = task(workspace, "task-settle-hold", room_id="!settle-hold:a")
+        # An unready placeholder blocks the first publish, so the receipt survives.
+        (results / blocked.name).write_text("  \n")
+        with patch.object(worker, "_run_claude", side_effect=worker.OutcomeUnknownError(
+            worker.OUTCOME_UNKNOWN_BODY
+        )) as first:
+            first_code = worker.handle("claude", workspace, blocked, results, REPO)
+        provider_calls = first.call_count
+        receipt = worker._outcome_path(workspace, blocked.name)
+        check(first_code == 0 and receipt.exists() and provider_calls == 1,
+              "outcome-unknown run leaves exactly one provider call and a durable receipt")
+
+        # Fault: the results destination is a regular file, so publishing raises.
+        broken = root / "broken-results"
+        broken.write_text("not a directory\n")
+        with patch.object(worker, "_run_claude") as during_fault:
+            fault_code = worker.handle("claude", workspace, blocked, broken, REPO)
+        check(fault_code == worker.OUTCOME_UNSETTLED,
+              "settlement publication failure returns 75 (held), not 1 (fallback)")
+        check(not during_fault.called,
+              "settlement failure does not re-invoke the provider")
+        check(receipt.exists(),
+              "settlement failure preserves the durable receipt")
+
+        # Storage recovers and the placeholder clears: the receipt finally settles.
+        (results / blocked.name).unlink(missing_ok=True)
+        with patch.object(worker, "_run_claude") as after:
+            recovered_code = worker.handle("claude", workspace, blocked, results, REPO)
+        published = worker.read_ready_result(results / blocked.name)
+        check(recovered_code == 0 and published is not None and not after.called,
+              "after recovery the receipt publishes with the provider call count still one")
+
+
 def main() -> int:
     test_opt_in_and_cardinality()
     test_session_state_reuses_room_not_message()
@@ -580,6 +624,7 @@ def main() -> int:
     test_timeout_outcome_unknown_is_terminal_and_checkpointed()
     test_cli_probe_and_empty_output()
     test_direct_failure_and_cli_edges()
+    test_settlement_failure_holds_instead_of_falling_back()
     print(f"\nResults: {len(FAILURES)} failed")
     return 1 if FAILURES else 0
 
