@@ -1,5 +1,6 @@
 #!/bin/bash
-# Staged to $HOME/.sutando/bin at install: launchd's TCC blocks exec of scripts
+# Staged into the install bin dir (see scripts/install-core-pool.sh, which owns
+# that path): launchd's TCC blocks exec of scripts
 # under the Documents tree, so the plist's ProgramArguments must point outside it.
 set -u
 
