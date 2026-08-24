@@ -8732,6 +8732,26 @@ def _settings_model_pins(candidates=None) -> list:
     return out
 
 
+def _live_core_runtime(socket: str, sessions) -> "str | None":
+    """Runtime stamped on the LIVE core sessions, or None when not knowable.
+
+    Config can disagree with a running pane mid-switch, so the pane's own stamp
+    decides; absent, unreadable or CONFLICTING stamps are unknown, never Claude.
+    """
+    seen = set()
+    for sess in sessions:
+        res = _run_tmux(socket, "show-environment", "-t", f"={sess}",
+                        "SUTANDO_CORE_RUNTIME")
+        if res is None or res.returncode != 0:
+            continue
+        out = (res.stdout or "").strip()
+        if out.startswith("SUTANDO_CORE_RUNTIME="):
+            val = out.split("=", 1)[1].strip()
+            if val:
+                seen.add(val)
+    return seen.pop() if len(seen) == 1 else None
+
+
 def _interpret_core_model_pin(pinned: list, socket: str, running=(),
                               settings=(), runtime: str = "claude") -> dict:
     """Interpret tmux pins AND the live core's argv. A tmux clear cannot change an
@@ -8759,9 +8779,9 @@ def _interpret_core_model_pin(pinned: list, socket: str, running=(),
             # The argv scan matches only `claude` panes and settings.json is
             # Claude-scoped, so neither says anything about this runtime.
             return {"name": name, "status": "ok",
-                    "detail": (f"no SUTANDO_CORE_MODEL pin in tmux env; the argv scan and "
-                               f"settings.json are Claude-scoped and were NOT consulted for "
-                               f"this {runtime} core, so its window is unassessed here")}
+                    "detail": (f"no SUTANDO_CORE_MODEL pin in tmux env; the live core runtime is "
+                               f"{runtime!r}, and the argv scan and settings.json are Claude-scoped, "
+                               f"so they were NOT consulted and its window is unassessed here")}
         if settings:
             where = ", ".join(f"{lbl}={val!r}" for lbl, val in settings)
             return {"name": name, "status": "ok",
@@ -8876,9 +8896,9 @@ def check_core_model_pin() -> dict:
         sessions = _tmux_sessions(socket)
     except (OSError, subprocess.SubprocessError) as e:
         if _tmux_no_server(e):
+            # No session list here, so the live stamp is unreadable -> unknown.
             return _interpret_core_model_pin(
-                pinned, socket, (), _settings_model_pins(),
-                "codex" if _codex_runtime_selected() else "claude")
+                pinned, socket, (), _settings_model_pins(), "unknown")
         # sessions=[] here would report a clean argv pass having read no core at all.
         return {"name": name, "status": "warn",
                 "detail": (f"could not enumerate core tmux sessions ({e}), so no core "
@@ -8887,7 +8907,7 @@ def check_core_model_pin() -> dict:
     return _interpret_core_model_pin(pinned, socket,
                                      _core_argv_pins(socket, sessions),
                                      _settings_model_pins(),
-                                     "codex" if _codex_runtime_selected() else "claude")
+                                     _live_core_runtime(socket, sessions) or "unknown")
 
 
 def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:

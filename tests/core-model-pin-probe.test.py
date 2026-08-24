@@ -726,10 +726,74 @@ class SettingsJsonIsAThirdWayTheModelIsChosen(unittest.TestCase):
         self.assertIn("opus[1m]", r["detail"])
         self.assertIn("not on the default window", r["detail"])
 
+    def test_unknown_runtime_fails_CLOSED_not_to_claude(self):
+        """Missing/unreadable/conflicting stamps must not default to Claude."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", (), [("user", "opus[1m]")], "unknown")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("opus[1m]", r["detail"])
+        self.assertIn("unassessed", r["detail"])
+
+    def test_live_runtime_reader_semantics(self):
+        """One stamp wins; none or CONFLICTING stamps are unknown, never Claude."""
+        class _R:
+            def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+
+        def mk(mapping):
+            return lambda sock, *a: _R(0, mapping[a[2][1:]]) if a[2][1:] in mapping else _R(1, "")
+
+        with mock.patch.object(self.hc, "_run_tmux",
+                               mk({"s1": "SUTANDO_CORE_RUNTIME=codex"})):
+            self.assertEqual(self.hc._live_core_runtime("/s", ["s1"]), "codex")
+        with mock.patch.object(self.hc, "_run_tmux",
+                               mk({"s1": "SUTANDO_CORE_RUNTIME=codex",
+                                   "s2": "SUTANDO_CORE_RUNTIME=claude"})):
+            self.assertIsNone(self.hc._live_core_runtime("/s", ["s1", "s2"]),
+                              "conflicting stamps must be unknown, not a pick")
+        with mock.patch.object(self.hc, "_run_tmux", lambda *a, **k: None):
+            self.assertIsNone(self.hc._live_core_runtime("/s", ["s1"]))
+
+    def test_SHIPPED_path_unresolvable_runtime_must_not_default_to_claude(self):
+        """The call-site fallback itself. Mutating `or "unknown"` to `or "claude"`
+        passed every other test in this file — the unknown test drives the
+        interpreter directly and the mirror test resolves a real value, so neither
+        reaches the fallback. This one does."""
+        with mock.patch.object(self.hc, "_live_core_runtime", lambda s, ss: None), \
+             mock.patch.object(self.hc, "_settings_model_pins",
+                               lambda *a, **k: [("user", "opus[1m]")]):
+            r = self.hc.check_core_model_pin()
+        self.assertNotIn("opus[1m]", r["detail"],
+                         "an unresolvable runtime must not consume Claude settings")
+        self.assertIn("unassessed", r["detail"])
+
+    def test_MIRROR_live_codex_pane_beats_a_claude_CONFIG(self):
+        """The reviewer's mirror case: config says claude (or is invalid, which
+        _codex_runtime_selected collapses to claude) while the live pane is codex.
+        Settings must still not be consulted."""
+        class _R:
+            def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+        with mock.patch.object(self.hc, "_codex_runtime_selected", lambda: False), \
+             mock.patch.object(self.hc, "_run_tmux",
+                               lambda sock, *a: _R(0, "SUTANDO_CORE_RUNTIME=codex")), \
+             mock.patch.object(self.hc, "_settings_model_pins",
+                               lambda *a, **k: [("user", "opus[1m]")]), \
+             mock.patch.object(self.hc, "_tmux_sessions", lambda s: ["sutando-core"]), \
+             mock.patch.object(self.hc, "_query_pin", lambda s, a: ""), \
+             mock.patch.object(self.hc, "_core_argv_pins", lambda s, ss: []), \
+             mock.patch.object(self.hc, "Path", self.hc.Path):
+            r = self.hc.check_core_model_pin()
+        self.assertNotIn("opus[1m]", r["detail"],
+                         "a live codex pane must veto the Claude settings value")
+        self.assertIn("codex", r["detail"])
+
     def test_codex_core_through_the_SHIPPED_check_path(self):
-        """Drives check_core_model_pin() itself with the runtime resolver forced
-        to codex — the reviewer's ask, not just the interpreter in isolation."""
-        with mock.patch.object(self.hc, "_codex_runtime_selected", lambda: True), \
+        """Drives check_core_model_pin() itself with the LIVE stamp reading codex.
+
+        This previously mocked _codex_runtime_selected(); when the source of truth
+        moved to the live pane that mock went inert and this test failed — which is
+        the test noticing its own premise had been removed.
+        """
+        with mock.patch.object(self.hc, "_live_core_runtime", lambda s, ss: "codex"), \
              mock.patch.object(self.hc, "_settings_model_pins",
                                lambda *a, **k: [("user", "opus[1m]")]):
             r = self.hc.check_core_model_pin()
