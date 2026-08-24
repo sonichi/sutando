@@ -79,12 +79,14 @@ assert_class "state/auth/device.json" "structural" || fail=1
 assert_class "state/contextual-chips.json" "structural" || fail=1
 assert_class "state/voice-state.json" "structural" || fail=1
 assert_class "state/core-status.json" "structural" || fail=1
-assert_class "state/process-pins.json" "structural" || fail=1
 assert_class "state/quota-state.json" "structural" || fail=1
 assert_class "state/dynamic-content.json" "structural" || fail=1
 # Accumulated grants, not a snapshot: newest-mtime drops the granted set when an
 # empty source is newer, and structural only sidecars it — neither merges in-file.
 assert_class "state/slack-allowed-recipients.json" "union-json-array" || fail=1
+# A losing pin used to land in an unread .legacy-* sidecar; union keeps every
+# pin in the one record src/health-check.py actually loads.
+assert_class "state/process-pins.json" "union-json-array" || fail=1
 # Other state/*.json (not in the per-host carve-out list) still hit newest-mtime
 assert_class "state/random-other.json" "newest-mtime" || fail=1
 assert_class "state/loop-paused-until.sentinel" "structural" || fail=1
