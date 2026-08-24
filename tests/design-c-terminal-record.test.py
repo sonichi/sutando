@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.delivery_core.backend_c import (  # noqa: E402
-    SEP, TERMINAL_TAG, DesignCClaimBackend, _safe_key)
+    SEP, TERMINAL_TAG, DesignCClaimBackend, _safe_component, _safe_key)
 from ag2_sparrow.delivery_core.contract import DeliveryOutcome  # noqa: E402
 
 failures = []
@@ -564,6 +564,53 @@ with tempfile.TemporaryDirectory() as td:
           f"M-D retirement clears the spent budget (got {bm.attempts('item-m')})")
     check(not next_cycle_parks(bm, "item-m"),
           "M-D: a republished item gets its full budget")
+
+
+    # ── bool subclasses int and True == 1, so an equality gate admits records
+    # _write_terminal cannot emit; and a symlink's bytes live outside the store.
+    def rec(**over):
+        r = {"schema": 1, "item_id": "item-b", "outcome": "confirmed",
+             "receipt": {"provider": "P", "destination": "D"},
+             "completed_ns": 123, "worker": "w0", "attempts": 0,
+             "incarnation": f"{_safe_key('item-b')}{SEP}{_safe_component('w0')}{SEP}1"}
+        r.update(over)
+        return r
+
+    bv = fresh(td, "bool-valid")
+    check(bv._record_is_terminal_proof(rec()) is True, "control: a real record validates")
+    for field in ("schema", "completed_ns", "attempts"):
+        for val in (True, False):
+            check(bv._record_is_terminal_proof(rec(**{field: val})) is False,
+                  f"{field}={val} is rejected (bool is not an exact int)")
+
+    # A staged SYMLINK named like valid proof must not be promoted, and must
+    # not retire the live claim — deleting its target would erase the proof.
+    bs = fresh(td, "sym-staged")
+    bs.publish("item-s", b"p")
+    ts_ = bs.claim("item-s", "w0")
+    ks = _safe_key("item-s")
+    outside = Path(td) / "outside-proof.json"
+    outside.write_text(json.dumps(rec(item_id="item-s", incarnation=ts_.incarnation)))
+    link = bs.root / "tmp" / f"{TERMINAL_TAG}{SEP}{ts_.incarnation}{SEP}{time.time_ns()}.json"
+    link.symlink_to(outside)
+    rep_s = bs.recover()
+    check(ks not in rep_s.retired, f"a staged SYMLINK does not retire the claim ({rep_s.retired})")
+    check(bs.terminal_record("item-s") is None,
+          "and it is not promoted into the archive as proof")
+
+    # Same for a symlink already sitting in the archive: never read as proof.
+    ba = fresh(td, "sym-archive")
+    ba.publish("item-a2", b"p")
+    ka = _safe_key("item-a2")
+    outside2 = Path(td) / "outside-archive.json"
+    outside2.write_text(json.dumps(rec(
+        item_id="item-a2",
+        incarnation=f"{_safe_key('item-a2')}{SEP}{_safe_component('w0')}{SEP}1")))
+    (ba.root / "archive" / f"{ka}.json").symlink_to(outside2)
+    check(ba.terminal_record("item-a2") is None,
+          "an ARCHIVE symlink is not returned as a terminal record")
+    check(ba.terminal_records("item-a2") == [],
+          "and terminal_records() lists nothing for it")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

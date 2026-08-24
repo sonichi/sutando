@@ -21,6 +21,7 @@ import errno
 import hashlib
 import json
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -61,6 +62,30 @@ def _safe_component(s: str) -> str:
     if not out:
         raise ValueError("empty component")
     return out
+
+
+def _exact_int(v) -> bool:
+    """bool subclasses int, so `isinstance(v, int)` admits True/False and
+    `True == 1` passes an equality gate — a record the writer cannot emit."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _regular_json(f: Path):
+    """Parsed JSON from a REGULAR, non-symlink file, else None.
+
+    A symlink named like a valid entry is promotable proof whose bytes live
+    outside the store: removing the target deletes the only record.
+    """
+    try:
+        st = os.lstat(f)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def _generation() -> str:
@@ -336,9 +361,8 @@ class DesignCClaimBackend:
         for f in self._d(ARCHIVE).glob(f"{key}*.json"):
             if f.name != f"{key}.json" and not f.name.startswith(f"{key}{SEP}"):
                 continue                      # a longer key sharing the prefix
-            try:
-                data = json.loads(f.read_text())
-            except (OSError, ValueError):
+            data = _regular_json(f)
+            if data is None:
                 continue
             if self._record_is_terminal_proof(data) \
                     and data.get("item_id") == item_id:
@@ -350,7 +374,8 @@ class DesignCClaimBackend:
     def _record_is_terminal_proof(rec) -> bool:
         """The ONE total validator — shared by staged promotion, archive
         retirement, and reads (divergent copies were round-4's P1 #2)."""
-        if not isinstance(rec, dict) or rec.get("schema") != 1:
+        if not isinstance(rec, dict) or not _exact_int(rec.get("schema")) \
+                or rec.get("schema") != 1:
             return False
         item_id = rec.get("item_id")
         # "" is a legal id (publish("") is contract-valid); the _safe_key
@@ -365,8 +390,8 @@ class DesignCClaimBackend:
         if not isinstance(receipt, dict) \
                 or "provider" not in receipt or "destination" not in receipt:
             return False
-        if not isinstance(rec.get("completed_ns"), int) \
-                or not isinstance(rec.get("attempts"), int):
+        if not _exact_int(rec.get("completed_ns")) \
+                or not _exact_int(rec.get("attempts")):
             return False
         worker = rec.get("worker")
         # "" stays rejected here: _safe_component refuses it at claim time,
@@ -405,9 +430,8 @@ class DesignCClaimBackend:
                 continue
             if not (f.name.startswith(f"{key}") and f.suffix == ".json"):
                 continue
-            try:
-                rec = json.loads(f.read_text())
-            except (OSError, ValueError):
+            rec = _regular_json(f)
+            if rec is None:
                 continue
             # A record authorizes retiring a LIVE claim only when it passes
             # the same total validation as staging; malformed fails closed.
@@ -429,10 +453,9 @@ class DesignCClaimBackend:
             with self._lock(key):
                 if not t.exists():
                     continue
-                try:
-                    staged = json.loads(t.read_text())
-                except (OSError, ValueError):
-                    staged = None
+                # None (torn, OR a symlink whose bytes live outside the store)
+                # falls through: _staged_is_complete refuses it, then it is deleted.
+                staged = _regular_json(t)
                 if not self._staged_is_complete(staged, inc):
                     t.unlink(missing_ok=True)      # torn write, never authoritative
                     continue
