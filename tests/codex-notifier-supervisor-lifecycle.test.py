@@ -250,6 +250,22 @@ class LeaseOwnershipTest(unittest.TestCase):
                         "the former owner deleted a lease it no longer held")
         self.assertNotEqual((self.lock / "token").read_text(), successor)
 
+    def test_an_unreadable_mtime_defers_instead_of_reclaiming(self):
+        """The grace check reads mtime through `stat`, whose flags differ by
+        platform. A variant that prints non-numeric text and exits 0 must not
+        turn the guard into the lease-steal it exists to prevent."""
+        _write(self.d / "stat", """
+            #!/bin/bash
+            echo '?'
+            exit 0
+        """, executable=True)
+        self.lock.mkdir()
+        r = self._run("blind", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("publishing", r.stderr)
+        self.assertNotIn("blind", self._ran(), "an unreadable mtime let it steal the lease")
+        self.assertTrue(self.lock.exists())
+
     # --- P2: the lease is keyed per (socket, session), as start-cli launches ---
 
     def test_a_second_socket_does_not_suppress_the_first(self):
