@@ -28,11 +28,8 @@ allows = [a for a in os.environ.get("RC_ALLOWS", "").split("\n") if a]
 paired = [tuple(x.strip() for x in a.split("::", 1))
           for a in os.environ.get("RC_ALLOW_PAIRED", "").split("\n")
           if a and "::" in a]
-# Guide-configured globs (checks.hardcoded-paths.skip_glob), same mechanism as
-# root-artifacts' root_artifact_glob. A stored .patch/.diff's OWN removal lines
-# (e.g. "-/some/real/path") read as ADDED lines in the outer PR diff, and the
-# scanner has no way to tell a nested diff's path token from a real hardcoded
-# one — so the file is exempted by extension rather than by content.
+# checks.hardcoded-paths.skip_glob: a stored patch's own removal lines read as
+# ADDED lines in the outer diff, so exempt by extension, not by content.
 skip_globs = [g for g in os.environ.get("RC_SKIP_GLOB", "").split("\n") if g]
 DELIMS = set("\"'()" + ", ;=" + chr(96) + chr(9))   # quotes, brackets, backtick, tab, etc.
 SKIP = re.compile(r"\.md$|(^|/)tests/|\.test\.|review-checks\.(sh|py)$")

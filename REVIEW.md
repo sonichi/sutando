@@ -288,9 +288,10 @@ checks:
     # diff's syntax, not this repo's content — they read as ADDED lines in the
     # outer PR diff and the scanner has no way to distinguish that from a real
     # hardcoded path, so the file is exempted by extension. Omitting the key
-    # uses these defaults rather than disabling the exemption. Mirrors
-    # root-artifacts' root_artifact_glob, which lists the same two extensions
-    # for the same underlying reason (a stored patch is not code to police).
+    # uses these defaults rather than disabling the exemption. Mirrors the
+    # analogous glob under root-artifacts above, which lists the same two
+    # extensions for the same underlying reason (a stored patch is not code
+    # to police).
     skip_glob:
       - '*.patch'
       - '*.diff'
