@@ -22,6 +22,9 @@ os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-tg-torn-")
 _cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
 _cfg.mkdir(parents=True, exist_ok=True)
 (_cfg / "access.json").write_text('{"allowFrom": ["4242"]}')
+# TOKEN is resolved at module level too, and the isolated dir has no .env — the
+# bridge prints and exits at import without this, so isolation alone is not enough.
+os.environ["TELEGRAM_BOT_TOKEN"] = "test-token-not-real"
 
 _spec = importlib.util.spec_from_file_location("tg", REPO / "src" / "telegram-bridge.py")
 tg = importlib.util.module_from_spec(_spec)
