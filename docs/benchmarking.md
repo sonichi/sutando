@@ -14,10 +14,16 @@ Resolve the workspace belonging to the Sutando instance under test, then run:
 python3 scripts/sutando-bench.py doctor --workspace /path/to/workspace
 python3 scripts/sutando-bench.py run \
   --workspace /path/to/workspace \
+  --sutando-config /path/to/that/engine/scripts/sutando-config.sh \
   --suite benchmarks/smoke.json \
   --label current \
   --repeat 3
 ```
+
+`--sutando-config` must point at the engine under test. It defaults to the
+script beside `sutando-bench`, which is correct when the runner is invoked from
+that engine. The command refuses to start when the runtime descriptor belongs
+to a different workspace or has no packaged/Git revision attribution.
 
 `doctor` exits 0 for a writable workspace with a fresh core heartbeat, 1 when
 the paths are usable but no live core is visible, and 2 for an unusable
@@ -27,6 +33,15 @@ The command writes `run.json` and `report.md` under
 `benchmark-runs/<run-id>/` by default. The smoke suite is intentionally
 read-only, but the task subject still has normal Sutando permissions; inspect
 custom suites before running them.
+
+Every run captures the runtime descriptor before the first task and after the
+last task. `run.json` records the full revision, short commit, source, branch,
+dirty state, Git tree SHA or packaged tree digest, build time, runtime id, and a
+content-aware `version_key`. A clean Git revision, or a packaged revision with
+its tree digest, is marked `exact`. If the identity changes or the final probe
+fails, artifacts are still written for diagnosis but the command exits 2 and
+the report marks the version as unstable. This prevents a long campaign from
+being attributed to an engine that was upgraded midway through the run.
 
 ## Re-render and compare
 
@@ -41,7 +56,9 @@ python3 scripts/sutando-bench.py compare \
 
 The comparison flags a lower pass rate, more timeouts, or a p95 latency
 increase greater than 20%. `--fail-on-regression` turns those findings into a
-non-zero exit for automation.
+non-zero exit for automation. Both the Markdown and JSON comparison artifacts
+include baseline/candidate runtime identities, whether the versions are equal,
+and warnings for legacy, unstable, dirty, or otherwise inexact attribution.
 
 ## Suite format
 

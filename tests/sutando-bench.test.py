@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
@@ -23,6 +24,23 @@ def workspace(root: Path) -> Path:
     return root
 
 
+def runtime_descriptor(ws: Path, revision="a" * 40, dirty=False,
+                       source="git", tree_sha="b" * 40, tree_digest=None):
+    return {
+        "workspace": str(ws.resolve()), "repo": "/engine/sutando", "runtimeId": "primary",
+        "code": {
+            "revision": revision, "commit": revision[:7], "branch": "main",
+            "describe": revision[:7], "tree_sha": tree_sha,
+            "tree_digest": tree_digest, "dirty": dirty, "source": source,
+            "built_at": "2026-08-24T00:00:00Z" if source == "engine-manifest" else None,
+        },
+    }
+
+
+def runtime_snapshot(ws: Path, **kwargs):
+    return bench.runtime_identity(runtime_descriptor(ws, **kwargs), ws)
+
+
 def example_run(label="subject", passed=True, latency=10.0, no_response=0):
     rows = [{
         "case_id": "one", "category": "test", "repetition": 1,
@@ -34,7 +52,8 @@ def example_run(label="subject", passed=True, latency=10.0, no_response=0):
     return {
         "schema": 1, "kind": "sutando-benchmark-run", "run_id": "run",
         "started_at": "start", "finished_at": "finish",
-        "subject": {"label": label, "workspace": "/tmp/ws", "host": "host"},
+        "subject": {"label": label, "workspace": "/tmp/ws", "host": "host",
+                    "runtime": runtime_snapshot(Path("/tmp/ws")), "version_stable": True},
         "suite": {"name": "test", "description": ""},
         "configuration": {}, "summary": bench.summarize(rows), "cases": rows,
     }
@@ -121,6 +140,47 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(bench._safe_id("a b/c"), "a-b-c")
         self.assertEqual(bench._safe_id("***"), "case")
 
+    def test_runtime_identity_is_workspace_bound_and_content_addressed(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            identity = runtime_snapshot(ws)
+            self.assertTrue(identity["exact"])
+            self.assertIn("git:" + "a" * 40, identity["version_key"])
+            packaged = runtime_snapshot(
+                ws, source="engine-manifest", tree_sha=None,
+                tree_digest="sha256:" + "c" * 64,
+            )
+            self.assertTrue(packaged["exact"])
+            self.assertIn("sha256:", packaged["version_key"])
+            dirty = runtime_snapshot(ws, dirty=True)
+            self.assertFalse(dirty["exact"])
+            self.assertTrue(dirty["version_key"].endswith(":dirty"))
+            wrong = runtime_descriptor(ws)
+            wrong["workspace"] = str(ws / "other")
+            with self.assertRaisesRegex(ValueError, "different workspace"):
+                bench.runtime_identity(wrong, ws)
+            missing = runtime_descriptor(ws)
+            missing["code"]["revision"] = None
+            with self.assertRaisesRegex(ValueError, "unattributed"):
+                bench.runtime_identity(missing, ws)
+
+    def test_probe_runtime_parses_and_validates_descriptor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            script = root / "scripts" / "sutando-config.sh"
+            script.parent.mkdir()
+            script.write_text("#!/bin/sh\n")
+            descriptor = runtime_descriptor(root)
+            completed = mock.Mock(returncode=0, stdout=json.dumps(descriptor), stderr="")
+            with mock.patch.object(bench.subprocess, "run", return_value=completed) as run:
+                identity = bench.probe_runtime(script, root)
+            self.assertEqual(identity["code"]["revision"], "a" * 40)
+            self.assertEqual(run.call_args.args[0], ["bash", str(script.resolve()), "runtime"])
+            completed.stdout = "not-json"
+            with mock.patch.object(bench.subprocess, "run", return_value=completed):
+                with self.assertRaisesRegex(RuntimeError, "did not return JSON"):
+                    bench.probe_runtime(script, root)
+
     def test_submit_and_result_paths(self):
         with tempfile.TemporaryDirectory() as td:
             ws = workspace(Path(td))
@@ -155,8 +215,10 @@ class BenchTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as td:
             ws = workspace(Path(td) / "ws")
+            runtime = runtime_snapshot(ws)
             with Responder(ws, {"say token": "OK", "do math": "7"}):
-                run = bench.run_suite(ws, suite, 2, 1, 0.001, "HEAD")
+                run = bench.run_suite(ws, suite, 2, 1, 0.001, "HEAD", runtime)
+            run["subject"]["version_stable"] = True
             self.assertEqual(run["summary"]["passed"], 4)
             self.assertEqual(run["summary"]["pass_rate"], 1)
             self.assertEqual(run["cases"][1]["category"], "reasoning")
@@ -164,6 +226,7 @@ class BenchTests(unittest.TestCase):
             json_path, report_path = bench.write_run(run, out)
             self.assertEqual(bench._load_run(out), run)
             self.assertIn("4/4", report_path.read_text())
+            self.assertIn("Version:", report_path.read_text())
             self.assertTrue(json_path.is_file())
             bad = example_run(passed=False)
             self.assertIn("## Failures", bench.render_run(bad))
@@ -186,7 +249,10 @@ class BenchTests(unittest.TestCase):
         candidate = example_run("new", True, 11)
         data, report = bench.compare_runs(baseline, candidate)
         self.assertEqual(data["regressions"], [])
+        self.assertTrue(data["attribution"]["same_version"])
+        self.assertEqual(data["attribution"]["warnings"], [])
         self.assertIn("Regressions: none", report)
+        self.assertIn("Baseline version:", report)
         slow = example_run("slow", False, 20, no_response=1)
         data, _ = bench.compare_runs(baseline, slow)
         self.assertEqual(data["regressions"], ["pass_rate", "no_response"])
@@ -218,10 +284,13 @@ class BenchTests(unittest.TestCase):
                 self.assertEqual(bench.main(["run", "--workspace", str(root / "missing")]), 2)
                 self.assertEqual(bench.main(["run", "--workspace", str(ws), "--repeat", "0"]), 2)
             output = root / "output"
-            with Responder(ws, {"answer-me": "OK"}), contextlib.redirect_stdout(stdout):
+            identity = runtime_snapshot(ws)
+            with Responder(ws, {"answer-me": "OK"}), contextlib.redirect_stdout(stdout), \
+                    mock.patch.object(bench, "probe_runtime", side_effect=[identity, identity]):
                 rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite_path),
                                  "--output", str(output), "--timeout", "1", "--poll", "0.001"])
             self.assertEqual(rc, 0)
+            self.assertTrue(bench._load_run(output)["subject"]["version_stable"])
             with contextlib.redirect_stdout(stdout):
                 self.assertEqual(bench.main(["report", str(output)]), 0)
             candidate = root / "candidate"
@@ -235,6 +304,41 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertTrue((comparison / "comparison.json").is_file())
             self.assertIn("workspace needs", stderr.getvalue())
+
+    def test_main_writes_diagnostic_run_and_exits_two_on_version_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = workspace(root / "ws")
+            suite_path = root / "suite.json"
+            suite_path.write_text(json.dumps({
+                "schema": 1, "name": "drift", "cases": [
+                    {"id": "one", "prompt": "answer-me", "expect": {"equals": "OK"}}
+                ]
+            }))
+            output = root / "output"
+            before = runtime_snapshot(ws, revision="a" * 40)
+            after = runtime_snapshot(ws, revision="c" * 40)
+            with Responder(ws, {"answer-me": "OK"}), \
+                    mock.patch.object(bench, "probe_runtime", side_effect=[before, after]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = bench.main([
+                    "run", "--workspace", str(ws), "--suite", str(suite_path),
+                    "--output", str(output), "--timeout", "1", "--poll", "0.001",
+                ])
+            self.assertEqual(rc, 2)
+            run = bench._load_run(output)
+            self.assertFalse(run["subject"]["version_stable"])
+            self.assertEqual(run["subject"]["runtime_end"], after)
+
+    def test_main_refuses_to_run_without_version_attribution(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = workspace(Path(td) / "ws")
+            stderr = io.StringIO()
+            with mock.patch.object(bench, "probe_runtime", side_effect=ValueError("unattributed")), \
+                    contextlib.redirect_stderr(stderr):
+                rc = bench.main(["run", "--workspace", str(ws)])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot attribute runtime version", stderr.getvalue())
 
 
 if __name__ == "__main__":

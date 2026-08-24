@@ -13,6 +13,7 @@ import math
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -22,6 +23,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA = 1
 DEFAULT_SUITE = Path(__file__).resolve().parent.parent / "benchmarks" / "smoke.json"
+DEFAULT_SUTANDO_CONFIG = Path(__file__).resolve().parent / "sutando-config.sh"
+CODE_IDENTITY_FIELDS = (
+    "revision", "commit", "branch", "describe", "tree_sha", "tree_digest",
+    "dirty", "source", "built_at",
+)
 
 
 def utc_now() -> str:
@@ -93,6 +99,81 @@ def workspace_diagnostics(workspace: Path, now: Optional[float] = None) -> Dict[
     }
 
 
+def runtime_identity(descriptor: Dict[str, Any], workspace: Path) -> Dict[str, Any]:
+    if not isinstance(descriptor, dict):
+        raise ValueError("runtime descriptor must be a JSON object")
+    reported_workspace = descriptor.get("workspace")
+    if not isinstance(reported_workspace, str):
+        raise ValueError("runtime descriptor has no workspace")
+    if Path(reported_workspace).expanduser().resolve() != workspace.expanduser().resolve():
+        raise ValueError("runtime descriptor belongs to a different workspace")
+    code = descriptor.get("code")
+    if not isinstance(code, dict):
+        raise ValueError("runtime descriptor has no code identity")
+    revision = code.get("revision")
+    source = code.get("source")
+    if not (isinstance(revision, str) and len(revision) >= 8
+            and all(character in "0123456789abcdefABCDEF" for character in revision)):
+        raise ValueError("runtime descriptor code identity is unattributed")
+    if source not in {"git", "engine-manifest"}:
+        raise ValueError("runtime descriptor code identity is unattributed")
+    identity = {
+        "runtime_id": descriptor.get("runtimeId"),
+        "repo": descriptor.get("repo"),
+        "code": {field: code.get(field) for field in CODE_IDENTITY_FIELDS},
+    }
+    content_id = code.get("tree_digest") or code.get("tree_sha")
+    identity["version_key"] = ":".join([
+        source, revision, str(content_id or "content-unknown"),
+        "dirty" if code.get("dirty") else "clean",
+    ])
+    identity["exact"] = bool(
+        (source == "git" and code.get("dirty") is False)
+        or (source == "engine-manifest" and code.get("tree_digest"))
+    )
+    return identity
+
+
+def probe_runtime(config_script: Path, workspace: Path) -> Dict[str, Any]:
+    result = subprocess.run(
+        ["bash", str(config_script.resolve()), "runtime"], capture_output=True, text=True,
+        timeout=30, cwd=config_script.resolve().parent.parent,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"runtime probe failed: {detail}")
+    try:
+        descriptor = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("runtime probe did not return JSON") from exc
+    return runtime_identity(descriptor, workspace)
+
+
+def _version_display(subject: Dict[str, Any]) -> str:
+    runtime = subject.get("runtime")
+    if not isinstance(runtime, dict):
+        return "unattributed"
+    code = runtime.get("code", {})
+    describe = code.get("describe") or code.get("commit") or code.get("revision")
+    if not describe:
+        return "unattributed"
+    suffix = " (dirty)" if code.get("dirty") and not str(describe).endswith("-dirty") else ""
+    return f"{describe}{suffix} [{code.get('source') or 'unknown source'}]"
+
+
+def _version_details(subject: Dict[str, Any]) -> List[str]:
+    runtime = subject.get("runtime")
+    if not isinstance(runtime, dict):
+        return ["- Revision: `unattributed`", "- Exact attribution: **False**"]
+    code = runtime.get("code", {})
+    content = code.get("tree_digest") or code.get("tree_sha") or "unavailable"
+    return [
+        f"- Revision: `{code.get('revision') or 'unattributed'}`",
+        f"- Content identity: `{content}`",
+        f"- Exact attribution: **{runtime.get('exact') is True}**",
+    ]
+
+
 def _safe_id(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "-", value).strip("-") or "case"
 
@@ -154,7 +235,8 @@ def summarize(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
-              timeout_s: float, poll_s: float, label: str) -> Dict[str, Any]:
+              timeout_s: float, poll_s: float, label: str,
+              runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     rows: List[Dict[str, Any]] = []
     started_at = utc_now()
@@ -192,7 +274,8 @@ def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
         "started_at": started_at,
         "finished_at": utc_now(),
         "subject": {"label": label, "workspace": str(workspace.resolve()),
-                    "host": socket.gethostname()},
+                    "host": socket.gethostname(), "runtime": runtime,
+                    "version_stable": None},
         "suite": {"name": suite["name"], "description": suite.get("description", "")},
         "configuration": {"repeat": repeat, "timeout_s": timeout_s, "poll_s": poll_s},
         "summary": summarize(rows),
@@ -206,12 +289,17 @@ def render_run(run: Dict[str, Any]) -> str:
     lines = [
         "# Sutando benchmark report", "",
         f"- Subject: `{run['subject']['label']}`",
+        f"- Version: `{_version_display(run['subject'])}`",
+    ]
+    lines.extend(_version_details(run["subject"]))
+    lines.extend([
+        f"- Version stable for full run: **{run['subject'].get('version_stable', 'unknown')}**",
         f"- Suite: `{run['suite']['name']}`",
         f"- Pass rate: **{summary['passed']}/{summary['attempts']} ({summary['pass_rate']:.1%})**",
         f"- No response: **{summary['no_response']}**",
         f"- Completion latency: p50 **{_fmt_ms(latency['p50'])}**, p95 **{_fmt_ms(latency['p95'])}**, max **{_fmt_ms(latency['max'])}**",
         "", "| Case | Run | Result | Latency |", "|---|---:|---|---:|",
-    ]
+    ])
     for row in run["cases"]:
         verdict = "PASS" if row["passed"] else row["status"].upper()
         lines.append(f"| {row['case_id']} | {row['repetition']} | {verdict} | {_fmt_ms(row['latency_ms'])} |")
@@ -241,11 +329,33 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
     c95 = cand["latency_ms"]["p95"]
     if b95 is not None and c95 is not None and c95 > b95 * 1.20:
         regressions.append("latency_p95")
+    base_runtime = baseline["subject"].get("runtime")
+    cand_runtime = candidate["subject"].get("runtime")
+    attribution_warnings = []
+    if not isinstance(base_runtime, dict):
+        attribution_warnings.append("baseline_unattributed")
+    if not isinstance(cand_runtime, dict):
+        attribution_warnings.append("candidate_unattributed")
+    if baseline["subject"].get("version_stable") is not True:
+        attribution_warnings.append("baseline_version_not_stable")
+    if candidate["subject"].get("version_stable") is not True:
+        attribution_warnings.append("candidate_version_not_stable")
+    if isinstance(base_runtime, dict) and base_runtime.get("exact") is not True:
+        attribution_warnings.append("baseline_version_not_exact")
+    if isinstance(cand_runtime, dict) and cand_runtime.get("exact") is not True:
+        attribution_warnings.append("candidate_version_not_exact")
+    same_version = bool(
+        isinstance(base_runtime, dict) and isinstance(cand_runtime, dict)
+        and base_runtime.get("exact") is True and cand_runtime.get("exact") is True
+        and base_runtime.get("version_key") == cand_runtime.get("version_key")
+    )
     data = {
         "schema": SCHEMA,
         "kind": "sutando-benchmark-comparison",
         "baseline": baseline["subject"]["label"],
         "candidate": candidate["subject"]["label"],
+        "versions": {"baseline": base_runtime, "candidate": cand_runtime},
+        "attribution": {"warnings": attribution_warnings, "same_version": same_version},
         "regressions": regressions,
         "metrics": {
             "pass_rate": {"baseline": base["pass_rate"], "candidate": cand["pass_rate"]},
@@ -256,12 +366,17 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
     report = "\n".join([
         "# Sutando benchmark comparison", "",
         f"Baseline: `{data['baseline']}`  ",
-        f"Candidate: `{data['candidate']}`", "",
+        f"Baseline version: `{_version_display(baseline['subject'])}`  ",
+        f"Candidate: `{data['candidate']}`  ",
+        f"Candidate version: `{_version_display(candidate['subject'])}`", "",
         "| Metric | Baseline | Candidate |", "|---|---:|---:|",
         f"| Pass rate | {base['pass_rate']:.1%} | {cand['pass_rate']:.1%} |",
         f"| No response | {base['no_response']} | {cand['no_response']} |",
         f"| Latency p95 | {_fmt_ms(b95)} | {_fmt_ms(c95)} |", "",
-        "Regressions: " + (", ".join(regressions) if regressions else "none"), "",
+        "Regressions: " + (", ".join(regressions) if regressions else "none"),
+        "Attribution warnings: " + (", ".join(attribution_warnings)
+                                     if attribution_warnings else "none"),
+        "Same runtime version: " + ("yes" if same_version else "no"), "",
     ])
     return data, report
 
@@ -296,6 +411,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float, default=180.0)
     run.add_argument("--poll", type=float, default=0.25)
     run.add_argument("--label", default="current")
+    run.add_argument("--sutando-config", type=Path, default=DEFAULT_SUTANDO_CONFIG,
+                     help="sutando-config.sh belonging to the runtime under test")
     run.add_argument("--output", type=Path)
     report = commands.add_parser("report", help="render a saved run")
     report.add_argument("run", type=Path)
@@ -333,12 +450,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.repeat < 1 or args.timeout <= 0 or args.poll <= 0:
         print("sutando-bench: repeat, timeout, and poll must be positive", file=sys.stderr)
         return 2
+    try:
+        runtime_start = probe_runtime(args.sutando_config, args.workspace)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"sutando-bench: cannot attribute runtime version: {exc}", file=sys.stderr)
+        return 2
     suite = load_suite(args.suite)
-    run = run_suite(args.workspace, suite, args.repeat, args.timeout, args.poll, args.label)
+    run = run_suite(args.workspace, suite, args.repeat, args.timeout, args.poll,
+                    args.label, runtime_start)
+    try:
+        runtime_end = probe_runtime(args.sutando_config, args.workspace)
+        run["subject"]["version_stable"] = runtime_start == runtime_end
+        if runtime_start != runtime_end:
+            run["subject"]["runtime_end"] = runtime_end
+    except (OSError, RuntimeError, ValueError) as exc:
+        run["subject"]["version_stable"] = False
+        run["subject"]["runtime_end_error"] = str(exc)
     output = args.output or Path("benchmark-runs") / run["run_id"]
     json_path, report_path = write_run(run, output)
     print(render_run(run), end="")
     print(f"Artifacts: {json_path} {report_path}")
+    if run["subject"]["version_stable"] is not True:
+        return 2
     return 0 if run["summary"]["failed"] == 0 else 1
 
 
