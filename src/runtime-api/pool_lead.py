@@ -155,8 +155,10 @@ class PoolLead:
         affinity = self._load_affinity()
         out = []
         for f in sort_tasks_by_priority(pending):
-            if self._done_flag_exists(f.name) and self._result_evidence(f.name):
-                continue  # processed by a since-dead claimer; bridge owns it now
+            if self._result_evidence(f.name):
+                # finish_task writes the result BEFORE the flag, so result-
+                # without-flag is COMPLETE; reassigning would re-execute it.
+                continue
             channel = _read_channel(f)
             inst = self._pick(channel, followers, affinity, _read_lane(f))
             target = f.with_name(
@@ -280,15 +282,6 @@ class PoolLead:
                     continue
         return removed
 
-    def _done_flag_exists(self, task_name: str) -> bool:
-        cores = self.state_dir / "cores"
-        try:
-            dirs = [d for d in cores.iterdir() if d.is_dir()]
-        except OSError:
-            return False
-        stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
-        return any((d / "done" / f"{stem}.flag").exists() for d in dirs)
-
     def _result_evidence(self, task_name: str) -> bool:
         """A result was produced: live in results/, or already consumed by a
         bridge (archive/ and undelivered/ are the two consumer dispositions)."""
@@ -300,12 +293,11 @@ class PoolLead:
             self.results_dir / "undelivered" / name))
 
     def reclaim_claimed(self) -> "list[tuple[str, str]]":
-        """Recover claimed files whose claimer died. Delivered means the
-        claimer's done-flag AND result evidence both exist; then restore
-        the canonical name so bridges can deliver (sweep skips it). A
-        done-flag alone is a crash between flag and result write — no
-        user-visible effect happened, so repool for reassignment rather
-        than silently losing the task."""
+        """Recover claimed files whose claimer died. Delivered means result
+        evidence exists; then restore the canonical name so bridges can
+        deliver (sweep skips it). The reachable crash residue is a result
+        with no done-flag — finish_task writes the result first — and that
+        work is COMPLETE, so it must not be repooled for re-execution."""
         out = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
         try:
@@ -321,7 +313,6 @@ class PoolLead:
                 os.rename(f, f.with_name(canonical))
             except OSError:
                 continue
-            done = (self._done_flag_exists(canonical)
-                    and self._result_evidence(canonical))
+            done = self._result_evidence(canonical)
             out.append((f.name, "delivered" if done else "repooled"))
         return out
