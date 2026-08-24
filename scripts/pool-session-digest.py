@@ -30,12 +30,14 @@ import sys
 import time
 from pathlib import Path
 
-CFG_ENV = "CLAUDE_CONFIG_DIR"
-DEFAULT_CFG = Path.home() / ".claude"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from util_paths import claude_home_path  # noqa: E402
 
 
 def config_dir() -> Path:
-    return Path(os.environ.get(CFG_ENV) or DEFAULT_CFG)
+    """The Claude home, via the ONE resolver that also honours $CLAUDE_HOME."""
+    return claude_home_path()
 
 
 def live_sessions() -> "list[dict]":
@@ -159,7 +161,12 @@ def age(iso: str) -> str:
         t = calendar.timegm(time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return "?"
-    secs = max(0, int(time.time() - t))
+    delta = int(time.time() - t)
+    # Clamping a future stamp to 0 renders skew as "0s ago" — identical to a
+    # genuinely fresh core, on the column operators read as the wedge signal.
+    if delta < -2:
+        return "clock skew"
+    secs = max(0, delta)
     if secs < 90:
         return f"{secs}s ago"
     if secs < 5400:

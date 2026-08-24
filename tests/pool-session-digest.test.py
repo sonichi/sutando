@@ -44,9 +44,18 @@ class AgeTest(unittest.TestCase):
         self.assertTrue(digest_mod.age(utc_iso(600)).endswith("m ago"))
         self.assertTrue(digest_mod.age(utc_iso(3 * 3600)).endswith("h ago"))
 
-    def test_age_is_never_negative(self):
-        """Clock skew must not render a future stamp as a huge negative age."""
-        self.assertEqual(digest_mod.age(utc_iso(-120)), "0s ago")
+    def test_future_stamp_is_skew_not_freshness(self):
+        """A future stamp must not be indistinguishable from a live core.
+
+        This previously asserted "0s ago" — pinning the clamp. The age column
+        IS the wedge signal, so rendering skew as fresh hides the thing it
+        exists to show.
+        """
+        self.assertEqual(digest_mod.age(utc_iso(-120)), "clock skew")
+        self.assertNotEqual(digest_mod.age(utc_iso(-120)),
+                            digest_mod.age(utc_iso(0)))
+        # Sub-second jitter is not skew; the tolerance must survive.
+        self.assertEqual(digest_mod.age(utc_iso(-1)), "0s ago")
 
     def test_unparsable_stamp_is_reported_not_raised(self):
         self.assertEqual(digest_mod.age("not-a-timestamp"), "?")
@@ -139,11 +148,21 @@ class DiscoveryTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.cfg = Path(self.tmp.name)
 
-    def test_config_dir_prefers_env_over_default(self):
-        with unittest.mock.patch.dict(os.environ, {digest_mod.CFG_ENV: str(self.cfg)}):
+    def test_config_dir_delegates_to_the_shared_claude_home_resolver(self):
+        """No private copy of the resolution rule — including $CLAUDE_HOME.
+
+        The script used to hand-roll $CLAUDE_CONFIG_DIR or ~/.claude, which
+        silently ignored the $CLAUDE_HOME override the shared contract honours.
+        """
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
             self.assertEqual(digest_mod.config_dir(), self.cfg)
+        # The override the private copy could not see.
+        alt = self.cfg / "alt-home"
+        alt.mkdir()
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_HOME": str(alt)}, clear=True):
+            self.assertEqual(digest_mod.config_dir(), alt)
         with unittest.mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(digest_mod.config_dir(), digest_mod.DEFAULT_CFG)
+            self.assertEqual(digest_mod.config_dir(), Path.home() / ".claude")
 
     def _run_result(self, rc=0, stdout="[]"):
         return subprocess.CompletedProcess(args=[], returncode=rc, stdout=stdout, stderr="")
@@ -174,7 +193,7 @@ class DiscoveryTest(unittest.TestCase):
         proj = self.cfg / "projects" / "-some-slug"
         proj.mkdir(parents=True)
         (proj / "sid-1.jsonl").write_text("")
-        with unittest.mock.patch.dict(os.environ, {digest_mod.CFG_ENV: str(self.cfg)}):
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
             self.assertEqual(digest_mod.find_transcript("sid-1").name, "sid-1.jsonl")
             self.assertIsNone(digest_mod.find_transcript("absent"))
 
@@ -200,7 +219,7 @@ class MainTest(unittest.TestCase):
         err = io.StringIO()
         with unittest.mock.patch.object(sys, "argv", ["prog", *argv]), \
              unittest.mock.patch.object(digest_mod, "live_sessions", return_value=sessions), \
-             unittest.mock.patch.dict(os.environ, {digest_mod.CFG_ENV: str(self.cfg)}), \
+             unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = digest_mod.main()
         return rc, out.getvalue(), err.getvalue()
