@@ -369,14 +369,23 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    single-valued, but a pool legitimately runs **one watcher per core**, so N-1 correct watchers
    always read as "untracked duplicates" and which pid holds the sentinel is arbitrary.
 
-   The probe does this classification for you, same-host, from the local process table: its verdict
-   names the untracked roots that have **NO live owning session**, and separately names any that are
-   session-owned and must be left alone. Act only on that split:
+   The probe does this classification for you, same-host, from the local process table — but only in
+   *some* of its branches. **Act only on a verdict that presents owned and ownerless as two
+   separately-labelled groups.** Key on that structure, never on wording:
 
-   - verdict names owner**less** roots → stop exactly those, leave the rest.
-   - verdict says every untracked tree still runs under a live session → **change nothing**.
-   - verdict does not make the distinction at all (older build) → **change nothing** and say so.
-     Ambiguous ownership is not a licence to stop a watcher; it is a reason not to.
+   - two groups, one of them ownerless → stop exactly the ownerless roots, leave the rest.
+   - two groups, none ownerless (every untracked tree session-owned) → **change nothing**.
+   - **one undifferentiated list of pids → change nothing** and say so, *whatever adjective it
+     carries* — including "orphaned" and "unsupervised", and including when it ends in the
+     imperative "stop them and restart one cleanly". Ambiguous ownership is not a licence to stop a
+     watcher; it is a reason not to.
+
+   **The last bullet is the common case, not a legacy edge case.** On `main` every multi-root
+   verdict is a single undifferentiated list, and #3328 splits only the branch where the sentinel is
+   *live* — one of three. After it lands, the no-sentinel and dead-sentinel branches still emit
+   `N orphaned watcher(s) … stop them and restart one cleanly`, naming every root including the
+   session-owned ones. Read structurally, that is the safe bullet; read for tone, it is the
+   dangerous one. That gap is why this rule tests for two groups instead of trusting the adjective.
 
    **Do not re-derive this yourself.** `ps -p <pid>` prints an identical row for a supervised watcher
    and an ownerless one — the roots come from `_watcher_trees()` and are alive by construction — so a
@@ -389,11 +398,12 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    genuinely orphaned local watchers — the inverse failure, equally bad. Measured on a live host: a
    remote `Mac-186.alive` carried the *same pid* as the local record.
 
-   | probe says | action (obey its ownerless/owned split) |
+   | probe says | action (apply the two-group test above first) |
    |---|---|
    | `ok` | nothing to do. |
-   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. Stop only the roots the probe calls ownerless, then ensure exactly one runs. |
-   | sentinel pid dead but **other watcher(s) still run** | same: stop only the roots the probe calls ownerless, then ensure one runs. If it reports every untracked tree session-owned, change NOTHING. |
+   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. This branch emits ONE undifferentiated list, so the two-group test fails: **change nothing**. Stop roots only if a future build names owned and ownerless separately here. |
+   | sentinel pid dead but **other watcher(s) still run** | same — one undifferentiated list, so **change nothing**. |
+   | multiple trees, some **not tracked by the sentinel**, reported as two groups | stop exactly the group with **no live owning session**; leave the session-owned group alone. If the ownerless group is empty, change nothing. |
    | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
