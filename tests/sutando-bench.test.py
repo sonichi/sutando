@@ -164,6 +164,72 @@ class BenchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unattributed"):
                 bench.runtime_identity(missing, ws)
 
+    def test_runtime_identity_rejects_each_malformed_descriptor_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+                bench.runtime_identity(["not", "a", "dict"], ws)
+            no_ws = runtime_descriptor(ws)
+            del no_ws["workspace"]
+            with self.assertRaisesRegex(ValueError, "has no workspace"):
+                bench.runtime_identity(no_ws, ws)
+            bad_ws_type = runtime_descriptor(ws)
+            bad_ws_type["workspace"] = 17
+            with self.assertRaisesRegex(ValueError, "has no workspace"):
+                bench.runtime_identity(bad_ws_type, ws)
+            no_code = runtime_descriptor(ws)
+            no_code["code"] = "a-string-is-not-an-identity"
+            with self.assertRaisesRegex(ValueError, "has no code identity"):
+                bench.runtime_identity(no_code, ws)
+            short = runtime_descriptor(ws, revision="abc")
+            with self.assertRaisesRegex(ValueError, "unattributed"):
+                bench.runtime_identity(short, ws)
+            nonhex = runtime_descriptor(ws, revision="z" * 40)
+            with self.assertRaisesRegex(ValueError, "unattributed"):
+                bench.runtime_identity(nonhex, ws)
+            bad_source = runtime_descriptor(ws)
+            bad_source["code"]["source"] = "hearsay"
+            with self.assertRaisesRegex(ValueError, "unattributed"):
+                bench.runtime_identity(bad_source, ws)
+
+    def test_compare_flags_every_attribution_gap(self):
+        # An unattributed or drifting build must not read as a clean comparison:
+        # the regression verdict is only as good as the identity behind it.
+        baseline = example_run()
+        candidate = example_run()
+        baseline["subject"]["runtime"] = None
+        candidate["subject"]["runtime"] = "not-a-descriptor"
+        baseline["subject"]["version_stable"] = False
+        candidate["subject"]["version_stable"] = None
+        data, _ = bench.compare_runs(baseline, candidate)
+        self.assertEqual(
+            sorted(data["attribution"]["warnings"]),
+            sorted(["baseline_unattributed", "candidate_unattributed",
+                    "baseline_version_not_stable", "candidate_version_not_stable"]),
+        )
+        self.assertFalse(data["attribution"]["same_version"])
+
+        dirty_base = example_run()
+        dirty_cand = example_run()
+        dirty_base["subject"]["runtime"] = runtime_snapshot(Path("/tmp/ws"), dirty=True)
+        dirty_cand["subject"]["runtime"] = runtime_snapshot(Path("/tmp/ws"), dirty=True)
+        data, _ = bench.compare_runs(dirty_base, dirty_cand)
+        self.assertIn("baseline_version_not_exact", data["attribution"]["warnings"])
+        self.assertIn("candidate_version_not_exact", data["attribution"]["warnings"])
+        self.assertFalse(data["attribution"]["same_version"])
+
+    def test_cli_shim_imports_and_exposes_main(self):
+        # scripts/sutando-bench.py is the installed entry point; nothing else
+        # asserts it resolves the sibling module and re-exports a callable main.
+        import importlib.util
+        shim_path = REPO / "scripts" / "sutando-bench.py"
+        self.assertTrue(shim_path.is_file())
+        spec = importlib.util.spec_from_file_location("sutando_bench_cli", shim_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(callable(module.main))
+        self.assertIs(module.main, bench.main)
+
     def test_probe_runtime_parses_and_validates_descriptor(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
