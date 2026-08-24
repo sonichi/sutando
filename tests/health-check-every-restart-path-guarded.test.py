@@ -91,16 +91,17 @@ for label, checks in CASES:
     check("canonical control: the branch DOES restart",
           bool(l_ok or s_ok), f"launchd={l_ok} spawns={s_ok}")
 
-print("\nstuck-CONNECTING voice-agent (a warn-status branch):")
-vt = [{"name": "voice-transport", "status": "warn", "detail": "stuck CONNECTING",
+print("\nstuck-CONNECTING voice-agent:")
+# status MUST be "fail", matching the producer at :4141 — is_issue() treats warn as
+# benign, so a warn fixture never enters issues[] and the branch is never reached.
+vt = [{"name": "voice-transport", "status": "fail", "detail": "stuck CONNECTING",
        "_stuck_connecting": True}]
 l_ref, s_ref, out_ref = drive(vt, allowed=False)
 l_ok, s_ok, _ = drive(vt, allowed=True)
-if not (l_ok or s_ok):
-    print("  skip voice-transport: not routed into issues[] by is_issue() in this build")
-else:
-    check("noncanonical: voice-agent not kickstarted", l_ref == [], f"launchd={l_ref}")
-    check("canonical control: it is kickstarted", bool(l_ok), f"launchd={l_ok}")
+check("noncanonical: voice-agent not kickstarted", l_ref == [], f"launchd={l_ref}")
+check("noncanonical: says it refused, and why",
+      "refused" in out_ref and "noncanonical" in out_ref, out_ref[-200:])
+check("canonical control: it IS kickstarted", l_ok == ["com.sutando.voice-agent"], f"launchd={l_ok}")
 
 print("\nthe guard is LAZY and memoized:")
 src = (REPO / "src" / "health-check.py").read_text()
