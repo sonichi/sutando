@@ -2955,8 +2955,19 @@ function sendText() {
       .then(d => {
         if (d.ok) {
           dbg('Sent text via task bridge: ' + d.task_id, 'event');
-          // Poll for result
+          // Poll for result. The deadline is the ceiling: /result answers
+          // pending for a torn or empty body, so this would never clear.
+          const deadline = Date.now() + 300000;
           const poll = setInterval(() => {
+            if (Date.now() > deadline) {
+              clearInterval(poll);
+              const to = document.createElement('div');
+              to.className = 't-entry t-assistant';
+              to.textContent = '(timed out after 5 minutes — the result may still arrive; refresh to retry)';
+              $('transcript').appendChild(to);
+              scrollTranscript();
+              return;
+            }
             fetch(apiBase + '/result/' + d.task_id).then(r => r.json()).then(r => {
               if (r.status === 'completed') {
                 clearInterval(poll);
