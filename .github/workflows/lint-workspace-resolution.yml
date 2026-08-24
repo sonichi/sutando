@@ -16,7 +16,7 @@ name: lint-workspace-resolution
 on:
   pull_request:
   push:
-    branches: [main, staging-workspace-revamp]
+    branches: [main]
 
 jobs:
   lint-workspace-resolution:
