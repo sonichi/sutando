@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.delivery_core.backend_c import (  # noqa: E402
-    SEP, TERMINAL_TAG, DesignCClaimBackend, _safe_key)
+    SEP, TERMINAL_TAG, DesignCClaimBackend, _safe_component, _safe_key)
 from ag2_sparrow.delivery_core.contract import DeliveryOutcome  # noqa: E402
 
 failures = []
@@ -507,6 +507,140 @@ with tempfile.TemporaryDirectory() as td:
     b7.complete(b7.claim("item-7", "w0"), DeliveryOutcome.CONFIRMED,
                 provider="P", destination="D")
     check(b7.terminal_record("item-7") is not None, "lax mode still records")
+
+
+    # ── retirement clears the attempt budget on EVERY path: freeing the
+    # claim but keeping attempts/{key} parks the next cycle on refusal #1.
+    def burn(b, item, n=2):
+        b.publish(item, b"p")
+        for _ in range(n):
+            b.complete(b.claim(item, "w0"), DeliveryOutcome.NOT_DELIVERED,
+                       park_at_attempts=3)
+        return _safe_key(item)
+
+    def next_cycle_parks(b, item):
+        """Republish and fail ONCE. True => the fresh cycle parked early."""
+        b.publish(item, b"p")
+        b.complete(b.claim(item, "w0"), DeliveryOutcome.NOT_DELIVERED,
+                   park_at_attempts=3)
+        return not (b.root / "ready" / _safe_key(item)).exists()
+
+    # CONTROL — the normal path already gets this right.
+    bn = fresh(td, "budget-normal")
+    burn(bn, "item-n")
+    bn.complete(bn.claim("item-n", "w0"), DeliveryOutcome.CONFIRMED,
+                provider="P", destination="D")
+    check(bn.attempts("item-n") == 0, "control: normal confirm clears the budget")
+    check(not next_cycle_parks(bn, "item-n"),
+          "control: the next cycle gets its full budget")
+
+    # R-M retirement.
+    br = fresh(td, "budget-rm")
+    burn(br, "item-r")
+    tr = br.claim("item-r", "w0")
+    (br.root / "tmp" / f"{TERMINAL_TAG}{SEP}{tr.incarnation}{SEP}{time.time_ns()}.json").write_text(
+        json.dumps({"schema": 1, "item_id": "item-r", "outcome": "confirmed",
+                    "receipt": {"provider": "P", "destination": "D"},
+                    "completed_ns": time.time_ns(), "worker": "w0",
+                    "attempts": 2, "incarnation": tr.incarnation}))
+    br.recover()
+    check(br.attempts("item-r") == 0,
+          f"R-M retirement clears the spent budget (got {br.attempts('item-r')})")
+    check(not next_cycle_parks(br, "item-r"),
+          "R-M: a republished item gets its full budget, not the prior cycle's")
+
+    # M-D retirement — archive record durable, claim still held.
+    bm = fresh(td, "budget-md")
+    burn(bm, "item-m")
+    tm = bm.claim("item-m", "w0")
+    bm._write_terminal(_safe_key("item-m"),
+                       {"schema": 1, "item_id": "item-m", "outcome": "confirmed",
+                        "receipt": {"provider": "P", "destination": "D"},
+                        "completed_ns": time.time_ns(), "worker": "w0",
+                        "attempts": 2, "incarnation": tm.incarnation},
+                       tm.incarnation)
+    bm.recover()
+    check(bm.attempts("item-m") == 0,
+          f"M-D retirement clears the spent budget (got {bm.attempts('item-m')})")
+    check(not next_cycle_parks(bm, "item-m"),
+          "M-D: a republished item gets its full budget")
+
+
+    # ── bool subclasses int and True == 1, so an equality gate admits records
+    # _write_terminal cannot emit; and a symlink's bytes live outside the store.
+    def rec(**over):
+        r = {"schema": 1, "item_id": "item-b", "outcome": "confirmed",
+             "receipt": {"provider": "P", "destination": "D"},
+             "completed_ns": 123, "worker": "w0", "attempts": 0,
+             "incarnation": f"{_safe_key('item-b')}{SEP}{_safe_component('w0')}{SEP}1"}
+        r.update(over)
+        return r
+
+    bv = fresh(td, "bool-valid")
+    check(bv._record_is_terminal_proof(rec()) is True, "control: a real record validates")
+    for field in ("schema", "completed_ns", "attempts"):
+        for val in (True, False):
+            check(bv._record_is_terminal_proof(rec(**{field: val})) is False,
+                  f"{field}={val} is rejected (bool is not an exact int)")
+
+    # A staged SYMLINK named like valid proof must not be promoted, and must
+    # not retire the live claim — deleting its target would erase the proof.
+    bs = fresh(td, "sym-staged")
+    bs.publish("item-s", b"p")
+    ts_ = bs.claim("item-s", "w0")
+    ks = _safe_key("item-s")
+    outside = Path(td) / "outside-proof.json"
+    outside.write_text(json.dumps(rec(item_id="item-s", incarnation=ts_.incarnation)))
+    link = bs.root / "tmp" / f"{TERMINAL_TAG}{SEP}{ts_.incarnation}{SEP}{time.time_ns()}.json"
+    link.symlink_to(outside)
+    rep_s = bs.recover()
+    check(ks not in rep_s.retired, f"a staged SYMLINK does not retire the claim ({rep_s.retired})")
+    check(bs.terminal_record("item-s") is None,
+          "and it is not promoted into the archive as proof")
+
+    # Same for a symlink already sitting in the archive: never read as proof.
+    ba = fresh(td, "sym-archive")
+    ba.publish("item-a2", b"p")
+    ka = _safe_key("item-a2")
+    outside2 = Path(td) / "outside-archive.json"
+    outside2.write_text(json.dumps(rec(
+        item_id="item-a2",
+        incarnation=f"{_safe_key('item-a2')}{SEP}{_safe_component('w0')}{SEP}1")))
+    (ba.root / "archive" / f"{ka}.json").symlink_to(outside2)
+    check(ba.terminal_record("item-a2") is None,
+          "an ARCHIVE symlink is not returned as a terminal record")
+    check(ba.terminal_records("item-a2") == [],
+          "and terminal_records() lists nothing for it")
+
+
+    # ── a clock correction must not let an older receipt win: regressing
+    # time.time_ns() between cycles used to return the FIRST one's destination.
+    import ag2_sparrow.delivery_core.backend_c as _bc
+    bclk = fresh(td, "clockback")
+    real_ns = _bc.time.time_ns
+    ticks = iter([2_000_000_000, 1_999_999_999])   # second cycle is EARLIER
+
+    def cycle(dest, forced_ns):
+        bclk.publish("item-clk", b"p")
+        tok = bclk.claim("item-clk", "w0")
+        _bc.time.time_ns = lambda: forced_ns
+        try:
+            bclk.complete(tok, DeliveryOutcome.CONFIRMED, provider="P", destination=dest)
+        finally:
+            _bc.time.time_ns = real_ns
+
+    cycle("D1", next(ticks))
+    cycle("D2", next(ticks))          # newer cycle, EARLIER timestamp
+
+    recs = bclk.terminal_records("item-clk")
+    hist = [(r["completed_ns"], r["receipt"]["destination"]) for r in recs]
+    check(len(recs) == 2, f"both cycles recorded ({len(recs)})")
+    check(hist[-1][1] == "D2",
+          f"the LATER cycle wins despite the earlier clock: history={hist}")
+    check(bclk.terminal_record("item-clk")["receipt"]["destination"] == "D2",
+          "terminal_record() returns the current cycle's destination")
+    check([r["cycle"] for r in recs] == [1, 2],
+          f"cycles are logical and monotonic ({[r.get('cycle') for r in recs]})")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

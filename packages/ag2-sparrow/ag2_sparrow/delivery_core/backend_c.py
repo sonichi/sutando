@@ -21,6 +21,7 @@ import errno
 import hashlib
 import json
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -63,15 +64,17 @@ def read_terminal_records(root: Path, item_id: str) -> "list[dict]":
     for f in arch.glob(f"{key}*.json"):
         if f.name != f"{key}.json" and not f.name.startswith(f"{key}{SEP}"):
             continue                      # a longer key sharing the prefix
-        try:
-            data = json.loads(f.read_text())
-        except (OSError, ValueError):
+        data = _regular_json(f)
+        if data is None:
             continue
         # Resolved at call time; the class is defined below in this module.
         if DesignCClaimBackend._record_is_terminal_proof(data) \
                 and data.get("item_id") == item_id:
             out.append(data)
-    out.sort(key=lambda r: r["completed_ns"])
+    # cycle FIRST: a clock correction must not let an older receipt win.
+    # completed_ns only breaks ties (legacy records carry no cycle -> 0).
+    out.sort(key=lambda r: (r.get("cycle") if _exact_int(r.get("cycle")) else 0,
+                            r["completed_ns"]))
     return out
 
 
@@ -85,6 +88,30 @@ def _safe_component(s: str) -> str:
     if not out:
         raise ValueError("empty component")
     return out
+
+
+def _exact_int(v) -> bool:
+    """bool subclasses int, so `isinstance(v, int)` admits True/False and
+    `True == 1` passes an equality gate — a record the writer cannot emit."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _regular_json(f: Path):
+    """Parsed JSON from a REGULAR, non-symlink file, else None.
+
+    A symlink named like a valid entry is promotable proof whose bytes live
+    outside the store: removing the target deletes the only record.
+    """
+    try:
+        st = os.lstat(f)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def _generation() -> str:
@@ -308,11 +335,30 @@ class DesignCClaimBackend:
     def _terminal_path(self, key: str) -> Path:
         return self._d(ARCHIVE) / f"{key}.json"
 
+    def _next_cycle(self, key: str) -> int:
+        """Durable logical cycle for `key`: one past the highest already recorded.
+
+        The archive (plus any staged record not yet finalized) IS the ledger, so
+        ordering never depends on `time.time_ns()` moving forward. Callers hold
+        the per-key lock, which is what makes read-max-then-write safe.
+        """
+        hi = 0
+        for f in self._d(ARCHIVE).glob(f"{key}*.json"):
+            rec = _regular_json(f)
+            if isinstance(rec, dict) and _exact_int(rec.get("cycle")):
+                hi = max(hi, rec["cycle"])
+        for f in self._d(TMP).glob(f"{TERMINAL_TAG}{SEP}{key}{SEP}*.json"):
+            rec = _regular_json(f)
+            if isinstance(rec, dict) and _exact_int(rec.get("cycle")):
+                hi = max(hi, rec["cycle"])
+        return hi + 1
+
     def _write_terminal(self, key: str, record: dict, incarnation: str) -> None:
         """R->F->M of the terminal protocol: atomic tmp write, fsync per the
         durability mode, then rename into archive/. Caller releases the claim.
         The staging name embeds the INCARNATION so recovery can bind a staged
         record to exactly the claim that produced it, never a sibling's."""
+        record = dict(record, cycle=self._next_cycle(key))
         tmp = self._d(TMP) / f"{TERMINAL_TAG}{SEP}{incarnation}{SEP}{time.time_ns()}.json"
         data = json.dumps(record).encode()
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -361,7 +407,8 @@ class DesignCClaimBackend:
     def _record_is_terminal_proof(rec) -> bool:
         """The ONE total validator — shared by staged promotion, archive
         retirement, and reads (divergent copies were round-4's P1 #2)."""
-        if not isinstance(rec, dict) or rec.get("schema") != 1:
+        if not isinstance(rec, dict) or not _exact_int(rec.get("schema")) \
+                or rec.get("schema") != 1:
             return False
         item_id = rec.get("item_id")
         # "" is a legal id (publish("") is contract-valid); the _safe_key
@@ -376,8 +423,8 @@ class DesignCClaimBackend:
         if not isinstance(receipt, dict) \
                 or "provider" not in receipt or "destination" not in receipt:
             return False
-        if not isinstance(rec.get("completed_ns"), int) \
-                or not isinstance(rec.get("attempts"), int):
+        if not _exact_int(rec.get("completed_ns")) \
+                or not _exact_int(rec.get("attempts")):
             return False
         worker = rec.get("worker")
         # "" stays rejected here: _safe_component refuses it at claim time,
@@ -416,9 +463,8 @@ class DesignCClaimBackend:
                 continue
             if not (f.name.startswith(f"{key}") and f.suffix == ".json"):
                 continue
-            try:
-                rec = json.loads(f.read_text())
-            except (OSError, ValueError):
+            rec = _regular_json(f)
+            if rec is None:
                 continue
             # A record authorizes retiring a LIVE claim only when it passes
             # the same total validation as staging; malformed fails closed.
@@ -440,10 +486,9 @@ class DesignCClaimBackend:
             with self._lock(key):
                 if not t.exists():
                     continue
-                try:
-                    staged = json.loads(t.read_text())
-                except (OSError, ValueError):
-                    staged = None
+                # None (torn, OR a symlink whose bytes live outside the store)
+                # falls through: _staged_is_complete refuses it, then it is deleted.
+                staged = _regular_json(t)
                 if not self._staged_is_complete(staged, inc):
                     t.unlink(missing_ok=True)      # torn write, never authoritative
                     continue
@@ -461,6 +506,9 @@ class DesignCClaimBackend:
                 os.rename(str(t), str(dst))
                 self._strict_dir_barrier()   # durable BEFORE the release
                 (self.root / INFLIGHT / inc).unlink(missing_ok=True)
+                # Retirement ends the cycle, so its attempt budget dies with it —
+                # a republished item must start at 0, not inherit a spent count.
+                self._attempts_path(key).unlink(missing_ok=True)
                 rep.retired.append(key)
         for f in sorted(self._d(INFLIGHT).iterdir()):
             parts = f.name.split(SEP)
@@ -476,6 +524,7 @@ class DesignCClaimBackend:
                         # claim dies, or a crash strands neither proof nor claim.
                         self._strict_dir_barrier()
                         f.unlink(missing_ok=True)
+                        self._attempts_path(key).unlink(missing_ok=True)
                         rep.retired.append(key)
                 continue
             ident = outbox.process_identity(int(parts[2]))

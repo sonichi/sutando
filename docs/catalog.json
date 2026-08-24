@@ -349,6 +349,26 @@
       "status": "draft",
       "canonical_for": "the v1 seven-link delivery chain, identity rules, provider capability declarations, and named v1 gaps",
       "last_verified": "2026-08-18"
+    },
+    "docs/subagent-delegation.md": {
+      "title": "When to spawn a subagent, and how to pick its model",
+      "audience": [
+        "contributors",
+        "agents"
+      ],
+      "status": "active",
+      "canonical_for": "subagent delegation triggers beyond the explicit at-background rule, the do-not-delegate list, and per-spawn model selection",
+      "last_verified": "2026-08-21"
+    },
+    "docs/delivery-protocol.md": {
+      "title": "The file delivery protocol as a formal state machine",
+      "audience": [
+        "contributors",
+        "maintainers"
+      ],
+      "status": "active",
+      "canonical_for": "delivery_core file-protocol transitions, fencing, crash matrix, support boundary, GC status",
+      "last_verified": "2026-08-22"
     }
   }
 }
