@@ -5,7 +5,6 @@ name: bundle-smoke
 
 on:
   pull_request:
-    branches: [main, staging-interaction-planes]
     paths:
       - 'src/**'
       - 'skills/phone-conversation/scripts/conversation-server.ts'
