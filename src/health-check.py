@@ -5722,17 +5722,26 @@ DISK_FAIL_GIB = 2.0
 
 DAILY_LATE_TOLERANCE_MIN = 15
 DAILY_MISS_GRACE_MIN = 60
+# Past this, a daily job's silence means the probe stopped matching its output,
+# not that the job is late; scoring a dead corpus asserts more than was measured.
+DAILY_ARTIFACT_STALE_DAYS = 10
 
 
 def _interpret_daily_punctuality(jobs: list) -> dict:
     """Score LATENESS, not presence: a file produced daily by another path looks
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
-    late, missed, unknown = [], [], []
+    late, missed, unknown, drifted = [], [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
         if not j["artifacts"]:
             unknown.append(j["name"])
+            continue
+        # The median would describe a corpus this job no longer writes, and a
+        # missed-today verdict would blame it for the probe's own blind spot.
+        if j.get("naming_stale"):
+            drifted.append((j["name"], j.get("newest_artifact") or "?",
+                            j.get("artifact_age_days")))
             continue
         # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
         # -1417 early. The filename date is logical, often a day off the mtime.
@@ -5744,7 +5753,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                 and not j.get("conditional")
                 and (j.get("stem_declared") or j["artifacts"])):
             missed.append((j["name"], j["minutes_since_due"]))
-    if not late and not missed:
+    if not late and not missed and not drifted:
         seen = len(jobs) - len(unknown)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -5764,6 +5773,12 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                     f"produced these; something else is covering for it")
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due")
+    for n, newest, age in sorted(drifted):
+        age_txt = f", {age}d ago" if age is not None else ""
+        bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
+                    f"probe's filename match has drifted off this job's output; "
+                    f"punctuality cannot be scored and a missed-today verdict would "
+                    f"blame the job for the probe's own blind spot")
     if unknown:
         bits.append(f"unverifiable (no dated artifact): {', '.join(sorted(unknown))}")
     return {"name": name, "status": "warn", "detail": "; ".join(bits)}
@@ -5871,8 +5886,19 @@ def check_daily_cron_punctuality() -> dict:
         # sentinel is the only dated record that it finished.
         arts = (_daily_completion_minutes(ws / "state", jname) if launchd
                 else _daily_artifact_minutes(ws / "results", stem))
+        # Staleness is computed HERE because `now` lives here; the interpret layer
+        # reads it as an optional field so its fixtures stay clock-independent.
+        newest = max((d for d, _ in arts), default=None)
+        age_days = None
+        if newest:
+            try:
+                age_days = (now.date() - datetime.strptime(newest, "%Y-%m-%d").date()).days
+            except ValueError:
+                age_days = None
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
+            "newest_artifact": newest, "artifact_age_days": age_days,
+            "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
             # `artifact` names a results file, so it cannot vouch for a sentinel:
