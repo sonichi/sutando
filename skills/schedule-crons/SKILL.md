@@ -79,7 +79,10 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 
    ```
    Monitor tool — description "schedule-crons watchdog", timeout_ms 3600000, command:
-   T0=$(date +%s); STAMP="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)/schedule-crons-stamp.json"
+   cd "$(git -C . rev-parse --show-toplevel 2>/dev/null || echo .)" 2>/dev/null || true
+   T0=$(date +%s); WS="$(bash scripts/sutando-config.sh workspace)"
+   STAMP="$WS/hosts/$(bash scripts/sutando-config.sh host-label)/schedule-crons-stamp.json"
+   [ -n "$WS" ] || { echo "CRONS-WATCHDOG-INERT: workspace did not resolve — guard not armed"; exit 1; }
    sleep 90
    while [ "$(stat -f %m "$STAMP" 2>/dev/null || echo 0)" -lt "$T0" ]; do
      echo "CRONS-UNREGISTERED: schedule-crons has not stamped this boot — return and register now"
@@ -88,7 +91,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    echo "CRONS-STAMPED: registration complete"
    ```
 
-   Then respond to task notifications as they land: send the fail-open progress ack first (`python3 skills/task-progress/scripts/notify.py ...` — one subprocess, no state mutation, cannot derail anything), and use judgment on handling — a short waiting owner task may simply be served before registration continues; anything substantial gets the ack and is handled when the agent is next free. Either way registration cannot be silently dropped: if it slips, the watchdog emits a nag every 60s until step 5.7's completion stamp lands, and the terminal `CRONS-STAMPED` line confirms the guard saw the stamp — which is also why that stamp write is not optional bookkeeping; it is what releases the watchdog. The 90s grace means a normal boot never hears from it, and the 1-hour cap bounds noise if a boot dies (an unregistered state dies with its session). Detection and re-prompt share one source of truth: the same stamp `health-check.py`'s `session-crons` probe already reads. `stat -f %m` is the darwin form; swap for a `python3 -c` mtime read on linux.
+   Then respond to task notifications as they land: send the fail-open progress ack first (`python3 skills/task-progress/scripts/notify.py ...` — one subprocess, no state mutation, cannot derail anything), and use judgment on handling — a short waiting owner task may simply be served before registration continues; anything substantial gets the ack and is handled when the agent is next free. Either way registration cannot be silently dropped: if it slips, the watchdog emits a nag every 60s until step 5.7's completion stamp lands, and the terminal `CRONS-STAMPED` line confirms the guard saw the stamp — which is also why that stamp write is not optional bookkeeping; it is what releases the watchdog. The 90s grace means a normal boot never hears from it, and the 1-hour cap bounds noise if a boot dies (an unregistered state dies with its session). Detection and re-prompt share one source of truth: the same stamp `health-check.py`'s `session-crons` probe already reads. `stat -f %m` is the darwin form; swap for a `python3 -c` mtime read on linux. **Resolve the workspace INSIDE the command** — a Monitor is a fresh shell and the loop's `WORKSPACE` is a per-command local that is never exported, so an inherited `$WORKSPACE` is empty there and the stamp path silently becomes `/hosts/<label>/...`, which never exists: the guard would then nag on every healthy boot (~58 times before the cap) and never print `CRONS-STAMPED`. That failure looks like the watchdog working hard, which is why the empty-`WS` refusal above is loud instead: an unarmed guard must announce itself rather than pass as a busy one.
 
 2. Check existing cron jobs with CronList
 3. For each job in the config:
