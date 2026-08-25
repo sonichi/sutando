@@ -62,8 +62,41 @@ PR_STATES = frozenset({"open", "closed"})
 MERGED_TOKENS = frozenset({"true", "false"})
 
 
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def _pr_repo(value: object, where: str) -> str:
+    """`#` is the subject separator, so a repo carrying one makes the encoded
+    resource_id parse back as a different repo and number."""
+    if not isinstance(value, str) or not value.strip() or "#" in value:
+        raise ValueError(f"{where}: repo must be a non-empty string without '#', "
+                         f"got {value!r}")
+    return value
+
+
+def _pr_number(value: object, where: str) -> int:
+    """The ONE place a PR number is judged. `str.isdigit()` is true for Unicode
+    digits and for leading zeros, and int() then canonicalizes them -- so the
+    subject that loads is not the subject that was written."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{where}: PR number must be an int or digit string, "
+                         f"got {type(value).__name__}")
+    if isinstance(value, str):
+        if not value or not set(value) <= _ASCII_DIGITS:
+            raise ValueError(f"{where}: PR number {value!r} is not ASCII digits")
+        if value != str(int(value)):
+            raise ValueError(f"{where}: PR number {value!r} is not canonical")
+        value = int(value)
+    if value <= 0:
+        raise ValueError(f"{where}: PR number must be positive, got {value}")
+    return value
+
+
 def subject_for(repo: str, number: int) -> Subject:
-    return Subject(PROVIDER, "pull_request", f"{repo}#{number}")
+    """Construction seam: every GitHub subject in the process is built here, so
+    validating here covers scope_for, observe and public rehydration alike."""
+    return Subject(PROVIDER, "pull_request",
+                   f"{_pr_repo(repo, 'subject_for')}#{_pr_number(number, 'subject_for')}")
 
 
 def resolve_actor(repo: str, number: int) -> Optional[Actor]:
@@ -166,9 +199,10 @@ def _subject_parts(scope: ResponsibilityScope) -> tuple[str, int]:
             f"scope carries {len(extra)} subject(s) this record cannot encode: "
             f"{[f'{s.provider}:{s.kind}:{s.resource_id}' for s in extra]}")
     repo, sep, number = subs[0].resource_id.rpartition("#")
-    if not sep or not repo.strip() or not number.isdigit():
-        raise ValueError(f"malformed subject resource_id: {subs[0].resource_id!r}")
-    return repo, int(number)
+    at = f"malformed subject resource_id {subs[0].resource_id!r}"
+    if not sep:
+        raise ValueError(at)
+    return _pr_repo(repo, at), _pr_number(number, at)
 
 
 _REQUIRED_KEYS = ("task_id", "provider", "repo", "number", "actor_scheme",
@@ -176,12 +210,18 @@ _REQUIRED_KEYS = ("task_id", "provider", "repo", "number", "actor_scheme",
                   "failure_conditions")
 
 
+def _binding(rec: dict) -> tuple:
+    """WHICH objective this record is -- subject, actor, conditions. Excludes
+    state, the one field a legal update is allowed to move."""
+    return (rec["repo"], rec["number"], rec["actor_scheme"], rec["actor_value"],
+            tuple(rec["waiting_for"]), tuple(rec["success_conditions"]),
+            tuple(rec["failure_conditions"]))
+
+
 def _identity(rec: dict) -> tuple:
     """Everything a stale write could clobber. `note` is free text whose change
     is benign, so it is excluded; every other field is identity-bearing."""
-    return (rec["repo"], rec["number"], rec["actor_scheme"], rec["actor_value"],
-            tuple(rec["waiting_for"]), tuple(rec["success_conditions"]),
-            tuple(rec["failure_conditions"]), rec["state"])
+    return _binding(rec) + (rec["state"],)
 
 
 _CONDITION_KEYS = ("waiting_for", "success_conditions", "failure_conditions")
@@ -204,8 +244,13 @@ def _validate_record(rec: dict, task_id: str) -> dict:
         raise ValueError(f"contract for {task_id} carries invalid state {rec['state']!r}")
     if rec["provider"] != PROVIDER:
         raise ValueError(f"contract for {task_id} is not a {PROVIDER} record")
+    at = f"contract for {task_id}"
+    # JSON round-trips an int, so a string here is a hand-edit or a foreign
+    # writer -- the persisted schema is stricter than the construction seam.
     if isinstance(rec["number"], bool) or not isinstance(rec["number"], int):
-        raise ValueError(f"contract for {task_id} has non-integer number")
+        raise ValueError(f"{at} has non-integer number")
+    _pr_number(rec["number"], at)
+    _pr_repo(rec["repo"], at)
     for key in _IDENTITY_KEYS:
         if not isinstance(rec[key], str) or not rec[key].strip():
             raise ValueError(f"contract for {task_id} has blank/non-string {key}")
@@ -225,13 +270,13 @@ def _validate_record(rec: dict, task_id: str) -> dict:
     return rec
 
 
-def _write_record(task_id: str, scope: ResponsibilityScope, state: str,
-                  note: str = "") -> Path:
-    """Caller holds the record lock."""
+def _record_payload(task_id: str, scope: ResponsibilityScope, state: str,
+                    note: str = "") -> dict:
+    """The record a write WOULD produce. Separated from the write so save() can
+    compare the proposed binding against the stored one before committing."""
     if state not in SHEPHERD_STATES:
         raise ValueError(f"refusing to persist state {state!r}; not in SHEPHERD_STATES")
     repo, number = _subject_parts(scope)
-    p = _contract_path(task_id)
     payload = {
         "task_id": task_id, "provider": PROVIDER, "repo": repo, "number": number,
         "actor_scheme": scope.actor.scheme, "actor_value": scope.actor.value,
@@ -242,15 +287,41 @@ def _write_record(task_id: str, scope: ResponsibilityScope, state: str,
     }
     # The loader's schema, applied before publish -- not a copy of it. A record
     # that save() accepts but load() rejects is a contract no successor can resume.
-    _validate_record(payload, task_id)
-    _atomic_write(p, payload)
+    return _validate_record(payload, task_id)
+
+
+def _write_record(task_id: str, scope: ResponsibilityScope, state: str,
+                  note: str = "") -> Path:
+    """Caller holds the record lock AND has established the transition is legal.
+    resume() qualifies its own write; save() is the public seam that does not."""
+    p = _contract_path(task_id)
+    _atomic_write(p, _record_payload(task_id, scope, state, note))
     return p
 
 
 def save(task_id: str, scope: ResponsibilityScope, state: str,
          note: str = "") -> Path:
-    """Persist the waiting contract. Atomic: a reader never sees a half-write."""
+    """Persist the waiting contract. Atomic: a reader never sees a half-write.
+
+    Create-or-advance, never rebind: an existing record may only move its STATE.
+    Without this, two creators racing on one task id are last-writer-wins, and a
+    finished objective can be reopened against a different pull request.
+    """
     with _record_lock(task_id):
+        prior = load(task_id)
+        if prior is not None:
+            proposed = _record_payload(task_id, scope, state, note)
+            if _binding(proposed) != _binding(prior):
+                raise ValueError(
+                    f"contract for {task_id} is bound to {prior['repo']}#{prior['number']} "
+                    f"({prior['actor_scheme']}:{prior['actor_value']}); refusing to rebind "
+                    f"to {proposed['repo']}#{proposed['number']}")
+            # Terminal is final for the public seam: resume() reaches a terminal
+            # state through its own guarded write, never through here.
+            if is_terminal(prior["state"]) and prior["state"] != state:
+                raise ValueError(
+                    f"contract for {task_id} is terminal ({prior['state']}); "
+                    f"refusing to reopen as {state!r}")
         return _write_record(task_id, scope, state, note)
 
 
@@ -280,6 +351,8 @@ def _conditions(rec: dict, key: str, *, required: bool = False,
 def scope_from_saved(rec: dict) -> ResponsibilityScope:
     # This is a public entry point in its own right — load() is not the only way
     # in — so it repeats the arity rule rather than trusting a prior validation.
+    if rec.get("provider") != PROVIDER:
+        raise ValueError(f"not a {PROVIDER} record: provider={rec.get('provider')!r}")
     success = _conditions(rec, "success_conditions")
     failure = _conditions(rec, "failure_conditions")
     if not (success or failure):

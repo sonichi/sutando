@@ -283,12 +283,20 @@ check("...without a network call", "not re-observed" in why17, True)
 
 # --- 10. a concurrent NON-TERMINAL rebind must not be reverted ----------------
 # The terminal guard catches one kind of concurrent mutation; a rebind is the other.
+
+
+def _race(task_id, scope, state, note=""):
+    """save() refuses a rebind outright, so only a resume() pass reaches here."""
+    with g._record_lock(task_id):
+        return g._write_record(task_id, scope, state, note)
+
+
 g.save("task-integrity-18", scope_for("org/old", 1), "waiting", "seed")
 _real4 = g.observe
 
 
 def _rebind_then_observe(repo, number):
-    g.save("task-integrity-18", scope_for("org/new", 2), "blocked", "rebound")
+    _race("task-integrity-18", scope_for("org/new", 2), "blocked", "rebound")
     return g.ObservedEvent(event_type="github.pull_request.updated",
                            subject=g.subject_for(repo, number),
                            actor=Actor(g.ACTOR_SCHEME, "someone@example.com"))
@@ -312,8 +320,8 @@ _real5 = g.observe
 
 
 def _reactor_then_observe(repo, number):
-    g.save("task-integrity-19", scope_for("org/a", 3, Actor(g.ACTOR_SCHEME, "second@x.z")),
-           "waiting", "new actor")
+    _race("task-integrity-19", scope_for("org/a", 3, Actor(g.ACTOR_SCHEME, "second@x.z")),
+          "waiting", "new actor")
     return g.ObservedEvent(event_type="github.pull_request.updated",
                            subject=g.subject_for(repo, number),
                            actor=Actor(g.ACTOR_SCHEME, "first@x.z"))

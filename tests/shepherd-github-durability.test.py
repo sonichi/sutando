@@ -22,9 +22,12 @@ _REAL_STATE_DIR = g.state_dir
 g.state_dir = lambda: pathlib.Path(WORK) / "state" / "shepherd"
 
 failures = []
+_ASSERTIONS = 0
 
 
 def check(name, got, want):
+    global _ASSERTIONS
+    _ASSERTIONS += 1
     if got != want:
         failures.append(f"{name}: got {got!r}, want {want!r}")
 
@@ -86,26 +89,34 @@ check("absolute path id refused", raises(lambda: g.load("/etc/passwd")), True)
 
 _REAL_OBSERVE = g.observe  # stubs below must not leak into later tests
 
+
+def _seed(task_id, scope, state, note=""):
+    """Force a record into `state`. save() is create-or-advance by contract, so a
+    fixture that re-seeds one id across states must use the lock-held primitive --
+    which is also exactly what a racing resume() pass does."""
+    with g._record_lock(task_id):
+        return g._write_record(task_id, scope, state, note)
+
 # resume() must be monotonic: re-observing may not reopen a closed objective,
 # and ordinary progress may not flatten blocked/needs_human into waiting
 g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
     "github.pull_request.updated", g.subject_for(repo, num), MINE)
 
 for prior in ("failed", "succeeded", "cancelled"):
-    g.save("task-dur-2", scope, prior)
+    _seed("task-dur-2", scope, prior)
     state, why = g.resume("task-dur-2")
     check(f"terminal {prior} stays {prior}", state, prior)
     check(f"terminal {prior} not re-observed", "not re-observed" in why, True)
 
 for prior in ("blocked", "needs_human", "waiting"):
-    g.save("task-dur-2", scope, prior)
+    _seed("task-dur-2", scope, prior)
     state, _ = g.resume("task-dur-2")
     check(f"progress preserves {prior}", state, prior)
 
 # an asserted actor's merge is surfaced but does not close the objective
 g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
     "github.pull_request.merged", g.subject_for(repo, num), MINE)
-g.save("task-dur-2", scope, "waiting")
+_seed("task-dur-2", scope, "waiting")
 state, why = g.resume("task-dur-2")
 check("asserted merge does not terminate", state, "waiting")
 check("but it is reported as proposed", "proposed=succeeded" in why, True)
@@ -304,6 +315,73 @@ check("an acquisition fault closes the descriptor and publishes nothing",
 check("a release fault still closes the descriptor; the record was already written",
       _fault("task-lock-rel", False, True), (0, True))
 
+# --- save() is create-or-advance, never rebind (reported at 8421ca66) ---------
+def _raises(name, fn):
+    global _ASSERTIONS
+    _ASSERTIONS += 1
+    try:
+        fn()
+    except ValueError as e:
+        return str(e)
+    failures.append(f"{name}: did NOT raise ValueError")
+    return ""
+
+
+g.save("task-bind-1", g.scope_for("org/first", 1, MINE), "succeeded", "done")
+msg = _raises("terminal record cannot be reopened",
+              lambda: g.save("task-bind-1", g.scope_for("org/first", 1, MINE), "waiting"))
+check("...and says why", "terminal" in msg, True)
+check("the record still reads as it was written", g.load("task-bind-1")["state"], "succeeded")
+
+msg = _raises("a same-id rebind to another PR is refused",
+              lambda: g.save("task-bind-1", g.scope_for("org/second", 2, MINE), "waiting"))
+check("...naming the binding it holds", "org/first#1" in msg, True)
+check("the subject did not move", g.load("task-bind-1")["repo"], "org/first")
+
+g.save("task-bind-2", g.scope_for("org/a", 3, MINE), "waiting", "seed")
+_raises("a same-id actor swap is refused",
+        lambda: g.save("task-bind-2", g.scope_for("org/a", 3, PEER), "waiting"))
+check("the actor did not move", g.load("task-bind-2")["actor_value"], MINE.value)
+
+# advancing STATE on an unchanged binding is the legal update, and must still work
+g.save("task-bind-2", g.scope_for("org/a", 3, MINE), "blocked", "advanced")
+check("an unchanged binding may advance its state", g.load("task-bind-2")["state"], "blocked")
+g.save("task-bind-2", g.scope_for("org/a", 3, MINE), "blocked", "idempotent")
+check("re-saving the same state is idempotent", g.load("task-bind-2")["state"], "blocked")
+
+# --- one canonical PR number at every seam (reported at 8421ca66) -------------
+# int() would fold each of these into a DIFFERENT subject than the one supplied.
+for bad, why in [("01", "leading zero"), ("\u0661", "Arabic-Indic digit"),
+                 (-1, "negative"), (0, "zero"), (True, "bool"), ("1.0", "non-digit")]:
+    _raises(f"construction rejects {why} PR number {bad!r}",
+            lambda b=bad: g.subject_for("org/repo", b))
+
+check("a canonical number still constructs",
+      g.subject_for("org/repo", 7).resource_id, "org/repo#7")
+check("a canonical digit STRING is accepted at construction",
+      g.subject_for("org/repo", "7").resource_id, "org/repo#7")
+_raises("a repo carrying the '#' separator is refused",
+        lambda: g.subject_for("org/re#po", 1))
+
+# load(): the persisted schema is stricter still -- a real int, positive
+_bad_dir = g.state_dir()
+_bad_dir.mkdir(parents=True, exist_ok=True)
+_ok = json.loads((_bad_dir / "task-bind-2.json").read_text())
+for field, value, why in [("number", -1, "negative"), ("number", 0, "zero"),
+                          ("number", True, "bool"), ("repo", "", "blank repo")]:
+    tid = f"task-bind-load-{field}-{why.split()[0]}"
+    (_bad_dir / f"{tid}.json").write_text(
+        json.dumps({**_ok, "task_id": tid, field: value}))
+    _raises(f"load rejects a {why}", lambda t=tid: g.load(t))
+
+# public rehydration is its own seam -- load() is not the only way in
+_raises("scope_from_saved rejects another provider's record",
+        lambda: g.scope_from_saved({**_ok, "provider": "gitlab"}))
+_raises("scope_from_saved rejects a blank repo with a bool number",
+        lambda: g.scope_from_saved({**_ok, "repo": "", "number": True}))
+check("scope_from_saved still rehydrates a good record",
+      g.scope_from_saved(_ok).subjects[0].resource_id, "org/a#3")
+
 # negative control: the harness must be able to register a failure
 _n = len(failures)
 check("CONTROL (expected to fail)", 1, 2)
@@ -317,4 +395,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 52 assertions, control verified")
+print(f"PASS: {_ASSERTIONS} assertions, control verified")
