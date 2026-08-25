@@ -45,7 +45,11 @@ def _read(path) -> str | None:
         return None
     try:
         return path.read_text()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # A holder mid-write is UNREADABLE, not empty. UnicodeDecodeError is a
+        # ValueError, so it escaped `except OSError` and the caller retired the
+        # original request. errors="replace" is wrong here: it would make a torn
+        # body decode to a non-skip string and read as a deliberate answer.
         return None
 
 
