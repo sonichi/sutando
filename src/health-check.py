@@ -3636,6 +3636,57 @@ def _pin_verdicts(service: str, lstart_by_pid: dict) -> list:
         service, lstart_by_pid, time.time())
 
 
+def _proc_lstarts(pgrep_pattern: str) -> tuple:
+    """(start timestamps, {pid: lstart}) for THIS checkout's matching processes.
+
+    Extracted so every prescription in mark_stale_if_outdated can consult a
+    pin, including the two that return before the src-vs-process comparison.
+    Returns ([], {}) on any probe failure or when nothing matches -- callers
+    that must run "regardless of process start" therefore still run.
+    """
+    try:
+        pids = subprocess.run(
+            ["/usr/bin/pgrep", "-f", pgrep_pattern],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip().split("\n")
+        pids = [x for x in pids if x]
+        if not pids:
+            return [], {}
+        # pgrep -f matches the same service launched from ANY clone on this
+        # machine; only processes belonging to THIS checkout are ours to judge.
+        pids = _filter_pids_this_checkout(pids)
+        if not pids:
+            return [], {}
+        ps_out = subprocess.run(
+            ["/bin/ps", "-o", "pid=,lstart=", "-p", ",".join(pids)],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip().split("\n")
+        from datetime import datetime as _dt
+        starts, lstart_by_pid = [], {}
+        for line in ps_out:
+            line = line.strip()
+            if not line:
+                continue
+            # Accept both shapes: `pid lstart` (what we ask ps for) and a bare
+            # lstart, so a caller or fixture supplying the older form still works.
+            pid_tok, lstart_tok = "", line
+            try:
+                stamp = _dt.strptime(lstart_tok, "%a %b %d %H:%M:%S %Y")
+            except ValueError:
+                pid_tok, _, lstart_tok = line.partition(" ")
+                pid_tok, lstart_tok = pid_tok.strip(), lstart_tok.strip()
+                try:
+                    stamp = _dt.strptime(lstart_tok, "%a %b %d %H:%M:%S %Y")
+                except ValueError:
+                    continue
+            starts.append(stamp.timestamp())
+            if pid_tok:
+                lstart_by_pid[pid_tok] = lstart_tok
+        return starts, lstart_by_pid
+    except (subprocess.TimeoutExpired, OSError):
+        return [], {}
+
+
 def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800,
                           binary_path: Optional[Path] = None, artifact_threshold_sec: int = 120,
                           service: Optional[str] = None) -> None:
@@ -3659,6 +3710,9 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
     """
     if not src_file.exists():
         return
+    # Probed above every arm: the binary-vs-source arm returns before the
+    # src-vs-process comparison, and empty keeps its no-process behaviour.
+    starts, lstart_by_pid = _proc_lstarts(pgrep_pattern)
     # Compiled-artifact check: binary older than source → "rebuild needed",
     # regardless of process start. This catches the case where --fix
     # relaunches a stale binary repeatedly (#528 stopped the leak; this
@@ -3677,57 +3731,18 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
                 if _binary_is_current(binary_path, src_file):
                     return
                 age_min = int((src_mtime - bin_mtime) / 60)
-                check["status"] = "stale"
-                check["detail"] = f"running, but binary is {age_min} min older than source — rebuild needed"
+                # A rebuild destroys a branch-only compiled witness exactly as a
+                # restart does, so this prescription consults the pin too.
+                check["status"], check["detail"] = process_pins.verdict_for(
+                    _pin_verdicts(service or check.get("name") or "", lstart_by_pid),
+                    f"binary is {age_min} min older than source",
+                    f"running, but binary is {age_min} min older than source — rebuild needed")
                 return
         except OSError:
             pass
+    if not starts:
+        return
     try:
-        pids = subprocess.run(
-            ["/usr/bin/pgrep", "-f", pgrep_pattern],
-            capture_output=True, text=True, timeout=5
-        ).stdout.strip().split("\n")
-        pids = [p for p in pids if p]
-        if not pids:
-            return
-        # pgrep -f matches the same service launched from ANY clone on this
-        # machine. Comparing our src mtime against a foreign clone's process
-        # start produces a perpetual "stale — restart needed" whenever two
-        # checkouts coexist (e.g. a staging clone alongside the live one).
-        # Only processes that belong to THIS checkout are ours to judge.
-        pids = _filter_pids_this_checkout(pids)
-        if not pids:
-            return
-        ps_out = subprocess.run(
-            ["/bin/ps", "-o", "pid=,lstart=", "-p", ",".join(pids)],
-            capture_output=True, text=True, timeout=5
-        ).stdout.strip().split("\n")
-        from datetime import datetime as _dt
-        starts = []
-        lstart_by_pid = {}
-        for line in ps_out:
-            line = line.strip()
-            if not line:
-                continue
-            # Accept both shapes: `pid lstart` (what we ask ps for) and a bare
-            # lstart, so a caller or fixture supplying the older form still works.
-            pid_tok, lstart_tok = "", line
-            try:
-                stamp = _dt.strptime(lstart_tok, "%a %b %d %H:%M:%S %Y")
-            except ValueError:
-                pid_tok, _, lstart_tok = line.partition(" ")
-                pid_tok, lstart_tok = pid_tok.strip(), lstart_tok.strip()
-                try:
-                    stamp = _dt.strptime(lstart_tok, "%a %b %d %H:%M:%S %Y")
-                except ValueError:
-                    continue
-            starts.append(stamp.timestamp())
-            if pid_tok:
-                lstart_by_pid[pid_tok] = lstart_tok
-        if not starts:
-            return
-        # Pick the OLDEST start time — the tsx wrapper spawns a child node
-        # process; we want the parent's launch time, not the child's.
         proc_start = min(starts)
         # A compiled service executes the ARTIFACT, so src-vs-process cannot see
         # a deploy that refreshes the artifact without touching source.
@@ -3738,11 +3753,14 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
                 # `git checkout` mtime bumps -- those never touch an artifact.
                 if bin_mtime - proc_start > artifact_threshold_sec:
                     age_min = int((bin_mtime - proc_start) / 60)
-                    check["status"] = "stale"
-                    check["detail"] = (
+                    # Same pin policy as the src-vs-process arm below: an armed
+                    # pin means restarting would discard a branch-only artifact.
+                    check["status"], check["detail"] = process_pins.verdict_for(
+                        _pin_verdicts(service or check.get("name") or "", lstart_by_pid),
+                        f"the artifact it executes was rebuilt {age_min} min "
+                        f"after the process started",
                         f"running, but the artifact it executes was rebuilt "
-                        f"{age_min} min after the process started -- restart needed"
-                    )
+                        f"{age_min} min after the process started -- restart needed")
                     return
             except OSError:
                 pass

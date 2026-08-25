@@ -98,12 +98,12 @@ def evaluate(pins: list, service: str, lstart_by_pid: dict, now_ts: float) -> li
     return out
 
 
-def stale_verdict(results: list, age_min: int) -> tuple:
-    """(status, detail) for a process the mtime check has already called stale.
+def verdict_for(results: list, warn_lead: str, stale_detail: str) -> tuple:
+    """(status, detail) for ANY prescription an armed pin must override.
 
-    One decision for every call site: an armed pin yields `warn` (so a
-    `status == "stale"` auto-restart skips it structurally), and any pin that
-    stopped matching is appended to the still-stale detail rather than dropped.
+    Every restart/rebuild prescription routes through here, not just the
+    src-vs-process one: a pin preserves a branch-only compiled witness, and a
+    rebuild destroys it exactly as a restart does.
     """
     armed = armed_detail(results)
     # A non-matching pin is a finding at BOTH verdicts: an armed sibling
@@ -111,11 +111,17 @@ def stale_verdict(results: list, age_min: int) -> tuple:
     others = "".join(f" [{note}]" for verdict, _pin, note in results
                      if verdict != ARMED)
     if armed:
-        return ("warn",
-                f"code is {age_min} min newer than process, but {armed}{others}")
-    return ("stale",
-            f"running but code is {age_min} min newer than process "
-            f"\u2014 restart needed{others}")
+        return ("warn", f"{warn_lead}, but {armed}{others}")
+    return ("stale", f"{stale_detail}{others}")
+
+
+def stale_verdict(results: list, age_min: int) -> tuple:
+    """(status, detail) for a process the mtime check has already called stale."""
+    return verdict_for(
+        results,
+        f"code is {age_min} min newer than process",
+        f"running but code is {age_min} min newer than process "
+        f"\u2014 restart needed")
 
 
 def armed_detail(results: list):
