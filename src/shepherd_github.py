@@ -60,6 +60,7 @@ def _gh(*args: str) -> str:
 
 PR_STATES = frozenset({"open", "closed"})
 MERGED_TOKENS = frozenset({"true", "false"})
+VALID_PR_PROJECTIONS = frozenset({("open", "false"), ("closed", "false"), ("closed", "true")})
 
 
 _ASCII_DIGITS = frozenset("0123456789")
@@ -68,9 +69,9 @@ _ASCII_DIGITS = frozenset("0123456789")
 def _pr_repo(value: object, where: str) -> str:
     """`#` is the subject separator, so a repo carrying one makes the encoded
     resource_id parse back as a different repo and number."""
-    if not isinstance(value, str) or not value.strip() or "#" in value:
-        raise ValueError(f"{where}: repo must be a non-empty string without '#', "
-                         f"got {value!r}")
+    if type(value) is not str or not value.strip() or "#" in value:
+        raise ValueError(f"{where}: repo must be a non-empty str (exact type) "
+                         f"without '#', got {type(value).__name__}: {value!r}")
     return value
 
 
@@ -78,10 +79,12 @@ def _pr_number(value: object, where: str) -> int:
     """The ONE place a PR number is judged. `str.isdigit()` is true for Unicode
     digits and for leading zeros, and int() then canonicalizes them -- so the
     subject that loads is not the subject that was written."""
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError(f"{where}: PR number must be an int or digit string, "
-                         f"got {type(value).__name__}")
-    if isinstance(value, str):
+    # EXACT types: an int SUBCLASS returned unchanged can override comparison
+    # and formatting, defeating the positivity and canonicalization rules below.
+    if type(value) not in (int, str):
+        raise ValueError(f"{where}: PR number must be an int or digit str "
+                         f"(exact type), got {type(value).__name__}")
+    if type(value) is str:
         if not value or not set(value) <= _ASCII_DIGITS:
             raise ValueError(f"{where}: PR number {value!r} is not ASCII digits")
         if value != str(int(value)):
@@ -121,6 +124,12 @@ def observe(repo: str, number: int) -> ObservedEvent:
     if state not in PR_STATES or merged not in MERGED_TOKENS:
         raise ValueError(
             f"unknown PR projection for {repo}#{number}: state={state!r} merged={merged!r}")
+    # Both fields come from ONE API object, so an impossible PAIR is malformed
+    # evidence, not a terminal state that should win. A merged PR is never open.
+    if (state, merged) not in VALID_PR_PROJECTIONS:
+        raise ValueError(
+            f"impossible PR projection for {repo}#{number}: "
+            f"state={state!r} merged={merged!r}")
     if merged == "true":
         etype = "github.pull_request.merged"
     elif state == "closed":
@@ -139,7 +148,12 @@ def scope_for(repo: str, number: int, actor: Actor) -> ResponsibilityScope:
 
 def _contract_path(task_id: str) -> Path:
     """The only place a task_id becomes a path. Unvalidated ids escape the
-    directory (`../../x`), and the repository already owns the gate."""
+    directory (`../../x`), and the repository already owns the gate.
+
+    EXACT str first: a subclass can satisfy valid_task_id() on its underlying
+    value while __format__ renders something else into the path."""
+    if type(task_id) is not str:
+        raise ValueError(f"task_id must be an exact str, got {type(task_id).__name__}")
     if not valid_task_id(task_id):
         raise ValueError(f"refusing to build a path from invalid task_id: {task_id!r}")
     return state_dir() / f"{task_id}.json"

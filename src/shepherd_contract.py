@@ -39,10 +39,12 @@ SHEPHERD_STATES = (
 TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
 def _require_text(owner: str, name: str, value) -> None:
-    """A coerced str() check passes on ints and keeps the original object, so a
-    non-string identity can cross the same boundary a blank one is rejected at."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{owner}.{name} must be a non-blank string, got {value!r}")
+    """EXACT str, not isinstance: a str SUBCLASS can override __eq__/__hash__/
+    __format__, so a value that reads as verified here can compare, hash or
+    render as something else at the seam that trusts it."""
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{owner}.{name} must be a non-blank str "
+                         f"(exact type), got {type(value).__name__}: {value!r}")
 
 
 # Anything weaker than a subject+actor match is recorded but never evidence.

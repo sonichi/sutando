@@ -385,6 +385,51 @@ _raises("scope_from_saved rejects a record with no reachable outcome",
 check("scope_from_saved still rehydrates a good record",
       g.scope_from_saved(_ok).subjects[0].resource_id, "org/a#3")
 
+# --- hostile SCALAR SUBCLASSES must not cross any boundary (reported at 113feaec) ---
+class _EscapingId(str):
+    """valid_task_id() sees the safe underlying value; __format__ renders the escape."""
+    def __format__(self, spec): return "../../escaped"
+
+
+class _ForgedStr(str):
+    """Overrides equality/hash so a visibly fake scheme can match and read verified."""
+    def __eq__(self, other): return True
+    def __hash__(self): return hash("git.commit_author_email")
+
+
+class _EvilInt(int):
+    """Overrides comparison so the positivity rule below cannot reject it."""
+    def __le__(self, other): return False
+    def __lt__(self, other): return False
+
+
+_outside = pathlib.Path(WORK) / "escaped.json"
+_raises("hostile task_id (str subclass) is refused before it becomes a path",
+        lambda: g.save(_EscapingId("task-safe"), scope, "waiting"))
+check("...and NO file was published outside the state dir", _outside.exists(), False)
+check("...nor anywhere above it", any(pathlib.Path(WORK).glob("*.json")), False)
+
+_raises("forged Actor scalar (str subclass) is refused at construction",
+        lambda: Actor(_ForgedStr("totally.fake"), _ForgedStr("nobody@example.com")))
+_raises("an int subclass PR number is refused",
+        lambda: g.subject_for("org/repo", _EvilInt(-1)))
+check("a genuine int still constructs", g.subject_for("org/repo", 9).resource_id, "org/repo#9")
+
+# --- observe(): an IMPOSSIBLE (state, merged) pair is malformed evidence -----
+_real_gh = g._gh
+def _proj(v):
+    g._gh = lambda *a: v
+    try: return g.observe("org/repo", 1)
+    finally: g._gh = _real_gh
+
+g.resolve_actor = lambda repo, num: MINE
+for pair, want in (("open false", "github.pull_request.updated"),
+                   ("closed false", "github.pull_request.closed_unmerged"),
+                   ("closed true", "github.pull_request.merged")):
+    check(f"projection {pair!r} maps to {want.split('.')[-1]}", _proj(pair).event_type, want)
+_raises("projection 'open true' is REFUSED (merged PRs are never open)",
+        lambda: _proj("open true"))
+
 # negative control: the harness must be able to register a failure
 _n = len(failures)
 check("CONTROL (expected to fail)", 1, 2)
