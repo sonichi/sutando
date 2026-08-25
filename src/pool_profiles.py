@@ -43,6 +43,10 @@ TRANSITION_REASONS = ("initial", "rotated_for_size", "rotated_for_age",
                       "runtime_switch", "branch", "manual")
 
 GENERATION_STATUSES = ("pending", "active", "superseded", "failed")
+
+# Startup outcomes kept per profile. Bounded because it is a diagnosis window,
+# not a log — old attempts cannot inform the current session's attribution.
+ATTEMPT_HISTORY = 20
 RUNTIMES = ("claude", "codex")
 
 ROOM_WRITE_MODES = ("scoped", "none")
@@ -153,7 +157,7 @@ def _validate_profile(pid: str, prof) -> None:
     if not isinstance(prof, dict):
         raise ProfileStoreCorrupt(f"{pid}: not a mapping")
     required = {"rooms", "seat", "policy", "context_policy",
-                "head_generation_id", "generations", "created_at"}
+                "head_generation_id", "generations", "attempts", "created_at"}
     missing = required - set(prof)
     if missing:
         raise ProfileStoreCorrupt(f"{pid}: missing {sorted(missing)}")
@@ -315,7 +319,7 @@ class ProfileStore:
             prof = {"rooms": rooms_v, "seat": {"core_id": None, "epoch": 0},
                     "policy": pol, "context_policy": cp,
                     "head_generation_id": None, "generations": {},
-                    "created_at": self.now()}
+                    "attempts": [], "created_at": self.now()}
             data["profiles"][profile_id] = prof
             return prof
 
@@ -413,6 +417,22 @@ class ProfileStore:
                 "transcript_sha256": None, "digest_ref": None,
                 "room_watermarks": {}}
             return gid
+
+        return self._mutate(apply)
+
+    def record_attempt(self, profile_id: str, core_id: str, seat_epoch: int,
+                       session_id: "str | None", ok: bool) -> list:
+        """Append a startup outcome, newest last, bounded to ATTEMPT_HISTORY.
+        This is what lets failure be attributed to a session rather than counted."""
+        def apply(data):
+            prof = data["profiles"].get(profile_id)
+            if prof is None:
+                raise UnknownProfile(profile_id)
+            self._fenced(prof, core_id, seat_epoch)
+            prof["attempts"].append({"session_id": session_id, "ok": bool(ok),
+                                     "core_id": core_id, "ts": self.now()})
+            del prof["attempts"][:-ATTEMPT_HISTORY]
+            return prof["attempts"]
 
         return self._mutate(apply)
 
