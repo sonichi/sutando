@@ -89,13 +89,15 @@ class DeliveryCore:
         return resolved.outcome, getattr(resolved, "destination", None)
 
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
-        """Claim -> deliver -> classify -> complete, with retry accounting."""
+        """Derive -> claim -> deliver -> classify -> complete, with retries."""
+        # Derive BEFORE claiming: a key that cannot be derived must not leave
+        # this worker holding an item no drain will ever deliver.
+        key = idempotency_key(item_id)
         token = self.backend.claim(item_id, self.worker)
         if token is None:
             # Another worker owns it. No provider call was made, so there is
             # no external ambiguity to report — this is not an outcome.
             return DrainResult(status=DrainStatus.NOT_CLAIMED)
-        key = idempotency_key(item_id)
         outcome, destination = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities

@@ -177,17 +177,96 @@ def _rebound_names(tree, import_nodes) -> set:
     return out
 
 
-def has_canonical_binding(tree) -> bool:
-    """True only when a real, public, unshadowed import of the canonical
-    package is in force."""
+# Names from the canonical package that actually MINT a delivery identity.
+# Importing a sibling type (TaskId) says nothing about delivery ids.
+_DELIVERY_CTORS = frozenset({"DeliveryId", "delivery_id", "parse_delivery_id",
+                             "identity"})
+
+
+def canonical_delivery_bindings(tree) -> set:
+    """Names in force that construct a delivery id canonically. A renamed,
+    private, or shadowed alias is unfollowable across files, so it binds
+    nothing here; neither does an unrelated import from the same package."""
     imports = _identity_imports(tree)
     if not imports:
-        return False
-    bound = set().union(*imports.values())
-    rebound = _rebound_names(tree, set(imports))
-    # A private alias is not a canonical binding: it re-exports the package
-    # under a name the ratchet cannot follow across files.
-    return any(n for n in bound if not n.startswith("_") and n not in rebound)
+        return set()
+    out = set()
+    for node, names in imports.items():
+        # A module handle (import ag2_sparrow.identity / from ag2_sparrow
+        # import identity) reaches every constructor through attribute access.
+        handle = not (isinstance(node, ast.ImportFrom)
+                      and node.module == _IDENTITY_MODULE)
+        for a in node.names:
+            root = a.name.split(".")[0] if isinstance(node, ast.Import) else a.name
+            if a.asname and a.asname != root:
+                continue
+            name = a.asname or root
+            if name.startswith("_") or name not in names:
+                continue
+            if handle or name in _DELIVERY_CTORS:
+                out.add(name)
+    return out
+
+
+def _canonical_scopes(tree, bindings: set) -> set:
+    """Scope names in which a canonical constructor is actually CALLED. A file
+    that merely imports one does not thereby make every scope in it canonical."""
+    if not bindings:
+        return set()
+    found, stack = set(), ["<module>"]
+
+    def called(fn):
+        while isinstance(fn, ast.Attribute):
+            fn = fn.value
+        return isinstance(fn, ast.Name) and fn.id in bindings
+
+    def _assigned_here(node) -> set:
+        """Names this scope rebinds directly, not counting nested scopes — a
+        sibling function's local cannot shadow the import for this one."""
+        out = set()
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
+                out.add(child.name)
+                continue
+            for sub in ast.walk(child):
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                    ast.ClassDef)):
+                    break
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx,
+                                                            (ast.Store, ast.Del)):
+                    out.add(sub.id)
+        return out
+
+    class C(ast.NodeVisitor):
+        def _scoped(self, n):
+            stack.append(n.name)
+            self.generic_visit(n)
+            stack.pop()
+        visit_FunctionDef = _scoped
+        visit_AsyncFunctionDef = _scoped
+        visit_ClassDef = _scoped
+
+        def visit_Call(self, n):
+            if called(n.func):
+                found.add(stack[-1])
+            self.generic_visit(n)
+
+    C().visit(tree)
+    # Drop any scope that rebinds the constructor name it appeared to call.
+    shadowing = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            shadowing[node.name] = _assigned_here(node)
+    shadowing.setdefault("<module>", _assigned_here(tree))
+    return {s for s in found if not (bindings & shadowing.get(s, set()))}
+
+
+def has_canonical_binding(tree) -> bool:
+    """True only where a canonical constructor is actually CALLED in some
+    unshadowed scope. An import alone is a claim, not an adoption."""
+    return bool(_canonical_scopes(tree, canonical_delivery_bindings(tree)))
 
 
 def scan_delivery_id_sites(root: Path) -> dict:
@@ -203,11 +282,15 @@ def scan_delivery_id_sites(root: Path) -> dict:
         except SyntaxError:
             counts[(rel, "<unparseable>")] = 1
             continue
-        if has_canonical_binding(tree):
-            continue
+        bindings = canonical_delivery_bindings(tree)
+        exempt = _canonical_scopes(tree, bindings)
         stack = ["<module>"]
 
         def record():
+            # Site-aware: only the scopes that actually call a canonical
+            # constructor are exempt, never the whole file.
+            if stack[-1] in exempt:
+                return
             key = (rel, stack[-1])
             counts[key] = counts.get(key, 0) + 1
 
@@ -243,7 +326,10 @@ def scan_delivery_id_sites(root: Path) -> dict:
                 self.generic_visit(n)
 
             def visit_alias(self, n):
-                if (n.asname or n.name) == _DELIVERY_NAME:
+                # Importing the canonical constructor is ADOPTION, not a legacy
+                # site — counting it would penalise the migration it exists for.
+                name = n.asname or n.name
+                if name == _DELIVERY_NAME and name not in bindings:
                     record()
                 self.generic_visit(n)
 
@@ -383,6 +469,42 @@ class DeliveryGateHostileControls(unittest.TestCase):
             'x = ag2_sparrow.identity.delivery_id("t", "b")\n',
         ):
             self.assertTrue(self._canonical(source), source)
+
+    def _sites(self, source: str) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "probe.py").write_text(source)
+            return {k[1]: v for k, v in scan_delivery_id_sites(Path(tmp)).items()}
+
+    def test_an_unrelated_import_from_the_package_exempts_nothing(self):
+        # The sibling type is CALLED here on purpose: an uncalled import is
+        # already stopped by the per-scope rule, so it cannot test this one.
+        self.assertEqual(
+            self._sites("from ag2_sparrow.identity import TaskId\n"
+                        "def f():\n"
+                        '    t = TaskId("task-x")\n'
+                        '    delivery_id = "d:" + str(1)\n'
+                        "    return t, delivery_id\n"),
+            {"f": 2}, "a sibling type cleared delivery_id sites")
+
+    def test_exemption_is_per_scope_not_per_file(self):
+        # One canonical call must not clear a sibling scope's private one.
+        self.assertEqual(
+            self._sites("from ag2_sparrow.identity import delivery_id\n"
+                        "def good():\n"
+                        '    return delivery_id("t", "g")\n'
+                        "def legacy():\n"
+                        '    delivery_id = "raw"\n'
+                        "    return delivery_id\n"),
+            {"legacy": 2}, "a canonical sibling scope cleared a legacy one")
+
+    def test_adopting_the_canonical_constructor_is_not_itself_a_site(self):
+        # Negative control: if adoption counted, migrating would red the
+        # ratchet and the gate would punish the change it exists to drive.
+        self.assertEqual(
+            self._sites("from ag2_sparrow.identity import delivery_id\n"
+                        "def good():\n"
+                        '    return delivery_id("t", "g")\n'),
+            {})
 
     def test_private_constructor_in_a_legacy_file_reds_the_ratchet(self):
         """The exemption is per SITE, not per file: future delivery work

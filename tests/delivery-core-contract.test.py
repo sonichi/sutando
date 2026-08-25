@@ -501,6 +501,62 @@ class CorePolicy(unittest.TestCase):
                          "no worker identity in the key")
 
 
+class LegacyKeyDomain(unittest.TestCase):
+    """The shipped provider key is opaque by contract: delegating its
+    derivation must not narrow which item_ids it accepts (reviewer P1)."""
+
+    def _core(self, td, item):
+        backend = DesignAClaimBackend(Path(td) / "root")
+        backend.publish(item, b"payload")
+        return backend, DeliveryCore(backend, _KeyProbe(), None)
+
+    def test_opaque_item_ids_keep_their_shipped_bytes(self):
+        # The outbox supports opaque ids via a digest-suffixed safe key, so a
+        # path separator reaches this derivation and must survive it verbatim.
+        for item in ("a/b", "a/b/c", "a\\b", "plain"):
+            with self.subTest(item=item):
+                self.assertEqual(idempotency_key(item), f"{item}#0")
+
+    def test_opaque_item_id_reaches_the_provider_through_the_real_core(self):
+        for item in ("a/b", "a/b/c"):
+            with self.subTest(item=item), tempfile.TemporaryDirectory() as td:
+                _, core = self._core(td, item)
+                core.deliver_one(item, b"payload")
+                self.assertEqual(core.provider.calls, [(item, f"{item}#0")],
+                                 "provider saw a different key than was shipped")
+
+    def test_underivable_key_strands_nothing(self):
+        # Derivation runs before the claim, so a key that cannot be derived
+        # leaves no provider call and no item held by this worker.
+        item = "x" * 300
+        with tempfile.TemporaryDirectory() as td:
+            backend, core = self._core(td, item)
+            with self.assertRaises(ValueError):
+                core.deliver_one(item, b"payload")
+            self.assertEqual(core.provider.calls, [], "provider was called")
+            self.assertIsNotNone(backend.claim(item, "successor"),
+                                 "item is stranded: no successor can claim it")
+
+
+class _KeyProbe:
+    def __init__(self):
+        self.calls = []
+
+    @property
+    def capabilities(self):
+        return ProviderCapabilities(reconcile_capable=False,
+                                    idempotent_send=True)
+
+    def deliver(self, item_id, payload, idempotency_key):
+        self.calls.append((item_id, idempotency_key))
+        return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
+                               provider_ref="probe", detail=None,
+                               destination="d")
+
+    def reconcile(self, attempt):
+        return None
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name in BACKENDS:
@@ -508,6 +564,7 @@ def load_tests(loader, tests, pattern):
                     {"backend_name": name})
         suite.addTests(loader.loadTestsFromTestCase(case))
     suite.addTests(loader.loadTestsFromTestCase(CorePolicy))
+    suite.addTests(loader.loadTestsFromTestCase(LegacyKeyDomain))
     return suite
 
 
