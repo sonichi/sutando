@@ -10,28 +10,23 @@
     "prompt": "Morning briefing. FIRST produce the calendar cache from the owner's REAL Google calendar (the standalone script can't reach the connector): pull today's events via the Google-calendar connector (e.g. sutando-station composio_exec GOOGLECALENDAR_EVENTS_LIST, calendarId=primary, today's local-day window), then pipe them as a JSON array of {raw,calendar} to `python3 src/write_calendar_cache.py` (or `python3 src/write_calendar_cache.py --empty` if genuinely no events today). THEN run `MORNING_BRIEFING_CALENDAR_SOURCE=google python3 src/morning-briefing.py` to deliver the briefing (weather, calendar, reminders, overnight Discord, pending questions, health). Producing the cache first makes the briefing read the owner's real Google Workspace calendar instead of falsely reporting 'clear' off an empty local macOS-Calendar read (#2256). If you have no Google connector, drop the cache step and the env var to fall back to the local macOS Calendar. Speak the result if voice is connected, send as Discord DM otherwise."
   },
   {
-    "name": "daily-insight",
-    "cron": "50 6 * * *",
-    "prompt": "Run python3 src/daily-insight.py to generate today's behavioral insight. If it produces output, include it in the morning briefing."
-  },
-  {
     "name": "pending-questions",
     "cron": "*/30 * * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh pending-questions python3 src/check-pending-questions.py — notifies about unanswered pending questions (deferred when owner tasks are queued; next */30 retry covers a skipped fire)."
+    "prompt": "Run: bash scripts/cron-gate.sh pending-questions python3 src/check-pending-questions.py \u2014 notifies about unanswered pending questions (deferred when owner tasks are queued; next */30 retry covers a skipped fire)."
   },
   {
     "name": "sync-workspace",
     "cron": "*/30 * * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh — syncs workspace (memory + notes + state/cores) to the private vault via per-host branch (requires vault.remote_url in sutando.config.local.json, or --vault-url flag; deferred when owner tasks are queued; next */30 retry covers a skipped fire). Replaces the legacy sync-memory entry (which used rsync to a separate ~/.sutando/memory-sync/ clone); sync-memory.sh still works during the transition but emits a deprecation banner."
+    "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh \u2014 syncs workspace (memory + notes + state/cores) to the private vault via per-host branch (requires vault.remote_url in sutando.config.local.json, or --vault-url flag; deferred when owner tasks are queued; next */30 retry covers a skipped fire). Replaces the legacy sync-memory entry (which used rsync to a separate ~/.sutando/memory-sync/ clone); sync-memory.sh still works during the transition but emits a deprecation banner."
   },
   {
     "name": "learned-skills-scan",
     "cron": "30 7 * * *",
-    "prompt": "Run python3 skills/learned-skills/scripts/detect-learned-skills.py to scan recent task archives for repeated workflow patterns and propose candidate learned skills. Gated on state/learned-skills-enabled.sentinel (toggled from Settings → Skills → Behavior); the script exits early when the gate is off."
+    "prompt": "Run python3 skills/learned-skills/scripts/detect-learned-skills.py to scan recent task archives for repeated workflow patterns and propose candidate learned skills. Gated on state/learned-skills-enabled.sentinel (toggled from Settings \u2192 Skills \u2192 Behavior); the script exits early when the gate is off."
   },
   {
     "name": "example-digest",
     "cron": "2 6 * * *",
-    "prompt": "Example digest cron — replace with your own research prompt. Web search for the latest <topic> developments in the past 24h. Summarize top 3-5 items as 'title — why-it-matters — link'. Keep under ~1500 chars. DELIVERY (required for digest crons): Write the full result to results/proactive-example-$(date +%s).txt — and nothing else. Do NOT use notify.py for the final result (it hard-rejects messages over 280 chars — it is a progress-ping tool, not a delivery channel), do NOT write results/briefing-* (Slack never drains that prefix), and do NOT mint a synthetic tasks/task-cron-* (an orphan task with no matching keyed result — re-processed as noise, delivers nothing). Every bridge drains results/proactive-*.txt via proactive_routing, routed to the owner's most-recently-active channel exactly once."
+    "prompt": "Example digest cron \u2014 replace with your own research prompt. Web search for the latest <topic> developments in the past 24h. Summarize top 3-5 items as 'title \u2014 why-it-matters \u2014 link'. Keep under ~1500 chars. DELIVERY (required for digest crons): Write the full result to results/proactive-example-$(date +%s).txt \u2014 and nothing else. Do NOT use notify.py for the final result (it hard-rejects messages over 280 chars \u2014 it is a progress-ping tool, not a delivery channel), do NOT write results/briefing-* (Slack never drains that prefix), and do NOT mint a synthetic tasks/task-cron-* (an orphan task with no matching keyed result \u2014 re-processed as noise, delivers nothing). Every bridge drains results/proactive-*.txt via proactive_routing, routed to the owner's most-recently-active channel exactly once."
   }
 ]

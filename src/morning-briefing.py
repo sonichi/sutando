@@ -635,30 +635,7 @@ def get_health_issues() -> "list[str] | None":
         return None
 
 
-def get_daily_insight() -> str | None:
-    """Get today's behavioral insight from daily-insight.py (cached via sentinel)."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    sentinel = STATE_DIR / f"daily-insight-{today}.sentinel"
-    if sentinel.exists():
-        return sentinel.read_text().strip() or None
-    # Not yet generated — run it
-    hc = _SRC_DIR / "daily-insight.py"
-    if not hc.exists():
-        return None
-    try:
-        r = subprocess.run(
-            [sys.executable, str(hc)],
-            capture_output=True, text=True, timeout=20,
-            cwd=str(WORKSPACE)
-        )
-        if r.returncode == 0 and sentinel.exists():
-            return sentinel.read_text().strip() or None
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    return None
-
-
-def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight=None) -> str:
+def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues) -> str:
     now = datetime.now()
     hour = now.hour
     if hour < 12:
@@ -717,13 +694,6 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         issues_str = "; ".join(health_issues[:2])
         parts.append(f"System note: {issues_str}.")
 
-    # Daily insight (closing thought) — take first sentence, skip if it's just raw data
-    if insight:
-        first_sentence = insight.split('.')[0].strip()
-        has_raw_data = '{' in first_sentence or first_sentence.count(':') > 2
-        if not has_raw_data and len(first_sentence) > 20:
-            parts.append(f"Insight: {first_sentence}.")
-
     # Closing — every input must be VERIFIED empty, not merely falsy. `None`
     # from any gather means that query did not run, and an unanswered query is
     # not evidence of a clean day. Previously only the calendar was checked this
@@ -777,8 +747,6 @@ def main():
     discord_msgs = get_overnight_discord()
     print(f"  discord overnight: {len(discord_msgs)} messages")
 
-    insight = get_daily_insight()
-    print(f"  insight: {'yes' if insight else 'none'}")
 
     pending_qs = get_pending_questions()
     print(f"  pending questions: {len(pending_qs)}")
@@ -787,7 +755,7 @@ def main():
     print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")
 
     # Synthesize
-    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight)
+    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues)
 
     # Write voice result
     ts = int(time.time() * 1000)
