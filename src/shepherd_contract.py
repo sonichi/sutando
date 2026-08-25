@@ -120,12 +120,14 @@ class ObservedEvent:
         _require_text("ObservedEvent", "event_type", self.event_type)
         # A duck-typed stand-in satisfies every attribute the decision functions
         # read, so `is_verified` becomes self-declared unless the TYPE is checked.
-        if not isinstance(self.subject, Subject):
+        # EXACT type, not isinstance: a subclass can override is_verified/matches and
+        # would then decide its own trust, which is what the scheme allowlist exists to deny.
+        if type(self.subject) is not Subject:
             raise ValueError(
-                f"ObservedEvent.subject must be a Subject, got {type(self.subject).__name__}")
-        if self.actor is not None and not isinstance(self.actor, Actor):
+                f"ObservedEvent.subject must be exactly a Subject, got {type(self.subject).__name__}")
+        if self.actor is not None and type(self.actor) is not Actor:
             raise ValueError(
-                f"ObservedEvent.actor must be an Actor or None, "
+                f"ObservedEvent.actor must be exactly an Actor or None, "
                 f"got {type(self.actor).__name__}")
 
 
@@ -159,13 +161,13 @@ class ResponsibilityScope:
             for element in getattr(self, name):
                 _require_text(f"ResponsibilityScope.{name}", "element", element)
         for subject in self.subjects:
-            if not isinstance(subject, Subject):
+            if type(subject) is not Subject:
                 raise ValueError(
-                    f"ResponsibilityScope.subjects element must be a Subject, "
+                    f"ResponsibilityScope.subjects element must be exactly a Subject, "
                     f"got {type(subject).__name__}")
-        if not isinstance(self.actor, Actor):
+        if type(self.actor) is not Actor:
             raise ValueError(
-                f"ResponsibilityScope.actor must be an Actor, "
+                f"ResponsibilityScope.actor must be exactly an Actor, "
                 f"got {type(self.actor).__name__}")
         clash = self.success_conditions & self.failure_conditions
         if clash:

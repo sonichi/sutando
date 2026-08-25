@@ -240,9 +240,49 @@ check("an event cannot carry a non-Subject subject or a foreign actor",
        _rejects(lambda: ObservedEvent("github.pull_request.merged", PR, _ForeignActor()))),
       (True, True))
 
+
+# A subclass inherits the constructor's blessing but can override the trust
+# predicates, so identity must be an EXACT type check, never isinstance().
+class _EvilActor(Actor):
+    @property
+    def is_discriminating(self):
+        return True
+
+    @property
+    def is_verified(self):
+        return True
+
+    def matches(self, other):
+        return True
+
+
+class _EvilSubject(Subject):
+    def matches(self, other):
+        return True
+
+
+check("an Actor SUBCLASS cannot self-certify into a scope",
+      _rejects(lambda: ResponsibilityScope(
+          subjects=(PR,), actor=_EvilActor("totally.fake", "attacker"),
+          watch_conditions=SCOPE.watch_conditions,
+          success_conditions=SCOPE.success_conditions,
+          failure_conditions=SCOPE.failure_conditions)), True)
+check("a Subject SUBCLASS cannot widen what a scope covers",
+      _rejects(lambda: ResponsibilityScope(
+          subjects=(_EvilSubject(PR.provider, PR.kind, PR.resource_id),), actor=SCOPE.actor,
+          watch_conditions=SCOPE.watch_conditions,
+          success_conditions=SCOPE.success_conditions,
+          failure_conditions=SCOPE.failure_conditions)), True)
+check("an event cannot carry a subclassed subject or actor either",
+      (_rejects(lambda: ObservedEvent("github.pull_request.merged",
+                                      _EvilSubject(PR.provider, PR.kind, PR.resource_id), _asserted)),
+       _rejects(lambda: ObservedEvent("github.pull_request.merged", PR,
+                                      _EvilActor("totally.fake", "attacker")))),
+      (True, True))
+
 if failures:
     print(f"FAIL ({len(failures)}):")
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 33 assertions, control verified")
+print("PASS: 36 assertions, control verified")
