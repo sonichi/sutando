@@ -53,8 +53,12 @@ def _load_or_create_capture_token() -> str | None:
     try:
         if _os.path.lexists(_CAPTURE_TOKEN_PATH):
             st = _os.lstat(_CAPTURE_TOKEN_PATH)
-            if (stat.S_ISREG(st.st_mode) and (st.st_mode & 0o777) == 0o600
-                    and st.st_uid == _os.getuid()):
+            regular = stat.S_ISREG(st.st_mode)
+            secure = regular and (
+                _os.name == "nt"
+                or ((st.st_mode & 0o777) == 0o600 and st.st_uid == _os.getuid())
+            )
+            if secure:
                 with open(_CAPTURE_TOKEN_PATH) as _f:
                     existing = _f.read().strip()
                 if existing:
@@ -62,8 +66,9 @@ def _load_or_create_capture_token() -> str | None:
             _os.unlink(_CAPTURE_TOKEN_PATH)
         _os.makedirs(_os.path.dirname(_CAPTURE_TOKEN_PATH), exist_ok=True)
         tok = secrets.token_urlsafe(32)
+        nofollow = getattr(_os, "O_NOFOLLOW", 0)
         fd = _os.open(_CAPTURE_TOKEN_PATH,
-                      _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL | _os.O_NOFOLLOW, 0o600)
+                      _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL | nofollow, 0o600)
         _os.write(fd, tok.encode())
         _os.close(fd)
         return tok
@@ -415,18 +420,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fmt = "png"
         ext = "jpg" if fmt in ("jpg", "jpeg") else "png"
         type_flag = "jpg" if ext == "jpg" else "png"
-        # P7 D7.4: optional downscale/recompress executed HERE, in the capture
-        # server's process (sips subprocess) — vision compression must never
-        # compete with the voice event loop. maxdim bounds the longest edge;
-        # quality is JPEG percent (jpg only). Bounded to sane ranges.
+        # Downscale in the capture process so compression never competes with voice.
+        # maxdim bounds the longest edge; quality is bounded JPEG percent.
         maxdim_raw = query.get("maxdim", [None])[0]
         maxdim = int(maxdim_raw) if maxdim_raw and maxdim_raw.isdigit() and 320 <= int(maxdim_raw) <= 3840 else None
         quality_raw = query.get("quality", [None])[0]
         quality = int(quality_raw) if quality_raw and quality_raw.isdigit() and 10 <= int(quality_raw) <= 100 else None
         try:
-            # macOS supports explicit per-display capture. Windows currently
-            # falls back to one virtual-screen capture for both `all` and
-            # `display` requests.
+            # macOS supports per-display capture; Windows falls back to one
+            # virtual-screen capture for `all` and `display`.
             if capture_all and is_macos():
                 # Capture all displays separately
                 paths = []

@@ -61,9 +61,8 @@ class TestFindPids(unittest.TestCase):
 
     # A nonsense pattern (absent from any real command line) returns nothing.
     def test_nonexistent_pattern_returns_empty(self):
-        # This literal is read from here, but the find_pids query tags itself
-        # with a sentinel + skips $PID, so its own probe never self-matches.
-        # The token is unlikely to appear in any other live process.
+        # The query tags itself and skips $PID, so this literal cannot self-match
+        # and is unlikely to occur in another process.
         self.assertEqual(self.mod.find_pids("nopE_no_such_proc_7Xq"), [])
 
     # A spawned child with a unique trailing marker is found by that marker.

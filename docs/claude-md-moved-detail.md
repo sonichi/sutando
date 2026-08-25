@@ -1,5 +1,14 @@
 # Detail moved verbatim from CLAUDE.md (2026-08-17 context-budget diet)
 
+## Windows task watcher
+
+Claude Code 2.1.168 on Windows does not ship the `Monitor` tool. `src/startup.ps1`
+therefore launches `src/task-dispatcher.ps1`, a `FileSystemWatcher` process that
+atomically claims task files and invokes `claude --print`. The dispatcher gives
+chat low latency while the long-running core retains scheduled/proactive work.
+Each dispatched task is a separate subprocess, so continuity is stored per
+channel through resumable Claude sessions rather than shared process context.
+
 ## Result-marker parser migration status
 
 *Migration status: all four Python consumers conform, and the guard enforces it.*

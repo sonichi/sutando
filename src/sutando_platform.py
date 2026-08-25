@@ -158,12 +158,8 @@ def find_pids(pattern: str) -> list[str]:
                 cond = f"$cl.StartsWith('{safe}')"
             else:
                 cond = f"$cl.Contains('{safe}')"
-            # Exclude the helper's own query pipeline: the pattern is interpolated
-            # into this PowerShell command, so for unanchored `.Contains` matches
-            # the powershell process — and any cmd/bash wrapper that carries the
-            # `-Command` text — would self-match. Tag the script with a fixed
-            # sentinel and drop any process whose command line carries it (plus
-            # our own $PID for good measure).
+            # Tag the query and exclude its tag/$PID so the interpolated pattern
+            # cannot make the helper or its wrapper self-match.
             sentinel = "__sutando_find_pids__"
             script = (
                 f"# {sentinel}\n"

@@ -9199,22 +9199,9 @@ def run_all_checks() -> list[dict]:
         if not env_file.exists() and not access_file.exists():
             continue
         try:
-            # Anchor on the .py suffix so we don't match unrelated processes
-            # whose command line happens to contain "discord-bridge" (shell
-            # invocations, ps/grep pipelines, etc). Otherwise a bare-name match
-            # produces false-positive "multiple processes" warnings that scared
-            # us into thinking the bridges were zombied today.
-            # find_pids() is cross-platform (pgrep on macOS/Linux, Get-CimInstance
-            # on Windows where /usr/bin/pgrep doesn't exist — previously this
-            # raised FileNotFoundError, swallowed below, so every Windows bridge
-            # was reported "not running" even when live).
-            # find_pids() honors the `$` end-anchor on both platforms (pgrep
-            # regex on macOS/Linux; EndsWith on Windows), so the real
-            # `python … src/discord-bridge.py` process matches but transient
-            # shells that merely mention the script mid-command-line don't.
+            # Anchor to the script suffix; find_pids preserves anchors on every OS.
+            # Drop launcher parents so only actual pollers remain.
             pids = find_pids(f"{proc_name}\\.py$")
-            # A launcher's argv ends with the same script path, so it matches
-            # this pgrep too — see _drop_launcher_parents.
             pids = _drop_launcher_parents(pids)
         except Exception:
             pids = []
