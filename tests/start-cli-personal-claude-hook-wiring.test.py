@@ -88,9 +88,10 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
             text=True,
             timeout=30,
         )
-        # `|| true` after the call is what keeps a broken/missing installer
-        # from taking the whole launcher down with it (bash -e).
+        # The `|| echo … >&2` fallback keeps a broken installer from taking the
+        # launcher down (bash -e) while making the failure visible on stderr.
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("personal-claude hook install failed", result.stderr)
 
 
 class RuntimeScopingTest(unittest.TestCase):

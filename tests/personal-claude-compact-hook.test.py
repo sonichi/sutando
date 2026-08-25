@@ -190,10 +190,7 @@ with tempfile.TemporaryDirectory() as ws:
         fail("cwd independence", f"bad output {r.stdout[:200]!r} ({e})")
 
 # ── Test 8b: installer skips (not crashes) on a clean Mac with no dev tools ───
-# Same fixture shape as tests/python-binary-sh.test.sh's "no CLT" cases: a fake
-# `xcode-select` (exit 2 = not installed) ahead of the REAL /usr/bin on PATH, so
-# `command -v python3` finds the genuine system stub location without needing
-# to fake python3 itself, and OSTYPE is forced so the check runs on any host.
+# "No CLT" fixture per tests/python-binary-sh.test.sh: fake xcode-select (exit 2).
 with tempfile.TemporaryDirectory() as tmp:
     noclt = os.path.join(tmp, "noclt")
     os.makedirs(noclt)
