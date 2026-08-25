@@ -6,6 +6,8 @@ Run: python3 tests/pool-lead-assignment.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import os
+import subprocess
 import shutil
 import sys
 import tempfile
@@ -308,6 +310,36 @@ class StuckDeadlineByRuntimeTests(unittest.TestCase):
         self.clock[0] += 61
         self.assertEqual(lead.reclaim_stuck_assignments(max_age_s=60), [f],
                          "a caller-supplied deadline must win")
+
+
+
+class AffinityIdleEnvKnob(unittest.TestCase):
+    """The sticky window is bound at import, so it is read in a subprocess —
+    testing the shipped path, not a re-implementation of the parse."""
+
+    def _idle_for(self, env_value):
+        env = dict(os.environ)
+        env.pop("SUTANDO_AFFINITY_IDLE_S", None)
+        if env_value is not None:
+            env["SUTANDO_AFFINITY_IDLE_S"] = env_value
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r);"
+             "from pool_lead import AFFINITY_IDLE_S as v; print(v)"
+             % str(REPO / "src" / "runtime-api")],
+            capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return int(r.stdout.strip())
+
+    def test_default_is_the_documented_thirty_minutes(self):
+        self.assertEqual(self._idle_for(None), 30 * 60)
+
+    def test_a_week_long_window_is_honoured(self):
+        self.assertEqual(self._idle_for("604800"), 604800)
+
+    def test_a_too_small_value_is_clamped_not_obeyed(self):
+        # a sub-minute window would rebalance mid-conversation every time
+        self.assertEqual(self._idle_for("5"), 60)
 
 
 if __name__ == "__main__":

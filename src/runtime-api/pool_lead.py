@@ -26,7 +26,7 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 
 # Sticky-channel window (#884 semantics): tasks from a channel follow its
 # handler until the channel has been idle this long, then rebalance.
-AFFINITY_IDLE_S = 30 * 60
+AFFINITY_IDLE_S = max(60, int(os.environ.get("SUTANDO_AFFINITY_IDLE_S", str(30 * 60))))
 # Outstanding assigned+claimed before affinity yields. Env-tunable: 1 = yield
 # the moment the handler is busy (latency over continuity — owner preference).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
