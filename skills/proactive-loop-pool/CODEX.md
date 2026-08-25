@@ -69,16 +69,35 @@ complete only through the finish helper.
 Identical to the Claude entry. Never claim an unassigned task while the lead is
 alive — `acquire_work` decides:
 
+**Both values come from the environment the wrapper set — never guess them.**
+`POOL_WORKSPACE` and `SUTANDO_CORE_ID` are exported by this core's launchd
+plist. Guessing the workspace is the failure this spells out: the documented
+default is `<repo>/workspace`, but the cwd is the repo and the real workspace is
+usually configured elsewhere, so a guessed path makes `tasks/` unreadable,
+`acquire_work` return `None`, and the sweep report "no assigned work" while an
+assignment addressed to this core sits in the real queue. That reads as an idle
+pool, not as a broken one.
+
 ```python
-import sys; sys.path.insert(0, "src")
+import os, sys, subprocess
+sys.path.insert(0, "src")
 from pathlib import Path
 from pool_follower import acquire_work
-WS = Path(WORKSPACE)
-got = acquire_work(WS / "tasks", WS / "state", f"core-{CORE_ID}", "pool-lead")
+
+ws = os.environ.get("POOL_WORKSPACE") or subprocess.run(
+    ["bash", "scripts/sutando-config.sh", "workspace"],
+    capture_output=True, text=True, check=True).stdout.strip()
+core = f"core-{os.environ['SUTANDO_CORE_ID']}"
+WS = Path(ws)
+got = acquire_work(WS / "tasks", WS / "state", core, "pool-lead")
 ```
 
 `got` is the claimed path or `None`. `None` means another core holds it — walk
 away, do not fall back to reading the unassigned file.
+
+Sanity check before believing an idle result: `ls "$POOL_WORKSPACE/tasks"`. If
+that path does not exist, the resolution above is wrong — fix it rather than
+reporting an empty queue.
 
 ## Complete
 
