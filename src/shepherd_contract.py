@@ -37,6 +37,13 @@ SHEPHERD_STATES = (
 
 TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
+def _require_text(owner: str, name: str, value) -> None:
+    """A coerced str() check passes on ints and keeps the original object, so a
+    non-string identity can cross the same boundary a blank one is rejected at."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{owner}.{name} must be a non-blank string, got {value!r}")
+
+
 # Anything weaker than a subject+actor match is recorded but never evidence.
 ADMISSION = ("accepted", "ignored", "ambiguous")
 
@@ -52,8 +59,7 @@ class Subject:
 
     def __post_init__(self) -> None:
         for name in ("provider", "kind", "resource_id"):
-            if not str(getattr(self, name) or "").strip():
-                raise ValueError(f"Subject.{name} must be non-blank")
+            _require_text("Subject", name, getattr(self, name))
 
     def matches(self, other: "Subject") -> bool:
         return (
@@ -85,8 +91,7 @@ class Actor:
 
     def __post_init__(self) -> None:
         for name in ("scheme", "value"):
-            if not str(getattr(self, name) or "").strip():
-                raise ValueError(f"Actor.{name} must be non-blank")
+            _require_text("Actor", name, getattr(self, name))
 
     @property
     def is_discriminating(self) -> bool:
@@ -110,6 +115,9 @@ class ObservedEvent:
     actor: Optional[Actor] = None
     source_id: str = ""          # provider-native id; the idempotency key
 
+    def __post_init__(self) -> None:
+        _require_text("ObservedEvent", "event_type", self.event_type)
+
 
 @dataclass(frozen=True)
 class ResponsibilityScope:
@@ -122,6 +130,9 @@ class ResponsibilityScope:
     failure_conditions: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
+        for name in ("watch_conditions", "success_conditions", "failure_conditions"):
+            for element in getattr(self, name):
+                _require_text(f"ResponsibilityScope.{name}", "element", element)
         clash = self.success_conditions & self.failure_conditions
         if clash:
             raise ValueError(

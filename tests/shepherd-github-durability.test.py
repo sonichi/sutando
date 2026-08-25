@@ -194,7 +194,7 @@ g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
 check("verified merge terminates the objective", g.resume("task-dur-4")[0], "succeeded")
 g.observe = _REAL_OBSERVE
 
-# --- a record save() accepts must be one load() can resume (PR #3312 review) ---
+# --- a record save() accepts must be one load() can resume ---
 from shepherd_contract import ResponsibilityScope, Subject  # noqa: E402
 
 _A = Actor(g.ACTOR_SCHEME, "someone@example.com")
@@ -215,17 +215,24 @@ def _raises(fn):
     return False
 
 
-check("empty watch set is refused at SAVE, not at the next load",
-      _raises(lambda: g._write_record("task-dur-emptywatch", _scope(
-          watch_conditions=frozenset()), "waiting")), True)
-check("a scope with no reachable outcome is refused at SAVE",
-      _raises(lambda: g._write_record("task-dur-emptyout", _scope(
-          success_conditions=frozenset(), failure_conditions=frozenset()), "waiting")), True)
+def _rejected_publishes_nothing(tid, sc):
+    """Raising is not enough: a validator that runs AFTER the atomic write also
+    raises, having already published the invalid record."""
+    if not _raises(lambda: g.save(tid, sc, "waiting")):
+        return False
+    return not (g.state_dir() / f"{tid}.json").exists()
+
+
+check("empty watch set is refused at SAVE and publishes NO record",
+      _rejected_publishes_nothing("task-dur-emptywatch", _scope(
+          watch_conditions=frozenset())), True)
+check("a scope with no reachable outcome is refused and publishes NO record",
+      _rejected_publishes_nothing("task-dur-emptyout", _scope(
+          success_conditions=frozenset(), failure_conditions=frozenset())), True)
 # the record encodes one subject; a wider scope must not silently narrow on reload
-check("a scope this record cannot encode is refused, not narrowed",
-      _raises(lambda: g._write_record("task-dur-wide", _scope(subjects=(
-          g.subject_for("o/r", 3), Subject("gitlab", "merge_request", "grp/proj!9"))),
-          "waiting")), True)
+check("a scope this record cannot encode is refused and publishes NO record",
+      _rejected_publishes_nothing("task-dur-wide", _scope(subjects=(
+          g.subject_for("o/r", 3), Subject("gitlab", "merge_request", "grp/proj!9")))), True)
 # round-trip: whatever save() accepted, load() must return unchanged
 g.save("task-dur-roundtrip", _scope(), "waiting")
 _rt = g.load("task-dur-roundtrip")
@@ -241,6 +248,9 @@ check("CONTROL a valid projection still maps to its outcome",
       g.observe("o/r", 3).event_type, "github.pull_request.closed_unmerged")
 g._gh = lambda *a, **k: "closed null"
 check("an unknown merged token is refused, not read as unmerged",
+      _raises(lambda: g.observe("o/r", 3)), True)
+g._gh = lambda *a, **k: "mystery false"
+check("an unknown STATE is refused, not read as progress",
       _raises(lambda: g.observe("o/r", 3)), True)
 g._gh = lambda *a, **k: ""
 check("an empty projection is refused, not read as progress",
@@ -260,4 +270,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 47 assertions, control verified")
+print("PASS: 48 assertions, control verified")
