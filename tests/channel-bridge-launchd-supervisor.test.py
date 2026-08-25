@@ -198,9 +198,8 @@ def test_a_bare_exit_zero_is_NOT_a_standdown():
         proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         time.sleep(1.0)
-        # Still supervising == did not stand down. Timing-independent, unlike a
-        # lap count: emit_restart_alert shells out to osascript, so one lap can
-        # fill the window and a low count would read as a stand-down.
+        # Still supervising == did not stand down. A lap count would be timing-
+        # dependent: emit_restart_alert shells out, so one lap can fill the window.
         still_running = proc.poll() is None
         proc.terminate(); proc.wait(timeout=5)
         check(still_running,
