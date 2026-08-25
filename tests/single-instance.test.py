@@ -119,9 +119,8 @@ class TestSingleInstance(unittest.TestCase):
             self.assertTrue(lock_path.exists(), f"{name} lock file missing")
 
 
-    # In-process, so coverage records the stand-down line itself. The sibling
-    # test proves the exit code via a real child; that path is invisible to
-    # coverage because it runs in another interpreter.
+    # In-process so coverage records the stand-down line: the sibling test's
+    # child runs in another interpreter, where coverage cannot see it.
     def test_standdown_exits_with_the_declared_constant(self):
         import os as _os
         mod = _load_single_instance(self.workspace)
