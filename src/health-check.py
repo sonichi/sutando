@@ -5723,17 +5723,26 @@ DISK_FAIL_GIB = 2.0
 
 DAILY_LATE_TOLERANCE_MIN = 15
 DAILY_MISS_GRACE_MIN = 60
+# Past this, a daily job's silence means the probe stopped matching its output,
+# not that the job is late; scoring a dead corpus asserts more than was measured.
+DAILY_ARTIFACT_STALE_DAYS = 10
 
 
 def _interpret_daily_punctuality(jobs: list) -> dict:
     """Score LATENESS, not presence: a file produced daily by another path looks
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
-    late, missed, unknown = [], [], []
+    late, missed, unknown, drifted = [], [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
         if not j["artifacts"]:
             unknown.append(j["name"])
+            continue
+        # The median would describe a corpus this job no longer writes, and a
+        # missed-today verdict would blame it for the probe's own blind spot.
+        if j.get("naming_stale"):
+            drifted.append((j["name"], j.get("newest_artifact") or "?",
+                            j.get("artifact_age_days")))
             continue
         # Wrap to the NEAREST occurrence: 23:42 finishing 00:05 is +23 late, not
         # -1417 early. The filename date is logical, often a day off the mtime.
@@ -5745,7 +5754,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                 and not j.get("conditional")
                 and (j.get("stem_declared") or j["artifacts"])):
             missed.append((j["name"], j["minutes_since_due"]))
-    if not late and not missed:
+    if not late and not missed and not drifted:
         seen = len(jobs) - len(unknown)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -5765,6 +5774,12 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                     f"produced these; something else is covering for it")
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due")
+    for n, newest, age in sorted(drifted):
+        age_txt = f", {age}d ago" if age is not None else ""
+        bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
+                    f"probe's filename match has drifted off this job's output; "
+                    f"punctuality cannot be scored and a missed-today verdict would "
+                    f"blame the job for the probe's own blind spot")
     if unknown:
         bits.append(f"unverifiable (no dated artifact): {', '.join(sorted(unknown))}")
     return {"name": name, "status": "warn", "detail": "; ".join(bits)}
@@ -5872,8 +5887,19 @@ def check_daily_cron_punctuality() -> dict:
         # sentinel is the only dated record that it finished.
         arts = (_daily_completion_minutes(ws / "state", jname) if launchd
                 else _daily_artifact_minutes(ws / "results", stem))
+        # Staleness is computed HERE because `now` lives here; the interpret layer
+        # reads it as an optional field so its fixtures stay clock-independent.
+        newest = max((d for d, _ in arts), default=None)
+        age_days = None
+        if newest:
+            try:
+                age_days = (now.date() - datetime.strptime(newest, "%Y-%m-%d").date()).days
+            except ValueError:
+                age_days = None
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
+            "newest_artifact": newest, "artifact_age_days": age_days,
+            "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
             # `artifact` names a results file, so it cannot vouch for a sentinel:
@@ -6613,6 +6639,16 @@ def check_proactive_quarantine() -> dict:
             age = now - path.stat().st_mtime
         except OSError:
             unreadable += 1
+            continue
+        # A declared skip had nothing to deliver, so it can never drain.
+        # `[deduped:]` stays counted: it promises delivery elsewhere.
+        try:
+            from result_markers import parse_markers  # noqa: PLC0415
+            skips = {a.value for a in parse_markers(path.read_text()).actions
+                     if a.kind == "skip"}
+        except (OSError, ValueError, ImportError):
+            skips = set()          # unreadable -> judge it as before, never silently clear
+        if skips & {"no-send", "REPLIED"}:
             continue
         kept.append((path.name, int(age)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
@@ -8699,9 +8735,70 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
     return out
 
 
-def _interpret_core_model_pin(pinned: list, socket: str, running=()) -> dict:
+def _settings_candidates() -> "tuple":
+    """The settings files the runtime actually consults, ((label, Path), ...).
+
+    claude_home_path() resolves CLAUDE_CONFIG_DIR with its own fallback; reading
+    that fallback separately would report a file the runtime does not consult.
+    """
+    return (
+        ("user", Path(claude_home_path("settings.json"))),
+        ("project", REPO_DIR / ".claude" / "settings.json"),
+    )
+
+
+def _settings_model_pins(candidates=None) -> list:
+    """[(label, model)] for every settings.json that sets `model`.
+
+    Read at the edge so the interpreter stays pure. A settings pin is a THIRD
+    way the core's model is decided, invisible to both tmux env and argv.
+    """
+    out = []
+    seen = set()
+    for label, path in (_settings_candidates() if candidates is None
+                        else candidates):
+        try:
+            resolved = path.resolve()
+            if resolved in seen or not path.is_file():
+                continue
+            seen.add(resolved)
+            model = json.loads(path.read_text()).get("model")
+        except (OSError, ValueError, TypeError):
+            continue  # unreadable/malformed settings is not a pin claim either way
+        if isinstance(model, str) and model.strip():
+            out.append((label, model.strip()))
+    return out
+
+
+def _live_core_runtime(socket: str, sessions) -> "str | None":
+    """Runtime stamped on the LIVE core sessions, or None when not knowable.
+
+    Config can disagree with a running pane mid-switch, so the pane's own stamp
+    decides; absent, unreadable or CONFLICTING stamps are unknown, never Claude.
+    """
+    seen = set()
+    for sess in sessions:
+        res = _run_tmux(socket, "show-environment", "-t", f"={sess}",
+                        "SUTANDO_CORE_RUNTIME")
+        if res is None or res.returncode != 0:
+            continue
+        out = (res.stdout or "").strip()
+        if out.startswith("SUTANDO_CORE_RUNTIME="):
+            val = out.split("=", 1)[1].strip()
+            if val:
+                seen.add(val)
+    return seen.pop() if len(seen) == 1 else None
+
+
+def _interpret_core_model_pin(pinned: list, socket: str, running=(),
+                              settings=(), runtime: str = "claude") -> dict:
     """Interpret tmux pins AND the live core's argv. A tmux clear cannot change an
-    already-running process, so argv must be reported even when tmux is clean."""
+    already-running process, so argv must be reported even when tmux is clean.
+
+    `settings` carries settings.json `model` values. They are a legitimate,
+    intended way to choose the model, so they never make this WARN — but the
+    clean line must not claim the default window while one is set.
+    """
     name = "core-model-pin"
     live = [(s, v) for s, v in running if v and v.strip()]
     # An empty-string argv read is as unverified as None; both mean "ps told us
@@ -8716,9 +8813,22 @@ def _interpret_core_model_pin(pinned: list, socket: str, running=()) -> dict:
                                f"({', '.join(sorted(unknown))}), so it cannot be "
                                f"confirmed unpinned — the tmux env is clear, but a "
                                f"clear cannot move a running core off a pinned model")}
+        if runtime != "claude":
+            # The argv scan matches only `claude` panes and settings.json is
+            # Claude-scoped, so neither says anything about this runtime.
+            return {"name": name, "status": "ok",
+                    "detail": (f"no SUTANDO_CORE_MODEL pin in tmux env; the live core runtime is "
+                               f"{runtime!r}, and the argv scan and settings.json are Claude-scoped, "
+                               f"so they were NOT consulted and its window is unassessed here")}
+        if settings:
+            where = ", ".join(f"{lbl}={val!r}" for lbl, val in settings)
+            return {"name": name, "status": "ok",
+                    "detail": (f"no SUTANDO_CORE_MODEL pin in tmux env or core argv, "
+                               f"but settings.json DOES select the model ({where}) — "
+                               f"so the core is not on the default window")}
         return {"name": name, "status": "ok",
-                "detail": ("no model pin on any session or the global env "
-                           "(core uses the default window)")}
+                "detail": ("no model pin in tmux env or core argv, and no settings.json "
+                           "selects a model — core uses the default window")}
     if live:
         where_live = ", ".join(f"{s} argv={v!r}" for s, v in live)
         extra = ""
@@ -8824,13 +8934,18 @@ def check_core_model_pin() -> dict:
         sessions = _tmux_sessions(socket)
     except (OSError, subprocess.SubprocessError) as e:
         if _tmux_no_server(e):
-            return _interpret_core_model_pin(pinned, socket, ())
+            # No session list here, so the live stamp is unreadable -> unknown.
+            return _interpret_core_model_pin(
+                pinned, socket, (), _settings_model_pins(), "unknown")
         # sessions=[] here would report a clean argv pass having read no core at all.
         return {"name": name, "status": "warn",
                 "detail": (f"could not enumerate core tmux sessions ({e}), so no core "
                            f"argv was inspected — the tmux env is clear, but a clear "
                            f"cannot move a running core off a pinned model")}
-    return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
+    return _interpret_core_model_pin(pinned, socket,
+                                     _core_argv_pins(socket, sessions),
+                                     _settings_model_pins(),
+                                     _live_core_runtime(socket, sessions) or "unknown")
 
 
 def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
