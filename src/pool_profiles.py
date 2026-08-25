@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """Durable logical session profiles for the lead-follower pool.
 
-A profile is the long-lived identity of a context: which rooms it covers,
-which provider session currently continues it, and which core is seated on
-it. Cores and provider sessions are both replaceable underneath it — the
-profile is what survives.
+A profile is the long-lived identity of a context: the rooms it covers, the
+core seated on it, and a graph of generations. Cores and provider sessions are
+both replaceable underneath it — the profile is what survives.
 
-Two fencing rules make that safe. The lead is the only writer of seating
-state, and every seat carries a monotonic epoch; a core may advance a
-profile's session lineage only while holding the current epoch, so a core
-that died, was re-seated elsewhere and then briefly revived cannot write
-into a profile it no longer owns.
+Ancestry is a graph, not a list. Each generation names its parent, so a chain,
+a retry after a failed start, a runtime switch, and a branch off an older
+generation are all the same shape, and per-generation transcript, digest and
+room-watermark references have somewhere to live.
+
+Three rules keep it consistent under concurrency:
+
+- The lead alone writes seating state, and every seating change bumps a
+  monotonic epoch.
+- A core may write lineage only while holding the current epoch, so a core
+  that died, was re-seated elsewhere and briefly revived is fenced out by
+  comparison rather than by liveness.
+- The head advances only when a child actually starts: begin_generation
+  records a pending child, and promote_generation is a compare-and-set on
+  (seat, head). A failed start leaves the previous head valid, so a profile is
+  never without a recoverable generation.
 
 This module owns profiles.json alone: schema, bounds, atomicity and failure
-semantics. It holds no task logic — task ownership remains entirely with the
-pool's atomic-rename claim. Injected path/clock; stdlib only.
+semantics. It holds no task logic — task ownership stays with the pool's
+atomic-rename claim. Injected path/clock; stdlib only.
 """
 from __future__ import annotations
 
@@ -26,10 +36,13 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 
-# A rotation reason is recorded on the generation it closes, so an audit can
-# tell a deliberate size rotation from a resume that failed.
-ROTATE_REASONS = ("rotated_for_size", "rotated_for_age", "resume_failed",
-                  "crashed", "auth_death", "runtime_switch", "manual")
+# Why this generation exists, recorded on the transition that created it.
+TRANSITION_REASONS = ("initial", "rotated_for_size", "rotated_for_age",
+                      "resume_failed", "crashed", "auth_death",
+                      "runtime_switch", "branch", "manual")
+
+GENERATION_STATUSES = ("pending", "active", "superseded", "failed")
+RUNTIMES = ("claude", "codex")
 
 ROOM_WRITE_MODES = ("scoped", "none")
 SHARING_MODES = ("explicit",)
@@ -48,12 +61,20 @@ class SeatFenced(Exception):
     """The caller is not the current seat, or holds a stale epoch."""
 
 
+class HeadMoved(Exception):
+    """The head advanced under a pending generation; its promotion is void."""
+
+
 class PolicyViolation(Exception):
-    """A room or context policy value is missing or not an enumerated one."""
+    """A room, policy or enum value is missing or not an enumerated one."""
 
 
 class UnknownProfile(Exception):
     """No profile with that id."""
+
+
+class UnknownGeneration(Exception):
+    """No generation with that id on this profile."""
 
 
 class NotTheWriter(Exception):
@@ -69,11 +90,10 @@ def _validate_rooms(rooms) -> dict:
             raise PolicyViolation(f"bad room id: {room_id!r}")
         if not isinstance(spec, dict):
             raise PolicyViolation(f"room {room_id}: spec must be a mapping")
-        if set(spec) - {"read", "write"}:
-            raise PolicyViolation(f"room {room_id}: unknown keys "
-                                  f"{sorted(set(spec) - {'read', 'write'})}")
-        read = spec.get("read")
-        write = spec.get("write")
+        extra = sorted(set(spec) - {"read", "write"})
+        if extra:
+            raise PolicyViolation(f"room {room_id}: unknown keys {extra}")
+        read, write = spec.get("read"), spec.get("write")
         if not isinstance(read, bool):
             raise PolicyViolation(f"room {room_id}: read must be a bool")
         if write not in ROOM_WRITE_MODES:
@@ -112,26 +132,41 @@ def _validate_policy(p) -> dict:
     return merged
 
 
-def _validate_profile(profile_id: str, prof) -> None:
+def _validate_generation(pid: str, gid: str, gen) -> None:
+    required = {"session_id", "parent_generation_id", "runtime", "status",
+                "transition_reason", "started_at", "ended_at",
+                "transcript_ref", "digest_ref", "room_watermarks"}
+    if not isinstance(gen, dict) or set(gen) != required:
+        raise ProfileStoreCorrupt(f"{pid}/{gid}: generation keys must be "
+                                  f"{sorted(required)}")
+    if gen["status"] not in GENERATION_STATUSES:
+        raise ProfileStoreCorrupt(f"{pid}/{gid}: bad status")
+    if gen["runtime"] not in RUNTIMES:
+        raise ProfileStoreCorrupt(f"{pid}/{gid}: bad runtime")
+    if not isinstance(gen["room_watermarks"], dict):
+        raise ProfileStoreCorrupt(f"{pid}/{gid}: bad room_watermarks")
+
+
+def _validate_profile(pid: str, prof) -> None:
     if not isinstance(prof, dict):
-        raise ProfileStoreCorrupt(f"{profile_id}: not a mapping")
-    required = {"rooms", "runtime", "lineage", "seat", "policy",
-                "context_policy"}
+        raise ProfileStoreCorrupt(f"{pid}: not a mapping")
+    required = {"rooms", "seat", "policy", "context_policy",
+                "head_generation_id", "generations", "created_at"}
     missing = required - set(prof)
     if missing:
-        raise ProfileStoreCorrupt(f"{profile_id}: missing {sorted(missing)}")
-    lin, seat = prof["lineage"], prof["seat"]
-    if not isinstance(lin, dict) or set(lin) != {
-            "generation", "active_session_id", "previous_session_ids"}:
-        raise ProfileStoreCorrupt(f"{profile_id}: bad lineage")
-    if not isinstance(lin["generation"], int) or lin["generation"] < 1:
-        raise ProfileStoreCorrupt(f"{profile_id}: bad generation")
-    if not isinstance(lin["previous_session_ids"], list):
-        raise ProfileStoreCorrupt(f"{profile_id}: bad previous_session_ids")
+        raise ProfileStoreCorrupt(f"{pid}: missing {sorted(missing)}")
+    seat, gens = prof["seat"], prof["generations"]
     if not isinstance(seat, dict) or set(seat) != {"core_id", "epoch"}:
-        raise ProfileStoreCorrupt(f"{profile_id}: bad seat")
+        raise ProfileStoreCorrupt(f"{pid}: bad seat")
     if not isinstance(seat["epoch"], int) or seat["epoch"] < 0:
-        raise ProfileStoreCorrupt(f"{profile_id}: bad seat epoch")
+        raise ProfileStoreCorrupt(f"{pid}: bad seat epoch")
+    if not isinstance(gens, dict):
+        raise ProfileStoreCorrupt(f"{pid}: bad generations")
+    for gid, gen in gens.items():
+        _validate_generation(pid, gid, gen)
+    head = prof["head_generation_id"]
+    if head is not None and head not in gens:
+        raise ProfileStoreCorrupt(f"{pid}: head {head!r} is not a generation")
 
 
 class ProfileStore:
@@ -145,6 +180,8 @@ class ProfileStore:
 
     # ── storage ──────────────────────────────────────────────────────────
     def _lock_path(self) -> Path:
+        """A sidecar the writer never replaces. Locking the data file instead
+        would let a waiter inherit the pre-replace inode and clobber a newer one."""
         return self.path.with_name(self.path.name + ".lock")
 
     def load(self) -> dict:
@@ -171,17 +208,24 @@ class ProfileStore:
         return data
 
     def _save(self, data: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        parent = self.path.parent
+        parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         with open(tmp, "w") as fh:
             json.dump(data, fh, indent=2, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, self.path)
+        # The rename itself is only durable once the directory entry is.
+        dfd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def _mutate(self, fn):
-        """Whole-file read-modify-write under flock; the lock file is opened
-        fresh per call because flock is per open-file-description."""
+        """Read-modify-write under flock on the sidecar. The read happens after
+        the lock is held, so a waiter never applies onto a stale snapshot."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._lock_path(), "a+") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -200,6 +244,23 @@ class ProfileStore:
             raise UnknownProfile(profile_id)
         return prof
 
+    def head(self, profile_id: str) -> "dict | None":
+        prof = self.get(profile_id)
+        gid = prof["head_generation_id"]
+        return None if gid is None else dict(prof["generations"][gid],
+                                             generation_id=gid)
+
+    def ancestry(self, profile_id: str) -> "list[str]":
+        """Head first, walking parent links back. Cycles cannot occur — a
+        parent always predates its child — but the seen-set makes that safe."""
+        prof = self.get(profile_id)
+        gid, seen, out = prof["head_generation_id"], set(), []
+        while gid is not None and gid not in seen:
+            seen.add(gid)
+            out.append(gid)
+            gid = prof["generations"][gid]["parent_generation_id"]
+        return out
+
     def profile_for_room(self, room_id: str) -> "str | None":
         for pid, prof in sorted(self.load()["profiles"].items()):
             if room_id in prof["rooms"]:
@@ -211,13 +272,11 @@ class ProfileStore:
         if writer != self.lead_label:
             raise NotTheWriter(f"{writer!r} may not write seating state")
 
-    def create(self, profile_id: str, rooms: dict, runtime: str, *,
-               writer: str, context_policy=None, policy=None) -> dict:
+    def create(self, profile_id: str, rooms: dict, *, writer: str,
+               context_policy=None, policy=None) -> dict:
         self._require_lead(writer)
         if not isinstance(profile_id, str) or not profile_id:
             raise PolicyViolation("profile_id must be a non-empty string")
-        if runtime not in ("claude", "codex"):
-            raise PolicyViolation(f"unsupported runtime {runtime!r}")
         rooms_v = _validate_rooms(rooms)
         cp = _validate_context_policy(context_policy)
         pol = _validate_policy(policy)
@@ -225,14 +284,10 @@ class ProfileStore:
         def apply(data):
             if profile_id in data["profiles"]:
                 raise PolicyViolation(f"{profile_id} already exists")
-            prof = {
-                "rooms": rooms_v, "runtime": runtime,
-                "lineage": {"generation": 1, "active_session_id": None,
-                            "previous_session_ids": []},
-                "seat": {"core_id": None, "epoch": 0},
-                "policy": pol, "context_policy": cp,
-                "created_at": self.now(),
-            }
+            prof = {"rooms": rooms_v, "seat": {"core_id": None, "epoch": 0},
+                    "policy": pol, "context_policy": cp,
+                    "head_generation_id": None, "generations": {},
+                    "created_at": self.now()}
             data["profiles"][profile_id] = prof
             return prof
 
@@ -293,7 +348,7 @@ class ProfileStore:
         in which neither the old nor the new core could be validated."""
         return self.seat(profile_id, core_id, writer=writer)
 
-    # ── seat-fenced: lineage ─────────────────────────────────────────────
+    # ── seat-fenced: the generation graph ────────────────────────────────
     def _fenced(self, prof: dict, core_id: str, seat_epoch: int) -> None:
         seat = prof["seat"]
         if seat["core_id"] != core_id or seat["epoch"] != seat_epoch:
@@ -301,9 +356,42 @@ class ProfileStore:
                 f"holder {core_id}@{seat_epoch} is not the seat "
                 f"{seat['core_id']}@{seat['epoch']}")
 
-    def advance_session(self, profile_id: str, core_id: str, seat_epoch: int,
-                        session_id: str) -> dict:
-        """Record the provider session now continuing this profile."""
+    def begin_generation(self, profile_id: str, core_id: str, seat_epoch: int,
+                         runtime: str, reason: str,
+                         parent_generation_id: "str | None" = "HEAD") -> str:
+        """Open a pending child of the current head. The head does NOT move —
+        a session that never starts must not leave the profile headless."""
+        if runtime not in RUNTIMES:
+            raise PolicyViolation(f"runtime must be one of {RUNTIMES}")
+        if reason not in TRANSITION_REASONS:
+            raise PolicyViolation(f"reason must be one of {TRANSITION_REASONS}")
+
+        def apply(data):
+            prof = data["profiles"].get(profile_id)
+            if prof is None:
+                raise UnknownProfile(profile_id)
+            self._fenced(prof, core_id, seat_epoch)
+            parent = (prof["head_generation_id"]
+                      if parent_generation_id == "HEAD"
+                      else parent_generation_id)
+            if parent is not None and parent not in prof["generations"]:
+                raise UnknownGeneration(f"{profile_id}/{parent}")
+            gid = f"g{len(prof['generations']) + 1}"
+            prof["generations"][gid] = {
+                "session_id": None, "parent_generation_id": parent,
+                "runtime": runtime, "status": "pending",
+                "transition_reason": reason, "started_at": self.now(),
+                "ended_at": None, "transcript_ref": None, "digest_ref": None,
+                "room_watermarks": {}}
+            return gid
+
+        return self._mutate(apply)
+
+    def promote_generation(self, profile_id: str, core_id: str,
+                           seat_epoch: int, generation_id: str,
+                           session_id: str) -> str:
+        """Compare-and-set the head: only a pending generation whose recorded
+        parent is still the head may take it. Refuses otherwise."""
         if not isinstance(session_id, str) or not session_id:
             raise PolicyViolation("session_id must be a non-empty string")
 
@@ -312,33 +400,74 @@ class ProfileStore:
             if prof is None:
                 raise UnknownProfile(profile_id)
             self._fenced(prof, core_id, seat_epoch)
-            prof["lineage"]["active_session_id"] = session_id
-            return prof["lineage"]
+            gen = prof["generations"].get(generation_id)
+            if gen is None:
+                raise UnknownGeneration(f"{profile_id}/{generation_id}")
+            if gen["status"] != "pending":
+                raise HeadMoved(f"{generation_id} is {gen['status']}")
+            if prof["head_generation_id"] != gen["parent_generation_id"]:
+                raise HeadMoved(
+                    f"head is {prof['head_generation_id']!r}, "
+                    f"parent was {gen['parent_generation_id']!r}")
+            parent_id = gen["parent_generation_id"]
+            if parent_id is not None:
+                parent = prof["generations"][parent_id]
+                parent["status"] = "superseded"
+                parent["ended_at"] = self.now()
+            gen["status"] = "active"
+            gen["session_id"] = session_id
+            prof["head_generation_id"] = generation_id
+            return generation_id
 
         return self._mutate(apply)
 
-    def rotate(self, profile_id: str, core_id: str, seat_epoch: int,
-               reason: str) -> int:
-        """Close the current generation and open the next. The closed session
-        is preserved, so a failed resume stays auditable rather than vanishing."""
-        if reason not in ROTATE_REASONS:
-            raise PolicyViolation(f"reason must be one of {ROTATE_REASONS}")
+    def fail_generation(self, profile_id: str, core_id: str, seat_epoch: int,
+                        generation_id: str, reason: str) -> str:
+        """Mark a pending child failed. The head is untouched, so the previous
+        generation stays the one to recover from."""
+        if reason not in TRANSITION_REASONS:
+            raise PolicyViolation(f"reason must be one of {TRANSITION_REASONS}")
 
         def apply(data):
             prof = data["profiles"].get(profile_id)
             if prof is None:
                 raise UnknownProfile(profile_id)
             self._fenced(prof, core_id, seat_epoch)
-            lin = prof["lineage"]
-            if lin["active_session_id"] is not None:
-                lin["previous_session_ids"].append({
-                    "session_id": lin["active_session_id"],
-                    "generation": lin["generation"],
-                    "reason": reason,
-                    "ended_at": self.now(),
-                })
-            lin["generation"] += 1
-            lin["active_session_id"] = None
-            return lin["generation"]
+            gen = prof["generations"].get(generation_id)
+            if gen is None:
+                raise UnknownGeneration(f"{profile_id}/{generation_id}")
+            if gen["status"] != "pending":
+                raise HeadMoved(f"{generation_id} is {gen['status']}")
+            gen["status"] = "failed"
+            gen["transition_reason"] = reason
+            gen["ended_at"] = self.now()
+            return generation_id
+
+        return self._mutate(apply)
+
+    def annotate_generation(self, profile_id: str, core_id: str,
+                            seat_epoch: int, generation_id: str, *,
+                            transcript_ref=None, digest_ref=None,
+                            room_watermarks=None) -> dict:
+        """Attach the per-generation references. Kept separate from promotion
+        because a transcript path and a digest become known at different times."""
+        if room_watermarks is not None and not isinstance(room_watermarks, dict):
+            raise PolicyViolation("room_watermarks must be a mapping")
+
+        def apply(data):
+            prof = data["profiles"].get(profile_id)
+            if prof is None:
+                raise UnknownProfile(profile_id)
+            self._fenced(prof, core_id, seat_epoch)
+            gen = prof["generations"].get(generation_id)
+            if gen is None:
+                raise UnknownGeneration(f"{profile_id}/{generation_id}")
+            if transcript_ref is not None:
+                gen["transcript_ref"] = transcript_ref
+            if digest_ref is not None:
+                gen["digest_ref"] = digest_ref
+            if room_watermarks is not None:
+                gen["room_watermarks"].update(room_watermarks)
+            return gen
 
         return self._mutate(apply)
