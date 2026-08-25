@@ -42,6 +42,12 @@ If the skill is not installed, skip silently. `/startup` works without it — ev
 
 Note: this step runs BEFORE step 2 so that the watcher (started by step 2's downstream) doesn't pick up an orphan task before recovery has classified it.
 
+### Step 1.5 — Serve a waiting owner task first
+
+After orphan recovery has classified the queue, check `<workspace>/tasks/` for a pending owner task (`access_tier: owner` or no tier field, and no matching file in `results/`). If one exists, process it and write its result NOW — before cron registration. A waiting owner beats bootstrap ceremony; crons registering 30 seconds later costs nothing. This is what makes a first message sent during onboarding answer in seconds instead of queuing behind the full bootstrap.
+
+Skip silently when the queue is empty (the common case). Runs after step 1, never before it: recovery must classify crash leftovers first so a stale half-executed task is not answered as if it just arrived.
+
 ### Step 2 — Register schedules + start watcher
 
 Invoke `/schedule-crons`. This handles:
@@ -69,6 +75,8 @@ session start
 /startup
     │
     ├─► step 1:  /task-orphan-check (optional) ──► classifies + archives orphan tasks
+    │
+    ├─► step 1.5: serve a pending owner task, if any ──► result written before bootstrap continues
     │
     ├─► step 2:  /schedule-crons ──┬─► step 1.5 (start watch-tasks-stream.sh via Monitor — FIRST, before registration)
     │                               ├─► step 2-3 (register crons.json entries)
