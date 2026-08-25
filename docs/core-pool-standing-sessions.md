@@ -139,6 +139,38 @@ Lead death is what would otherwise keep a follower-side timer honest, and #3314
 already covers it: followers "degrade to leaderless claiming on lead loss". That
 path stands without a periodic sweep behind it.
 
+## Decision 6 — subagent vs new core: the discriminator is SHARED CONTEXT
+
+Both add parallelism, so the design needs a rule for which one, or the two
+policies compete for the same resource budget.
+
+```
+work SHARES the group's context   ->  subagent, inside the seated core
+work is a NEW context group       ->  the create path (decision 4)
+```
+
+A subagent costs no seat, no binding, no pane, and no lead involvement — it runs
+inside the core already holding that group's conversation, which is exactly why
+it is the right tool for intra-group fan-out. Creating a core is the expensive
+operation: a new plist, a new session, a new binding the lead must then own,
+reassign on death, and restore after preemption.
+
+**This is what makes decision 2 affordable.** The objection to binding a group to
+a fixed core is that it collapses least-loaded fallback into a static table. That
+objection only holds if task-level distribution has to supply the parallelism. It
+does not: subagents supply it *within* a group, so the pool's job narrows to
+placement *across* groups, and a static table is the correct structure for
+placement.
+
+So the create factors in decision 4 are reached only after this test. "All cores
+are busy" is not by itself a reason to create — if the work belongs to a group
+that is already seated, the answer is a subagent in that core, and creating one
+would fragment a conversation across two sessions.
+
+**Corollary for preemption:** a core running subagents is not idle, however its
+own turn-taking looks. Whatever idle threshold decision 4 settles on has to count
+subagent activity, or the pool will preempt exactly the cores doing the most work.
+
 ## Costs, stated rather than discovered later
 
 1. **Per-group concurrency is 1, by definition.** One thread, one turn at a
