@@ -4801,9 +4801,9 @@ async def poll_results():
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
                                 save_pending_replies()
-                            elif _act == "report":
-                                # The asker learns nothing if this send fails, so
-                                # its outcome decides retirement, not the attempt.
+                            elif _act == "report" and not _target:
+                                # Cross-channel carries a None payload and is
+                                # delivered by the _target block below instead.
                                 await channel.send(_pl)
                                 _delivered = True
                             if _target:

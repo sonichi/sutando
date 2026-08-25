@@ -117,6 +117,10 @@ class DiscordRealLoop(unittest.TestCase):
             async def send(self, text, **kw):
                 if send_raises:
                     raise RuntimeError("channel unavailable")
+                # Discord rejects a content-only send with no content; accepting
+                # it here let a None payload read as delivered.
+                if not text:
+                    raise RuntimeError("Cannot send an empty message")
                 sent.append(text)
 
         chan = _Chan()
@@ -223,7 +227,8 @@ class DiscordRealLoop(unittest.TestCase):
                 r = self._one_pass(td, f"[deduped: {H.HOLDER}]", send_raises=False)
             finally:
                 db.dedup_cross_channel_target = _orig_t
-            self.assertTrue(r["sent"], "control broken: the notify never sent")
+            self.assertTrue(r["sent"] and all(r["sent"]),
+                            f"control broken: the notify never sent a real body ({r['sent']!r})")
             self.assertFalse(r["result_remaining"],
                              "retained a cross-channel notice that WAS delivered")
 
