@@ -43,7 +43,9 @@ def decide(pending_unassigned: int, in_flight: "dict[str, int]",
             and current_n < max_n
             and now - last_change_ts >= up_cooldown_s):
         return current_n + 1
-    if (current_n > min_n and pending_unassigned == 0
+    # `and live` matches the up-branch: all([]) is True, so an empty in_flight
+    # (every follower gone) would otherwise read as "idle" and shrink the pool.
+    if (current_n > min_n and pending_unassigned == 0 and live
             and all(v == 0 for v in live)
             and now - last_busy_ts >= down_idle_s
             and now - last_change_ts >= down_idle_s):
